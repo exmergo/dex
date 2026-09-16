@@ -115,6 +115,26 @@ class MemoryStore:
     ) -> float:
         return spend_total(self._spend, cutoff_iso, field=field, connector=connector)
 
+    def spend_entries(
+        self,
+        *,
+        connector: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """The tail of this instance's ledger, oldest first, copied out.
+
+        Copied for the reason every read on this backend copies: the entries are
+        the store's own live objects, and handing a caller a reference would let
+        a mutation upstream rewrite recorded spend.
+        """
+
+        matching = [
+            dict(entry)
+            for entry in self._spend
+            if connector is None or entry.get("connector") == connector
+        ]
+        return matching[-limit:] if limit > 0 else []
+
     @contextmanager
     def spend_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
         """Serialize the spend admission across threads sharing this instance.

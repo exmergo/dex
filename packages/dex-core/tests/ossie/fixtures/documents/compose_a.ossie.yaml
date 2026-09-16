@@ -1,0 +1,16 @@
+# Half of a two-document layer. Its sibling declares a different model, so the
+# two compose; compose_clash.ossie.yaml declares this same model name, which is
+# the cross-file collision dex refuses.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id

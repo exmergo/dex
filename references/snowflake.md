@@ -118,7 +118,7 @@ no warehouse), while any data scan costs warehouse runtime. So dex guards
 - **Billed:** profiling aggregates, `explore query`, relationship verification
   probes, and `transform build`.
 
-`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statements rather than added afterward, so the estimate you confirm is the whole cost. A call carrying several statements is quoted once for all of them, itemized per statement, and an object two of them share is scanned once rather than twice. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+`explore query` and `explore cluster` bill an auto-profile of an object this connection has that the `.dex/` cache cannot adjudicate, priced into the same handshake as the statements: see [`cost-controls.md`](cost-controls.md). Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
 
 Budgets (`budget.ceiling`, `--budget`, `budget.session_ceiling`) are
 warehouse-seconds: the number you budget is the number the server enforces.
@@ -137,19 +137,37 @@ probe against a cold warehouse is quoted at what the account will actually
 see. The same estimator prices `transform build`: each compiled model,
 snapshot, and test is estimated and summed into the build's upfront cost.
 
+`transform build --verify` costs only where the warehouse keeps no row
+count, so a table's count is free metadata; how the counts are priced into
+the build's own estimate is in
+[`cost-controls.md`](cost-controls.md).
+
+`transform test --mutate` prices the batch in warehouse-seconds, from the same
+heuristic the rest of this connector uses rather than from a dry run, so the
+estimate carries `estimate_quality: heuristic` and the resume minimum floors it
+like any other billed command here. One estimate and one confirmation cover
+every mutant; a budget that runs out partway stops the run and reports the rest
+as `not_run`. Settlement is the sum of the per-node execution seconds each run
+reports, ledgered under `command: "transform test"`. Nothing is materialized,
+because a mutant builds as an ephemeral model, so `snowflake.dev_database` holds
+exactly the objects it held before the run.
+
+
+`--verify` also folds `snowflake.dev_database` / `snowflake.dev_schema` into its read scope for the length of that one
+command, because dbt writes the relations it is judging there and that namespace
+is refused as a source everywhere else. The widening shows in the envelope's
+`connection.target`; nothing is written back to `.dex/config.yml`.
+
+
 **The budget is hard-enforced regardless of estimate quality.** Before every
 billed statement the session's `STATEMENT_TIMEOUT_IN_SECONDS` is set to the
 remaining budget, so a wrong heuristic cannot overrun the ceiling: Snowflake
 kills the statement and dex reports the over-ceiling refusal. Actual spend is
 wall-clock seconds per statement (including any resume the statement caused),
-recorded to `.dex/spend.jsonl` as `billed_seconds` and summed into the daily
-session ceiling. Every session is tagged `QUERY_TAG = 'dex'` for attribution.
+recorded as `billed_seconds` in the ledger. Every session is tagged `QUERY_TAG = 'dex'` for attribution.
 
-The handshake is the same strict two-step as every billed connector: a
-scanning command without `--confirm` returns `needs_confirmation` carrying the
-seconds estimate (per table where relevant) and its credit translation;
-re-issue with `--confirm --budget <seconds>`. Nothing executes unconfirmed or
-without a ceiling, and an estimate over the ceiling is refused outright.
+The estimate carries its credit translation; the handshake itself is in
+[`cost-controls.md`](cost-controls.md).
 
 ## Read-only, enforced in depth
 
@@ -175,6 +193,13 @@ profiled from a block sample (`SAMPLE SYSTEM`), noted, with uniqueness not
 judged. Exact distinct-count escalation spends only inside the confirmed
 budget and degrades to approximate verdicts with a note when the remainder
 cannot cover it.
+
+`SHOW COLUMNS` reports a type token rather than a full type. `NUMBER(38,0)` and
+`NUMBER(10,2)` both arrive as `FIXED`, and `VARCHAR(50)` as `TEXT`, so precision,
+scale and length are not recorded anywhere dex can compare. Two things follow:
+`maintain schema` reports no `column_retyped` for a precision, scale or length
+change, and `is_integer_type` treats `FIXED` as a known, accepted false negative
+rather than guessing at the scale behind it.
 
 ## Testing
 

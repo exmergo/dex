@@ -1,0 +1,38 @@
+# Release notes are GitHub's generated "What's Changed" list: one line per merged
+# pull request, in merge order. Labels make that list useful to consumers before
+# they bump, while the catch-all keeps every merged pull request visible.
+#
+# When to apply `downstream-visible`: a consumer who stores or compares this
+# command's output would observe a difference. That is broader than "breaking":
+# it covers a key that moves (#250), a bug fix that changes what a profile
+# contains (#431 returned full aggregates to every BigQuery table with a
+# TIMESTAMP column, against baselines that held the empty shape), and a new
+# finding class that fires on the first run after a bump (#421). It does not
+# cover a docstring, a refactor, or a fix whose only observable is the absence
+# of an error.
+changelog:
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking-change
+    - title: Downstream-visible changes
+      labels:
+        - downstream-visible
+    - title: Features and improvements
+      labels:
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Maintenance
+      labels:
+        - maintenance
+    - title: Other changes
+      labels:
+        - "*"

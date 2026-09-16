@@ -236,7 +236,25 @@ DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
 scripts/setup_clickhouse_dev.sh --down
 ```
 
-There is no `setup_clickhouse_ci.sh`; there is nothing to provision.
+There is no setup script for the free container job; there is nothing to
+provision for that exhaustive path.
+
+### Narrow ClickHouse Cloud tests
+
+The repository also runs `tests/integration/test_clickhouse_cloud.py` under the
+protected `clickhouse-cloud-integration` environment. It is intentionally
+narrow: Cloud mode/capacity and control-plane agreement, confirmation and CU/USD
+translation, read-only enforcement, and one minimal dbt build. The container
+suite remains the exhaustive connector suite.
+
+One-time setup and subsequent atomic credential rotation use
+`scripts/setup_clickhouse_cloud_ci.sh`. The stable non-secret policy and all
+`dex_ci_*` names, dedicated account/service IDs, region, and real Scale-tier
+prices live in that script; flags are reserved for deliberate migration/testing.
+`scripts/clickhouse_cloud/preflight.sh` reads the exact
+service's UTC-day usage before any SQL connection can wake it and refuses at the
+protected 2-CHC limit. See `scripts/clickhouse_cloud/README.md` for setup, local
+execution, rotation, and bounded teardown.
 
 Two assertions in that suite are load-bearing and worth understanding before
 changing the seed. The seed puts exactly 40 of 5,000 `order_items` rows on
@@ -310,9 +328,12 @@ three lines a third party writes.
 
 The source of truth lives behind a tiered protocol in `adapters/project.py`, and
 that contract is public too. The usual reason to write one is that your models are
-not a dbt project: an orchestrated asset graph, SQLMesh, or a semantic layer that
-owns its own definitions still knows which tables it builds, at what grain, and how
-they relate.
+not a dbt project: an orchestrated asset graph or SQLMesh still knows which tables
+it builds, at what grain, and how they relate.
+
+If what you have is a semantic layer that owns its own definitions and builds
+nothing, this is the wrong seam. Write a semantic source instead, described in the
+next section.
 
 Implement the tier your format can answer (`ExploreProject` is one method;
 `MaintainProject` adds the two snapshot layers; `EditableProject` adds the write
@@ -401,6 +422,58 @@ Formats contributed here run the same suite: see
 neither dbt nor a directory, driven through the contract and then broken on purpose,
 one defect per assertion.
 
+## Writing a semantic source
+
+A semantic source is the third public seam, beside a storage backend and a project
+format, and it is the right one when the thing you want dex to read declares
+metrics, dimensions, keys and joins but builds nothing. A semantic source owns no
+model graph, no compilation and no target, so it satisfies none of the project
+tiers, and dex enforces that separation structurally rather than by convention.
+
+Selection is on the semantic axis (`semantic.vendor` in `.dex/config.yml`), and a
+source is built through `exmergo_dex_core.semantic_source`. Implement what your
+format can honestly answer:
+
+- `semantic_catalog()` supplies the read view `explore semantic list` returns.
+- `semantic_layer()` supplies the definition fingerprints `maintain` diffs. A
+  source with no fingerprint is complete without it, and `maintain` reports the
+  absence rather than treating it as an empty layer.
+- `declared_definitions()` carries declared keys and relationships into
+  `explore` and `maintain grain`. It must never raise: no repository, no readable
+  document, or an unparseable one yields the empty view with a note.
+- A file-backed source that authors its own documents also implements the edit
+  target, which pins the write surface to declared paths and refuses a stale
+  target.
+
+Prove it with the shipped suite:
+
+```
+pip install "exmergo-dex-core[semantic-conformance]"
+```
+
+```python
+from exmergo_dex_core.semantic_source_conformance import (
+    SemanticCatalogSourceContract,
+    SemanticDeclarationContract,
+    SemanticFingerprintContract,
+    SemanticSourceFactoryContract,
+)
+```
+
+Subclass the contracts your source answers. They assert construction, that the
+declared surface is honest, that a fingerprint is stable across reads, and that
+the physical column map never reaches the payload. The runtime side of the
+catalog has its own contract in `exmergo_dex_core.explore.semantic.conformance`,
+and a source that authors documents has `SemanticEditTargetContract` in
+`exmergo_dex_core.edits_conformance`.
+
+`references/semantic-layer.md` is the contract in full: what each method owes its
+callers, how a vendor and a deployment resolve, and how a backend declares the
+fields its format structurally cannot carry instead of returning them empty. The
+shipped native Ossie source binds every applicable contract in
+`packages/dex-core/tests/ossie/test_conformance.py`, which is the worked example
+to read.
+
 ## Linting and formatting (Ruff)
 
 We use [Ruff](https://docs.astral.sh/ruff/) as both the linter and the
@@ -483,6 +556,30 @@ bump it:
 - `.github/workflows/lint.yml` (the `uvx ruff@<version>` calls)
 - `.pre-commit-config.yaml` (the `rev:` tag)
 - `packages/dex-core/pyproject.toml` (the `ruff==<version>` pin in the `dev` extra)
+
+## Pull requests and release notes
+
+GitHub generates each release's "What's Changed" section from merged pull
+requests using [.github/release.yml](.github/release.yml). Write a PR title that
+states the resulting behavior in language a user can understand, because it may
+appear in those notes unchanged.
+
+Apply a primary change label before merge: `breaking-change`, `enhancement`,
+`bug`, `documentation`, `dependencies`, or `maintenance`. Add
+`downstream-visible` when it applies. Maintainers make sure suitable labels are
+present. GitHub assigns a PR to the first matching release-note category:
+breaking changes, then downstream-visible changes, features, fixes,
+documentation, dependencies, and maintenance. The final category includes
+anything else, so no merged PR is silently omitted.
+
+`downstream-visible` is for a compatible change a consumer can observe in stored
+or compared command output. Use `breaking-change` when consumers must take an
+incompatible action to upgrade; it takes precedence in the generated notes.
+Keep `CHANGELOG.md` updated under `[Unreleased]` for context, migration steps,
+or detail that does not fit a PR title. Before publishing a release, generate
+and review GitHub's notes, then add any necessary highlights or upgrade
+instructions. The tag workflow publishes packages but does not create the
+GitHub release or its notes.
 
 
 ## Maintainers

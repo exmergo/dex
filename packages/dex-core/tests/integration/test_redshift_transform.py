@@ -19,6 +19,7 @@ from .conftest import (
     RS_MAX_SECONDS,
     assert_ok,
     assert_unpivot_build,
+    integration_budget,
     unpivot_fixture_edits,
 )
 from .test_redshift_connect import run_cli
@@ -58,7 +59,7 @@ def seed_repo_password_path(
     config = {
         "connector": "redshift",
         "redshift": {"dev_schema": dev_schema, "schemas": schemas},
-        "budget": {"ceiling": budget},
+        "budget": integration_budget(budget),
     }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -115,7 +116,7 @@ def test_init_and_build_write_only_the_dev_schema(tmp_path: Path, capsys, dev_en
     # surfaced before the run (the 5x budget covers it comfortably).
     assert envelope["cost"]["estimate"] is not None
     assert envelope["cost"]["estimate"] > 0
-    assert data["seconds_billed"] > 0
+    assert data["spend"]["seconds_billed"] > 0
     assert any("statement_timeout" in w for w in envelope["warnings"])
 
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text(encoding="utf-8")

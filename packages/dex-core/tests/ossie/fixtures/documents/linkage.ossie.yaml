@@ -1,0 +1,57 @@
+# Every physical-linkage rule in one document, because the rules are only
+# meaningful against each other: what makes `bare` a link is the same thing that
+# makes `computed` not one.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: linkage
+    datasets:
+      # A plain relation and a bare identifier: the only shape that links.
+      - name: direct
+        source: demo.main.orders
+        fields:
+          - name: bare
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_total
+          - name: computed
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_total - COALESCE(discount, 0)
+          - name: quoted
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: '"Region"'
+          - name: qualified
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: orders.order_id
+          - name: non_sql_only
+            expression:
+              dialects:
+                - dialect: MDX
+                  expression: "[Order].[Total]"
+      # A query-valued source. Ossie documents a source as database.schema.table
+      # OR a query, with no portable discriminator, and a query read as a
+      # relation would reach the PII gate as a relation that does not exist.
+      - name: query_backed
+        source: SELECT * FROM demo.main.orders WHERE placed_at > '2026-01-01'
+        fields:
+          - name: bare
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+      # A source that is not three parts, so not a relation this connector can
+      # address. Opaque rather than guessed at.
+      - name: opaque
+        source: orders
+        fields:
+          - name: bare
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id

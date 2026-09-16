@@ -1,0 +1,19 @@
+{
+  "name": "classify-declarative",
+  "contract": "classification",
+  "description": "A schema.yml that only declares. No signal fires and the verdict is declarative.",
+  "payload": {
+    "path": "models/staging/mart.yml",
+    "content": "version: 2\nmodels:\n  - name: mart\n    description: A mart.\n"
+  },
+  "expect": {
+    "artifact_class": "declarative",
+    "result": {
+      "path": "models/staging/mart.yml",
+      "artifact_class": "declarative",
+      "basis": "content",
+      "parsed": true,
+      "signals": []
+    }
+  }
+}

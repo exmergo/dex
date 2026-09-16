@@ -5,11 +5,13 @@ from __future__ import annotations
 import importlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.envelope import Paradigm
 
 
 def _run(argv: list[str], capsys) -> tuple[int, dict]:
@@ -547,10 +549,19 @@ def test_missing_dev_db_without_sources_only_warns(
     assert any("does not exist" in w for w in envelope["warnings"])
 
 
+@pytest.mark.parametrize("function_guard", [False, True])
 def test_confirmed_dev_build_runs_dbt_for_real(
-    dbt_project_dir: Path, tmp_path: Path, capsys
+    dbt_project_dir: Path, tmp_path: Path, capsys, function_guard
 ):
     pytest.importorskip("dbt.cli.main")
+    if function_guard:
+        import yaml
+
+        config_path = tmp_path / ".dex/config.yml"
+        config_path.parent.mkdir(exist_ok=True)
+        config = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        config["guards"] = {"approved_functions": ["approved_udf"]}
+        config_path.write_text(yaml.safe_dump(config))
     rc, envelope = _run(
         [
             "--repo-root",
@@ -574,14 +585,42 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         + envelope["data"]["counts"].get("pass", 0)
         >= 2
     )  # the model and its not_null test
-    # No raw dbt log text in data: only the structured summary keys.
+    # No raw dbt log text in data: only the structured summary keys, plus the
+    # typed evidence and the outcome lifted out of it.
     assert set(envelope["data"]) == {
         "target",
         "success",
         "returncode",
         "nodes",
         "counts",
+        "outcome",
+        "evidence",
+        "verification",
     }
+    # `success` is dbt's exit code; `outcome` is whether anything was validated,
+    # and this run built real nodes against current artifacts.
+    assert envelope["data"]["outcome"] == "validated"
+    evidence = envelope["data"]["evidence"]
+    assert set(evidence) == {
+        "outcome",
+        "invocation",
+        "selection",
+        "digests",
+        "generated",
+        "errors",
+        "nodes",
+        "stale_artifacts",
+        "plan_drift",
+    }
+    # No plan was named, so there is no coverage to report and the key is absent
+    # rather than empty.
+    assert "coverage" not in evidence
+    assert evidence["selection"]["empty"] is False
+    assert "stg_customers" in evidence["selection"]["matched"]
+    # Present and negative rather than absent: a build that did not verify and
+    # one that verified and found nothing are different answers.
+    assert envelope["data"]["verification"]["ran"] is False
+    assert "--verify" in envelope["data"]["verification"]["reason"]
 
 
 def test_relative_profile_path_resolves_against_project(
@@ -711,6 +750,14 @@ def test_relative_project_dir_builds_without_path_doubling(
 # --- billed connectors (BigQuery): the ceiling binds, spend is ledgered --------
 
 
+@dataclass
+class _CountResult:
+    """One row of ``dex_rows_<n>`` aliases, as the batched count returns it."""
+
+    columns: list[str]
+    cells: list[list[int]]
+
+
 def _install_fake_pricing(
     monkeypatch,
     *,
@@ -721,9 +768,13 @@ def _install_fake_pricing(
     confirmed: bool,
     ceiling: float | None,
     describe=None,
+    translate=None,
     notes: list[str] = (),
     store=None,
     session_ceiling: float | None = None,
+    objects: list | None = None,
+    query_estimate: float = 0.0,
+    counts: list[int] = (),
 ):
     """Make ``cmd_build`` price a billed build without a real warehouse.
 
@@ -731,6 +782,11 @@ def _install_fake_pricing(
     ``compile_estimate`` so no dbt compile or dry-run runs, and neutralizes the
     dev-target check (which would otherwise open its own connection). Returns the
     fake adapter, whose ``.closed`` records that ``cmd_build`` closed it.
+
+    ``objects``/``query_estimate``/``counts`` are what a ``--verify`` run needs
+    on top: the catalog the sweep resolves its relations against, the dry-run
+    price of the batched count statement, and what that statement returns. A
+    build that does not verify touches none of them.
     """
 
     from exmergo_dex_core.engine import DexEngine
@@ -769,9 +825,28 @@ def _install_fake_pricing(
                 lock=None if store is None else store.spend_lock,
             )
             self.closed = False
+            self.queries: list[str] = []
+            self.estimated: list[str] = []
 
-        def query_estimate(self, sql):  # not exercised: compile_estimate is stubbed
-            return 0.0
+        dialect = "bigquery"
+
+        def query_estimate(self, sql):
+            # compile_estimate is stubbed, so the only statement priced through
+            # here is `--verify`'s batched row count.
+            self.estimated.append(sql)
+            return query_estimate
+
+        def list_objects(self, *, include_views: bool = True):
+            return list(objects or [])
+
+        def run_query(self, sql, max_rows=None, timeout_seconds=None):
+            self.queries.append(sql)
+            self.cost_gate.charge(query_estimate)
+            self.cost_gate.record_billed(query_estimate)
+            return _CountResult(
+                columns=[f"dex_rows_{i}" for i in range(len(counts))],
+                cells=[list(counts)],
+            )
 
         def close(self):
             self.closed = True
@@ -779,6 +854,8 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
+    if translate is not None:
+        adapter.compute_spend_translation = translate
     monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
     monkeypatch.setattr(
         build_module,
@@ -881,6 +958,121 @@ def test_billed_build_surfaces_estimate_quality_on_compute_time(
     assert envelope["cost"]["estimate"] == 42.0
     assert envelope["data"]["estimated_seconds"] == 42.0
     assert envelope["data"]["estimate_quality"] == "heuristic"
+
+
+def test_clickhouse_cloud_build_uses_compute_time_and_translates_settled_seconds(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: clickhouse\n"
+        "clickhouse:\n"
+        "  deployment: cloud\n"
+        "  compute_unit_price_usd: 0.29846\n",
+        encoding="utf-8",
+    )
+    _install_fake_pricing(
+        monkeypatch,
+        connector="clickhouse",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=1.0,
+        per_node={"stg_customers": 1.0},
+        confirmed=True,
+        ceiling=60,
+        translate=lambda seconds: {
+            "compute_unit_hours_billed": seconds * 2 / 3600,
+            "usd_billed": seconds * 2 / 3600 * 0.29846,
+        },
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 18.0,
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "60",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    spend = envelope["data"]["spend"]
+    assert spend["seconds_billed"] == 18.0
+    assert spend["compute_unit_hours_billed"] == pytest.approx(0.01)
+    assert spend["usd_billed"] == pytest.approx(0.0029846)
+
+
+def test_clickhouse_cloud_build_fails_closed_before_dbt_without_live_capacity(
+    bigquery_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    forbid_dbt,
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: clickhouse\nclickhouse:\n  deployment: cloud\n",
+        encoding="utf-8",
+    )
+
+    def missing_capacity(_seconds):
+        raise RuntimeError("capacity could not be proved")
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="clickhouse",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=1.0,
+        per_node={"stg_customers": 1.0},
+        confirmed=True,
+        ceiling=60,
+        translate=missing_capacity,
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "60",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    assert "capacity could not be proved" in envelope["errors"][0]
 
 
 def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
@@ -1013,7 +1205,11 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     assert rc == 0, envelope
     # The confirmed run's envelope carries the preflight estimate and the actual.
     assert envelope["cost"]["estimate"] == 5_000_000.0
-    assert envelope["data"]["bytes_billed"] == 3000
+    # Issue #276: spend lives at `data.spend` and nowhere else. `transform build`
+    # used to also stamp a top-level `data.bytes_billed` that no other billed
+    # command carried, so a caller reading that key saw a build's spend and read
+    # `maintain check`'s missing key as zero.
+    assert "bytes_billed" not in envelope["data"]
     assert any("maximum_bytes_billed" in w for w in envelope["warnings"])
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
     entry = json_mod.loads(ledger[-1])
@@ -1025,6 +1221,161 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     # `data.spend` across commands used to count every build as free.
     assert envelope["data"]["spend"]["bytes_billed"] == entry["billed_bytes"]
     assert envelope["data"]["spend"]["session_spent_today"] == 3000
+    # Issue #278: the estimate rides into the ledger beside the settled figure,
+    # so a later over-ceiling refusal on this connector can say how far the two
+    # have run apart. A build is the largest billed command dex has and settles
+    # outside any gate, so without this the command most likely to be refused
+    # over a ceiling would have been the one contributing nothing to calibrating
+    # that refusal.
+    assert entry["entry"] == "settlement"
+    assert entry["estimate"] == envelope["cost"]["estimate"] == 5_000_000.0
+    # Issue #277: the whole row, not only the keys this test cares about. A build
+    # settles outside any gate, and the row it wrote used to say so by omission,
+    # carrying no `reservation_id` at all where every gate-written row carries
+    # one. A reader joining settlements on that key skipped or mis-joined every
+    # build, so the row now declares the absence instead of leaving it to be
+    # inferred, and pinning the shape here is what keeps the next writer honest.
+    assert set(entry) == {
+        "at",
+        "connector",
+        "command",
+        "entry",
+        "reservation_id",
+        "billed_bytes",
+        "estimate",
+        "job_id",
+        "statement_sha256",
+    }
+    assert entry["reservation_id"] is None
+
+
+def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Issue #276, the other half: a key present only sometimes is worse than one
+    that never exists, so a billed connector reports `data.spend` whatever the
+    build settled at. A build that billed zero and one that does not report spend
+    have to be distinguishable, and `if billed:` made them identical."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    # dbt ran the node and BigQuery billed nothing for it: a cache hit, or a
+    # no-op incremental. The figure is reported, so it is zero.
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 0},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["spend"]["bytes_billed"] == 0
+    assert envelope["data"]["spend"]["session_spent_today"] == 0
+    entry = json.loads((tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()[-1])
+    assert entry["command"] == "transform build"
+    assert entry["billed_bytes"] == 0
+
+
+def test_a_build_whose_statements_reported_no_billing_figure_says_so(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Statements ran and none of them reported what they billed, so the spend is
+    unknown rather than zero. The key is still there (parity), its value is null
+    (honesty), a note explains it, and nothing reaches the ledger: rounding an
+    unknown spend down to zero is the under-report issue #276 is about."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    # No adapter_response at all: whatever this scanned, dbt is
+                    # not saying.
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["spend"]["bytes_billed"] is None
+    # A build's per-paradigm notes ride in `warnings`, where its cap note does.
+    assert any("no billing figure" in w for w in envelope["warnings"])
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(
@@ -1241,11 +1592,170 @@ def test_prod_refusal_still_beats_the_dev_target_check(
     assert "seed" not in envelope["errors"][0]
 
 
+@pytest.mark.parametrize("connector", ["duckdb", "bigquery"])
+def test_public_build_refuses_partial_installation_before_pricing(
+    dbt_project_dir, monkeypatch, connector
+):
+    from exmergo_dex_core import DexEngine, MissingPackagesError
+    from exmergo_dex_core.transform import commands, dev_target
+    from exmergo_dex_core.transform.build import DependencyPolicy
+
+    (dbt_project_dir / "packages.yml").write_text(
+        "packages:\n  - package: a/installed\n  - package: a/missing\n"
+    )
+    (dbt_project_dir / "dbt_packages/installed").mkdir(parents=True)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+
+    def forbidden(*a, **k):
+        pytest.fail("partial installation reached pricing or a subprocess")
+
+    module = importlib.import_module("exmergo_dex_core.transform.build")
+    monkeypatch.setattr(module, "_default_runner", forbidden)
+    monkeypatch.setattr(commands, "_price_build", forbidden)
+    with (
+        DexEngine.from_repo(dbt_project_dir.parent, connector=connector) as engine,
+        pytest.raises(MissingPackagesError) as caught,
+    ):
+        engine.build(dependencies=DependencyPolicy.REFUSE)
+    assert [p.name for p in caught.value.packages] == ["a/missing"]
+
+
 # --- compile_estimate: pricing a build from a free dbt compile dry-run --------
 
 
+@pytest.mark.parametrize("connector", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "code,reason",
+    [
+        ("select forbidden_udf(1)", "unapproved_function"),
+        ("CALL forbidden_proc()", "stored_procedure_or_call"),
+    ],
+)
+def test_public_build_enforces_configured_functions_before_execution(
+    dbt_project_dir, monkeypatch, connector, code, reason
+):
+    from types import SimpleNamespace
+
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError
+    from exmergo_dex_core.transform import dev_target
+
+    calls = _guard_compile_runner(monkeypatch, dbt_project_dir, code)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    adapter = SimpleNamespace(
+        dialect=connector,
+        paradigm=Paradigm.BYTES_SCANNED,
+        query_estimate=lambda _: pytest.fail("refused SQL reached provider pricing"),
+    )
+    monkeypatch.setattr(DexEngine, "_adapter", lambda *a, **k: adapter)
+    with DexEngine.from_repo(dbt_project_dir.parent, connector=connector) as engine:
+        engine.config.guards.approved_functions = ["approved_udf"]
+        with pytest.raises(NotSelectOnlyError) as caught:
+            engine.build(select="guarded")
+    assert caught.value.reason.value == reason
+    assert "model.dex_test.guarded" in str(caught.value)
+    assert calls == ["compile"]
+
+
+def _guard_compile_runner(monkeypatch, project, code, *, mode="ok"):
+    """Exercise the real guard with dbt artifacts produced by a controlled runner."""
+    import subprocess
+
+    module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls = []
+
+    def factory(*args, **kwargs):
+        def run(argv):
+            command = argv[1]
+            calls.append(command)
+            if command == "compile":
+                assert argv[argv.index("--select") + 1] == "guarded"
+                if mode == "failed":
+                    return subprocess.CompletedProcess(argv, 1, "", "")
+                if mode != "absent":
+                    target = project / "target"
+                    target.mkdir(exist_ok=True)
+                    uid = "model.dex_test.guarded"
+                    (target / "run_results.json").write_text(
+                        json.dumps(
+                            {"results": [{"unique_id": uid, "status": "success"}]}
+                        )
+                    )
+                    (target / "manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "nodes": {
+                                    uid: {
+                                        "name": "guarded",
+                                        "resource_type": "model",
+                                        "compiled_code": code,
+                                        "config": {},
+                                    }
+                                }
+                            }
+                        )
+                    )
+            else:
+                assert command == "build"
+                assert not (project / "target/run_results.json").exists()
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return run
+
+    monkeypatch.setattr(module, "_default_runner", factory)
+    return calls
+
+
+@pytest.mark.parametrize("approved", [[], ["APPROVED_UDF"]])
+def test_public_local_build_allows_approved_functions_and_preserves_default(
+    dbt_project_dir, monkeypatch, approved
+):
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.transform import dev_target
+
+    calls = _guard_compile_runner(
+        monkeypatch, dbt_project_dir, "select approved_udf(abs(-1))"
+    )
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    with DexEngine.from_repo(dbt_project_dir.parent, connector="duckdb") as engine:
+        engine.config.guards.approved_functions = approved
+        result = engine.build(select="guarded")
+    assert result.success
+    assert calls == (["compile", "build"] if approved else ["build"])
+
+
+@pytest.mark.parametrize(
+    "mode,code",
+    [
+        ("failed", "select 1"),
+        ("absent", "select 1"),
+        ("ok", None),
+    ],
+)
+def test_enabled_function_guard_refuses_unavailable_compile_evidence(
+    dbt_project_dir, monkeypatch, mode, code
+):
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.transform import dev_target
+
+    module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls = _guard_compile_runner(monkeypatch, dbt_project_dir, code, mode=mode)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    with DexEngine.from_repo(dbt_project_dir.parent, connector="duckdb") as engine:
+        engine.config.guards.approved_functions = ["approved_udf"]
+        with pytest.raises(module.DbtRunError):
+            engine.build(select="guarded")
+    assert calls == ["compile"]
+
+
 def _compile_runner(
-    monkeypatch, project: Path, run_results: dict, *, returncode: int = 0
+    monkeypatch,
+    project: Path,
+    run_results: dict,
+    *,
+    returncode: int = 0,
+    expected_env: dict[str, str] | None = None,
 ):
     """Fake ``_default_runner`` for compile: writes the given run_results.json on
     invocation (mirroring real dbt) and returns the requested code."""
@@ -1255,6 +1765,9 @@ def _compile_runner(
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
 
     def fake(timeout: float, cwd, env=None):
+        if expected_env is not None:
+            assert env == expected_env
+
         def run(argv: list[str]):
             (project / "target").mkdir(parents=True, exist_ok=True)
             (project / "target" / "run_results.json").write_text(
@@ -1265,6 +1778,30 @@ def _compile_runner(
         return run
 
     monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
+def test_compile_estimate_forwards_statement_caps_to_dbt_compile(
+    dbt_project_dir: Path, monkeypatch
+):
+    """The pricing compile opens the dev connection, so it needs the same
+    constrained settings as the eventual build."""
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+    env = {
+        "DEX_CLICKHOUSE_MAX_EXECUTION_TIME": "60",
+        "DEX_CLICKHOUSE_MAX_BYTES_TO_READ": str(60 * 200 * 1024 * 1024),
+    }
+    _compile_runner(
+        monkeypatch,
+        dbt_project_dir,
+        {"results": []},
+        expected_env=env,
+    )
+    total, per_node, notes = build_mod.compile_estimate(
+        dbt_project_dir, _EstimatingAdapter(), target="dev", env=env
+    )
+    assert (total, per_node) == (0.0, {})
+    assert notes == ["no scanning build nodes to price; the estimate is zero"]
 
 
 class _EstimatingAdapter:
@@ -1660,3 +2197,493 @@ def test_a_running_build_holds_its_headroom_and_gives_it_back(
         == 3_000_000
     )
     assert envelope["data"]["spend"]["session_spent_today"] == 3_000_000
+
+
+# --- node identity: which test warned (the field report behind --verify) ------
+
+
+def _node_results(*entries: dict) -> str:
+    return json.dumps({"results": list(entries)})
+
+
+def test_a_warning_test_node_is_named_rather_than_hashed(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A green build with warnings has to say which nodes warned.
+
+    dbt's unique id for a generic test ends in a content hash, so taking the
+    last segment named every test in the envelope something like `3249b83c15`.
+    A caller with seventeen warnings and a suspicion that one of them is new
+    had no way to tell which seventeen they were.
+    """
+
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            dbt_project_dir / "target" / "run_results.json",
+            _node_results(
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                },
+                {
+                    "unique_id": ("test.dex_test.not_null_stg_customers_id.3249b83c15"),
+                    "status": "warn",
+                    "execution_time": 0.1,
+                },
+            ),
+        ),
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--confirm"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    by_status = {n["status"]: n for n in envelope["data"]["nodes"]}
+    assert by_status["warn"]["name"] == "not_null_stg_customers_id"
+    assert (
+        by_status["warn"]["unique_id"]
+        == "test.dex_test.not_null_stg_customers_id.3249b83c15"
+    )
+    # A model's id has no trailing hash, so its name is untouched.
+    assert by_status["success"]["name"] == "stg_customers"
+
+
+# --- --verify: the sweep folded onto the build --------------------------------
+
+
+def test_a_build_does_not_verify_unless_asked(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _fake_runner_factory(monkeypatch, returncode=0)
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--confirm"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["verification"] == {
+        "ran": False,
+        "reason": "not requested; re-run with --verify to sweep",
+    }
+
+
+def test_a_verified_build_reports_findings_and_stays_ok(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Findings never turn a build dbt completed into a failure.
+
+    They ride `data.verification`, the status stays `ok`, `errors` stays empty,
+    and a pointer line in `warnings` says they are there so a caller scanning
+    warnings alone still learns about them.
+    """
+
+    target = dbt_project_dir / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "test.dex_test.relationships_orders.abc123": {
+                        "name": "relationships_orders",
+                        "resource_type": "test",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            target / "run_results.json",
+            _node_results(
+                {
+                    "unique_id": "test.dex_test.relationships_orders.abc123",
+                    "status": "warn",
+                    "message": "got 12 results, configured to warn if != 0",
+                    "execution_time": 0.1,
+                }
+            ),
+        ),
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--confirm", "--verify"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert envelope["errors"] == []
+    verification = envelope["data"]["verification"]
+    assert verification["ran"] is True
+    assert verification["finding_count"] == 1
+    finding = verification["findings"][0]
+    assert finding["code"] == "node_warned"
+    assert finding["identifier"] == "relationships_orders"
+    assert any("data.verification.findings" in w for w in envelope["warnings"])
+
+
+def test_a_failed_verified_build_names_the_failed_and_skipped_nodes(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The error envelope is built by hand rather than through `to_envelope`,
+    so the payload has to reach it separately. A half-built project is also
+    when "which node failed, and what did it take down with it" is worth most.
+    """
+
+    target = dbt_project_dir / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.dex_test.stg_customers": {
+                        "name": "stg_customers",
+                        "resource_type": "model",
+                    },
+                    "model.dex_test.mart_customers": {
+                        "name": "mart_customers",
+                        "resource_type": "model",
+                        "depends_on": {"nodes": ["model.dex_test.stg_customers"]},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=1,
+        stdout=json.dumps({"info": {"level": "error", "msg": "Database Error"}}),
+        run_results_json=(
+            target / "run_results.json",
+            _node_results(
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "error",
+                    "message": "relation raw.customers does not exist",
+                    "execution_time": 0.2,
+                },
+                {
+                    "unique_id": "model.dex_test.mart_customers",
+                    "status": "skipped",
+                    "execution_time": 0.0,
+                },
+            ),
+        ),
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--confirm", "--verify"],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    verification = envelope["data"]["verification"]
+    codes = {f["code"]: f for f in verification["findings"]}
+    assert set(codes) == {"node_failed", "node_skipped"}
+    assert codes["node_skipped"]["data"]["caused_by"] == "stg_customers"
+    # A half-built dev target is a mix of this run's output and the last one's,
+    # so its row counts are not judged and the envelope says why.
+    assert "did not complete" in verification["suppressed"]["row_population"]
+
+
+@dataclass
+class _Meta:
+    """One catalog row, as `list_objects` returns it."""
+
+    identifier: str
+    row_count: int | None = None
+
+
+def _verifiable_manifest(project: Path, *, materialized: str) -> None:
+    """A one-model project whose driving parent is a source relation.
+
+    The model loses every row to its join, which is the shape `row_loss` exists
+    for; ``materialized`` decides whether the warehouse keeps a row count for it
+    and therefore whether the sweep has anything to price.
+
+    Writes the run results a `dbt compile` leaves behind as well as the
+    manifest, because that pair is what pricing reads and the selection in it is
+    what scopes the sweep. A build that follows overwrites them with its own.
+    """
+
+    target = project / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "run_results.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    {"unique_id": "model.dex_test.fct_orders", "status": "success"}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "source.dex_test.raw.orders": {
+                        "name": "orders",
+                        "relation_name": "`dex-test`.`raw`.`orders`",
+                    }
+                },
+                "nodes": {
+                    "model.dex_test.fct_orders": {
+                        "name": "fct_orders",
+                        "resource_type": "model",
+                        "relation_name": "`dex-test`.`dbt_dev`.`fct_orders`",
+                        "config": {"materialized": materialized},
+                        "compiled_code": (
+                            "select o.id from `dex-test`.`raw`.`orders` o "
+                            "join `dex-test`.`raw`.`events` e on o.id = e.order_id"
+                        ),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _built_run_results() -> str:
+    return json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.fct_orders",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 3000},
+                }
+            ]
+        }
+    )
+
+
+def test_a_metered_build_does_not_verify_or_connect_unless_asked(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The safety property: no scan a caller did not ask for."""
+
+    adapter = _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=1000.0,
+        per_node={"fct_orders": 1000.0},
+        confirmed=True,
+        ceiling=100_000.0,
+        query_estimate=50_000.0,
+    )
+    _verifiable_manifest(bigquery_project_dir, materialized="view")
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            _built_run_results(),
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--confirm",
+            "--budget",
+            "100000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["verification"]["ran"] is False
+    assert adapter.queries == [], "a build that was not asked to verify scanned"
+    assert adapter.estimated == [], "a build that was not asked to verify priced a scan"
+
+
+def test_the_upfront_estimate_covers_the_build_and_its_verification(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """One estimate, one budget, one handshake.
+
+    The row counts are priced during the build's own pricing pass, off the
+    manifest the compile wrote, so an unconfirmed `--verify` returns a single
+    number that covers both phases instead of agreeing to a build and then
+    being asked again about the counts that judge it.
+    """
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=1000.0,
+        per_node={"fct_orders": 1000.0},
+        confirmed=False,
+        ceiling=None,
+        query_estimate=50_000.0,
+    )
+    _verifiable_manifest(bigquery_project_dir, materialized="view")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--verify",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["data"]["estimated_bytes"] == 51_000.0
+    assert envelope["data"]["per_table_bytes"]["(row counts)"] == 50_000.0
+    assert envelope["data"]["per_table_bytes"]["fct_orders"] == 1000.0
+
+
+def test_a_table_materialization_adds_nothing_to_the_estimate(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A warehouse keeps a row count for a table, so nothing has to be scanned
+    to judge it. A view is the case that costs, and it is dbt's default."""
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=1000.0,
+        per_node={"fct_orders": 1000.0},
+        confirmed=False,
+        ceiling=None,
+        query_estimate=50_000.0,
+    )
+    _verifiable_manifest(bigquery_project_dir, materialized="table")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--verify",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["estimated_bytes"] == 1000.0
+    assert "(row counts)" not in envelope["data"]["per_table_bytes"]
+
+
+def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """`data.spend` is what this command billed, and the counts are part of it.
+
+    dbt bills outside the gate and the counts bill through it, so reporting
+    dbt's figure alone would under-report the command. Under-reporting is the
+    one direction a cost guard must never round.
+    """
+
+    adapter = _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=1000.0,
+        per_node={"fct_orders": 1000.0},
+        confirmed=True,
+        ceiling=1_000_000.0,
+        query_estimate=50_000.0,
+        objects=[
+            _Meta("dex-test.raw.orders", 1000),
+            _Meta("dex-test.dbt_dev.fct_orders", None),
+        ],
+        counts=[0],
+    )
+    _verifiable_manifest(bigquery_project_dir, materialized="view")
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            _built_run_results(),
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--verify",
+            "--confirm",
+            "--budget",
+            "1000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert len(adapter.queries) == 1, "the counts are one batched statement"
+    # 3000 from dbt, 50000 from the count statement dex issued through the gate.
+    assert envelope["data"]["spend"]["bytes_billed"] == 53_000.0
+    verification = envelope["data"]["verification"]
+    assert verification["ran"] is True
+    assert verification["scope"] == ["fct_orders"]
+    assert [f["code"] for f in verification["findings"]] == ["row_loss"]
+
+
+def test_a_verified_build_whose_dev_target_is_out_of_scope_says_so(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The metered default, before the dev-namespace fold takes effect: dbt
+    writes to a dataset that is refused as a source, so a sweep that just
+    compared what it could see would report nothing and look clean."""
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=1000.0,
+        per_node={"fct_orders": 1000.0},
+        confirmed=True,
+        ceiling=1_000_000.0,
+        query_estimate=0.0,
+        objects=[_Meta("dex-test.raw.orders", 1000)],
+    )
+    _verifiable_manifest(bigquery_project_dir, materialized="table")
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            _built_run_results(),
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--verify",
+            "--confirm",
+            "--budget",
+            "1000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    suppressed = envelope["data"]["verification"]["suppressed"]
+    assert "outside dex's read scope" in suppressed["row_population"]

@@ -33,7 +33,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import DatabricksTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -43,6 +43,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -204,6 +205,9 @@ class DatabricksAdapter:
     name = "databricks"
     dialect = DIALECT
     paradigm = Paradigm.COMPUTE_TIME
+    # A floor that sharpens itself inside the confirmed budget rather than a
+    # prediction, which is approximate in the direction a caller can act on.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,
@@ -270,7 +274,7 @@ class DatabricksAdapter:
         cost = self.cost_gate.cost()
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if self.target.warehouse:
             info = self._warehouse()
@@ -1113,34 +1117,34 @@ class DatabricksAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
             return {}
         self._ensure_detail(identifier)
         meta, _ = self.table_metadata(identifier)
-        estimate = self._statement_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._statement_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1268,12 +1272,7 @@ class DatabricksAdapter:
         cannot overrun the ceiling."""
 
         self._warehouse()  # refuses when config pins no warehouse
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one warehouse-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         bounds = [b for b in (remaining, cap_seconds) if b is not None]
         # Remember which bound won so a timeout kill is reported as the wall
         # limit or the budget, whichever actually fired.
@@ -1285,7 +1284,9 @@ class DatabricksAdapter:
         cursor = self._conn.cursor()
         if bounds:
             # An engine-built session statement, not agent SQL. STATEMENT_TIMEOUT
-            # treats 0 as "no timeout", so the cap never rounds below 1.
+            # treats 0 as "no timeout", so the cap never rounds below 1: the
+            # budget bound cannot (`statement_cap` refuses first) and the wall
+            # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
         return cursor
 

@@ -3,9 +3,10 @@
 dex writes two kinds of things, and only one of them is a storage backend's
 business.
 
-The **source of truth** is the dbt project: model SQL, `schema.yml`, semantic
-definitions. It is a git-reviewable filesystem artifact by design, it stays one,
-and it never moves into a datastore. No backend choice changes that.
+The **source of truth** is the repository: model SQL, `schema.yml`, and the
+semantic layer's definitions, whether those are dbt's or a native format's. It is
+a git-reviewable filesystem artifact by design, it stays one, and it never moves
+into a datastore. No backend choice changes that.
 
 The **scratch state** is everything dex learns along the way: the exploration
 cache, the reconcile baseline, the last drift report, the append-only query and
@@ -60,11 +61,13 @@ at runtime. Passing an explore-only store to a transform command refuses with a
 message naming the tier and the missing members, rather than failing on a missing
 attribute several frames down.
 
-Two capabilities sit alongside the tiers rather than inside them, and both are
+Three capabilities sit alongside the tiers rather than inside them, and all are
 optional: `SpendLock`, so the cumulative spend ceiling binds when two commands
-overlap, and the construction contract, so your backend can be named in
-configuration. A backend is a complete backend without either, and the first is
-one every concurrent host wants.
+overlap; `SpendHistory`, so an over-ceiling refusal can say how far this
+connector's past estimates ran from what they actually billed; and the
+construction contract, so your backend can be named in configuration. A backend
+is a complete backend without any of them, and the first is one every concurrent
+host wants.
 
 ## Writing one
 
@@ -160,6 +163,58 @@ skip the lock on anything serving concurrent requests.
 
 `SpendLockContract` in the conformance suite is the executable version of all of
 the above.
+
+## Reading the ledger back
+
+A second optional capability, and a gentler one: skipping it costs a sentence,
+not correctness.
+
+```python
+class MyStore:
+    def spend_entries(self, *, connector=None, limit=500):
+        entries = [e for e in self._entries("spend")
+                   if connector is None or e.get("connector") == connector]
+        return entries[-limit:]
+```
+
+**Why dex wants it.** `spend_since` answers the one question the cumulative
+ceiling asks, "how much today", and answers it as a single float, which is what
+keeps that hot path cheap. There is a second question worth asking of the same
+ledger. A dry-run estimate on a partitioned or clustered table is an upper bound
+by construction, so a build refused at an estimated 6.9 GB against a 5 GB ceiling
+may bill 4.75 GB when it is finally run, and "raise the budget or narrow the
+work" is then answered by a guess made under the impression that the estimate
+approximates the cost. dex records both halves already: every `settlement` entry
+carries an `estimate` beside the figure it settled at. This member is what reads
+them back, so the refusal can end with
+
+> The last 8 settled bigquery commands in this project's spend ledger billed a
+> median 69% of estimate (range 61%-88%) ...
+
+**Three properties.**
+
+- **Return the entries uninterpreted**, as dicts, exactly as they were appended.
+  The guard pairs `estimate` with the settled figure and groups by
+  `reservation_id`; a backend that drops keys it does not recognize breaks that.
+- **Append order, oldest first.** Not sorted by `at`: the ledger is append-only,
+  so insertion order is the true order and it stays right for entries whose stamp
+  is missing.
+- **Filter by connector, then cap.** `limit` takes the *most recent* matching
+  entries. Capping before filtering returns fewer than `limit` of the asked-for
+  connector whenever another connector shares the ledger.
+
+**Failing is allowed**, which is the opposite of `spend_since` and for the reason
+that separates them: nothing is admitted or refused on what this returns. It only
+decides whether an already-decided refusal carries one more sentence, so dex
+swallows an error here and drops the sentence. Raise or return `[]`; both read as
+"no history".
+
+**Without it your backend still works**, and nothing warns: no guard is narrower
+than it looks, so there is nothing to disclose. Over-ceiling refusals simply read
+as they always did.
+
+`SpendHistoryContract` in the conformance suite is the executable version of the
+above.
 
 ## Constructing one
 
@@ -303,21 +358,19 @@ principals. A host that splits stores for some other reason, one per repo root
 say, has split the budget too and will not be told.
 
 **The ledger read-then-write has to be atomic for the cumulative ceiling to
-bind**, and `SpendLock` below is how a backend provides it. The cost gate reads
-`spend_since`, decides whether the command fits under `budget.session_ceiling`,
-and appends, and two commands running that sequence at once read the same total
-and both decide yes. Implement the lock and dex serializes the sequence through
-it. Without one dex still books the headroom, which narrows the window from the
-length of a warehouse query to the microseconds around the read, and warns on
-every billed command that the ceiling is advisory on this backend.
+bind**, and `SpendLock` is how a backend provides it. See
+[Serializing the spend admission](#serializing-the-spend-admission) above, which
+states the obligation and what dex does for a backend that provides no lock.
 
-**Entries are stored, not interpreted.** Each carries an `entry` kind
-(`reservation`, `settlement`, `release`) and a `reservation_id` tying the three
-together, because the ceiling has to hold headroom for a command that has been
-admitted and has not finished paying. A release carries a **negative**
-magnitude, and that is the one thing to know here: a backend that clamps or
-filters on sign would leak held headroom for the rest of the UTC day. Sum what
-you are given.
+**Entries are stored, not interpreted.** A backend stores the dict it was
+handed, whole, and three properties of that dict are the whole obligation: a
+release carries a **negative** magnitude, so clamping or filtering on sign leaks
+held headroom for the rest of the UTC day; every entry carries the same keys with
+`null` where one does not apply, so dropping unrecognized keys breaks a reader
+joining settlements to reservations; and projecting the entry onto columns of
+your own diverges the first time dex adds a key. Sum what you are given. What
+each key holds, and what the three kinds mean to a reader, is in
+[`cost-controls.md`](cost-controls.md).
 
 Two properties follow, and neither required a change to any backend written
 before reservations existed:
@@ -431,6 +484,12 @@ this contract cannot tell the difference. That gap is real, and it is why the tw
 shipped backends carry cross-process assertions of their own rather than treating
 a green contract as the whole answer.
 
+**If your backend implements `spend_entries`**, mix in `SpendHistoryContract` the
+same way. It checks the three properties from
+[Reading the ledger back](#reading-the-ledger-back): entries come back
+uninterpreted, oldest first, and `limit` caps the most recent entries *after* the
+connector filter rather than before it.
+
 ## Which calls need nothing on the filesystem
 
 A host with no project on disk can run the whole explore surface: `inventory`,
@@ -442,10 +501,18 @@ connector resolved and no credential in play. Hosted semantic-layer calls
 `semantic_query` against dbt Cloud) need even less: no store, no connector, no
 repo root.
 
-Everything in transform needs `repo_root`, because the dbt project is a
-filesystem artifact and stays one. So does `explore map --use-project`, which
-reads the dbt project to rank and annotate what it found. Those refuse with a
-message naming what needed the root rather than inventing one.
+A native semantic layer is the mirror image of that hosted case and worth stating
+because the pairing is easy to get backwards. It needs a `repo_root`, since the
+documents are files, and it needs no connector and no warehouse at all: reading,
+validating, fingerprinting and authoring one are repository operations. The
+connector enters only where the layer is resolved onto physical relations, which
+is what decides whether a field links to a column.
+
+Everything in transform needs `repo_root`, because the project is a filesystem
+artifact and stays one, and so is a native semantic document. So does
+`explore map --use-project`, which reads the project and the semantic layer to
+rank and annotate what it found. Those refuse with a message naming what needed the root
+rather than inventing one.
 
 ## Selecting a backend
 

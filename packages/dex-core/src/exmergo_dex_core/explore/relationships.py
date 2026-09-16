@@ -4,12 +4,17 @@ Inference is metadata-only: it reads the profiles already gathered (names, types
 uniqueness signals) and never scans data, which keeps it free at the cost of
 confidence, so every inferred join carries a confidence the agent can weigh. The
 one deliberate exception is the opt-in ``--verify`` pass
-(:func:`verify_relationships`), which runs one bounded, engine-authored aggregate
-probe per join to measure the actual key overlap. Declared joins come from the
-dbt project; absent one, they are simply empty (explore is designed to work
-without a dbt project). They are probed too: a declaration is a claim about the
-data, so it is measurable, and only what the measurement may *change* differs by
-kind (see :func:`verify_relationships`).
+(:func:`verify_relationships`), which measures the actual key overlap with
+bounded, engine-authored aggregate probes, batched by child relation so a table
+is read once per statement rather than once per join (:func:`probe_batches`).
+Declared joins come from the project, from two channels that are equally
+authoritative and that this module keeps apart: a ``relationships`` test
+(:func:`declared_relationships`) and a semantic layer's shared entity
+(:func:`semantic_relationships`). Absent a project
+they are simply empty, since explore is designed to work without one. They are
+probed too: a declaration is a claim about the data, so it is measurable, and only
+what the measurement may *change* differs by kind (see
+:func:`verify_relationships`).
 """
 
 from __future__ import annotations
@@ -17,10 +22,11 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from ..adapters.base import Adapter
+from ..adapters.base import Adapter, is_temporal_type
 from ..cache import (
     ColumnProfile,
     Dataset,
+    KeyEvidence,
     Relationship,
     RelationshipKind,
     match_identifier,
@@ -28,7 +34,14 @@ from ..cache import (
 from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
 from ..progress import ProgressReporter
-from .profile import NEAR_UNIQUE_RATIO
+from ..semantic_catalog import EntityJoin
+from .profile import (
+    KEY_MEMBER_ANCHOR,
+    NEAR_UNIQUE_RATIO,
+    format_uniqueness_fraction,
+    key_member_verdict,
+    uniqueness_shortfall,
+)
 
 # Warehouse-layer prefixes stripped from a table name before entity matching, so
 # RAW_HOSTS, stg_races, and dim_customers all match FKs named after the bare entity.
@@ -126,7 +139,7 @@ def _strip_configured_affixes(name: str, affixes: EntityAffixes) -> str:
     return stripped
 
 
-def _fk_stem(column_name: str) -> str | None:
+def fk_stem(column_name: str) -> str | None:
     """The entity stem of an id-shaped column, or None if not id-shaped.
 
     Recognizes each suffix in :data:`_ID_SUFFIXES` in the three naming shapes
@@ -159,14 +172,14 @@ def _dealias(column_name: str) -> str:
     return _COLUMN_ALIAS_PREFIX.sub("", column_name.lower())
 
 
-def _entity(table_name: str) -> str:
+def entity_of(table_name: str) -> str:
     """The entity a table represents: layer prefix stripped, singularized, lowered."""
 
     return _singularize(_LAYER_PREFIX.sub("", table_name)).lower()
 
 
-def _is_id_shaped(column_name: str) -> bool:
-    return column_name.lower() in _ID_SUFFIXES or _fk_stem(column_name) is not None
+def is_id_shaped(column_name: str) -> bool:
+    return column_name.lower() in _ID_SUFFIXES or fk_stem(column_name) is not None
 
 
 def candidate_keys(dataset: Dataset) -> list[list[str]]:
@@ -200,10 +213,10 @@ def detect_grain(dataset: Dataset) -> list[str] | None:
     if not singles:
         composites = [key for key in keys if len(key) > 1]
         return composites[0] if composites else None
-    entity = _entity(dataset.identifier.rsplit(".", 1)[-1])
+    entity = entity_of(dataset.identifier.rsplit(".", 1)[-1])
     for key in singles:
         name = key[0].lower()
-        if name in ("id", f"{entity}_id", f"{entity}id") or _is_id_shaped(key[0]):
+        if name in ("id", f"{entity}_id", f"{entity}id") or is_id_shaped(key[0]):
             return key
     # Fall back to the lowest-cardinality unique column.
     by_card = sorted(
@@ -263,7 +276,7 @@ def infer_relationships(
 
     for child in datasets:
         for col in child.columns:
-            stem = _fk_stem(col.name)
+            stem = fk_stem(col.name)
             if stem is None:
                 continue
             for parent in datasets:
@@ -338,7 +351,7 @@ def fold_replica_relationships(
         schema = schema_of(dataset.identifier)
         present_schemas.add(schema)
         key = (
-            _entity(bare(dataset.identifier)),
+            entity_of(bare(dataset.identifier)),
             frozenset(c.name.lower() for c in dataset.columns),
         )
         schemas_by_fingerprint.setdefault(key, set()).add(schema)
@@ -371,9 +384,9 @@ def fold_replica_relationships(
 
     def signature(rel: Relationship) -> tuple:
         return (
-            _entity(bare(rel.from_dataset)),
+            entity_of(bare(rel.from_dataset)),
             tuple(c.lower() for c in rel.from_columns),
-            _entity(bare(rel.to_dataset)),
+            entity_of(bare(rel.to_dataset)),
             tuple(c.lower() for c in rel.to_columns),
         )
 
@@ -406,7 +419,7 @@ def fk_candidate_count(datasets: list[Dataset]) -> int:
     inference result so an empty relationships array is distinguishable from
     'nothing id-shaped to try'."""
 
-    return sum(1 for d in datasets for c in d.columns if _fk_stem(c.name) is not None)
+    return sum(1 for d in datasets for c in d.columns if fk_stem(c.name) is not None)
 
 
 def data_quality_notes(dataset: Dataset) -> list[str]:
@@ -421,10 +434,11 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
     notes: list[str] = []
     if not dataset.row_count:
         return notes
+    counted: set[str] = set()
 
-    entity = _entity(dataset.identifier.rsplit(".", 1)[-1])
+    entity = entity_of(dataset.identifier.rsplit(".", 1)[-1])
     for col in dataset.columns:
-        stem = _fk_stem(col.name)
+        stem = fk_stem(col.name)
         own_key = col.name.lower() == "id" or (
             stem is not None and _singularize(stem).lower() == entity
         )
@@ -439,18 +453,163 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
             # noise (an approx 500 distinct over 1,125 rows) still warns.
             continue
         if col.distinct_count < dataset.row_count:
-            duplicates = dataset.row_count - col.distinct_count
-            # An unescalated count is honest about being approximate.
-            marker = "" if col.distinct_count_exact else "~"
-            notes.append(
-                f"{col.name} is not unique: {marker}{col.distinct_count} distinct "
-                f"over {dataset.row_count} rows (~{duplicates} duplicate rows); "
-                "joins on it will fan out"
-            )
+            notes.append(_not_unique_note(col, dataset.row_count))
+            counted.add(col.name)
 
     if not candidate_keys(dataset):
-        notes.append("no candidate key detected; grain unknown")
+        notes.append(_grain_unknown_note(dataset, counted))
     return notes
+
+
+def _not_unique_note(col: ColumnProfile, row_count: int) -> str:
+    """How far a column is from keying its table, in the terms a caller acts on.
+
+    Three numbers: the distinct count, the row count, and how many rows would
+    have to be removed for the column to be unique. The last is what a caller
+    needs in order to decide, and deriving it from an approximate distinct
+    count was the thing they previously had to do by hand.
+
+    The `~` marker follows the arithmetic rather than the distinct count alone.
+    A surplus derived from two exact numbers is itself exact, so the marker
+    comes off there; with nulls the non-null count is derived from a fraction,
+    so it goes back on even though the distinct count is proven.
+    """
+
+    shortfall = uniqueness_shortfall(col.distinct_count, col.null_fraction, row_count)
+    distinct_marker = "" if col.distinct_count_exact else "~"
+    if shortfall is None:
+        return (
+            f"{col.name} is not unique: {distinct_marker}{col.distinct_count} "
+            f"distinct over {row_count} rows; joins on it will fan out"
+        )
+    surplus, fraction, exact = shortfall
+    marker = "" if (exact and col.distinct_count_exact) else "~"
+    return (
+        f"{col.name} is not unique: {distinct_marker}{col.distinct_count} distinct "
+        f"over {row_count} rows ({marker}{surplus} rows would have to be removed "
+        f"for it to be unique, so it is unique for "
+        f"{marker}{format_uniqueness_fraction(fraction)} of rows); joins on it "
+        "will fan out"
+    )
+
+
+def _grain_unknown_note(dataset: Dataset, counted: set[str]) -> str:
+    """ "Grain unknown", and where the reader should look instead.
+
+    A bare "no candidate key detected" leaves the most useful fact unsaid: on
+    the shape this exists for, one column very nearly keys the table and the
+    real defect is the duplicates in it. Naming that column turns the note from
+    an absence into an instruction.
+
+    Bounded to one column, the highest-cardinality anchor, so a wide table does
+    not get five of these. Temporal anchors are skipped as uninteresting to
+    report even though they still prune pairs: a per-row timestamp being
+    near-unique is not news, and it is never the key anyone meant.
+
+    ``counted`` is the columns that already have a non-uniqueness note above,
+    carrying the distinct count, the row count and the surplus. For one of
+    those this note points at them rather than restating them: several notes
+    repeating one column's arithmetic reads as padding and spends a budget
+    ``explore map`` caps per object.
+
+    Where the profile-time probe suppressed combinations, this sentence says so
+    too rather than leaving that to a note of its own. The two always co-occur
+    (a suppressed-everything probe is exactly a probe that proved no composite,
+    and the probe only runs when no single column is a key), so they are one
+    finding and belong in one sentence.
+    """
+
+    bare = "no candidate key detected; grain unknown"
+    suppressed = [e for e in dataset.key_evidence if e.status == "suppressed"]
+    probe = (
+        "; the composite-key probe found combinations that were unique and "
+        "suppressed every one of them as an artifact of that, and key_evidence "
+        "carries each with its reason"
+        if suppressed
+        else ""
+    )
+    if not dataset.row_count:
+        return bare
+    anchors = [
+        col
+        for col in dataset.columns
+        if col.pii is None
+        and col.null_fraction in (0.0, None)
+        and not is_temporal_type(col.data_type)
+        and key_member_verdict(
+            col.name,
+            col.data_type,
+            col.distinct_count,
+            distinct_count_exact=col.distinct_count_exact,
+            row_count=dataset.row_count,
+        )
+        == KEY_MEMBER_ANCHOR
+    ]
+    if not anchors:
+        return bare + probe
+    best = max(anchors, key=lambda c: c.distinct_count or 0)
+    shortfall = uniqueness_shortfall(
+        best.distinct_count, best.null_fraction, dataset.row_count
+    )
+    if shortfall is None:
+        return bare + probe
+    surplus, fraction, _exact = shortfall
+    if best.name in counted:
+        return (
+            f"{bare}: {best.name} is the closest thing to one, and the "
+            f"duplicates in it noted above are the reason{probe}"
+        )
+    return (
+        f"{bare}: {best.name} is the closest thing to one at "
+        f"{format_uniqueness_fraction(fraction)} unique ({best.distinct_count} "
+        f"distinct over {dataset.row_count} rows, {surplus} rows would have to "
+        "be removed), and a combination pairing it with any wider column would "
+        f"prove unique without describing the grain{probe}"
+    )
+
+
+def key_evidence(dataset: Dataset) -> list[KeyEvidence]:
+    """Why each of this dataset's keys is or is not reported, ranked.
+
+    The reported entries are in exactly ``candidate_keys`` order, which is the
+    invariant that keeps the two fields from drifting; the suppressed entries
+    the profile-time probe recorded follow. Composite reasons come from the
+    probe (only it measured the combination); single-column reasons are derived
+    here from the same column statistics ``candidate_keys`` reads.
+    """
+
+    from_probe = {
+        tuple(entry.columns): entry
+        for entry in dataset.key_evidence
+        if entry.status == "reported"
+    }
+    suppressed = [e for e in dataset.key_evidence if e.status == "suppressed"]
+    by_name = {col.name: col for col in dataset.columns}
+
+    reported: list[KeyEvidence] = []
+    for key in candidate_keys(dataset):
+        existing = from_probe.get(tuple(key))
+        if existing is not None:
+            reported.append(existing)
+            continue
+        col = by_name.get(key[0])
+        if col is None or len(key) != 1:
+            continue
+        rows = dataset.row_count
+        proof = (
+            "proven by an exact distinct count"
+            if col.distinct_count_exact
+            else "but its distinct count is still approximate, so this is a "
+            "signal rather than a proof"
+        )
+        reported.append(
+            KeyEvidence(
+                columns=list(key),
+                status="reported",
+                reason=f"{col.name} is unique and non-null on all {rows} rows, {proof}",
+            )
+        )
+    return reported + suppressed
 
 
 # Below this, a high orphan rate is still just weaker evidence for the
@@ -532,21 +691,72 @@ def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
     the measurement is *allowed to change* still depends on the kind: see
     :func:`verify_relationships` on confidence.
 
-    A composite join is excluded, and the exclusion is load-bearing rather than
-    an oversight. :func:`_overlap_probe_sql` joins on ``from_columns[0]`` and
-    ``to_columns[0]`` only, which was total coverage while inference was the
-    sole source (it emits single-column edges by construction) and stops being
-    so now that declared edges qualify. Probing the first column of a composite
-    key measures a different relationship than the one declared and would
-    report its orphan count as though it were the join's: silently wrong beats
-    unmeasured, so these stay unverified until the probe itself spans a key.
+    Composite joins are included only when they carry equal, non-empty column
+    lists. :func:`_batched_probe_sql` joins every ordered pair as one tuple;
+    probing only the first pair would measure a different relationship and is
+    never an allowed fallback.
     """
 
     return [
         rel
         for rel in relationships
-        if len(rel.from_columns) == 1 and len(rel.to_columns) == 1
+        if rel.from_columns and len(rel.from_columns) == len(rel.to_columns)
     ]
+
+
+# Edges that share one statement. The bound exists so a warehouse with hundreds
+# of joins does not compose one enormous statement; the common graph fits well
+# inside it and verifies in a single round trip.
+_PROBE_BATCH = 25
+
+
+def probe_batches(candidates: list[Relationship]) -> list[list[Relationship]]:
+    """Group already-selected probe candidates into the statements that will
+    measure them, so a table is referenced once per statement instead of once
+    per edge.
+
+    Cost here is a function of edge count rather than of data size, and the
+    grouping is what inverts that back. A warehouse whose probe scans fall under
+    a connector's per-statement or per-table minimum pays that minimum for every
+    table each statement names: unbatched, a shared dimension pays it once per
+    edge that joins it. Grouped, it pays once (issue #398).
+
+    Grouping is by child relation, which is the axis that pays twice over. Every
+    edge sharing a child is measured against one read of that child, and each of
+    its parents is named once in that read. Batches then pack whole child groups
+    up to ``_PROBE_BATCH`` edges; a child with more edges than the cap becomes
+    its own batch rather than being split, because splitting it would put the
+    same child in two statements and read it twice, which is the thing this
+    exists to stop.
+
+    Order is preserved end to end (children in first-seen order, edges in their
+    order within a child), so the flattened batches are exactly ``candidates``.
+    :func:`probe_statements` and :func:`verify_relationships` both go through
+    here, which is what keeps the priced statements and the run statements the
+    same statements.
+
+    Takes candidates rather than raw relationships: ``--verify`` selects with
+    :func:`probe_candidates` and the overlap sweep has already restricted its
+    pool by construction, so the filter belongs to the caller.
+    """
+
+    by_child: dict[str, list[Relationship]] = {}
+    for rel in candidates:
+        by_child.setdefault(rel.from_dataset, []).append(rel)
+
+    batched: list[list[Relationship]] = []
+    current: list[Relationship] = []
+    for group in by_child.values():
+        if current and len(current) + len(group) > _PROBE_BATCH:
+            batched.append(current)
+            current = []
+        current.extend(group)
+        if len(current) >= _PROBE_BATCH:
+            batched.append(current)
+            current = []
+    if current:
+        batched.append(current)
+    return batched
 
 
 def verify_relationships(
@@ -573,81 +783,154 @@ def verify_relationships(
     #163); a declared join that fails its probe surfaces through
     :func:`orphan_findings`, where the disagreement can be stated plainly.
 
+    ``timeout_seconds`` is the budget for one edge. A batch is issued with the
+    sum of the budgets of the edges it carries, so the command's total time
+    bound is what it was when every edge had a statement to itself.
+
     An optional ``progress`` reporter emits a throttled stderr line per probed
     join, so its counts match a ``total`` taken from :func:`probe_candidates`;
     ``None`` (the default) keeps existing callers silent and unchanged.
     """
 
-    for rel in probe_candidates(relationships):
-        sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
-        result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
-        values = dict(zip(result.columns, result.cells[0], strict=True))
-        nonnull = int(values["nonnull_fk"] or 0)
-        orphans = int(values["orphans"] or 0)
+    for batch in probe_batches(probe_candidates(relationships)):
+        for rel, nonnull, orphans in _run_probe_batch(
+            adapter, batch, timeout_seconds=timeout_seconds
+        ):
+            rel.verified = True
+            if nonnull == 0:
+                rel.orphan_fraction = None
+                if progress is not None:
+                    progress.advance()  # this edge was probed; count it
+                continue
+            fraction = orphans / nonnull
+            rel.orphan_fraction = round(fraction, 4)
 
-        rel.verified = True
-        if nonnull == 0:
-            rel.orphan_fraction = None
+            if rel.kind is RelationshipKind.INFERRED:
+                confidence = rel.confidence or 0.5
+                if fraction == 0.0:
+                    confidence += 0.1
+                elif fraction <= 0.02:
+                    confidence += 0.05
+                elif fraction >= 0.2:
+                    confidence -= 0.25
+                else:
+                    confidence -= 0.1
+                rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
+
             if progress is not None:
-                progress.advance()  # this iteration ran a probe; count it
-            continue
-        fraction = orphans / nonnull
-        rel.orphan_fraction = round(fraction, 4)
-
-        if rel.kind is RelationshipKind.INFERRED:
-            confidence = rel.confidence or 0.5
-            if fraction == 0.0:
-                confidence += 0.1
-            elif fraction <= 0.02:
-                confidence += 0.05
-            elif fraction >= 0.2:
-                confidence -= 0.25
-            else:
-                confidence -= 0.1
-            rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
-
-        if progress is not None:
-            progress.advance()
+                progress.advance()
 
 
 def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`verify_relationships` will run, one statement per
-    probed join, in the adapter's dialect. Exists so a billed caller can
-    dry-run the probes for a cost estimate before confirming the spend."""
+    batch of probed joins, in the adapter's dialect. Exists so a billed caller
+    can dry-run the probes for a cost estimate before confirming the spend."""
 
     return [
-        _transpile_probe(_overlap_probe_sql(rel), dialect)
-        for rel in probe_candidates(relationships)
+        _transpile_probe(_batched_probe_sql(batch), dialect)
+        for batch in probe_batches(probe_candidates(relationships))
     ]
 
 
-def _overlap_probe_sql(rel: Relationship) -> str:
-    child = _quote_identifier(rel.from_dataset)
-    parent = _quote_identifier(rel.to_dataset)
-    fk = _quote_part(rel.from_columns[0])
-    key = _quote_part(rel.to_columns[0])
-    # Aggregate-only by construction: two counts, no value in the projection.
-    # A LEFT JOIN against the DISTINCT parent keys keeps the orphan count
-    # correct even when the parent key is not unique (a bare join would fan
-    # out and inflate it). Deliberately portable SQL: CASE inside COUNT
-    # rather than FILTER (which BigQuery lacks and sqlglot does not rewrite),
-    # and a join rather than a projected NOT EXISTS, which Redshift refuses
-    # outright (XX000: correlated subquery pattern not supported).
-    return (
-        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
-        f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d.pk IS NULL THEN 1 END) "
-        f"AS orphans "
-        f"FROM {child} c LEFT JOIN ("
-        f"SELECT DISTINCT {key} AS pk FROM {parent}) d ON d.pk = c.{fk}"
+def _batched_probe_sql(batch: list[Relationship]) -> str:
+    """One statement measuring every edge in ``batch``, returning a single row.
+
+    Aggregate-only by construction: two counts per edge, no value in the
+    projection. A LEFT JOIN against the DISTINCT parent keys keeps the orphan
+    count correct even when the parent key is not unique (a bare join would fan
+    out and inflate it), and because each such join matches at most one row per
+    child row, chaining several of them across one child leaves that child's
+    cardinality exactly as it was. That is what makes a batched count identical
+    to the count the edge would have got on its own rather than merely close.
+
+    The edges of one child are measured against one read of that child; the
+    children of one batch are cross-joined, which is well defined because each
+    contributing subquery is an ungrouped aggregate over exactly one row.
+
+    Aliases carry the edge's index within the batch (``nonnull_fk_3``,
+    ``orphans_3``, parent ``d3``), the way the profiling and cumulative probes
+    index theirs, so they stay unique across cross-joined subqueries and the
+    caller unpacks by name rather than by position.
+
+    Deliberately portable SQL: CASE inside COUNT rather than FILTER (which
+    BigQuery lacks and sqlglot does not rewrite), and a join rather than a
+    projected NOT EXISTS, which Redshift refuses outright (XX000: correlated
+    subquery pattern not supported).
+    """
+
+    by_child: dict[str, list[tuple[int, Relationship]]] = {}
+    for index, rel in enumerate(batch):
+        by_child.setdefault(rel.from_dataset, []).append((index, rel))
+
+    aggregates = []
+    for child, edges in by_child.items():
+        counts, joins = [], []
+        for index, rel in edges:
+            fks = [_quote_part(column) for column in rel.from_columns]
+            keys = [_quote_part(column) for column in rel.to_columns]
+            parent = _quote_identifier(rel.to_dataset)
+            nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
+            parent_keys = ", ".join(
+                f"{key} AS pk{pair_index}" for pair_index, key in enumerate(keys)
+            )
+            predicate = " AND ".join(
+                f"d{index}.pk{pair_index} = c.{fk}" for pair_index, fk in enumerate(fks)
+            )
+            counts.append(
+                f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS nonnull_fk_{index}, "
+                f"COUNT(CASE WHEN {nonnull} AND d{index}.pk0 IS NULL "
+                f"THEN 1 END) AS orphans_{index}"
+            )
+            joins.append(
+                f"LEFT JOIN (SELECT DISTINCT {parent_keys} FROM {parent}) "  # noqa: S608
+                f"d{index} ON {predicate}"
+            )
+        aggregates.append(
+            f"SELECT {', '.join(counts)} "  # noqa: S608
+            f"FROM {_quote_identifier(child)} c {' '.join(joins)}"
+        )
+
+    if len(aggregates) == 1:
+        return aggregates[0]
+    joined = " CROSS JOIN ".join(f"({sql}) a{i}" for i, sql in enumerate(aggregates))
+    return f"SELECT * FROM {joined}"  # noqa: S608
+
+
+def _run_probe_batch(
+    adapter: Adapter,
+    batch: list[Relationship],
+    *,
+    timeout_seconds: float,
+) -> list[tuple[Relationship, int, int]]:
+    """Issue one batched probe and return ``(edge, nonnull_fk, orphans)`` per
+    edge, in the batch's own order.
+
+    ``timeout_seconds`` is the per-edge budget; the statement gets the sum of
+    the budgets of the edges it replaces, so batching does not loosen the
+    command's overall time bound. Reads the row by alias, never by position.
+    """
+
+    sql = _transpile_probe(_batched_probe_sql(batch), adapter.dialect)
+    result = adapter.run_query(
+        sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
     )
+    values = dict(zip(result.columns, result.cells[0], strict=True))
+    return [
+        (
+            rel,
+            int(values[f"nonnull_fk_{index}"] or 0),
+            int(values[f"orphans_{index}"] or 0),
+        )
+        for index, rel in enumerate(batch)
+    ]
 
 
 def _transpile_probe(sql: str, dialect: str) -> str:
     """Render the DuckDB-flavored probe in the active connector's dialect.
 
-    The probe is authored once in DuckDB SQL (double-quoted identifiers,
-    ``COUNT(*) FILTER``); sqlglot rewrites it per connector (BigQuery gets
-    backticks and COUNTIF). Identity on DuckDB itself.
+    The probe is authored once in DuckDB SQL (double-quoted identifiers);
+    sqlglot rewrites it per connector, so BigQuery gets backticks. Identity on
+    DuckDB itself.
     """
 
     if dialect == "duckdb":
@@ -843,14 +1126,21 @@ def overlap_sweep_candidates(
 
 def overlap_sweep_statements(candidates: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`probe_overlap_candidates` will run, one statement
-    per candidate, in the adapter's dialect. Exists so a billed caller can
-    dry-run the sweep for a cost estimate before confirming the spend.
+    per batch of candidates, in the adapter's dialect. Exists so a billed caller
+    can dry-run the sweep for a cost estimate before confirming the spend.
 
     Every candidate :func:`overlap_sweep_candidates` returns is already
     single-column by construction, so this skips the `probe_candidates`
-    composite-key filter ``--verify`` needs; there is nothing to filter."""
+    composite-key filter ``--verify`` needs; there is nothing to filter. The
+    batching in :func:`probe_batches` is the same, and matters more here: the
+    sweep runs up to ``_OVERLAP_SWEEP_CAP`` probes, so an unbatched sweep on a
+    connector with a per-table minimum pays that minimum a hundred times over
+    for a pool whose answers are two counts apiece."""
 
-    return [_transpile_probe(_overlap_probe_sql(rel), dialect) for rel in candidates]
+    return [
+        _transpile_probe(_batched_probe_sql(batch), dialect)
+        for batch in probe_batches(candidates)
+    ]
 
 
 def probe_overlap_candidates(
@@ -879,7 +1169,7 @@ def probe_overlap_candidates(
     building a return value that a raise would discard.
 
     Only the two aggregate counts the probe itself computes are ever read;
-    reuses :func:`_overlap_probe_sql` verbatim, so this is exactly as
+    reuses :func:`_batched_probe_sql` verbatim, so this is exactly as
     value-blind as :func:`verify_relationships`.
 
     Returns the count rejected by measurement (a candidate the ceiling cut
@@ -887,24 +1177,22 @@ def probe_overlap_candidates(
     """
 
     rejected = 0
-    for rel in candidates:
-        sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
-        result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
-        values = dict(zip(result.columns, result.cells[0], strict=True))
-        nonnull = int(values["nonnull_fk"] or 0)
-        orphans = int(values["orphans"] or 0)
-        if progress is not None:
-            progress.advance()
-        if nonnull < _OVERLAP_MIN_OBSERVATIONS:
-            rejected += 1
-            continue
-        fraction = orphans / nonnull
-        if fraction > _OVERLAP_ORPHAN_CEILING:
-            rejected += 1
-            continue
-        rel.verified = True
-        rel.orphan_fraction = round(fraction, 4)
-        rel.confidence = round(min(0.95, max(0.05, 1.0 - fraction)), 4)
+    for batch in probe_batches(candidates):
+        for rel, nonnull, orphans in _run_probe_batch(
+            adapter, batch, timeout_seconds=timeout_seconds
+        ):
+            if progress is not None:
+                progress.advance()
+            if nonnull < _OVERLAP_MIN_OBSERVATIONS:
+                rejected += 1
+                continue
+            fraction = orphans / nonnull
+            if fraction > _OVERLAP_ORPHAN_CEILING:
+                rejected += 1
+                continue
+            rel.verified = True
+            rel.orphan_fraction = round(fraction, 4)
+            rel.confidence = round(min(0.95, max(0.05, 1.0 - fraction)), 4)
     return rejected
 
 
@@ -944,7 +1232,12 @@ def declared_relationships(
                     f"{label} references a relation not in this connection's inventory"
                 )
             continue
-        key = (child.lower(), fk.column.lower(), parent.lower(), fk.to_column.lower())
+        key = (
+            child.lower(),
+            (fk.column.lower(),),
+            parent.lower(),
+            (fk.to_column.lower(),),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -956,6 +1249,126 @@ def declared_relationships(
                 to_columns=[fk.to_column],
                 kind=RelationshipKind.DECLARED,
                 confidence=1.0,
+                declaration_sources=[fk.source],
+            )
+        )
+    for declaration in defs.declared_relationships:
+        child, child_ambiguous = resolve_declared(
+            declaration.relation, declaration.model, known_identifiers
+        )
+        parent, parent_ambiguous = resolve_declared(
+            declaration.to_relation, declaration.to_model, known_identifiers
+        )
+        label = declaration.name or (
+            f"declared relationship {declaration.model} -> {declaration.to_model}"
+        )
+        if child is None or parent is None:
+            reason = (
+                "matches more than one object here"
+                if (child_ambiguous or parent_ambiguous)
+                else "references a relation not in this connection's inventory"
+            )
+            notes.append(f"{label} {reason}; skipped rather than guessed")
+            continue
+        from_columns = [pair[0] for pair in declaration.column_pairs]
+        to_columns = [pair[1] for pair in declaration.column_pairs]
+        key = (
+            child.lower(),
+            tuple(c.lower() for c in from_columns),
+            parent.lower(),
+            tuple(c.lower() for c in to_columns),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        source = declaration.source + (
+            f" relationship '{declaration.name}'" if declaration.name else ""
+        )
+        relationships.append(
+            Relationship(
+                from_dataset=child,
+                from_columns=from_columns,
+                to_dataset=parent,
+                to_columns=to_columns,
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+                declared_by=source,
+                declaration_sources=[source],
+            )
+        )
+    return relationships, notes
+
+
+def semantic_relationships(
+    joins: list[EntityJoin], known_identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """The semantic layer's declared entity graph, resolved against this
+    connection's identifiers.
+
+    A shared entity is a join the layer states outright, with the physical key
+    named per model, so these arrive at the **declared** tier beside the project's
+    ``relationships`` tests rather than at the inferred one. That is not a
+    generosity: a name-based inference is a guess about whether a join exists,
+    while this is the layer telling dex which join it performs, and the key
+    routinely differs between the two sides in a way no name-matching rule would
+    ever find.
+
+    Resolution is :func:`resolve_declared`, the same function and the same
+    never-guess rule the ``relationships`` tests go through, so an endpoint
+    matching nothing or matching several objects yields a note instead of an edge.
+    A semantic model pointing at a relation this connection does not hold is a real
+    signal (the project was compiled against a different target), which is why it
+    is said rather than dropped.
+
+    ``declared_by`` names the entity, because that is the part a reader can look up
+    with ``explore semantic list`` and the only part the edge does not already
+    carry.
+    """
+
+    relationships: list[Relationship] = []
+    notes: list[str] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for join in joins:
+        child, child_ambiguous = resolve_declared(
+            join.child_relation, join.child_model, known_identifiers
+        )
+        parent, parent_ambiguous = resolve_declared(
+            join.parent_relation, join.parent_model, known_identifiers
+        )
+        label = (
+            f"semantic entity '{join.entity}' joins {join.child_model}."
+            f"{join.child_column} -> {join.parent_model}.{join.parent_column}"
+        )
+        if child is None or parent is None:
+            if child_ambiguous or parent_ambiguous:
+                notes.append(
+                    f"{label}, and at least one side matches more than one object "
+                    "here; skipped rather than guessed"
+                )
+            else:
+                notes.append(
+                    f"{label}, and at least one side is not in this connection's "
+                    "inventory"
+                )
+            continue
+        key = (
+            child.lower(),
+            join.child_column.lower(),
+            parent.lower(),
+            join.parent_column.lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append(
+            Relationship(
+                from_dataset=child,
+                from_columns=[join.child_column],
+                to_dataset=parent,
+                to_columns=[join.parent_column],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+                declared_by=f"semantic entity '{join.entity}'",
             )
         )
     return relationships, notes

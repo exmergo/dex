@@ -168,6 +168,9 @@ def test_orphan_relation_is_flagged_when_model_removed(maintain_repo):
     # table_added, and the physical table is untouched, so never table_dropped.
     assert "table_added" not in by_code
     assert "table_dropped" not in by_code
+    # Two true, different-axis facts about the same edit (#164): the warehouse
+    # table is orphaned, and the project's own model list also lost the model.
+    assert by_code["model_removed"][0]["identifier"] == "stg_orders"
 
 
 def test_orphan_relation_not_reported_for_never_backed_table(maintain_repo):
@@ -182,6 +185,100 @@ def test_orphan_relation_not_reported_for_never_backed_table(maintain_repo):
     by_code = _by_code(payload)
     assert by_code["table_added"][0]["identifier"] == "warehouse.main.payments"
     assert "orphan_relation" not in by_code
+
+
+# --- transform_drift (#164): a model added, removed, or content-changed -------
+
+
+def test_model_added_when_a_new_staging_model_appears(maintain_repo):
+    maintain_repo.snapshot()
+    maintain_repo.edit(
+        "models/staging/stg_customers.sql",
+        "select * from {{ source('main', 'customers') }}\n",
+    )
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    assert by_code["model_added"][0]["identifier"] == "stg_customers"
+    # Never built, so nothing else fires alongside it.
+    assert "orphan_relation" not in by_code
+    assert "table_added" not in by_code
+
+
+def test_model_removed_alone_when_the_model_was_never_built(maintain_repo):
+    """Removing a model that was never materialized removes only the model,
+    unlike test_orphan_relation_is_flagged_when_model_removed above, where the
+    same edit also orphans a real warehouse table."""
+
+    maintain_repo.edit(
+        "models/staging/stg_customers.sql",
+        "select * from {{ source('main', 'customers') }}\n",
+    )
+    maintain_repo.snapshot()
+    (maintain_repo.project_dir / "models" / "staging" / "stg_customers.sql").unlink()
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    assert by_code["model_removed"][0]["identifier"] == "stg_customers"
+    assert "orphan_relation" not in by_code
+
+
+def test_model_changed_when_its_sql_content_changes(maintain_repo):
+    maintain_repo.snapshot()
+    maintain_repo.edit(
+        "models/staging/stg_orders.sql",
+        "with source as (\n"
+        "    select * from {{ source('main', 'orders') }}\n"
+        "),\n\n"
+        "renamed as (\n"
+        "    select\n"
+        "        order_id,\n"
+        "        customer_id,\n"
+        "        amount,\n"
+        "        status,\n"
+        "        ordered_at,\n"
+        "        1 as extra\n"
+        "    from source\n"
+        ")\n\n"
+        "select * from renamed\n",
+    )
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    changed = by_code["model_changed"][0]
+    assert changed["identifier"] == "stg_orders"
+    assert changed["data"]["path"] == "models/staging/stg_orders.sql"
+    assert "model_added" not in by_code
+    assert "model_removed" not in by_code
+
+
+def test_model_changed_catches_a_rewired_ref_without_a_second_check(maintain_repo):
+    """The issue's fourth invisible case (#164): a model's ref()/source() edges
+    rewired. No separate comparison over model_refs/model_sources is needed,
+    because rewiring one changes the file's text, and so its content hash."""
+
+    maintain_repo.edit(
+        "models/staging/stg_products.sql",
+        "select * from {{ ref('stg_orders') }}\n",
+    )
+    maintain_repo.snapshot()
+    maintain_repo.edit(
+        "models/staging/stg_products.sql",
+        "select * from {{ source('main', 'orders') }}\n",
+    )
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    assert by_code["model_changed"][0]["identifier"] == "stg_products"
+
+
+def test_transform_drift_is_silent_on_an_unchanged_project(maintain_repo):
+    maintain_repo.snapshot()
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    assert "model_added" not in by_code
+    assert "model_removed" not in by_code
+    assert "model_changed" not in by_code
 
 
 def test_scope_filters_findings_to_named_objects(maintain_repo):

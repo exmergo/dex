@@ -8,6 +8,7 @@ touch real stderr.
 from __future__ import annotations
 
 import io
+import sys
 
 from exmergo_dex_core.progress import (
     PROGRESS_FIRST_AFTER,
@@ -112,10 +113,32 @@ def test_total_zero_and_one_stay_silent() -> None:
         assert stream.getvalue() == ""
 
 
-def test_stream_defaults_to_stderr_never_stdout() -> None:
+def test_stream_defaults_to_the_current_stderr_never_stdout(monkeypatch) -> None:
     # The default stream must be stderr: writing progress to stdout would corrupt
-    # the single-JSON-envelope contract.
-    import sys
+    # the single-JSON-envelope contract. It must also be *the stderr in force
+    # when the line is written*, not the one this module saw at import: a
+    # `stream: TextIO = sys.stderr` default argument is evaluated once per
+    # process, and under pytest that object is a capture buffer which is closed
+    # long before any run is slow enough to emit, so a live profiling run died
+    # on `ValueError: I/O operation on closed file` after it had already billed.
+    clock, stream = _Clock(), io.StringIO()
+    reporter = ProgressReporter(90, "profiled", "objects", clock=clock)
 
-    reporter = ProgressReporter(1, "profiled", "objects")
-    assert reporter._stream is sys.stderr
+    monkeypatch.setattr(sys, "stderr", stream)
+    clock.tick(PROGRESS_FIRST_AFTER + 0.1)
+    reporter.advance()
+
+    assert stream.getvalue() == "dex: profiled 1/90 objects\n"
+
+
+def test_a_dead_stream_never_fails_the_run() -> None:
+    # Progress narrates work that already happened and, on a metered connector,
+    # already billed. A stream that has gone away must not be what turns a
+    # finished run into an error.
+    clock, stream = _Clock(), io.StringIO()
+    reporter = ProgressReporter(90, "profiled", "objects", stream=stream, clock=clock)
+    stream.close()
+
+    clock.tick(PROGRESS_FIRST_AFTER + 0.1)
+    reporter.advance()  # must not raise
+    reporter.done()

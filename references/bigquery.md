@@ -53,20 +53,17 @@ budget:
 - **Billed:** profiling aggregates, `explore query`, relationship verification
   probes, and `transform build`.
 
-`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statements rather than added afterward, so the estimate you confirm is the whole cost. A call carrying several statements is quoted once for all of them, itemized per statement, and an object two of them share is scanned once rather than twice. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+`explore query` and `explore cluster` bill an auto-profile of an object this connection has that the `.dex/` cache cannot adjudicate, priced into the same handshake as the statements: see [`cost-controls.md`](cost-controls.md). Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
 
-Every billed command is estimated first with free dry-runs. Without
-`--confirm` it returns a `needs_confirmation` envelope carrying the byte
-estimate (per table where relevant); re-issue with `--confirm` and
-`--budget <bytes>`. Nothing executes unconfirmed or without a ceiling, and an estimate
-over the ceiling is refused outright (confirmation cannot override it).
+Every billed command is estimated first with free dry-runs, which is why the
+estimate here is `exact` rather than modelled. Budgets are bytes; the handshake
+itself is in [`cost-controls.md`](cost-controls.md).
 
 On the confirmed run, every statement is dry-run again and charged against the
 budget, and every job carries a server-side `maximum_bytes_billed` cap, so a
-drifting estimate cannot overrun the budget. Billed bytes are appended to
-`.dex/spend.jsonl` (byte counts, job ids, and statement hashes; never SQL text
-or values), and `budget.session_ceiling` binds cumulatively against that
-ledger per UTC day.
+drifting estimate cannot overrun the budget. Where the billed bytes land
+afterwards, and when a ledger that cannot be read refuses a command, are in
+[`cost-controls.md`](cost-controls.md).
 
 BigQuery bills a 10 MB minimum per query; a remaining budget below that is
 refused with the math rather than letting the job fail server-side. Query-cache
@@ -80,10 +77,27 @@ distinct count for a near-unique column, a value-domain probe for a
 low-cardinality one, and a composite-key probe. Which of them run depends on
 the aggregate scan's own approximate results, so none can be dry-run before it,
 and the estimate holds one 10 MB floor apiece instead. A reserve is dropped only
-where an object's metadata already rules the query out: a view (no row count, so
-no probe can run), a table of nested or repeated columns only (no approximate
-distinct, which every probe starts from), a table too small for a value domain,
-or one with too few countable columns to form a composite pair.
+where an object's metadata already rules the query out: a table known to hold no
+rows, a table of nested or repeated columns only (no approximate distinct, which
+every probe starts from), a table too small for a value domain, or one with too
+few countable columns to form a composite pair.
+
+The reserve cannot mirror every reason a composite probe ends up issuing nothing.
+A pair built on a continuous measure, or one that merely completes a column
+already unique on almost every row, is excluded before the probe runs, and both
+verdicts come from distinct counts that do not exist at estimate time. So a table
+whose every candidate pair is excluded that way still carries its reserve and
+then spends nothing. That is the loose direction and it is the safe one:
+reserving for a query that does not run costs a caller headroom, while failing to
+reserve for one that does is an overrun.
+
+An object BigQuery keeps no row count for, meaning every view and every external
+table, reserves all three. Unknown is not empty: the count arrives inside the
+aggregate scan, so every probe can run, and at estimate time there is no number
+yet to narrow the hold with. That makes an external table's estimate four 10 MB
+floors rather than one, which is worth knowing before pointing a profile at a
+lakehouse of them. The reserve is released rather than spent when a probe does not
+run, so it costs headroom for the length of the command, not money.
 
 The reserve scales with object count rather than data size, so on a warehouse of
 many small tables it can be most of the number. Both the `needs_confirmation`
@@ -101,6 +115,24 @@ is dry-run scan
 A mid-command verify checkpoint prices overlap probes, which carry no reserve,
 so it reports none rather than repeating the profile's.
 
+### What a join overlap probe costs
+
+The 10 MB minimum is charged per table a query references, so a probe that reads
+a child and a parent floors at two of them. Issued one per join, a graph's probes
+therefore cost twice its edge count in floors, and a dimension five facts join
+pays its own floor five times. That is a bill set by how many joins exist rather
+than by how much data they cover, and it recurs on every run that verifies.
+
+So the probes are batched: the joins that share a child relation are measured
+against one read of it, and the batch's children are combined into a single
+statement. Each statement then names each of its tables once, and a graph of M
+tables floors at M times 10 MB however many joins connect them. On a nine-edge
+star schema over seven tables the estimate falls from 180 MiB to 70 MiB, against
+32 MiB of scan that both shapes pay: what the batching removes is floor, not
+measurement. The per-join results are identical, and `--infer-by-overlap`'s sweep
+is batched the same way, which matters more there because it runs up to fifty
+probes.
+
 ## Profiling behavior
 
 - Aggregates only (`COUNT`, `APPROX_COUNT_DISTINCT`, `MIN`/`MAX` on safe
@@ -110,6 +142,16 @@ so it reports none rather than repeating the profile's.
   invalid on them); `JSON`/`GEOGRAPHY` are treated as nested.
 - Tables that require a partition filter are never scanned: they get a
   metadata-only profile plus a data-quality note.
+- A row count is read from the metadata only for a base table, which is the only
+  kind BigQuery maintains one for. A view, a materialized view, an external table
+  and a snapshot all report `num_rows` as `0` whatever they hold, so that zero is
+  read as unknown rather than as empty, and the real count comes from the
+  aggregate scan's own `COUNT(*)`, which is already paid for. Until an object is
+  profiled its count and byte size are therefore `null`, which ranks it as if it
+  were small: profile it to rank it on its size. `empty table (no rows)` is
+  reported from the aggregate's zero, so it means the object is empty rather than
+  uncounted, and `maintain volume` names the objects it could not compare instead
+  of returning no finding for them.
 - With `bigquery.max_full_profile_bytes` set, larger tables are profiled from
   a `TABLESAMPLE SYSTEM` block sample, flagged as approximate, and uniqueness
   is not judged.
@@ -117,7 +159,16 @@ so it reports none rather than repeating the profile's.
   probe, and the value-domain probe each spend only within the
   already-confirmed budget, and degrade (to an approximate verdict, no
   composite key, or no reported domain) plus a table note when the remaining
-  budget cannot cover them.
+  budget cannot cover them. The composite-key probe degrades in two steps: it
+  first narrows to the best-ranked candidate pairs the budget can cover, and
+  only skips outright when it cannot cover one. Either way the note says which
+  it was, because a missing composite key otherwise reads as a warehouse that
+  answered and had none.
+- The reserve holds one query minimum for the composite-key probe however many
+  pairs it carries, so on a wide table the probe's dry run can price above what
+  the estimate held for it. The per-statement gate, not the reserve, is what
+  bounds that: the probe is priced against the live remaining budget before it
+  runs, and narrows or skips rather than exceeding it.
 
 ## Read-only, in depth
 
@@ -144,6 +195,31 @@ server-side. `transform build` surfaces an upfront byte estimate: it runs a free
 and sums the result (downstream nodes whose dev inputs are not built yet cannot
 be dry-run, so on a cold target the total is a partial floor). It still requires
 `--confirm` and a `--budget`, and its billed bytes land in the spend ledger.
+
+`transform build --verify` costs only where the warehouse keeps no row
+count, so a table's count is free metadata; how the counts are priced into
+the build's own estimate is in
+[`cost-controls.md`](cost-controls.md).
+
+`--verify` also folds `bigquery.dev_dataset` into its read scope for the length of that one
+command, because dbt writes the relations it is judging there and that namespace
+is refused as a source everywhere else. The widening shows in the envelope's
+`connection.target`; nothing is written back to `.dex/config.yml`.
+
+`transform test --mutate` prices the whole batch upfront and confirms it once.
+Each mutant is spliced into each of the model's compiled data tests and dry-run
+priced as the statement the warehouse will actually run, which matters here more
+than on any other connector: dropping or flipping a predicate on a partitioned
+table changes what the scan prunes, so a mutant can legitimately cost more than
+the model it came from and pricing the batch at the baseline's cost would
+under-report it. The breakdown names `(baseline)` and each mutant by id, so one
+`--budget` covers the run and the caller sees where it goes. Unit tests read
+fixtures rather than the warehouse and are not priced. If the confirmed budget
+runs out partway, the run stops and the remaining mutants come back `not_run`.
+Nothing is materialized: mutants build as ephemeral models, so no table or view
+is created in `bigquery.dev_dataset` and none of the run needs cleaning up.
+
+
 
 With `--layered-schemas`, the scaffolded `generate_schema_name` override makes
 each layer build into its own sibling dataset in the profile's project

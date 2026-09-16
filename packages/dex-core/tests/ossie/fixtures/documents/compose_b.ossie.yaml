@@ -1,0 +1,13 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: logistics
+    datasets:
+      - name: shipments
+        source: demo.main.shipments
+        primary_key: [shipment_id]
+        fields:
+          - name: shipment_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: shipment_id

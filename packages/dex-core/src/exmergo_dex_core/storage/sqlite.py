@@ -306,6 +306,45 @@ class SqliteStore:
                 continue
         return spend_total(entries, cutoff_iso, field=field, connector=connector)
 
+    def spend_entries(
+        self,
+        *,
+        connector: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """The tail of the ledger, oldest first (see :class:`SpendHistory`).
+
+        `rowid` orders it, not `at`: the ledger is append-only, so insertion
+        order is the true order, and it stays correct for the entries whose
+        stamp is missing or unparseable, which are exactly the rows a stamp sort
+        would scatter. The connector filter is pushed into SQL so the
+        `(connector, at)` index narrows the scan, and `LIMIT` then caps the JSON
+        this has to deserialize rather than reading a ledger of months to find
+        the last few commands.
+        """
+
+        if limit <= 0:
+            return []
+        query = (
+            "SELECT entry FROM spend_log WHERE (? IS NULL OR connector = ?) "
+            "ORDER BY rowid DESC LIMIT ?"
+        )
+        with self._conn_lock:
+            rows = (
+                self._connection()
+                .execute(query, (connector, connector, limit))
+                .fetchall()
+            )
+        entries = []
+        for (raw,) in reversed(rows):
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+        return entries
+
     @contextmanager
     def spend_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
         """Serialize the spend admission across every process holding this file.

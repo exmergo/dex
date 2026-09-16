@@ -7,8 +7,11 @@ through one stable command contract.
 
 Dex is the agent-native analytics engineering toolkit: explore an unfamiliar
 warehouse, transform raw data into clean dbt models and a semantic layer on top,
-and maintain all of it as the data underneath changes. Read-only against your data;
-every change is a reviewable diff.
+and maintain all of it as the data underneath changes. The semantic layer is a
+separate axis from the transformation project, so it can be dbt's own, a hosted
+dbt Cloud deployment, or native Apache Ossie documents in a repository with no
+dbt project at all. Read-only against your data; every change is a reviewable
+diff.
 
 ## Install
 
@@ -31,16 +34,23 @@ exmergo-dex-core[clickhouse]
 exmergo-dex-core[all]          # every optional capability at once
 ```
 
-Two capabilities sit behind their own extras rather than a connector's:
+Some capabilities sit behind their own extras rather than a connector's:
 `[semantic]` and `[semantic-api]` for the local and hosted semantic-layer query
-backends, and `[cluster]` for `explore cluster`. `[all]` covers all of these too.
+backends, `[ossie]` for reading native Apache Ossie semantic documents out of the
+repository, and `[cluster]` for `explore cluster`. `[all]` covers all of these
+too.
 
-`[semantic-api]` is the one extra that stands completely alone: dbt Cloud owns the
-warehouse connection and executes server-side, so a deployment that only queries a
-hosted semantic layer needs no connector, no dbt-core, and no SQL parser. Every
-other command validates SQL before running it, which is why the connector extras
-carry the dialect engine; run one without a connector installed and dex refuses
-with the install to use rather than guessing.
+Two of them stand alone, and for different reasons. `[semantic-api]` needs no
+connector, no dbt-core, and no SQL parser, because dbt Cloud owns the warehouse
+connection and executes server-side. `[ossie]` needs none of those either,
+because a native semantic layer is files in the repository: reading, validating,
+snapshotting, and authoring them all happen without a warehouse. Checking that an
+authored SQL expression parses is the one part that wants the dialect engine, and
+without it that check names itself as skipped rather than passing silently.
+
+Every command that generates or runs SQL validates it first, which is why the
+connector extras carry the dialect engine; run one without a connector installed
+and dex refuses with the install to use rather than guessing.
 
 ## First run, with nothing to point it at
 
@@ -64,7 +74,7 @@ uniqueness to a double-loaded batch, a key mixing two id schemes from a merged
 catalogue, a join whose columns share a name and none of their values, a table an
 interrupted load left empty, two columns whose declared type contradicts their
 content, and personal data alongside two deliberate false positives. `explore map`
-finds 6 PII columns, 5 joins, and 5 data-quality findings; `explore query "select
+finds 6 PII columns, 5 joins, and 6 data-quality findings; `explore query "select
 email from customers"` is refused, and the same count over the same column is not.
 
 The generation is create-only: it writes a new file and refuses rather than replace
@@ -213,6 +223,18 @@ exception, stated so it is never overclaimed: `explore semantic query --local`
 renders through MetricFlow, which ships no ClickHouse renderer, so that one
 capability refuses on ClickHouse by name rather than running.
 
+The semantic axis carries a second and larger set of named refusals, and they are
+a property of a format rather than an unfinished path. A native Apache Ossie
+layer is catalog-first: `explore semantic list` answers on every connector, while
+`explore semantic query`, `explore semantic values`, and
+`explore semantic list --for-dimension` refuse by name, because Ossie specifies
+interchange metadata and no portable query runtime, and states no
+metric-to-dimension relationship to invert. `--api` refuses too, since Ossie has
+no hosted deployment. Each refusal names the governed alternative rather than
+leaving the caller stuck, and the catalog declares what the format structurally
+cannot carry (no measures, no entities, no metric groupability) instead of
+returning empty fields a caller would read as facts about the layer.
+
 ### Commands
 
 `demo`: generates a seeded local DuckDB warehouse and wires it up, so a first run
@@ -224,7 +246,8 @@ on its own path, never through a connector, which is what keeps the read-only ru
 true everywhere else.
 
 `explore`: ranks what matters in an unfamiliar warehouse, profiles columns
-selectively, flags PII, surfaces grain and data-quality warnings, infers joins
+selectively, flags PII, surfaces grain and data-quality warnings with the ranked
+keys and the reasoning behind each, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
 ad-hoc SELECTs behind a PII-aware query firewall (`explore query`, which takes
 several statements per call, or a `--sql-file`, and adjudicates each on its own),
@@ -235,19 +258,48 @@ one. It starts bare by default; with `--use-project` it reads an existing
 dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
-writing back to `.dex/config.yml`. It also queries the dbt semantic layer
-(`explore semantic list` / `query`): metric queries run either locally through
-MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt Cloud
-deployment (`--api`), where dbt Cloud executes server-side and every result warns
-that dex's cost guard does not apply there.
+writing back to `.dex/config.yml`. It also reads and queries the semantic layer
+(`explore semantic list` / `values` / `query`). `list` returns the layer's objects,
+semantic models and metrics and their composition and measures and dimensions and
+the declared entity graph, in one shape from either backend, scopeable to the
+metrics a caller came for (or, with `--for-dimension`, to the metrics a given slice
+is available on, or, with `--search`, to the metrics a word matches in a name or in
+the project's own prose) and costing no warehouse query. The catalog is budgeted
+like the map, with every cut counted in the payload and `--full` to lift the caps,
+so a complete answer says that it is complete. Each semantic model carries the
+relation it sits on and each element the column behind it, which is what connects a
+metric to the objects `explore map` and `explore profile` describe; the hosted
+backend exposes columns but no relations, and declares that gap rather than leaving
+it to be inferred. That link runs both ways: with `--use-project`, `explore map`
+marks each object with the semantic models that expose it and draws the joins the
+layer declares, at the declared tier and with the entity named. `values` returns one dimension's
+value domain, which is what you need before writing a filter and the only way to
+reach it at all on a hosted layer. Metric queries run either locally
+through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt
+Cloud deployment (`--api`), where dbt Cloud executes server-side and every result
+warns that dex's cost guard does not apply there. A native Apache Ossie layer
+answers `list` the same way and refuses the two query verbs, and its declarations
+reach `--use-project` through the same channels a dbt project's do: source
+annotations on the map, declared keys including a composite grain, and declared
+relationships whose ordered column pairs stay whole through the diagram and
+through `--verify`, which measures a composite as one complete tuple and never
+one column at a time.
 
 `transform`: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and
 deterministic staging scaffolds into reviewable, conflict-checked diffs
 (`transform plan` / `apply`, with human edits authoritative on conflict), runs
 gated dev-target-only builds with cost surfaced before any spend
-(`transform build`), and authors the semantic layer as MetricFlow-validated dbt
-semantic models (`semantic define|update|plan`, applied with `transform apply`).
+(`transform build`), and authors the semantic layer, either as
+MetricFlow-validated dbt semantic models
+(`semantic define|update|plan`, applied with `transform apply`) or as whole
+native Apache Ossie documents (`semantic ossie define|update|plan`, applied the
+same way). The native route is validated against the pinned Ossie schema, its own
+integrity rules, and expression syntax, and then against the exploration cache
+without opening a connection, so a reference the cache contradicts refuses and
+stores no plan while anything the cache cannot speak to is a named note. Accepted
+bytes are written exactly as authored, comments and formatting included, and only
+to the exact documents the semantic axis declares.
 It also answers, and then acts on, "where is this used": `transform references`
 reports every use of a name across model SQL, `schema.yml`, `dbt_project.yml`,
 macros, semantic YAML, seed headers and installed packages, jinja-aware and honest
@@ -258,6 +310,21 @@ derived column that several models need should be defined, proposing the lowest
 common ancestor in the `ref()` graph along with the reasoning behind the choice.
 All four are repo-only and free on every connector.
 
+The whole lifecycle also runs across more than one process, for an application
+that plans where the model runs, applies offline in a disposable checkout, and
+builds in a sandbox holding only a dev credential. `transform export` turns a
+stored plan into a document a second process can check and apply, digest and all;
+`transform apply --plan-file` applies one where the plan store has never been,
+with no connector, no dbt, and no network; `transform ground` says what the change
+depends on and how complete that answer is; `transform classify` says whether an
+edit's content actually runs anything, from the content rather than from the kind
+it was filed under; and `transform preflight` says what the warehouse itself will
+enforce on the next build. On the build, `data.outcome` says what the run
+established, which `success` cannot: an empty selection exits zero, and so does a
+build of a model the change never touched. See `references/host-integration.md`,
+and the conformance vectors that ship in the wheel for a consumer to assert its
+own reader against.
+
 `maintain`: detects drift against the `.dex/` snapshot on four axes and proposes
 the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
 and semantic (definitions, dangling references, and dimension cardinality).
@@ -266,7 +333,13 @@ proposes reviewable diffs tagged mechanical or advisory, applied through
 `transform apply`. Detection is read-only on every connector; on billed
 connectors the metadata axes (schema, volume, references) stay free while the
 scanning axes (grain, dimension cardinality) take the `--confirm --budget`
-handshake, so `check` is two-phase.
+handshake, so `check` is two-phase. The transformation project and the semantic
+layer are fingerprinted independently, so a repository with a semantic layer and
+no dbt project still gets a baseline and still runs every free axis; a native
+semantic layer contributes its definitions, its declared keys, and its
+relationships with every ordered column pair, and whether that side was captured
+is itself recorded, so a baseline written before it reports the relationship axis
+as unchecked rather than as clean.
 
 ### Connectors
 
@@ -282,9 +355,11 @@ BigQuery: connects through Application Default Credentials
 asks for keys). Metadata is free; every scan is dry-run first, returned as a
 `needs_confirmation` estimate, and runs only with `--confirm --budget <bytes>`,
 capped server-side by `maximum_bytes_billed` and recorded in a local
-`.dex/spend.jsonl` ledger. dbt builds go to a dedicated dev dataset via
-dbt-bigquery, which the `[bigquery]` extra carries. See
-[`references/bigquery.md`](../../references/bigquery.md).
+`.dex/spend.jsonl` ledger (one JSON object per line, every row declaring its
+kind, documented in
+[`references/command-contract.md`](../../references/command-contract.md)). dbt
+builds go to a dedicated dev dataset via dbt-bigquery, which the `[bigquery]`
+extra carries. See [`references/bigquery.md`](../../references/bigquery.md).
 
 Snowflake: connects through discovered credentials (`connections.toml`,
 `SNOWFLAKE_*` env, or a dbt profile; dex never asks for or persists a
@@ -344,13 +419,15 @@ a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
 carries, with the ceiling injected as a statement timeout through
 `PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
 
-ClickHouse: the self-hosted analytical connector. Connects through discovered
+ClickHouse: the self-hosted analytical connector and ClickHouse Cloud warehouse.
+Connects through discovered
 credentials (`CLICKHOUSE_URL`, the `CLICKHOUSE_*` environment, a committed
 non-secret target, or a dbt profile). Identifiers are two-part
 `database.table`, because ClickHouse has no catalog level and dbt-clickhouse's
-`schema:` is the ClickHouse database. Nothing is billed in dollars; the
-guarded quantity is load on a server that is usually shared, so budgets are
-**database-seconds** through the same confirm handshake. Estimates come from
+`schema:` is the ClickHouse database. Self-hosted budgets are
+**database-seconds**; Cloud budgets are **compute-seconds**, with live
+per-replica memory translating them to approximate compute-unit-hours and
+optional USD. Estimates come from
 the free, non-executing `EXPLAIN ESTIMATE`, which prices a statement after
 primary-key pruning, with a `system.tables` fallback for the relations it does
 not cover; the budget is hard-enforced anyway by a per-statement
@@ -360,9 +437,8 @@ the server's own elapsed time, so the ledger records what the server spent
 rather than what the client waited. The session sends `readonly = 2` and
 `allow_ddl = 0` on every statement, and dbt builds go to a dedicated dev
 database via dbt-clickhouse, which the `[clickhouse]` extra carries, with the
-ceiling injected through the profile's `custom_settings`. ClickHouse Cloud
-bills compute-unit-hours, which dex does not yet model, and is refused at
-connect rather than guarded in the wrong unit. See
+ceiling injected through the profile's `custom_settings`. Cloud corroborates
+`cloud_mode` and fails closed unless every replica reports its capacity. See
 [`references/clickhouse.md`](../../references/clickhouse.md).
 
 ## License

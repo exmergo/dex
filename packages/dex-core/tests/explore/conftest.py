@@ -18,6 +18,34 @@ def _isolated_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.chdir(tmp_path)
 
 
+@pytest.fixture
+def profile_findings_duckdb(tmp_path: Path) -> Path:
+    """A table with a clean split between columns that carry a finding and
+    columns that don't, for #288's default column summary.
+
+    ``id`` is a proven key, ``email`` is PII: both must survive the default.
+    ``amount`` and ``tag`` repeat (30 distinct values over 50 rows: not
+    unique, and past both the 25-value cap and the 10%-of-rows fraction that
+    would otherwise earn a value domain), carry no PII and no nulls, and are
+    named in no data-quality note: both must be elided by default and
+    restored under ``--columns all``.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "profile_findings.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE wide_profile (id INTEGER, email VARCHAR, amount DOUBLE, "
+        "tag VARCHAR)"
+    )
+    conn.executemany(
+        "INSERT INTO wide_profile VALUES (?, ?, ?, ?)",
+        [(i, f"u{i}@x.com", (i % 30) * 1.5, f"tag_{i % 30}") for i in range(50)],
+    )
+    conn.close()
+    return path
+
+
 def unreachable_warehouse(monkeypatch) -> None:
     """Every attempt to open a connection fails, the way an uninstalled connector
     extra or an absent credential fails. Applied AFTER the cache exists, because
@@ -248,6 +276,74 @@ def composite_grain_duckdb(tmp_path: Path) -> Path:
         "SELECT o.range::INTEGER AS order_key, l.range::INTEGER AS line_number, "
         "(l.range % 2)::INTEGER AS quantity "
         "FROM range(1, 501) o, range(1, 5) l"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def near_unique_key_duckdb(tmp_path: Path) -> Path:
+    """The field failure of issue #292: an orders table whose own key is unique
+    on all but 110 of 2,037 rows, so every high-cardinality column completes it.
+
+    Before the artifact rules, this table reported five candidate keys and
+    elected a grain out of them: `(order_id, customer_id)`, and `created_at`,
+    `subtotal`, `grand_total` and `updated_at` each paired with `order_id`. All
+    five are genuinely unique over these rows, so the fixture is a real
+    regression test rather than a mock of one: rows 1928..2037 repeat ids
+    1..110, and the twin rows differ in every one of those five columns.
+
+    No column is unique on its own, so the composite probe really runs.
+    `status` is functionally determined by `order_id` on purpose: it is a
+    bounded enumeration, so it is the one partner still asked, and it honestly
+    fails to prove.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "near_unique_key.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE orders AS SELECT "
+        "  (CASE WHEN r <= 1927 THEN r ELSE r - 1927 END)::BIGINT AS order_id, "
+        "  ((r % 640) + 1)::INTEGER AS customer_id, "
+        "  (['new', 'paid', 'shipped', 'closed'])"
+        "    [(CASE WHEN r <= 1927 THEN r ELSE r - 1927 END) % 4 + 1] AS status, "
+        "  (((r % 1900) * 7 + 13) / 100.0)::DECIMAL(12,2) AS subtotal, "
+        "  (((r % 1850) * 11 + 29) / 100.0)::DECIMAL(12,2) AS grand_total, "
+        "  (TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (r % 2000) SECOND) "
+        "    AS created_at, "
+        "  (TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (r % 1950) MINUTE) "
+        "    AS updated_at "
+        "FROM (SELECT UNNEST(range(1, 2038)) AS r)"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def parent_line_grain_duckdb(tmp_path: Path) -> Path:
+    """The fact-table shape whose grain the pair probe used to discard: a
+    parent-plus-line key sitting beside a second id column that pairs with the
+    parent at a higher distinct-count product.
+
+    Six rows, distinct counts 4 / 2 / 3 / 4, no column unique on its own, and
+    ``(order_id, line_number)`` the only pair whose combinations cover every
+    row. ``(order_id, customer_id)`` is the decoy: two id-shaped columns, so it
+    ranks first, while ``customer_id`` is functionally determined by
+    ``order_id`` and the pair can never be a key.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "parent_line.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE order_items (order_id INTEGER, line_number INTEGER, "
+        "customer_id INTEGER, amount DOUBLE)"
+    )
+    conn.execute(
+        "INSERT INTO order_items VALUES "
+        "(1, 1, 10, 5.0), (1, 2, 10, 5.0), (2, 1, 20, 7.0), "
+        "(2, 2, 20, 8.0), (3, 1, 30, 9.0), (4, 1, 30, 9.0)"
     )
     conn.close()
     return path

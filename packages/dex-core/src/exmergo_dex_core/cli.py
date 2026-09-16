@@ -23,9 +23,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
+from typing import Any
 
 from . import command_args
 from . import envelope as env
+from .config import SEMANTIC_SOURCE_FACTORIES
 from .engine import DexEngine
 from .guards.cost_guard import ConfirmationRequiredError, CostGuardError
 from .guards.dialect import DialectDependencyError
@@ -33,6 +35,16 @@ from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
 
 # The full command surface. Group -> its subcommands.
+#
+# Adding a subcommand here means adding it to `DexEngine` too (#344): the CLI is
+# a wrapper over the engine, not a parallel implementation of it, so every entry
+# below needs a `DexEngine` method offering the same capability, unless it is
+# named in `_SUBCOMMAND_PARITY`'s CLI-only allowlist with a reason (see
+# `packages/dex-core/tests/test_cli_contract.py`, the section on CLI/DexEngine
+# parity). That test fails on a subcommand with no method and on one whose
+# method cannot express something the CLI can, which is what keeps the two
+# surfaces from drifting apart the way `DexEngine.check()` once had (it dropped
+# the object-scope argument all four of its sibling detectors accept).
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": [
@@ -58,8 +70,19 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "remove",
         "place",
         "test",
+        # The host boundary (#441): a plan a second process can carry and check,
+        # what that plan depends on, what its edits actually contain, and what
+        # the warehouse will enforce on the build that validates it. Every one is
+        # repo-only and free except `preflight`, which opens no connection either.
+        "export",
+        "ground",
+        "classify",
+        "preflight",
     ],
-    "semantic": ["define", "update", "plan"],
+    # `define`/`update`/`plan` author the dbt semantic layer; each vendor whose
+    # semantic layer is its own project format gets a subcommand of its own name
+    # for authoring that layer's native documents.
+    "semantic": ["define", "update", "plan", *SEMANTIC_SOURCE_FACTORIES],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
     # `schema`/`volume`/`grain`/`semantic` are the per-axis deep detectors;
@@ -73,6 +96,9 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "grain",
         "semantic",
         "reconcile",
+        # verify: is the project correct right now, no baseline required
+        # (#224), unlike every other maintain subcommand above.
+        "verify",
     ],
     "viz": ["preview"],
     # demo: the on-ramp. No subcommands, because there is exactly one thing to
@@ -108,6 +134,7 @@ def _rewrite_unambiguous_bare_subcommand(argv: list[str]) -> list[str]:
             "--cache-backend",
             "--project-format",
             "--budget",
+            "--session-ceiling",
         }:
             i += 2
             continue
@@ -159,13 +186,79 @@ def _sub_connection_options() -> argparse.ArgumentParser:
     common.add_argument("--repo-root", default=argparse.SUPPRESS)
     common.add_argument("--confirm", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--budget", type=float, default=argparse.SUPPRESS)
+    # The two answers to the one-time cumulative-ceiling ask (issue #283). Both
+    # write `.dex/config.yml` once and then never matter again, which is why
+    # they sit beside `--budget` rather than under a subcommand of their own:
+    # the ask fires from a billed command, and the answer belongs on the re-run
+    # of that same command.
+    common.add_argument("--session-ceiling", type=float, default=argparse.SUPPRESS)
+    common.add_argument(
+        "--no-session-ceiling", action="store_true", default=argparse.SUPPRESS
+    )
     return common
+
+
+#: One line per group, shown both in --help's subcommand list and as the
+#: onboarding orientation (#296): `dex --help` is where a stranger's first
+#: contact lands, and a bare argparse flag/subcommand dump answered none of
+#: "what do the three verbs do", "how do I point this at data", or "what do
+#: I run first", which is exactly what a caller piping the output into
+#: `head -30` is looking for and not finding.
+_GROUP_HELP: dict[str, str] = {
+    "connect": "check a connector's own credentials and capabilities",
+    "explore": "make sense of a warehouse: rank objects, profile columns, infer joins",
+    "transform": "author and refactor dbt models, tests, and the semantic layer",
+    "semantic": "define dbt or native Ossie semantics as reviewable diffs",
+    "maintain": "detect drift against the last snapshot and propose the fix",
+    "viz": "preview the semantic layer (not yet implemented)",
+    "demo": "create a seeded local DuckDB warehouse to try dex against "
+    "(no credentials, no network)",
+}
+
+#: Authoring subcommands that read and report rather than author SQL, so the
+#: dialect gate does not apply. `transform references` is routed around the table
+#: entirely for the stronger version of the same reason (it must not even import
+#: the authoring module); these four can import it, and only need not be refused
+#: on an install with no connector extra.
+_NEEDS_NO_DIALECT = frozenset(
+    {
+        ("transform", "export"),
+        ("transform", "classify"),
+        ("transform", "preflight"),
+        # Grounding reads columns through the dialect engine where one is
+        # installed and names its absence as a limit where it is not, exactly as
+        # `transform references` does, so refusing here would turn a degraded
+        # answer into no answer.
+        ("transform", "ground"),
+    }
+)
+
+
+_EPILOG = """\
+Point it at data with --connector/--path, or commit a connector: block to
+.dex/config.yml (found by walking up from the working directory).
+
+DBT_PROFILES_DIR only locates dbt profiles.yml for dbt operations and the
+last-resort credential fallback; it does not select dex's connector or override
+--connector/--path or .dex/config.yml.
+
+No warehouse yet: `dex demo` seeds a local one, no credentials needed.
+Have one already: `dex explore map` is the command to run first -- it
+ranks what matters, profiles it, and infers how the tables join.
+
+`dex <group> --help` lists a group's own subcommands.
+"""
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dex",
-        description="dex-core command contract (Explore. Transform. Maintain.)",
+        description=(
+            "Explore an unfamiliar warehouse, transform it with reviewable\n"
+            "dbt edits, and maintain it as the world drifts."
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Real defaults live on the top-level parser so every namespace has them.
     parser.add_argument("--connector", default=None)
@@ -178,23 +271,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-format", default=None)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--budget", type=float, default=None)
+    parser.add_argument("--session-ceiling", type=float, default=None)
+    parser.add_argument("--no-session-ceiling", action="store_true")
 
     common = _sub_connection_options()
     groups = parser.add_subparsers(dest="group", required=True)
     for group, subcommands in COMMAND_SURFACE.items():
-        # `demo` is the only group carrying help text, and deliberately so: the
-        # top-level --help is where a stranger's first contact lands, and the one
-        # thing worth saying there is what to run when you have no warehouse yet.
-        gp = groups.add_parser(
-            group,
-            parents=[common],
-            help=(
-                "create a seeded local DuckDB warehouse to try dex against "
-                "(no credentials, no network)"
-                if group == "demo"
-                else None
-            ),
-        )
+        gp = groups.add_parser(group, parents=[common], help=_GROUP_HELP.get(group))
         if group == "demo":
             # Positional rather than --path: --path names the warehouse dex
             # reads, everywhere, and this is the one command that writes one.
@@ -203,9 +286,20 @@ def _build_parser() -> argparse.ArgumentParser:
             sub = gp.add_subparsers(dest="subcommand", required=True)
             for name in subcommands:
                 sp = sub.add_parser(name, parents=[common])
+                if group == "maintain" and name == "snapshot":
+                    sp.add_argument(
+                        "--project-only", action="store_true", default=False
+                    )
                 if group == "explore" and name == "inventory":
                     sp.add_argument(
                         "--rank", action="store_true", default=argparse.SUPPRESS
+                    )
+                    # Ranked inventory is capped by default (#289); --limit widens
+                    # it, --all lifts the cap entirely. Both are no-ops without
+                    # --rank, since the unranked list carries no order to cut from.
+                    sp.add_argument("--limit", type=int, default=None)
+                    sp.add_argument(
+                        "--all", action="store_true", default=argparse.SUPPRESS
                     )
                 if group == "explore" and name == "profile":
                     sp.add_argument("objects", nargs="+")
@@ -240,19 +334,45 @@ def _build_parser() -> argparse.ArgumentParser:
                         type=int,
                         default=argparse.SUPPRESS,
                     )
-                # `explore semantic list|query` queries the dbt semantic layer
-                # (distinct from the top-level `semantic` group, which authors it).
-                # The backend (local MetricFlow vs a hosted dbt Cloud deployment) is
-                # ambient: the .dex config `semantic.backend`, overridable here with
-                # --local / --api.
+                # `explore semantic list|query` reads and queries the dbt
+                # semantic layer (distinct from the top-level `semantic` group,
+                # which authors it). Which layer answers is ambient: the .dex
+                # config `semantic.vendor` and `semantic.deployment` (or the
+                # released `semantic.backend` spelling of the two), overridable
+                # here with --local / --api.
                 if group == "explore" and name == "semantic":
                     # Bare `explore semantic` lists (discovery is first-class);
-                    # `explore semantic query` runs a metric query.
+                    # `values` returns one dimension's value domain, and `query`
+                    # runs a metric query.
                     sp.add_argument(
-                        "mode", nargs="?", choices=["list", "query"], default="list"
+                        "mode",
+                        nargs="?",
+                        choices=["list", "values", "query"],
+                        default="list",
                     )
+                    # Named metrics mean something in both modes, which is why one
+                    # pair of spellings serves both: in `query` they are what to
+                    # measure, in `list` they scope the catalog to those metrics
+                    # and what they reach. A whole layer's catalog is one payload
+                    # and mostly about something else, so a caller that already
+                    # knows the metric should not have to read past it.
+                    # In `list` and `query` these are metrics; in `values` the
+                    # one positional is the dimension, and `--metric` scopes it.
                     sp.add_argument("metrics", nargs="*")
                     sp.add_argument("--metric", action="append", default=None)
+                    # The reverse of a metric's dimension list: which metrics can
+                    # be grouped by all of these. `list` only, and refused rather
+                    # than dropped in the other two modes.
+                    sp.add_argument("--for-dimension", action="append", default=None)
+                    # A word rather than a name, matched against every element's
+                    # own name and the project's words about it. `list` only, and
+                    # refused in the other two modes rather than dropped.
+                    sp.add_argument("--search", action="append", default=None)
+                    # Lifts the catalog's payload caps. Deliberately `--full`
+                    # rather than `--detail`: nothing here scans, so the word
+                    # carries its usual sense on this surface (stop selecting,
+                    # take everything) with no cost attached to it.
+                    sp.add_argument("--full", action="store_true", default=False)
                     sp.add_argument("--group-by", action="append", default=None)
                     sp.add_argument("--where", action="append", default=None)
                     sp.add_argument("--order-by", action="append", default=None)
@@ -298,6 +418,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=argparse.SUPPRESS,
                     )
+                    # Default summarizes each dataset's columns to the ones that
+                    # carry a finding (#288); --columns all restores the full list.
+                    sp.add_argument(
+                        "--columns", choices=["all"], default=argparse.SUPPRESS
+                    )
                 # Force a full re-profile even when the cache holds a fresh,
                 # schema-matching profile for a requested object (the default is
                 # skip-if-cached; --refresh is the escape hatch when the source
@@ -316,10 +441,36 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=argparse.SUPPRESS,
                     )
+                if group == "explore" and name in {"relationships", "map"}:
+                    sp.add_argument(
+                        "--use-hosted-semantic-layer",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                    )
                 # transform init takes the project name; plan the intent; apply
                 # the plan id; macro the shipped-macro name (none lists them).
-                if group == "transform" and name in {"init", "plan", "apply", "macro"}:
+                if group == "transform" and name in {
+                    "init",
+                    "plan",
+                    "apply",
+                    "macro",
+                    "export",
+                    "ground",
+                    "classify",
+                }:
                     sp.add_argument("argument", nargs="?", default=None)
+                if group == "transform" and name == "apply":
+                    # The offline half of the lifecycle: apply a plan document
+                    # this checkout's store has never seen. `--expect-digest` is
+                    # where authenticity enters, and it is separate from the file
+                    # on purpose, because the point is that it arrives by a
+                    # different route than the document does.
+                    sp.add_argument("--plan-file", default=None)
+                    sp.add_argument("--expect-digest", default=None)
+                if group == "transform" and name == "classify":
+                    sp.add_argument("--edits-file", default=None)
+                if group == "transform" and name == "preflight":
+                    sp.add_argument("--target", default=None)
                 if group == "transform" and name == "init":
                     sp.add_argument(
                         "--layered-schemas", action="store_true", default=False
@@ -355,6 +506,24 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                    # Opt-in on every connector, free ones included. Verifying
+                    # on DuckDB costs nothing, so defaulting it on there was
+                    # available; one flag meaning one thing everywhere is worth
+                    # more than saving the flag on one connector.
+                    sp.add_argument("--verify", action="store_true", default=False)
+                    # Which change this build is meant to validate, so the
+                    # evidence can report coverage rather than leaving a caller to
+                    # infer it from node names.
+                    sp.add_argument("--for-plan", default=None)
+                    # The same change, as the document a sandbox holds instead of
+                    # the store id the authoring process holds.
+                    sp.add_argument("--for-plan-file", default=None)
+                    # An off switch only, like `--no-auto-profile`: installing
+                    # missing packages is what an interactive build should do, and
+                    # the spelling that needs a flag is the sandbox's refusal.
+                    sp.add_argument(
+                        "--no-install-deps", action="store_true", default=False
+                    )
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is
                     # each of these used", which is the shape of a rename. `--kind`
@@ -371,7 +540,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
-                if group == "transform" and name in {"rename", "remove", "place"}:
+                if group == "transform" and name in {"rename", "remove"}:
                     # The write half of `references`, so it sits behind the
                     # dialect gate the read half is routed around: these author
                     # SQL and need the engine that parses it.
@@ -381,7 +550,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     # removes a declaration and refuses while a read survives,
                     # and only the caller knows what a read should become); a
                     # rename accepts it so a related hand-authored change can
-                    # ride in the same atomic plan.
+                    # ride in the same atomic plan. Not `place` (#344): it takes
+                    # no edits_file parameter and never read the flag, so the
+                    # parser accepted it as a silent no-op.
                     sp.add_argument("--edits-file", default=None)
                 if group == "transform" and name == "rename":
                     sp.add_argument("kind")
@@ -402,14 +573,40 @@ def _build_parser() -> argparse.ArgumentParser:
                     # calling one if a caller can ask for it cheaply and disagree.
                     sp.add_argument("--explain", action="store_true", default=False)
                 if group == "transform" and name == "test":
-                    # `test` is scaffold-only for now: the model to derive a
-                    # unit_tests: skeleton from. No bare `transform test`
-                    # mode exists yet, unlike `macro`'s list-when-bare shape.
-                    sp.add_argument("--scaffold", default=None)
-                if group == "semantic":
+                    # Two modes, and they are opposites: `--scaffold` writes a
+                    # unit test, `--mutate` measures the tests that already
+                    # exist. Mutually exclusive rather than ordered, because
+                    # asking for both in one call names no coherent outcome. No
+                    # bare `transform test` mode exists, unlike `macro`'s
+                    # list-when-bare shape.
+                    mode = sp.add_mutually_exclusive_group()
+                    mode.add_argument("--scaffold", default=None)
+                    mode.add_argument("--mutate", default=None)
+                    # Only ever narrows: the engine ceiling is what keeps a run
+                    # that invokes dbt once per mutant predictable.
+                    sp.add_argument("--max-mutants", type=int, default=None)
+                    sp.add_argument("--target", default=None)
+                if group == "semantic" and name in {"define", "update", "plan"}:
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
+                    # The per-definition payload: name only what changes, and the
+                    # engine writes it into the file that holds it. An entry's `op`
+                    # removes one instead, which is the only way a definition goes
+                    # away: never by going unmentioned.
+                    sp.add_argument("--definitions-file", default=None)
                     sp.add_argument("--no-parse", action="store_true", default=False)
+                if group == "semantic" and name in SEMANTIC_SOURCE_FACTORIES:
+                    # Whole documents in, so no `--definitions-file`: a native
+                    # document is authored as a unit, and the mode the dbt
+                    # routes carry in their subcommand name is an argument here.
+                    sp.add_argument(
+                        "mode",
+                        nargs="?",
+                        choices=["define", "update", "plan"],
+                        default=None,
+                    )
+                    sp.add_argument("argument", nargs="?", default=None)
+                    sp.add_argument("--edits-file", default=None)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {
@@ -418,6 +615,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "volume",
                     "grain",
                     "semantic",
+                    "verify",
                 }:
                     sp.add_argument("objects", nargs="*")
                 if group == "maintain" and name == "reconcile":
@@ -489,8 +687,9 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # executes the SQL, so the command needs no dialect engine, and a
         # pure-remote install ([semantic-api], no connector) must be able to reach
         # it. Importing the module below would pull the query firewall and defeat
-        # that. `--local` lands here too: `list` is a manifest read-view, and a
-        # local `query` reaches the dialect engine through MetricFlow's own path.
+        # that. `--local` lands here too: `list` reads the catalog through the
+        # project seam and parses no SQL, and a local `query` reaches the dialect
+        # engine through MetricFlow's own path.
         if args.subcommand == "semantic":
             from .explore.semantic.commands import cmd_semantic
 
@@ -511,7 +710,11 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return handlers[args.subcommand](args, engine)
 
     if args.group == "maintain":
-        ensure_dialect_available()
+        # Project-only snapshot refreshes use only the store and project seam;
+        # requiring a warehouse dialect here would make a zero-connection path
+        # depend on the very connector it deliberately does not touch.
+        if not (args.subcommand == "snapshot" and getattr(args, "project_only", False)):
+            ensure_dialect_available()
         from .maintain import commands as maintain_cmds
 
         handlers = {
@@ -522,6 +725,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "grain": maintain_cmds.cmd_grain,
             "semantic": maintain_cmds.cmd_semantic,
             "reconcile": maintain_cmds.cmd_reconcile,
+            "verify": maintain_cmds.cmd_verify,
         }
         return handlers[args.subcommand](args, engine)
 
@@ -543,6 +747,10 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
         ("transform", "test"): "cmd_test",
+        ("transform", "export"): "cmd_export",
+        ("transform", "ground"): "cmd_ground",
+        ("transform", "classify"): "cmd_classify",
+        ("transform", "preflight"): "cmd_preflight",
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
@@ -558,9 +766,43 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
         return cmd_references(args, engine)
 
+    # Native semantic authoring is routed around the table for the same trade,
+    # and without `ensure_dialect_available`: it authors whole documents through
+    # the vendor's own reader, so structure and integrity need only that
+    # vendor's extra. Parsing a SQL expression inside a document is optional and
+    # names its own skip when the dialect engine is absent, which is a weaker
+    # floor than the dbt authoring routes below can accept.
+    if args.group == "semantic" and args.subcommand in SEMANTIC_SOURCE_FACTORIES:
+        from .transform.native_semantic import cmd_semantic_ossie
+
+        return cmd_semantic_ossie(args, engine)
+
+    # `transform apply` writes bytes a plan already validated, so what it needs
+    # depends on the plan rather than on the verb. A semantic-document plan
+    # authors no SQL and reaches no dialect engine; gating it on sqlglot anyway
+    # would let an install that carries only a semantic reader author a plan it
+    # could never apply, which is the one command that install exists to run.
+    # The stored plan says which it is, so ask it and gate only what needs it.
+    if args.group == "transform" and args.subcommand == "apply":
+        # A plan document carries its own edits, so there is no stored plan to
+        # ask and, more to the point, nothing on this path parses SQL at all:
+        # gating it on the dialect engine would make the offline apply need a
+        # dependency it never uses, in the one environment least able to install
+        # one.
+        if getattr(args, "plan_file", None):
+            from .transform.commands import cmd_apply_document
+
+            return cmd_apply_document(args, engine)
+        if _apply_authors_sql(args, engine):
+            ensure_dialect_available()
+        from .transform.commands import cmd_apply
+
+        return cmd_apply(args, engine)
+
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
-        ensure_dialect_available()
+        if (args.group, args.subcommand) not in _NEEDS_NO_DIALECT:
+            ensure_dialect_available()
         from .transform import commands as transform_cmds
 
         return getattr(transform_cmds, handler)(args, engine)
@@ -569,12 +811,41 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return env.not_implemented(command_args.command_name(args))
 
 
+def _apply_authors_sql(args: argparse.Namespace, engine: Any) -> bool:
+    """Whether the plan this apply would write reaches the dialect engine.
+
+    Fails toward gating. Every reason this cannot answer (no store, no plan, an
+    unreadable one) is a reason the apply is about to refuse anyway, and it
+    should refuse with the message it always did rather than with a new one from
+    a route that was only trying to decide whether to check a dependency.
+    """
+
+    try:
+        store = engine.require_full_store("applying a plan")
+        plan_id = getattr(args, "argument", None)
+        if not plan_id:
+            latest = store.latest_plan(None)
+            if latest is None:
+                return True
+            plan_id = latest.plan_id
+        return store.load_plan(plan_id).edit_target != "semantic"
+    except Exception:
+        return True
+
+
 def main(argv: list[str] | None = None) -> int:
     from .command_args import repo_root
     from .connect import paradigm_for
 
     parser = _build_parser()
     raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw:
+        # A bare `dex` still has to pick a group (required=True below), but
+        # argparse's error for that is "the following arguments are required:
+        # group": true, useless to someone who does not know the groups exist
+        # yet. Route it to the same orientation --help gives instead.
+        parser.print_help()
+        return 0
     rewritten = _rewrite_unambiguous_bare_subcommand(raw)
     try:
         args = parser.parse_args(rewritten)
@@ -595,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--cache-backend",
                     "--project-format",
                     "--budget",
+                    "--session-ceiling",
                 }:
                     j += 2
                     continue
@@ -620,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
     # reason the paradigm is: `close()` drops the adapter the gate hangs off,
     # and it runs before the handlers below.
     spend: dict | None = None
+    connection = env.Connection()
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -642,6 +915,8 @@ def main(argv: list[str] | None = None) -> int:
             scopes=getattr(args, "scope", None),
             budget=getattr(args, "budget", None),
             confirmed=getattr(args, "confirm", False),
+            session_ceiling=getattr(args, "session_ceiling", None),
+            decline_session_ceiling=getattr(args, "no_session_ceiling", False),
         )
         try:
             envelope = dispatch(args, engine)
@@ -657,6 +932,7 @@ def main(argv: list[str] | None = None) -> int:
             # number about it.
             with contextlib.suppress(Exception):
                 spend = engine.settled_spend()
+            connection = engine.connection_provenance()
             engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
@@ -690,6 +966,13 @@ def main(argv: list[str] | None = None) -> int:
     if engine is not None and engine.connection_warnings:
         envelope.warnings = list(engine.connection_warnings) + list(envelope.warnings)
 
+    # A config amendment dex performed on the caller's behalf (the answer to the
+    # cumulative-ceiling ask, issue #283) rides out the same way, as a diff:
+    # the write happened before the command did, so even a command that failed
+    # afterwards has to report it or the file changed with nothing saying so.
+    if engine is not None and engine.config_diffs:
+        envelope.diffs = list(engine.config_diffs) + list(envelope.diffs)
+
     # Every command runs against a connector or against none, so every envelope
     # can name the paradigm a later billed command would spend in. Filled only
     # where nothing claimed one, so a deliberate label survives: `explore
@@ -698,6 +981,10 @@ def main(argv: list[str] | None = None) -> int:
     # `free_local`, which is DuckDB's answer and not a way to say nothing.
     if envelope.cost.paradigm is None and paradigm is not None:
         envelope.cost.paradigm = paradigm
+
+    # The connection identity is stamped centrally, just like cost paradigm:
+    # handlers cannot drift, and filling it performs no extra warehouse read.
+    envelope.connection = connection
 
     env.emit(envelope)
     return 0 if envelope.status != env.Status.ERROR else 1

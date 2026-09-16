@@ -1,0 +1,99 @@
+{
+  "name": "grounding-ambiguous",
+  "contract": "grounding",
+  "description": "A name an installed package also defines. dbt resolves the project's copy, and reporting only the winner hides that the package still ships its own.",
+  "payload": {
+    "edits": [
+      {
+        "path": "models/staging/mart.sql",
+        "new_content": "select o.order_id, c.region\nfrom {{ ref('stg_orders') }} o\nleft join {{ ref('stg_customers') }} c on o.customer_id = c.id\n",
+        "old_content_hash": null,
+        "op": "upsert",
+        "kind": "model_sql"
+      }
+    ]
+  },
+  "expect": {
+    "completeness": "complete",
+    "ambiguous_count": 1,
+    "result": {
+      "completeness": "complete",
+      "limits": [],
+      "unresolved": [],
+      "ambiguous": [
+        {
+          "name": "stg_orders",
+          "kind": "model",
+          "candidates": [
+            "shared:dbt_packages/shared/models/stg_orders.sql",
+            "this project:models/staging/stg_orders.sql"
+          ]
+        }
+      ],
+      "freshness": {
+        "manifest_present": false,
+        "generated_at": null,
+        "newest_source_at": "2026-09-08T01:04:26.652394+00:00",
+        "stale": null
+      },
+      "binding": {
+        "plan_digest": null,
+        "source_digest": "sha256:70cc1dd4fb5dc1831906721fa160c8c386f0ac0880fb2cc072910284f7f49c61",
+        "config_digest": null,
+        "packages_digest": "sha256:1fa04cfa6921dc2f3e97dfc7cec74cc90e67d833f44bcb30b9b2781c4e4d4b98",
+        "engine_version": "1.10.1.dev32+gb057fca4a.d20260906"
+      },
+      "relations": [],
+      "dependencies": [
+        {
+          "kind": "column",
+          "name": "customer_id",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "column",
+          "name": "id",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "column",
+          "name": "order_id",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "column",
+          "name": "region",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "model",
+          "name": "stg_customers",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "model",
+          "name": "stg_orders",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        }
+      ]
+    }
+  }
+}

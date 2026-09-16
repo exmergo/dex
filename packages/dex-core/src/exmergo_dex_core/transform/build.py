@@ -14,6 +14,7 @@ only a sanitized summary crosses the boundary. Node results come from dbt's own
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -21,11 +22,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import BaseModel
 
 from ..dbt_project import (
     PROFILES_FILE,
@@ -36,8 +39,8 @@ from ..dbt_project import (
     profiles_dir,
 )
 from ..dbt_project import load as load_project
-from ..envelope import Cost, Paradigm, redact
-from ..errors import DexError
+from ..envelope import Cost, EstimateQuality, Paradigm, redact
+from ..errors import DexError, PrerequisiteError
 from ..guards.cost_guard import preflight
 
 # Names that mean production no matter what the config says. The build target
@@ -55,6 +58,21 @@ _MESSAGE_MAX_CHARS = 400
 _MESSAGE_CAP = 20
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+class DependencyPolicy(str, Enum):
+    """What a build does when a declared package is not installed.
+
+    ``INSTALL`` is what an interactive user wants and what every build did before
+    this existed: run ``dbt deps`` post-gate so a first build never fails on a
+    step the agent has no verb for. ``REFUSE`` is what a sandbox wants: no
+    network, a pinned dependency set, and a build that must not quietly reach out
+    and resolve a package. The refusal names the packages, which a dbt failure
+    would not.
+    """
+
+    INSTALL = "install"
+    REFUSE = "refuse"
 
 
 class ProdTargetRefusedError(DexError):
@@ -98,9 +116,12 @@ def build(
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
     connector: str | None = None,
     estimate: float | None = None,
+    estimate_quality: EstimateQuality | None = None,
     dev_target_check: Callable[[], list[str]] | None = None,
     runner: Runner | None = None,
     timeout: float = _DBT_TIMEOUT_SECONDS,
+    dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
+    approved_functions: frozenset[str] | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -134,12 +155,28 @@ def build(
 
     target_warnings = dev_target_check() if dev_target_check is not None else []
 
+    if dependencies is DependencyPolicy.REFUSE:
+        assert_packages_installed(project)
+
     gate_estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else estimate
-    cost = preflight(gate_estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
+    cost = preflight(
+        gate_estimate,
+        ceiling,
+        paradigm=paradigm,
+        confirmed=confirmed,
+        # Carried so a finished build reports its estimate's worth exactly as the
+        # confirmation ask did. Without it the handshake said `exact` and the run
+        # it authorized came back claiming nothing had been priced.
+        estimate_quality=estimate_quality,
+    )
 
     # Most real projects carry a packages.yml, and dbt refuses to compile until
     # its packages are installed; running deps here (post-gate) means the first
     # build never fails on a missing `dbt deps` step the agent has no verb for.
+    # A sandbox with no network asks for the refusal before the subprocess, so
+    # the policy is read ahead of the presence check rather than inside it: the
+    # useful message names the packages, and `dbt deps` failing to reach a
+    # registry does not.
     deps_ran = False
     if needs_deps(project):
         deps_summary = deps(project, runner=runner)
@@ -186,6 +223,17 @@ def build(
     run = runner or _default_runner(
         timeout, project, env=_build_env(connector, paradigm, ceiling)
     )
+    if approved_functions:
+        from ..adapters import get_dialect
+
+        _compile_project(project, target=target, select=select, runner=run)
+        _assert_compiled_functions(
+            project,
+            dialect=get_dialect(connector or "duckdb"),
+            approved_functions=approved_functions,
+        )
+        # Compilation also writes run_results; it is not build evidence.
+        (project / "target" / "run_results.json").unlink(missing_ok=True)
     completed = run(argv)
 
     summary = _summarize(project, target, completed)
@@ -196,6 +244,47 @@ def build(
         # is promoted to the envelope's error line on failure.
         summary["notes"] = list(target_warnings)
     return summary, cost
+
+
+@contextlib.contextmanager
+def shadow_project(
+    project_dir: Path | str, edits: Sequence[Edit] = ()
+) -> Iterator[Path]:
+    """A throwaway copy of the project with ``edits`` overlaid, yielded by path.
+
+    The copy is what lets dex run dbt against a hypothetical version of a project
+    without touching the real one: everything dbt writes into it (``target/``,
+    ``logs/``, any stray database a relative profile path would create) lives and
+    dies with the copy.
+
+    ``dbt_packages/`` is deliberately copied, because parsing needs the installed
+    macros. Warehouse files deliberately are not: they can be huge, and a copy of
+    a database is not the database, so a caller that needs the real warehouse must
+    reach it through the profile rather than through the tree. ``.dex`` matters
+    when the project is the repo root.
+    """
+
+    project = Path(project_dir).resolve()
+    view = load_project(project)
+    with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
+        shadow = Path(tmp) / (project.name or "project")
+        shutil.copytree(
+            project,
+            shadow,
+            ignore=shutil.ignore_patterns(
+                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
+            ),
+        )
+        for edit in edits:
+            edit_path = contained_path(shadow, edit.path, view)
+            if edit.op is EditOp.DELETE:
+                # Remove it from the copy so the parse runs against the true
+                # post-deletion tree: a surviving ref() to it fails dbt's parse.
+                edit_path.unlink(missing_ok=True)
+            else:
+                edit_path.parent.mkdir(parents=True, exist_ok=True)
+                edit_path.write_text(edit.new_content, encoding="utf-8")
+        yield shadow
 
 
 def shadow_parse(
@@ -246,29 +335,7 @@ def shadow_parse(
             "messages": [],
         }
 
-    view = load_project(project)
-    with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
-        shadow = Path(tmp) / (project.resolve().name or "project")
-        # dbt_packages/ is deliberately copied (parse needs installed macros);
-        # warehouse files are deliberately not (parse never reads them, and
-        # they can be huge). `.dex` matters when the project is the repo root.
-        shutil.copytree(
-            project,
-            shadow,
-            ignore=shutil.ignore_patterns(
-                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
-            ),
-        )
-        for edit in edits:
-            edit_path = contained_path(shadow, edit.path, view)
-            if edit.op is EditOp.DELETE:
-                # Remove it from the copy so the parse runs against the true
-                # post-deletion tree: a surviving ref() to it fails dbt's parse.
-                edit_path.unlink(missing_ok=True)
-            else:
-                edit_path.parent.mkdir(parents=True, exist_ok=True)
-                edit_path.write_text(edit.new_content, encoding="utf-8")
-
+    with shadow_project(project, edits) as shadow:
         # A profiles.yml edit only takes effect if dbt reads the shadowed copy;
         # pointing --profiles-dir at the real project would parse the edit
         # against the unedited profile. Redirect to the shadow when the
@@ -305,6 +372,202 @@ def shadow_parse(
     return {"available": True, "reason": None, "success": success, "messages": messages}
 
 
+# dbt reads these from the environment, and each one can silently change which
+# tests run, what a status means, or where dbt writes. A mutation run has to mean
+# the same thing on every machine, and the one that matters most is
+# `DBT_INDIRECT_SELECTION`: set to `cautious` it drops the tests from the
+# selection, every mutant then survives, and the report says the suite is weak
+# when in fact it was never asked.
+_ISOLATED_ENV_SCRUBBED = (
+    "DBT_TARGET_PATH",
+    "DBT_LOG_PATH",
+    "DBT_STATE",
+    "DBT_DEFER_STATE",
+    "DBT_STORE_FAILURES",
+    "DBT_WARN_ERROR",
+    "DBT_WARN_ERROR_OPTIONS",
+    "DBT_RESOURCE_TYPES",
+    "DBT_EXCLUDE_RESOURCE_TYPES",
+    "DBT_SELECTOR",
+    "DBT_EMPTY",
+    "DBT_FULL_REFRESH",
+    "DBT_INDIRECT_SELECTION",
+    "DBT_DEFER",
+    "DBT_FAVOR_STATE",
+    "DBT_FAIL_FAST",
+)
+
+
+class ShadowRun:
+    """A copied project that dbt can be run against many times, never the real one.
+
+    :func:`shadow_parse` copies a project to parse it once. This is the same
+    isolation held open across a sequence of invocations, which is what mutation
+    coverage needs: one copy, then a compile and N test runs against it, each
+    with a different version of one model's file.
+
+    Stateful by nature, hence a class rather than a function taking the same six
+    arguments each call: it owns the copy's lifetime, and dbt's partial-parse
+    cache inside the copy is what keeps run N+1 from re-parsing the whole project.
+
+    **cwd stays at the real project, and every artifact path is passed as a flag.**
+    That split is deliberate and it is the only arrangement that is safe on every
+    connector. dbt resolves ``target/`` and ``logs/`` against ``--project-dir``,
+    so the flags keep its writes inside the copy; dbt-duckdb resolves a relative
+    ``path:`` in the profile against the *process* cwd, so leaving cwd at the real
+    project is what lets a copied project still reach the real dev database.
+    Copying or linking the database instead would split it from its
+    write-ahead log, which risks the user's data rather than merely confusing dbt.
+    """
+
+    def __init__(
+        self,
+        project_dir: Path | str,
+        *,
+        target: str,
+        connector: str | None = None,
+        paradigm: Paradigm = Paradigm.FREE_LOCAL,
+        ceiling: float | None = None,
+        runner: Runner | None = None,
+        timeout: float = _DBT_TIMEOUT_SECONDS,
+    ):
+        self.project = Path(project_dir).resolve()
+        self.target = target
+        self._connector = connector
+        self._paradigm = paradigm
+        self._ceiling = ceiling
+        self._runner = runner
+        self._timeout = timeout
+        self._stack = contextlib.ExitStack()
+        self.shadow: Path | None = None
+        self.view = None
+
+    def __enter__(self) -> ShadowRun:
+        self.view = load_project(self.project)
+        self.shadow = self._stack.enter_context(shadow_project(self.project))
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stack.close()
+        self.shadow = None
+
+    def write(self, rel_path: str, text: str) -> None:
+        """Put a file into the copy, confined to the project's editing surface."""
+
+        path = contained_path(self._require_shadow(), rel_path, self.view)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def strip_run_hooks(self) -> bool:
+        """Drop ``on-run-start`` and ``on-run-end`` from the copy. True if any went.
+
+        A hook fires once per invocation, and this runs dbt once per mutant, so a
+        project whose hooks grant permissions or write an audit row would do that
+        N+1 times for a command the user thinks of as read-only.
+        """
+
+        manifest = self._require_shadow() / "dbt_project.yml"
+        if not manifest.is_file():
+            return False
+        parsed = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+        present = [key for key in ("on-run-start", "on-run-end") if key in parsed]
+        if not present:
+            return False
+        for key in present:
+            parsed.pop(key)
+        manifest.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+        return True
+
+    def manifest(self) -> dict[str, Any]:
+        path = self._require_shadow() / "target" / "manifest.json"
+        if not path.is_file():
+            raise DbtRunError("dbt wrote no manifest for the copied project")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def compile(self, select: str) -> dict[str, Any]:
+        """Compile one selection in the copy and return the manifest dbt wrote."""
+
+        completed = self._invoke("compile", "--select", select)
+        if completed.returncode != 0:
+            messages = _collect_messages(completed)
+            raise DbtRunError(messages[0] if messages else "dbt compile failed")
+        return self.manifest()
+
+    def test(
+        self, select: str, *, exclude: Sequence[str] = ()
+    ) -> dict[str, Any] | None:
+        """Run one selection's tests. ``None`` when dbt wrote no results at all.
+
+        ``dbt test``, never ``dbt build``. Two reasons, and both are load-bearing.
+        A build runs a model's unit tests before the model, so one failing unit
+        test marks the model skipped and the skip cascades onto every data test
+        attached to it: the run would then report four tests as skipped and the
+        caller could not tell which of them would have caught the defect. And
+        ``dbt test`` executes no model materialization at all, so even a config
+        override that failed to apply could not write a relation.
+        """
+
+        args = ["--select", select]
+        for name in exclude:
+            args += ["--exclude", name]
+        completed = self._invoke("test", *args)
+        results = self._require_shadow() / "target" / "run_results.json"
+        if not results.is_file():
+            return None
+        return _summarize(self._require_shadow(), self.target, completed)
+
+    def _invoke(self, verb: str, *args: str) -> subprocess.CompletedProcess:
+        shadow = self._require_shadow()
+        # Cleared first: dbt writes this as part of running, so a leftover from
+        # the previous mutant would otherwise be read as this one's answer.
+        (shadow / "target" / "run_results.json").unlink(missing_ok=True)
+        argv = [
+            _dbt_executable(),
+            verb,
+            "--target",
+            self.target,
+            "--project-dir",
+            str(shadow),
+            "--profiles-dir",
+            str(profiles_dir(self.project).resolve()),
+            "--target-path",
+            str(shadow / "target"),
+            "--log-path",
+            str(shadow / "logs"),
+            "--log-format",
+            "json",
+            # Pinned rather than inherited, for the reason the environment is
+            # scrubbed: each of these changes what a run means.
+            "--indirect-selection",
+            "eager",
+            "--no-defer",
+            "--no-favor-state",
+            "--no-fail-fast",
+            *args,
+        ]
+        run = self._runner or _default_runner(
+            self._timeout, self.project, env=self._env()
+        )
+        return run(argv)
+
+    def _env(self) -> dict[str, str]:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _ISOLATED_ENV_SCRUBBED
+        }
+        # dbt writes a `.user.yml` into the profiles directory when usage
+        # tracking is on, and the profiles directory here is the real project.
+        env["DO_NOT_TRACK"] = "1"
+        env.update(_build_env(self._connector, self._paradigm, self._ceiling) or {})
+        return env
+
+    def _require_shadow(self) -> Path:
+        if self.shadow is None:
+            raise DbtRunError("the shadow project is only open inside a `with` block")
+        return self.shadow
+
+
 def has_package_spec(project_dir: Path | str) -> bool:
     """True when the project declares dbt packages (packages.yml, or a
     dependencies.yml with a ``packages:`` key)."""
@@ -320,6 +583,212 @@ def has_package_spec(project_dir: Path | str) -> bool:
             return False
         return isinstance(parsed, dict) and bool(parsed.get("packages"))
     return False
+
+
+class DeclaredPackage(BaseModel):
+    """One entry from ``packages.yml`` or ``dependencies.yml``.
+
+    ``install_name`` is the directory dbt installs it into, which is what a
+    presence check compares against, and it is ``None`` wherever the declaration
+    does not determine it. A git URL names a repository and a dbt package names
+    itself, and those disagree often enough that guessing would report an
+    installed package as missing. ``None`` means dex cannot check this one, never
+    that it is fine.
+    """
+
+    source: str
+    name: str
+    version: str | None = None
+    install_name: str | None = None
+
+    def describe(self) -> str:
+        return f"{self.name}@{self.version}" if self.version else self.name
+
+
+def _package_entries(project: Path) -> list[dict[str, Any]]:
+    """The raw ``packages:`` list, from whichever file declares it."""
+
+    for filename in ("packages.yml", "dependencies.yml"):
+        candidate = project / filename
+        if not candidate.is_file():
+            continue
+        try:
+            parsed = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("packages"), list):
+            return [e for e in parsed["packages"] if isinstance(e, dict)]
+    return []
+
+
+def declared_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+    """Every package the project declares, in the three forms dbt accepts.
+
+    Read rather than resolved: this says what the project asks for, not what a
+    registry would hand back. That is the right half for a refusal, whose whole
+    job is to name what the sandbox was expected to already have.
+    """
+
+    project = Path(project_dir)
+    packages: list[DeclaredPackage] = []
+    for entry in _package_entries(project):
+        if isinstance(entry.get("package"), str):
+            name = entry["package"]
+            packages.append(
+                DeclaredPackage(
+                    source="hub",
+                    name=name,
+                    version=_version_text(entry.get("version")),
+                    install_name=name.rsplit("/", 1)[-1] or None,
+                )
+            )
+        elif isinstance(entry.get("git"), str):
+            packages.append(
+                DeclaredPackage(
+                    source="git",
+                    name=entry["git"],
+                    version=_version_text(entry.get("revision")),
+                    # A repository name is not a dbt package name, and dbt
+                    # installs under the latter. Left unknown rather than guessed.
+                    install_name=None,
+                )
+            )
+        elif isinstance(entry.get("local"), str):
+            local = entry["local"]
+            packages.append(
+                DeclaredPackage(
+                    source="local",
+                    name=local,
+                    install_name=Path(local).name or None,
+                )
+            )
+        elif isinstance(entry.get("tarball"), str):
+            packages.append(
+                DeclaredPackage(
+                    source="tarball", name=entry["tarball"], install_name=None
+                )
+            )
+    return packages
+
+
+def _version_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def installed_packages(project_dir: Path | str) -> set[str]:
+    """What is actually in ``dbt_packages/``, by directory and by declared name.
+
+    Both, because dbt installs a hub package into a directory named after the
+    package's second segment while the package's own ``dbt_project.yml`` may say
+    something else, and a check that reads only one of them reports a present
+    package as absent.
+    """
+
+    installed: set[str] = set()
+    root = Path(project_dir) / "dbt_packages"
+    if not root.is_dir():
+        return installed
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        installed.add(child.name)
+        manifest = child / "dbt_project.yml"
+        if not manifest.is_file():
+            continue
+        try:
+            parsed = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("name"), str):
+            installed.add(parsed["name"])
+    return installed
+
+
+def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+    """Declared packages this project does not have installed.
+
+    An empty ``dbt_packages/`` means every declaration is missing, which is the
+    common sandbox case and the one where naming them all is most useful.
+    Otherwise only the ones dex can check are reported: a declaration whose
+    install name is unknown is left out rather than named on a guess, and
+    :func:`unverifiable_packages` is how a caller learns that happened.
+    """
+
+    project = Path(project_dir)
+    declared = declared_packages(project)
+    if not declared:
+        return []
+    installed = installed_packages(project)
+    if not installed:
+        return declared
+    return [
+        package
+        for package in declared
+        if package.install_name is not None and package.install_name not in installed
+    ]
+
+
+def unverifiable_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+    """Declared packages whose presence dex cannot check by name."""
+
+    if not installed_packages(project_dir):
+        return []
+    return [p for p in declared_packages(project_dir) if p.install_name is None]
+
+
+class MissingPackagesError(PrerequisiteError):
+    """A build refused because a declared package is not installed.
+
+    A :class:`~..errors.PrerequisiteError` because that is the one refusal family
+    a caller can resolve automatically: run the named command and retry. In a
+    sandbox with no network the command is not runnable there, and the refusal
+    still names what the image was supposed to bake in, which is the actionable
+    half.
+    """
+
+    def __init__(
+        self,
+        packages: list[DeclaredPackage],
+        unverifiable: list[DeclaredPackage] | None = None,
+    ):
+        self.packages = packages
+        self.unverifiable = unverifiable or []
+        detail = (
+            "these declared dbt packages are not installed: "
+            + ", ".join(p.describe() for p in packages)
+            if packages
+            else "the declared dbt package installation cannot be verified"
+        )
+        if self.unverifiable:
+            detail += (
+                "; dex could not check "
+                + ", ".join(p.describe() for p in self.unverifiable)
+                + " by name, so those may be missing too"
+            )
+        super().__init__(
+            f"this build may not install dependencies, and {detail}. "
+            "Run `transform deps` "
+            "where the network is available, or bake dbt_packages/ into the "
+            "environment before the build"
+        )
+
+
+def assert_packages_installed(project_dir: Path | str) -> None:
+    """Check every declaration, even when some packages are already installed.
+
+    REFUSE cannot establish an installation whose declared name is unknown;
+    report that uncertainty instead of admitting it as an installed package.
+    The interactive installation heuristic remains separate.
+    """
+
+    missing = missing_packages(project_dir)
+    unverifiable = unverifiable_packages(project_dir)
+    if missing or unverifiable or needs_deps(project_dir):
+        raise MissingPackagesError(missing, unverifiable)
 
 
 def needs_deps(project_dir: Path | str) -> bool:
@@ -388,7 +857,9 @@ def compile_estimate(
     target: str,
     select: str | None = None,
     runner: Runner | None = None,
+    env: dict[str, str] | None = None,
     timeout: float = _COMPILE_TIMEOUT_SECONDS,
+    approved_functions: frozenset[str] | None = None,
 ) -> tuple[float, dict[str, float], list[str]]:
     """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
 
@@ -418,32 +889,29 @@ def compile_estimate(
 
     project = Path(project_dir).resolve()
     estimator = getattr(adapter, "query_estimate", None)
-    if estimator is None:
+    if estimator is None and not approved_functions:
         return (
             0.0,
             {},
             ["connector exposes no estimator; build cost not priced upfront"],
         )
 
-    argv = [
-        _dbt_executable(),
-        "compile",
-        "--target",
-        target,
-        "--project-dir",
-        str(project),
-        "--profiles-dir",
-        str(profiles_dir(project).resolve()),
-        "--log-format",
-        "json",
-    ]
-    if select:
-        argv += ["--select", select]
-    run = runner or _default_runner(timeout, project)
-    completed = run(argv)
-    if completed.returncode != 0:
-        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
-        raise DbtRunError(messages[0] if messages else "dbt compile failed")
+    _compile_project(
+        project,
+        target=target,
+        select=select,
+        runner=runner or _default_runner(timeout, project, env),
+    )
+    if approved_functions:
+        _assert_compiled_functions(
+            project, dialect=adapter.dialect, approved_functions=approved_functions
+        )
+    if estimator is None:
+        return (
+            0.0,
+            {},
+            ["connector exposes no estimator; build cost not priced upfront"],
+        )
 
     compiled = _compiled_nodes(project)
     total = 0.0
@@ -471,6 +939,96 @@ def compile_estimate(
     if not per_node and not skipped:
         notes.append("no scanning build nodes to price; the estimate is zero")
     return total, per_node, notes
+
+
+def compiled_model_names(project: Path) -> set[str]:
+    """The models dbt's last compile selected, by name.
+
+    The same ``run_results.json`` the estimate is built from, which is what
+    makes this the build's own selection rather than the whole project: a
+    ``--select`` narrows the compile, so it narrows this too.
+    """
+
+    run_results = project / "target" / "run_results.json"
+    if not run_results.is_file():
+        return set()
+    try:
+        results = json.loads(run_results.read_text(encoding="utf-8")).get("results", [])
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {
+        str(r["unique_id"]).rsplit(".", 1)[-1]
+        for r in results
+        if str(r.get("unique_id", "")).startswith("model.")
+    }
+
+
+def _compile_project(
+    project: Path, *, target: str, select: str | None, runner: Runner
+) -> None:
+    """Compile the selection afresh; never reuse a prior invocation's results."""
+
+    (project / "target" / "run_results.json").unlink(missing_ok=True)
+    argv = [
+        _dbt_executable(),
+        "compile",
+        "--target",
+        target,
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(profiles_dir(project).resolve()),
+        "--log-format",
+        "json",
+    ]
+    if select:
+        argv += ["--select", select]
+    completed = runner(argv)
+    if completed.returncode != 0:
+        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+        raise DbtRunError(messages[0] if messages else "dbt compile failed")
+
+
+def _assert_compiled_functions(
+    project: Path, *, dialect: str, approved_functions: frozenset[str]
+) -> None:
+    """Adjudicate every selected SQL node before pricing or building it.
+
+    Pricing may omit unreadable nodes. An enabled execution restriction cannot,
+    so missing artifacts or compiled SQL are hard failures on this path.
+    """
+
+    from ..guards.execution import guarded_statement_verdict
+    from ..guards.sql_guard import NotSelectOnlyError, RefusalReason
+
+    try:
+        results = json.loads((project / "target/run_results.json").read_text())
+        manifest = json.loads((project / "target/manifest.json").read_text())
+        selected = results["results"]
+        nodes = manifest["nodes"]
+        if not isinstance(selected, list) or not isinstance(nodes, dict):
+            raise ValueError("invalid compile artifact shape")
+        for result in selected:
+            uid = result["unique_id"]
+            node = nodes[uid]
+            if node.get("resource_type") == "seed":
+                continue
+            code = node.get("compiled_code")
+            if not isinstance(code, str) or not code.strip():
+                raise ValueError(f"{uid}: no compiled SQL available")
+            verdict = guarded_statement_verdict(
+                code,
+                node=uid,
+                dialect=dialect,
+                approved_functions=approved_functions,
+            )
+            if not verdict.allowed:
+                raise NotSelectOnlyError(
+                    f"{uid}: {verdict.detail}",
+                    reason=RefusalReason(verdict.reason),
+                )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DbtRunError(f"cannot enforce guards.approved_functions: {exc}") from exc
 
 
 def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
@@ -580,7 +1138,15 @@ def _build_env(
     database past the budget even if the upfront estimate under-priced it.
     """
 
-    if paradigm is not Paradigm.DB_LOAD or ceiling is None:
+    if ceiling is None:
+        return None
+    # ClickHouse uses the same two server settings under both deployments; only
+    # the meaning of the seconds changes. Other compute-time connectors own
+    # their caps elsewhere, and other db-load connectors remain opt-in below.
+    supported = paradigm is Paradigm.DB_LOAD or (
+        connector == "clickhouse" and paradigm is Paradigm.COMPUTE_TIME
+    )
+    if not supported:
         return None
     builder = _CAP_ENV_BUILDERS.get(connector or "")
     if builder is None:
@@ -737,10 +1303,38 @@ def _collect_messages(
     return messages
 
 
+def _display_name(unique_id: str) -> str:
+    """dbt's own name for a node, read off its unique id.
+
+    A model is ``model.<package>.<name>``, so the last segment is the name. A
+    generic test is ``test.<package>.<name>.<hash>``, where the hash is content
+    derived, so the name is the segment before it. Taking the last segment for
+    everything is what made a green build report seventeen warning tests under
+    names like ``3249b83c15``: correct, unique, and useless to a reader trying
+    to tell which test warned.
+    """
+
+    parts = unique_id.split(".")
+    if len(parts) < 3:
+        return parts[-1] if parts else unique_id
+    # Only the generic-test spelling carries a trailing hash. A singular test is
+    # `test.<package>.<name>` like a model, so segment count decides, not the
+    # resource type: a three-part id is already at its name.
+    if parts[0] == "test" and len(parts) > 3:
+        return parts[-2]
+    return parts[-1]
+
+
 def _summarize(
     project: Path, target: str, completed: subprocess.CompletedProcess
 ) -> dict[str, Any]:
-    """Reduce a dbt run to a sanitized summary; raw log text stays behind."""
+    """Reduce a dbt run to a sanitized summary; raw log text stays behind.
+
+    Each node carries both its ``unique_id`` and the readable ``name`` derived
+    from it. The id is the only unambiguous identifier (it names the resource
+    type and the package, and it is what `run_results.json` can be
+    cross-referenced on); the name is what a reader scans.
+    """
 
     nodes: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
@@ -751,9 +1345,11 @@ def _summarize(
         results = json.loads(run_results.read_text(encoding="utf-8")).get("results", [])
         for result in results:
             status = str(result.get("status", "unknown"))
+            unique_id = str(result.get("unique_id", ""))
             nodes.append(
                 {
-                    "name": str(result.get("unique_id", "")).split(".")[-1],
+                    "name": _display_name(unique_id),
+                    "unique_id": unique_id,
                     "status": status,
                     "execution_time": result.get("execution_time"),
                 }
@@ -778,6 +1374,11 @@ def _summarize(
         "counts": counts,
         "messages": messages,
     }
+    # Internal hand-off, not envelope shape: `_shape_build_result` pops this to
+    # ledger the build and report it under `data.spend`, the one key every billed
+    # command reports spend under (issue #276). Present only when dbt actually
+    # reported a figure, so the shaper can tell "billed nothing" from "billed an
+    # amount dbt never told us".
     if saw_billing:
         summary["bytes_billed"] = bytes_billed
     return summary

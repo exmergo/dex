@@ -1,0 +1,60 @@
+{
+  "name": "build-not-run",
+  "contract": "build-evidence",
+  "description": "dbt never reached node execution, which is what a project that fails to parse looks like.",
+  "payload": {
+    "run_results": null
+  },
+  "expect": {
+    "outcome": "not_run",
+    "result": {
+      "outcome": "not_run",
+      "invocation": {
+        "invocation_id": null,
+        "generated_at": null,
+        "dbt_version": null,
+        "command": "build",
+        "target": "dev",
+        "select": null,
+        "elapsed_seconds": null
+      },
+      "selection": {
+        "requested": null,
+        "matched": [],
+        "empty": true,
+        "complete": false,
+        "unmatched": []
+      },
+      "digests": {
+        "manifest_sha256": "sha256:1ec72846b43af6a798f532fc15c66811c7ada95cb25b1e4a7c433a6df8797ce0",
+        "run_results_sha256": null,
+        "source_digest": null,
+        "plan_digest": null
+      },
+      "generated": [],
+      "errors": [],
+      "stale_artifacts": true,
+      "plan_drift": [
+        {
+          "path": "models/staging/mart.sql",
+          "expected_sha256": "3bc49b7d9d33b36f48259d78e79a835f89254c2f17099574439828710e7aa564",
+          "found_sha256": "31d1e470dfb20e1e620eae695a09e3e2ba4839f2116c0be8beb890e4e4bcc6c3"
+        }
+      ],
+      "nodes": [],
+      "coverage": {
+        "required": [
+          "mart"
+        ],
+        "covered": [],
+        "missing": [
+          "mart"
+        ],
+        "basis": [
+          "models/staging/mart.sql: builds 'mart'",
+          "models/staging/mart.yml: documents mart"
+        ]
+      }
+    }
+  }
+}

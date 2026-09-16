@@ -31,7 +31,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import SnowflakeTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -41,6 +41,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -167,6 +168,8 @@ class SnowflakeAdapter:
     name = "snowflake"
     dialect = DIALECT
     paradigm = Paradigm.COMPUTE_TIME
+    # Warehouse-seconds modelled from table statistics and the pinned size.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,
@@ -200,6 +203,11 @@ class SnowflakeAdapter:
         # confirmed run share table facts, and each SHOW is free but a
         # round-trip.
         self._objects: dict[str, dict] = {}
+        # Row counts learned from a profiling aggregate, which for a view is the
+        # only count there is: SHOW TABLES maintains none. Supersedes the SHOW
+        # figure for the rest of the command, so uniqueness proofs and grain
+        # verdicts compare against rows that were counted rather than reported.
+        self._exact_rows: dict[str, int] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
         self._inventory_loaded = False
         self._resolved_scopes: list[str] | None = None
@@ -234,7 +242,7 @@ class SnowflakeAdapter:
         cost = self.cost_gate.cost()
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if self.target.warehouse:
             info = self._warehouse()
@@ -334,14 +342,13 @@ class SnowflakeAdapter:
         name = row.get("table_name") or row.get("name")
         return f"{row['database_name']}.{row['schema_name']}.{name}"
 
-    @staticmethod
-    def _object_meta(entry: dict) -> ObjectMeta:
+    def _object_meta(self, entry: dict) -> ObjectMeta:
         return ObjectMeta(
             identifier=entry["identifier"],
             object_type=entry["object_type"],
             schema=entry["schema"],
             name=entry["name"],
-            row_count=entry["row_count"],
+            row_count=self._exact_rows.get(entry["identifier"], entry["row_count"]),
             byte_size=entry["byte_size"],
             column_count=entry["column_count"],
         )
@@ -782,6 +789,13 @@ class SnowflakeAdapter:
                 sql, estimate=self._scan_seconds(meta.byte_size)
             )
             values = dict(zip(labels, rows[0], strict=True))
+            if sample_percent is None:
+                # The batch counted the table exactly, and for a view that is the
+                # only count available: capture it so the metadata re-read after
+                # this scan can hand it to the probes that decline to run without
+                # a row count. Not under sampling, where the count is the
+                # sample's rather than the table's.
+                self._exact_rows[identifier] = int(values["n_total"])
             results.extend(
                 self._read_aggregates(values, plan, sampled=sample_percent is not None)
             )
@@ -985,33 +999,33 @@ class SnowflakeAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
             return {}
         meta, _ = self.table_metadata(identifier)
-        estimate = self._scan_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._scan_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1137,12 +1151,7 @@ class SnowflakeAdapter:
         of the budget, so even a wrong heuristic cannot overrun the ceiling."""
 
         info = self._warehouse()  # refuses when config pins no warehouse
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one warehouse-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         cursor = self._conn.cursor()
         if not self._session_prepared:
             # dex-built session statements, not agent SQL: the warehouse

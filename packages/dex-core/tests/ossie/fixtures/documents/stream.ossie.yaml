@@ -1,0 +1,28 @@
+# A YAML `---` stream in one configured file. Configuring a file is what makes
+# its content a document; a stream inside one is not a second configured file,
+# and the loader's existing behavior for it is what this case pins.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: first
+    datasets:
+      - name: things
+        source: demo.main.things
+        fields:
+          - name: thing_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: thing_id
+---
+version: "0.2.0.dev0"
+semantic_model:
+  - name: second
+    datasets:
+      - name: others
+        source: demo.main.others
+        fields:
+          - name: other_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: other_id

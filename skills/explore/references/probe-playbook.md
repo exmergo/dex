@@ -5,7 +5,8 @@ firewall guarantees safety; this playbook is about effectiveness: asking the
 question in a shape that returns a small, decisive answer instead of a wall of
 rows. Map first (`explore map`) when you are getting your bearings: the profile
 usually already holds the answer (null fractions, distinct counts, min/max,
-candidate keys), and probes exist for the questions it does not. But you do not
+ranked candidate keys and the reason behind each), and probes exist for the
+questions it does not. But you do not
 have to map before you can probe. A table the engine has not profiled, including
 a model you built moments ago, is profiled as part of answering, so a probe
 against something new costs one call.
@@ -48,10 +49,16 @@ FROM child c
 ```
 
 Zero orphans confirms the join; a high orphan fraction says the name-based guess
-was wrong or the parent is incomplete.
+was wrong or the parent is incomplete. `--verify` applies the second habit above
+to this recipe for you: the joins that share a child are measured in one
+statement, so it costs what the relations cost rather than what the join count
+costs.
 
-**2. Duplicate / grain check.** How badly is a key broken, and what does the
-duplication look like?
+**2. Duplicate distribution.** How badly a key is broken is already in the
+profile: it reports the distinct count, the row count, and how many rows would
+have to be removed for the column to be unique, exactly, whenever the distinct
+count was escalated and the column has no nulls. Probe when you need the *shape*
+of the duplication rather than its size.
 
 ```sql
 SELECT COUNT(*)                          AS rows,
@@ -60,6 +67,10 @@ SELECT COUNT(*)                          AS rows,
        MAX(cnt)                          AS worst_repeat
 FROM (SELECT id, COUNT(*) AS cnt FROM t GROUP BY id)
 ```
+
+`worst_repeat` is the column the profile cannot give you, and it is the one that
+separates a double-loaded batch (every repeat is 2) from a single id that
+swallowed the table.
 
 **3. Top-K categorical distribution.** What values dominate a (non-flagged)
 column, and how concentrated is it?

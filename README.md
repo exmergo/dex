@@ -1,6 +1,6 @@
 <img width="1280" height="563" alt="exmergo-dex-showcase" src="https://github.com/user-attachments/assets/9dd574c2-8598-47bc-ae90-7d5a3a4d2e18" />
 
-**Built by [Exmergo](https://exmergo.com)** · AI Agents for Your Data Stack.
+**Built by [Exmergo](https://exmergo.com)** · The AI Stack for Your Data Stack.
 
 [![PyPI](https://img.shields.io/pypi/v/exmergo-dex-core?logo=pypi&logoColor=white&color=165dfc)](https://pypi.org/project/exmergo-dex-core/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-165dfc)](LICENSE)
@@ -30,18 +30,21 @@ Run these commands **inside Claude Code** one at a time
 
 Update later with `/plugin marketplace update exmergo`. The skills appear as
 `/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
-intent.
+intent. Ask it to warm dex once after installing, so the first real command does
+not wait for the engine to install (see [Prerequisite: `uv`](#prerequisite-uv)).
 
 ## `dex`: the agent-native analytics engineering toolkit
 
 **`dex` is analytics engineering** for Claude Code and **any agent**: **data warehouse
 exploration**, **dbt transformation** and **semantic modeling**, and **schema-drift
-maintenance** on dbt. Point it at your warehouse (or a local DuckDB file, or the one
-`dex demo` generates for you) and your
-dbt project; it learns the landscape, writes and refactors your dbt transformations
-and semantic models, and tells you what to fix when anything drifts. The dbt
-project is the source of truth; every change is a reviewable diff. Read-only
-against your data.
+maintenance**. Point it at your warehouse (or a local DuckDB file, or the one
+`dex demo` generates for you) and at your repository; it learns the landscape,
+writes and refactors your dbt transformations and your semantic layer, and tells
+you what to fix when anything drifts. Your repository is the source of truth, on
+two independent axes: the transformation project, which is dbt, and the semantic
+layer, which is dbt's own, a hosted dbt Cloud deployment, or native Apache Ossie
+documents that need no dbt project at all. Every change is a reviewable diff.
+Read-only against your data.
 
 **It closes the gap a general coding agent still has**: agents re-learn the schema
 each session, have no strategy for thousands of tables, are blind to warehouse
@@ -55,25 +58,36 @@ time. `dex` owns exactly that loop.
 
 - **Explore** an unfamiliar warehouse: rank what matters, profile selectively,
   infer and verify joins, answer ad-hoc questions with guarded SQL probes behind
-  a PII-aware query firewall, query the semantic layer's metrics (locally via
-  MetricFlow or against a hosted dbt Cloud deployment), and render the map as a
-  Mermaid ER diagram that never claims a cardinality the data has not proven.
+  a PII-aware query firewall, read the semantic layer as the object graph it is
+  (semantic models, metrics with their composition, measures, dimensions, and the
+  declared join graph, each resolved to the relation and column behind it, and the
+  whole of it searchable and budgeted), read a
+  dimension's value domain before filtering on it,
+  and query its metrics (locally via
+  MetricFlow or against a hosted dbt Cloud deployment; a native Apache Ossie
+  layer is catalog-first and refuses a metric query by name, because the format
+  specifies interchange metadata and no query runtime), and render the map as a
+  Mermaid ER diagram that draws the joins the semantic layer declares and never
+  claims a cardinality the data has not proven.
   Persist a draft map. Fully read-only.
 
 <img width="522" height="343" alt="image" src="https://github.com/user-attachments/assets/7f16b370-66ed-4596-ae01-041cf3db3525" />
 
   
-- **Transform** the dbt project: author dbt models (staging to marts) with tests
-  and docs, and the semantic layer on top (entities, dimensions, measures,
-  metrics) as dbt semantic models (MetricFlow YAML), with a free Viz preview.
+- **Transform** the project: author dbt models (staging to marts) with tests
+  and docs, and the semantic layer on top, either as dbt semantic models
+  (MetricFlow YAML: entities, dimensions, measures, metrics) or as native Apache
+  Ossie documents written back byte for byte, with a free Viz preview.
   Validated against a dev target, cost-guarded.
 
 <img width="504" height="271" alt="image" src="https://github.com/user-attachments/assets/fda40e48-b481-424c-adc7-d79c0ede346b" />
 
   
-- **Maintain** the project as it drifts: diff the warehouse and dbt against the
-  last snapshot, surface schema, volume, grain, and definition drift ranked by
-  blast radius, and propose edits.
+- **Maintain** the repository as it drifts: diff the warehouse, the project, and
+  the semantic layer against the last snapshot, surface schema, volume, grain,
+  and definition drift ranked by blast radius, and propose edits. The two project
+  axes are fingerprinted independently, so a repository with a semantic layer and
+  no dbt project still gets a baseline.
 
 <img width="484" height="344" alt="image" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
 
@@ -95,7 +109,7 @@ from a pinned seed, so what you see is what is written here.
 
 It is seeded to be **realistically broken**, because a first run that reports a clean
 bill of health teaches you nothing. `explore map` flags 6 columns as personal data,
-infers 5 joins, and reports 5 data-quality findings. Then:
+infers 5 joins, and reports 6 data-quality findings. Then:
 
 ```
 dex explore profile order_items products
@@ -103,8 +117,13 @@ dex explore relationships --verify
 dex explore query "select email from customers"
 ```
 
-- **A broken grain.** `order_item_id is not unique: 13000 distinct over 14000 rows`,
-  because a batch was loaded twice. Any join on it silently fans out.
+- **A broken grain, reported as duplicates rather than as a missing key.**
+  `order_item_id is not unique: 13000 distinct over 14000 rows (1000 rows would have
+  to be removed for it to be unique, so it is unique for 92.9% of rows)`, because a
+  batch was loaded twice. Any join on it silently fans out. The grain comes back
+  unknown rather than as one of the several column pairs that are technically unique
+  here only because `order_item_id` almost is; those are in `key_evidence` with the
+  reason each was suppressed.
 - **A key that mixes id schemes.** `sku` is `90% numeric, 10% 32-character
   hexadecimal (md5-shaped)`, from a merged catalogue. Cast it to a number and you
   drop 10% of your rows without an error.
@@ -135,6 +154,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 `brew install uv` and `pipx install uv` work too. Nothing else is required: `uv`
 supplies the Python and the engine, with the connector extra chosen for you at
 runtime.
+
+The first command in a fresh environment pays for that install, which is tens of
+seconds on a cold `uv` cache. `--warm` pays it up front instead: it materializes
+the environment, prints what it installed, and exits without running anything.
+```
+uv run --no-project --script skills/<skill>/scripts/run.py --warm
+```
+Run it as a container build step or a CI setup step, or ask your agent to warm dex
+once after installing. Add `--connector snowflake` (or any other connector) to warm
+a warehouse before there is a project to read the choice from.
 
 ## Benchmarks
 
@@ -191,36 +220,54 @@ it is better than the one a point below it.
 
 ## Connectors
 
-- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first).
-- Self-hosted analytical: **ClickHouse**.
-- Embedded analytical: **DuckDB**.
-- Operational database: **Postgres**.
+| Connector | Type | Self-hostable | Extra / `--connector` | Cost surfaced as | Credentials discovered from |
+| --- | --- | :---: | --- | --- | --- |
+| <img src="https://www.exmergo.com/connectors/snowflake.png" width="20" height="20" alt=""> **Snowflake** | Cloud warehouse | ❌ | `snowflake` | Warehouse-seconds, credits alongside | `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile |
+| <img src="https://www.exmergo.com/connectors/bigquery.png" width="20" height="20" alt=""> **BigQuery** | Cloud warehouse | ❌ | `bigquery` | Bytes scanned | Application Default Credentials (`gcloud auth application-default login`) |
+| <img src="https://www.exmergo.com/connectors/databricks.png" width="20" height="20" alt=""> **Databricks** | Cloud warehouse | ❌ | `databricks` | Warehouse-seconds, DBUs alongside | The SDK's unified chain: `databricks auth login`, `DATABRICKS_*` env, or a dbt profile |
+| <img src="https://www.exmergo.com/connectors/redshift.png" width="20" height="20" alt=""> **Amazon Redshift** | Cloud warehouse, Serverless-first | ❌ | `redshift` | Compute-seconds, RPU-hours alongside | The AWS credential chain (a pinned Serverless workgroup mints IAM temporary database credentials) or `REDSHIFT_*` env |
+| <img src="https://www.exmergo.com/connectors/clickhouse.png" width="20" height="20" alt=""> **ClickHouse** | Analytical database | ✅ | `clickhouse` | Compute-seconds on Cloud, with live allocated memory translating to approximate compute-unit-hours and optional USD; database-seconds self-hosted | `CLICKHOUSE_URL`, the `CLICKHOUSE_*` env, or a dbt profile |
+| <img src="https://www.exmergo.com/connectors/duckdb.png" width="20" height="20" alt=""> **DuckDB** | Embedded analytical | ✅ | `duckdb` | Free and local, nothing to confirm | None, just a file path |
+| <img src="https://www.exmergo.com/connectors/postgresql.png" width="20" height="20" alt=""> **Postgres** | Operational database | ✅ | `postgres` | Database-seconds, no invoice | `pg_service.conf`, `DATABASE_URL`, the `PG*` env, or a dbt profile |
 
-<img width="1162" height="225" alt="image" src="https://github.com/user-attachments/assets/32d2311b-b85e-41a5-8431-4edb1f928346" />
+Credentials are discovered, never asked for. Every scan is estimated and
+confirmed before it spends, and capped server-side: `maximum_bytes_billed` on
+BigQuery, a per-statement statement timeout on Snowflake, Databricks, Redshift,
+and Postgres, and `max_execution_time` plus `max_bytes_to_read` on ClickHouse.
+All settled spend is recorded in a local ledger.
 
-Credentials are discovered, never asked for: BigQuery through Application
-Default Credentials (`gcloud auth application-default login`), Snowflake
-through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Databricks
-through the SDK's unified chain (`databricks auth login`, `DATABRICKS_*` env,
-or a dbt profile), Redshift through the AWS credential chain (a pinned
-Serverless workgroup mints IAM temporary database credentials) or `REDSHIFT_*`
-env, Postgres through `pg_service.conf`, `DATABASE_URL`, the `PG*`
-environment, or a dbt profile, ClickHouse through `CLICKHOUSE_URL`, the
-`CLICKHOUSE_*` environment, or a dbt profile. Every scan is estimated and
-confirmed before it spends, capped server-side (`maximum_bytes_billed` on
-BigQuery; a per-statement statement timeout on Snowflake, Databricks, Redshift,
-and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse,
-whose budgets are warehouse-seconds with credits or DBUs alongside,
-compute-seconds with RPU-hours alongside, and database-seconds for the last
-two), and recorded in a local spend ledger.
-
-The two self-hosted connectors bill no dollars, and dex still gates them: an
+Self-hosted Postgres and ClickHouse bill no dollars, and dex still gates them: an
 unbounded scan on a production Postgres primary or a shared ClickHouse cluster
 is a real cost even when nothing appears on an invoice.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**, **ClickHouse Cloud**
+- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**
+
+## Semantic layers
+
+The semantic layer is a separate axis from the transformation project, chosen
+once per repository in `.dex/config.yml`. dex reads two vendors across three
+deployments today:
+
+| Semantic layer | Hosted | Queryable | `vendor` / `deployment` | Read through |
+| --- | :---: | :---: | --- | --- |
+| <img src="https://www.exmergo.com/connectors/dbt.png" width="20" height="20" alt=""> **dbt** | ✅ | ✅ | `dbt` / `local` or `dbt_cloud` | MetricFlow locally, with the rendered SQL run through the dex connector and its cost guard, or the hosted dbt Cloud Semantic Layer over its API |
+| <img src="https://www.exmergo.com/connectors/ossie.png" width="20" height="20" alt=""> **[Apache Ossie](https://github.com/apache/ossie)** (incubating) | ❌ | ❌ | `ossie` / `local` | Native documents read straight out of the repository, with no dbt project and no MetricFlow anywhere in the path |
+
+Ossie is catalog-first, and that is a statement about the format rather than
+about how far we got: Ossie specifies interchange metadata and no portable query
+runtime, so dex reads and authors the layer, folds its declared keys and
+relationships (composites kept whole) into exploration and drift detection, and
+refuses a metric query by name instead of inventing execution semantics the
+specification does not define. What dex accepts, what it checks, and what it
+declines to claim is written out row by row in
+[`references/ossie-compatibility.md`](references/ossie-compatibility.md), and
+[`references/ossie-walkthrough.md`](references/ossie-walkthrough.md) runs one
+document through every command on a local warehouse.
+
+### Upcoming Semantic Layers
+- Cube
 
 ## The `exmergo-dex-core` package
 
@@ -269,17 +316,33 @@ rather than surfaced.
 
 A process serving more than one end user can pass a `ConnectionSource` so each
 request reaches the warehouse as its own principal rather than as the container,
-and a `SemanticSource` to do the same for a hosted dbt Cloud Semantic Layer token.
+and a `SemanticSource` to do the same for a hosted dbt Cloud Semantic Layer
+token. `SemanticSource` is a credential and nothing more; the reader that decides
+which semantic layer answers is a separate seam, resolved from config, and the
+two share a word rather than a job.
 The host owns authentication; dex still builds the cost gate from your store, so
 the session budget binds either way.
+
+An application that splits the loop across processes has its own seam,
+`exmergo_dex_core.host`: a stored plan exports as a document a second process can
+verify and apply with no plan store and no network, that plan's dependencies and
+its edits' contents come back as typed evidence, and a build reports what it
+actually established rather than only whether dbt exited zero. Conformance
+vectors ship in the wheel so a consumer can prove its own reader against the
+engine's. See [`references/host-integration.md`](references/host-integration.md).
 
 More info in the package's [`README.md`](packages/dex-core/README.md)
 
 ## Agent References
 
 - Cross-agent contract: [`AGENTS.md`](AGENTS.md).
-- References (connectors, the contract, the canonical model, evaluation):
-  [`references/`](references/).
+- References: [`references/`](references/), covering the per-connector notes, the
+  command contract, the source of truth and the `.dex/` cache, the semantic layer
+  and Ossie compatibility, the project, storage and host-integration seams,
+  methodology, and evaluation.
+- The two guardrails that cut across all of it:
+  [`references/pii-policy.md`](references/pii-policy.md) and
+  [`references/cost-controls.md`](references/cost-controls.md).
 
 ## Contributing
 
@@ -289,12 +352,21 @@ pass the Lint workflow and CI before it can merge.
 
 ## Community
 
+### Community Integrations
+
+#### **[dagster-dex](https://github.com/catincloud-labs/dagster-dex)**
+A rigorously-tested project format that allows `dex` to read a Dagster asset graph, maintained by CatInCloud Labs.  
+Instead of requiring a dbt project, `dagster-dex` maps your Dagster definitions directly into `dex`, allowing you to 
+run schema-drift maintenance and exploration natively against your orchestrated assets.
+
+### Connect with the Community
+
 Connect with the Analytics Engineering Community (Data Engineers welcome as well!) 
 and discover how Exmergo brings AI Agents to Your Data Stack.
 
 - 🌟 [Star Us on GitHub](https://github.com/exmergo/dex/)
 - 🔗 [Follow Us on LinkedIn](https://www.linkedin.com/company/exmergo/)
-- 🐦 [Follow Us on Twitter](https://x.com/exmergo)
+- 🐦 [Follow Us on X](https://x.com/exmergo)
 - 🔨 [Follow Us on GitHub](https://github.com/exmergo/)
 
 ## License

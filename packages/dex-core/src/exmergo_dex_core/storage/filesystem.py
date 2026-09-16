@@ -222,6 +222,38 @@ class FilesystemStore:
                 continue
         return spend_total(entries, cutoff_iso, field=field, connector=connector)
 
+    def spend_entries(
+        self,
+        *,
+        connector: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """The tail of the ledger, oldest first (see :class:`SpendHistory`).
+
+        The file is read whole, as ``spend_since`` already reads it whole, and
+        the tail is taken after filtering rather than before: slicing the raw
+        lines first would return fewer than ``limit`` of the requested
+        connector's entries whenever another connector shares the ledger, which
+        is exactly the multi-connector project where the per-connector scoping
+        matters most.
+        """
+
+        path = self.dex_dir / SPEND_FILE
+        if not path.is_file():
+            return []
+        entries: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if connector is not None and entry.get("connector") != connector:
+                continue
+            entries.append(entry)
+        return entries[-limit:] if limit > 0 else []
+
     @contextmanager
     def spend_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
         """Serialize the spend admission across every process holding this root.

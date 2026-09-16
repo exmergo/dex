@@ -44,7 +44,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import RedshiftTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -54,6 +54,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -67,7 +68,6 @@ from .base import (
     shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
-    temporal_continuity_sql,
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
@@ -165,8 +165,68 @@ def _date_trunc_expr(qcol: str, unit: str) -> str:
     return f"DATE_TRUNC('{unit}', {qcol})"
 
 
+def _substring_expr(qcol: str, start: int, length: int) -> str:
+    # Redshift refuses SUBSTR by name -- "SUBSTR() function is not supported
+    # (Hint: use SUBSTRING instead)" -- and does so at execution, over a real
+    # table, not only in a leader-node-only query. SUBSTRING takes the same
+    # positional arguments and is what the hint asks for.
+    return f"SUBSTRING({qcol}, {start}, {length})"
+
+
 def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
-    return f"DATEDIFF({unit}, {earlier}, {later})"
+    # Both operands are cast, and the cast is not decorative: Redshift's
+    # DATEDIFF resolves to pg_catalog.date_diff, which is declared over
+    # DATE/TIME/TIMETZ/TIMESTAMP and has no TIMESTAMPTZ overload, while
+    # DATE_TRUNC over a TIMESTAMPTZ column returns TIMESTAMPTZ. The periods
+    # this diffs are therefore exactly the shape it refuses ("function
+    # pg_catalog.date_diff(\"unknown\", timestamp with time zone, timestamp
+    # with time zone) does not exist"), and a plain DATEDIFF failed the whole
+    # profiling statement for any table carrying a TIMESTAMPTZ column. The cast
+    # is total for every type that reaches here (DATE and TIMESTAMP widen
+    # unchanged; TIME is never temporal-profiled, see `is_temporal_type`), and
+    # it shifts nothing: both operands convert to the session timezone by the
+    # same rule, so their difference is what it was.
+    return f"DATEDIFF({unit}, {earlier}::TIMESTAMP, {later}::TIMESTAMP)"
+
+
+def _temporal_continuity_ctes(
+    qcol: str, i: int, unit: str, table_sql: str
+) -> tuple[list[str], list[str], str]:
+    """Build Redshift's temporal continuity branch as named CTEs.
+
+    Redshift rejects a flat aggregate containing a distinct aggregate plus
+    both scalar temporal subqueries under ``default_transaction_read_only``
+    (SQLSTATE 25006), even though every component is a SELECT. Keeping the
+    period and gap work in a separate aggregate branch avoids that planner
+    path without dropping session-level read-only protection or issuing a
+    second billed statement.
+    """
+
+    alias = {"day": "d", "month": "m", "hour": "h"}[unit]
+    periods = f"periods_{alias}_{i}"
+    lagged = f"lagged_{alias}_{i}"
+    continuity = f"continuity_{alias}_{i}"
+    period_expr = _date_trunc_expr(qcol, unit)
+    gap_expr = _date_diff_expr(unit, "period", "prev_period")
+    ctes = [
+        (
+            f"{periods} AS (SELECT DISTINCT {period_expr} AS period "  # noqa: S608
+            f"FROM {table_sql} WHERE {qcol} IS NOT NULL)"
+        ),
+        (
+            f"{lagged} AS (SELECT period, "  # noqa: S608
+            f"LAG(period) OVER (ORDER BY period) AS prev_period FROM {periods})"
+        ),
+        (
+            f"{continuity} AS (SELECT COUNT(*) AS tp_{alias}_{i}, "  # noqa: S608
+            f"COALESCE(MAX({gap_expr} - 1), 0) AS tg_{alias}_{i} FROM {lagged})"
+        ),
+    ]
+    projections = [
+        f"{continuity}.tp_{alias}_{i} AS tp_{alias}_{i}",
+        f"{continuity}.tg_{alias}_{i} AS tg_{alias}_{i}",
+    ]
+    return ctes, projections, continuity
 
 
 class RedshiftConnectionError(ConnectorError):
@@ -194,6 +254,9 @@ class RedshiftAdapter:
     name = "redshift"
     dialect = DIALECT
     paradigm = Paradigm.COMPUTE_TIME
+    # Compute-seconds from the planner's cost, plus the Serverless wake
+    # minimum where it applies.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,
@@ -282,7 +345,7 @@ class RedshiftAdapter:
         }
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if cost.ceiling is not None:
             rpu_hours = self._to_rpu_hours(cost.ceiling)
@@ -818,6 +881,9 @@ class RedshiftAdapter:
         # does), and MIN/MAX would carry values.
         table_sql = self._quote(identifier)
         select_parts = ["COUNT(*) AS n_total"]
+        continuity_ctes: list[str] = []
+        continuity_projections: list[str] = []
+        continuity_relations: list[str] = []
         plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
@@ -847,6 +913,7 @@ class RedshiftAdapter:
                         is_integer=is_integer_type(col.data_type),
                         regexp_predicate=_regexp_predicate,
                         bigint_type=_BIGINT_TYPE,
+                        substring_expr=_substring_expr,
                     )
                 )
             wants_key_shape = (col.name in key_shape_req) and not degraded
@@ -858,16 +925,12 @@ class RedshiftAdapter:
                     temporal_alignment_expressions(qcol, i, _date_trunc_expr)
                 )
                 for unit in temporal_units_for(col.data_type):
-                    select_parts.extend(
-                        temporal_continuity_sql(
-                            qcol,
-                            i,
-                            unit,
-                            table_sql,
-                            _date_trunc_expr,
-                            _date_diff_expr,
-                        )
+                    ctes, projections, relation = _temporal_continuity_ctes(
+                        qcol, i, unit, table_sql
                     )
+                    continuity_ctes.extend(ctes)
+                    continuity_projections.extend(projections)
+                    continuity_relations.append(relation)
             plan.append(
                 (
                     i,
@@ -882,7 +945,19 @@ class RedshiftAdapter:
             )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
-        sql = f"SELECT {', '.join(select_parts)} FROM {table_sql}"  # noqa: S608
+        main_sql = f"SELECT {', '.join(select_parts)} FROM {table_sql}"  # noqa: S608
+        if continuity_ctes:
+            ctes = [f"main_aggregates AS ({main_sql})", *continuity_ctes]
+            joins = " ".join(
+                f"CROSS JOIN {relation}" for relation in continuity_relations
+            )
+            sql = (
+                f"WITH {', '.join(ctes)} "  # noqa: S608
+                f"SELECT main_aggregates.*, {', '.join(continuity_projections)} "
+                f"FROM main_aggregates {joins}"
+            )
+        else:
+            sql = main_sql
         return assert_select_only(sql, dialect=self.dialect), plan
 
     @staticmethod
@@ -984,9 +1059,11 @@ class RedshiftAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
@@ -994,29 +1071,27 @@ class RedshiftAdapter:
         meta, _ = self.table_metadata(identifier)
         # Like the exact-distinct escalation, this can be a command's first
         # billed statement, so the pending Serverless wake minimum rides the
-        # charge; on refusal it stays pending.
-        estimate = (
-            self._scan_seconds(meta.byte_size) * len(combinations) + self._wake_floor()
+        # charge; it is flat across prefixes, and stays pending unless a prefix
+        # is actually charged.
+        unit = self._scan_seconds(meta.byte_size)
+        wake = self._wake_floor()
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix) + wake,
+            self.cost_gate.try_charge,
         )
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         self._consume_wake_floor()
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1160,12 +1235,7 @@ class RedshiftAdapter:
         the cursor and whether the budget (not the wall clock) is the binding
         bound."""
 
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one compute-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="compute-second")
         self._ensure_session()
         cursor = self._conn.cursor()
         timeout_ms: int | None = None

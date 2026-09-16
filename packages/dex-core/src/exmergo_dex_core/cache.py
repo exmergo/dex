@@ -13,12 +13,23 @@ lives behind the storage contract (see storage/base.py). Secrets never live here
 
 from __future__ import annotations
 
+import re
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 # Bump when the stored cache shape changes in a way old readers cannot handle.
-CACHE_SCHEMA_VERSION = 3
+#
+# 4 added `Dataset.key_evidence` and, with it, changed what `candidate_keys`
+# means: it was every combination measured unique, and it is now every one that
+# survived artifact suppression. An older reader handed a version-4 cache is
+# fine, since an unknown key is ignored. The direction that breaks is a current
+# reader handed a version-3 one, where a suppressed combination still reads as a
+# ranked candidate and an empty `key_evidence` is indistinguishable from "this
+# run suppressed nothing". So a pre-4 profile is treated as stale rather than
+# reused (see `_split_fresh_stale`), and the cache heals on the next profile.
+CACHE_SCHEMA_VERSION = 4
 
 
 class PIICategory(str, Enum):
@@ -67,6 +78,28 @@ class ValueDomain(BaseModel):
 
     values: list[ValueCount]
     elided: int = 0
+
+
+class KeyEvidence(BaseModel):
+    """Why one column combination is, or is not, reported as a key.
+
+    ``candidate_keys`` is ranked but says nothing about why, and a caller who
+    cannot tell a real key from filler is worse served by several candidates
+    than by one named defect and none. This is where the reasoning lives.
+
+    ``status`` is the only discriminator a consumer needs. ``reason`` is prose
+    rather than a code, because the set of causes is open and a new one should
+    not need a contract change and an exhaustive match in every consumer; the
+    sentences are engine-authored templates over column names and counts, never
+    a customer string and never a column value.
+
+    The reported entries appear in the same order as ``candidate_keys``, which
+    is what keeps the two fields from drifting; the suppressed ones follow.
+    """
+
+    columns: list[str]
+    status: Literal["reported", "suppressed"]
+    reason: str
 
 
 class ColumnProfile(BaseModel):
@@ -123,9 +156,24 @@ class Dataset(BaseModel):
     #: annotation pass recomputes from column stats) so the proof survives
     #: re-annotation and its provenance stays distinct from derived signals.
     composite_keys: list[list[str]] = Field(default_factory=list)
+    #: Why each combination is or is not a key, reported entries first and in
+    #: ``candidate_keys`` order. Empty on a profile written before this existed;
+    #: the cache schema version is what tells those apart from a run that
+    #: suppressed nothing.
+    key_evidence: list[KeyEvidence] = Field(default_factory=list)
     rank_score: float | None = None
     data_quality: list[str] = Field(default_factory=list)
     profiled_at: str | None = None
+    #: The semantic models that sit on this relation, from the project's own
+    #: semantic layer. This is the physical catalog's half of a link the semantic
+    #: catalog carries in the other direction, and it is what makes "is this table
+    #: load-bearing" answerable from the map: a relation several metrics are built
+    #: on is a different object from one nothing reads, and the two are
+    #: indistinguishable by row count and PII flags alone. Empty means the layer
+    #: exposes it through no model **or** that no project was read, which is why
+    #: it is folded in only under `--use-project` and stated in the payload rather
+    #: than inferred from its absence.
+    semantic_models: list[str] = Field(default_factory=list)
 
     def notable_columns(
         self,
@@ -141,9 +189,19 @@ class Dataset(BaseModel):
         reporting it is the enumeration dex exists not to do.
 
         Returns each kept column paired with its role (``"grain"``, ``"key"``,
-        ``"join"``, or ``None`` for a column kept only because it is flagged) and
-        the number dropped, so a caller can always say how much it did not show.
-        ``everything`` keeps every column and still assigns the roles.
+        ``"join"``, or ``None`` for a column kept only because it is flagged or
+        because it almost keys the table) and the number dropped, so a caller
+        can always say how much it did not show. ``everything`` keeps every
+        column and still assigns the roles.
+
+        A column named by a **suppressed** ``key_evidence`` entry is kept, with
+        no role, because it is the subject of the grain verdict on exactly the
+        tables that have no grain: a map reporting "order_item_id is not unique"
+        while omitting ``order_item_id`` from the columns would be answering
+        past the question. It gets no role because it is not a key; claiming one
+        is the thing the suppression exists to stop. Only suppressed entries are
+        read, and each names a single anchor column rather than the partners it
+        was paired with, so this cannot pull filler columns in.
 
         ``join_columns`` is supplied rather than derived, because which joins are
         in view is the caller's question: a diagram marks FK against the edges it
@@ -157,6 +215,12 @@ class Dataset(BaseModel):
         keyed |= {c.lower() for group in self.composite_keys for c in group}
         grain = {c.lower() for c in (self.grain or [])}
         joins = {c.lower() for c in (join_columns or ())}
+        near_keys = {
+            c.lower()
+            for entry in self.key_evidence
+            if entry.status == "suppressed"
+            for c in entry.columns
+        }
 
         kept: list[tuple[ColumnProfile, str | None]] = []
         dropped = 0
@@ -170,10 +234,74 @@ class Dataset(BaseModel):
                 role = "key"
             else:
                 role = None
-            if role is None and column.pii is None and not everything:
+            if (
+                role is None
+                and column.pii is None
+                and lowered not in near_keys
+                and not everything
+            ):
                 dropped += 1
                 continue
             kept.append((column, role))
+        return kept, dropped
+
+    def columns_with_findings(
+        self, *, everything: bool = False
+    ) -> tuple[list[ColumnProfile], int]:
+        """The columns of this dataset worth showing by default in `explore
+        profile`'s payload: the ones its own checks already flagged, so the
+        verdict a caller asked for -- grain, keys, data quality -- is not the
+        part 107 columns of schema push past a truncating harness's cutoff.
+
+        Deliberately not `notable_columns`: that method is shared with `map`
+        and `diagram`, where "notable" means a grain/key/join/PII role, and
+        widening it to include null fraction and data-quality mentions would
+        change what those two commands consider notable too. This predicate
+        is `profile`'s own.
+
+        A column carries a finding if it is PII-flagged, has a non-zero null
+        fraction, is a member of a candidate or composite key (or is itself
+        proven unique), carries a reported value domain (a low-cardinality
+        enumeration the profiler specifically computed, so its presence is
+        already the profiler saying this column is worth a look), or is
+        named in one of this dataset's own `data_quality` sentences. The
+        last check is a word-boundary match against the joined notes, not a
+        raw substring (a column named `am` must not match `amount`), and it
+        can still over-include a column merely mentioned in a note about a
+        different one. That is the safe direction to be wrong in: the
+        predicate exists so a real finding is never the reason it gets
+        truncated away, not to be a precise finding-to-column index.
+        ``everything`` keeps every column.
+
+        Needs no ``key_evidence`` check of its own: a suppressed entry's
+        anchor is a column with duplicates, so it is already named in one of
+        this dataset's ``data_quality`` sentences and kept by the last rule
+        below. That is also why the suppression prose names only the anchor and
+        never the partners it was paired with; naming those would pull four
+        columns back in through the same rule, which is exactly the payload
+        bloat the finding summary removed.
+        """
+
+        keyed = {c.lower() for group in self.candidate_keys for c in group}
+        keyed |= {c.lower() for group in self.composite_keys for c in group}
+        note_text = " ".join(self.data_quality)
+
+        kept: list[ColumnProfile] = []
+        dropped = 0
+        for column in self.columns:
+            has_finding = (
+                column.pii is not None
+                or bool(column.null_fraction)
+                or column.name.lower() in keyed
+                or column.is_unique is True
+                or column.value_domain is not None
+                or re.search(rf"\b{re.escape(column.name)}\b", note_text, re.IGNORECASE)
+                is not None
+            )
+            if everything or has_finding:
+                kept.append(column)
+            else:
+                dropped += 1
         return kept, dropped
 
 
@@ -190,8 +318,18 @@ class RelationshipKind(str, Enum):
 
 
 class Relationship(BaseModel):
-    """A join between two datasets: declared (FK / dbt), inferred (a name-based
-    heuristic), or overlap-inferred (a name-blind value-containment probe).
+    """A join between two datasets: declared (a project's own statement), inferred
+    (a name-based heuristic), or overlap-inferred (a name-blind value-containment
+    probe).
+
+    A declared edge has two possible sources and they are equally authoritative: a
+    ``relationships`` test, which is the project's claim that a foreign key holds,
+    and a semantic layer's shared entity, which is a join the layer will actually
+    perform with a key it names per model. ``declared_by`` names the second, whose
+    name (the entity) is something a reader can look up and the edge does not
+    otherwise carry. It stays unset for a ``relationships`` test, which declares
+    exactly the two columns the edge already names, so repeating them there would
+    be noise rather than provenance.
 
     ``verified`` and ``orphan_fraction`` are set by the opt-in ``--verify``
     overlap probe on a DECLARED or INFERRED edge: a name-based join stays a
@@ -218,6 +356,10 @@ class Relationship(BaseModel):
     confidence: float | None = None
     verified: bool = False
     orphan_fraction: float | None = None
+    declared_by: str | None = None
+    #: Every channel that made the declared claim. ``declared_by`` remains the
+    #: legacy single semantic handle; this field preserves agreement provenance.
+    declaration_sources: list[str] = Field(default_factory=list)
 
 
 def match_identifier(name: str, known: list[str]) -> list[str]:
@@ -303,6 +445,12 @@ class CacheProvenance(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     tool_version: str | None = Field(default_factory=tool_version)
+    #: Namespaces whose complete object inventory contributed to this cache.
+    #: A named relation absent from one of these namespaces is known missing;
+    #: absence elsewhere is only unknown because ``explore profile`` may write
+    #: a deliberately partial cache.  Kept as provenance rather than inferred
+    #: from ``datasets`` so a partial profile can never masquerade as inventory.
+    inventory_namespaces: list[str] = Field(default_factory=list)
 
 
 class DexCache(BaseModel):

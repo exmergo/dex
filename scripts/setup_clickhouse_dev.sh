@@ -25,6 +25,7 @@ HTTP_PORT="${DEX_CH_PORT:-8124}"
 NATIVE_PORT="${DEX_CH_NATIVE_PORT:-9001}"
 IMAGE=clickhouse/clickhouse-server:25.3
 SEED="$(cd "$(dirname "$0")" && pwd)/clickhouse_seed.sql"
+USERS="$(cd "$(dirname "$0")" && pwd)/clickhouse_local_users.sql"
 
 if [[ "${1:-}" == "--down" ]]; then
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -61,7 +62,10 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
-docker exec -i "$CONTAINER" clickhouse-client --multiquery <"$SEED"
+docker exec -i "$CONTAINER" clickhouse-client --multiquery \
+    --param_app_database=app \
+    --param_dev_database=dbt_dev <"$SEED"
+docker exec -i "$CONTAINER" clickhouse-client --multiquery <"$USERS"
 
 echo "seeded app and dbt_dev from scripts/clickhouse_seed.sql"
 echo

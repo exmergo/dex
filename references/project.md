@@ -16,13 +16,20 @@ satisfy, and what dex promises to do with it.
 One reason, and it is a real one: your models are not a dbt project.
 
 A host that builds its transformation graph in something else (an orchestrator's
-asset graph, SQLMesh, a semantic layer that owns its own definitions) still has
-everything dex needs to be useful. It knows which tables it builds, at what grain,
-and how they relate. What it does not have is a `dbt_project.yml`, and generating a
-fake one to satisfy dex means maintaining a translation nobody reads and dex cannot
-check.
+asset graph, SQLMesh) still has everything dex needs to be useful. It knows which
+tables it builds, at what grain, and how they relate. What it does not have is a
+`dbt_project.yml`, and generating a fake one to satisfy dex means maintaining a
+translation nobody reads and dex cannot check.
 
 The seam exists so that translation can be code you own instead.
+
+**A semantic layer that owns its own definitions is not one of these**, and
+writing it as a project format is the wrong shape. It builds nothing, so it has
+no model graph to fingerprint and no relation it could claim to own. It belongs
+on the semantic axis instead, as a semantic source with its own contracts. That
+distinction is spelled out under
+[the two protocols beside the tiers](#the-three-tiers) further down, and in full
+in [`semantic-layer.md`](semantic-layer.md).
 
 ## The three tiers
 
@@ -40,14 +47,34 @@ implementation is complete rather than partial.
 `isinstance` rather than declared, so a format cannot claim a tier it has not
 implemented.
 
-One protocol sits beside the tiers rather than in them, `PlacingProject`, and
-reaching `reconcile`'s write path means implementing it as well as tier 3. Its three
-methods are `load()`, `edit_path()` and `editing_surface()`, and they are described
-under [Where an edit lands](#where-an-edit-lands-and-what-you-own) below. It is
-beside rather than on tier 3 because these protocols are `runtime_checkable`: a
-method added to tier 3 would demote every format that has not implemented it yet, so
-`tier_of` would start answering 2 where it answered 3 and the write path would close
-for exactly the implementers who were already passing.
+Two protocols sit beside the tiers rather than in them.
+
+`PlacingProject` is one, and reaching `reconcile`'s write path means implementing it
+as well as tier 3. Its three methods are `load()`, `edit_path()` and
+`editing_surface()`, and they are described under
+[Where an edit lands](#where-an-edit-lands-and-what-you-own) below.
+
+`SemanticCatalogProject` is the other, one method, `semantic_catalog()`, and it is
+what `explore semantic list --local` reads. It is described under
+[Reading the semantic layer twice](#reading-the-semantic-layer-twice-for-two-different-questions).
+
+It is here because a *dbt project* happens to hold a semantic layer, not because
+a semantic layer is a project. A repository can have a layer and no
+transformation project at all, and one that does is configured on the semantic
+axis (`semantic.vendor`) and built through
+`exmergo_dex_core.semantic_source`, which checks that what it built can answer a
+catalog and checks nothing else. Nothing on this page applies to it: it owns no
+model graph, no compilation, no targets, and no write surface into dbt's files,
+and it satisfies none of the tiers below. See
+[the semantic layer reference](semantic-layer.md) for that axis and its own
+conformance contracts.
+
+Both are beside rather than on a tier because these protocols are
+`runtime_checkable`: a method added to a tier would demote every format that has not
+implemented it yet, so `tier_of` would start answering 2 where it answered 3 and the
+write path would close for exactly the implementers who were already passing. A
+capability a format may legitimately decline belongs in its own protocol, where
+declining it is an answer rather than a regression.
 
 That is also why `load()` is there rather than on tier 3, which is where you would
 look for it first. Nothing outside the placement path calls it: both callers reach it
@@ -83,6 +110,11 @@ does not implement `EditableProject` gets every finding back as an advisory
 proposal, with no edits and no stored plan, and a warning naming the format and the
 tier it declined. The findings themselves are still surfaced: declining the write
 tier removes dex's authority to author an edit, not your need to see the drift.
+
+Declining the tier and declining one kind are different statements and they no longer
+produce the same outcome. A format that implements tier 3 and answers `None` for one
+kind has refused that artifact, not the write path, and reconcile still writes to the
+kinds it placed.
 
 That used to hold by accident. Reconcile's two mechanical write paths gated on the
 `models/staging/stg_<table>.*` scaffold convention and failed closed, so a generated
@@ -120,6 +152,85 @@ human the divergence and ask. A result answering neither fails in both direction
 once: a plan recorded as applied that wrote nothing, or a conflict that never reaches
 the person it was raised for. Return `dbt_project.ApplyResult`, or anything exposing
 those two.
+
+## Reading the semantic layer twice, for two different questions
+
+Beside tier 2 sits one optional protocol, `SemanticCatalogProject`, and the reason
+it is a second channel rather than a third member of the tier is worth stating
+before you implement either.
+
+```python
+@runtime_checkable
+class SemanticCatalogProject(Protocol):
+    def semantic_catalog(self) -> SemanticCatalogView: ...
+```
+
+`semantic_layer()` is a **fingerprint**. Its job is to make a change detectable, so
+it reduces the layer to a content hash per definition plus the physical column
+behind each field, and it hashes what the author wrote rather than what a compiler
+produced, which is what keeps a stored baseline stable across a tool upgrade. It
+deliberately throws away everything a reader wants: element types, the project's own
+labels and descriptions, a measure's aggregation, a metric's composition, and the
+token a query actually groups by.
+
+`semantic_catalog()` is the **read view** `explore semantic list` returns, and every
+field it carries is a field the fingerprint is right to drop. Widening the
+fingerprint to serve it would push presentation metadata into a persisted baseline
+and cost it the stability it exists for, so the two are separate reductions of one
+layer and your format performs both.
+
+Four things to get right, all of them things dex itself got wrong first:
+
+**An entity is not one record.** `EntityInfo.roles` carries one entry per
+`(entity, semantic model)` declaration, with that model's own `type`, `expr` and
+`description`. An entity is `primary` in the one model that keys it and `foreign` in
+every model that joins to it, the join key differs per model for the same entity, and
+each declaration is where a project documents that model's join. The single
+top-level `type` is derived, primary wherever any declaration is primary. Returning
+one record per entity means picking a value, and whichever you pick is iteration
+order rather than a fact about the layer.
+
+**`DimensionInfo.name` is a query token, not a display name.** A caller pastes it
+into `--group-by`. If your layer requires a qualified path, return the path;
+`definition` and `semantic_model` are where the declaration behind it goes.
+`SemanticCatalogContract` asserts that every dimension a metric claims to be
+groupable by appears as a dimension row, because the two have to be one vocabulary
+or neither can be acted on.
+
+**Resolve the layer to the warehouse, and never invent the resolution.**
+`SemanticModelInfo.relation` is the physical relation the model sits on, and it is
+the only place a relation appears in the catalog: a dimension, an entity
+declaration and a measure each carry `column` and each already names its
+`semantic_model`, so an element's address is its column plus its model's relation.
+That is what connects your layer to the objects `explore map` and
+`explore profile` describe, and what lets a caller answer "which table is behind
+this metric". Leave `column` unset wherever the reference is a computed expression
+rather than a plain column, because the PII gate resolves a dimension to a column
+and reads that column's evidence: a guessed column makes it screen the wrong one
+and report the verdict as authoritative. A backend that structurally cannot know
+the relation declares that gap instead, which is a different statement from a
+format that could resolve it and did not.
+
+**Say what one dimension row is.** `dimension_scope` is `declarations` (one row per
+declared dimension) or `queryable_paths` (one row per groupable token, so a dimension
+reached through a join appears once per path). Both are honest and they produce very
+different counts for one layer, which is unreadable to a caller who is not told
+which they hold.
+
+`physical_columns` maps every dimension and entity token, bare and qualified, to the
+`(relation, column)` behind it. It is never serialized: the PII request-gate reads it
+to resolve a token to a profiled column, which is why the resolution belongs to the
+format rather than to a query backend. Leave a token out where the reference is a
+computed expression, on the same principle as the `None` columns on
+`SemanticModelDef`: a guessed column makes the gate over-claim.
+
+Raise `ProjectError` where the layer cannot be read *yet*, as opposed to being
+empty. An uncompiled project and a project that declares no metrics are different
+answers and only one is fixed by running a command, and the caller turns the raise
+into a refusal naming that command. Declining the protocol outright is also a
+complete answer: a format with no semantic layer implements nothing here, and
+`explore semantic list --local` refuses by name rather than returning an empty
+catalog that reads as a layer with nothing in it.
 
 ## Where an edit lands, and what you own
 
@@ -185,8 +296,17 @@ keyspace.
 are not equally receivable and you are expected to differ across them. `SCHEMA_YML`
 is a mutation of a file you already have. `MODEL_SQL` carries dbt SQL that dex
 generates alongside the path, so placement alone cannot open that channel: a format
-that places a staging model elsewhere gets the proposal as advice rather than having
-dbt written into its tree. One `None` and one path is the shape this exists for.
+that places a staging model elsewhere gets that half as advice rather than having
+dbt written into its tree. One `None` and one path is the shape this exists for, and
+the two halves are answered separately.
+
+Declining `MODEL_SQL` costs you the model and nothing else. Schema drift on a table
+you place a `SCHEMA_YML` for still arrives as a mechanical edit to that declaration,
+because a column appearing or disappearing upstream is a fact about the declaration
+rather than about dbt SQL. The proposal says in its own words that dex authored
+nothing for the model, so a reader can tell a half you declined from a half dex
+dropped. What lands in the declaration is described under
+[What reconcile writes into a declaration](#what-reconcile-writes-into-a-declaration).
 
 The kind list grows over time (`MACRO_SQL`, `SNAPSHOT_SQL`, `SEED_CSV`, `TEST_SQL`
 and `ANALYSIS_SQL` are all dbt-shaped artifacts a non-dbt format may have no
@@ -226,11 +346,10 @@ declaration narrower than the writer is not a modest one: it refuses the project
 config, the profiles and the package manifests at apply, every one of which is a path
 dex authors through a plan.
 
-**One thing dex still spells its own way.** The `unique` test edit finds your model
-inside the placed file by the file's own name (`declarations/orders.yml` means a
-model named `orders`). If you pack several models into one file, no entry matches and
-you get a warning instead of an edit, which is a refusal to guess rather than a wrong
-write.
+**One thing dex still spells its own way.** Every edit finds your model inside the
+placed file by the file's own name (`declarations/orders.yml` means a model named
+`orders`). If you pack several models into one file, no entry matches and you get a
+warning instead of an edit, which is a refusal to guess rather than a wrong write.
 
 **That edit is checked against your declarations before it is proposed.** If
 `definitions()` reports a composite grain covering the column, no column-level
@@ -250,6 +369,57 @@ their member columns. Splitting one grain across several entries is worse than
 leaving it out, because each entry then claims a column is unique on its own, which
 is a stronger claim than the one you made and the one that gets acted on. The
 conformance suite checks both shapes.
+
+## What reconcile writes into a declaration
+
+Your file is one a person wrote and nothing regenerates, so dex splices it: the bytes
+that declare the drifted column change and every other byte stays where it was.
+Comments, descriptions, key order and formatting survive, and the diff a reviewer
+reads is the size of the change rather than the size of the file.
+
+| finding | what lands |
+|---|---|
+| `column_added` | a column entry at the end of the model's `columns:`, carrying `meta.contains_pii` and the category when the name scores as PII |
+| `column_dropped` | the column's entry, removed with the lines that only described it |
+| `nullability_changed` | `not_null` added or removed on that column, in whichever direction the source moved |
+| `column_retyped` | nothing, and a proposal saying why |
+| `key_lost_uniqueness` | `unique` added to that column, subject to the declared-grain check below |
+
+**A retype is the one dex declines, and the reason is worth stating.** Nothing dex
+authors declares a type, and the type it holds is the connector's own spelling rather
+than a canonical one: Snowflake reports `NUMBER(38,0)` and `NUMBER(10,2)` both as
+`FIXED`, BigQuery reports a repeated record as `ARRAY<STRUCT>`, ClickHouse carries
+nullability inside the type as `Nullable(Int64)`. A type written from that would be
+one warehouse's word for the column rather than the column's, so the change is
+surfaced with both spellings named and the edit is yours to make.
+
+Two consequences of that last point are worth knowing before you read a drift report:
+
+- On **ClickHouse**, nullability *is* the type constructor, so a column that starts
+  or stops accepting nulls is reported as `column_retyped` and never as
+  `nullability_changed`. It therefore arrives as advice where every other connector
+  produces an edit.
+- On **Snowflake**, a precision or scale change produces no schema finding at all,
+  because both spellings render identically.
+
+**The mechanics, for a format whose files dex did not write.** A new column entry
+takes its indent from the entries already there rather than from a convention, and a
+model declaring no columns is declined instead of being given a `columns:` block it
+never had. A `tests` list stays flow if it was flow and block if it was block, the
+file's own choice between `tests` and `data_tests` is kept, and removing the last
+test removes the key rather than leaving an empty list. A test written as a mapping
+is counted and never rewritten, so a configured `accepted_values` survives an edit to
+the plain names beside it. A file dex cannot span safely, one indented with tabs, one
+holding several YAML documents, or one using anchors and aliases, is declined by name
+rather than spliced at an offset nobody chose. Every result is re-parsed and compared
+against what the edit intended before it can reach the plan store.
+
+**A table that drifted on two axes arrives as one edit.** Schema drift and a lost
+unique key both land in the same declaration, and two edits on one path would pin the
+same content hash, so the second would overwrite the first and the change a reviewer
+approved would not be the change that got written. Everything folds into one edit per
+path, and an edit that would have reproduced the file you already have is dropped
+rather than offered.
 
 ## The one rule that is not visible in the signatures
 
@@ -346,8 +516,9 @@ class TestMyProject(ExploreProjectContract):
 pytest collects the inherited assertions and runs the contract against your format.
 Use `MaintainProjectContract` instead if you reach tier 2, `EditableProjectContract`
 if you reach tier 3, mix `DeclaringProjectContract` and `SemanticProjectContract`
-beside it for the content your format declares, mix `PlacingProjectContract` beside
-it if you implement placement, and mix
+beside it for the content your format declares, mix `PlacingProjectContract` and
+`SemanticCatalogContract` beside it for each protocol you implement beside the
+tiers, and mix
 `ProjectFactoryContract` in front of it if dex will build your format from a name
 rather than be handed an instance. Construction is a separate contract, so a format
 that passes the behavioral suite can still be unreachable from configuration; "the
@@ -544,13 +715,20 @@ format and one format's coordinates are not another's.
 Anything callable that takes a `ProjectContext` and returns a project: a function, a
 class whose `__init__` takes one, or a classmethod like `DbtProject.from_context`.
 
-`ProjectContext` has three fields, and the point of the shape is that a format
-ignores the ones it does not have.
+`ProjectContext` is a set of nullable slots, and the point of the shape is that a
+format ignores the ones it does not have.
 
 - **`repo_root`**, the directory dex was pointed at, or `None` when there is no
   repository in the picture.
 - **`project_dir`**, where within that repository the project was pinned, relative
   to `repo_root`. `None` when nothing pinned one.
+- **`connector`**, the name of the warehouse dex resolved for this run, or `None`
+  when nothing named one. A **name**, never a live adapter and never a credential,
+  so reading it opens no connection and costs nothing. It is here because a format
+  may have to read an authored expression or relation name the way the active
+  warehouse would, and identifier arity, quoting, and unquoted-case folding are
+  the connector's rules: a format that guesses them links a declaration to the
+  wrong column or to none. dbt reads its own target and ignores this.
 - **`options`**, your format's own coordinates, passed through verbatim. dex does
   not interpret them, so the keys are yours to define and yours to validate.
 

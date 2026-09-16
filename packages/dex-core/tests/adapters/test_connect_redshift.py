@@ -714,6 +714,50 @@ def test_aggregates_use_hll_distinct_in_one_pass(fake_redshift_connection):
     assert by_name["email"].null_fraction == pytest.approx(0.1)
 
 
+def test_temporal_aggregates_run_in_redshift_read_only_session(
+    fake_redshift_connection,
+):
+    """A distinct aggregate and temporal continuity must remain one valid
+    read-only statement; Redshift rejects the flat scalar-subquery shape with
+    SQLSTATE 25006 even though each SELECT succeeds independently."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    fake_redshift_connection.reject_read_only_temporal_plan = True
+    fake_redshift_connection.row_resolver = lambda sql: FakeResult(
+        rows=[
+            {
+                "n_total": 4,
+                "nn_0": 4,
+                "nd_0": 4,
+                "mn_0": "2026-01-01 00:00:00",
+                "mx_0": "2026-01-05 00:00:00",
+                "tc_da_0": 1.0,
+                "tc_ma_0": 0.25,
+                "tp_d_0": 4,
+                "tg_d_0": 1,
+                "tp_m_0": 1,
+                "tg_m_0": 0,
+                "tp_h_0": 4,
+                "tg_h_0": 47,
+            }
+        ],
+        seconds=0.5,
+    )
+    adapter = make_adapter(fake_redshift_connection)
+    aggregates = adapter.column_aggregates(
+        "dexdb.shop.customers",
+        [ColumnMeta("created_at", "timestamp", False, 0)],
+        safe_min_max={"created_at"},
+        temporal_stats={"created_at"},
+    )
+
+    assert len(fake_redshift_connection.data_statements) == 1
+    assert aggregates[0].day_distinct_periods == 4
+    assert aggregates[0].day_largest_gap == 1
+    assert aggregates[0].hour_largest_gap == 47
+
+
 def test_shape_stats_ride_the_aggregate_batch(fake_redshift_connection):
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 

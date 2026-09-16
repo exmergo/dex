@@ -300,6 +300,37 @@ def _grain_drift(repo):
     repo.dex("maintain", "grain")
 
 
+def _schema_drift(repo, *statements):
+    repo.snapshot()
+    repo.sql(*statements)
+    repo.dex("maintain", "schema")
+
+
+def test_a_placing_format_receives_a_column_edit_in_its_own_sidecar(sidecar_repo):
+    """The schema axis reaches a format that declines the staging model channel.
+
+    Placement decides where an edit lands, not what dex is allowed to author. A
+    column appearing upstream is a fact about the declaration, and the
+    declaration is a file this format placed and can receive. Declining the SQL
+    half is not a reason to forfeit the half that was never dbt SQL.
+    """
+
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0 and payload["status"] == "ok", payload.get("errors")
+    mechanical = [p for p in payload["data"]["proposals"] if p["kind"] == "mechanical"]
+    assert mechanical, payload
+    assert mechanical[0]["paths"] == [_SIDECAR]
+    diff = next(d for d in payload.get("diffs") or [] if d["path"] == _SIDECAR)
+    assert "discount" in diff["unified"]
+    # Nothing was authored against dbt's convention, which this format does not have.
+    assert not any(
+        d["path"].startswith("models/staging/") for d in payload.get("diffs") or []
+    )
+
+
 def test_a_placing_format_receives_the_test_edit_in_its_own_sidecar(sidecar_repo):
     """The third gate, open: a format's own surface is what its edits are checked
     against.
@@ -326,6 +357,249 @@ def test_a_placing_format_receives_the_test_edit_in_its_own_sidecar(sidecar_repo
     )
 
 
+_HAND_WRITTEN = (
+    "version: 2\n"
+    "models:\n"
+    "  # the orders asset, declared by hand\n"
+    "  - name: orders\n"
+    "    columns:\n"
+    "      - name: order_id\n"
+    "        description: the natural key\n"
+    "        tests: [not_null]\n"
+    "      - name: customer_id\n"
+    "        tests: [not_null]\n"
+    "      - name: status\n"
+    "        tests: [not_null]\n"
+)
+
+
+def test_the_column_edit_is_a_splice_that_leaves_the_hand_written_file_alone(
+    sidecar_repo,
+):
+    """The declaration is a file a person wrote, so dex changes bytes, not shape.
+
+    Reprinting the document a YAML parser produced would drop the comment and
+    reflow every line, and a reviewer would be reading a whole-file diff to find
+    the one column that moved. The comment and the description below are the
+    things a round trip loses, which is why they are what this asserts on.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(_HAND_WRITTEN, encoding="utf-8")
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    diff = next(d for d in payload["diffs"] if d["path"] == _SIDECAR)
+    assert diff["deletions"] == 0 and diff["additions"] == 1, diff["unified"]
+
+    sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    written = (sidecar_repo.root / _SIDECAR).read_text(encoding="utf-8")
+    assert "# the orders asset, declared by hand" in written
+    assert "description: the natural key" in written
+    assert "- name: discount" in written
+
+
+def test_a_dropped_column_takes_its_own_entry_and_not_its_neighbour(sidecar_repo):
+    """Removing the middle of three leaves the other two.
+
+    A block entry's span is measured by indentation rather than from the parser's
+    end mark, which lands inside the *next* entry. Trusting the mark makes a
+    removal take the column below it with it, in a diff the reviewer reads as one
+    deletion. The middle column is the only position where that is visible.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(_HAND_WRITTEN, encoding="utf-8")
+    _schema_drift(sidecar_repo, "ALTER TABLE orders DROP customer_id")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+    assert rc == 0, payload.get("errors")
+    sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+
+    written = (sidecar_repo.root / _SIDECAR).read_text(encoding="utf-8")
+    assert "- name: customer_id" not in written
+    assert "- name: order_id" in written and "- name: status" in written
+    assert "description: the natural key" in written
+
+
+def test_a_retype_is_advisory_because_the_declaration_carries_no_type(sidecar_repo):
+    """A type change is surfaced, not written, and the action says why.
+
+    Nothing dex authors declares a type, and the type it holds is the connector's
+    own spelling rather than a canonical one, so a written type would be one
+    warehouse's word for the column rather than the column's.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(_HAND_WRITTEN, encoding="utf-8")
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ALTER amount TYPE DECIMAL(10,2)")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    retyped = [
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "column_retyped"
+    ]
+    assert [p["kind"] for p in retyped] == ["advisory"]
+    assert "DOUBLE -> DECIMAL(10,2)" in retyped[0]["action"]
+    assert retyped[0]["paths"] == []
+    assert payload["data"].get("plan_id") is None
+    assert not payload.get("diffs")
+
+
+def test_a_nullability_change_adds_and_removes_the_not_null_test(sidecar_repo):
+    """Both directions, because the warehouse moves both ways.
+
+    A column that stopped accepting nulls gains the test; one that started
+    accepting them loses it, because the declaration asserts something the source
+    no longer guarantees and a test that cannot pass is not a safeguard.
+    """
+
+    sidecar = sidecar_repo.root / _SIDECAR
+    sidecar.write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        tests: [not_null, unique]\n"
+        "      - name: status\n",
+        encoding="utf-8",
+    )
+    sidecar_repo.sql("ALTER TABLE orders ALTER order_id SET NOT NULL")
+    sidecar_repo.dex("explore", "map")
+    sidecar_repo.snapshot()
+    sidecar_repo.sql("ALTER TABLE orders ALTER order_id DROP NOT NULL")
+    sidecar_repo.dex("maintain", "schema")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    diff = next(d for d in payload["diffs"] if d["path"] == _SIDECAR)
+    # The other declared test survives: only the one the drift is about moves.
+    assert "-        tests: [not_null, unique]" in diff["unified"]
+    assert "+        tests: [unique]" in diff["unified"]
+
+
+def test_grain_and_schema_drift_on_one_table_arrive_as_one_edit(sidecar_repo):
+    """Two axes, one declaration, one edit.
+
+    Both axes land in the file the format placed for this table. Two edits on one
+    path pin the same content hash, so the second overwrites the first and the
+    change the reviewer approved is not the change that gets written.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(_HAND_WRITTEN, encoding="utf-8")
+    sidecar_repo.snapshot()
+    sidecar_repo.sql(
+        "ALTER TABLE orders ADD COLUMN discount DOUBLE",
+        "INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10",
+    )
+    sidecar_repo.dex("maintain", "schema")
+    sidecar_repo.dex("maintain", "grain")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile")
+
+    assert rc == 0, payload.get("errors")
+    assert [d["path"] for d in payload["diffs"]].count(_SIDECAR) == 1
+
+    sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    written = (sidecar_repo.root / _SIDECAR).read_text(encoding="utf-8")
+    # Neither half was dropped on the way through.
+    assert "- name: discount" in written
+    assert "unique" in written
+
+
+def test_a_declarations_file_packing_many_models_gets_a_warning_not_a_guess(
+    sidecar_repo,
+):
+    """Dex names the model after the file the format chose, and will not guess.
+
+    The format answered where this table's declaration lives. A file holding
+    several models has no entry that answer identifies, and picking one would be
+    iteration order rather than a fact about the project.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders_core\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "  - name: orders_extra\n"
+        "    columns:\n"
+        "      - name: status\n",
+        encoding="utf-8",
+    )
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    added = next(
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "column_added"
+    )
+    assert added["kind"] == "advisory"
+    assert "declares no model named 'orders'" in added["action"]
+    assert not payload.get("diffs")
+
+
+def test_a_declarations_file_dex_cannot_span_stays_advisory(sidecar_repo):
+    """A structure the splice cannot be trusted through is declined by name.
+
+    Tabs make indentation ambiguous, and every offset in this path is computed
+    from indentation. Refusing and saying which structure is the answer; a splice
+    into a file dex cannot read the shape of would land somewhere nobody chose.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n\t- name: order_id\n",
+        encoding="utf-8",
+    )
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    added = next(
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "column_added"
+    )
+    assert added["kind"] == "advisory"
+    assert "indents with tabs" in added["action"]
+    assert not payload.get("diffs")
+
+
+def test_a_column_dropped_by_drift_gets_no_unique_test_proposed_on_it(sidecar_repo):
+    """The two axes disagree about a column, and the removal wins.
+
+    A key that lost uniqueness and was then dropped upstream is one event, not
+    two. Proposing a test on an entry the same plan removes would build an edit
+    that contradicts itself, so the drop stands and the test says why it did not.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(_HAND_WRITTEN, encoding="utf-8")
+    sidecar_repo.snapshot()
+    sidecar_repo.sql(
+        "INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10",
+    )
+    sidecar_repo.dex("maintain", "grain")
+    sidecar_repo.sql("ALTER TABLE orders DROP order_id")
+    sidecar_repo.dex("maintain", "schema")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile")
+
+    assert rc == 0, payload.get("errors")
+    lost = next(
+        (
+            p
+            for p in payload["data"]["proposals"]
+            if p["finding_code"] == "key_lost_uniqueness"
+        ),
+        None,
+    )
+    assert lost is not None and lost["paths"] == []
+    assert any("being removed from" in w for w in payload["warnings"])
+
+
 def test_the_edit_is_pinned_to_the_formats_file_not_dbts_view_of_it(sidecar_repo):
     """The diff is the one-line change, not the whole file appearing from nowhere.
 
@@ -347,10 +621,11 @@ def test_the_edit_is_pinned_to_the_formats_file_not_dbts_view_of_it(sidecar_repo
     # every line as an addition. This one was read from the format's own view, so
     # it diffs against itself and the untouched declarations survive as context.
     assert "/dev/null" not in diff["unified"], diff["unified"]
-    # Context lines exist only against a file the plan knew was there. (The
-    # additions are noisier than the change, because the edit round-trips the
-    # YAML through `safe_dump`, which is how the scaffolded dbt path renders too.)
-    assert " version: 2" in diff["unified"].splitlines()
+    # Context lines exist only against a file the plan knew was there, and the
+    # change is one line: the edit is a splice into the bytes that were there
+    # rather than a reprint of the document they parsed into.
+    assert "       - name: order_id" in diff["unified"].splitlines()
+    assert diff["additions"] == 1 and diff["deletions"] == 1, diff["unified"]
     assert "unique" in diff["unified"]
 
 

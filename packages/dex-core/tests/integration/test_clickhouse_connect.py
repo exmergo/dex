@@ -14,6 +14,8 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
+from .conftest import integration_budget
+
 pytestmark = [pytest.mark.integration, pytest.mark.clickhouse]
 
 
@@ -29,9 +31,11 @@ def seed_repo(
         clickhouse["databases"] = databases
     if max_full_profile_bytes is not None:
         clickhouse["max_full_profile_bytes"] = max_full_profile_bytes
-    config: dict = {"connector": "clickhouse", "clickhouse": clickhouse}
-    if budget is not None:
-        config["budget"] = {"ceiling": budget}
+    config: dict = {
+        "connector": "clickhouse",
+        "clickhouse": clickhouse,
+        "budget": integration_budget(budget),
+    }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
 

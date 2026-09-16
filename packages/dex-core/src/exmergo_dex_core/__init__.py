@@ -82,13 +82,18 @@ _EXPORTS = {
     "Document": "storage",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "LedgerUnreadableError": "guards.cost_guard",
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
+    "MissingPackagesError": "transform.build",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
+    "OssieDependencyError": "ossie.loader",
     "OverCeilingError": "guards.cost_guard",
     "Paradigm": "envelope",
+    "PlanDigestMismatchError": "transform.portable",
+    "PlanDocumentError": "transform.portable",
     "PlanError": "transform.plans",
     "PlanNotFoundError": "transform.plans",
     "PrerequisiteError": "errors",
@@ -100,9 +105,12 @@ _EXPORTS = {
     "Result": "results",
     "ScopeError": "connect",
     "SemanticBackendError": "explore.semantic",
+    "SemanticLayerError": "explore.semantic",
     "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
+    "SessionCeilingDecisionRequiredError": "guards.cost_guard",
     "Snapshot": "maintain.snapshot",
+    "SpendHistory": "storage",
     "SpendLock": "storage",
     "SpendLockTimeoutError": "guards.cost_guard",
     "Store": "storage",
@@ -151,19 +159,23 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .explore.diagram import MermaidDiagram, render_er_mermaid
     from .explore.semantic import (
         SemanticBackendError,
+        SemanticLayerError,
         SemanticQueryRefusedError,
     )
     from .guards.cost_guard import (
         CeilingRequiredError,
         ConfirmationRequiredError,
         CostGuardError,
+        LedgerUnreadableError,
         OverCeilingError,
+        SessionCeilingDecisionRequiredError,
         SpendLockTimeoutError,
     )
     from .guards.dialect import DialectDependencyError
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
+    from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
         ConfirmationRequest,
@@ -177,12 +189,15 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         FilesystemStore,
         MaintainStore,
         MemoryStore,
+        SpendHistory,
         SpendLock,
         Store,
         StoreContext,
         StoreFactory,
     )
+    from .transform.build import MissingPackagesError
     from .transform.plans import PlanError, PlanNotFoundError
+    from .transform.portable import PlanDigestMismatchError, PlanDocumentError
 
 try:
     __version__ = version("exmergo-dex-core")
@@ -224,13 +239,18 @@ __all__ = [
     "Document",
     "ExploreStore",
     "FilesystemStore",
+    "LedgerUnreadableError",
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
+    "MissingPackagesError",
     "NoBaselineError",
     "NoConnectorSelectedError",
+    "OssieDependencyError",
     "OverCeilingError",
     "Paradigm",
+    "PlanDigestMismatchError",
+    "PlanDocumentError",
     "PlanError",
     "PlanNotFoundError",
     "PrerequisiteError",
@@ -242,9 +262,12 @@ __all__ = [
     "Result",
     "ScopeError",
     "SemanticBackendError",
+    "SemanticLayerError",
     "SemanticQueryRefusedError",
     "SemanticSource",
+    "SessionCeilingDecisionRequiredError",
     "Snapshot",
+    "SpendHistory",
     "SpendLock",
     "SpendLockTimeoutError",
     "Store",

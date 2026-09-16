@@ -39,7 +39,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import PostgresTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -49,6 +49,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -169,6 +170,8 @@ class PostgresAdapter:
     name = "postgres"
     dialect = DIALECT
     paradigm = Paradigm.DB_LOAD
+    # Database-seconds from EXPLAIN, which prices a plan rather than a run.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,
@@ -240,7 +243,7 @@ class PostgresAdapter:
             ],
             "budget": {
                 "ceiling_seconds": cost.ceiling,
-                "session_spent_today_seconds": self.cost_gate.session_spent,
+                "session_spent_today_seconds": self.cost_gate.session_spent_now(),
             },
         }
 
@@ -914,33 +917,33 @@ class PostgresAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
             return {}
         meta, _ = self.table_metadata(identifier)
-        estimate = self._scan_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._scan_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1080,12 +1083,7 @@ class PostgresAdapter:
         the cursor and whether the budget (not the wall clock) is the binding
         bound."""
 
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one database-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="database-second")
         self._ensure_session()
         cursor = self._conn.cursor()
         timeout_ms: int | None = None

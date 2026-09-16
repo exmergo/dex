@@ -25,11 +25,11 @@ from typing import NamedTuple
 
 from pydantic import BaseModel, Field
 
-from ..adapters.base import Adapter, distinct_combination_sql
+from ..adapters.base import Adapter, ColumnMeta, distinct_combination_sql
 from ..cache import Dataset, Relationship, match_identifier
 from ..dbt_project import ProjectDefinitions
 from ..explore import relationships as rel_mod
-from .snapshot import SemanticLayer, Snapshot, TransformLayer
+from .snapshot import SemanticLayer, SemanticModelDef, Snapshot, TransformLayer
 
 #: Deliberately without the supported-set gate `SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS`
 #: gives the baseline, and this is where that decision is recorded rather than
@@ -150,6 +150,10 @@ def schema_drift(
     enables ``orphan_relation``: a table present at the baseline and now, that
     the baseline's project built or sourced but the live project no longer
     does. Without it (no project available), that check is skipped.
+
+    ``transform_drift`` is the same transform layer compared a second way (a
+    model added, removed, or content-changed since the baseline) and is its
+    own function; every caller here runs both and reports them as one axis.
     """
 
     baseline = {d.identifier: d for d in snap.warehouse.datasets}
@@ -339,12 +343,122 @@ def schema_drift(
     return findings
 
 
+def transform_drift(
+    current_transform: TransformLayer | None,
+    snap: Snapshot,
+) -> list[DriftFinding]:
+    """A model added, removed, or content-changed since the baseline.
+
+    Symmetric with ``semantic_free_drift``'s ``definition_added``/``_removed``/
+    ``_changed``, over ``TransformLayer.models``/``.files`` instead of
+    semantic model/metric definitions. Folded into the ``schema`` axis rather
+    than a new one of its own: ``schema_drift`` already loads the project's
+    transform layer for ``orphan_relation``, and this is the same fingerprint
+    compared a second way.
+
+    ``model_changed`` diffs content hashes through ``model_paths``, so it also
+    catches a rewired ``ref()``/``source()`` call: rewiring one changes the
+    file's text, and so its hash, with no second comparison over
+    ``model_refs``/``model_sources`` needed. A model missing from either
+    side's ``model_paths`` (a baseline pinned before that field existed) is
+    skipped for the content comparison rather than reported changed: an
+    unknown is not a diff.
+    """
+
+    findings: list[DriftFinding] = []
+    baseline = snap.transform_layer
+    if baseline is None or current_transform is None:
+        return findings
+
+    base_models = set(baseline.models)
+    cur_models = set(current_transform.models)
+
+    findings.extend(
+        DriftFinding(
+            axis="schema",
+            code="model_added",
+            identifier=name,
+            severity="low",
+            detail=f"model '{name}' is new since the baseline",
+        )
+        for name in sorted(cur_models - base_models)
+    )
+    findings.extend(
+        DriftFinding(
+            axis="schema",
+            code="model_removed",
+            identifier=name,
+            severity="low",
+            detail=f"model '{name}' was removed since the baseline",
+        )
+        for name in sorted(base_models - cur_models)
+    )
+    for name in sorted(base_models & cur_models):
+        base_path = baseline.model_paths.get(name)
+        cur_path = current_transform.model_paths.get(name)
+        if base_path is None or cur_path is None:
+            continue
+        base_hash = baseline.files.get(base_path)
+        cur_hash = current_transform.files.get(cur_path)
+        if base_hash is not None and cur_hash is not None and base_hash != cur_hash:
+            findings.append(
+                DriftFinding(
+                    axis="schema",
+                    code="model_changed",
+                    identifier=name,
+                    severity="low",
+                    detail=f"model '{name}' changed since the baseline",
+                    data={"path": cur_path},
+                )
+            )
+    return findings
+
+
+def uncomparable_volume(
+    current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
+) -> list[str]:
+    """Objects this axis had to skip because no live row count exists for them.
+
+    The axis runs on free metadata, and for a view or an external table the
+    warehouse maintains no count to read, so there is nothing to compare the
+    baseline against. :func:`volume_drift` skipping those is correct; skipping
+    them in silence is not, because an absent finding reads as "checked, and
+    nothing moved". A baseline with a real count on one side and nothing on the
+    other is the case worth naming: the object was profiled once, so a reader has
+    every reason to expect the axis covers it.
+    """
+
+    baseline = {d.identifier: d for d in snap.warehouse.datasets}
+    now = {d.identifier: d for d in current}
+    skipped = sorted(
+        identifier
+        for identifier in baseline.keys() & now.keys()
+        if (scope is None or identifier in scope)
+        and baseline[identifier].row_count is not None
+        and now[identifier].row_count is None
+    )
+    if not skipped:
+        return []
+    return [
+        "no live row count for "
+        + ", ".join(skipped)
+        + ", so volume was not compared for "
+        + ("it" if len(skipped) == 1 else "them")
+        + " (the warehouse maintains no count for this kind of object; "
+        "`explore profile` counts it, at a scan's cost)"
+    ]
+
+
 def volume_drift(
     current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
 ) -> list[DriftFinding]:
     """Freshness drift from free metadata: row counts (and byte sizes) that
     moved beyond load chatter. Structure unchanged, keys intact, but the data
-    stopped flowing correctly: the axis the other three cannot see."""
+    stopped flowing correctly: the axis the other three cannot see.
+
+    An object with no count on either side is not drift and not a finding;
+    :func:`uncomparable_volume` is what says so out loud.
+    """
 
     baseline = {d.identifier: d for d in snap.warehouse.datasets}
     now = {d.identifier: d for d in current}
@@ -419,6 +533,11 @@ class GrainPlan(NamedTuple):
     # What the plan could not survey, so an unchecked declaration never reads as
     # a clean bill.
     notes: list[str]
+    # Every selected relation gets a null-fraction survey.  This does not need a
+    # baseline measurement: a column that is wholly NULL in a non-empty result
+    # is a defect in its present shape, not a before-and-after drift claim.
+    # Last/defaulted to retain compatibility with focused detector test plans.
+    null_checks: list[tuple[Dataset, list[ColumnMeta], int]] | None = None
 
 
 def grain_plan(
@@ -570,7 +689,24 @@ def grain_plan(
             "grains on " + ", ".join(sorted(set(unsurveyed))) + " were not verified",
         ]
         declared_checks = []
-    return GrainPlan(key_checks, fanout_pairs, composite_checks, declared_checks, notes)
+    null_checks: list[tuple[Dataset, list[ColumnMeta], int]] = []
+    if callable(getattr(adapter, "column_aggregates", None)):
+        for dataset in snap.warehouse.datasets:
+            if scope is not None and dataset.identifier not in scope:
+                continue
+            if dataset.identifier not in current:
+                continue
+            meta, columns = adapter.table_metadata(dataset.identifier)
+            null_checks.append((dataset, columns, meta.row_count or 0))
+
+    return GrainPlan(
+        key_checks,
+        fanout_pairs,
+        composite_checks,
+        declared_checks,
+        notes,
+        null_checks,
+    )
 
 
 def _same_combo(left: list[str], right: list[str]) -> bool:
@@ -653,11 +789,53 @@ def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, 
     )
     if probes:
         per_table["(join overlap probes)"] = sum(query_estimate(sql) for sql in probes)
+    profile_estimate = getattr(adapter, "profile_estimate", None)
+    if profile_estimate is not None and plan.null_checks:
+        identifiers = [
+            dataset.identifier for dataset, _columns, _rows in plan.null_checks
+        ]
+        # A NULL fraction is meaningful for binary columns too, unlike an
+        # explore value profile; opt blobs back into the survey so the estimate
+        # and the aggregate execution cover exactly the same columns.
+        include_blobs = {
+            f"{dataset.identifier}.{column.name}"
+            for dataset, columns, _rows in plan.null_checks
+            for column in columns
+        }
+        _total, null_per_table = profile_estimate(
+            identifiers, include_blobs=include_blobs
+        )
+        for identifier, estimate in null_per_table.items():
+            per_table[identifier] = per_table.get(identifier, 0.0) + estimate
     return sum(per_table.values()), per_table
 
 
+def _grain_severity(row_count: int, min_rows: int) -> tuple[str, dict, str]:
+    """A lost-uniqueness finding's severity, damped below ``min_rows`` (#280).
+
+    A handful of rows is exactly the shape where losing uniqueness means the
+    least: a 4-row table with a boolean column "loses" a uniqueness it never
+    meaningfully had once a fifth row repeats a value. Damped to ``low``
+    rather than dropped, so a real defect on a small table is still visible,
+    just not the first thing a triager reads; the damping is named in the
+    finding's own ``data`` and prose, so nothing about the run is silent.
+    """
+
+    if row_count < min_rows:
+        return (
+            "low",
+            {"severity_floor_applied": True, "grain_min_rows": min_rows},
+            f" (severity capped at low: fewer than {min_rows} rows)",
+        )
+    return "high", {}, ""
+
+
 def grain_drift(
-    adapter: Adapter, plan: GrainPlan, *, timeout_seconds: float = 30.0
+    adapter: Adapter,
+    plan: GrainPlan,
+    *,
+    timeout_seconds: float = 30.0,
+    min_rows: int = 100,
 ) -> list[DriftFinding]:
     """Cardinality and identity drift, from aggregates only: exact distinct
     counts against the baseline's proven keys, the grains the project declares
@@ -670,7 +848,13 @@ def grain_drift(
     explore proved unique and no longer is. ``declared_grain_not_unique`` has no
     before at all, because the combination comes from the project rather than
     from a measurement, so the honest reading of a failure is that the
-    declaration is false rather than that anything changed."""
+    declaration is false rather than that anything changed.
+
+    ``min_rows`` damps a uniqueness-regression finding to ``low`` below that row
+    count (see :func:`_grain_severity`); it does not apply to
+    ``join_orphans_increased``, which already grades its own severity from the
+    measured orphan fraction rather than asserting ``high`` unconditionally.
+    """
 
     findings: list[DriftFinding] = []
     for dataset, keys, row_count in plan.key_checks:
@@ -688,22 +872,25 @@ def grain_drift(
             if count is None or count >= row_count:
                 continue
             duplicates = row_count - count
+            severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             findings.append(
                 DriftFinding(
                     axis="grain",
                     code="key_lost_uniqueness",
                     identifier=dataset.identifier,
                     column=key,
-                    severity="high",
+                    severity=severity,
                     detail=(
                         f"{key} on {dataset.identifier} is no longer unique: "
                         f"{count} distinct over {row_count} rows "
                         f"(~{duplicates} duplicate rows); joins on it will fan out"
+                        f"{floor_note}"
                     ),
                     data={
                         "distinct_count": count,
                         "row_count": row_count,
                         "was_grain": bool(dataset.grain and key in dataset.grain),
+                        **floor_data,
                     },
                 )
             )
@@ -722,18 +909,19 @@ def grain_drift(
                 continue
             duplicates = row_count - count
             members = ", ".join(combo)
+            severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             findings.append(
                 DriftFinding(
                     axis="grain",
                     code="key_lost_uniqueness",
                     identifier=dataset.identifier,
                     column=members,
-                    severity="high",
+                    severity=severity,
                     detail=(
                         f"({members}) on {dataset.identifier} is no longer "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows); "
-                        "joins on it will fan out"
+                        f"joins on it will fan out{floor_note}"
                     ),
                     data={
                         "columns": list(combo),
@@ -742,6 +930,7 @@ def grain_drift(
                         "was_grain": bool(
                             dataset.grain and list(combo) == list(dataset.grain)
                         ),
+                        **floor_data,
                     },
                 )
             )
@@ -763,26 +952,28 @@ def grain_drift(
                 continue
             duplicates = row_count - count
             members = ", ".join(combo)
+            severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             findings.append(
                 DriftFinding(
                     axis="grain",
                     code="declared_grain_not_unique",
                     identifier=dataset.identifier,
                     column=members,
-                    severity="high",
+                    severity=severity,
                     detail=(
                         f"the project declares ({members}) as the grain of "
                         f"{dataset.identifier}, and the combination is not "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows). "
                         "Builds asserting this grain will fail and joins on it "
-                        "will fan out"
+                        f"will fan out{floor_note}"
                     ),
                     data={
                         "columns": list(combo),
                         "distinct_count": count,
                         "row_count": row_count,
                         "declared": True,
+                        **floor_data,
                     },
                 )
             )
@@ -813,7 +1004,77 @@ def grain_drift(
                 },
             )
         )
+    aggregate_columns = getattr(adapter, "column_aggregates", None)
+    for dataset, columns, row_count in plan.null_checks or []:
+        if not callable(aggregate_columns):
+            continue
+        if row_count == 0:
+            findings.append(
+                DriftFinding(
+                    axis="grain",
+                    code="no_rows",
+                    identifier=dataset.identifier,
+                    severity="low",
+                    detail=(
+                        f"{dataset.identifier} has no rows; null fractions were not "
+                        "reported"
+                    ),
+                    data={"row_count": 0},
+                )
+            )
+            continue
+        joins = [
+            {
+                "from_dataset": relation.from_dataset,
+                "from_columns": relation.from_columns,
+                "to_dataset": relation.to_dataset,
+                "to_columns": relation.to_columns,
+            }
+            for _baseline, relation in plan.fanout_pairs
+            if relation.from_dataset == dataset.identifier
+        ]
+        for aggregate in aggregate_columns(dataset.identifier, columns):
+            fraction = aggregate.null_fraction
+            if fraction is None or fraction < 0.95:
+                continue
+            fully_null = fraction == 1.0
+            finding_data = {"null_fraction": fraction, "row_count": row_count}
+            if fully_null and joins:
+                # A right-side projection that is NULL for every result row is
+                # the observable form of a failed join.  Multiple joins remain
+                # explicit rather than guessing which one supplied the column.
+                finding_data["joins"] = joins
+            findings.append(
+                DriftFinding(
+                    axis="grain",
+                    code="fully_null_column" if fully_null else "mostly_null_column",
+                    identifier=dataset.identifier,
+                    column=aggregate.name,
+                    severity="high" if fully_null else "low",
+                    detail=(
+                        f"{aggregate.name} on {dataset.identifier} is "
+                        + ("100% NULL" if fully_null else f"{fraction:.1%} NULL")
+                        + (
+                            "; its joined relation may have matched nothing"
+                            if fully_null and joins
+                            else ""
+                        )
+                    ),
+                    data=finding_data,
+                )
+            )
     return findings
+
+
+def _matched_identifier(sm: SemanticModelDef, dataset_ids: list[str]) -> list[str]:
+    """The live warehouse identifier(s) this semantic model resolves to, by
+    whichever of ``model_ref``/``relation`` it states (#409): the same
+    fallback :func:`semantic_free_drift` applies inline for its own column
+    check, shared here so the relationship check resolves each endpoint the
+    same way rather than by a second rule."""
+
+    target = sm.model_ref or sm.relation
+    return match_identifier(target, dataset_ids) if target else []
 
 
 def semantic_free_drift(
@@ -834,6 +1095,18 @@ def semantic_free_drift(
     base_defs.update({("metric", m.name): m for m in baseline.metrics})
     cur_defs = {("semantic_model", d.name): d for d in current.semantic_models}
     cur_defs.update({("metric", m.name): m for m in current.metrics})
+    # Relationships join the same generic added/removed/changed diff below,
+    # but only when both sides actually captured them (#409): a baseline
+    # pinned before this field existed has none, and comparing that against a
+    # populated current layer would report every real relationship as
+    # freshly added rather than as a baseline gap.
+    relationships_comparable = (
+        baseline.relationships_and_keys_captured
+        and current.relationships_and_keys_captured
+    )
+    if relationships_comparable:
+        base_defs.update({("relationship", r.name): r for r in baseline.relationships})
+        cur_defs.update({("relationship", r.name): r for r in current.relationships})
 
     for kind, name in sorted(cur_defs.keys() - base_defs.keys()):
         findings.append(
@@ -903,7 +1176,14 @@ def semantic_free_drift(
                 )
             )
             continue
-        matches = match_identifier(sm.model_ref, dataset_ids) if sm.model_ref else []
+        # A model whose semantic layer states its own physical relation
+        # directly (#409: `relation`, populated by a format with no build
+        # step between a semantic model and a warehouse relation) is matched
+        # against the warehouse the same way `model_ref` is, once a model_ref
+        # is absent to try first: the two name the same kind of thing to this
+        # comparison, a physical relation this semantic model sits on.
+        match_target = sm.model_ref or sm.relation
+        matches = match_identifier(match_target, dataset_ids) if match_target else []
         if len(matches) != 1:
             continue  # not built (or ambiguous): nothing to check columns against
         available = columns_by_id[matches[0]]
@@ -933,8 +1213,76 @@ def semantic_free_drift(
                             f"{matches[0]}"
                         ),
                         data={"semantic_model": sm.name, "role": role, "name": name},
-                        impacted_models=[sm.model_ref],
+                        impacted_models=[sm.model_ref] if sm.model_ref else [],
                         impacted_metrics=_metrics_from_measures(current, impacted),
+                    )
+                )
+        if not current.relationships_and_keys_captured:
+            continue
+        for columns in sm.keys:
+            missing = [c for c in columns if c not in available]
+            if not missing:
+                continue
+            findings.append(
+                DriftFinding(
+                    axis="semantic",
+                    code="dangling_reference",
+                    identifier=matches[0],
+                    severity="high",
+                    detail=(
+                        f"a declared key on semantic model '{sm.name}' names "
+                        f"column(s) {', '.join(missing)}, which "
+                        f"{'is' if len(missing) == 1 else 'are'} gone from "
+                        f"{matches[0]}"
+                    ),
+                    data={"semantic_model": sm.name, "role": "key", "columns": columns},
+                )
+            )
+
+    if current.relationships_and_keys_captured:
+        models_by_name = {sm.name: sm for sm in current.semantic_models}
+        for rel in current.relationships:
+            left = models_by_name.get(rel.model)
+            right = models_by_name.get(rel.to_model)
+            if left is None or right is None:
+                missing_side = rel.model if left is None else rel.to_model
+                findings.append(
+                    DriftFinding(
+                        axis="semantic",
+                        code="broken_relationship",
+                        severity="high",
+                        detail=(
+                            f"relationship '{rel.name}' names '{missing_side}', "
+                            "which is no longer a semantic model"
+                        ),
+                        data={"relationship": rel.name, "missing_model": missing_side},
+                    )
+                )
+                continue
+            left_matches = _matched_identifier(left, dataset_ids)
+            right_matches = _matched_identifier(right, dataset_ids)
+            if len(left_matches) != 1 or len(right_matches) != 1:
+                continue  # not built (or ambiguous): nothing to check columns against
+            left_available = columns_by_id[left_matches[0]]
+            right_available = columns_by_id[right_matches[0]]
+            broken = [
+                [frm, to]
+                for frm, to in rel.column_pairs
+                if frm not in left_available or to not in right_available
+            ]
+            if broken:
+                findings.append(
+                    DriftFinding(
+                        axis="semantic",
+                        code="broken_relationship",
+                        identifier=left_matches[0],
+                        severity="high",
+                        detail=(
+                            f"relationship '{rel.name}' from '{rel.model}' to "
+                            f"'{rel.to_model}' names column pair(s) that no "
+                            f"longer resolve: {broken}"
+                        ),
+                        data={"relationship": rel.name, "missing_pairs": broken},
                     )
                 )
 

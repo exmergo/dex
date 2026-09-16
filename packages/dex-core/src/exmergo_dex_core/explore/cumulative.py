@@ -30,7 +30,7 @@ from typing import NamedTuple
 from ..adapters.base import Adapter, is_temporal_type
 from ..cache import ColumnProfile, Dataset
 from .profile import is_numeric_type
-from .relationships import _is_id_shaped
+from .relationships import is_id_shaped
 
 # A fraction of within-entity consecutive decreases at or below this, over
 # enough observations, is read as "does not decrease" -- strong evidence of a
@@ -75,7 +75,7 @@ def _is_entity_key(col: ColumnProfile) -> bool:
 
     if col.pii is not None:
         return False
-    if not _is_id_shaped(col.name):
+    if not is_id_shaped(col.name):
         return False
     return not _is_single_column_key(col)
 
@@ -98,7 +98,7 @@ def _is_measure_candidate(col: ColumnProfile) -> bool:
         return False
     if not is_numeric_type(col.data_type):
         return False
-    if _is_id_shaped(col.name):
+    if is_id_shaped(col.name):
         return False
     return not _is_single_column_key(col)
 

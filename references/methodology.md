@@ -17,6 +17,16 @@ estimate is the size signal that feeds ranking. This pass is what makes selectiv
 drill-down possible: you cannot rank what you have not listed, and you should not
 scan what you have not yet decided is worth scanning.
 
+The row count is an estimate where the catalog keeps one and unknown where it does
+not, and the two are never collapsed into each other. A warehouse maintains no
+count for a view, and BigQuery maintains none for an external table either;
+several report that as a zero, which is why the count is decided from the object's
+kind rather than taken at face value. Unknown means the size signal cannot
+participate, so an uncounted object ranks as if it were small until something
+counts it. Empty means the object holds nothing, which is a finding. Reading the
+first as the second was how an external table over object storage came to be
+reported as an empty table with correct column statistics beside the claim.
+
 ## Ranking: turn a list into a shortlist
 
 Ranking scores every object in [0, 1] from cheap signals so attention goes to the
@@ -59,10 +69,51 @@ pair can only be a key if the product of its members' distinct counts reaches th
 row count, so pairs are pruned on that necessary condition using the counts
 already in hand, then ranked (id-shaped members first, smallest product next) and
 capped to a few probes issued as one exact distinct-combination statement. A pair
-whose combination count equals the row count is a proven composite key: it enters
-the candidate keys and, absent any single-column key, becomes the reported grain.
-On metered connectors the probe spends only inside the already-confirmed budget
-and skips with an explanatory note when the remaining budget cannot cover it.
+that reuses a column from a better-ranked pair at a similar product is the same
+hypothesis with different filler, so it ranks behind every pair that is not, but
+it is never removed from the running: the cap is the spend guard, and while it
+has room a discarded candidate costs a grain and saves nothing. A pair whose
+combination count equals the row count is unique, which is necessary for a key and
+not sufficient to be one. On metered connectors the probe spends only inside the
+already-confirmed budget, narrowing to the best-ranked pairs the budget covers, and
+skipping with an explanatory note only when it cannot cover one.
+
+Two shapes of pair are unique for reasons that have nothing to do with the table's
+identity, and both are excluded from the pool before anything is priced. A pair
+whose member is a **continuous measure** is one: a measurement's cardinality grows
+with the table, so it completes a partner by arithmetic rather than by meaning, and
+a key made of money is almost never the grain anybody intended. The other is a pair
+**anchored on a column that is already unique on almost every row**. At that ratio
+the handful of rows the column fails to separate get separated by accident by any
+partner carrying more than a value or two, so the pair restates the column's
+near-uniqueness instead of discovering a grain. The exception, and the reason this
+is a test on the pair rather than on the column, is a partner whose domain is
+bounded by the fanout rather than by the table: when a few duplicate order ids are
+separated by a three-value line number, the data really does have that grain. A
+near-unique *timestamp* gets no such exception, because a per-row event time is not
+an entity whose rows a position column enumerates.
+
+Excluding before probing is deliberate on three counts: the exact answer could not
+move a decision either way, the pair would have to be reported and immediately
+disclaimed, and dropping it frees a capped slot for a pair that might be the real
+grain. None of it applies to a table too small for cardinality-versus-rows
+reasoning to mean anything, where every column looks near-unique and every measure
+looks continuous: below a fixed row floor everything is asked and the exact count
+decides.
+
+What survives enters the candidate keys, smallest proven cardinality first, so the
+tightest proven key is the first entry and, absent any single-column key, the
+reported grain. Where nothing survives, the grain is reported unknown and the
+near-unique column is named with its counts, because the finding there is
+duplicates in the source rather than an absent key.
+
+Suppression is never silent. Every combination the probe considered comes back in
+`key_evidence`, one entry per combination, carrying its columns, whether it was
+reported or suppressed, and the reason in the profile's own words. The reported
+entries appear in the same order as the candidate keys, so the ranking is readable
+rather than implied, and the suppressed ones follow. That is also what makes a
+probe that ran and found only artifacts distinguishable from one that never ran,
+which the probe's own budget notes say instead.
 
 Two safety rules are enforced at the source, in the SQL that is generated:
 
@@ -97,32 +148,44 @@ When the evidence is missing or ambiguous, the name-derived confidence stands:
 absence of evidence never weakens a flag.
 
 The flag itself is never removed by evidence. What a weak flag means is the
-consumer's decision: the query firewall blocks projection at confidence 0.5 and
-above (a hard-coded engine constant) and allows lower-confidence columns with an
-envelope warning, while min/max suppression and dbt `meta` stamping remain
-presence-based at any confidence. The only way to clear a flag entirely is a
-human decision recorded as a `pii_overrides` entry in `.dex/config.yml` (fully
-qualified column plus an optional reason). An override is re-applied on every
-profile, so it survives re-profiling, takes effect at query time immediately,
-and leaves an audit trail in the cache recording which category the detector had
-matched.
+consumer's decision, and the consumers differ: some gate on a flag's presence at
+any confidence, others compare it against a blocking threshold. That split, the
+threshold, and the only way a human clears a flag are in
+[`pii-policy.md`](pii-policy.md).
 
 ## Relationships: joins from metadata, not scans
 
 Relationship inference reads the profiles already gathered and never scans data to
 verify referential integrity, so it stays free and read-only at the cost of
-certainty, which is why every inferred join carries a confidence. A join is
-proposed when a foreign-key-shaped column name matches a parent object whose
+certainty, which is why every inferred join carries a confidence. The opt-in
+verification pass is the one place joins are measured, and it batches: the joins
+sharing a child relation are answered by one read of it, so what verification
+costs follows the relations it touches rather than the number of joins between
+them.
+
+A join is proposed when a foreign-key-shaped column name matches a parent object whose
 corresponding column is a candidate key and the types are compatible; confidence
 reflects how strong the name and key signals are. Candidate keys and the most
 likely grain come from the uniqueness signals: single columns proven unique, plus
-the composite keys proven at profile time; a single-column key is always
-preferred as the grain, and a member of a composite key is never treated as
-unique on its own. Declared joins come
-from the dbt project when one is present; absent a dbt project, declared joins are
-simply empty, which is expected because explore is designed to work without one.
+the composite keys proven at profile time that survived the artifact exclusions
+above; a single-column key is always preferred as the grain, and a member of a
+composite key is never treated as unique on its own. Where the strongest signal is
+a column unique on almost every row but not all of them, that is what the profile
+says, naming the ratio, the counts, and how many rows would have to be removed for
+the column to be unique. It reports no key at all rather than a combination built
+on the shortfall, because a caller who cannot tell a real key from filler is worse
+served by several candidates than by one named defect and none. Declared joins come
+from whichever channels declare one: the dbt project when one is present, and the
+semantic layer when one is configured, which need not be dbt's. Absent both,
+declared joins are simply empty, which is expected because explore is designed to
+work without either. A declared join carries every column pair it was written
+with, so a composite is one declaration measured as one complete tuple rather
+than a first-column proxy that would report a healthy join three times over while
+no tuple matched. Where two channels declare a join between the same pair of
+relations on different columns, both are kept and the disagreement is reported;
+dex does not pick a winner between two things the repository asserts.
 
-A project's declarations refine those verdicts without entering them. A declared
+Declarations refine those verdicts without entering them. A declared
 grain fills in where measurement found none, and is noted where it disagrees, but
 a measurement-proven single column still wins the reported grain and the candidate
 keys stay measurement-only: an unmeasured declared key is a claim, and the cache is
@@ -133,6 +196,78 @@ uniqueness. A key measurement proved unique that no longer is has a before and a
 after, so it lapsed. A declared combination that does not hold has neither: nothing
 changed, the project is asserting a grain the data never had, and the fix is to the
 declaration rather than to the data.
+
+## Row population: a model against the relation it is built from
+
+Everything above measures a relation on its own terms. A transformation project
+raises a question none of it answers: not what this relation looks like, but
+whether it holds the rows it should, given the relation it was built from. That
+is where the expensive errors live, because they raise nothing. An inner join
+written where a left join was meant, a filter that quietly excludes NULLs, a
+de-duplication keyed on the wrong column: each drops rows, none is an error, and
+uniqueness and not-null tests all still pass over the smaller result.
+
+The comparison needs one thing the warehouse cannot supply, which is the model's
+**driving parent**: the relation in its FROM clause, as distinct from the ones it
+joins. Those are different roles. The driving relation sets how many rows the
+model starts with, and a join can only reduce that number or multiply it. So the
+parent is read out of the compiled SQL rather than out of the dependency graph,
+which knows a model's parents but not which of them drives it, and it is followed
+through the chain of CTEs a dbt model compiles to, since the FROM of a compiled
+model's final select names an internal CTE almost every time.
+
+**What the SQL says about itself decides whether the numbers mean anything.** A
+model carrying a filter, an aggregate, a de-duplication, or a set operation was
+written to hold fewer rows than its parent, and no amount of arithmetic
+distinguishes a filter that removed the rows it should from one that removed too
+many. There is no principled bound to compute, so those models are not reported
+at all rather than reported with a caveat. The cost of that choice is real: a
+filtered model that also lost rows to a bad join says nothing. The cost of the
+other choice is worse, because a detector that fires on every aggregate in a
+project is one nobody reads twice. The same logic runs the other way for growth,
+where an `UNNEST` or a lateral is a construct whose entire purpose is turning one
+row into several.
+
+Row counts themselves come from the cheapest source that can answer, and which
+one answered changes what the finding claims. A stored catalog count is free but
+is treated as an estimate, so the finding is not marked exact; an actual count is
+a proof. Where counting bills nothing, everything is counted, because a verdict
+about a ten percent difference has no business resting on an estimate. Where it
+bills something, it is priced and offered rather than taken, and the models it
+would have covered are named as uncompared. That last part matters more than it
+looks: a warehouse keeps no row count for a view, and a view is dbt's default
+materialization, so on a metered connector the models this can judge for free and
+the ones it cannot are split down exactly that line.
+
+## Test strength: measuring the tests rather than the data
+
+Everything above measures data. A dbt project also carries assertions about that
+data, and those assertions are themselves unmeasured: a suite of twenty tests
+that all pass proves the tests ran, not that any of them would object if the
+model were wrong. The two are routinely confused, because the only number the
+ecosystem reports is a count, and a count cannot distinguish a `not_null` on a
+surrogate key from a unit test pinning the arithmetic.
+
+The measurement that does distinguish them is to break the model deliberately and
+see whether anything complains. `transform test --mutate` plants one defect at a
+time, drawn from the same taxonomy the rest of this document is organised around:
+a boundary comparison that now includes or excludes its edge, a filter dropped or
+inverted, an inner join where a left join was meant, a missing `CASE` branch, an
+inverted ratio, a window frame off by one, a `sum` reporting a `max`. Each is
+built and the model's own tests are run against it. A defect nothing catches is
+reported as a gap in the suite, described as the defect rather than as a diff,
+because the reader's next step is to write a test and not to reread SQL they
+already know.
+
+Three properties keep the result honest. Every verdict is relative to the tests
+that passed against the *unmutated* model, so a suite measured against its own
+already-failing tests cannot come back looking clean. A mutant the warehouse
+refuses outright is reported separately from one the tests caught, since a build
+would have failed on it anyway and counting it would flatter the suite. And a
+mutant that survives is a statement about detection, not about correctness: some
+survivors are defects the current data cannot distinguish at all, such as an
+inner join where every key happens to match, which is exactly why the finding
+names the test that would catch it rather than claiming the model is wrong.
 
 ## The draft map: composing and persisting
 
@@ -170,7 +305,7 @@ A diagram is trusted more readily than the JSON it came from, so the cardinality
 rules are strict. Mermaid requires a glyph on every edge and dex's relationship
 record carries no cardinality, so the renderer derives one only from what was
 proven. It claims "exactly one" on the parent side only when the parent key is a
-proven key **and** the join was declared in the project or measured with no
+proven key **and** the join was declared in the repository or measured with no
 orphans; it degrades to "zero or one" when uniqueness is proven but nothing
 measured the overlap; and it degrades to "zero or many" when uniqueness was never
 established at all. Declared joins are drawn solid and inferred joins dotted, and
@@ -193,4 +328,4 @@ Every command prints exactly one sanitized JSON envelope (see
 `command-contract.md`); credentials and raw rows can never cross that boundary,
 and a leak is a hard failure rather than a silent scrub. The agent reads the
 envelope and decides the next step, so multi-step exploration is the agent
-orchestrating stateless subcommands over the dbt project and the `.dex/` cache.
+orchestrating stateless subcommands over the repository and the `.dex/` cache.

@@ -23,14 +23,31 @@ from exmergo_dex_core import (
     MemoryStore,
 )
 from exmergo_dex_core.cache import DexCache
-from exmergo_dex_core.config import CacheConfig, DuckDBTarget, save_config
-from exmergo_dex_core.envelope import Envelope
+from exmergo_dex_core.config import (
+    CacheConfig,
+    ClickHouseTarget,
+    DuckDBTarget,
+    save_config,
+)
+from exmergo_dex_core.envelope import Envelope, Paradigm
 from exmergo_dex_core.explore.results import MapResult, ProfileResult, QueryResult
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "exmergo_dex_core"
 
 
 # --- the surface itself --------------------------------------------------------
+
+
+def test_cloud_clickhouse_paradigm_is_available_before_connection_failure():
+    """An error envelope must still name the binding unit when no adapter opens."""
+
+    engine = DexEngine(
+        config=DexConfig(
+            connector="clickhouse",
+            clickhouse=ClickHouseTarget(deployment="cloud"),
+        )
+    )
+    assert engine.paradigm is Paradigm.COMPUTE_TIME
 
 
 def test_the_public_import_works_and_defaults_to_writing_nothing(
@@ -85,7 +102,8 @@ def test_methods_return_domain_objects_never_envelopes(duckdb_file: Path):
 
 
 #: Subcommands that are not engine methods, each for a reason the reader can
-#: check. `test` is `transform test --scaffold`, reached as `test_scaffold`;
+#: check. `test` carries two modes and only one of them is a method: `--mutate`
+#: is `test_mutations`, while `--scaffold` is reached as `test_scaffold`.
 #: `semantic *` is spelled `semantic_*`; `demo` writes a warehouse and is not a
 #: command a library caller drives. Everything else must have a method.
 _NOT_ENGINE_METHODS = {
@@ -100,11 +118,13 @@ _NOT_ENGINE_METHODS = {
 _METHOD_NAMES = {
     ("connect", "test"): "connect_test",
     ("explore", "semantic"): "semantic_list",
+    ("semantic", "ossie"): "semantic_ossie",
     ("maintain", "schema"): "schema_drift",
     ("maintain", "volume"): "volume_drift",
     ("maintain", "grain"): "grain_drift",
     ("maintain", "semantic"): "semantic_drift",
     ("transform", "init"): "init_project",
+    ("transform", "export"): "export_plan",
 }
 
 
@@ -569,7 +589,7 @@ def test_each_call_gets_its_own_cost_gate(monkeypatch: pytest.MonkeyPatch, tmp_p
     # labelled with its own command, and has its full budget available.
     assert second.cost_gate is not None
     assert second.cost_gate.command == "explore query"
-    assert second.cost_gate.remaining_for_statement() == 1_000
+    assert second.cost_gate.statement_cap(unit="byte") == 1_000
     second.cost_gate.charge(600.0)  # would raise if the first charge carried over
 
 

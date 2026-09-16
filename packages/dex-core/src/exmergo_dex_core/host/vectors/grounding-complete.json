@@ -1,0 +1,90 @@
+{
+  "name": "grounding-complete",
+  "contract": "grounding",
+  "description": "Every reference resolved and nothing left to doubt, so completeness is complete and limits is empty.",
+  "payload": {
+    "edits": [
+      {
+        "path": "models/staging/mart.sql",
+        "new_content": "select o.order_id, c.region\nfrom {{ ref('stg_orders') }} o\nleft join {{ ref('stg_customers') }} c on o.customer_id = c.id\n",
+        "old_content_hash": null,
+        "op": "upsert",
+        "kind": "model_sql"
+      }
+    ]
+  },
+  "expect": {
+    "completeness": "complete",
+    "limits": [],
+    "result": {
+      "completeness": "complete",
+      "limits": [],
+      "unresolved": [],
+      "ambiguous": [],
+      "freshness": {
+        "manifest_present": false,
+        "generated_at": null,
+        "newest_source_at": "2026-09-08T01:04:26.652394+00:00",
+        "stale": null
+      },
+      "binding": {
+        "plan_digest": null,
+        "source_digest": "sha256:70cc1dd4fb5dc1831906721fa160c8c386f0ac0880fb2cc072910284f7f49c61",
+        "config_digest": null,
+        "packages_digest": null,
+        "engine_version": "1.10.1.dev32+gb057fca4a.d20260906"
+      },
+      "relations": [],
+      "dependencies": [
+        {
+          "kind": "column",
+          "name": "customer_id",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "column",
+          "name": "id",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "column",
+          "name": "order_id",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "column",
+          "name": "region",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "model",
+          "name": "stg_customers",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        },
+        {
+          "kind": "model",
+          "name": "stg_orders",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/mart.sql"
+          ]
+        }
+      ]
+    }
+  }
+}

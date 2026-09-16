@@ -11,6 +11,43 @@ def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+def test_model_findings_warn_toward_resnapshot_rather_than_propose_a_fix():
+    """A model added/removed/changed (#164's transform_drift) gets the same
+    treatment as a semantic definition_* finding: it is the project's own
+    edit, so there is no warehouse-side fix to propose, only a nudge to
+    re-baseline if the change is intended."""
+
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import build
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    findings = [
+        DriftFinding(
+            axis="schema",
+            code="model_added",
+            identifier="stg_customers",
+            detail="model 'stg_customers' is new since the baseline",
+        ),
+        DriftFinding(
+            axis="schema",
+            code="model_changed",
+            identifier="stg_orders",
+            detail="model 'stg_orders' changed since the baseline",
+        ),
+    ]
+    snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        connector="duckdb",
+        warehouse=WarehouseBaseline(datasets=[]),
+    )
+
+    proposals, edits, warnings = build(findings, snap, None, None)
+
+    assert proposals == []
+    assert edits == []
+    assert any("re-run `maintain snapshot`" in w for w in warnings)
+
+
 def test_drift_added_column_honors_pii_override():
     """A drift-added column gets a name-based flag at base confidence (no
     aggregates exist yet, so it blocks until the next profile); an override
@@ -73,6 +110,68 @@ def test_drift_added_column_honors_pattern_pii_override():
     added = next(c for c in cleared.columns if c.name == "customer_name")
     assert added.pii is None
     assert added.pii_overridden is not None
+
+
+def test_orphan_relation_action_names_the_macro_and_the_one_relation():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import build
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    finding = DriftFinding(
+        axis="schema",
+        code="orphan_relation",
+        identifier="db.marts.old_fct_orders",
+        detail="relation exists with no backing model or source",
+        data={"drop_statement": "DROP TABLE db.marts.old_fct_orders;"},
+    )
+    snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        connector="duckdb",
+        warehouse=WarehouseBaseline(datasets=[]),
+        warehouse_from="metadata",
+    )
+
+    proposals, edits, warnings = build([finding], snap, None, None)
+
+    assert edits == []
+    orphan = next(p for p in proposals if p.finding_code == "orphan_relation")
+    assert orphan.kind == "advisory"
+    assert "transform macro drop_orphan_relations" in orphan.action
+    assert "dbt run-operation drop_orphan_relations" in orphan.action
+    assert '"db.marts.old_fct_orders"' in orphan.action
+    # A single orphan does not earn the batched-invocation warning.
+    assert not any("orphan relations found" in w for w in warnings)
+
+
+def test_multiple_orphans_also_get_one_batched_invocation_warning():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import build
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    findings = [
+        DriftFinding(
+            axis="schema",
+            code="orphan_relation",
+            identifier=identifier,
+            detail="relation exists with no backing model or source",
+            data={"drop_statement": f"DROP TABLE {identifier};"},
+        )
+        for identifier in ("db.marts.old_dim_orders", "db.marts.old_fct_orders")
+    ]
+    snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        connector="duckdb",
+        warehouse=WarehouseBaseline(datasets=[]),
+        warehouse_from="metadata",
+    )
+
+    proposals, _edits, warnings = build(findings, snap, None, None)
+
+    assert sum(p.finding_code == "orphan_relation" for p in proposals) == 2
+    batched = next(w for w in warnings if "orphan relations found" in w)
+    assert "dbt run-operation drop_orphan_relations" in batched
+    assert '"db.marts.old_dim_orders"' in batched
+    assert '"db.marts.old_fct_orders"' in batched
 
 
 def test_reconcile_needs_a_drift_report(maintain_repo):
@@ -142,6 +241,158 @@ def test_schema_drift_is_mechanical_and_rescaffolds(maintain_repo):
             maintain_repo.project_dir / "models" / "staging" / "stg_orders.sql"
         ).read_text()
     )
+
+
+def _scaffolded(repo):
+    """A dex-authored staging pair on disk, which the mechanical path requires."""
+
+    _rc, payload = repo.dex(
+        "transform", "plan", "--scaffold", "orders", "scaffold stg_orders"
+    )
+    assert payload["status"] == "ok", payload
+    repo.dex("transform", "apply", payload["data"]["plan_id"])
+
+
+def test_a_retype_alone_is_advisory_and_stores_no_plan(maintain_repo):
+    """A type change reconciles to nothing, so it proposes nothing.
+
+    Neither the model SQL nor the schema.yml dex writes carries a type, so
+    re-scaffolding from a retyped profile reproduces both files byte for byte.
+    That used to come back `mechanical` with a stored plan whose every diff was
+    empty, which reads as a fix and applies as nothing.
+    """
+
+    _scaffolded(maintain_repo)
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+
+    maintain_repo.sql("ALTER TABLE orders ALTER amount TYPE DECIMAL(10,2)")
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    assert not payload.get("diffs")
+    retyped = next(
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "column_retyped"
+    )
+    assert "DOUBLE -> DECIMAL(10,2)" in retyped["action"]
+
+
+def test_a_retype_riding_along_with_a_drop_still_re_scaffolds(maintain_repo):
+    """The positive control for the test above.
+
+    A run reporting "no edit" proves nothing unless the same harness reports an
+    edit when one is due. Identical project, identical fixtures; the added column
+    is the only difference, and the retype rides along on the re-scaffold rather
+    than blocking it.
+    """
+
+    _scaffolded(maintain_repo)
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+
+    maintain_repo.sql(
+        "ALTER TABLE orders ALTER amount TYPE DECIMAL(10,2)",
+        "ALTER TABLE orders ADD COLUMN discount DOUBLE",
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+
+    assert payload["data"]["mechanical_count"] == 1
+    assert payload["data"]["plan_id"] is not None
+    sql_diff = next(
+        d for d in payload["diffs"] if d["path"] == "models/staging/stg_orders.sql"
+    )
+    assert "discount" in sql_diff["unified"]
+    # The retype is still surfaced, and the mechanical proposal does not claim it.
+    mechanical = next(
+        p for p in payload["data"]["proposals"] if p["kind"] == "mechanical"
+    )
+    assert "column retyped" not in mechanical["action"]
+    assert any(
+        p["finding_code"] == "column_retyped" and p["kind"] == "advisory"
+        for p in payload["data"]["proposals"]
+    )
+
+
+def test_the_unique_test_edit_is_a_one_line_splice_not_a_reprinted_file(maintain_repo):
+    """The test edit changes the line it is about and leaves the rest alone.
+
+    It used to parse the file, mutate the tree and print it back, which reflows
+    every line and drops every comment, so the diff a reviewer reads to approve a
+    one-word change describes the whole document.
+    """
+
+    maintain_repo.edit(
+        "models/staging/stg_orders.yml",
+        "version: 2\n"
+        "\n"
+        "models:\n"
+        "  # built from the orders source\n"
+        "  - name: stg_orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        tests: [not_null]\n"
+        "      - name: customer_id\n"
+        "        tests: [not_null]\n",
+    )
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+
+    maintain_repo.sql("INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10")
+    maintain_repo.dex("maintain", "grain")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "grain")
+
+    diff = next(
+        d for d in payload["diffs"] if d["path"] == "models/staging/stg_orders.yml"
+    )
+    assert diff["additions"] == 1 and diff["deletions"] == 1, diff["unified"]
+
+    maintain_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    written = (maintain_repo.root / "models" / "staging" / "stg_orders.yml").read_text()
+    assert "# built from the orders source" in written
+    assert "tests: [not_null, unique]" in written
+
+
+def test_schema_and_grain_drift_produce_one_edit_for_the_shared_yaml(maintain_repo):
+    """A table that drifted both ways writes its schema.yml once.
+
+    Both axes reach the same file. Two edits on one path pin the same content
+    hash, so the second overwrote the first: the apply reported `ok`, listed the
+    path twice as written, and the added column never reached the declaration
+    while the model SQL that selects it did.
+    """
+
+    _scaffolded(maintain_repo)
+    yml = maintain_repo.root / "models" / "staging" / "stg_orders.yml"
+    # A key carrying no unique test, which is what makes the grain axis propose one.
+    yml.write_text(
+        yml.read_text().replace("[unique, not_null]", "[not_null]"), encoding="utf-8"
+    )
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+
+    maintain_repo.sql(
+        "ALTER TABLE orders ADD COLUMN discount DOUBLE",
+        "INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10",
+    )
+    maintain_repo.dex("maintain", "schema")
+    maintain_repo.dex("maintain", "grain")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile")
+
+    paths = [d["path"] for d in payload["diffs"]]
+    assert paths.count("models/staging/stg_orders.yml") == 1, paths
+
+    _rc, applied = maintain_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    assert applied["status"] == "ok", applied.get("errors")
+    written = yml.read_text(encoding="utf-8")
+    assert "- name: discount" in written, written
+    assert "unique" in written, written
 
 
 def test_grain_drift_is_advisory_with_a_visibility_test(maintain_repo):
@@ -459,7 +710,7 @@ def test_dropped_source_reconcile_is_advisory_when_no_scaffold(maintain_repo):
     assert "dangling_source" in codes or "table_dropped" in codes
 
 
-def test_orphan_relation_reconcile_is_advisory_with_drop_statement(maintain_repo):
+def test_orphan_relation_reconcile_proposes_the_governed_macro(maintain_repo):
     maintain_repo.snapshot()
     (maintain_repo.project_dir / "models" / "staging" / "stg_orders.sql").unlink()
     maintain_repo.dex("maintain", "schema")
@@ -471,8 +722,10 @@ def test_orphan_relation_reconcile_is_advisory_with_drop_statement(maintain_repo
         p for p in by_axis["schema"] if p["finding_code"] == "orphan_relation"
     ]
     assert orphan_proposals and all(p["kind"] == "advisory" for p in orphan_proposals)
-    assert "DROP TABLE" in orphan_proposals[0]["action"]
-    assert "warehouse.main.stg_orders" in orphan_proposals[0]["action"]
+    action = orphan_proposals[0]["action"]
+    assert "transform macro drop_orphan_relations" in action
+    assert "dbt run-operation drop_orphan_relations" in action
+    assert "warehouse.main.stg_orders" in action
 
 
 def test_the_no_format_fallback_answers_exactly_what_dbt_answers():

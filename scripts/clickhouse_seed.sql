@@ -7,8 +7,10 @@
 -- the HTTP interface refuses multi-statement bodies, so this file cannot be
 -- POSTed.
 --
--- ClickHouse namespaces are two-part (database.table), so `app` here is a
--- database, not a schema, and dex identifiers read `app.customers`.
+-- ClickHouse namespaces are two-part (database.table). Both database names are
+-- clickhouse-client query parameters so this exact data fixture is used by the
+-- local container and the dedicated Cloud CI service. Each environment creates
+-- its own users and grants after applying the shared data fixture.
 --
 -- The shape is a small realistic analytical schema that exercises every
 -- explore/transform/maintain surface, plus five ClickHouse-specific hazards
@@ -36,17 +38,14 @@
 --   - signups: an empty table (volume drift, zero-row profiling)
 --   - v_order_totals: a view (no stored rows, NULL total_rows in system.tables)
 --   - dbt_dev: the empty dev database dbt builds into (never a source)
--- Users:
---   - dex_ro: the read-only user dex connects as (SELECT on app only)
---   - dbt_dev: reads app, writes only database dbt_dev
 
-DROP DATABASE IF EXISTS app;
-DROP DATABASE IF EXISTS dbt_dev;
+DROP DATABASE IF EXISTS {app_database:Identifier};
+DROP DATABASE IF EXISTS {dev_database:Identifier};
 
-CREATE DATABASE app;
-CREATE DATABASE dbt_dev;
+CREATE DATABASE {app_database:Identifier};
+CREATE DATABASE {dev_database:Identifier};
 
-CREATE TABLE app.customers
+CREATE TABLE {app_database:Identifier}.customers
 (
     id         UInt64,
     email      String,
@@ -61,7 +60,7 @@ CREATE TABLE app.customers
 ENGINE = MergeTree
 ORDER BY id;
 
-INSERT INTO app.customers
+INSERT INTO {app_database:Identifier}.customers
 SELECT
     number + 1                                              AS id,
     format('user{}@example.com', toString(number + 1))      AS email,
@@ -75,7 +74,7 @@ SELECT
     now() - toIntervalDay(number % 400)                     AS created_at
 FROM numbers(500);
 
-CREATE TABLE app.products
+CREATE TABLE {app_database:Identifier}.products
 (
     id       UInt64,
     name     String,
@@ -87,7 +86,7 @@ CREATE TABLE app.products
 ENGINE = MergeTree
 ORDER BY id;
 
-INSERT INTO app.products
+INSERT INTO {app_database:Identifier}.products
 SELECT
     number + 1                                        AS id,
     format('Product {}', toString(number + 1))        AS name,
@@ -99,7 +98,7 @@ SELECT
            ',"in_stock":', if(number % 2 = 0, 'true', 'false'), '}') AS attrs
 FROM numbers(80);
 
-CREATE TABLE app.orders
+CREATE TABLE {app_database:Identifier}.orders
 (
     id          UInt64,
     customer_id UInt64,
@@ -110,7 +109,7 @@ CREATE TABLE app.orders
 ENGINE = MergeTree
 ORDER BY id;
 
-INSERT INTO app.orders
+INSERT INTO {app_database:Identifier}.orders
 SELECT
     number + 1                                   AS id,
     1 + ((number * 7) % 500)                     AS customer_id,
@@ -122,7 +121,7 @@ FROM numbers(2000);
 -- product_id carries no declaration (ClickHouse has none to carry) and 40 of the
 -- 5000 rows point at products 900-939, which do not exist. Relationship
 -- verification and maintain grain's join-fanout half both read this.
-CREATE TABLE app.order_items
+CREATE TABLE {app_database:Identifier}.order_items
 (
     id         UInt64,
     order_id   UInt64,
@@ -133,7 +132,7 @@ CREATE TABLE app.order_items
 ENGINE = MergeTree
 ORDER BY id;
 
-INSERT INTO app.order_items
+INSERT INTO {app_database:Identifier}.order_items
 SELECT
     number + 1                                        AS id,
     1 + ((number * 3) % 2000)                         AS order_id,
@@ -142,7 +141,7 @@ SELECT
     toDecimal64(1 + (number % 150) + 0.49, 2)         AS unit_price
 FROM numbers(5000);
 
-CREATE TABLE app.payments
+CREATE TABLE {app_database:Identifier}.payments
 (
     id          UInt64,
     order_id    UInt64,
@@ -153,28 +152,33 @@ CREATE TABLE app.payments
 ENGINE = MergeTree
 ORDER BY id;
 
-INSERT INTO app.payments
+INSERT INTO {app_database:Identifier}.payments
 SELECT
     rowNumberInAllBlocks() + 1                        AS id,
     o.id                                              AS order_id,
     ['card', 'transfer', 'wallet'][1 + (o.id % 3)]    AS method,
     toFixedString(hex(MD5(toString(o.id))), 32)       AS checksum,
     o.ordered_at + toIntervalHour(1)                  AS paid_at
-FROM app.orders AS o
+FROM {app_database:Identifier}.orders AS o
 WHERE o.status IN ('paid', 'shipped');
 
-CREATE VIEW app.v_order_totals AS
+-- Query parameters are substituted while parsing the DDL statement, but a
+-- parameter embedded in a stored view body is retained and later resolves as
+-- empty. Pin the current database for this statement and keep the stored body
+-- unqualified so the same parameterized fixture works locally and in Cloud.
+USE {app_database:Identifier};
+CREATE VIEW v_order_totals AS
 SELECT
     o.id          AS order_id,
     o.customer_id AS customer_id,
     o.status      AS status,
     sum(i.quantity * i.unit_price) AS computed_total
-FROM app.orders AS o
-INNER JOIN app.order_items AS i ON i.order_id = o.id
+FROM orders AS o
+INNER JOIN order_items AS i ON i.order_id = o.id
 GROUP BY o.id, o.customer_id, o.status;
 
 -- Empty on purpose: volume drift's emptied-table case, and a zero-row profile.
-CREATE TABLE app.signups
+CREATE TABLE {app_database:Identifier}.signups
 (
     id         UInt64,
     email      String,
@@ -187,7 +191,7 @@ ORDER BY id;
 -- order_id is genuinely non-unique in the stored data while being the declared
 -- grain. Two of the 300 ids are double-loaded. A key_lost_uniqueness finding
 -- here is engine behavior, not a defect, which is what table_notes has to say.
-CREATE TABLE app.order_events_raw
+CREATE TABLE {app_database:Identifier}.order_events_raw
 (
     order_id   UInt64,
     state      LowCardinality(String),
@@ -197,7 +201,7 @@ CREATE TABLE app.order_events_raw
 ENGINE = ReplacingMergeTree(version)
 ORDER BY order_id;
 
-INSERT INTO app.order_events_raw
+INSERT INTO {app_database:Identifier}.order_events_raw
 SELECT
     number + 1                                  AS order_id,
     ['new', 'picked', 'shipped'][1 + (number % 3)] AS state,
@@ -205,7 +209,7 @@ SELECT
     now() - toIntervalHour(number % 48)         AS updated_at
 FROM numbers(300);
 
-INSERT INTO app.order_events_raw VALUES
+INSERT INTO {app_database:Identifier}.order_events_raw VALUES
     (7,  'shipped', 2, now()),
     (42, 'shipped', 2, now());
 
@@ -214,7 +218,7 @@ INSERT INTO app.order_events_raw VALUES
 -- distinct_periods, missing_periods and largest_gap all have something to
 -- report. recorded_at is a DateTime, whose spelling is what makes the shared
 -- date-only check skip hour granularity unless the substring test excludes it.
-CREATE TABLE app.events
+CREATE TABLE {app_database:Identifier}.events
 (
     id          UInt64,
     customer_id UInt64,
@@ -227,7 +231,7 @@ CREATE TABLE app.events
 ENGINE = MergeTree
 ORDER BY (occurred_at, id);
 
-INSERT INTO app.events
+INSERT INTO {app_database:Identifier}.events
 SELECT
     number + 1                                             AS id,
     1 + (number % 500)                                     AS customer_id,
@@ -240,27 +244,4 @@ SELECT
 FROM numbers(100000)
 WHERE (number % 90) NOT IN (30, 31, 32);
 
--- Users. Recreated on every seed so the passwords are known and the grants are
--- exactly what the docs claim. dex connects as dex_ro and can reach nothing but
--- app; dbt builds as dbt_dev and can write nothing but dbt_dev.
-DROP USER IF EXISTS dex_ro;
-DROP USER IF EXISTS dbt_dev;
-
-CREATE USER dex_ro IDENTIFIED WITH plaintext_password BY 'dex_ro';
-GRANT SELECT ON app.* TO dex_ro;
-GRANT SELECT ON system.tables TO dex_ro;
-GRANT SELECT ON system.columns TO dex_ro;
-GRANT SELECT ON system.databases TO dex_ro;
-GRANT SELECT ON system.settings TO dex_ro;
-GRANT SELECT ON system.grants TO dex_ro;
-GRANT SELECT ON system.role_grants TO dex_ro;
-
-CREATE USER dbt_dev IDENTIFIED WITH plaintext_password BY 'dbt_dev';
-GRANT SELECT ON app.* TO dbt_dev;
-GRANT SELECT ON system.tables TO dbt_dev;
-GRANT SELECT ON system.columns TO dbt_dev;
-GRANT SELECT ON system.databases TO dbt_dev;
-GRANT SELECT, INSERT, ALTER, CREATE TABLE, CREATE VIEW, DROP TABLE, DROP VIEW, TRUNCATE, OPTIMIZE ON dbt_dev.* TO dbt_dev;
-GRANT CREATE DATABASE ON dbt_dev.* TO dbt_dev;
-
-OPTIMIZE TABLE app.customers FINAL;
+OPTIMIZE TABLE {app_database:Identifier}.customers FINAL;

@@ -25,7 +25,11 @@ from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
+    _declared_relationship_conflicts,
+    _fold_semantic_edges,
     _merge_relationships,
+    _relationship_conflict_notes,
+    _semantic_join_notes,
 )
 from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.explore.relationships import (
@@ -36,9 +40,12 @@ from exmergo_dex_core.explore.relationships import (
     fk_candidate_count,
     fold_replica_relationships,
     infer_relationships,
+    probe_batches,
+    semantic_relationships,
     verify_relationships,
 )
 from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
+from exmergo_dex_core.semantic_catalog import EntityJoin
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -735,7 +742,10 @@ def test_own_key_duplicates_produce_fan_out_warning():
     notes = data_quality_notes(hosts)
     warning = next(n for n in notes if "not unique" in n)
     assert "ID is not unique: ~9590 distinct over 14111 rows" in warning
-    assert "4521 duplicate rows" in warning
+    # The surplus is stated as what it is, a number of rows to remove, and not
+    # as "duplicate ids": those differ, and only this one follows from the counts.
+    assert "~4521 rows would have to be removed for it to be unique" in warning
+    assert "unique for ~68.0% of rows" in warning
     assert "fan out" in warning
     assert any("grain unknown" in n for n in notes)
 
@@ -1000,6 +1010,7 @@ def test_probe_statements_and_verify_cover_the_same_set():
     """
 
     from exmergo_dex_core.explore.relationships import (
+        probe_batches,
         probe_candidates,
         probe_statements,
     )
@@ -1016,12 +1027,18 @@ def test_probe_statements_and_verify_cover_the_same_set():
     ]
 
     candidates = probe_candidates(mixed)
-    assert len(probe_statements(mixed, "duckdb")) == len(candidates)
+    # A statement now answers several joins at once, so "the same set" is about
+    # the joins the statements cover, not how many statements there are. Both
+    # sides flatten to `candidates`, in order.
+    batched = [rel for batch in probe_batches(candidates) for rel in batch]
+    assert batched == candidates
+    assert len(probe_statements(mixed, "duckdb")) == len(probe_batches(candidates))
 
-    # The composite is the one excluded, and deliberately: the probe SQL joins
-    # on a single column pair, so measuring it would answer about a different
-    # relationship than the one declared.
-    assert [len(r.from_columns) for r in candidates] == [1, 1]
+    # A composite is probed as the full ordered tuple, never as its first pair.
+    assert [len(r.from_columns) for r in candidates] == [1, 1, 2]
+    composite_sql = probe_statements(mixed, "duckdb")[-1]
+    assert 'd2.pk0 = c."order_id"' in composite_sql
+    assert 'd2.pk1 = c."line_no"' in composite_sql
     assert {r.kind for r in candidates} == {
         RelationshipKind.INFERRED,
         RelationshipKind.DECLARED,
@@ -1371,6 +1388,217 @@ def test_overlap_probe_transpiles_to_postgres_and_stays_select_only():
     assert "order_items" in sql and "products" in sql
 
 
+# --- issue #398: overlap probes share their table references ----------------
+
+
+def _probe_rel(child: str, fk: str, parent: str, key: str) -> Relationship:
+    return Relationship(
+        from_dataset=f"wh.main.{child}",
+        from_columns=[fk],
+        to_dataset=f"wh.main.{parent}",
+        to_columns=[key],
+        kind=RelationshipKind.INFERRED,
+        confidence=0.7,
+    )
+
+
+def test_a_batch_costs_the_graph_s_tables_not_twice_its_edges():
+    """The invariant that produces the saving, counted the way the estimator
+    counts it.
+
+    A per-table minimum is charged on the distinct tables a statement reads, so
+    what matters is that one statement's table set is the graph's table set. Five
+    edges unbatched are five statements reading two tables each, ten table
+    references to bill; batched they are one statement reading five.
+    """
+
+    import sqlglot
+
+    from exmergo_dex_core.explore.relationships import probe_statements
+
+    edges = [
+        _probe_rel("order_items", "order_id", "orders", "id"),
+        _probe_rel("order_items", "user_id", "users", "id"),
+        _probe_rel("order_items", "product_id", "products", "id"),
+        _probe_rel("orders", "user_id", "users", "id"),
+        _probe_rel("events", "user_id", "users", "id"),
+    ]
+
+    [sql] = probe_statements(edges, "bigquery")  # five edges, inside the cap
+
+    parsed = sqlglot.parse_one(sql, read="bigquery")
+    referenced = {t.name for t in parsed.find_all(sqlglot.exp.Table)}
+    assert referenced == {"order_items", "orders", "users", "products", "events"}
+    # And the child side is read once per child, not once per edge, which is
+    # what the connectors billing scan time rather than bytes are paying for.
+    assert sql.count("`order_items` AS c") == 1
+
+
+def test_a_child_with_more_edges_than_the_cap_stays_one_statement(monkeypatch):
+    """Splitting a child across statements would read that child twice, which
+    is the thing batching exists to stop, so the cap yields to it."""
+
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    monkeypatch.setattr(rel_mod, "_PROBE_BATCH", 2)
+    edges = [_probe_rel("wide_fact", f"fk_{i}", f"dim_{i}", "id") for i in range(5)] + [
+        _probe_rel("other_fact", "fk_0", "dim_0", "id")
+    ]
+
+    batches = rel_mod.probe_batches(edges)
+
+    assert [len(b) for b in batches] == [5, 1]
+    assert {r.from_dataset for r in batches[0]} == {"wh.main.wide_fact"}
+
+
+def test_batching_never_reorders_or_drops_an_edge(monkeypatch):
+    """`probe_batches` is what keeps the priced statements and the run
+    statements the same statements, so it must be a regrouping of its input and
+    nothing else."""
+
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    monkeypatch.setattr(rel_mod, "_PROBE_BATCH", 3)
+    edges = [
+        _probe_rel("a", "x", "p", "id"),
+        _probe_rel("b", "x", "p", "id"),
+        _probe_rel("a", "y", "q", "id"),
+        _probe_rel("c", "x", "p", "id"),
+        _probe_rel("b", "y", "q", "id"),
+    ]
+
+    flattened = [rel for batch in rel_mod.probe_batches(edges) for rel in batch]
+
+    assert sorted(id(r) for r in flattened) == sorted(id(r) for r in edges)
+    # Edges sharing a child are adjacent, which is what lets one read answer
+    # all of them.
+    children = [r.from_dataset for r in flattened]
+    assert children == sorted(children, key=children.index)
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    ["bigquery", "snowflake", "postgres", "redshift", "databricks", "clickhouse"],
+)
+def test_a_cross_child_batch_transpiles_and_stays_select_only(dialect: str):
+    """The batched statement carries two shapes a single-edge probe never did
+    (several LEFT JOINs over one child, and a CROSS JOIN between children), so
+    every connector's dialect has to survive both."""
+
+    import sqlglot
+
+    from exmergo_dex_core.explore.relationships import probe_statements
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    [sql] = probe_statements(
+        [
+            _probe_rel("order_items", "order_id", "orders", "id"),
+            _probe_rel("order_items", "user_id", "users", "id"),
+            _probe_rel("orders", "user_id", "users", "id"),
+        ],
+        dialect,
+    )
+
+    assert_select_only(sql, dialect=dialect)
+    assert sqlglot.parse_one(sql, read=dialect) is not None
+    assert "FILTER" not in sql.upper()
+
+
+def test_batched_verification_matches_a_probe_per_join(tmp_path: Path):
+    """The acceptance criterion for #398: batching may change how many
+    statements run and nothing else.
+
+    The oracle is the pre-batching probe, written out here rather than reached
+    through a knob, so the comparison is against an independent statement per
+    join and not against the batcher configured small.
+
+    The warehouse carries every case that could plausibly diverge under a
+    batched read: several foreign keys on one child, a dimension shared by two
+    children, a non-unique parent key (which a bare join would fan out on), NULL
+    foreign keys, an entirely orphaned key, and a key with no non-null values at
+    all.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.relationships import verify_relationships
+
+    path = tmp_path / "batched.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2), (2)")  # not unique
+    conn.execute("CREATE TABLE products (id INTEGER)")
+    conn.execute("INSERT INTO products VALUES (100), (101)")
+    conn.execute(
+        "CREATE TABLE orders (customer_id INTEGER, product_id INTEGER, "
+        "promo_id INTEGER, void_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO orders VALUES (1, 100, 900, NULL), (2, 101, 901, NULL), "
+        "(7, 100, 902, NULL), (NULL, 999, 903, NULL)"
+    )
+    conn.execute("CREATE TABLE returns (customer_id INTEGER)")
+    conn.execute("INSERT INTO returns VALUES (1), (55)")
+    conn.close()
+
+    def edges() -> list[Relationship]:
+        return [
+            _probe_rel("orders", "customer_id", "customers", "id"),
+            _probe_rel("orders", "product_id", "products", "id"),
+            _probe_rel("orders", "promo_id", "products", "id"),  # fully orphaned
+            _probe_rel("orders", "void_id", "products", "id"),  # no non-null values
+            _probe_rel("returns", "customer_id", "customers", "id"),
+        ]
+
+    def qualify(rels: list[Relationship]) -> list[Relationship]:
+        for rel in rels:
+            rel.from_dataset = rel.from_dataset.replace("wh.main.", "batched.main.")
+            rel.to_dataset = rel.to_dataset.replace("wh.main.", "batched.main.")
+        return rels
+
+    def one_probe_per_join(adapter, rels: list[Relationship]) -> list[tuple]:
+        """The statement `--verify` issued before #398, one join at a time."""
+
+        def quoted(identifier: str) -> str:
+            return ".".join(f'"{part}"' for part in identifier.split("."))
+
+        measured = []
+        for rel in rels:
+            child, parent = quoted(rel.from_dataset), quoted(rel.to_dataset)
+            fk, key = rel.from_columns[0], rel.to_columns[0]
+            result = adapter.run_query(
+                f'SELECT COUNT(c."{fk}") AS nonnull_fk, '  # noqa: S608
+                f'COUNT(CASE WHEN c."{fk}" IS NOT NULL AND d.pk IS NULL '
+                f"THEN 1 END) AS orphans "
+                f"FROM {child} c LEFT JOIN "
+                f'(SELECT DISTINCT "{key}" AS pk FROM {parent}) d '
+                f'ON d.pk = c."{fk}"',
+                max_rows=1,
+                timeout_seconds=30.0,
+            )
+            values = dict(zip(result.columns, result.cells[0], strict=True))
+            nonnull = int(values["nonnull_fk"] or 0)
+            orphans = int(values["orphans"] or 0)
+            fraction = None if nonnull == 0 else round(orphans / nonnull, 4)
+            measured.append((True, fraction))
+        return measured
+
+    adapter = DuckDBAdapter(str(path))
+    try:
+        expected = one_probe_per_join(adapter, qualify(edges()))
+        batched = qualify(edges())
+        verify_relationships(adapter, batched)
+    finally:
+        adapter.close()
+
+    assert [(r.verified, r.orphan_fraction) for r in batched] == expected
+    assert expected[2][1] == 1.0, "the fully orphaned edge is measured as such"
+    assert expected[3][1] is None, "no non-null values stays unmeasurable"
+    # Five joins, two children: one statement now, five before.
+    assert len(probe_batches(batched)) == 1
+
+
 # --- declared joins from the dbt project -----------------------------------------
 
 
@@ -1675,3 +1903,269 @@ def test_relationships_envelope_unresolved_declared_is_a_signal(tmp_path: Path, 
     notes = data["notes"]
     assert any("no declared relationships resolved" in n for n in notes)
     assert any("not in this connection's inventory" in n for n in notes)
+
+
+# ---- the semantic layer's declared entity graph (#361) -----------------------
+#
+# A shared entity is a join the layer states, with the key named per model. These
+# arrive at the declared tier beside the `relationships` tests, so the assertions
+# below are the ones that keep that tier honest: the same never-guess endpoint
+# resolution, one edge per join however many channels name it, and the entity
+# carried as the thing a reader can look up.
+
+
+def _join(
+    entity: str = "customer",
+    *,
+    parent_relation: str = "wh.main.customers",
+    parent_column: str = "id",
+    child_relation: str = "wh.main.orders",
+    child_column: str = "buyer_id",
+) -> EntityJoin:
+    return EntityJoin(
+        entity=entity,
+        parent_model="customers_sm",
+        parent_relation=parent_relation,
+        parent_column=parent_column,
+        child_model="orders_sm",
+        child_relation=child_relation,
+        child_column=child_column,
+    )
+
+
+def test_a_declared_entity_becomes_an_edge_naming_the_entity():
+    rels, notes = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    assert notes == []
+    (rel,) = rels
+    assert rel.from_dataset == "wh.main.orders" and rel.from_columns == ["buyer_id"]
+    assert rel.to_dataset == "wh.main.customers" and rel.to_columns == ["id"]
+    # Declared, not inferred: the layer states this join and names its key. A
+    # name-based rule would never have found `buyer_id` against `id`.
+    assert rel.kind is RelationshipKind.DECLARED
+    assert rel.confidence == 1.0
+    assert rel.declared_by == "semantic entity 'customer'"
+
+
+def test_a_semantic_endpoint_resolves_across_a_database_alias():
+    """Same rule the `relationships` tests go through, and the same reason: a
+    compiled manifest spells the database the way dbt was configured while the
+    adapter normalizes it per connector."""
+
+    rels, notes = semantic_relationships(
+        [
+            _join(
+                parent_relation="analytics.main.customers",
+                child_relation="analytics.main.orders",
+            )
+        ],
+        ["wh.main.orders", "wh.main.customers"],
+    )
+
+    assert notes == []
+    assert rels[0].from_dataset == "wh.main.orders"
+
+
+def test_a_semantic_endpoint_missing_here_is_a_note_not_an_edge():
+    rels, notes = semantic_relationships([_join()], ["wh.main.orders"])
+
+    assert rels == []
+    (note,) = notes
+    assert "semantic entity 'customer'" in note
+    assert "not in this connection's inventory" in note
+
+
+def test_an_ambiguous_semantic_endpoint_is_skipped_rather_than_guessed():
+    rels, notes = semantic_relationships(
+        [_join()], ["wh.a.orders", "wh.b.orders", "wh.main.customers"]
+    )
+
+    assert rels == []
+    assert any("more than one object" in note for note in notes)
+
+
+def test_duplicate_semantic_joins_are_deduped():
+    rels, _ = semantic_relationships(
+        [_join(), _join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    assert len(rels) == 1
+
+
+def test_a_semantic_edge_the_project_already_declares_is_counted_once():
+    """Both channels are declarations of the same tier, so an edge in both is one
+    edge. Which named it first is not a fact about the warehouse, and doubling it
+    would inflate the connectivity ranking."""
+
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["buyer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, already = _fold_semantic_edges([declared], semantic)
+
+    assert len(merged) == 1 and already == 1
+    # The relationships test's edge stands; the semantic channel adds nothing it
+    # did not already say.
+    assert merged[0].declared_by is None
+
+
+# --- declared relationship conflicts (#408) -------------------------------------
+
+
+def test_conflicting_declarations_over_the_same_endpoints_are_both_kept_and_flagged():
+    """A relationships test and the semantic layer's shared entity name the same
+    two datasets but disagree on which column joins them: dex never picks a
+    winner, so both edges survive and the disagreement is named rather than
+    one silently overwriting or merging with the other."""
+
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declaration_sources=["relationships test orders.customer_id"],
+    )
+    semantic, _ = semantic_relationships(
+        [_join(child_column="buyer_id")], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, already = _fold_semantic_edges([declared], semantic)
+    conflicts = _declared_relationship_conflicts(merged)
+
+    assert already == 0
+    assert len(merged) == 2, "neither declaration wins; both edges survive"
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert conflict.from_dataset == "wh.main.orders"
+    assert conflict.to_dataset == "wh.main.customers"
+    pairs = {tuple(tuple(p) for p in d.column_pairs) for d in conflict.declarations}
+    assert pairs == {(("customer_id", "id"),), (("buyer_id", "id"),)}
+    sources = {d.source for d in conflict.declarations}
+    assert "relationships test orders.customer_id" in sources
+    assert any("customer" in s for s in sources)  # the semantic entity's name
+
+
+def test_agreeing_declarations_over_the_same_endpoints_are_not_a_conflict():
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["buyer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, _already = _fold_semantic_edges([declared], semantic)
+
+    assert _declared_relationship_conflicts(merged) == []
+
+
+def test_a_composite_conflict_carries_every_column_pair():
+    declared = Relationship(
+        from_dataset="wh.main.order_lines",
+        from_columns=["product_id"],
+        to_dataset="wh.main.products",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declaration_sources=["relationships test order_lines.product_id"],
+    )
+    composite = Relationship(
+        from_dataset="wh.main.order_lines",
+        from_columns=["product_id", "variant_id"],
+        to_dataset="wh.main.products",
+        to_columns=["id", "variant_id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declaration_sources=["native relationship 'order_lines_to_products'"],
+    )
+
+    (conflict,) = _declared_relationship_conflicts([declared, composite])
+
+    by_pairs = {
+        tuple(tuple(p) for p in d.column_pairs): d for d in conflict.declarations
+    }
+    assert (("product_id", "id"),) in by_pairs
+    assert (("product_id", "id"), ("variant_id", "variant_id")) in by_pairs
+
+
+def test_conflict_notes_name_the_endpoints_and_point_at_the_structured_field():
+    conflicts = _declared_relationship_conflicts(
+        [
+            Relationship(
+                from_dataset="wh.main.orders",
+                from_columns=["customer_id"],
+                to_dataset="wh.main.customers",
+                to_columns=["id"],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+            ),
+            Relationship(
+                from_dataset="wh.main.orders",
+                from_columns=["buyer_id"],
+                to_dataset="wh.main.customers",
+                to_columns=["id"],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+            ),
+        ]
+    )
+
+    (note,) = _relationship_conflict_notes(conflicts)
+    assert "wh.main.orders -> wh.main.customers" in note
+    assert "data.conflicts" in note
+
+
+def test_no_conflict_notes_when_nothing_disagrees():
+    assert _relationship_conflict_notes([]) == []
+
+
+def test_the_notes_name_what_inference_would_have_missed():
+    """The count alone is not the interesting number. An edge the layer declares
+    and inference did not find is a join that would otherwise be absent from the
+    map, with a key no naming rule could have matched."""
+
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    notes = _semantic_join_notes(semantic, 0, [])
+
+    assert any("declared entity graph" in note for note in notes)
+    missed = next(note for note in notes if "not found by name-based" in note)
+    assert "semantic entity 'customer'" in missed
+
+
+def test_an_edge_inference_also_found_is_not_reported_as_rescued():
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+    inferred = [
+        Relationship(
+            from_dataset="wh.main.orders",
+            from_columns=["buyer_id"],
+            to_dataset="wh.main.customers",
+            to_columns=["id"],
+            kind=RelationshipKind.INFERRED,
+            confidence=0.7,
+        )
+    ]
+
+    notes = _semantic_join_notes(semantic, 0, inferred)
+
+    assert not any("not found by name-based" in note for note in notes)

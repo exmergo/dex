@@ -105,6 +105,25 @@ message rather than letting dbt create an empty database: seed the dev target fi
 source-less project is allowed to create its dev database on first build, with a
 warning.
 
+`transform build --verify` is free here. A relation whose row count the catalog
+does not keep gets a real `COUNT(*)` instead of an estimate, because counting
+bills nothing and a verdict about a ten percent difference has no business
+resting on a catalog figure, so every finding comes back `exact: true`. That
+matters more than it sounds: dbt-duckdb materializes as a view by default and
+DuckDB keeps no row count for a view, so a sweep that trusted metadata alone
+would judge nothing in a default project. There is no dev-namespace fold to make
+either, since the dev target is a database file and the dev-target preflight
+already refuses a build whose profile and config disagree about which one.
+
+`transform test --mutate` is free here too, and it is the connector to learn the
+command on: every mutant is a full dbt run, so twenty of them against a local
+file cost nothing but a few seconds, and no handshake stands between the caller
+and the answer. Nothing is materialized either way, because a mutant builds as
+an ephemeral model, so the dev database holds exactly the relations it held
+before.
+
+
+
 The dev target being the source file is also why `transform init`'s content
 preflight skips DuckDB's base namespace: "the file already holds objects" is
 true of every working setup, so warning on it would only teach users to skim.

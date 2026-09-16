@@ -1,6 +1,6 @@
 ---
 name: transform
-description: 'Use this to author and change a dbt project: bootstrap a project in a repo that has none (`transform init`), write or refactor model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Reach for this rather than editing model files by hand whenever the change spans more than one file or has to stay consistent with the rest of the project: it validates the edit against the real schema before writing, returns the change as a reviewable diff with a plan id, and catches the class of error that only surfaces at `dbt run`, such as wrong column names, broken refs, or a materialization that fights the project config. On a large project that check is worth more than the round trip costs. It applies to bug-fix tickets too: "this model returns wrong numbers, fix it" is a transform task. Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Any warehouse build is dev-target only, gated, and cost-surfaced first. If you do not yet know the source tables'' columns or grain, use explore first, then come back. To reconcile a project that has drifted out of sync with the warehouse, use maintain.'
+description: 'Use this to author and change a dbt project or a semantic layer: bootstrap a project in a repo that has none (`transform init`), write or refactor model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer, whether that is dbt semantic models (MetricFlow: entities, dimensions, measures, metrics) or native Apache Ossie documents in a repo with no dbt project at all. Reach for this rather than editing model files by hand whenever the change spans more than one file or has to stay consistent with the rest of the project: it validates the edit against the real schema before writing, returns the change as a reviewable diff with a plan id, and catches the class of error that only surfaces at `dbt run`, such as wrong column names, broken refs, or a materialization that fights the project config. On a large project that check is worth more than the round trip costs. It applies to bug-fix tickets too: "this model returns wrong numbers, fix it" is a transform task. Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", "add a dimension to this entity", "add a metric to my Ossie semantic model", or "update semantics/commerce.ossie.yaml". Any warehouse build is dev-target only, gated, and cost-surfaced first. If you do not yet know the source tables'' columns or grain, use explore first, then come back. To reconcile a project that has drifted out of sync with the warehouse, use maintain.'
 ---
 
 # Transform
@@ -14,7 +14,7 @@ writes only to the repo, as reviewable diffs, and runs against a dev target only
 ## How to drive it
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
 dex runs its engine through `uv`, which is a prerequisite and is not installed by
@@ -23,6 +23,16 @@ to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
 `brew install uv`, or `pipx install uv`), then re-run. Never fall back to editing
 the dbt project by hand instead: the validation, the diffs, and the dev-target
 gating live in the engine, so any other path is unguarded.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 You author the dbt file content; the engine validates it, computes the diffs,
 and stores the proposal as a plan. Hand content over with `--edits-file <path>`
@@ -80,6 +90,8 @@ Generic tests are declared inside a `schema.yml` (`data_tests:` on a model or a
 column). Unit tests come from `transform test --scaffold <model>`, which writes a
 `unit_tests:` block, also `schema_yml`. Singular tests and generic test
 *definitions* are files under `test-paths`, and `test_sql` is the kind for those.
+`transform test --mutate <model>` measures all three at once, since a defect has
+to get past every one of them to reach production.
 
 **A seed puts values, not logic, into a diff, and a diff goes into git and stays
 there.** So a seed whose header names a column that looks like personal data is
@@ -120,7 +132,7 @@ else: `transform plan` needs a project to edit. Ask the user for the project
 name and **confirm the connector with them**, then run:
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
 ```
 
 The engine renders the whole skeleton (`dbt_project.yml`, `models/staging/` and
@@ -193,6 +205,20 @@ check" note just means no connection was reachable at init time.
   (then the usual `--confirm --budget` once priced), so ask the user before
   spending. A change reported with `attributed: false` names why it could not be
   measured; treat that as unknown, not as zero.
+- The plan also warns about the **shape** of what you authored, in `warnings`.
+  A SELECT list that diverges from the columns the model's `schema.yml` declares
+  is named in both directions; fix whichever side is actually stale, and say
+  which one you decided it was.
+- A warning that the model **exposes a raw foreign key with no resolved
+  counterpart** is dex reading a convention out of the project's own models: the
+  siblings it names all resolve keys of that shape, and it names the parent
+  model yours could resolve against. Prefer resolving it, by joining that parent
+  the way the siblings do. Where the raw key is deliberate (a fact-shaped model
+  in a dimension folder, a key the consumer needs verbatim), say so plainly to
+  the user rather than quietly leaving it. Never switch the check off to make
+  the warning go away: `conventions.resolved_keys: false` in `.dex/config.yml`
+  is a decision about the house's style, so recommend it for the user to accept,
+  the same way you would a `pii_overrides` entry.
 - `transform apply [plan-id]` writes the plan into the dbt project (the latest
   unapplied plan when no id is given; any plan kind, semantic included). The
   result is still a reviewable git diff for the user. If a human edited a file
@@ -284,16 +310,90 @@ check" note just means no connection was reachable at init time.
   first) is what they actually want.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
-  `--budget` on billed connectors). On BigQuery there is no upfront estimate
-  (dbt has no dry-run), so always get an explicit byte budget from the user and
-  pass it as `--budget <bytes>`; never invent one. Each statement dbt runs is
-  capped server-side by the profile's `maximum_bytes_billed`, and the envelope
-  reports billed bytes afterward. Production-looking targets are refused
+  `--budget` on billed connectors). dbt itself has no dry-run, but the engine
+  compiles the project and dry-runs each node itself, so on BigQuery the first
+  unconfirmed call already returns `needs_confirmation` with `estimated_bytes`
+  and a `per_table_bytes` breakdown, the same shape the scanning `explore`
+  commands use. Never invent a `--budget` figure: read the reported estimate
+  (`per_table_bytes` is the actionable half, since it names which node is
+  driving the cost) and confirm with a `--budget` grounded in that number.
+  If the build is refused over the ceiling, the refusal carries a calibration
+  line from `.dex/spend.jsonl`: what this connector's recent commands billed as
+  a fraction of estimate, or a sentence saying there is too little history to
+  say. Builds over-estimate most on a partitioned or clustered warehouse, so
+  relay it, and note that the ceiling binds on the estimate rather than on what
+  settles, so a budget set at that fraction of the estimate is refused again.
+  A `suggested_session_ceiling` on that envelope is the project's one-time ask
+  for a cumulative daily cap, separate from `--budget`: relay it and add the
+  user's answer (`--session-ceiling <value>` or `--no-session-ceiling`) to the
+  same re-issue, which records it in `.dex/config.yml` for good.
+  Each statement dbt runs is capped server-side by the profile's
+  `maximum_bytes_billed`, and the envelope reports billed bytes afterward.
+  Production-looking targets are refused
   outright; `--confirm` cannot override that. dbt runs with its working
   directory pinned to the project dir, so relative paths in `profiles.yml`
   resolve against the project. When the project declares packages
   (`packages.yml`) and `dbt_packages/` is missing, the engine runs `dbt deps`
   automatically before the build.
+- **`transform build --verify` is how you answer "is it right", not just "did it
+  run".** A green build tells you dbt executed. It does not tell you the model
+  holds the rows it should, and that is where the expensive defects live: an
+  inner join written where a left join was meant loses rows, raises nothing, and
+  passes every uniqueness and not-null test over the smaller result. `--verify`
+  sweeps the nodes this build touched and reports the findings in the same
+  envelope, under `data.verification`. Reach for it whenever the build was meant
+  to prove a change is correct, which is most of the time you build at all.
+
+  Read `data.verification.ran` before reading anything else. It is always
+  present, because a build that did not verify and a build that verified and
+  found nothing look identical otherwise, and only the second one means the
+  models are clean. When it ran, `findings` is ranked the way `maintain verify`
+  ranks it, `scope` names the models covered, and `suppressed` names each class
+  that could not run and why. Relay a suppression rather than reading past it:
+  it is the difference between "checked and clean" and "not checked".
+
+  Findings never fail the build and never appear in `errors`. Do not treat one
+  as a build failure or re-run to make it go away: relay the finding, its two
+  counts, and the join it names, and let the user decide. A failed build still
+  reports which node failed and which were skipped because of it, which is
+  usually a faster read than the dbt log.
+
+  On a billed connector the sweep is priced into the build's own estimate as a
+  `(row counts)` line, so the `--budget` you already read off the unconfirmed
+  envelope covers both. Never add a second budget for it. If the envelope comes
+  back `ok` with a `data.offer`, the build is done and billed and the offer buys
+  only the counts it could not afford; relay the number rather than re-running
+  the build.
+- **`transform test --mutate <model>` answers "are these tests worth
+  anything".** Writing a test is not the same as writing a test that would catch
+  something, and nothing else in the dbt ecosystem tells the two apart. This
+  plants one standard analytics defect at a time in the model's SQL (a flipped
+  boundary, a dropped or negated filter, a swapped join type, a removed `CASE`
+  branch, an inverted ratio, a shifted window frame, `sum` for `max`), runs the
+  model's own tests against each, and reports which ones nothing caught.
+
+  Reach for it right after you author or scaffold tests, and before telling the
+  user the model is covered. It is also the honest answer when a user asks
+  whether their tests are any good, which is otherwise unanswerable.
+
+  Read `data.counts` and then the survivors, which are listed first. Each carries
+  `defect`, a sentence saying what would now be wrong, and `suggested_test`, the
+  test that would catch it. Relay those two: the user's next action is to write
+  that test, not to read the SQL. A `score` is reported but it is a ratio of two
+  small integers over one model, so quote it as context and never as a grade, and
+  never compare it between models.
+
+  Check `baseline.excluded` before trusting a clean-looking result. Every verdict
+  is relative to the tests that passed against the unmutated model, so a test
+  that was already failing is excluded and named there. And read `cap.elided`:
+  the run is capped at 20 mutants, so a model with more sites than that was
+  measured on a sample, spread across defect classes.
+
+  It writes nothing. Mutants build as ephemeral models in a throwaway copy, so
+  the project is untouched and no relation is created or replaced. On a billed
+  connector the whole batch is one estimate and one `--confirm`, and if the
+  budget runs out partway the rest come back `not_run`: relay that rather than
+  reading a short list as a clean bill.
 - `transform deps` installs dbt packages explicitly (also the refresh path when
   `dbt_packages/` exists but is stale). No confirmation needed: deps writes only
   inside the project and never touches the warehouse.
@@ -367,13 +467,45 @@ database, which is fine for model-only builds.
 
 ### The semantic layer
 
-- `semantic define ... --edits-file <path|->` and `semantic update ...` author
-  and evolve the dbt semantic models (entities, dimensions, measures, metrics)
-  as plans. `define` refuses names that already exist (use `update`); `update`
-  refuses names that do not (use `define`). For one logical change that mixes
-  both (evolve existing metrics and add the helpers they depend on), use
-  `semantic plan ...`: it accepts mixed intent and classifies each name, and the
-  envelope reports the split as `defined` and `updated`.
+- `semantic define ...` and `semantic update ...` author and evolve the dbt
+  semantic models (entities, dimensions, measures, metrics) as plans. `define`
+  refuses names that already exist (use `update`); `update` refuses names that
+  do not (use `define`). For one logical change that mixes both (evolve existing
+  metrics and add the helpers they depend on), use `semantic plan ...`: it
+  accepts mixed intent and classifies each name, and the envelope reports the
+  split as `defined`, `updated`, `unchanged`, and `removed`.
+- **Prefer `--definitions-file` over `--edits-file` for the semantic layer.** A
+  real project keeps its metrics in one shared file, so a whole-file payload
+  means retyping every definition you are not touching: the diff and the
+  `updated` list then describe the whole file instead of your change, and every
+  restated line is a chance to corrupt a definition by hand. Send only what
+  changes instead:
+  `{"definitions": [{"kind": "metric", "content": "name: ...\n..."}]}`, where
+  `kind` is `semantic_model` or `metric` and `content` is that definition's YAML
+  body with no leading `- `. The name comes from the content, and `path` can be
+  omitted for anything the project already declares (the engine rewrites it
+  where it lives). Everything else in the file, comments included, is preserved
+  byte for byte. Reach for `--edits-file` when you are creating a file, moving a
+  definition between files, or emptying one, and when the engine refuses a layout
+  it will not splice into.
+- **Removing one definition is the same payload with `"op": "delete"`**:
+  `{"definitions": [{"kind": "metric", "name": "doubled", "op": "delete"}]}`, the
+  name declared (there is no content to read it from) and no `content` beside it.
+  Nothing is removed for going unmentioned, so you can send a removal and an
+  edit in one payload and everything you did not name stays as it is. Use
+  `semantic update` or `semantic plan`, not `define`. The envelope reports it
+  under `removed`.
+- If a metric still reads what you are removing (its input is that metric, or a
+  measure of the semantic model you are removing), the plan is refused and the
+  reader is named: add that reader's own delete or update to the same payload,
+  in any order, and it goes through. A removal that would leave a file with no
+  semantic model or metric in it is refused too, because deleting or emptying a
+  file is a whole-file edit: do that with `transform plan --edits-file` and
+  `"op": "delete"`.
+- `unchanged` means you re-stated a definition exactly as the project already
+  has it. It is not an error, but if a plan is entirely `unchanged` it changes
+  nothing, and the envelope warns as much: check whether you meant to edit
+  something.
 - Plan-time validation is layered so a plan that validates will build:
   MetricFlow's schemas check the shape; the engine resolves every metric input
   (ratio and derived metrics reference **metrics**, not measures; a measure only
@@ -384,6 +516,44 @@ database, which is fine for model-only builds.
   explicitly.
 - A semantic plan is applied like any other: `transform apply [plan-id]` writes
   its YAML into the dbt project (no id applies the latest unapplied plan).
+- For native Ossie use `semantic ossie define|update|plan` with
+  `--edits-file <path|->`. Supply whole documents whose paths are listed in
+  `semantic.ossie.files`; the command implies the `semantic_document` kind,
+  validates the complete prospective configured layer, and writes the accepted
+  bytes exactly when the plan is later applied. This is a semantic-layer write
+  surface and does not make Ossie the transformation project.
+
+  The namespace guards match the dbt ones: `define` refuses a semantic-model name
+  the layer already has, `update` refuses one it does not, and `plan` accepts
+  both and reports each under `defined` or `updated`. Neither removes a model, and
+  a configured file may be absent before `define`, so a new document is planned
+  once its path is committed to config.
+
+  What validates an Ossie plan is not what validates a dbt one, and the
+  difference matters. There is no external parser to gate on: dex checks the
+  document's structure against the Ossie schema it pins (needs `[ossie]`), its
+  internal consistency in pure Python, and each SQL expression's syntax through
+  the dialect engine (needs `[sql]`, which every connector extra carries).
+  Without `[sql]` the third layer degrades to a named skipped-validation note,
+  never to a silent pass. All three run over the complete prospective layer, your
+  edits overlaid on the other configured documents, before a plan is stored.
+
+  It then checks the references against the exploration cache, opening no
+  connection. A source relation the cached inventory positively lacks, or a
+  column absent from a relation the cache profiled, refuses and stores no plan.
+  Anything the cache cannot speak to is a named note instead: an unprofiled
+  relation, a computed or non-SQL expression, a quoted identifier, a query-backed
+  source. Read those notes rather than treating them as failures; they say what
+  was not checked.
+
+  Accepted bytes are written exactly as authored on apply. dex does not parse and
+  re-serialize the document, so comments, key order, quoting and whitespace all
+  survive, and a configured document the payload did not mention is untouched. A
+  target file that changed after planning refuses the whole apply rather than
+  writing part of it, unless you confirm the overwrite deliberately.
+
+  `references/ossie-walkthrough.md` in the engine repository runs the whole
+  sequence on a local warehouse if you want to see it end to end.
 - dbt cannot parse semantic models in a project without a MetricFlow **time
   spine**; the engine warns when one is missing and defers the parse gate until
   one exists. Author it like any other model (a day-grain date model plus YAML
@@ -393,16 +563,20 @@ database, which is fine for model-only builds.
 
 ## Guardrails (enforced in the engine, not here)
 
-- Writes confined to the repo, and within it to the dbt project's authored path
-  families (models, macros, snapshots, seeds, tests, analyses) plus the
-  project-root manifests dbt keeps there. dex never writes to source warehouse
-  data.
+- Writes confined to the repo, and within it to two disjoint surfaces: the dbt
+  project's authored path families (models, macros, snapshots, seeds, tests,
+  analyses) plus the project-root manifests dbt keeps there, and the exact
+  native semantic documents named in `semantic.ossie.files`. Neither surface can
+  reach the other, an absolute path or a `..` escape is refused on both, and dex
+  never writes to source warehouse data.
 - Dev-target only. Prod-target execution is never initiated by dex.
 - Cost surfaced before any spend. A build that would spend requires explicit
-  confirmation and a session budget.
-- Propose, don't impose. Human edits to dbt (SQL and semantic YAML) are
-  authoritative; on conflict the engine surfaces a diff and asks rather than
-  overwriting.
+  confirmation and a session budget. The cost guard in full, in the engine
+  repository: `references/cost-controls.md`; the PII policy that governs what
+  a seed may carry and what gets stamped into `meta`: `references/pii-policy.md`.
+- Propose, don't impose. Human edits to the project (SQL and semantic YAML) and
+  to a native semantic document are authoritative; on conflict the engine
+  surfaces a diff and asks rather than overwriting.
 - PII flags propagate from the cache into emitted dbt (model and column `meta`),
   never example values. Stamping is presence-based at any confidence; only a
   column cleared by a human `pii_overrides` entry in `.dex/config.yml` is

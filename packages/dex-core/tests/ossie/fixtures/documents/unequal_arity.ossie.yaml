@@ -1,0 +1,35 @@
+# dex's own rule, not upstream's: the schema constrains both arrays but not
+# their lengths against each other, and a relationship whose two sides differ in
+# arity has no complete tuple to probe.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: order_items
+        source: demo.main.order_items
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+          - name: line_no
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: line_no
+      - name: orders
+        source: demo.main.orders
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+    relationships:
+      - name: items_to_orders
+        from: order_items
+        to: orders
+        from_columns: [order_id, line_no]
+        to_columns: [order_id]

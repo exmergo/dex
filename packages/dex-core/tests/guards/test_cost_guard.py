@@ -6,10 +6,12 @@ import pytest
 
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import (
+    LEDGER_ENTRY_KINDS,
     CeilingRequiredError,
     ConfirmationRequiredError,
     CostGate,
     OverCeilingError,
+    ledger_row,
     preflight,
 )
 
@@ -206,9 +208,9 @@ def test_gate_phase_zero_estimate_and_no_ceiling_never_raise():
 
 def test_gate_max_bytes_tracks_actual_billing():
     gate = _gate(ceiling=1_000.0)
-    assert gate.remaining_for_statement() == 1_000
+    assert gate.statement_cap(unit="byte") == 1_000
     gate.record_billed(400.0, statement="SELECT 1")
-    assert gate.remaining_for_statement() == 600
+    assert gate.statement_cap(unit="byte") == 600
 
 
 def test_gate_ledger_entries_carry_hashes_never_sql():
@@ -229,7 +231,16 @@ def test_gate_spend_summary_reports_actuals_not_estimates():
     gate.charge(700.0)
     gate.record_billed(100.0)
     summary = gate.spend_summary()
-    assert summary == {"bytes_billed": 100.0, "session_spent_today": 150.0}
+    assert summary == {
+        "bytes_billed": 100.0,
+        "session_spent_today": 150.0,
+        # A gate settles from figures the warehouse handed back, so what it
+        # reports is always settled; the flag is present anyway, because a key
+        # on some spend blocks and absent on others reads as a default.
+        "settled": True,
+        "unknown_settlement": False,
+        "reserved": None,
+    }
 
 
 def test_gate_cost_prefers_the_command_estimate():
@@ -415,6 +426,76 @@ def test_settling_releases_what_was_held_but_not_spent():
     assert ledger.total() == 400.0
 
 
+def test_an_unreleased_hold_puts_the_days_total_above_settled_spend():
+    """The limit of "sum the settlements to get the day", stated as a test.
+
+    Summing `entry == "settlement"` gives settled spend, and that is what a
+    reader of the ledger wants. It is not always `session_spent_today`, which
+    also counts headroom held by commands that have not finished paying, and
+    deliberately so: that is the figure a concurrent command has to be measured
+    against, and a process killed outright leaves its hold standing until the UTC
+    rollover rather than expiring it. The two meet when nothing is in flight,
+    which is the case the CLI-level parity suite pins. This is the other one, and
+    it is why the docs state a relation rather than an equality.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    gate.record_billed(400.0)
+    # No `settle()`: this is the killed process. Its hold of 600 stands beside
+    # the 400 it settled, because what cancels the hold is the release it never
+    # got to write.
+    settled = sum(
+        e["billed_bytes"] for e in ledger.entries if e["entry"] == "settlement"
+    )
+    assert settled == 400.0
+    assert ledger.total() == 1_000.0
+
+
+def test_every_row_a_gate_writes_has_one_shape():
+    """One key set across all three kinds, nulls included.
+
+    A reader that keys settlements by `reservation_id` gets a row that either
+    carries one or says it has none; it never gets a row where the key is simply
+    missing and the absence has to be interpreted. `transform build` wrote that
+    third shape for a year, which is what made it invisible to a settlement join.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    gate.record_billed(400.0, job_id="job-1", statement="SELECT 1")
+    gate.settle()
+    shapes = {e["entry"]: frozenset(e) for e in ledger.entries}
+    assert len(set(shapes.values())) == 1, (
+        f"a gate's rows disagree about their keys: "
+        f"{ {kind: sorted(keys) for kind, keys in shapes.items()} }"
+    )
+    release = next(e for e in ledger.entries if e["entry"] == "release")
+    assert release["billed_bytes"] == -600.0, (
+        "a release is a reservation with the sign flipped, and a reader that "
+        "clamps it would leak the hold for the rest of the UTC day"
+    )
+    assert release["estimate"] is None and release["job_id"] is None
+
+
+def test_the_ledger_vocabulary_is_closed():
+    """A kind outside the vocabulary is a writer being added, which is the moment
+    it needs defending. Every call site passes a literal, so this cannot fire on a
+    spend path."""
+
+    assert LEDGER_ENTRY_KINDS == ("reservation", "settlement", "release")
+    with pytest.raises(ValueError, match="closed to"):
+        ledger_row(
+            connector="bigquery",
+            command="transform build",
+            entry="build",
+            field="billed_bytes",
+            amount=1.0,
+        )
+
+
 def test_the_freed_headroom_admits_the_next_command():
     ledger = _Ledger()
     first = _ledger_gate(ledger)
@@ -482,9 +563,9 @@ def test_the_server_side_cap_never_exceeds_what_was_booked():
     ledger = _Ledger()
     gate = _ledger_gate(ledger)
     gate.preflight_command(300.0)
-    assert gate.remaining_for_statement() == 300
+    assert gate.statement_cap(unit="byte") == 300
     gate.record_billed(100.0)
-    assert gate.remaining_for_statement() == 200
+    assert gate.statement_cap(unit="byte") == 200
 
 
 def test_settling_is_idempotent():
@@ -531,6 +612,9 @@ def test_settlement_reports_the_days_total_not_this_commands_share():
     assert gate.spend_summary() == {
         "bytes_billed": 200.0,
         "session_spent_today": 500.0,
+        "settled": True,
+        "unknown_settlement": False,
+        "reserved": None,
     }
 
 
@@ -588,10 +672,10 @@ def test_the_ledger_and_envelope_spellings_stay_distinct():
 def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
     """A cheap command under a cumulative ceiling must still be runnable.
 
-    `remaining_for_statement` is an integer because every connector's cap
-    setting takes one, and on the time-paradigm connectors a cap of 0 means *no
-    limit* rather than "spend nothing", so the adapters refuse rather than send
-    a 0. Truncating a fractional remainder therefore turned into a refusal of
+    A statement cap is an integer because every connector's cap setting takes
+    one, and on the time-paradigm connectors a cap of 0 means *no limit* rather
+    than "spend nothing", so the gate refuses rather than hand one over.
+    Truncating a fractional remainder therefore turned into a refusal of
     affordable work: setting `session_ceiling` creates a reservation, a cheap
     command books less than a second, and `int(0.5)` is 0, so every small query
     was refused with "the remaining budget is under one database-second" against
@@ -599,8 +683,8 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
 
     The discriminator is which term produced the sub-unit value, so all three
     cases are asserted together: a booking under one unit still yields a usable
-    cap, a genuinely exhausted ceiling still reads as exhausted, and the booking
-    still tightens the cap when it is the smaller of the two. Dropping any one of
+    cap, a genuinely exhausted ceiling still refuses, and the booking still
+    tightens the cap when it is the smaller of the two. Dropping any one of
     them would trade a false refusal for a missing one, or the reverse.
     """
 
@@ -618,7 +702,7 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
     )
     gate.preflight_command(0.5)
     gate.charge(0.5)
-    assert gate.remaining_for_statement() == 1
+    assert gate.statement_cap(unit="database-second") == 1
 
     spent = CostGate(
         paradigm=Paradigm.DB_LOAD,
@@ -630,10 +714,8 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
         session_spent=0.0,
     )
     spent.record_billed(59.5, job_id=None, statement="prior")
-    assert spent.remaining_for_statement() == 0, (
-        "a ceiling with under a unit left is genuinely exhausted and must still "
-        "refuse, which is the half the booking fix must not break"
-    )
+    with pytest.raises(OverCeilingError, match="under one database-second"):
+        spent.statement_cap(unit="database-second")
 
     # And the booking still tightens: 5 booked against a 60-second ceiling caps
     # the statement at 5, not 60.
@@ -647,4 +729,201 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
         session_spent=0.0,
     )
     tight.preflight_command(5.0)
-    assert tight.remaining_for_statement() == 5
+    assert tight.statement_cap(unit="database-second") == 5
+
+
+def test_an_exhausted_budget_refuses_at_the_gate_rather_than_at_each_adapter():
+    """Issue #316: the two states a cap of 0 could mean are told apart here.
+
+    An exhausted budget and "no cap applies" used to be a 0 and a `None` handed
+    back for the caller to tell apart, and every adapter told them apart the
+    same way in its own billed path. That is a convention, not a contract: the
+    connector that forgets the check sends the server a 0, which Postgres,
+    ClickHouse and Databricks all read as *no limit*, so the backstop
+    disappears exactly when the budget is nearly gone and the run looks
+    entirely ordinary while it happens.
+
+    So the shortfall is the call's own refusal. `statement_cap` returns a cap
+    the server will honour or raises, with nothing in between for a caller to
+    misread, and the refusal carries the cost the envelope reports.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    def gate(paradigm: Paradigm, ceiling: float) -> CostGate:
+        return CostGate(
+            paradigm=paradigm,
+            connector="postgres",
+            command="explore query",
+            ceiling=ceiling,
+            confirmed=True,
+            session_ceiling=None,
+            session_spent=0.0,
+        )
+
+    exhausted = gate(Paradigm.DB_LOAD, 60.0)
+    exhausted.record_billed(59.7, job_id=None, statement="prior")
+    with pytest.raises(OverCeilingError) as refusal:
+        exhausted.statement_cap(unit="database-second")
+    # The refusal is priced: an empty cost block on a spend refusal reads as a
+    # claim that nothing was going to be spent.
+    assert refusal.value.cost is not None
+    assert refusal.value.cost.paradigm is Paradigm.DB_LOAD
+    assert refusal.value.cost.ceiling == 60.0
+
+    # A floor above one unit is the same event: BigQuery bills a 10 MB minimum
+    # per query, so a cap under that is refused by the server rather than
+    # honoured by it, and the shortfall names the number to raise --budget past.
+    bytes_gate = gate(Paradigm.BYTES_SCANNED, 12 * 1024 * 1024)
+    bytes_gate.record_billed(4 * 1024 * 1024, job_id=None, statement="prior")
+    with pytest.raises(OverCeilingError, match="10,485,760-byte minimum"):
+        bytes_gate.statement_cap(unit="byte", minimum=10 * 1024 * 1024)
+    # ...and it is a floor, not a rounding: 12 MB of the 12 MB budget is above
+    # it and still prices normally.
+    assert (
+        gate(Paradigm.BYTES_SCANNED, 12 * 1024 * 1024).statement_cap(
+            unit="byte", minimum=10 * 1024 * 1024
+        )
+        == 12 * 1024 * 1024
+    )
+
+    # `None` is the only other answer, and it means no ceiling bounds the
+    # statement at all rather than "spend nothing": distinct from every integer,
+    # so no adapter has to recognise a magnitude to tell them apart.
+    unbounded = CostGate(
+        paradigm=Paradigm.FREE_LOCAL,
+        connector="duckdb",
+        command="explore query",
+        ceiling=None,
+        confirmed=True,
+        session_ceiling=None,
+        session_spent=0.0,
+    )
+    assert unbounded.statement_cap(unit="database-second") is None
+
+
+# --- the ledger is a dependency of billing, not of every command -----------------
+
+
+class _Outage:
+    """A ledger reader that fails, and counts how often it was asked.
+
+    The count is the assertion that matters for issue #374: the defect was not
+    that the reader raised, it was that it was called at all on a command with no
+    stake in the answer.
+    """
+
+    def __init__(self, *, fail: bool = True, total: float = 0.0) -> None:
+        self.calls = 0
+        self.fail = fail
+        self.total = total
+
+    def __call__(self) -> float:
+        self.calls += 1
+        if self.fail:
+            raise ConnectionError("the ledger backend is unreachable")
+        return self.total
+
+
+def test_building_a_gate_reads_no_ledger():
+    """Issue #374: a gate is built for every command on a billed connector,
+    including the ones that cannot spend, so construction that reads the ledger
+    puts a free cache-served answer behind the ledger's availability. The
+    constructor holds a reader; only admission calls it."""
+
+    reader = _Outage()
+    gate = _gate(session_spent=reader, session_ceiling=1_000.0)
+    assert reader.calls == 0
+    assert gate.session_spent is None
+
+
+def test_a_fixed_session_spend_is_seeded_at_construction():
+    """A caller who passed a number passed the answer, not a way to get it, so
+    there is nothing to defer and nothing that can fail."""
+
+    gate = _gate(session_spent=250.0, session_ceiling=1_000.0)
+    assert gate.session_spent == 250.0
+    assert gate.effective_ceiling() == 750.0
+
+
+def test_an_unread_session_spend_leaves_the_ceiling_to_the_command_budget():
+    """The session bound needs a reading to exist. Its absence is not a loosened
+    ceiling: admission always reads before it decides, so what reaches here
+    unread is a command reporting a cost it never priced."""
+
+    gate = _gate(
+        session_spent=_Outage(fail=False, total=900.0), session_ceiling=1_000.0
+    )
+    assert gate.effective_ceiling() == 1_000.0  # the per-command budget alone
+    assert gate.cost().ceiling == 1_000.0
+
+
+def test_admitting_billed_work_against_an_unreadable_ledger_refuses():
+    """Fail closed, and say which guard refused rather than reading as a crash.
+
+    Before this the reader was called bare, so a backend's own exception
+    travelled out of gate construction as an unclassified internal error.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import LedgerUnreadableError
+
+    ledger = _Ledger()
+    reader = _Outage()
+    gate = _ledger_gate(ledger, session_spent=reader)
+    with pytest.raises(LedgerUnreadableError) as exc_info:
+        gate.preflight_command(10.0)
+    assert "re-issuing the same command is safe" in str(exc_info.value)
+    assert exc_info.value.cost.paradigm is Paradigm.BYTES_SCANNED
+    # A refusal books nothing, the same as every other refusal in this suite.
+    assert ledger.entries == []
+
+
+def test_settling_survives_a_ledger_that_went_away_mid_command():
+    """Settlement re-reads only so the summary can report the day's total, and
+    the release needs no reading at all, so a backend that failed after the work
+    ran must not turn a completed command into a refusal."""
+
+    ledger = _Ledger()
+    reader = _Outage(fail=False)
+    gate = _ledger_gate(ledger, session_spent=reader)
+    gate.preflight_command(100.0)
+    gate.record_billed(80.0)
+    reader.fail = True
+    gate.settle()  # does not raise
+    summary = gate.spend_summary()
+    assert summary["bytes_billed"] == 80.0
+    # What this command billed is exact (the warehouse said so); only the day's
+    # total is unavailable, and it says so rather than reporting this one's share.
+    assert summary["session_spent_today"] is None
+    assert "release" in ledger.kinds()
+
+
+def test_reporting_the_day_never_fails_the_command_that_asks():
+    """``connect test`` exists to say what the budget looks like, so a ledger it
+    cannot reach is an "unavailable" on an otherwise healthy report."""
+
+    gate = _gate(session_spent=_Outage())
+    assert gate.session_spent_now() is None
+    healthy = _gate(session_spent=_Outage(fail=False, total=42.0))
+    assert healthy.session_spent_now() == 42.0
+
+
+def test_a_cumulative_cap_binds_on_a_statement_charged_without_a_handshake():
+    """The unread session bound must not read as an absent one.
+
+    A caller that charges a statement without going through the handshake has no
+    booking, so the cheap local path applies, and a ceiling computed there would
+    have the session bound simply missing. That would let a configured cumulative
+    cap silently not apply, which is the failure the whole guard exists to
+    prevent, so the reading is taken here instead.
+    """
+
+    ledger = _Ledger()
+    ledger.append({"entry": "settlement", "billed_bytes": 950.0})
+    gate = _ledger_gate(ledger, session_spent=ledger.total)
+    assert gate.session_spent is None  # a reader, so nothing read yet
+    # 100 against a 1_000 cumulative cap with 950 already spent: the per-command
+    # ceiling of 1_000 would admit it, the cumulative cap must not.
+    with pytest.raises(OverCeilingError):
+        gate.charge(100.0)

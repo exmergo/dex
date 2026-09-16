@@ -16,6 +16,7 @@ them, and CI runs them because a broken install is a broken release.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -312,10 +313,10 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     dbt adapters and MetricFlow in one environment, it is also the only place a
     version conflict between them can surface at all.
 
-    `dev` and the two `*-conformance` extras are excluded deliberately: contributor
-    tooling, not capabilities. They carry a test runner for people implementing a
-    storage backend or a project format, and nobody installing "everything dex can
-    do" wants pytest.
+    `dev` and the three `*-conformance` extras are excluded deliberately:
+    contributor tooling, not capabilities. They carry a test runner for people
+    implementing a storage backend, a project format, or a semantic backend, and
+    nobody installing "everything dex can do" wants pytest.
     """
 
     extras = _project_metadata()["optional-dependencies"]
@@ -323,7 +324,13 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     referenced = set(
         extras["all"][0].removeprefix("exmergo-dex-core[").removesuffix("]").split(",")
     )
-    tooling = {"all", "dev", "storage-conformance", "project-conformance"}
+    tooling = {
+        "all",
+        "dev",
+        "storage-conformance",
+        "project-conformance",
+        "semantic-conformance",
+    }
     assert referenced == set(extras) - tooling, (
         f"[all] does not cover {sorted(set(extras) - tooling - referenced)}"
     )
@@ -492,6 +499,57 @@ def test_the_wheel_ships_the_typed_marker(wheel: str):
         "py.typed is not in the wheel, so the storage seam is unverifiable "
         f"downstream: {sorted(n for n in names if n.count('/') <= 1)[:15]}"
     )
+
+
+def test_the_wheel_ships_the_host_conformance_vectors(wheel: str):
+    """The fixtures have to travel with the reader that validates them.
+
+    A host installs the package and gets `verify_plan_document`; without the
+    vectors beside it, it has the reader and nothing concrete to prove its own
+    integration against, which is the whole point of shipping them.
+    """
+
+    import zipfile
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    vectors = [n for n in names if n.startswith("exmergo_dex_core/host/vectors/")]
+    assert vectors, (
+        "no host conformance vectors in the wheel, so a consumer that installs "
+        "the package has the reader and none of the fixtures"
+    )
+    assert any(n.endswith("plan-valid.json") for n in vectors), sorted(vectors)[:10]
+
+
+def test_the_host_boundary_is_reachable_on_a_bare_install(wheel: str):
+    """The offline half of the lifecycle runs where there is no connector extra.
+
+    A disposable checkout with no warehouse client still has to verify and apply
+    a plan document, which is the one thing it exists to do.
+    """
+
+    code = """
+from exmergo_dex_core.host import (
+    conformance_vectors,
+    verify_plan_document,
+    PlanDigestMismatchError,
+)
+
+vectors = {v["name"]: v for v in conformance_vectors()}
+plan = verify_plan_document(vectors["plan-valid"]["payload"])
+assert plan.digest == vectors["plan-valid"]["expect"]["digest"]
+
+try:
+    verify_plan_document(vectors["plan-tampered-content"]["payload"])
+except PlanDigestMismatchError:
+    pass
+else:
+    raise AssertionError("a tampered document verified")
+print("ok")
+"""
+    done = _run_isolated(wheel, code)
+    assert done.returncode == 0, done.stderr
+    assert "ok" in done.stdout
 
 
 # A full-tier backend, and a durable one: two instances built from the same key
@@ -1102,6 +1160,53 @@ def test_the_project_contract_needs_only_a_test_runner(wheel: str, tmp_path: Pat
     assert "passed" in done.stdout
 
 
+def test_the_semantic_contract_needs_only_a_test_runner(wheel: str, tmp_path: Path):
+    """`[semantic-conformance]` is pytest and nothing else, held by installing it.
+
+    The same floor the project contract has, checked the same way and for the same
+    reason: this repo's dev environment carries sqlglot, MetricFlow and httpx, so
+    an assertion that started reaching one of them would quietly make the extra
+    heavier for every implementer while staying green here. The reference layer
+    being data in the module is what keeps the floor this low, and it is also what
+    lets an implementer run the suite before their backend can reach anything.
+    """
+
+    suite = tmp_path / "test_light_floor.py"
+    suite.write_text(
+        "import sys\n\n"
+        "from exmergo_dex_core.explore.semantic import conformance\n\n\n"
+        "def test_the_contract_imports_nothing_heavy():\n"
+        "    assert 'sqlglot' not in sys.modules\n"
+        "    assert 'metricflow' not in sys.modules\n"
+        "    assert 'httpx' not in sys.modules\n"
+        "    assert conformance.SemanticBackendContract\n"
+        "    assert conformance.reference_dbt_manifest()['metrics']\n",
+        encoding="utf-8",
+    )
+    spec = f"exmergo-dex-core[semantic-conformance] @ {wheel}"
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
+
+
 PROJECT_PLUGIN_PYPROJECT = """
 [project]
 name = "dex-acme-format"
@@ -1206,3 +1311,328 @@ def test_an_entry_point_registration_selects_a_format_dex_does_not_ship(
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "resolved acme 2 ['orders']" in done.stdout
+
+
+def test_the_wheel_ships_every_non_python_asset_the_engine_reads(wheel: str):
+    """A vendored asset absent from the wheel fails only on an installed copy.
+
+    Two of them now, and they fail differently. A missing macro breaks
+    `transform macro`; a missing Ossie schema breaks every read of a native
+    document, and it breaks it *after* the format resolved and the command
+    started, which reads as a bug in the document rather than in the install.
+
+    Asserted against the source tree rather than a hard-coded list, so an asset
+    added later is covered without anyone remembering to add it here.
+    """
+
+    import zipfile
+
+    source = Path(__file__).resolve().parents[1] / "src" / "exmergo_dex_core"
+    expected = {
+        f"exmergo_dex_core/{path.relative_to(source).as_posix()}"
+        for path in source.rglob("*")
+        if path.is_file()
+        and path.suffix in {".sql", ".json", ".md"}
+        and "__pycache__" not in path.parts
+    }
+    assert expected, "the probe found no assets, so it is asserting nothing"
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+
+    assert expected <= names, sorted(expected - names)
+
+
+def test_the_ossie_extra_carries_the_schema_validator_and_not_the_dialect_engine(
+    wheel: str,
+):
+    """The three validation layers sit on three install tiers deliberately.
+
+    Structure and integrity decide whether a document is readable at all and are
+    pure plus one validator. Expression syntax is the third layer and rides on
+    `[sql]`, which every connector extra already brings. Bundling them would make
+    the lightest Ossie install pull the dialect engine to check something the
+    other two layers never need.
+    """
+
+    done = _run_isolated(
+        wheel,
+        "import jsonschema, sys\n"
+        "from exmergo_dex_core.ossie.loader import schema_sha256, SCHEMA_SHA256\n"
+        "assert schema_sha256() == SCHEMA_SHA256, 'bundled schema hash moved'\n"
+        "print('sqlglot' in sys.modules)\n",
+        extras=["ossie"],
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
+
+
+def test_selecting_ossie_without_its_extra_refuses_by_name(wheel: str):
+    """Never a fallback to a weaker check: structure validation is what stands
+    between an authored file and dex treating it as a semantic layer, and there
+    is no second validator to fall back to.
+    """
+
+    done = _run_isolated(
+        wheel,
+        "from exmergo_dex_core.ossie import OssieSemanticLayer, OssieDependencyError\n"
+        "from exmergo_dex_core.semantic_source import SemanticSourceContext\n"
+        "p = OssieSemanticLayer.from_context(SemanticSourceContext(\n"
+        "    repo_root='.', connector='duckdb',\n"
+        "    options={'files': ['a.ossie.yaml']}))\n"
+        "try:\n"
+        "    p.semantic_catalog()\n"
+        "except OssieDependencyError as exc:\n"
+        "    assert 'exmergo-dex-core[ossie]' in str(exc), exc\n"
+        "    print('refused')\n"
+        "else:\n"
+        "    raise AssertionError('read a document with no validator installed')\n"
+        "# The declaration channel degrades instead, because explore runs on\n"
+        "# raw warehouses where a semantic layer is absent.\n"
+        "assert p.declared_definitions().notes\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "refused"
+
+
+# --- the Ossie install boundary, from an actual wheel --------------------------
+#
+# `[ossie]` exists so a repository whose semantic layer is native documents can
+# install a validator and nothing else. Every assertion below is about what that
+# install can and cannot do, run against a real wheel in a real isolated
+# environment, because the boundary is a packaging property and an in-process
+# import probe cannot see it.
+
+OSSIE_DOCUMENT = """version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+          - name: net_total
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_total - discount
+"""
+
+OSSIE_CONFIG = """connector: duckdb
+semantic:
+  vendor: ossie
+  ossie:
+    files:
+      - layer.ossie.yaml
+"""
+
+
+def _ossie_repo(tmp_path: Path) -> Path:
+    """A repository whose only project is a native semantic layer."""
+
+    root = tmp_path / "ossie_repo"
+    (root / ".dex").mkdir(parents=True)
+    (root / "layer.ossie.yaml").write_text(OSSIE_DOCUMENT, encoding="utf-8")
+    (root / ".dex" / "config.yml").write_text(OSSIE_CONFIG, encoding="utf-8")
+    return root
+
+
+def test_a_base_install_imports_no_reader_and_no_optional_dependency(wheel: str):
+    """The floor the extras are measured against.
+
+    A base install is pydantic and pyyaml. A module that eagerly imported the
+    schema validator, the dialect engine, dbt, or MetricFlow would break
+    `import exmergo_dex_core` on an install that has none of them, and the
+    failure would land at import rather than at the command that needed it.
+    """
+
+    done = _run_isolated(
+        wheel,
+        "import exmergo_dex_core, sys\n"
+        "watched = ('jsonschema', 'sqlglot', 'dbt', 'metricflow')\n"
+        "print(sorted({m.split('.')[0] for m in sys.modules "
+        "if m.startswith(watched)}))\n"
+        "assert 'exmergo_dex_core.ossie' not in sys.modules\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+def test_the_ossie_extra_catalogs_a_document_without_the_dialect_engine(
+    wheel: str, tmp_path: Path
+):
+    """Reading a layer is the thing `[ossie]` exists for, so the assertion is
+    that it reads one rather than that it imports.
+
+    An optional dependency can be loaded after import time, so an import probe
+    alone would pass an implementation that reached for sqlglot on the first
+    document it was handed.
+    """
+
+    root = _ossie_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import sys, json\n"
+        "from exmergo_dex_core.engine import DexEngine\n"
+        f"engine = DexEngine.from_repo({str(root)!r})\n"
+        "view = engine.semantic_catalog_source().semantic_catalog()\n"
+        "assert [m.name for m in view.semantic_models] == ['shop.orders'], view\n"
+        "assert view.physical_columns == "
+        "{'orders__order_id': ('demo.main.orders', 'order_id')}, "
+        "view.physical_columns\n"
+        "assert any('sqlglot' in note or 'sql' in note.lower() "
+        "for note in view.notes), view.notes\n"
+        "print(sorted({m.split('.')[0] for m in sys.modules "
+        "if m.startswith(('sqlglot', 'dbt', 'metricflow'))}))\n",
+        extras=["ossie"],
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+def test_the_ossie_extra_plans_and_applies_a_document(wheel: str, tmp_path: Path):
+    """The command that install exists to run has to run on that install.
+
+    Native authoring reaches `transform apply`, which is a dbt-shaped verb, and
+    routing it through the dbt authoring surface would make a minimal Ossie
+    install unable to apply the plan it just made. This is the assertion that
+    holds the two apart, and it goes through the CLI because the router is where
+    the coupling lives.
+    """
+
+    root = _ossie_repo(tmp_path)
+    edits = root / "edits.json"
+    edits.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "layer.ossie.yaml",
+                        "content": OSSIE_DOCUMENT + "\n# reviewed\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    done = _run_isolated(
+        wheel,
+        "import sys, io, json, contextlib\n"
+        "from exmergo_dex_core.cli import main\n"
+        "def run(argv):\n"
+        "    out = io.StringIO()\n"
+        "    with contextlib.redirect_stdout(out):\n"
+        "        code = main(argv)\n"
+        "    payload = json.loads(out.getvalue())\n"
+        "    assert payload['status'] == 'ok', payload\n"
+        "    return payload\n"
+        f"root = {str(root)!r}\n"
+        "run(['--repo-root', root, 'semantic', 'ossie', 'plan', 'revise',\n"
+        f"     '--edits-file', {str(edits)!r}])\n"
+        "run(['--repo-root', root, 'transform', 'apply'])\n"
+        "import pathlib\n"
+        "written = pathlib.Path(root, 'layer.ossie.yaml').read_text()\n"
+        "assert written.endswith('# reviewed\\n'), written[-40:]\n"
+        "print(sorted({m.split('.')[0] for m in sys.modules "
+        "if m.startswith(('sqlglot', 'dbt', 'metricflow'))}))\n",
+        extras=["ossie"],
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "[]", (
+        "applying a native semantic plan pulled a dbt-shaped dependency, so the "
+        "minimal Ossie install cannot apply the plan it can make"
+    )
+
+
+def test_the_ossie_and_sql_extras_together_check_expression_syntax(
+    wheel: str, tmp_path: Path
+):
+    """The third validation layer, which rides on `[sql]`.
+
+    With it, a malformed SQL expression is a diagnostic. Without it, the layer
+    does not run and says so. The difference between the two is what stops a
+    skipped check from reading as a passed one.
+    """
+
+    root = tmp_path / "bad_sql"
+    (root / ".dex").mkdir(parents=True)
+    (root / ".dex" / "config.yml").write_text(OSSIE_CONFIG, encoding="utf-8")
+    (root / "layer.ossie.yaml").write_text(
+        OSSIE_DOCUMENT.replace("order_total - discount", "SELECT FROM WHERE ,"),
+        encoding="utf-8",
+    )
+
+    probe = (
+        "from exmergo_dex_core.ossie.loader import load_documents\n"
+        f"loaded = load_documents({str(root)!r}, ['layer.ossie.yaml'], "
+        "connector='duckdb')\n"
+        "print(sorted({d.rule for d in loaded.diagnostics}))\n"
+    )
+
+    with_sql = _run_isolated(wheel, probe, extras=["ossie", "sql"])
+    without_sql = _run_isolated(wheel, probe, extras=["ossie"])
+
+    assert with_sql.returncode == 0, with_sql.stderr
+    assert "sql_syntax" in with_sql.stdout, with_sql.stdout
+    assert without_sql.returncode == 0, without_sql.stderr
+    assert "sql_unavailable" in without_sql.stdout, without_sql.stdout
+    assert "sql_syntax" not in without_sql.stdout, (
+        "a skipped check reported a verdict it did not reach"
+    )
+
+
+def test_a_dbt_read_pulls_in_neither_ossie_nor_its_validator(wheel: str):
+    """The other direction, which is the one that would make an existing dbt
+    deployment depend on a draft interchange schema."""
+
+    done = _run_isolated(
+        wheel,
+        "import sys\n"
+        "from exmergo_dex_core.adapters.project import DbtProject\n"
+        "DbtProject('.', None).definitions()\n"
+        "assert 'exmergo_dex_core.ossie' not in sys.modules\n"
+        "print(sorted({m.split('.')[0] for m in sys.modules "
+        "if m.startswith('jsonschema')}))\n",
+        extras=["sql"],
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+def test_the_semantic_source_contract_needs_only_a_test_runner(wheel: str):
+    """Same floor as the other three shipped contracts, and the floor is the
+    point: an implementer runs the suite against their own source without
+    installing a warehouse client, a dialect engine, or either semantic extra.
+
+    The cheapest way for this to acquire a heavier floor is for one assertion to
+    start building something that parses SQL, which is why it is asserted rather
+    than reviewed.
+    """
+
+    done = _run_isolated(
+        wheel,
+        "import sys\n"
+        "from exmergo_dex_core import semantic_source_conformance as c\n"
+        "assert c.SemanticCatalogSourceContract\n"
+        "assert c.SemanticDeclarationContract\n"
+        "assert c.SemanticFingerprintContract\n"
+        "assert c.SemanticSourceFactoryContract\n"
+        "print(sorted({m.split('.')[0] for m in sys.modules "
+        "if m.startswith(('sqlglot', 'metricflow', 'httpx', 'jsonschema'))}))\n",
+        extras=["semantic-conformance"],
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "[]"

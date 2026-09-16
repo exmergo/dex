@@ -1,6 +1,6 @@
 ---
 name: explore
-description: 'Use this whenever you need to know what is actually in a database, warehouse, or DuckDB file before you trust it: ranked inventory of what exists, column profiles, PII detection, grain and data-quality problems, verified join inference, Mermaid ER diagrams, guarded ad-hoc SQL probes, and k-means segmentation, producing a draft map without dumping the whole schema into context. Trigger it on an unmet precondition, not on any particular phrasing: if you are about to write or fix SQL against tables whose columns, types, grain, or join keys you have not verified in this session, use this FIRST. That includes dbt work: building a staging or mart model, fixing a broken model, or debugging wrong numbers, whenever the ticket names source tables without spelling out their schema. It also applies mid-task: if you are partway through and hit a table you have not inspected, stop and use this rather than guessing column names or firing off one-off SELECTs. Also use it for direct questions like "what''s in my duckdb", "which tables matter", "how do these tables relate", "is this data any good", "any PII in here", "how many orders have no customer", or "cluster my customers". Explore is read-only and writes nothing but the .dex/ cache. It does not author the model: pair it with transform, which writes the change once you know what you are writing against. To reconcile a project that has fallen out of sync, use maintain.'
+description: 'Use this whenever you need to know what is actually in a database, warehouse, or DuckDB file before you trust it: ranked inventory of what exists, column profiles, PII detection, grain and data-quality problems, verified join inference, Mermaid ER diagrams, guarded ad-hoc SQL probes, k-means segmentation, and reading the semantic layer a repo declares (dbt semantic models, a hosted dbt Cloud layer, or native Apache Ossie documents), producing a draft map without dumping the whole schema into context. Trigger it on an unmet precondition, not on any particular phrasing: if you are about to write or fix SQL against tables whose columns, types, grain, or join keys you have not verified in this session, use this FIRST. That includes dbt work: building a staging or mart model, fixing a broken model, or debugging wrong numbers, whenever the ticket names source tables without spelling out their schema. It also applies mid-task: if you are partway through and hit a table you have not inspected, stop and use this rather than guessing column names or firing off one-off SELECTs. Also use it for direct questions like "what''s in my duckdb", "which tables matter", "how do these tables relate", "is this data any good", "any PII in here", "how many orders have no customer", "cluster my customers", or "what metrics does this semantic layer define". Explore is read-only and writes nothing but the .dex/ cache. It does not author the model: pair it with transform, which writes the change once you know what you are writing against. To reconcile a project that has fallen out of sync, use maintain.'
 ---
 
 # Explore
@@ -16,7 +16,7 @@ Run the engine through the wrapper. It prints one sanitized JSON envelope and
 nothing else; read the envelope and decide the next step.
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
 dex runs its engine through `uv`, which is a prerequisite and is not installed by
@@ -25,6 +25,16 @@ to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
 `brew install uv`, or `pipx install uv`), then re-run. Never fall back to raw
 Python, `pip`, or a database CLI to do the work another way: the guardrails live in
 the engine, so any other path is unguarded.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 If the user has no warehouse to point at and wants to see what dex does, `demo`
 generates one: a seeded local DuckDB warehouse plus the `.dex/config.yml` for it,
@@ -41,8 +51,17 @@ Subcommands, in the usual order:
    never rows).
 3. `explore profile <objects>` (space- or comma-separated) returns column
    profiles, PII flags recorded as (column, category, confidence) and never
-   example values, plus candidate keys, the likely grain, and data-quality
-   warnings (e.g. a non-unique id that will fan out on joins). A generic
+   example values, plus ranked candidate keys, the likely grain, `key_evidence`,
+   and data-quality warnings (e.g. an id unique on all but 110 rows, which will
+   fan out on joins). `candidate_keys` is ordered, tightest proven key first,
+   and `key_evidence` gives one entry per combination considered with its
+   `status` (`reported` or `suppressed`) and the reason. Read it before you
+   trust a composite: a combination unique only because one member is unique on
+   almost every row, or because a money column completes it, is suppressed
+   rather than reported. Where a near-unique column is the real story the
+   warning says so with the ratio, the counts, and how many rows would have to
+   be removed for it to be unique. That last number is the one to act on: it
+   names a source defect to fix rather than a key to work around. A generic
    `*_name` flag's confidence is refined by value-shape evidence from the same
    scan, in both directions: person-shaped values corroborate it, a closed
    reference vocabulary or long labels de-rate it below the firewall's blocking
@@ -51,7 +70,9 @@ Subcommands, in the usual order:
    are approximate for scale, but any column that looks unique within
    approximation noise is escalated to an exact COUNT(DISTINCT)
    (`distinct_count_exact: true`), so uniqueness and grain verdicts rest on
-   proof; a `~` prefix in a warning marks a count that is still approximate.
+   proof; a `~` prefix marks a number that is still approximate, on a count and
+   on a percentage alike, so a figure quoted without one is exact arithmetic
+   over an exact distinct count on a column with no nulls.
    A requested object whose cached profile is still fresh (same connector,
    schema unchanged, within `profile_freshness_hours`, default 24) is served
    from the cache (`cache_hit_count`) instead of re-scanned, so profiling a
@@ -60,13 +81,22 @@ Subcommands, in the usual order:
 4. `explore relationships` returns inferred and declared joins with confidences,
    plus notes explaining what the inference examined (so an empty list is
    meaningful). Add `--verify` to measure each inferred join with an aggregate
-   overlap probe (orphan fraction, confidence adjusted).
+   overlap probe (orphan fraction, confidence adjusted). A declared join has two
+   sources: a `relationships` test, and (with `--use-project`) an entity two
+   semantic models share, which the layer states outright with the key named per
+   model. `declared_by` on an edge names that entity, `semantic_join_count` says
+   how many came that way, and the notes call out the ones name-based inference
+   did not find, which is the interesting set: a semantic layer routinely joins
+   columns that share no name at all.
 5. `explore map` writes or updates the `.dex/` cache and returns the map
    (`--verify` works here too). Alongside the counts, `data.objects` gives each
-   top-ranked object its row count, detected grain, candidate key, notable
-   columns (each carrying the role that earned it a place: `grain`, `key`,
+   top-ranked object its row count, detected grain, best-ranked candidate key,
+   notable columns (each carrying the role that earned it a place: `grain`, `key`,
    `join`, or a PII flag) and data-quality findings, and `data.edges` gives the
-   join edges in the same shape `explore relationships` returns. **Read that
+   join edges in the same shape `explore relationships` returns. With
+   `--use-project` each object also carries `semantic_models`, the semantic models
+   that sit on that relation, which is what separates a load-bearing table from a
+   merely large one: empty means nothing in the layer reads it. **Read that
    payload instead of chaining `profile` and `relationships` to re-derive it**;
    go to those two when you need one object in full, or a value domain, which
    `map` never carries. It is budgeted: 25 objects by rank, 12 columns per
@@ -95,7 +125,9 @@ Subcommands, in the usual order:
    by hand. The glyphs are claims the engine derived from evidence, and a
    plausible-looking cardinality you supplied is exactly the overclaim this
    command exists to prevent: declared joins are solid, inferred dotted, and an
-   unverified inference never says "exactly one". Read `notes` before presenting
+   unverified inference never says "exactly one". A solid line labelled with a
+   semantic entity is a join the semantic layer declares; look the entity up with
+   `explore semantic list`. Read `notes` before presenting
    it, since it states any object or column that was left out; `--full` widens
    from the default (profiled, joined objects and their grain, key, join, and
    PII columns) to everything eligible.
@@ -141,27 +173,103 @@ Subcommands, in the usual order:
    sample clause reads a fraction), so surface the estimate and get a budget
    first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
    automatically for this subcommand.
-9. `explore semantic list` and `explore semantic query` reach the dbt semantic
-   layer (metrics, dimensions, entities). `list` is discovery: which metrics
-   exist, which dimensions each can be grouped by, and the label and description
-   the dbt project gave each metric, dimension, and entity. `query` takes a positional
-   metric after the explicit mode (with `--metric` kept for compatibility) and a
-   `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
-   `--limit`) and returns a metric's values as a capped, columnar result. Name
-   flags take a comma-separated list or a repeated flag (`--group-by a,b` is
-   `--group-by a --group-by b`); `--where` is never split. Two backends answer
-   these, chosen by `.dex/config.yml` `semantic.backend` and overridable with
-   `--local` / `--api`. `--local` renders the SQL with MetricFlow and executes it
-   through dex's own connector and cost handshake, so cost is surfaced before
-   spend (needs a dbt project and, for `query`, the `[semantic]` extra; `list` is
-   a manifest read-view that needs neither). `--api` sends the query to a hosted
-   dbt Cloud deployment (needs only a host, an environment id, and a
-   `DBT_SL_TOKEN`, plus the `[semantic-api]` extra, no local project). The hosted
-   backend is the one place the cost guard cannot apply: dbt Cloud executes
-   server-side, so the result carries an explicit warning that spend is governed
-   there, not by dex, and no `--confirm` is asked. Either way a PII-shaped grouped
-   or filtered dimension (e.g. `user__email`) is refused before the query runs.
-   This queries the layer; authoring it is `transform`'s job.
+9. `explore semantic list|values|query` reach the semantic layer: the metrics an
+   author defined, and the semantic models, measures, dimensions and entities
+   they are built out of. Distinct from the warehouse commands above, and from
+   the top-level `semantic` group, which *authors* the layer where this *queries*
+   it.
+
+   `list` is discovery and returns the layer's objects rather than three lists of
+   names: semantic models (the unit the layer is organized around, each with the
+   transformation model it sits on, its default time dimension, and the physical
+   `relation` underneath), metrics (which dimensions each can be grouped by, the
+   measures it reads, a ratio's two sides, any filter that makes it a subset, the
+   grains it can be queried at, and `time_axis`, the physical time column a time
+   grouping resolves to), dimensions (the token to group by, plus the bare
+   definition, owning model, queryable grains and `column` behind it), entities
+   (one declaration per semantic model, each with its own join key, so the
+   declared join graph is readable), and measures (the aggregation and expression
+   the number is actually made of, which is often a conditional rather than a
+   column). An element defined as an expression carries no column rather than a
+   guessed one. So "which table is behind this metric" is the metric's
+   `semantic_models` followed to their relations, and `explore profile <relation>`
+   is the next call; `--api` exposes no relation at all and declares that in
+   `unavailable`, so use `--local` when you need the physical side.
+
+   Three free ways to narrow it, and they compose. `--metric <m>` keeps those
+   metrics and what they reach. `--for-dimension <d>` asks the reverse question,
+   returning the metrics groupable by all the named tokens, which is what you want
+   when you know the slice rather than the metric and is also the cheapest way to
+   find the metrics that can go on one chart against one axis. `--search <t>`
+   takes a word rather than a name and matches it against every element's name and
+   against the project's own label and description. Each names its scope in the
+   payload (`scoped_to`, `for_dimensions`, `searched_for`), so a subset is never
+   mistaken for the layer; an unknown metric or dimension is refused by name,
+   while a search term that matched nothing comes back as a note. The catalog is
+   also capped, with every cut counted in `elided` and named in `notes` and
+   `--full` to lift the caps. `elided` is always present, so all zeros and no cap
+   notes is the positive statement that this is the whole layer. Prefer narrowing
+   over `--full`: it decides which part comes back rather than letting a cap
+   decide.
+
+   `values <dimension>` returns that dimension's value domain, which is what you
+   need before writing a `--where` filter and the one thing no other dex command
+   can reach on a hosted layer (`profile` cannot see a semantic dimension). A
+   PII-flagged dimension refuses this command outright rather than being screened,
+   because the whole output is values.
+
+   `query` takes a positional metric after the explicit mode (with `--metric` kept
+   for compatibility), a `--group-by <entity__dim>`, and optional `--where`,
+   `--order-by`, `--grain` and `--limit`, and returns the metric's values as a
+   capped columnar result. Name flags take a comma-separated list or a repeated
+   flag (`--group-by a,b` is `--group-by a --group-by b`); `--where` is never
+   split, because a filter clause carries its own commas. `--grain` is checked
+   against the grains the layer reports for the metrics queried, so a refusal
+   names the ones that metric has.
+
+   Two payload fields carry legitimate differences between the backends rather
+   than leaving them to be inferred: `dimension_scope` says whether a dimension
+   row is one declaration or one groupable path, which is why two backends can
+   report different dimension counts for one layer, and `unavailable` names fields
+   a backend structurally cannot supply. `--local` resolves the join graph through
+   MetricFlow where the `[semantic]` extra is installed, which is what makes its
+   dimension lists the tokens a query can actually use; without it the payload says
+   `declarations` and a note names the extra.
+
+   Three backends answer these commands, chosen by `.dex/config.yml`
+   `semantic.vendor` and `semantic.deployment` (the older `semantic.backend`
+   spelling still works),
+   overridable with `--local` / `--api`. Those two flags name **who executes**, not
+   which vendor, and every result reports it as `execution` (`dex` or `vendor`).
+   `--local` renders the SQL with MetricFlow and executes it through dex's own
+   connector and cost handshake, so cost is surfaced before spend (needs a dbt
+   project parsed at least once, and the `[semantic]` extra for `values` and
+   `query`; `list` reads the project and needs no extra). `--api` sends the query to
+   a hosted dbt Cloud deployment (needs a host, an environment id and a
+   `DBT_SL_TOKEN`, plus `[semantic-api]`, and no local project). The hosted backend
+   is the one place the cost guard cannot apply: dbt Cloud executes server-side, so
+   the result carries an explicit warning that spend is governed there and no
+   `--confirm` is asked. Either way a PII-shaped grouped or filtered dimension (for
+   example `user__email`) is refused before the query runs, and on `--api` the
+   layer's own PII metadata is fetched per metric so a multi-metric query stays
+   authoritative rather than falling back to names.
+
+   The third backend is `semantic.vendor: ossie`, native Apache Ossie documents
+   read out of the repository with no dbt project and no MetricFlow in the path
+   (needs the `[ossie]` extra). It is catalog-first: `list` answers, and `values`,
+   `query` and `--for-dimension` refuse by name, because Ossie specifies
+   interchange metadata and no portable query runtime. Those refusals are the
+   format's shape rather than a missing feature, and each one names the physical
+   route instead: a dimension carries its `semantic_model`, that model carries its
+   `relation`, and `explore profile` then `explore query` reach the values under
+   the firewall and the cost guard. `--api` is refused too; Ossie has no hosted
+   deployment.
+
+   Read `${CLAUDE_SKILL_DIR}/references/semantic-playbook.md` before running a
+   metric query: a metric's `time_axis`, `filter` and measures decide what the
+   number *is*, and the playbook covers the discovery order, the additivity and
+   time-axis traps this surface is full of, when `values` answers rather than a
+   query, and what changes when the layer is native Ossie.
 
 Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single
@@ -179,14 +287,15 @@ DuckDB `t, UNNEST(json_keys(doc)) AS u(k)`, ClickHouse
 join; ARRAY JOIN is the expansion). The unnested value must come from
 a column of a table in the query (bare, or through a JSON/array function);
 unnesting a subquery, another table, a literal, or a generator is refused,
-and the unnest's outputs inherit the source column's PII flags. A column whose flag was de-rated below the 0.5
-blocking threshold projects normally, with an envelope warning naming it; treat
-the warning as information for the user, not an error to fix. If the user says a
-refused column is not personal data, recommend a `pii_overrides` entry in
-`.dex/config.yml` (fully qualified column, optional reason): it unblocks
-querying immediately, survives re-profiles, and is reviewable in git. Never
-hand-edit `.dex/cache.json` to clear a flag. Never fall back to raw Python or a
-database CLI to run SQL; the firewall path is the only sanctioned one.
+and the unnest's outputs inherit the source column's PII flags. A column whose
+flag was de-rated below the blocking threshold projects normally, with an
+envelope warning naming it; treat the warning as information for the user, not
+an error to fix. If the user says a refused column is not personal data,
+recommend a `pii_overrides` entry in `.dex/config.yml` (fully qualified column,
+optional reason): it unblocks querying immediately, survives re-profiles, and is
+reviewable in git. Never hand-edit `.dex/cache.json` to clear a flag. Never fall
+back to raw Python or a database CLI to run SQL; the firewall path is the only
+sanctioned one.
 
 ## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift, ClickHouse)
 
@@ -207,25 +316,38 @@ entry or `SNOWFLAKE_*` env; for Databricks `databricks auth login` or
 paste a key, token, or password.
 
 On a metered connector, scanning commands (`profile`, `map`, `relationships`,
-`query`) run a two-step handshake. The first call returns
-`needs_confirmation` with an estimate in `cost.estimate` (and a per-table
-breakdown where relevant): an exact dry-run byte figure on BigQuery, a
-heuristic labeled `estimate_quality: "heuristic"` in warehouse-seconds on
-Snowflake (credits alongside), a floor labeled `estimate_quality: "low"` in
-warehouse-seconds on Databricks (DBUs alongside; it sharpens itself inside
-the confirmed budget), a heuristic in compute-seconds on Redshift (RPU-hours
-alongside; Serverless estimates carry the 60-second wake minimum once), and
-database-seconds on Postgres (no dollars; the guarded quantity is load on
-the operational database) and on ClickHouse (self-hosted, also no dollars;
-estimated free by the non-executing `EXPLAIN ESTIMATE`, which prices after
-primary-key pruning, and reporting `estimate_basis` so you can tell a pruned
-plan estimate from a whole-relation fallback). Surface the
-estimate to the user in human units, get an explicit budget from them, and
-re-issue the same command with `--confirm` and `--budget <magnitude>` in the
-paradigm's unit. Never invent a budget the user did not agree to, and never
-retry with a raised budget on an over-ceiling refusal without asking.
-Metadata is free (`connect test`, `inventory` run immediately), and OK
-envelopes report actual spend under `data.spend`.
+`query`) run a two-step handshake. The first call returns `needs_confirmation`
+with an estimate in `cost.estimate`, a per-table breakdown where relevant, and
+the unit it is counted in: bytes on BigQuery, warehouse-seconds on Snowflake
+(credits alongside) and Databricks (DBUs), compute-seconds on Redshift
+(RPU-hours), database-seconds on Postgres and ClickHouse (no dollars; the
+guarded quantity is load). Surface the estimate to the user in human units, get
+an explicit budget from them, and re-issue the same command with `--confirm` and
+`--budget <magnitude>` in that unit. Never invent a budget the user did not
+agree to, and never retry with a raised budget on an over-ceiling refusal
+without asking. Metadata is free (`connect test`, `inventory` run immediately),
+and OK envelopes report actual spend under `data.spend`.
+
+An over-ceiling refusal now carries a calibration line drawn from
+`.dex/spend.jsonl`: what this connector's last few settled commands actually
+billed as a fraction of what they were estimated at, or a sentence saying the
+project has too little history to say. On a partitioned or clustered warehouse a
+dry-run estimate is an upper bound, so this is often the difference between a
+budget that admits the work and one that does not. Relay it verbatim when you
+surface the refusal, and note the part callers get wrong: the ceiling is checked
+against the *estimate*, so a budget set at the observed fraction of the estimate
+is refused again. It is still the user's decision, never yours.
+
+When a `needs_confirmation` envelope carries `suggested_session_ceiling`, the
+project has never decided whether the *day's* total spend is bounded, and this is
+the one time it is asked. Surface it beside the per-command estimate and get the
+user's answer: `--session-ceiling <value>` sets a cumulative cap for the project
+(the suggestion is five times this command's estimate, a starting point, not a
+recommendation), and `--no-session-ceiling` records that the project runs
+unbounded. Either one is written to `.dex/config.yml` and reported as a diff, and
+nothing asks again. Add it to the same re-issue that carries `--confirm
+--budget`, or the confirmed run will stop once to ask. Never answer it on the
+user's behalf: it is a durable project setting, not a per-command flag.
 
 On BigQuery a profiling estimate holds a 10 MB floor per table for each
 escalation query a profile may still issue after its aggregate scan, so on a
@@ -257,3 +379,5 @@ thing to reach for on a warehouse whose full map would be expensive.
   cross the envelope only from profiled columns whose flag is absent or below
   the blocking threshold, bounded and capped. Only a human's `pii_overrides`
   entry clears a flag entirely; never suggest weakening the detection.
+- The two policies in full, in the engine repository:
+  `references/pii-policy.md` and `references/cost-controls.md`.

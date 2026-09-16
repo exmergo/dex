@@ -1,0 +1,73 @@
+{
+  "name": "build-unrelated",
+  "contract": "build-evidence",
+  "description": "Nodes ran, and not one of them was a node this change required.",
+  "payload": {
+    "run_results": [
+      {
+        "unique_id": "model.dex_test.other",
+        "status": "success"
+      }
+    ],
+    "select": "other"
+  },
+  "expect": {
+    "outcome": "unrelated",
+    "result": {
+      "outcome": "unrelated",
+      "invocation": {
+        "invocation_id": "conformance",
+        "generated_at": "2026-09-08T01:04:26.725194+00:00",
+        "dbt_version": "1.11.11",
+        "command": "build",
+        "target": "dev",
+        "select": "other",
+        "elapsed_seconds": null
+      },
+      "selection": {
+        "requested": "other",
+        "matched": [
+          "other"
+        ],
+        "empty": false,
+        "complete": true,
+        "unmatched": []
+      },
+      "digests": {
+        "manifest_sha256": "sha256:1ec72846b43af6a798f532fc15c66811c7ada95cb25b1e4a7c433a6df8797ce0",
+        "run_results_sha256": "sha256:ddbf58ba9c05b94e84d009319139a16faf9fe711a4b925d029a3ca8f5bca757d",
+        "source_digest": null,
+        "plan_digest": null
+      },
+      "generated": [
+        "dev.main.other"
+      ],
+      "errors": [],
+      "stale_artifacts": false,
+      "plan_drift": [],
+      "nodes": [
+        {
+          "unique_id": "model.dex_test.other",
+          "name": "other",
+          "resource_type": "model",
+          "status": "success",
+          "materialization": "table",
+          "relation": "dev.main.other"
+        }
+      ],
+      "coverage": {
+        "required": [
+          "mart"
+        ],
+        "covered": [],
+        "missing": [
+          "mart"
+        ],
+        "basis": [
+          "models/staging/mart.sql: builds 'mart'",
+          "models/staging/mart.yml: documents mart"
+        ]
+      }
+    }
+  }
+}

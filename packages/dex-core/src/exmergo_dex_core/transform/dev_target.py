@@ -176,13 +176,15 @@ def _assert_build_cap_reachable(
     ]
 
 
-def _raw_target_key(project: Path, target: str, key: str) -> dict:
-    """One raw key from the profile's target block.
+def target_output(project: Path, target: str) -> dict:
+    """The profile's whole output block for ``target``, unfiltered.
 
-    Needed because ``target_identifiers`` deliberately filters its output
-    through ``_TARGET_IDENTIFIER_KEYS``, so a nested block like
-    ``custom_settings`` never reaches the drift comparison and is invisible to
-    every other reader here.
+    ``target_identifiers`` deliberately filters through
+    ``_TARGET_IDENTIFIER_KEYS`` so the drift comparison sees only what names the
+    warehouse. A reader asking what actually *binds* a build (a cap, a timeout, a
+    thread count) needs the keys that filter drops, which is what this returns.
+    Never raises: an unreadable or absent profile is an empty block, and the
+    caller says so rather than guessing.
     """
 
     path = project / PROFILES_FILE
@@ -196,9 +198,16 @@ def _raw_target_key(project: Path, target: str, key: str) -> dict:
         if not isinstance(profile, dict):
             continue
         output = (profile.get("outputs") or {}).get(target)
-        if isinstance(output, dict) and isinstance(output.get(key), dict):
-            return output[key]
+        if isinstance(output, dict):
+            return output
     return {}
+
+
+def _raw_target_key(project: Path, target: str, key: str) -> dict:
+    """One raw nested key from the profile's target block."""
+
+    value = target_output(project, target).get(key)
+    return value if isinstance(value, dict) else {}
 
 
 def _assert_no_drift(

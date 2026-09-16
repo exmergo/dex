@@ -132,6 +132,15 @@ class TransformLayer(BaseModel):
     warehouse-level finding is traced to the models it lands on without
     re-reading the project at detection time.
 
+    ``model_paths`` maps each name in ``models`` to the file that builds it, so
+    :func:`~.drift.transform_drift` can look up that model's entry in ``files``
+    without guessing: a model and its schema YAML routinely share a filename
+    stem (``stg_orders.sql`` next to ``stg_orders.yml``), so recovering the path
+    from the name by stem alone would risk hashing the wrong file. A baseline
+    pinned before this field existed has an empty ``model_paths``, and a model
+    missing from it is a model ``transform_drift`` cannot content-diff, not one
+    it reports changed.
+
     ``notes`` is how a project format says what it could not supply, the way
     ``ProjectDefinitions.notes`` does on the declarations channel. A format whose
     layer is faithful but narrower than a dbt project's (no file hashes because it
@@ -144,6 +153,7 @@ class TransformLayer(BaseModel):
 
     files: dict[str, str] = Field(default_factory=dict)
     models: list[str] = Field(default_factory=list)
+    model_paths: dict[str, str] = Field(default_factory=dict)
     sources: list[SourceTable] = Field(default_factory=list)
     model_sources: dict[str, list[str]] = Field(default_factory=dict)
     model_refs: dict[str, list[str]] = Field(default_factory=dict)
@@ -162,16 +172,29 @@ class SemanticModelDef(BaseModel):
     dangling-ref finding. ``path`` is ``None`` on the same principle: it is
     provenance carried on the ``definition_changed`` finding, absent for a format
     whose definitions are objects rather than files, and never opened.
+
+    ``relation`` and ``keys`` are additive, #409 fields (empty/``None`` for
+    every baseline pinned before this field existed, and for dbt, which has no
+    populated analogue for either): a format whose semantic model *is* a
+    direct relation reference, rather than a name a transformation project
+    later builds, records that relation here so drift can match it straight
+    against the warehouse without a ``model_ref``. ``keys`` is every column
+    combination the format declares independently unique, one list per
+    declaration regardless of arity, so a single-column and a composite key
+    are recorded the same way instead of one being disguised as several
+    single ones.
     """
 
     name: str
     path: str | None = None
     content_sha256: str
     model_ref: str | None = None
+    relation: str | None = None
     entities: dict[str, str | None] = Field(default_factory=dict)
     dimensions: dict[str, str | None] = Field(default_factory=dict)
     categorical_dimensions: dict[str, str] = Field(default_factory=dict)
     measures: dict[str, str | None] = Field(default_factory=dict)
+    keys: list[list[str]] = Field(default_factory=list)
 
     def referenced_columns(self) -> set[str]:
         return {
@@ -179,19 +202,19 @@ class SemanticModelDef(BaseModel):
             for mapping in (self.entities, self.dimensions, self.measures)
             for column in mapping.values()
             if column is not None
-        }
+        } | {column for combo in self.keys for column in combo}
 
     def structural_columns(self) -> set[str]:
-        """Columns whose loss breaks the model as a whole (entities and
-        dimensions), as opposed to a measure column that breaks only the
-        measures on it."""
+        """Columns whose loss breaks the model as a whole (entities,
+        dimensions, and declared keys), as opposed to a measure column that
+        breaks only the measures on it."""
 
         return {
             column
             for mapping in (self.entities, self.dimensions)
             for column in mapping.values()
             if column is not None
-        }
+        } | {column for combo in self.keys for column in combo}
 
 
 class MetricDef(BaseModel):
@@ -210,17 +233,58 @@ class MetricDef(BaseModel):
     input_metrics: list[str] = Field(default_factory=list)
 
 
-class SemanticLayer(BaseModel):
+class RelationshipDef(BaseModel):
+    """One declared join between two semantic models, with its full ordered
+    column pairs (#409).
+
+    Composite and single-column joins are recorded the same way: dropping a
+    pair's second column here would be the exact partial-edge risk #408
+    refused at the read-catalog layer, one level down. It sits beside
+    :class:`SemanticModelDef` rather than on it because a join names two
+    models, not one.
+
+    ``name`` is never ``None``: a format whose declarations are themselves
+    unnamed (Ossie's relationships are optional to name) synthesizes a stable
+    one from the endpoints and columns, because this is the identity
+    ``semantic_free_drift`` diffs added/removed/changed by, and an identity
+    that is absent for some rows would silently exclude them from that diff.
+    """
+
+    name: str
+    path: str | None = None
+    content_sha256: str
+    model: str
+    to_model: str
+    column_pairs: list[tuple[str, str]] = Field(default_factory=list)
+
+
+class SemanticLayerSnapshot(BaseModel):
     """The semantic layer's fingerprint: every named definition the project holds.
 
     ``notes`` carries the same meaning as on :class:`TransformLayer`, and for the
     same reason: this is a return type a non-dbt project format fills in, and a
     layer that is narrower than a dbt one needs somewhere to say so that travels
     with the value rather than sitting beside it.
+
+    ``relationships_and_keys_captured`` is #409's answer to the hazard its own
+    fields create: ``relationships`` and every ``SemanticModelDef.keys`` entry
+    are additive fields a baseline pinned before they existed carries empty,
+    and empty there is indistinguishable from "this layer declares no
+    relationships or keys" -- which would read as a clean bill rather than as
+    "not checked". This flag is what ``semantic_free_drift`` reads instead of
+    trusting the emptiness: ``False`` (the default, so an old baseline and a
+    format that has never populated these -- dbt included, which has no
+    composite-relationship or multi-column-key concept at the semantic-model
+    level -- both land here) skips every relationship/key finding rather than
+    reporting false drift or a false clean bill; only a layer that set it
+    ``True`` on both sides of a comparison is one the two new checks run
+    against.
     """
 
     semantic_models: list[SemanticModelDef] = Field(default_factory=list)
     metrics: list[MetricDef] = Field(default_factory=list)
+    relationships: list[RelationshipDef] = Field(default_factory=list)
+    relationships_and_keys_captured: bool = False
     notes: list[str] = Field(default_factory=list)
 
 
@@ -240,7 +304,7 @@ class Snapshot(BaseModel):
     warehouse_from: str = "cache"
     cache_updated_at: str | None = None
     transform_layer: TransformLayer | None = None
-    semantic_layer: SemanticLayer | None = None
+    semantic_layer: SemanticLayerSnapshot | None = None
 
 
 def warehouse_from_cache(cache: DexCache) -> WarehouseBaseline:
@@ -288,16 +352,21 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
     or seed from being missed now that both are loaded.
 
     ``files`` stays the whole editable surface: it is a change fingerprint of
-    what a human can edit, not a node list, and nothing compares it across
-    snapshots to raise a finding.
+    what a human can edit, not a node list. ``model_paths`` is the narrower
+    index from a node's name back to the one entry in ``files`` that builds
+    it, which is what lets :func:`~.drift.transform_drift` diff a model's
+    content hash across snapshots without guessing at a path from the name
+    alone.
     """
 
     models: list[str] = []
+    model_paths: dict[str, str] = {}
     model_sources: dict[str, list[str]] = {}
     model_refs: dict[str, list[str]] = {}
     for path, source in node_files(view).items():
         model = node_name(path)
         models.append(model)
+        model_paths[model] = path
         source_calls = sorted(
             {
                 f"{name}.{table}"
@@ -334,13 +403,14 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
     return TransformLayer(
         files={path: source.sha256 for path, source in view.files.items()},
         models=models,
+        model_paths=model_paths,
         sources=sources,
         model_sources=model_sources,
         model_refs=model_refs,
     )
 
 
-def semantic_layer(view: DbtProjectView) -> SemanticLayer:
+def semantic_layer_snapshot(view: DbtProjectView) -> SemanticLayerSnapshot:
     """Fingerprint the semantic layer from the project's YAML files."""
 
     semantic_models: list[SemanticModelDef] = []
@@ -350,7 +420,12 @@ def semantic_layer(view: DbtProjectView) -> SemanticLayer:
             semantic_models.append(_semantic_model_def(entry, path))
         else:
             metrics.append(_metric_def(entry, path))
-    return SemanticLayer(semantic_models=semantic_models, metrics=metrics)
+    return SemanticLayerSnapshot(semantic_models=semantic_models, metrics=metrics)
+
+
+# RETRO: Compatibility names: the JSON field is intentionally still `semantic_layer`.
+SemanticLayer = SemanticLayerSnapshot
+semantic_layer = semantic_layer_snapshot
 
 
 # --- helpers -----------------------------------------------------------------

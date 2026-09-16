@@ -113,6 +113,20 @@ def corpus() -> dict[str, DexCache]:
             [proven_parent, child],
             [edge(kind=RelationshipKind.DECLARED, confidence=1.0)],
         ),
+        # A join the semantic layer declares. The label carries the entity name in
+        # single quotes, which is a character the renderer keeps (it strips only
+        # the double quote that would end the label), so it belongs in front of a
+        # real parser rather than in a unit test alone.
+        "edge_declared_by_semantic_entity": _cache(
+            [proven_parent, child],
+            [
+                edge(
+                    kind=RelationshipKind.DECLARED,
+                    confidence=1.0,
+                    declared_by="semantic entity 'customer'",
+                )
+            ],
+        ),
         "edge_verified_clean": _cache(
             [proven_parent, child],
             [edge(confidence=0.85, verified=True, orphan_fraction=0.0)],

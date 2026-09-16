@@ -1,0 +1,282 @@
+"""Native Apache Ossie documents behind the semantic-source seam.
+
+Ossie is a **semantic layer**, not a transformation project. Its documents own
+semantic metadata and declared relationships; they do not own dbt models,
+snapshots, or writeback, and this class implements none of the project tiers.
+What it implements is the two source capabilities in :mod:`..semantic_source`,
+:class:`~..semantic_source.SemanticCatalogSource` for the read catalog and
+:class:`~..semantic_source.SemanticSnapshotSource` for the drift fingerprint
+``maintain snapshot`` and ``maintain check`` compare against, plus
+:class:`~..edits.SemanticEditTarget` for authoring.
+
+Ossie is configured through ``semantic.vendor: ossie`` and
+``semantic.ossie.files``, whether or not the repository also has a dbt project.
+The engine builds this reader from those coordinates; dbt, when present, remains
+responsible for the transformation-project tiers, and where dbt is absent nobody
+serves them rather than this class pretending to.
+
+The authoring methods deliberately use semantic-document names rather than the
+``Project`` tier protocols: Ossie can receive semantic edits without becoming a
+transformation project or claiming dbt model writeback.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from ..errors import ConfigurationError, ProjectError, RepoRootRequiredError
+from . import catalog as catalog_mod
+from .loader import DOCUMENT_SUFFIXES, LoadResult, OssieDependencyError, load_documents
+
+if TYPE_CHECKING:
+    from ..maintain.snapshot import SemanticLayerSnapshot
+    from ..project_definitions import ProjectDefinitions
+    from ..semantic_catalog import SemanticCatalogView
+    from ..semantic_source import SemanticSourceContext
+
+__all__ = [
+    "VENDOR_NAME",
+    "OssieSemanticLayer",
+    "build_semantic_layer",
+]
+
+#: The semantic vendor this reader answers for, as `semantic.vendor` spells it.
+#: Not a project format name: `project.format: ossie` is refused, and nothing
+#: here is reachable through the project resolver.
+VENDOR_NAME = "ossie"
+
+
+class OssieSemanticLayer:
+    """The native Ossie semantic layer.
+
+    Holds its coordinates and reads nothing until asked, because construction is
+    cheap by contract: dex builds one project per command rather than holding
+    one, so a factory that parsed would pay for every command that never looks at
+    a semantic layer.
+
+    **One instance is meant to live for one command.** It memoizes the validated
+    document set, and a document on disk is an artifact a future `semantic ossie
+    apply` will rewrite, so an instance held across commands would serve the
+    documents as they were before the write.
+    """
+
+    def __init__(
+        self,
+        repo_root: Path | str,
+        files: Sequence[str],
+        connector: str | None = None,
+    ) -> None:
+        self.repo_root = Path(repo_root)
+        self.files = list(files)
+        self.connector = connector
+        self._loaded: LoadResult | None = None
+        self._semantic_edit_view: Any = None
+
+    @classmethod
+    def from_context(cls, context: SemanticSourceContext) -> OssieSemanticLayer:
+        """Build from configuration, refusing coordinates it cannot honor.
+
+        Every refusal here is about a committed config line, so each one names
+        the line to fix. Nothing is read: a file that is named but absent, or
+        named and malformed, is a *document* problem and is reported through
+        `declared_definitions()` and `semantic_catalog()`, which are the channels
+        whose callers can degrade. Refusing it here would make `explore map` on a
+        raw warehouse fail because of a typo in a semantic-layer path.
+        """
+
+        if context.repo_root is None:
+            raise RepoRootRequiredError(
+                "the Ossie semantic source needs a repo root: its documents are "
+                "git-reviewable files in the repository, so build the engine "
+                "with DexEngine.from_repo(repo_root) or pass repo_root="
+            )
+        options = dict(context.options or {})
+        files = _files(options.pop("files", None))
+        if unknown := sorted(options):
+            named = ", ".join(unknown)
+            raise ConfigurationError(
+                f"the Ossie semantic source takes one option, `files`, and got: "
+                f"{named}. An option dex accepted and ignored would be "
+                "indistinguishable from one it honored, right up until dex was "
+                "reading different documents than the configuration named"
+            )
+        return cls(Path(context.repo_root), files, context.connector)
+
+    # --- the declaration channel ----------------------------------------------
+
+    def declared_definitions(self) -> ProjectDefinitions:
+        """What the documents declare: dataset keys, joins, and relations.
+
+        **This must not raise**, and here that is a promise with real work
+        behind it rather than a formality. Exploration runs against raw
+        warehouses where a semantic layer is absent, and every failure this
+        source has (a missing file, a path escaping the repository, unparseable
+        YAML, a document that fails the schema, the `[ossie]` extra not
+        installed) is a state a user will reach. Each one yields the empty view
+        with a note naming the file and the fix.
+        """
+
+        from ..project_definitions import ProjectDefinitions
+
+        try:
+            loaded = self._load()
+        except OssieDependencyError as exc:
+            return ProjectDefinitions(notes=[str(exc)])
+        except (OSError, ValueError) as exc:
+            return ProjectDefinitions(
+                notes=[f"native Ossie documents could not be read: {exc}"]
+            )
+        if not loaded.documents:
+            return ProjectDefinitions(notes=loaded.notes())
+        return catalog_mod.definitions(
+            loaded.documents, connector=self.connector, notes=loaded.notes()
+        )
+
+    # --- the catalog channel ---------------------------------------------------
+
+    def semantic_catalog(self) -> SemanticCatalogView:
+        """The documents as a read catalog.
+
+        **Raises where the declaration channel degrades**, and the asymmetry is
+        the contract rather than an inconsistency. A caller here asked what the
+        semantic layer contains, so an unreadable document is the answer to their
+        question and an empty catalog would read as "this layer declares
+        nothing". A caller on the declaration channel asked about a warehouse and
+        happens to have a layer; there, the same condition is a footnote.
+        """
+
+        loaded = self._load()
+        if loaded.errors and not loaded.documents:
+            listed = "\n  ".join(d.render() for d in loaded.errors)
+            raise ProjectError(
+                "the configured native Ossie documents could not be read as a "
+                f"semantic layer:\n  {listed}"
+            )
+        return catalog_mod.semantic_catalog(
+            loaded.documents, connector=self.connector, notes=loaded.notes()
+        )
+
+    # --- the snapshot channel --------------------------------------------------
+
+    def semantic_layer(self) -> SemanticLayerSnapshot:
+        """The documents' own fingerprint: named definitions, declared keys, and
+        composite relationships, each with a content hash.
+
+        There is no transformation half beside this one, and its absence is a
+        fact about Ossie rather than a gap. Ossie declares no build step, so
+        there is nothing for a transform baseline to be a baseline *of*; a
+        repository with dbt beside Ossie gets its transform layer from dbt, and
+        one without gets none.
+
+        Degrades the same way :meth:`declared_definitions` does, for the same
+        reason: every failure this source has is a state a user reaches by an
+        ordinary typo or a missing extra, not a wiring mistake that should
+        propagate.
+        """
+
+        from ..maintain.snapshot import SemanticLayerSnapshot
+        from . import snapshot as snapshot_mod
+
+        try:
+            loaded = self._load()
+        except OssieDependencyError as exc:
+            return SemanticLayerSnapshot(notes=[str(exc)])
+        except (OSError, ValueError) as exc:
+            return SemanticLayerSnapshot(
+                notes=[f"native Ossie documents could not be read: {exc}"]
+            )
+        return snapshot_mod.semantic_layer(loaded, connector=self.connector)
+
+    # --- native semantic-document authoring ---------------------------------
+
+    def semantic_edit_view(self):
+        """Configured document bytes and hashes for format-neutral planning."""
+
+        from .authoring import load_edit_view
+
+        if self._semantic_edit_view is None:
+            self._semantic_edit_view = load_edit_view(self)
+        return self._semantic_edit_view
+
+    def semantic_editing_surface(self) -> list[str]:
+        """The exact configured documents; no directory-wide write authority."""
+
+        return list(self.files)
+
+    def write_semantic_edits(self, edits: Any, *, confirmed: bool = False) -> Any:
+        """Write exact authored bytes with atomic stale-edit protection."""
+
+        from .authoring import write_edits
+
+        return write_edits(self, edits, confirmed=confirmed)
+
+    def _load(self) -> LoadResult:
+        if self._loaded is None:
+            self._loaded = load_documents(
+                self.repo_root, self.files, connector=self.connector
+            )
+        return self._loaded
+
+
+def build_semantic_layer(context: SemanticSourceContext) -> OssieSemanticLayer:
+    """Build the native reader from the semantic configuration coordinates."""
+
+    return OssieSemanticLayer.from_context(context)
+
+
+def _files(value: Any) -> list[str]:
+    """The configured document list, validated as coordinates.
+
+    Shape, suffix, confinement and duplication are checked here as well as in the
+    loader, and the duplication is deliberate: this runs against a committed
+    config line and can name it, while the loader runs against whatever it is
+    handed and has to survive a caller that built its coordinates elsewhere.
+    """
+
+    if value is None:
+        raise ConfigurationError(
+            "the Ossie semantic source needs `files`: native documents named "
+            "relative to the repository root. Configure them under "
+            "`semantic.ossie.files` in .dex/config.yml"
+        )
+    if isinstance(value, str) or not isinstance(value, Sequence | Mapping):
+        raise ConfigurationError(
+            "`files` for the Ossie semantic source is a list of document paths, "
+            f"and got {type(value).__name__}. One document is a list of one"
+        )
+    if isinstance(value, Mapping):
+        raise ConfigurationError(
+            "`files` for the Ossie semantic source is a list of document paths, "
+            "and got a mapping"
+        )
+    files = [str(item) for item in value]
+    if not files:
+        raise ConfigurationError(
+            "`files` for the Ossie semantic source is empty. A source "
+            "configured to read no documents declares nothing, which is what "
+            "leaving `semantic.vendor` unset already does"
+        )
+    listed = ", ".join(DOCUMENT_SUFFIXES)
+    for name in files:
+        if not name.endswith(DOCUMENT_SUFFIXES):
+            raise ConfigurationError(
+                f"'{name}' is not a native Ossie document: they are named "
+                f"{listed}. The suffix is what tells dex a repository file is "
+                "one of the documents this source owns"
+            )
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            raise ConfigurationError(
+                f"'{name}' has to name a file inside the repository, written "
+                "relative to its root. dex reads native Ossie documents only "
+                "from the repository it was pointed at"
+            )
+    if duplicated := sorted({n for n in files if files.count(n) > 1}):
+        raise ConfigurationError(
+            f"the Ossie semantic source was given the same document twice: "
+            f"{', '.join(duplicated)}. Reading one document twice declares "
+            "everything in it twice, which is a duplicate-name refusal rather "
+            "than a larger layer"
+        )
+    return files

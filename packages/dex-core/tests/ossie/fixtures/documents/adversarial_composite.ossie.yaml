@@ -1,0 +1,38 @@
+# The case a per-column overlap measurement gets wrong.
+#
+# Child tuples (1, 10, 100) and (2, 20, 200); parent tuples (1, 20, 200) and
+# (2, 10, 100). Every component overlaps independently, so a probe that measures
+# one column at a time reports a healthy join three times over. No complete
+# tuple matches, so the join finds nothing.
+#
+# The two sides are named differently on purpose: copying one side's columns
+# onto the other would otherwise satisfy the assertion.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: adversarial
+    datasets:
+      - name: child
+        source: demo.main.child
+        fields:
+          - name: c_one
+            expression: {dialects: [{dialect: ANSI_SQL, expression: c_one}]}
+          - name: c_two
+            expression: {dialects: [{dialect: ANSI_SQL, expression: c_two}]}
+          - name: c_three
+            expression: {dialects: [{dialect: ANSI_SQL, expression: c_three}]}
+      - name: parent
+        source: demo.main.parent
+        primary_key: [p_one, p_two, p_three]
+        fields:
+          - name: p_one
+            expression: {dialects: [{dialect: ANSI_SQL, expression: p_one}]}
+          - name: p_two
+            expression: {dialects: [{dialect: ANSI_SQL, expression: p_two}]}
+          - name: p_three
+            expression: {dialects: [{dialect: ANSI_SQL, expression: p_three}]}
+    relationships:
+      - name: child_to_parent
+        from: child
+        to: parent
+        from_columns: [c_one, c_two, c_three]
+        to_columns: [p_one, p_two, p_three]

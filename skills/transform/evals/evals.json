@@ -13,7 +13,9 @@
       "Preview this semantic model in Viz.",
       "Fix the rpt_customer_metrics.sql model. It produces inf and NaN values in calculated columns and is missing the ltv_tier column.",
       "This model returns wrong numbers for Q4, the revenue is double counted. Fix it.",
-      "Add three new columns to models/marts/customer_metrics.sql: engagement score, churn risk score, and an LTV tier."
+      "Add three new columns to models/marts/customer_metrics.sql: engagement score, churn risk score, and an LTV tier.",
+      "Add a revenue metric to my Ossie semantic model.",
+      "Update semantics/commerce.ossie.yaml to add a lifetime_value field on customers."
     ],
     "negative": [
       "What's in this warehouse and which tables matter?",
@@ -21,7 +23,9 @@
       "What changed in the warehouse since I last looked?",
       "Reconcile my dbt project with the current source schema.",
       "Write the PR description for the branch I just pushed.",
-      "Bump dbt-core to 1.10 in requirements.txt."
+      "Bump dbt-core to 1.10 in requirements.txt.",
+      "Did my Ossie semantic layer drift from the warehouse?",
+      "What metrics does this repo's semantic layer define, and what tables are behind them?"
     ]
   },
   "evals": [
@@ -69,6 +73,19 @@
         "Emitted dbt semantic models are valid MetricFlow YAML",
         "PII flags propagate into emitted dbt (model and column meta); no example values",
         "Nothing is applied silently; the change is a reviewable diff"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "I added tests to my orders mart last week. Are they actually any good?",
+      "expected_output": "Mutation coverage run on that model, reporting which planted defects the tests failed to catch, each with the test that would catch it. Survivors are relayed as the finding; the score is context, not a grade.",
+      "files": [],
+      "assertions": [
+        "Reaches for `transform test --mutate <model>` rather than reading the tests and judging them by eye",
+        "Relays the surviving defects and their suggested tests, not just a count or a score",
+        "Reports the cap and any excluded baseline tests rather than presenting a partial run as complete",
+        "Any metered connector surfaces one batch estimate before running (cost before spend)",
+        "Never claims the project or the warehouse was modified: mutants are ephemeral and confined to a throwaway copy"
       ]
     }
   ]

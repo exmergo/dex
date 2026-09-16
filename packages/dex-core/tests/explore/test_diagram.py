@@ -218,6 +218,50 @@ def test_the_edge_label_states_the_kind_the_confidence_and_the_verification():
     )
 
 
+def test_a_composite_edge_label_pairs_every_column_rather_than_two_lists():
+    """A composite join's label used to join only `from_columns`, dropping the
+    parent side entirely: `product_id, variant_id` with no way to tell which
+    parent column each one pairs with. It now names every pair (#408)."""
+
+    products = _ds(
+        "shop.main.products",
+        [_col("id", is_unique=True), _col("variant_id")],
+        candidate_keys=[["id", "variant_id"]],
+        grain=["id", "variant_id"],
+    )
+    order_lines = _ds(
+        "shop.main.order_lines",
+        [_col("product_id"), _col("variant_id")],
+    )
+    rel = _rel(
+        "shop.main.order_lines",
+        ["product_id", "variant_id"],
+        "shop.main.products",
+        ["id", "variant_id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    rendered = render_er_mermaid(_cache([products, order_lines], [rel]))
+    assert _edge_line(rendered.mermaid).endswith(
+        ': "product_id = id, variant_id = variant_id, declared"'
+    )
+
+
+def test_a_single_pair_with_differing_names_is_also_paired():
+    rel = _rel(
+        "shop.main.orders",
+        ["cust_id"],
+        "shop.main.customers",
+        ["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    customers = _ds("shop.main.customers", [_col("id", is_unique=True)])
+    orders = _ds("shop.main.orders", [_col("cust_id")])
+    rendered = render_er_mermaid(_cache([customers, orders], [rel]))
+    assert _edge_line(rendered.mermaid).endswith(': "cust_id = id, declared"')
+
+
 # --- what never crosses into the diagram --------------------------------------
 
 
@@ -636,3 +680,102 @@ def test_diagram_without_a_cache_refuses_as_a_prerequisite_naming_the_fix(
     )
     assert payload["reason"] == "prerequisite"
     assert "explore map" in payload["errors"][0]
+
+
+# --- a join the semantic layer declares (#361) --------------------------------
+
+
+def test_a_semantic_edge_names_the_entity_it_came_from():
+    """A solid line has two possible sources and a reader cannot tell them apart
+    from the glyph, so the one that carries a lookupable name says it.
+
+    `explore semantic list` is where that name resolves, which is what makes the
+    label actionable rather than decorative.
+    """
+
+    cache = _star(
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declared_by="semantic entity 'customer'",
+    )
+
+    line = _edge_line(render_er_mermaid(cache).mermaid)
+
+    assert "declared: semantic entity 'customer'" in line
+    # Solid, like any declared edge: the layer states this join.
+    assert "--" in line and ".." not in line
+
+
+def test_a_semantic_edge_still_may_not_claim_exactly_one_without_proof():
+    """A primary entity is the layer's claim, and the diagram's rule is that the
+    *cache* must have proven the parent key unique before a crow's foot says
+    "exactly one". Semantic edges inherit that unchanged, which is the whole
+    reason they could be admitted at the declared tier without loosening
+    anything.
+    """
+
+    cache = _star(
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declared_by="semantic entity 'customer'",
+    )
+    parent = next(d for d in cache.datasets if d.identifier.endswith("customers"))
+    parent.candidate_keys = []
+    parent.columns[0].is_unique = None
+
+    line = _edge_line(render_er_mermaid(cache).mermaid)
+
+    assert line.startswith("customers }o--")
+
+
+def test_an_inferred_edge_carries_no_declaration():
+    line = _edge_line(render_er_mermaid(_star(confidence=0.62)).mermaid)
+
+    assert "semantic entity" not in line
+    assert "inferred 0.62" in line
+
+
+def test_the_legend_names_both_sources_of_a_solid_line():
+    mermaid = render_er_mermaid(_star(kind=RelationshipKind.DECLARED)).mermaid
+
+    legend = next(line for line in mermaid.splitlines() if "solid lines" in line)
+    assert "relationships test" in legend and "semantic-layer entity" in legend
+
+
+def test_a_near_unique_anchor_is_drawn_without_claiming_a_key():
+    """A table whose only "keys" were artifacts of a near-unique column has no
+    key to draw, but the column carrying that finding must still appear: a
+    diagram that omitted it would answer past the question. It is drawn with no
+    key mark, because it is not a key, which is the whole point."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, KeyEvidence
+    from exmergo_dex_core.explore.diagram import render_er_mermaid
+
+    items = Dataset(
+        identifier="shop.main.order_items",
+        row_count=14000,
+        columns=[
+            ColumnProfile(
+                name="order_item_id",
+                data_type="BIGINT",
+                distinct_count=13000,
+                distinct_count_exact=True,
+                is_unique=False,
+                null_fraction=0.0,
+            ),
+            ColumnProfile(name="filler", data_type="VARCHAR"),
+        ],
+        key_evidence=[
+            KeyEvidence(
+                columns=["order_item_id"],
+                status="suppressed",
+                reason="order_item_id is already unique for 92.9% of rows",
+            )
+        ],
+    )
+    mermaid = render_er_mermaid(DexCache(datasets=[items]), full=True).mermaid
+
+    assert "order_item_id" in mermaid
+    line = next(row for row in mermaid.splitlines() if "order_item_id" in row)
+    for mark in (" PK", " UK", " FK"):
+        assert mark not in line, line

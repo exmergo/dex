@@ -1,0 +1,16 @@
+# The smallest complete layer: one model, one dataset, one bare direct field.
+# Its .yml and .json twins carry byte-different serializations of the same
+# document, which is what makes the suffix-equivalence case mean something.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id

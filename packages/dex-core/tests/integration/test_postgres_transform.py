@@ -92,7 +92,7 @@ def test_init_and_build_write_only_the_dev_schema(
     # EXPLAIN planner preflight is surfaced before the run.
     assert envelope["cost"]["estimate"] is not None
     assert envelope["cost"]["estimate"] > 0
-    assert data["seconds_billed"] > 0
+    assert data["spend"]["seconds_billed"] > 0
     assert any("statement_timeout" in w for w in envelope["warnings"])
 
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text(encoding="utf-8")

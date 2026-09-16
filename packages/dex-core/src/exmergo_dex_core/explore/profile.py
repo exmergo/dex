@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
 from ..adapters.base import (
@@ -29,6 +29,7 @@ from ..adapters.base import is_string_type as _base_is_string_type
 from ..cache import (
     ColumnProfile,
     Dataset,
+    KeyEvidence,
     PIICategory,
     PIIFlag,
     ValueCount,
@@ -57,15 +58,122 @@ _EXACT_DISTINCT_CAP = 8
 # and the ranking puts a real grain in the first slots when one exists.
 _COMPOSITE_PAIR_CAP = 5
 
-# A later pair that shares a column with an already-kept pair is treated as
-# the same hypothesis tried with different filler ("does this dimension have
-# *a* partner?") when its product is within this multiple of the kept pair's
-# -- not a genuinely different candidate. Keeping the ratio bounded (rather
-# than 1:1) is what stops several near-identical junk pairs from each
-# consuming a cap slot; a pair whose product diverges meaningfully (a real
-# competing hypothesis, not filler) still gets its own slot even if it
-# reuses a column.
+# A later pair that shares a column with a better-ranked one is treated as the
+# same hypothesis tried with different filler ("does this dimension have *a*
+# partner?") when its product is within this multiple of the better-ranked
+# pair's -- not a genuinely different candidate. Keeping the ratio bounded
+# (rather than 1:1) is what sends several near-identical junk pairs to the back
+# together; a pair whose product diverges meaningfully (a real competing
+# hypothesis, not filler) keeps its place even if it reuses a column. This only
+# orders candidates. It decides nothing about which ones get probed while the
+# cap has room, because a discarded candidate cannot be the grain.
 _COMPOSITE_REDUNDANCY_RATIO = 3.0
+
+# A column whose EXACT distinct count reaches this fraction of the rows is an
+# identifier that almost holds. The handful of rows it fails to separate get
+# separated by accident by any partner carrying more than a value or two, so a
+# pair anchored on such a column restates its near-uniqueness rather than
+# discovering a grain: it is unique for a reason that has nothing to do with the
+# table's identity. Deliberately NOT `NEAR_UNIQUE_RATIO`, and well clear of it.
+# That one means "an approximation cannot tell whether this column is unique",
+# which is a statement about HLL noise and says nothing about structure. This is
+# a structural judgement, so it is only ever applied to a count that was proven,
+# and a column still resting on an approximation is left alone.
+_ANCHOR_NEAR_UNIQUE_RATIO = 0.90
+
+# A key member that enumerates positions within a parent (a line number, a
+# version, a fiscal period, a status, a snapshot date) has a domain bounded by
+# the fanout rather than by the table; a continuous measurement has the opposite
+# property, its distinct count grows with the row count. Below this fraction of
+# the rows a column is the former whatever its type or name suggests, which is
+# what keeps a legitimate numeric grain member out of the measure exclusion: a
+# Snowflake `FIXED` line number, a `NUMERIC(6,0)` fiscal period, a `DECIMAL`
+# latitude snapped to a grid. It is also what lets a near-unique anchor keep the
+# one partner that genuinely refines it.
+#
+# Deliberately not `VALUE_DOMAIN_MAX_FRACTION`, whose value this happens to
+# match: that one decides whether values are worth printing in a payload and is
+# tuned to a payload budget. Coupling them would let a payload change silently
+# move grain detection.
+_KEY_MEMBER_ENUM_FRACTION = 0.10
+
+# Below this row count, cardinality-versus-rows reasoning says nothing: on a
+# 20-row table every column looks near-unique and every measure looks
+# continuous, so the two exclusions below would suppress grains rather than
+# junk. The probes are nearly free at this size too, so the honest default is to
+# ask everything and let the exact combination count decide. A fixed floor
+# rather than a config knob, because it changes what gets measured rather than
+# how loudly a finding reads.
+_COMPOSITE_MIN_ROWS = 100
+
+# Declared types that are unambiguously fractional, so a column carrying one is
+# a measurement and never an identifier, whatever its cardinality.
+#
+# The scale pattern is the load-bearing half, and it is narrow on purpose. A
+# blanket "numeric but not integer" test would be wrong on a whole connector:
+# `adapters.base.is_integer_type` documents that Snowflake's `SHOW COLUMNS`
+# renders `NUMBER(38,0)` and `NUMBER(10,2)` identically as `FIXED`, so on
+# Snowflake every non-id numeric column would read as fractional and a real
+# `LINE_NUMBER` grain member would be excluded. Requiring an explicit nonzero
+# scale covers DuckDB `DECIMAL(10,2)`, Postgres and Redshift `numeric(10,2)` and
+# Databricks `decimal(10,2)`, and goes silent on BigQuery `NUMERIC` and
+# Snowflake `FIXED`, which carry no scale at all. Going silent is the house's
+# under-report posture, and it is what `_MEASURE_TOKENS` exists to cover.
+_FLOAT_HINTS = ("DOUBLE", "FLOAT", "REAL")
+_NONZERO_SCALE = re.compile(r"\(\s*\d+\s*,\s*[1-9]\d*\s*\)")
+
+# Measure tokens, matched as whole tokens on the snake-normalized name (so
+# `order_amount`, `amountUsd` and `grand_total` hit and `am` does not). Two
+# jobs: they catch a measure declared as an integer (money in minor units, a
+# duration in milliseconds, a byte count), and they are the only signal left on
+# a connector whose type strings cannot separate `NUMBER(38,0)` from
+# `NUMBER(10,2)`, where the fractional-type test above goes silent by design.
+#
+# A token never decides alone. It only matters above `_KEY_MEMBER_ENUM_FRACTION`,
+# because a column with a domain that small is a bounded enumeration whatever it
+# is called, and several of these names sit on legitimate low-cardinality key
+# members.
+#
+# Deliberately excluded, and do not "complete" this list:
+#   `qty` / `quantity`: an integer quantity is a bounded count of units, not a
+#     continuous measurement, and a fractional one (a weight, a rate) is already
+#     caught by the type test. Both spellings are load-bearing key members in
+#     this probe's own fixtures.
+#   `rate` / `score` / `weight`: fractional in practice, so the type test has
+#     them; as integers they read as ordinals.
+#   `value` / `number` / `num`: too generic, and frequently identifiers
+#     (`account_number`).
+#   `version` / `seq` / `period` / `line` / `rank` / `position` / `index` /
+#     `year` / `month` / `day`: ordinals and dimensions that legitimately
+#     complete a grain, which is the failure mode this rule must not cause.
+_MEASURE_TOKENS = (
+    "amount",
+    "amt",
+    "total",
+    "subtotal",
+    "revenue",
+    "price",
+    "cost",
+    "fee",
+    "tax",
+    "discount",
+    "balance",
+    "spend",
+    "margin",
+    "profit",
+    "duration",
+    "elapsed",
+    "latency",
+    "bytes",
+)
+_MEASURE_TOKEN_PATTERN = re.compile(r"(^|_)(" + "|".join(_MEASURE_TOKENS) + r")(_|$)")
+
+# The four parts a column can play in a composite key, returned by
+# :func:`key_member_verdict`.
+KEY_MEMBER_ELIGIBLE = "eligible"
+KEY_MEMBER_ENUMERATION = "bounded_enumeration"
+KEY_MEMBER_MEASURE = "continuous_measure"
+KEY_MEMBER_ANCHOR = "near_unique_anchor"
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
@@ -233,6 +341,77 @@ def is_numeric_type(data_type: str) -> bool:
     if any(h in upper for h in _BOOLEAN_HINTS + _TEMPORAL_HINTS):
         return False
     return any(h in upper for h in _NUMERIC_HINTS)
+
+
+def key_member_verdict(
+    name: str,
+    data_type: str,
+    distinct_count: int | None,
+    *,
+    distinct_count_exact: bool,
+    row_count: int | None,
+) -> str:
+    """What part a column can play in a composite key: ``KEY_MEMBER_ELIGIBLE``,
+    ``KEY_MEMBER_ENUMERATION``, ``KEY_MEMBER_MEASURE`` or ``KEY_MEMBER_ANCHOR``.
+
+    Composite-key candidates are drawn from this, and so is the sentence a
+    profile writes when the strongest thing it found was a column that almost
+    keys the table. Both read the same verdict from the same constants, so the
+    prose can never disagree with the pruning.
+
+    **The order of the tests is the substance**, so it is stated rather than
+    implied:
+
+    1. A column at or below ``_KEY_MEMBER_ENUM_FRACTION`` of the rows is a
+       bounded enumeration and nothing else. It is checked first because it is
+       the escape hatch: a fractional latitude, a Snowflake ``FIXED`` line
+       number and a low-cardinality snapshot date are all legitimate key
+       members, and a domain that small cannot be continuous whatever the
+       declared type or the name says.
+    2. A measure-shaped column above that bar is a continuous measure. Checked
+       before the anchor test deliberately: a money column at 93% distinct is a
+       measurement, not an identifier that almost holds, and calling it an
+       anchor would put it in front of a reader as the closest thing to a key.
+    3. A column whose **exact** distinct count reaches
+       ``_ANCHOR_NEAR_UNIQUE_RATIO`` of the rows is a near-unique anchor. Exact
+       only: a key claim is withheld on the strength of this verdict, and an
+       approximation inside the HLL band cannot carry that weight. A column
+       left approximate by the escalation cap, or by an adapter with no
+       ``exact_distinct_counts``, is simply eligible and behaves as it always
+       did.
+
+    An id-shaped name never reads as a measure, and below
+    ``_COMPOSITE_MIN_ROWS`` rows every column is eligible, because none of the
+    three tests means anything at that size.
+    """
+
+    if not row_count or row_count < _COMPOSITE_MIN_ROWS or distinct_count is None:
+        return KEY_MEMBER_ELIGIBLE
+
+    # Imported here rather than at module scope: relationships imports
+    # NEAR_UNIQUE_RATIO from this module, so a top-level import would cycle.
+    from .relationships import is_id_shaped
+
+    if distinct_count <= row_count * _KEY_MEMBER_ENUM_FRACTION:
+        return KEY_MEMBER_ENUMERATION
+
+    if not is_id_shaped(name) and is_numeric_type(data_type):
+        normalized = _normalize(name)
+        upper = data_type.upper()
+        fractional = any(h in upper for h in _FLOAT_HINTS) or bool(
+            _NONZERO_SCALE.search(data_type)
+        )
+        if (
+            fractional
+            or _MEASURE_TOKEN_PATTERN.search(normalized) is not None
+            or normalized.endswith(_AGGREGATE_SUFFIXES)
+        ):
+            return KEY_MEMBER_MEASURE
+
+    if distinct_count_exact and distinct_count >= row_count * _ANCHOR_NEAR_UNIQUE_RATIO:
+        return KEY_MEMBER_ANCHOR
+
+    return KEY_MEMBER_ELIGIBLE
 
 
 # Per-category structural type gate. Type evidence is known before any scan, so
@@ -810,9 +989,14 @@ def profile(
             aggregates = _escalate_near_unique(
                 adapter, identifier, meta.row_count, aggregates
             )
-            composite_keys = _probe_composite_keys(
-                adapter, identifier, meta.row_count, aggregates
+            composite_probe = _probe_composite_keys(
+                adapter,
+                identifier,
+                meta.row_count,
+                aggregates,
+                {c.name: c.data_type for c in columns},
             )
+            composite_keys = composite_probe.keys
             value_domains = _probe_value_domains(
                 adapter,
                 identifier,
@@ -900,6 +1084,7 @@ def profile(
             byte_size=meta.byte_size,
             columns=profiles,
             composite_keys=composite_keys,
+            key_evidence=composite_probe.evidence,
             data_quality=data_quality,
             profiled_at=datetime.now(UTC).isoformat(),
         )
@@ -966,14 +1151,172 @@ def _escalate_near_unique(
     return escalated
 
 
+def uniqueness_shortfall(
+    distinct_count: int | None,
+    null_fraction: float | None,
+    row_count: int | None,
+) -> tuple[int, float, bool] | None:
+    """How far a column is from being unique: ``(surplus_rows, fraction,
+    exact)``, or ``None`` when the numbers cannot support the arithmetic.
+
+    ``surplus_rows`` is how many rows would have to be removed for the column
+    to be unique, which is the non-null row count less the distinct count. That
+    is deliberately **not** "how many values repeat": those differ, and only
+    the first is derivable from counts already in hand. One id appearing 111
+    times is 110 surplus rows and exactly one repeated value, so a sentence
+    claiming 110 duplicate ids would be wrong. The removal figure is exactly
+    true in every case, needs no extra scan, and is the form that tells a
+    caller what to fix.
+
+    ``exact`` is true only when the distinct count was proven **and** the
+    column has no nulls. With nulls the non-null count is derived from a
+    fraction, so everything downstream of it is approximate even though the
+    distinct count is not, and the ``~`` marker has to follow the derivation
+    rather than the distinct count alone.
+    """
+
+    if not row_count or distinct_count is None:
+        return None
+    exact = bool(null_fraction in (0.0, None))
+    non_null = (
+        row_count
+        if null_fraction in (0.0, None)
+        else round((1 - null_fraction) * row_count)
+    )
+    if non_null <= 0:
+        return None
+    return non_null - distinct_count, distinct_count / non_null, exact
+
+
+def format_uniqueness_fraction(fraction: float) -> str:
+    """A uniqueness ratio as a percentage, one decimal place.
+
+    Never prints ``100.0%``: a column with two duplicates in a million rows
+    rounds there, and "unique for 100.0% of rows" in a sentence that then
+    reports duplicates contradicts itself. Such a column reads ``>99.9%``.
+    """
+
+    percent = fraction * 100
+    if percent >= 99.95:
+        return ">99.9%"
+    return f"{percent:.1f}%"
+
+
+def _near_unique_clause(name: str, agg: ColumnAggregate, row_count: int) -> str:
+    """``order_id is already unique for 94.6% of rows``, the phrase both the
+    suppression reason and the suppression note are built from."""
+
+    shortfall = uniqueness_shortfall(agg.distinct_count, agg.null_fraction, row_count)
+    if shortfall is None:
+        return f"{name} is already near-unique"
+    _surplus, fraction, exact = shortfall
+    marker = "" if (exact and agg.distinct_count_exact) else "~"
+    return (
+        f"{name} is already unique for {marker}"
+        f"{format_uniqueness_fraction(fraction)} of rows"
+    )
+
+
+def _proven_composite_reason(
+    key: tuple[str, ...] | list[str], keys: list[list[str]], row_count: int
+) -> str:
+    """Why a proven combination is reported, and where it sits in the ranking."""
+
+    columns = ", ".join(key)
+    reason = (
+        f"{columns} is unique as a combination on all {row_count} rows, proven "
+        "by an exact distinct-combination probe"
+    )
+    if list(key) == keys[0]:
+        return f"{reason}; it is the smallest proven combination, so it is the grain"
+    best = ", ".join(keys[0])
+    return (
+        f"{reason}, and ranks behind {best}, which is proven at a smaller cardinality"
+    )
+
+
+def _suppressed_evidence(
+    anchors: set[str], aggregates: dict[str, ColumnAggregate], row_count: int
+) -> list[KeyEvidence]:
+    """One entry per near-unique column whose pairs were dropped, so a
+    suppression is never silent. Keyed on the anchor rather than on each
+    dropped pair: the pairs are interchangeable filler, the anchor is the
+    finding, and naming every partner would put four column names into the
+    payload that nothing else needs (see ``Dataset.columns_with_findings``)."""
+
+    entries = []
+    for name in sorted(anchors):
+        agg = aggregates.get(name)
+        if agg is None:
+            continue
+        entries.append(
+            KeyEvidence(
+                columns=[name],
+                status="suppressed",
+                reason=(
+                    f"combinations pairing {name} with another column were not "
+                    f"probed because {_near_unique_clause(name, agg, row_count)}, "
+                    "so any partner completes it by accident rather than keying "
+                    "the table; the duplicates in "
+                    f"{name} are the finding, not a composite key"
+                ),
+            )
+        )
+    return entries
+
+
+@dataclass(frozen=True)
+class CompositeKeyProbe:
+    """What the composite-key probe proved, and the reasoning it owes a reader.
+
+    ``keys`` is what :class:`~..cache.Dataset` persists as ``composite_keys``,
+    best candidate first. ``evidence`` is one :class:`~..cache.KeyEvidence` per
+    combination the probe considered, reported or suppressed.
+
+    Both come back from the probe rather than being recomputed later because
+    only the probe knows what it excluded and what it measured: a caller
+    re-deriving the suppression would have to reimplement the pool rules, and
+    the two would drift. The prose a suppression owes a reader is *not* here,
+    though. It belongs beside the "grain unknown" verdict it explains, and
+    :func:`~.relationships.data_quality_notes` builds it there from these
+    entries, so one sentence carries both facts instead of two carrying one
+    each.
+    """
+
+    keys: list[list[str]]
+    evidence: list[KeyEvidence]
+
+
 def _probe_composite_keys(
     adapter: Adapter,
     identifier: str,
     row_count: int | None,
     aggregates: dict[str, ColumnAggregate],
-) -> list[list[str]]:
+    data_types: dict[str, str],
+) -> CompositeKeyProbe:
     """Prove 2-column keys on tables where no single column is one: the shape
     of a fact table, whose grain is exactly what a profile must answer.
+
+    **Unique is necessary for a key and not sufficient to be one**, and two
+    shapes of pair are unique for reasons that have nothing to do with the
+    table's identity. Both are excluded from the pool before anything is
+    priced, because the exact answer could not move a decision either way and
+    a pair reported and then disclaimed is worse than a pair never offered.
+    Pruning early also frees cap slots for pairs that might be the real grain,
+    which is the same argument the redundancy rule below makes for keeping a
+    demoted candidate in the running.
+
+    - A member that is a continuous measure (``KEY_MEMBER_MEASURE``) leaves the
+      pool outright. A key made of a measurement is almost never the intended
+      grain, and its cardinality grows with the table, so it completes a
+      partner by arithmetic rather than by meaning.
+    - A pair **anchored** on a near-unique column (``KEY_MEMBER_ANCHOR``) is
+      dropped unless its partner is a bounded enumeration. When a handful of
+      duplicate order ids are separated by a three-value line number, the data
+      really does have that grain; any wider partner separates them by
+      accident, and the pair only restates the anchor's near-uniqueness. That
+      near-uniqueness is what the profile reports instead, with the counts, and
+      it names a defect in the source rather than a key.
 
     A pair can only be a key if the product of its members' distinct counts
     reaches the row count, so pairs are pruned on that necessary condition
@@ -981,45 +1324,93 @@ def _probe_composite_keys(
     id-shaped members first (real grains are key-shaped), smallest product
     next (a minimal grain sits just above the row count; a pair of two
     near-unique columns lands near rows squared and is analytically useless
-    even when technically unique). Before the cut, pairs that share a column
-    with an already-kept pair and score within ``_COMPOSITE_REDUNDANCY_RATIO``
-    of it are dropped as the same hypothesis tried with different filler, so
-    the cap is spent on genuinely distinct candidates rather than several
-    near-identical pairs anchored on one popular column. Bounded to
-    ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a pair is
-    proven when its exact combination count equals the row count. Adapters
-    without ``distinct_combination_counts`` degrade to no composite keys.
+    even when technically unique).
+
+    A pair sharing a column with a better-ranked one at a product within
+    ``_COMPOSITE_REDUNDANCY_RATIO`` of it is the same hypothesis tried with
+    different filler, so it goes behind every pair that is not. **Behind, not
+    away.** That preference is only worth anything while the cap binds, and
+    discarding a ranked candidate with slots still free buys nothing and can
+    cost the grain outright: on a fact table the pair a two-id parent pair
+    blocks is exactly the parent-plus-line grain, which is the one shape this
+    probe exists to find. So the cap is filled from the preferred pairs first
+    and the demoted ones after, and the survivors go back into rank order.
+
+    Bounded to ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a
+    pair is proven when its exact combination count equals the row count.
+    Proven pairs come back smallest product first, which is the minimal grain
+    among them: once a pair is proven, id-shapedness has nothing left to say,
+    and a superkey of two id columns that happen to be unique together must not
+    outrank the tighter key, because callers read the first entry as the grain.
+    Adapters without ``distinct_combination_counts`` degrade to no composite
+    keys, and one that narrows the probe to what its budget covers leaves the
+    pairs it dropped simply unproven.
     """
 
+    empty = CompositeKeyProbe(keys=[], evidence=[])
     if not row_count:
-        return []
+        return empty
     combo_counts = getattr(adapter, "distinct_combination_counts", None)
     if combo_counts is None:
-        return []
+        return empty
     for agg in aggregates.values():
         if agg.is_unique and agg.null_fraction in (0.0, None):
-            return []  # a proven single-column key makes the probe waste
+            return empty  # a proven single-column key makes the probe waste
 
+    verdicts = {
+        agg.name: key_member_verdict(
+            agg.name,
+            data_types.get(agg.name, ""),
+            agg.distinct_count,
+            distinct_count_exact=agg.distinct_count_exact,
+            row_count=row_count,
+        )
+        for agg in aggregates.values()
+    }
     pool = [
         agg
         for agg in aggregates.values()
-        if agg.distinct_count and not agg.is_unique and agg.null_fraction in (0.0, None)
+        if agg.distinct_count
+        and not agg.is_unique
+        and agg.null_fraction in (0.0, None)
+        and verdicts[agg.name] != KEY_MEMBER_MEASURE
     ]
     if len(pool) < 2:
-        return []
+        return empty
 
     # Imported here: relationships imports NEAR_UNIQUE_RATIO from this module,
     # so a module-level import would be circular.
-    from .relationships import _is_id_shaped
+    from .relationships import is_id_shaped
 
     ranked: list[tuple[int, int, tuple[str, str]]] = []
+    suppressed_anchors: set[str] = set()
     for i, a in enumerate(pool):
         for b in pool[i + 1 :]:
+            anchored = [m for m in (a, b) if verdicts[m.name] == KEY_MEMBER_ANCHOR]
+            if anchored and not any(
+                verdicts[m.name] == KEY_MEMBER_ENUMERATION
+                # The enumeration escape holds only for an anchor that could
+                # plausibly be a parent identifier. A near-unique *timestamp*
+                # is a per-row event time, not an entity whose rows a position
+                # column enumerates, so pairing it with a low-cardinality
+                # dimension separates rows by accident exactly the way a wider
+                # partner would: `(status, created_at)` is unique on a table
+                # whose created_at is 98% unique, and it is not a grain. A
+                # near-unique identifier paired with a line number is.
+                and not any(
+                    is_temporal_type(data_types.get(m.name, "")) for m in anchored
+                )
+                for m in (a, b)
+            ):
+                # Unique only because one member almost is: the pair restates
+                # that, and the near-uniqueness note says it properly.
+                suppressed_anchors.update(m.name for m in anchored)
+                continue
             product = a.distinct_count * b.distinct_count
             n_approx = sum(1 for m in (a, b) if not m.distinct_count_exact)
             if product < row_count * NEAR_UNIQUE_RATIO**n_approx:
                 continue
-            id_shaped = sum(1 for m in (a, b) if _is_id_shaped(m.name))
+            id_shaped = sum(1 for m in (a, b) if is_id_shaped(m.name))
             # Members ordered by descending cardinality so the key reads
             # parent-then-line, e.g. (L_ORDERKEY, L_LINENUMBER).
             members = sorted(
@@ -1028,25 +1419,46 @@ def _probe_composite_keys(
             )
             ranked.append((-id_shaped, product, (members[0], members[1])))
     if not ranked:
-        return []
+        return CompositeKeyProbe(
+            keys=[],
+            evidence=_suppressed_evidence(suppressed_anchors, aggregates, row_count),
+        )
 
     ranked.sort()
-    deduped: list[tuple[int, int, tuple[str, str]]] = []
+    preferred: list[tuple[int, int, tuple[str, str]]] = []
+    demoted: list[tuple[int, int, tuple[str, str]]] = []
     best_product_for: dict[str, int] = {}
-    for ids, product, pair in ranked:
+    for entry in ranked:
+        _ids, product, pair = entry
         if any(
             col in best_product_for
             and product <= best_product_for[col] * _COMPOSITE_REDUNDANCY_RATIO
             for col in pair
         ):
-            continue  # near-duplicate: same anchor, interchangeable filler
-        deduped.append((ids, product, pair))
+            demoted.append(entry)  # same anchor, interchangeable filler
+            continue
+        preferred.append(entry)
         for col in pair:
             best_product_for.setdefault(col, product)
 
-    chosen = [list(pair) for _ids, _product, pair in deduped[:_COMPOSITE_PAIR_CAP]]
-    exact = combo_counts(identifier, chosen)
-    return [combo for combo in chosen if exact.get(tuple(combo)) == row_count]
+    selected = sorted((preferred + demoted)[:_COMPOSITE_PAIR_CAP])
+    exact = combo_counts(identifier, [list(pair) for _ids, _product, pair in selected])
+    proven = sorted(
+        (product, pair)
+        for _ids, product, pair in selected
+        if exact.get(pair) == row_count
+    )
+    keys = [list(pair) for _product, pair in proven]
+    evidence = [
+        KeyEvidence(
+            columns=list(key),
+            status="reported",
+            reason=_proven_composite_reason(key, keys, row_count),
+        )
+        for key in keys
+    ]
+    evidence.extend(_suppressed_evidence(suppressed_anchors, aggregates, row_count))
+    return CompositeKeyProbe(keys=keys, evidence=evidence)
 
 
 def _probe_value_domains(

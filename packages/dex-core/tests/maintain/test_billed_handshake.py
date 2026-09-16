@@ -5,7 +5,8 @@ free phase of a two-phase command completes before any confirmation."""
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ import pytest
 pytest.importorskip("google.cloud.bigquery")
 
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
-from exmergo_dex_core.cache import ColumnProfile, Dataset
+from exmergo_dex_core.cache import CacheProvenance, ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.cli import dispatch
 from exmergo_dex_core.config import BigQueryTarget, DexConfig
 from exmergo_dex_core.engine import DexEngine
@@ -27,6 +28,18 @@ from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
 from exmergo_dex_core.storage import FilesystemStore
 
 MB = 1024 * 1024
+
+
+def _aggregate_response(sql: str, *, distinct: int = 100) -> list[dict]:
+    """Return the aggregate aliases a real profile query asks the fake for."""
+
+    row = {"d_0": distinct}
+    if "n_total" in sql:
+        row["n_total"] = 100
+        for index in range(32):
+            row[f"nn_{index}"] = 100
+            row[f"nd_{index}"] = 100
+    return [row]
 
 
 def _adapter(fake_bq_client, *, confirmed: bool, budget: float | None, record=None):
@@ -181,9 +194,10 @@ def test_unconfirmed_grain_returns_the_dry_run_estimate(
     envelope = _dispatch(tmp_path, "grain")
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    # The single-table distinct-count scan floors to the per-query minimum.
-    assert envelope.cost.estimate == 10 * MB
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 10 * MB}
+    # The aggregate null-fraction scan is reserved in the same paid half as
+    # the distinct-count check (one scan plus its profile safety reserves).
+    assert envelope.cost.estimate == 50 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 50 * MB}
     assert "--confirm" in envelope.data["hint"]
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
@@ -193,7 +207,7 @@ def test_confirmed_grain_scans_within_budget_and_ledgers(
 ):
     _seed_snapshot(tmp_path)
     entries: list[dict] = []
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 90}]
+    fake_bq_client.row_resolver = lambda sql: _aggregate_response(sql, distinct=90)
     route_adapter(fake_bq_client, record=entries.append)
 
     envelope = _dispatch(tmp_path, "grain", confirm=True, budget=float(100 * MB))
@@ -202,11 +216,13 @@ def test_confirmed_grain_scans_within_budget_and_ledgers(
     assert finding["code"] == "key_lost_uniqueness"
     assert finding["data"]["distinct_count"] == 90
     assert finding["data"]["row_count"] == 100
-    assert envelope.data["spend"]["bytes_billed"] == 5_000
-    assert [e["billed_bytes"] for e in entries] == [5_000]
+    assert envelope.data["spend"]["bytes_billed"] == 10_000
+    assert [e["billed_bytes"] for e in entries] == [5_000, 5_000]
     # The command estimate and the adapter's per-statement charge are free
-    # dry-runs; exactly one execution follows.
-    assert [c.dry_run for c in fake_bq_client.query_calls] == [True, True, False]
+    # dry-runs; the key and null-fraction scans both execute after confirmation.
+    dry_runs = [call.dry_run for call in fake_bq_client.query_calls]
+    assert any(not dry_run for dry_run in dry_runs)
+    assert any(dry_run for dry_run in dry_runs)
 
 
 def test_confirmed_grain_without_a_budget_is_refused(
@@ -229,18 +245,34 @@ def test_over_ceiling_grain_cannot_be_confirmed_through(
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
-def test_unconfirmed_check_is_two_phase(fake_bq_client, route_adapter, tmp_path):
+def test_unconfirmed_check_answers_and_offers(fake_bq_client, route_adapter, tmp_path):
+    """The free axes are the answer, not a pending charge.
+
+    An unconfirmed `check` completed three of four axes and spent nothing, so it
+    reports `ok`. The scanning axes are work the caller never asked for, and they
+    come back as an offer: gating the whole response behind confirming them would
+    train a caller to confirm what costs nothing.
+    """
+
     _seed_snapshot(tmp_path, extra_baseline_column=True)
     route_adapter(fake_bq_client)
 
     envelope = _dispatch(tmp_path, "check")
-    assert envelope.status.value == "needs_confirmation"
-    # Phase one is complete and returned: the free axes' findings ride along
-    # with the estimate for the scanning axes.
+    assert envelope.status.value == "ok"
     codes = {f["code"] for f in envelope.data["findings"]}
     assert "column_dropped" in codes
-    assert envelope.data["estimated_bytes"] == 10 * MB
-    assert any("free" in note for note in envelope.data["notes"])
+
+    offer = envelope.data["offer"]
+    # The offer prices the aggregate null-fraction scan alongside the
+    # distinct-count check: one paid half, both scans.
+    assert offer["estimated_bytes"] == 50 * MB
+    # What did not run has to be nameable, now that the status no longer says so.
+    assert offer["axes"] == ["grain"]
+    assert envelope.data["axes_run"] == ["schema", "volume"]
+    assert any("final" in note for note in offer["notes"])
+    # An `ok` must never carry the estimate where a reader looks for what a run
+    # cost; the offer is the only place that number lives.
+    assert envelope.cost.estimate is None
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
     # The free axes are already persisted for reconcile; grain waits.
@@ -252,7 +284,7 @@ def test_confirmed_check_completes_the_scanning_axes(
     fake_bq_client, route_adapter, tmp_path
 ):
     _seed_snapshot(tmp_path)
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    fake_bq_client.row_resolver = _aggregate_response
     route_adapter(fake_bq_client)
 
     envelope = _dispatch(tmp_path, "check", confirm=True, budget=float(100 * MB))
@@ -304,24 +336,272 @@ def _seed_two_keyed_tables(tmp_path: Path) -> None:
 def test_check_fanout_estimate_reflects_per_query_floor(
     fake_bq_client, route_adapter, tmp_path
 ):
-    """A fan-out check over two tables estimates 2x the per-query floor, not the
-    few KB of raw scan; confirming with exactly that budget then runs without the
-    per-statement floor rejecting a statement (the reject-ladder the estimate
-    used to cause)."""
+    """A fan-out check over two tables estimates the per-query floors and the
+    null-fraction profile reserves, not the few KB of raw scan; confirming with
+    exactly that budget then runs without the per-statement floor rejecting a
+    statement (the reject-ladder the estimate used to cause)."""
 
     _seed_two_keyed_tables(tmp_path)
     route_adapter(fake_bq_client)
 
     unconfirmed = _dispatch(tmp_path, "check")
-    assert unconfirmed.status.value == "needs_confirmation"
-    assert unconfirmed.data["estimated_bytes"] == 2 * 10 * MB
+    assert unconfirmed.status.value == "ok"
+    assert unconfirmed.data["offer"]["estimated_bytes"] == 90 * MB
 
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    fake_bq_client.row_resolver = _aggregate_response
     route_adapter(fake_bq_client)
     confirmed = _dispatch(
         tmp_path,
         "check",
         confirm=True,
-        budget=float(unconfirmed.data["estimated_bytes"]),
+        budget=float(unconfirmed.data["offer"]["estimated_bytes"]),
     )
     assert confirmed.status.value == "ok"
+    # The completed sweep has nothing left to offer, so the key is absent
+    # entirely rather than present and empty.
+    assert "offer" not in confirmed.data
+
+
+def test_the_offer_carries_the_same_caveats_as_the_settled_answer(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """A baseline that may be wrong bounds the free findings too.
+
+    The unconfirmed call is the one a maintenance session opens with, so it is
+    the last place a caveat about the baseline should go missing. It used to:
+    the confirmation branch built its result without the baseline warnings the
+    settled branch adds, which silently dropped the "your baseline is stale"
+    line from the only response most sessions ever read.
+    """
+
+    _seed_snapshot(tmp_path, extra_baseline_column=True)
+    store = FilesystemStore(tmp_path)
+    snap = store.load_snapshot()
+    later = datetime.fromisoformat(snap.created_at) + timedelta(hours=1)
+    store.save_cache(
+        DexCache(
+            datasets=[],
+            provenance=CacheProvenance(
+                connector="bigquery", updated_at=later.isoformat()
+            ),
+        )
+    )
+    route_adapter(fake_bq_client)
+
+    unconfirmed = _dispatch(tmp_path, "check")
+    assert unconfirmed.status.value == "ok"
+    assert "offer" in unconfirmed.data
+    assert [w for w in unconfirmed.warnings if "newer than the drift baseline" in w]
+
+    fake_bq_client.row_resolver = _aggregate_response
+    route_adapter(fake_bq_client)
+    confirmed = _dispatch(
+        tmp_path,
+        "check",
+        confirm=True,
+        budget=float(unconfirmed.data["offer"]["estimated_bytes"]),
+    )
+    stale = "newer than the drift baseline"
+    assert [w for w in confirmed.warnings if stale in w] == [
+        w for w in unconfirmed.warnings if stale in w
+    ]
+
+
+def test_volume_names_an_external_table_it_could_not_compare(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Issue #375's downstream half: an external table's row count is unknown to
+    free metadata, so this axis has nothing to diff and says so.
+
+    The baseline holds a real count because the object was profiled once, which is
+    exactly why the silence was misleading: an absent finding on an object a
+    reader knows was mapped reads as "checked, and nothing moved". The axis stays
+    free, so it names the object rather than buying a count for it.
+    """
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    now = datetime.now(UTC).isoformat()
+    FilesystemStore(tmp_path).save_snapshot(
+        Snapshot(
+            created_at=now,
+            connector="bigquery",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="test-proj.shop.ext_orders",
+                        row_count=500,
+                        columns=[ColumnProfile(name="id", data_type="INTEGER")],
+                        profiled_at=now,
+                    )
+                ]
+            ),
+            warehouse_from="cache",
+        )
+    )
+    external = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_orders",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=0,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables = {external.identifier: external}
+    route_adapter(fake_bq_client)
+
+    envelope = _dispatch(tmp_path, "volume")
+    assert envelope.status.value == "ok"
+    assert envelope.data["finding_count"] == 0
+    assert any(
+        "ext_orders" in w and "volume was not compared" in w for w in envelope.warnings
+    ), envelope.warnings
+    # Free, as this axis always is: naming what it skipped costs no query.
+    assert fake_bq_client.query_calls == []
+
+
+# --- row population on a metered connector (#226) -------------------------------
+#
+# BigQuery keeps a stored row count for a base table and none at all for a view,
+# which is what dbt's default materialization produces. So the two halves of the
+# same finding class sit on opposite sides of the free/gated split, and this is
+# where that split is held: the metadata half always answers, the counting half
+# is priced and offered, never taken.
+
+
+def _seed_verify_project(tmp_path: Path, monkeypatch) -> None:
+    """A dbt project whose one model is a view over `customers` that inner-joins
+    `events`, plus a compiled manifest for it. The compile check is faked to a
+    pass, as in the verify suite: dbt itself is not what these assert."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    monkeypatch.setattr(
+        verify_mod,
+        "shadow_parse",
+        lambda *a, **k: {
+            "available": True,
+            "reason": None,
+            "success": True,
+            "messages": [],
+        },
+    )
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "models").mkdir(exist_ok=True)
+    target = tmp_path / "target"
+    target.mkdir(exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.shop.mart_customers": {
+                        "name": "mart_customers",
+                        "resource_type": "model",
+                        "relation_name": "`test-proj`.`shop`.`mart_customers`",
+                        "config": {"materialized": "view"},
+                        "compiled_code": (
+                            "select c.id from `test-proj`.`shop`.`customers` c "
+                            "inner join `test-proj`.`shop`.`events` e "
+                            "on c.id = e.id"
+                        ),
+                    }
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _client_with_a_view(fake_bq_client):
+    """The standard fake plus a view, which BigQuery keeps no row count for."""
+
+    from fakes.bigquery import FakeTable
+
+    view = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="mart_customers",
+        schema=list(fake_bq_client.tables["test-proj.shop.customers"].schema),
+        num_rows=0,
+        num_bytes=0,
+        table_type="VIEW",
+    )
+    fake_bq_client.tables[view.identifier] = view
+    return fake_bq_client
+
+
+def test_unconfirmed_verify_answers_and_offers_the_counts(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """The free half is a complete answer, not a pending charge: `ok`, with the
+    row counts BigQuery keeps no metadata for priced beside it."""
+
+    _seed_verify_project(tmp_path, monkeypatch)
+    route_adapter(_client_with_a_view(fake_bq_client))
+
+    envelope = _dispatch(tmp_path, "verify")
+    assert envelope.status == "ok", envelope.model_dump()
+    offer = envelope.data["offer"]
+    assert offer["axes"] == ["row_population"]
+    assert offer["estimated_bytes"] > 0
+    assert any("row population was not judged" in w for w in envelope.warnings)
+    # What this run cost, beside what the offer would cost: the free half spent
+    # nothing, and every statement it issued was a dry run.
+    assert envelope.cost.estimate == 0.0
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    # Nothing was suppressed: the class ran, priced what it could not read for
+    # free, and said so. A suppression here would claim it never ran at all.
+    assert "row_population" not in envelope.data["suppressed"]
+
+
+def test_confirmed_verify_counts_what_the_catalog_does_not_keep(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """Confirmed, the view is counted and the finding lands. `exact` stays False
+    because the parent's side came from the catalog, which is the honest flag
+    for a verdict that is part measurement and part metadata."""
+
+    _seed_verify_project(tmp_path, monkeypatch)
+    client = _client_with_a_view(fake_bq_client)
+    client.row_resolver = lambda sql: [{"dex_rows_0": 42}]
+    route_adapter(client)
+
+    envelope = _dispatch(tmp_path, "verify", confirm=True, budget=100 * MB)
+    assert envelope.status == "ok", envelope.model_dump()
+    assert "offer" not in envelope.data
+    findings = [f for f in envelope.data["findings"] if f["code"] == "row_loss"]
+    assert len(findings) == 1, envelope.data["findings"]
+    assert findings[0]["identifier"] == "mart_customers"
+    assert findings[0]["data"]["row_count"] == 42
+    assert findings[0]["data"]["parent_row_count"] == 100
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["exact"] is False
+    assert "inner join to 'test-proj.shop.events'" in findings[0]["detail"]
+
+
+def test_the_counting_statement_is_one_aggregate_only_query(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """Aggregate-only and batched, so it can carry a row count and nothing else,
+    and a metered connector pays its per-query floor once rather than per
+    relation."""
+
+    _seed_verify_project(tmp_path, monkeypatch)
+    client = _client_with_a_view(fake_bq_client)
+    client.row_resolver = lambda sql: [{"dex_rows_0": 42}]
+    route_adapter(client)
+
+    _dispatch(tmp_path, "verify", confirm=True, budget=100 * MB)
+    counting = [c for c in client.query_calls if "dex_rows_0" in c.sql]
+    assert len({c.sql for c in counting}) == 1
+    statement = counting[0].sql
+    assert statement.count("COUNT(*)") == 1
+    assert "mart_customers" in statement
+    # The tables the catalog already answered for are not re-counted.
+    assert "`customers`" not in statement

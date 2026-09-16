@@ -70,9 +70,19 @@ _PARADIGMS = {
 }
 
 
-def paradigm_for(connector: str | None) -> Paradigm:
-    """The cost paradigm a connector bills in, free/local when it bills nothing."""
+def paradigm_for(connector: str | None, config: DexConfig | None = None) -> Paradigm:
+    """The cost paradigm a connector bills in, free/local when it bills nothing.
 
+    ClickHouse is the one connector whose paradigm is deployment-dependent.
+    Config-free callers deliberately retain the historical self-hosted answer;
+    callers that resolved a project config must pass it so Cloud refusals and
+    error envelopes are denominated in compute-seconds before an adapter opens.
+    """
+
+    if connector == "clickhouse" and config is not None:
+        target = config.clickhouse or ClickHouseTarget()
+        if target.deployment == "cloud":
+            return Paradigm.COMPUTE_TIME
     return _PARADIGMS.get(connector or "", Paradigm.FREE_LOCAL)
 
 
@@ -227,16 +237,37 @@ def new_cost_gate(
     Kept here, alongside credential discovery, on purpose: a host that supplies
     its own connection must never be the thing that supplies the guard.
 
-    The day's spend is passed as a reader rather than a number, so the gate
-    re-reads it when it admits work instead of deciding the whole command from
-    one reading taken here. The lock comes from the store when the store has
-    one; without it the gate still reserves and says on every billed result that
-    the cumulative ceiling is advisory.
+    The day's spend is passed as a reader rather than a number, and nothing
+    calls it here: the gate reads it when it admits work instead of deciding the
+    whole command from one reading taken at assembly. That is what keeps the
+    ledger out of the availability path of commands that cannot spend, since a
+    gate is built for every command on a billed connector and only the billed
+    ones have any stake in the day's total. A store whose ledger lives on a
+    network can therefore be unreachable without taking down a cache-served
+    answer, while billed admission still refuses.
+
+    The lock comes from the store when the store has one; without it the gate
+    still reserves and says on every billed result that the cumulative ceiling
+    is advisory.
+
+    The history reader is bound the same way and scoped to this connector at the
+    binding, so nothing downstream can widen it: the ratio an over-ceiling
+    refusal quotes has to be this connector's own, and a DuckDB history
+    calibrating a BigQuery refusal would be worse than no calibration at all.
+    Passed as a reader for the same reason the day's spend is, and more so:
+    nothing calls it unless a command is actually refused over its ceiling.
+
+    The one-time cumulative-ceiling ask (issue #283) is armed from
+    ``config.source_path``, so it fires only where dex itself loaded the config
+    from a file it can therefore amend: a config-free ad-hoc read and a
+    host-supplied config object are both never asked a question they have
+    nowhere to answer.
     """
 
-    paradigm = paradigm_for(connector)
+    paradigm = paradigm_for(connector, config)
     field = ledger_field(paradigm)
     lock = getattr(store, "spend_lock", None)
+    history = getattr(store, "spend_entries", None)
     return CostGate(
         paradigm=paradigm,
         ceiling=budget if budget is not None else config.budget.ceiling,
@@ -249,6 +280,9 @@ def new_cost_gate(
         command=command,
         record=store.append_spend_log,
         lock=lock if callable(lock) else None,
+        history=(lambda: history(connector=connector)) if callable(history) else None,
+        session_ceiling_declined=config.budget.session_ceiling_declined,
+        config_path=config.source_path,
     )
 
 
@@ -284,7 +318,8 @@ def no_connector_selected(
         return NoConnectorSelectedError(
             "no connector selected: pass connector= (with path= for duckdb) or a "
             "config= that declares one, or build from a project on disk with "
-            "DexEngine.from_repo(repo_root)"
+            "DexEngine.from_repo(repo_root). DBT_PROFILES_DIR only locates dbt "
+            "profiles.yml; it does not select dex's connector"
         )
     if ambiguous_duckdb:
         names = ", ".join(str(p) for p in ambiguous_duckdb)
@@ -296,7 +331,8 @@ def no_connector_selected(
     return NoConnectorSelectedError(
         f"no .dex/config.yml found searching from '{repo_root}' up to the git "
         "root: run inside your dex project, pass --repo-root, or pass "
-        "--connector/--path for an ad-hoc read"
+        "--connector/--path for an ad-hoc read. DBT_PROFILES_DIR only locates "
+        "dbt profiles.yml; it does not select dex's connector"
     )
 
 

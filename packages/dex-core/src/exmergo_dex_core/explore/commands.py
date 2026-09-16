@@ -17,6 +17,7 @@ only to the exploration cache, so a scan is never paid for twice.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import re
@@ -24,7 +25,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import sqlglot
+from sqlglot import expressions as exp
 
 from .. import command_args, dbt_project
 from .. import envelope as env
@@ -33,8 +37,10 @@ from ..adapters.base import Adapter, ObjectMeta, name_list
 
 # Aliased: `QueryResult` here is the explore record, and the adapter's
 # same-named row carrier is only a type hint on one shaping helper.
-from ..adapters.base import QueryResult as AdapterQueryResult  # noqa: F401
+from ..adapters.base import QueryResult as AdapterQueryResult
 from ..cache import (
+    CACHE_SCHEMA_VERSION,
+    ColumnProfile,
     Dataset,
     DexCache,
     Relationship,
@@ -64,6 +70,12 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
+from ..semantic_catalog import (
+    EntityInfo,
+    SemanticCatalogView,
+    derive_entity_type,
+    entity_joins,
+)
 from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
 from . import cluster as cluster_mod
 from . import cumulative as cumulative_mod
@@ -74,6 +86,8 @@ from . import rank as rank_mod
 from . import relationships as rel_mod
 from .results import (
     ClusterResult,
+    ConflictingRelationshipDeclaration,
+    DeclaredRelationshipConflict,
     DiagramResult,
     InventoryEntry,
     InventoryResult,
@@ -299,24 +313,61 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
     )
 
 
-def inventory(engine: DexEngine, *, rank: bool = False) -> InventoryResult:
+# A ranked call's default cap (#289): a full catalog dump sorted by score is
+# not a shortlist, and on a warehouse of thousands of objects the rank is the
+# one part a caller never reads (every real invocation observed piping this
+# through `head` is the evidence). In the 20-50 range the issue asked for;
+# `--limit` widens it and `--all` lifts it, both no-ops without `--rank`.
+_INVENTORY_RANK_DEFAULT_LIMIT = 30
+
+
+def inventory(
+    engine: DexEngine,
+    *,
+    rank: bool = False,
+    limit: int | None = None,
+    show_all: bool = False,
+) -> InventoryResult:
     """Every object the connection can see, metadata only.
 
     Free on every connector (catalog reads, not scans), so it never needs the
     confirm handshake and is the cheapest way to find out what is out there.
     ``rank`` orders by the same signals ``map`` uses, minus connectivity: there
     is no relationship pass here, so only naming, size, and shape contribute.
+
+    ``limit``/``show_all`` only act on a ranked call: an unranked list carries
+    no order to cut a shortlist from, so it is returned whole either way, the
+    same as it always has been.
     """
 
     adapter = engine._adapter("explore inventory")
     metas = inventory_mod.inventory(adapter)
     cost = command_args.preflight_cost(adapter)
 
+    notes: list[str] = []
+    elided = 0
     if rank:
         # Honor the same configured ranking_hints as `map`; without them, a
         # ranked inventory would silently ignore the user's bias.
         scores = rank_mod.rank(metas, None, engine.config.ranking_hints)
         metas = sorted(metas, key=lambda m: scores.get(m.identifier, 0.0), reverse=True)
+        notes.append(
+            "ranked by size (row count), naming convention (fct/dim/stg-style "
+            "prefixes score higher, tmp/scratch-style lower), and shape (column "
+            "count); connectivity (how many objects it joins to) is not part of "
+            "this score, because inventory runs no relationship pass. `explore "
+            "map` ranks with connectivity included"
+        )
+        if not show_all:
+            cap = limit if limit is not None else _INVENTORY_RANK_DEFAULT_LIMIT
+            elided = max(0, len(metas) - cap)
+            metas = metas[:cap]
+            if elided:
+                notes.append(
+                    f"{elided} more ranked object(s) are not shown: capped at "
+                    f"{cap}, kept by rank. Pass --limit to widen it, or --all "
+                    "for the complete ranking"
+                )
     else:
         scores = {}
 
@@ -332,12 +383,21 @@ def inventory(engine: DexEngine, *, rank: bool = False) -> InventoryResult:
             for m in metas
         ],
         ranked=rank,
+        elided_object_count=elided,
+        notes=notes,
         cost=cost,
     )
 
 
 def cmd_inventory(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return to_envelope(inventory(engine, rank=getattr(args, "rank", False)))
+    return to_envelope(
+        inventory(
+            engine,
+            rank=getattr(args, "rank", False),
+            limit=getattr(args, "limit", None),
+            show_all=getattr(args, "all", False),
+        )
+    )
 
 
 class _ObjectGap:
@@ -539,6 +599,7 @@ def profile(
     refresh: bool = False,
     use_project: bool = False,
     check_cumulative: bool = False,
+    show_all_columns: bool = False,
 ) -> ProfileResult:
     """Profile the named objects, reusing fresh cached profiles where they exist.
 
@@ -550,6 +611,12 @@ def profile(
     measures that look like a running total or point-in-time snapshot; this
     probe is priced only after profiling knows what to test, which is why it
     can come back as ``pending_confirmation`` rather than raising.
+
+    ``show_all_columns`` answers ``--columns all`` (#288): the default
+    summarizes each dataset's payload to the columns carrying a finding (see
+    :meth:`~..cache.Dataset.columns_with_findings`), so the verdict a caller
+    asked for -- grain, keys, data quality -- is not the part a truncating
+    harness cuts off on a wide table.
     """
 
     store = engine.store
@@ -695,6 +762,8 @@ def profile(
         cache_hit_count=len(fresh_reused),
         cache_path=locator,
         updated_at=now.isoformat(),
+        show_all_columns=show_all_columns,
+        value_domain_cap=config.profile_value_domain_cap,
         notes=notes,
         warnings=_override_mismatches(datasets, config.pii_overrides),
         pending_confirmation=cumulative_pending,
@@ -708,6 +777,7 @@ def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             engine,
             args.objects,
             refresh=getattr(args, "refresh", False),
+            show_all_columns=getattr(args, "columns", None) == "all",
             use_project=getattr(args, "use_project", False),
             check_cumulative=getattr(args, "check_cumulative", False),
         )
@@ -721,6 +791,7 @@ def relationships(
     infer_by_overlap: bool = False,
     refresh: bool = False,
     use_project: bool = False,
+    use_hosted_semantic_layer: bool = False,
 ) -> RelationshipsResult:
     """Infer joins across every object in scope, optionally probing them.
 
@@ -739,6 +810,9 @@ def relationships(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
+    catalog = _semantic_catalog(
+        engine, use_project, use_hosted_semantic_layer=use_hosted_semantic_layer
+    )
 
     adapter = engine._adapter("explore relationships")
     # Capture pre-run cache state before any checkpoint write, so the success-path
@@ -855,9 +929,18 @@ def relationships(
         datasets, inferred, _dev_schemas(config)
     )
 
-    declared, declared_notes = rel_mod.declared_relationships(
-        defs, [d.identifier for d in datasets]
+    identifiers = [d.identifier for d in datasets]
+    declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    native_edges, native_edge_notes = _native_semantic_edges(
+        engine,
+        use_project,
+        identifiers,
+        use_hosted_semantic_layer=use_hosted_semantic_layer,
     )
+    declared, _native_already_declared = _fold_semantic_edges(declared, native_edges)
+    semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
+    declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
+    relationship_conflicts = _declared_relationship_conflicts(declared)
     rels, confirmed = _merge_relationships(declared, inferred)
 
     # A prior overlap-derived edge (issue #220) is never rediscovered by
@@ -981,6 +1064,12 @@ def relationships(
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
+    notes.extend(native_edge_notes)
+    notes.extend(semantic_edge_notes)
+    notes.extend(
+        _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
+    )
+    notes.extend(_relationship_conflict_notes(relationship_conflicts))
     notes.extend(defs.notes)
     if confirmed:
         notes.append(
@@ -1048,16 +1137,27 @@ def relationships(
     # set is authoritative for every identifier it examined; anything with an
     # endpoint outside that (a narrower --scope/--dataset than a prior run) is
     # carried forward above rather than dropped, same as the profiles are.
-    cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
+    cache, stats = _merge_profiles(
+        prior,
+        datasets,
+        connector,
+        now,
+        relationships=rels,
+        observed_namespaces=observed_namespaces,
+    )
+    if catalog is not None:
+        _annotate_semantic_exposure(cache.datasets, catalog)
     locator = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
     result = RelationshipsResult(
         relationships=rels,
         declared_count=len(declared),
+        semantic_join_count=len(semantic_edges),
         profiled_count=len(profiled),
         cache_hit_count=len(fresh_reused),
         carried_relationship_count=carried_relationships,
+        conflicts=relationship_conflicts,
         cache_path=locator,
         updated_at=now.isoformat(),
         notes=notes,
@@ -1080,6 +1180,7 @@ def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
             infer_by_overlap=getattr(args, "infer_by_overlap", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
+            use_hosted_semantic_layer=getattr(args, "use_hosted_semantic_layer", False),
         )
     )
 
@@ -1199,6 +1300,8 @@ def query_batch(
                         "row_count": statement.result.row_count,
                         "truncated": statement.result.truncated,
                         "tables": statement.result.tables,
+                        "column_notes": statement.result.column_notes,
+                        "query_notes": statement.result.query_notes,
                         "notes": statement.result.notes,
                         "warnings": statement.result.warnings,
                     }
@@ -1393,7 +1496,7 @@ def _run_statements(
     if not shared.profiled:
         _price_statements(shared.adapter, live, size, ledger)
 
-    _execute(engine, shared, batch, limits, ledger)
+    _execute(engine, shared, batch, limits, ledger, cache, dialect)
     return batch, shared
 
 
@@ -1447,6 +1550,8 @@ def _execute(
     batch: list[_Statement],
     limits: QueryLimits,
     ledger: Callable[[_Statement, dict], None],
+    cache: DexCache,
+    dialect: str,
 ) -> None:
     """Run each approved statement in order, against one shared payload budget.
 
@@ -1498,12 +1603,18 @@ def _execute(
             statement.inspected,
             limits,
             budget_bytes=None if len(batch) == 1 else budget,
+            cache=cache,
+            dialect=dialect,
         )
         budget -= payload.pop("payload_bytes")
         notes = payload.pop("notes")
+        column_notes = payload.pop("column_notes", None)
+        query_notes = payload.pop("query_notes", None)
         statement.result = QueryResult(
             **payload,
             profiled_on_demand=shared.profiled,
+            column_notes=column_notes,
+            query_notes=query_notes,
             notes=notes,
             # A lone statement carries the call's own warnings, because there is no
             # batch record above it to hold them.
@@ -1818,6 +1929,7 @@ def map(
     infer_by_overlap: bool = False,
     refresh: bool = False,
     use_project: bool = False,
+    use_hosted_semantic_layer: bool = False,
 ) -> MapResult:
     """The whole landscape in one pass: inventory, ranked profiling, and joins.
 
@@ -1839,6 +1951,9 @@ def map(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
+    catalog = _semantic_catalog(
+        engine, use_project, use_hosted_semantic_layer=use_hosted_semantic_layer
+    )
     hints = _merged_hints(config.ranking_hints, defs.metric_models)
 
     adapter = engine._adapter("explore map")
@@ -1953,9 +2068,21 @@ def map(
         all_selected, inferred, _dev_schemas(config)
     )
 
-    declared, declared_notes = rel_mod.declared_relationships(
-        defs, [m.identifier for m in metas]
+    # Resolved against the full live inventory rather than the profiled subset:
+    # a declared join between two objects the rank cutoff skipped is still a fact
+    # about this warehouse, and both channels are read on the same terms.
+    identifiers = [m.identifier for m in metas]
+    declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    native_edges, native_edge_notes = _native_semantic_edges(
+        engine,
+        use_project,
+        identifiers,
+        use_hosted_semantic_layer=use_hosted_semantic_layer,
     )
+    declared, _native_already_declared = _fold_semantic_edges(declared, native_edges)
+    semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
+    declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
+    relationship_conflicts = _declared_relationship_conflicts(declared)
     relationship_set, confirmed = _merge_relationships(declared, inferred)
 
     # A prior overlap-derived edge (issue #220) is never rediscovered by
@@ -2086,8 +2213,22 @@ def map(
         if child is not None:
             child.data_quality.append(text)
 
+    # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
+    # composed set rather than this run's profiles: the link is derived from the
+    # project, not from a scan, so an object this run declined to re-profile is
+    # marked as accurately as one it just read.
+    semantic_exposed = (
+        _annotate_semantic_exposure(datasets, catalog) if catalog is not None else 0
+    )
+
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
+    cache.provenance.inventory_namespaces = sorted(
+        {
+            *(reusable.provenance.inventory_namespaces if reusable else []),
+            *observed_namespaces,
+        }
+    )
     cache.provenance.created_at = (
         prior.provenance.created_at
         if prior and prior.provenance.created_at
@@ -2097,6 +2238,18 @@ def map(
 
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
+    notes.extend(native_edge_notes)
+    notes.extend(semantic_edge_notes)
+    notes.extend(
+        _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
+    )
+    notes.extend(_relationship_conflict_notes(relationship_conflicts))
+    if semantic_exposed:
+        notes.append(
+            f"{semantic_exposed} object(s) are exposed through the project's "
+            "semantic layer (see semantic_models on each); the rest back no "
+            "metric, which is what separates a load-bearing table from a large one"
+        )
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
     if confirmed:
@@ -2177,6 +2330,12 @@ def map(
     )
     if overlap_warning:
         warnings.append(overlap_warning)
+    # The same sentence `profile` emits when a `pii_overrides` entry names a
+    # column the profiled table does not have (issue #448). `map` is the
+    # command a host schedules, so this is where a rename that orphaned an
+    # override gets seen; over the composed set, fresh and carried alike, so
+    # a cache hit does not hide it.
+    warnings.extend(_override_mismatches(datasets, config.pii_overrides))
 
     # Same ordering the payload's own selection uses: rank first, identifier
     # second. Two orderings derived from one cache inside one envelope would be a
@@ -2205,6 +2364,7 @@ def map(
         ],
         objects=view.objects,
         edges=view.edges,
+        conflicts=relationship_conflicts,
         elided_object_count=view.elided_object_count,
         elided_column_count=view.elided_column_count,
         elided_edge_count=view.elided_edge_count,
@@ -2228,6 +2388,7 @@ def cmd_map(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             infer_by_overlap=getattr(args, "infer_by_overlap", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
+            use_hosted_semantic_layer=getattr(args, "use_hosted_semantic_layer", False),
         )
     )
 
@@ -2366,6 +2527,14 @@ def cluster(
         seed=limits.sample_seed,
     )
     repeatable = cluster_mod.sample_is_repeatable(adapter.dialect, limits.sample_seed)
+    if sample_method == cluster_mod.UNRECOGNIZED_DIALECT_NOTE:
+        # #313: a connector with no sampling entry silently scanned the whole
+        # table, with the cost showing up only as a bigger bill. An informational
+        # note is easy to miss; a warning is not.
+        warnings.append(
+            f"'{adapter.dialect}' has no sampling clause registered; this reads "
+            "the whole table, bounded only by the cost gate"
+        )
     adapter_name = adapter.name
     query_estimate = getattr(adapter, "query_estimate", None)
     sample_estimate = query_estimate(sample_sql) if query_estimate else 0.0
@@ -2725,11 +2894,13 @@ def _select_cluster_features(
 
 
 def _shape_query_payload(
-    result: QueryResult,
+    result: AdapterQueryResult,
     inspected: InspectedQuery,
     limits: QueryLimits,
     *,
     budget_bytes: int | None = None,
+    cache: DexCache | None = None,
+    dialect: str = "duckdb",
 ) -> dict:
     """Cap the result for agent context: row-major cells, cell-width truncation,
     and a payload byte cap, each announced in `notes` so a cut result is never
@@ -2782,7 +2953,7 @@ def _shape_query_payload(
             "the query, or raise query.max_rows in .dex/config.yml"
         )
 
-    return {
+    payload = {
         "columns": result.columns,
         "types": result.types,
         "cells": cells,
@@ -2792,6 +2963,297 @@ def _shape_query_payload(
         "notes": notes,
         "payload_bytes": len(json.dumps(cells)),
     }
+    if cache is not None:
+        annotations = _query_annotations(result.columns, inspected, cache, dialect)
+        payload.update(annotations)
+    return payload
+
+
+def _query_annotations(
+    output_columns: list[str],
+    inspected: InspectedQuery,
+    cache: DexCache,
+    dialect: str,
+) -> dict[str, dict]:
+    """Attach cache-backed judgment to a successful query result.
+
+    The helper is deliberately conservative: it emits only facts already in the
+    exploration cache and only when a query expression resolves directly to a
+    physical cached column or to a cached verified relationship.
+    """
+
+    try:
+        root = sqlglot.parse_one(inspected.sql, dialect=dialect)
+    except sqlglot.errors.ParseError:
+        return {}
+    if not isinstance(root, exp.Select):
+        return {}
+
+    sources = _query_annotation_sources(root, inspected.tables, cache)
+    if not sources:
+        return {}
+
+    projected = _projected_physical_columns(root, output_columns, sources)
+    column_notes = _column_notes(projected)
+    grouping = _grouping_notes(root, sources)
+    joins = _join_notes(root, sources, cache.relationships)
+
+    payload: dict[str, dict] = {}
+    if column_notes:
+        payload["column_notes"] = column_notes
+    query_notes = {}
+    if grouping:
+        query_notes["grouping"] = grouping
+    if joins:
+        query_notes["joins"] = joins
+    if query_notes:
+        payload["query_notes"] = query_notes
+    return payload
+
+
+def _query_annotation_sources(
+    root: exp.Select, tables: list[str], cache: DexCache
+) -> dict[str, Dataset]:
+    datasets = {d.identifier: d for d in cache.datasets}
+    sources: dict[str, Dataset] = {}
+    for table in root.find_all(exp.Table):
+        matches = match_identifier(table.name, tables)
+        if len(matches) != 1:
+            continue
+        dataset = datasets.get(matches[0])
+        if dataset is None:
+            continue
+        sources[table.alias_or_name.lower()] = dataset
+        sources[table.name.lower()] = dataset
+    return sources
+
+
+def _projected_physical_columns(
+    root: exp.Select,
+    output_columns: list[str],
+    sources: dict[str, Dataset],
+) -> list[tuple[str, Dataset, str]]:
+    projected: list[tuple[str, Dataset, str]] = []
+    for index, projection in enumerate(root.expressions):
+        if index >= len(output_columns):
+            break
+        column = projection
+        if isinstance(projection, exp.Alias):
+            column = projection.this
+        if not isinstance(column, exp.Column):
+            continue
+        resolved = _resolve_query_column(column, sources)
+        if resolved is None:
+            continue
+        dataset, source_column = resolved
+        projected.append((output_columns[index], dataset, source_column.name))
+    return projected
+
+
+def _column_notes(
+    projected: list[tuple[str, Dataset, str]],
+) -> dict[str, list[dict]] | None:
+    notes: list[dict] = []
+    selected_by_dataset: dict[str, tuple[Dataset, list[str]]] = {}
+    for output, dataset, source_name in projected:
+        column = _cached_column(dataset, source_name)
+        if column is None:
+            continue
+        selected_by_dataset.setdefault(dataset.identifier, (dataset, []))[1].append(
+            source_name
+        )
+        note = {
+            "column": output,
+            "table": dataset.identifier,
+            "source_column": column.name,
+        }
+        has_note = False
+        if column.null_fraction:
+            note["null_fraction"] = column.null_fraction
+            has_note = True
+        if column.pii is not None:
+            note["pii"] = column.pii.model_dump(mode="json")
+            has_note = True
+        if has_note:
+            notes.append(note)
+
+    grain_notes: list[dict] = []
+    for dataset, selected in selected_by_dataset.values():
+        if not dataset.grain:
+            continue
+        selected_lower = {c.lower() for c in selected}
+        grain_lower = {c.lower() for c in dataset.grain}
+        if not grain_lower <= selected_lower:
+            continue
+        grain_notes.append(
+            {
+                "table": dataset.identifier,
+                "columns": dataset.grain,
+                "selected_columns": selected,
+                "covered": True,
+            }
+        )
+
+    if not notes and not grain_notes:
+        return None
+    payload: dict[str, list[dict]] = {}
+    if notes:
+        payload["columns"] = notes
+    if grain_notes:
+        payload["grain"] = grain_notes
+    return payload
+
+
+def _grouping_notes(root: exp.Select, sources: dict[str, Dataset]) -> list[dict]:
+    group = root.args.get("group")
+    if group is None:
+        return []
+    grouped: dict[str, tuple[Dataset, list[str]]] = {}
+    for expression in group.expressions:
+        if not isinstance(expression, exp.Column):
+            continue
+        resolved = _resolve_query_column(expression, sources)
+        if resolved is None:
+            continue
+        dataset, column = resolved
+        grouped.setdefault(dataset.identifier, (dataset, []))[1].append(column.name)
+
+    notes = []
+    for dataset, columns in grouped.values():
+        if not dataset.grain:
+            continue
+        grouped_lower = {c.lower() for c in columns}
+        grain_lower = {c.lower() for c in dataset.grain}
+        if grouped_lower == grain_lower:
+            match = "matches_grain"
+        elif grain_lower <= grouped_lower:
+            match = "covers_grain"
+        else:
+            match = "misses_grain"
+        notes.append(
+            {
+                "table": dataset.identifier,
+                "columns": columns,
+                "grain": dataset.grain,
+                "match": match,
+            }
+        )
+    return notes
+
+
+def _join_notes(
+    root: exp.Select,
+    sources: dict[str, Dataset],
+    relationships: list[Relationship],
+) -> list[dict]:
+    notes: list[dict] = []
+    seen: set[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = set()
+    for join in root.find_all(exp.Join):
+        predicate = join.args.get("on")
+        if predicate is None:
+            continue
+        for eq in predicate.find_all(exp.EQ):
+            if not isinstance(eq.left, exp.Column) or not isinstance(
+                eq.right, exp.Column
+            ):
+                continue
+            left = _resolve_query_column(eq.left, sources)
+            right = _resolve_query_column(eq.right, sources)
+            if left is None or right is None:
+                continue
+            left_dataset, left_column = left
+            right_dataset, right_column = right
+            if left_dataset.identifier == right_dataset.identifier:
+                continue
+            relationship = _matching_verified_relationship(
+                relationships,
+                left_dataset.identifier,
+                left_column.name,
+                right_dataset.identifier,
+                right_column.name,
+            )
+            if relationship is None:
+                continue
+            key = (
+                relationship.from_dataset,
+                tuple(relationship.from_columns),
+                relationship.to_dataset,
+                tuple(relationship.to_columns),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            note = {
+                "from_table": relationship.from_dataset,
+                "from_columns": relationship.from_columns,
+                "to_table": relationship.to_dataset,
+                "to_columns": relationship.to_columns,
+                "verified": True,
+            }
+            if relationship.orphan_fraction is not None:
+                note["orphan_fraction"] = relationship.orphan_fraction
+            notes.append(note)
+    return notes
+
+
+def _resolve_query_column(
+    column: exp.Column, sources: dict[str, Dataset]
+) -> tuple[Dataset, ColumnProfile] | None:
+    if column.table:
+        dataset = sources.get(column.table.lower())
+        if dataset is None:
+            return None
+    else:
+        unique_sources = {d.identifier: d for d in sources.values()}
+        if len(unique_sources) != 1:
+            return None
+        dataset = next(iter(unique_sources.values()))
+    cached = _cached_column(dataset, column.name)
+    if cached is None:
+        return None
+    return dataset, cached
+
+
+def _cached_column(dataset: Dataset, name: str) -> ColumnProfile | None:
+    lowered = name.lower()
+    for column in dataset.columns:
+        if column.name.lower() == lowered:
+            return column
+    return None
+
+
+def _matching_verified_relationship(
+    relationships: list[Relationship],
+    left_dataset: str,
+    left_column: str,
+    right_dataset: str,
+    right_column: str,
+) -> Relationship | None:
+    for relationship in relationships:
+        if not relationship.verified:
+            continue
+        if _relationship_matches(
+            relationship, left_dataset, left_column, right_dataset, right_column
+        ) or _relationship_matches(
+            relationship, right_dataset, right_column, left_dataset, left_column
+        ):
+            return relationship
+    return None
+
+
+def _relationship_matches(
+    relationship: Relationship,
+    from_dataset: str,
+    from_column: str,
+    to_dataset: str,
+    to_column: str,
+) -> bool:
+    return (
+        relationship.from_dataset.lower() == from_dataset.lower()
+        and relationship.to_dataset.lower() == to_dataset.lower()
+        and [c.lower() for c in relationship.from_columns] == [from_column.lower()]
+        and [c.lower() for c in relationship.to_columns] == [to_column.lower()]
+    )
 
 
 def _project_definitions(
@@ -2835,7 +3297,343 @@ def _project_definitions(
     # Through the seam rather than the module: this is the one project read on the
     # explore path, and `definitions()` is the channel declared keys and joins
     # reach dex through at all. Whichever format configuration named answers here.
-    return engine.project_format().definitions()
+    defs = engine.project_format().definitions()
+    return _fold_semantic_layer_keys(engine, defs)
+
+
+def _fold_semantic_layer_keys(
+    engine: DexEngine, defs: dbt_project.ProjectDefinitions
+) -> dbt_project.ProjectDefinitions:
+    """A semantic layer's own declared dataset keys, folded into the grain
+    channel (#408), through the same capability every format already answers
+    rather than a name check on which one is configured.
+
+    Empty for a layer whose keys already reach grain through the transformation
+    project's own `definitions()` (dbt); non-empty only for a layer that is
+    itself the sole declaration channel for its repository (native Ossie
+    documents, never a transformation project). A repo may have both, and both
+    are additive, not a choice between them.
+    """
+
+    if engine.repo_root is None:
+        return defs
+    try:
+        from .semantic import resolve_semantic_layer
+
+        keys, composite_keys = resolve_semantic_layer(
+            engine, local=True
+        ).declared_keys()
+    except (DexError, ValueError, OSError):
+        return defs
+    if not keys and not composite_keys:
+        return defs
+    return defs.model_copy(
+        update={
+            "present": True,
+            "declared_keys": [*defs.declared_keys, *keys],
+            "declared_composite_keys": [*defs.declared_composite_keys, *composite_keys],
+        }
+    )
+
+
+def _semantic_catalog(
+    engine: DexEngine, use_project: bool, *, use_hosted_semantic_layer: bool = False
+):
+    """The repository-local semantic layer as a read catalog, or None.
+
+    The optional channel beside tier 2, read the way :func:`_project_definitions`
+    reads tier 1, and gated the same way: exploration starts bare, so a project's
+    declared join graph and its physical exposure fold in only when
+    ``--use-project`` asks for them. Without the flag the default map's payload is
+    byte-identical to what it was.
+
+    With both flags, both sources are read and composed (#408) rather than one
+    winning by accidental precedence: the local read and the hosted read answer
+    different questions (a repository's own declarations versus a service's own
+    metadata) and neither subsumes the other. Composition is additive, local
+    first, so a name both declare keeps the local entry, the one with physical
+    relations.
+
+    **None on every declinable condition, and it never raises**, which is the
+    difference between this and calling ``semantic_catalog()`` directly. There is
+    no repo, or the configured format does not read a semantic layer, or the
+    project has no compiled semantic manifest yet: every one of those is an
+    ordinary state on the explore path, where the warehouse is the subject and a
+    project is a bonus. ``explore semantic list`` is the command whose whole
+    subject *is* the layer, and it is the one that refuses by name instead.
+    """
+
+    from .semantic import resolve_semantic_layer
+
+    if not use_project and not use_hosted_semantic_layer:
+        return None
+
+    # Each side is read and caught on its own (rather than one shared try) so
+    # that a hosted read this vendor has no deployment for (Ossie has no dbt
+    # Cloud counterpart, for instance) degrades to the local view instead of
+    # discarding a local read that already succeeded.
+    local_view = None
+    if use_project:
+        try:
+            # The local override is intentional: --use-project is a free,
+            # repository-only enrichment read even when semantic execution
+            # defaults to dbt Cloud. SemanticLayer owns the catalog rather
+            # than Project.
+            layer = resolve_semantic_layer(engine, local=True)
+            local_view = layer.list_definitions().view
+        except (DexError, ValueError, OSError):
+            local_view = None
+
+    if not use_hosted_semantic_layer:
+        return local_view
+
+    hosted_view = None
+    try:
+        hosted_view = resolve_semantic_layer(engine, api=True).list_definitions().view
+        hosted_view.notes.append(
+            "hosted semantic metadata was read by --use-hosted-semantic-layer; "
+            "this backend does not expose physical relations, so it cannot add "
+            "map exposure annotations or relationship edges on its own"
+        )
+    except (DexError, ValueError, OSError):
+        hosted_view = None
+
+    if local_view is not None and hosted_view is not None:
+        return _compose_semantic_catalogs(local_view, hosted_view)
+    return local_view if local_view is not None else hosted_view
+
+
+def _compose_semantic_catalogs(
+    local_view: SemanticCatalogView, hosted_view: SemanticCatalogView
+) -> SemanticCatalogView:
+    """Both sources folded into one read catalog (#408).
+
+    Additive, never a choice between them: a repository's own declarations and
+    a service's own metadata answer different questions, so a caller asking for
+    both gets the union. Identity is by name within each collection, local
+    first, since the local read is the one with physical relations
+    (``--use-project``'s own contract); a name both declare keeps the local
+    entry rather than whichever iteration order happened to reach it. Entities
+    are the one collection already merged across models by construction (see
+    :class:`~..semantic_catalog.EntityInfo`), so composing two sources means
+    combining their roles the same way and re-deriving the summary type from
+    the wider set, not picking one side's entity over the other's.
+    """
+
+    def _merge(local_items: list, hosted_items: list, key) -> list:
+        seen = {key(item) for item in local_items}
+        return list(local_items) + [
+            item for item in hosted_items if key(item) not in seen
+        ]
+
+    entities_by_name = {e.name: e for e in local_view.entities}
+    for hosted_entity in hosted_view.entities:
+        existing = entities_by_name.get(hosted_entity.name)
+        if existing is None:
+            entities_by_name[hosted_entity.name] = hosted_entity
+            continue
+        roles = list(existing.roles)
+        seen_roles = {(r.semantic_model, r.type, r.column) for r in roles}
+        roles.extend(
+            role
+            for role in hosted_entity.roles
+            if (role.semantic_model, role.type, role.column) not in seen_roles
+        )
+        entities_by_name[hosted_entity.name] = EntityInfo(
+            name=existing.name,
+            type=derive_entity_type(roles),
+            label=existing.label or hosted_entity.label,
+            description=existing.description or hosted_entity.description,
+            roles=roles,
+        )
+
+    return SemanticCatalogView(
+        semantic_models=_merge(
+            local_view.semantic_models, hosted_view.semantic_models, lambda m: m.name
+        ),
+        metrics=_merge(local_view.metrics, hosted_view.metrics, lambda m: m.name),
+        dimensions=_merge(
+            local_view.dimensions,
+            hosted_view.dimensions,
+            lambda d: (d.semantic_model, d.name),
+        ),
+        entities=list(entities_by_name.values()),
+        measures=_merge(
+            local_view.measures,
+            hosted_view.measures,
+            lambda m: (m.semantic_model, m.name),
+        ),
+        dimension_scope=local_view.dimension_scope,
+        notes=[*local_view.notes, *hosted_view.notes],
+        # Local wins a token both resolve, the same precedence every other
+        # collection here gives the source that has physical relations at all.
+        physical_columns={
+            **hosted_view.physical_columns,
+            **local_view.physical_columns,
+        },
+    )
+
+
+def _annotate_semantic_exposure(datasets: list[Dataset], catalog) -> int:
+    """Mark each dataset with the semantic models that sit on it. Returns how many
+    were exposed.
+
+    Runs over the **composed** set rather than this run's profiles, unlike
+    :func:`_annotate_grain`: the link is derived from the project rather than from
+    a scan, so it costs nothing to apply to a carried-forward object, and leaving
+    those unmarked would make the annotation read as "not exposed" for exactly the
+    objects a narrower run declined to re-profile.
+
+    Every dataset in view is written, empty list included, so a model dropped from
+    the layer clears on the next run instead of persisting as a stale claim. That
+    is only correct because the caller reaches this at all only when a catalog was
+    actually read; with no catalog nothing here runs and the prior values stand.
+    """
+
+    known = [d.identifier for d in datasets]
+    by_identifier: dict[str, set[str]] = {}
+    for model in catalog.semantic_models:
+        if not model.relation:
+            continue
+        # The same resolution a declared join's endpoints go through, and for the
+        # same reason: a compiled manifest spells the database component the way
+        # dbt was configured while the adapter normalizes it per connector, so an
+        # exact compare would expose nothing on a project that works. A relation
+        # matching several objects here resolves to none of them rather than to a
+        # guess.
+        identifier, _ambiguous = rel_mod.resolve_declared(
+            model.relation, model.name, known
+        )
+        if identifier is not None:
+            by_identifier.setdefault(identifier, set()).add(model.name)
+    exposed = 0
+    for dataset in datasets:
+        models = sorted(by_identifier.get(dataset.identifier, ()))
+        dataset.semantic_models = models
+        exposed += bool(models)
+    return exposed
+
+
+def _semantic_edges(
+    catalog, identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """The layer's declared entity graph as join edges, or nothing without one."""
+
+    if catalog is None:
+        return [], []
+    return rel_mod.semantic_relationships(entity_joins(catalog), identifiers)
+
+
+def _native_semantic_edges(
+    engine: DexEngine,
+    use_project: bool,
+    identifiers: list[str],
+    *,
+    use_hosted_semantic_layer: bool = False,
+) -> tuple[list[Relationship], list[str]]:
+    """Native layer declarations, including composite pairs, as cached edges.
+
+    Reads both sources when both flags ask for one, the same composition
+    :func:`_semantic_catalog` gives the rest of the catalog (#408): a hosted
+    backend that ever starts returning direct physical relations gets folded in
+    beside the local read rather than silently ignored because a local project
+    happened to be configured too. Today no shipped hosted backend returns
+    anything here (dbt Cloud has no physical relation to name), so this is a
+    no-op in practice and every edge still comes from the local layer.
+    """
+
+    if engine.repo_root is None or not (use_project or use_hosted_semantic_layer):
+        return [], []
+    from .semantic import resolve_semantic_layer
+
+    declarations: list[Any] = []
+    if use_project:
+        with contextlib.suppress(DexError, ValueError, OSError):
+            declarations.extend(
+                resolve_semantic_layer(engine, local=True).declared_relationships()
+            )
+    if use_hosted_semantic_layer:
+        with contextlib.suppress(DexError, ValueError, OSError):
+            declarations.extend(
+                resolve_semantic_layer(engine, api=True).declared_relationships()
+            )
+    if not declarations:
+        return [], []
+    return rel_mod.declared_relationships(
+        dbt_project.ProjectDefinitions(declared_relationships=declarations), identifiers
+    )
+
+
+def _fold_semantic_edges(
+    declared: list[Relationship], semantic: list[Relationship]
+) -> tuple[list[Relationship], int]:
+    """Semantic edges added to the declared set, deduped against it.
+
+    Returns the widened declared set and how many semantic edges the project's
+    ``relationships`` tests already stated. Both channels are declarations of the
+    same tier, so an edge in both is one edge; which of the two named it first is
+    not a fact about the warehouse, and doubling it would inflate the connectivity
+    ranking the same way a doubled declared/inferred pair would.
+    """
+
+    known = {_relationship_edge_key(rel) for rel in declared}
+    merged = list(declared)
+    already = 0
+    for rel in semantic:
+        if _relationship_edge_key(rel) in known:
+            already += 1
+            existing = next(
+                item
+                for item in merged
+                if _relationship_edge_key(item) == _relationship_edge_key(rel)
+            )
+            sources = sorted(
+                set(existing.declaration_sources) | set(rel.declaration_sources)
+            )
+            existing.declaration_sources = sources
+            continue
+        known.add(_relationship_edge_key(rel))
+        merged.append(rel)
+    return merged, already
+
+
+def _semantic_join_notes(
+    semantic: list[Relationship], already_declared: int, inferred: list[Relationship]
+) -> list[str]:
+    """What the declared entity graph added, and specifically what it rescued.
+
+    The count alone is not the interesting number. An edge the semantic layer
+    declares and name-based inference did not find is a join that would otherwise
+    be missing from the map entirely, with a key no naming rule could have matched,
+    and that is the case worth naming out loud: it is the whole argument for
+    reading the graph rather than scanning for it.
+    """
+
+    if not semantic:
+        return []
+    inferred_keys = {_relationship_edge_key(rel) for rel in inferred}
+    missed = [
+        rel for rel in semantic if _relationship_edge_key(rel) not in inferred_keys
+    ]
+    notes = [
+        f"{len(semantic)} join(s) come from the semantic layer's declared entity "
+        "graph, at the declared tier: the layer states the join and names its key "
+        "per model, so these are read rather than inferred"
+    ]
+    if missed:
+        named = ", ".join(
+            sorted({rel.declared_by for rel in missed if rel.declared_by})[:5]
+        )
+        notes.append(
+            f"{len(missed)} of them were not found by name-based inference and "
+            f"would otherwise be missing from this map ({named})"
+        )
+    if already_declared:
+        notes.append(
+            f"{already_declared} of them are also declared by a relationships "
+            "test; counted once"
+        )
+    return notes
 
 
 def _relationship_edge_key(rel: Relationship) -> tuple:
@@ -2845,6 +3643,70 @@ def _relationship_edge_key(rel: Relationship) -> tuple:
         rel.to_dataset.lower(),
         tuple(c.lower() for c in rel.to_columns),
     )
+
+
+def _declared_relationship_conflicts(
+    declared: list[Relationship],
+) -> list[DeclaredRelationshipConflict]:
+    """Declarations that join the same two datasets with different columns
+    (#408): a project's own ``relationships`` test, a semantic layer's shared
+    entity, and a native declaration are three channels that can each state a
+    join between one pair of datasets, and nothing before this point notices
+    when two of them disagree about which columns it runs on.
+
+    Both edges still survive in the merged set (:func:`_fold_semantic_edges`
+    only folds an exact match); this only names the disagreement, since which
+    columns actually join is a fact about the warehouse only one declaration
+    can be right about, and picking a winner or merging one column set into
+    the other would be inventing evidence no declaration offered.
+    """
+
+    by_endpoint: dict[tuple[str, str], dict[tuple, Relationship]] = {}
+    for rel in declared:
+        if rel.kind is not RelationshipKind.DECLARED:
+            continue
+        endpoint = (rel.from_dataset.lower(), rel.to_dataset.lower())
+        by_endpoint.setdefault(endpoint, {})[_relationship_edge_key(rel)] = rel
+
+    conflicts: list[DeclaredRelationshipConflict] = []
+    for edges in by_endpoint.values():
+        if len(edges) < 2:
+            continue
+        first = next(iter(edges.values()))
+        conflicts.append(
+            DeclaredRelationshipConflict(
+                from_dataset=first.from_dataset,
+                to_dataset=first.to_dataset,
+                declarations=[
+                    ConflictingRelationshipDeclaration(
+                        column_pairs=[
+                            [frm, to]
+                            for frm, to in zip(
+                                rel.from_columns, rel.to_columns, strict=False
+                            )
+                        ],
+                        source=", ".join(rel.declaration_sources)
+                        or rel.declared_by
+                        or "unknown",
+                    )
+                    for rel in edges.values()
+                ],
+            )
+        )
+    return conflicts
+
+
+def _relationship_conflict_notes(
+    conflicts: list[DeclaredRelationshipConflict],
+) -> list[str]:
+    if not conflicts:
+        return []
+    named = ", ".join(f"{c.from_dataset} -> {c.to_dataset}" for c in conflicts[:5])
+    return [
+        f"{len(conflicts)} declared relationship(s) disagree on which columns "
+        f"join the same two datasets ({named}); every declaration is kept as "
+        "its own edge rather than dex picking a winner, see data.conflicts"
+    ]
 
 
 def _merge_relationships(
@@ -3062,6 +3924,9 @@ def _annotate_grain(
     for ds in datasets:
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
+        # After candidate_keys, because the reported half has to come back in
+        # exactly its order; the probe's suppressed entries ride through.
+        ds.key_evidence = rel_mod.key_evidence(ds)
         ds.data_quality.extend(rel_mod.data_quality_notes(ds))
         if orphaned and ds.identifier in orphaned:
             ds.data_quality.append(
@@ -3078,10 +3943,21 @@ def _annotate_grain(
             )
             if profiled is not None:
                 declared = [profiled.name]
-                if ds.grain and ds.grain != declared:
+                if ds.grain != declared:
+                    # Says where the grain came from either way. "Measurement
+                    # found none" is as much worth stating as a disagreement:
+                    # it is the case where the declaration is carrying the
+                    # answer on its own, and a reader who cannot tell that
+                    # apart from a confirmed guess does not know how much the
+                    # grain rests on.
+                    origin = (
+                        f"heuristic suggested {', '.join(ds.grain)}"
+                        if ds.grain
+                        else "measurement found no key of its own"
+                    )
                     ds.data_quality.append(
                         f"grain {profiled.name} comes from the project's declared "
-                        f"primary entity (heuristic suggested {', '.join(ds.grain)})"
+                        f"primary entity ({origin})"
                     )
                 ds.grain = declared
         for col in ds.columns:
@@ -3138,11 +4014,15 @@ def _annotate_grain(
                             f"table; using {', '.join(chosen)} (also declared: "
                             f"{others})"
                         )
-                    if ds.grain and ds.grain != chosen:
+                    if ds.grain != chosen:
+                        origin = (
+                            f"heuristic suggested {', '.join(ds.grain)}"
+                            if ds.grain
+                            else "measurement found no key of its own"
+                        )
                         ds.data_quality.append(
                             f"grain {', '.join(chosen)} comes from the project's "
-                            "declared composite key (heuristic suggested "
-                            f"{', '.join(ds.grain)})"
+                            f"declared composite key ({origin})"
                         )
                     ds.grain = chosen
 
@@ -3332,7 +4212,13 @@ def _split_fresh_stale(
     mismatched-connector or absent prior — mirroring ``cmd_map``'s reuse gate.
 
     Freshness is fail-closed: a missing or unparseable ``profiled_at``, or any
-    doubt, re-profiles rather than trusting a stale scan.
+    doubt, re-profiles rather than trusting a stale scan. A cache written before
+    the current ``CACHE_SCHEMA_VERSION`` is stale for the same reason: an older
+    profile can carry verdicts this version would no longer reach (a composite
+    key later recognized as an artifact of a near-unique column, say), and
+    reusing one would keep a superseded answer alive and keep charging a metered
+    connector to re-check it. One scan per table per upgrade, and no caller has
+    to know to pass ``--refresh``.
 
     This is the gate for a *deliberate* profile, which is why the age window
     belongs in it. The on-demand path asks a narrower question (see
@@ -3346,7 +4232,12 @@ def _split_fresh_stale(
     common, not on ``ObjectMeta``.
     """
 
-    if refresh or prior is None or prior.provenance.connector != connector:
+    if (
+        refresh
+        or prior is None
+        or prior.provenance.connector != connector
+        or prior.schema_version < CACHE_SCHEMA_VERSION
+    ):
         return list(identifiers), {}
 
     prior_by_id = {d.identifier: d for d in prior.datasets if d.columns}
@@ -3521,6 +4412,7 @@ def _merge_profiles(
     now: datetime,
     *,
     relationships=_KEEP_RELATIONSHIPS,
+    observed_namespaces: set[str] | None = None,
 ) -> tuple[DexCache, dict]:
     """Fold freshly profiled datasets into a prior cache, keyed by identifier.
 
@@ -3559,6 +4451,12 @@ def _merge_profiles(
         rels = relationships
     cache = DexCache(datasets=datasets, relationships=rels)
     cache.provenance.connector = connector
+    cache.provenance.inventory_namespaces = sorted(
+        {
+            *(reusable.provenance.inventory_namespaces if reusable else []),
+            *(observed_namespaces or set()),
+        }
+    )
     cache.provenance.created_at = (
         reusable.provenance.created_at
         if reusable and reusable.provenance.created_at

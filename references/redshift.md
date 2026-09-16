@@ -88,7 +88,7 @@ rather than hides:
 **Metered:** profiling aggregates, `explore query`, relationship
 verification probes, distinct-count escalations, and `transform build`.
 
-`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statements rather than added afterward, so the estimate you confirm is the whole cost. A call carrying several statements is quoted once for all of them, itemized per statement, and an object two of them share is scanned once rather than twice. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+`explore query` and `explore cluster` bill an auto-profile of an object this connection has that the `.dex/` cache cannot adjudicate, priced into the same handshake as the statements: see [`cost-controls.md`](cost-controls.md). Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
 
 Budgets (`budget.ceiling`, `--budget`, `budget.session_ceiling`) are
 compute-seconds: the number you budget is the number the server enforces.
@@ -106,20 +106,34 @@ conservative capacity-scaled scan rate; every handshake payload carries
 each compiled model, snapshot, and test is estimated and summed into the
 build's upfront cost.
 
+`transform build --verify` costs only where the warehouse keeps no row
+count, so a table's count is free metadata; how the counts are priced into
+the build's own estimate is in
+[`cost-controls.md`](cost-controls.md).
+
+`transform test --mutate` prices its whole batch as one number and confirms it
+once, then runs one dbt invocation per mutant. Nothing is materialized: a mutant
+builds as an ephemeral model, so the dev namespace holds exactly the relations it
+held before. A budget that runs out partway stops the run, and the remaining
+mutants are reported `not_run` rather than the budget being exceeded.
+
+
+`--verify` also folds `redshift.dev_schema` into its read scope for the length of that one
+command, because dbt writes the relations it is judging there and that namespace
+is refused as a source everywhere else. The widening shows in the envelope's
+`connection.target`; nothing is written back to `.dex/config.yml`.
+
+
 **The budget is hard-enforced regardless of estimate quality.** Before every
 metered statement the session's `statement_timeout` is set to the remaining
 budget, so a wrong heuristic cannot overrun the ceiling: Redshift kills the
 statement and dex reports the over-ceiling refusal. Actual spend is
 wall-clock seconds per statement (a killed statement still bills what ran),
-recorded to `.dex/spend.jsonl` as `billed_seconds` and summed into the daily
-session ceiling. Every session connects as `application_name = 'dex'`
+recorded as `billed_seconds` in the ledger. Every session connects as `application_name = 'dex'`
 (`SYS_CONNECTION_LOG`) and sets `query_group = 'dex'` for attribution.
 
-The handshake is the same strict two-step as every metered connector: a
-scanning command without `--confirm` returns `needs_confirmation` carrying
-the seconds estimate (per table where relevant) and its RPU translation;
-re-issue with `--confirm --budget <seconds>`. Nothing executes unconfirmed
-or without a ceiling, and an estimate over the ceiling is refused outright.
+The estimate carries its RPU translation; the handshake itself is in
+[`cost-controls.md`](cost-controls.md).
 
 ## Read-only, enforced in depth
 
@@ -150,8 +164,9 @@ upgrades the `SVV_TABLE_INFO` row estimate to an exact figure. When no single
 column proves unique, the composite-key probe (a bounded batch of exact
 distinct-combination counts) spends inside the same confirmed budget, and
 like the escalation it carries the pending Serverless wake minimum when it
-bills first; when the remaining budget cannot cover it, the probe skips with
-a note and the grain stays unknown. `SUPER`,
+bills first; when the remaining budget cannot cover every pair, the probe
+narrows to the best-ranked pairs it can afford, and skips with a note only
+when it cannot afford one, in which case the grain stays unknown. `SUPER`,
 `VARBYTE`, `GEOMETRY`, `GEOGRAPHY`, and `HLLSKETCH` columns degrade to
 non-null counts. There is **no sampled-profiling threshold**: Redshift has
 no TABLESAMPLE, so a sampling knob would be a lie; the budget is the only
@@ -170,6 +185,24 @@ string on every row, with a sentinel every predicate built on the cast
 rejects. It is enforced offline for all six adapters (see
 `assert_every_cast_is_total`), because no unit test can catch a dialect that
 disagrees with the standard about evaluation order.
+
+**Two more spellings the server refuses outright, both verified live.**
+`DATEDIFF` resolves to `pg_catalog.date_diff`, which is declared over
+`DATE`/`TIME`/`TIMETZ`/`TIMESTAMP` and has no `TIMESTAMPTZ` overload, while
+`DATE_TRUNC` over a `TIMESTAMPTZ` column returns `TIMESTAMPTZ`: the periods
+the temporal-continuity probe diffs are exactly the shape it rejects
+(`function pg_catalog.date_diff("unknown", timestamp with time zone,
+timestamp with time zone) does not exist`), which failed the whole profiling
+statement for any table carrying a `TIMESTAMPTZ` column. Both operands are
+therefore cast to `TIMESTAMP`, a conversion that is total for every type
+reaching that path and shifts nothing, since it applies to both sides by the
+same rule. And `SUBSTR`, the spelling the shared expressions use, is refused
+by name (`SUBSTR() function is not supported (Hint: use SUBSTRING instead)`)
+at execution over a real table, not only in a leader-node-only query, so this
+adapter emits `SUBSTRING` for the slash-date component extraction. Neither
+spelling is universal in the other direction: BigQuery has `SUBSTR` and no
+`SUBSTRING`, which is why the idiom is per-connector rather than swapped in
+the shared builder.
 
 ## dbt builds
 

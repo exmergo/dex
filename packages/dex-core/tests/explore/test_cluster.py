@@ -603,6 +603,70 @@ def test_sample_sql_skips_percent_sampling_when_row_count_unknown():
     assert_select_only(sql, dialect="bigquery")
 
 
+# --- an unrecognized dialect's silent full scan (#313) ------------------------
+#
+# `_sample_parts` falls through to `UNRECOGNIZED_DIALECT_NOTE` for a dialect it
+# has no case for. Every shipped connector has an entry, so nothing is broken
+# today; the risk is the next one: a connector added without an entry does not
+# fail, it silently reads the whole table, bounded only by the cost gate.
+
+
+def test_every_registered_dialect_has_a_real_sample_clause():
+    """The cheap half of the fix: a connector added to the adapter registry
+    without a matching case in `_sample_parts` now fails here, at merge,
+    rather than at someone's month-end bill."""
+
+    from exmergo_dex_core.adapters import _DIALECTS
+
+    for connector, dialect in _DIALECTS.items():
+        _table_suffix, _tail, method = cluster_mod._sample_parts(
+            dialect, 100, 1_000_000
+        )
+        assert method != cluster_mod.UNRECOGNIZED_DIALECT_NOTE, (
+            f"{connector!r} ({dialect!r}) has no sampling entry in _sample_parts"
+        )
+
+
+def test_an_unrecognized_dialect_still_builds_valid_sql():
+    """Not one of dex's own connectors, but a dialect sqlglot can render (the
+    shape a future connector takes): the builder degrades to no sample clause
+    rather than raising, and the note is the one `explore cluster` escalates
+    to a warning rather than an informational line."""
+
+    sql, method = cluster_mod.build_sample_sql(
+        "db.sch.customers",
+        ["spend", "visits"],
+        dialect="trino",
+        sample_rows=100,
+        row_count=1000,
+    )
+    assert method == cluster_mod.UNRECOGNIZED_DIALECT_NOTE
+    assert "SAMPLE" not in sql.upper()
+    assert_select_only(sql, dialect="trino")
+
+
+@requires_sklearn
+def test_an_unrecognized_dialect_warns_rather_than_reading_the_note_only(
+    clusterable_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The note alone lives inside `notes`, easy to miss; a full, unbounded
+    scan belongs in `warnings`, where a caller checking cost cannot miss it."""
+
+    repo = _mapped_repo(clusterable_duckdb, tmp_path, capsys)
+
+    real_build_sample_sql = cluster_mod.build_sample_sql
+
+    def _fake_build_sample_sql(*args, **kwargs):
+        sql, _method = real_build_sample_sql(*args, **kwargs)
+        return sql, cluster_mod.UNRECOGNIZED_DIALECT_NOTE
+
+    monkeypatch.setattr(cluster_mod, "build_sample_sql", _fake_build_sample_sql)
+    payload = _cluster(clusterable_duckdb, repo, capsys=capsys)
+    assert any("no sampling clause registered" in w for w in payload["warnings"]), (
+        payload["warnings"]
+    )
+
+
 # --- the companion null-count query (#160: dropped_null_rows was structurally
 # near-always 0, since the sample SQL's own filter excludes nulls before
 # Python ever sees them) -----------------------------------------------------

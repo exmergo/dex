@@ -1,0 +1,42 @@
+{
+  "name": "plan-delete-carries-no-content",
+  "contract": "portable-plan",
+  "description": "A removal. It carries no content and no content hash, and a document that puts content on a delete is refused.",
+  "payload": {
+    "schema_version": 1,
+    "plan_id": "pconformance1",
+    "intent": "a mart and its schema",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "project_dir": "analytics",
+    "edit_target": "project",
+    "engine_version": "1.10.1.dev32+gb057fca4a.d20260906",
+    "edits": [
+      {
+        "path": "models/staging/mart.sql",
+        "op": "delete",
+        "kind": "model_sql",
+        "old_content_hash": null,
+        "new_content_hash": null,
+        "new_content": null,
+        "classification": {
+          "path": "models/staging/mart.sql",
+          "artifact_class": "executable",
+          "signals": [
+            {
+              "signal": "sql_statement",
+              "where": "line 1",
+              "detail": null
+            }
+          ],
+          "basis": "content",
+          "parsed": false
+        }
+      }
+    ],
+    "digest": "sha256:f59667735933a81a0296aceb908999d574e5e06a7c708d02d60aefd9394c5970"
+  },
+  "expect": {
+    "verifies": true,
+    "digest": "sha256:f59667735933a81a0296aceb908999d574e5e06a7c708d02d60aefd9394c5970"
+  }
+}

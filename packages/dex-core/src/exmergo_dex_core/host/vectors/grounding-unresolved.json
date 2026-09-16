@@ -1,0 +1,58 @@
+{
+  "name": "grounding-unresolved",
+  "contract": "grounding",
+  "description": "A reference dex read and could not name. There is a dependency there, and reporting it is the difference between an incomplete answer and a wrong one.",
+  "payload": {
+    "edits": [
+      {
+        "path": "models/staging/dyn.sql",
+        "new_content": "select * from {{ ref(var('which')) }}\n",
+        "old_content_hash": null,
+        "op": "upsert",
+        "kind": "model_sql"
+      }
+    ]
+  },
+  "expect": {
+    "completeness": "partial",
+    "unresolved_count": 1,
+    "result": {
+      "completeness": "partial",
+      "limits": [],
+      "unresolved": [
+        {
+          "path": "models/staging/dyn.sql",
+          "line": 1,
+          "form": "ref_call",
+          "kind": "model",
+          "reason": "dex could not resolve this reference statically"
+        }
+      ],
+      "ambiguous": [],
+      "freshness": {
+        "manifest_present": false,
+        "generated_at": null,
+        "newest_source_at": "2026-09-08T01:04:26.652394+00:00",
+        "stale": null
+      },
+      "binding": {
+        "plan_digest": null,
+        "source_digest": "sha256:70cc1dd4fb5dc1831906721fa160c8c386f0ac0880fb2cc072910284f7f49c61",
+        "config_digest": null,
+        "packages_digest": null,
+        "engine_version": "1.10.1.dev32+gb057fca4a.d20260906"
+      },
+      "relations": [],
+      "dependencies": [
+        {
+          "kind": "var",
+          "name": "which",
+          "origin": "source_scan",
+          "used_in": [
+            "models/staging/dyn.sql"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,37 @@
+# One field per selection rule, so a change to the order shows up as a specific
+# failure rather than as "the dialect test broke". Every declared expression is
+# preserved whichever one dex reads.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: dialects
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          # The active connector's own dialect wins where the document has one.
+          - name: connector_wins
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: ansi_column
+                - dialect: BIGQUERY
+                  expression: bigquery_column
+                - dialect: SNOWFLAKE
+                  expression: snowflake_column
+          # No connector dialect declared, so the portable one answers.
+          - name: ansi_next
+            expression:
+              dialects:
+                - dialect: SNOWFLAKE
+                  expression: snowflake_only
+                - dialect: ANSI_SQL
+                  expression: ansi_column
+          # Neither the connector's nor the portable one: the first supported
+          # SQL dialect in declaration order.
+          - name: first_supported
+            expression:
+              dialects:
+                - dialect: DATABRICKS
+                  expression: databricks_column
+                - dialect: SNOWFLAKE
+                  expression: snowflake_column

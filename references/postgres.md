@@ -63,7 +63,7 @@ metered connector.
 - **Metered:** profiling aggregates, `explore query`, relationship
   verification probes, distinct-count escalations, and `transform build`.
 
-`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statements rather than added afterward, so the estimate you confirm is the whole cost. A call carrying several statements is quoted once for all of them, itemized per statement, and an object two of them share is scanned once rather than twice. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+`explore query` and `explore cluster` bill an auto-profile of an object this connection has that the `.dex/` cache cannot adjudicate, priced into the same handshake as the statements: see [`cost-controls.md`](cost-controls.md). Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
 
 Budgets (`budget.ceiling`, `--budget`, `budget.session_ceiling`) are
 database-seconds: the number you budget is the number the server enforces.
@@ -80,15 +80,11 @@ metered statement the session's `statement_timeout` is set to the remaining
 budget, so a wrong heuristic cannot overrun the ceiling: Postgres kills the
 statement and dex reports the over-ceiling refusal. Actual spend is
 wall-clock seconds per statement (a killed statement still bills what ran),
-recorded to `.dex/spend.jsonl` as `billed_seconds` and summed into the daily
-session ceiling. Every session connects as `application_name = 'dex'` for
+recorded as `billed_seconds` in the ledger. Every session connects as `application_name = 'dex'` for
 attribution in `pg_stat_activity`.
 
-The handshake is the same strict two-step as every metered connector: a
-scanning command without `--confirm` returns `needs_confirmation` carrying
-the seconds estimate (per table where relevant); re-issue with
-`--confirm --budget <seconds>`. Nothing executes unconfirmed or without a
-ceiling, and an estimate over the ceiling is refused outright.
+Budgets here are database-seconds; the handshake itself is in
+[`cost-controls.md`](cost-controls.md).
 
 ## Read-only, enforced in depth
 
@@ -141,6 +137,27 @@ confirmation still bind, and the ceiling is injected into the dbt subprocess
 as `PGOPTIONS="-c statement_timeout=<ceiling>s"`, the per-statement
 server-side cap (the `maximum_bytes_billed` analogue). Actual per-node
 execution time is summed into `billed_seconds` and recorded to the ledger.
+
+`transform build --verify` inherits that: its row counts cannot be priced
+upfront either, so they are gated after the build as a phase drawn against the
+reservation the build already holds, and their execution time is billed into the
+same settlement. Only a relation the warehouse keeps no row count for is counted
+at all, which is any view (dbt's default materialization); a table's count is
+free catalog metadata, and a verdict resting on it is reported `exact: false` to
+say so.
+
+`transform test --mutate` prices its whole batch as one number and confirms it
+once, then runs one dbt invocation per mutant. Nothing is materialized: a mutant
+builds as an ephemeral model, so the dev namespace holds exactly the relations it
+held before. A budget that runs out partway stops the run, and the remaining
+mutants are reported `not_run` rather than the budget being exceeded.
+
+
+`--verify` also folds `postgres.dev_schema` into its read scope for the length of that one
+command, because dbt writes the relations it is judging there and that namespace
+is refused as a source everywhere else. The widening shows in the envelope's
+`connection.target`; nothing is written back to `.dex/config.yml`.
+
 
 `transform init` content-checks the dev schema (and, with `--layered-schemas`,
 the sibling `staging_dev` / `intermediate_dev` / `marts_dev` layer schemas)
