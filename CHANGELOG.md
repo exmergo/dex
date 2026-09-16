@@ -110,6 +110,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   since its determinism is a contract and it is the reproduction rather than
   something to fix.
 
+### Changed
+
+- **The PII policy and the cost guard each have one document, and every other
+  document links to it.** Both guardrails cut across every connector, command and
+  backend, so neither had an owner: the PII blocking threshold was stated in five
+  places in four wordings, one paragraph about auto-profile pricing was copied
+  verbatim into five connector references, the `--confirm` handshake was fully
+  restated in roughly thirteen files, and the hosted dbt Cloud exception appeared
+  ten times across seven. `references/pii-policy.md` and
+  `references/cost-controls.md` now own the policy, the constants and the
+  end-to-end flow. Connector references keep their own cost models, which are
+  genuinely per-warehouse, and `references/storage.md` keeps the store protocol a
+  backend implements, which is a different reader's question. `AGENTS.md`
+  guardrails 4 and 6 state the invariant and point.
+
+  Two behaviors that lived only in this changelog are now documented: the
+  `pii_overrides` mismatch warning that `explore profile` and `explore map` both
+  emit, and the `column_name` plus `scope` pattern form of an override entry.
+
+  The three skills keep their copies, because `npx skills add exmergo/dex`
+  installs each one standalone with no engine repository to link into. What they
+  no longer carry is the constant: a skill states the consequence ("below the
+  blocking threshold it projects with a warning") and names the file that states
+  the number, so a skill can go stale on wording but not on the threshold.
+
+  `packages/dex-core/tests/test_docs_policy.py` holds this in place. It asserts
+  that any document stating the threshold states the engine's
+  `PII_BLOCK_CONFIDENCE`, that the set of files allowed to state it has not grown,
+  that the shared cost prose lives in one file, that every connector's
+  `session_ceiling` example keeps one wording, and that relative links between
+  documents resolve. `packages/dex-core/README.md` is deliberately untouched: the
+  PyPI package ships without `references/`, so that file stays self-contained.
+
 ## [1.12.2] - 2026-09-09
 
 ### Fixed

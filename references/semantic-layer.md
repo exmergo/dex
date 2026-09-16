@@ -355,12 +355,11 @@ request), so the second attempt is free. The metric it settled on is in `scoped_
 and named in a note along with the alternatives and the `--metric` flag that
 overrides the choice, because the narrowing must never be silent.
 
-**PII is screened harder here than on a metric query.** A metric query returns
-aggregates that a dimension merely slices, so a flagged dimension can be dropped
-from the grouping and the query still answers something. Here the result *is* the
-values, so a flagged dimension refuses the command, and the refusal names the
-durable ways to clear a dimension reviewed as not PII (a `pii_overrides` entry in
-`.dex/config.yml`, or `meta: {pii: false}` in the project). The evidence is the same
+**PII is screened harder here than on a metric query**, because the result *is*
+the values rather than aggregates a dimension slices, so a flagged dimension
+refuses the command instead of being dropped from the grouping. That rule and
+the two durable ways to clear a dimension are in
+[`pii-policy.md`](pii-policy.md). The evidence is the same
 on each backend as it is for a query: the `.dex/` cache's flag on the resolved
 physical column locally, the layer's own `config.meta` hosted, fetched one metric at
 a time and unioned across every metric that reaches the dimension, with the name
@@ -424,13 +423,9 @@ open a connection or see a credential, and dex then runs that SQL through its ow
 spine, in order:
 
 1. **PII request-gate.** Each grouped or filtered dimension is resolved through the
-   manifest to its physical column, and that column's `.dex/` cache flag decides
-   (with `pii_overrides` from `.dex/config.yml` applied). Evidence rules in both
-   directions: a dimension whose name reads innocuous is refused when its column is
-   flagged, and a profiled, cleared column is not re-blocked by a PII-shaped name.
-   When the cache cannot speak to a dimension (never profiled, or a computed
-   expression rather than a bare column), the name heuristic is the fail-closed
-   floor, so silence never clears.
+   manifest to its physical column, and that column's `.dex/` cache flag decides.
+   The evidence rules, in both directions, and the name heuristic that floors them
+   are in [`pii-policy.md`](pii-policy.md).
 2. **SELECT-only assertion.** Before anything else touches the statement or the
    connection, the rendered SQL is proven read-only.
 3. **Relation pre-check.** The rendered SQL bakes in `relation_name` from the
@@ -529,14 +524,10 @@ passes `--api`. Leaving the default in place there is refused with that fix name
 rather than failing further in on a missing project.
 
 **The cost guard is unavailable on this backend, and dex says so on every
-result.** dbt Cloud owns the warehouse connection and executes the query
-server-side under its own credential, so dex cannot dry-run to estimate cost and
-cannot set a byte or credit ceiling. The hosted backend therefore does not ask for
-a `--confirm` (a confirmation dex could not back with a ceiling would be
-dishonest); it runs, and it attaches a warning to every result stating that dbt
-Cloud, not dex, governs the spend, with the cost paradigm reported as `hosted` and
-no estimate or ceiling. Spend is bounded only by the dbt Cloud environment's own
-limits.
+result.** It asks for no `--confirm`, reports the paradigm as `hosted` with no
+estimate and no ceiling, and warns on every result that dbt Cloud governs the
+spend. Why no ceiling is possible here, and what a caller must not conclude from
+a missing estimate, are in [`cost-controls.md`](cost-controls.md).
 
 Both backends screen the group-by tokens and the dimensions a filter clause names.
 Reading a clause is the **backend's** job, not the shared gate's, because the
@@ -547,11 +538,10 @@ no note is emitted, because nothing was found to adjudicate). A backend that can
 read its own filter dialect therefore refuses filtered queries instead of passing
 them.
 
-PII is still screened before the query is sent: a dimension the layer's own
-metadata marks as PII is refused, and a name heuristic (the same detector the
-profiler uses) is the fail-closed floor for a layer that carries no such metadata.
-Grouping or filtering by a PII-shaped dimension (`user__email`) is refused with a
-recovery hint before anything reaches dbt Cloud.
+PII is still screened before the query is sent, and the evidence here is the
+layer's own metadata rather than the `.dex/` cache. Grouping or filtering by a
+PII-shaped dimension (`user__email`) is refused with a recovery hint before
+anything reaches dbt Cloud.
 
 That metadata is fetched one metric at a time and unioned, in a single request
 that carries one aliased field per metric. The API's `dimensions(metrics:)` field
@@ -1015,9 +1005,7 @@ backend is bound to the same runtime contract in
 | Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime |
 | Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse |
 | Needs a local dbt project | yes | no | no, and it never reads one |
-| Cost surfaced before spend | yes, the full handshake | no: cost guard unavailable, warns on every result | not applicable: reading the layer spends nothing |
-| Ceiling enforced by dex | yes (`maximum_bytes_billed` / timeout) | no: the dbt Cloud environment's own limits | not applicable: nothing runs |
-| `--confirm` required | yes, on billed connectors | no (nothing dex can gate) | no: the catalog is free on every connector |
+| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing |
 | PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none |
 | When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies |
 | Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing |

@@ -539,7 +539,9 @@ database, which is fine for model-only builds.
   never writes to source warehouse data.
 - Dev-target only. Prod-target execution is never initiated by dex.
 - Cost surfaced before any spend. A build that would spend requires explicit
-  confirmation and a session budget.
+  confirmation and a session budget. The cost guard in full, in the engine
+  repository: `references/cost-controls.md`; the PII policy that governs what
+  a seed may carry and what gets stamped into `meta`: `references/pii-policy.md`.
 - Propose, don't impose. Human edits to the project (SQL and semantic YAML) and
   to a native semantic document are authoritative; on conflict the engine
   surfaces a diff and asks rather than overwriting.

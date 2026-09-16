@@ -148,15 +148,10 @@ When the evidence is missing or ambiguous, the name-derived confidence stands:
 absence of evidence never weakens a flag.
 
 The flag itself is never removed by evidence. What a weak flag means is the
-consumer's decision: the query firewall blocks projection at confidence 0.5 and
-above (a hard-coded engine constant) and allows lower-confidence columns with an
-envelope warning, while min/max suppression and dbt `meta` stamping remain
-presence-based at any confidence. The only way to clear a flag entirely is a
-human decision recorded as a `pii_overrides` entry in `.dex/config.yml` (fully
-qualified column plus an optional reason). An override is re-applied on every
-profile, so it survives re-profiling, takes effect at query time immediately,
-and leaves an audit trail in the cache recording which category the detector had
-matched.
+consumer's decision, and the consumers differ: some gate on a flag's presence at
+any confidence, others compare it against a blocking threshold. That split, the
+threshold, and the only way a human clears a flag are in
+[`pii-policy.md`](pii-policy.md).
 
 ## Relationships: joins from metadata, not scans
 

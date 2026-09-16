@@ -424,8 +424,9 @@ dex explore query "select country_code, count(*) as customers
 ```
 
 This route is governed, not a way around the guards. It runs through the query
-firewall and, on a metered warehouse, through the cost handshake. Profiling
-flagged `customers.email` at confidence 0.95, so:
+firewall ([`pii-policy.md`](pii-policy.md)) and, on a metered warehouse, through
+the cost handshake ([`cost-controls.md`](cost-controls.md)). Profiling flagged
+`customers.email` at confidence 0.95, so:
 
 ```
 dex explore query "select email from dex_demo.main.customers limit 5"

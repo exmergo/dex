@@ -408,11 +408,12 @@ also `schema_yml`. Singular tests and generic test *definitions* are files under
 `seed_csv` is the first kind that puts **values**, not logic, into a reviewable
 diff, and a diff goes into git and stays there. So a seed's header is checked
 both against the PII detector `explore` profiles warehouse columns with and
-against the flags already in the `.dex/` cache. A column at or above the block
-threshold is refused, and the refusal names the `pii_overrides` entry that would
-clear it (never a value). The standing limit is worth knowing: dex detects PII
-from names and types and never from values, everywhere, so a seed column named
-`code` full of email addresses passes this gate.
+against the flags already in the `.dex/` cache. A column at or above the
+blocking threshold is refused, and the refusal names the `pii_overrides` entry
+that would clear it, never a value ([`pii-policy.md`](pii-policy.md)). The
+standing limit is worth knowing: dex detects PII from names and types and never
+from values, everywhere, so a seed column named `code` full of email addresses
+passes this gate.
 
 `project_yml` and `profiles_yml` bring the two
 project-root config files into the same plan/diff/apply flow; because they carry
@@ -774,18 +775,13 @@ the warehouse and take the `--confirm --budget` handshake on billed connectors;
 `check` runs the free axes first and returns one combined estimate for the
 scanning axes.
 
-That estimate arrives as an **offer on a complete answer**, not as a pending
-charge. `check` and `semantic` finish their free axes on every call and return
-`ok`, with the price of the scanning axes under `data.offer` (`estimated_bytes`
-or the connector's own estimate shape, `per_table_bytes`, `axes` naming what the
-estimate would add, and the `--confirm --budget` hint). `data.axes_run` names
-what completed, and reading both is how a caller tells "grain found nothing"
-from "grain did not run", which the status used to imply. Nothing scans until
-the confirmed re-issue arrives, and `cost.estimate` stays unset on the offer so
-an `ok` never carries a number that reads as spend. The reason for the split is
-that `needs_confirmation` is a request for a decision dex is blocked on, and
-spending it on work the caller never asked for teaches them to confirm
-reflexively, which is the one habit the handshake cannot survive.
+That estimate arrives as an **offer on a complete answer**
+([`cost-controls.md`](cost-controls.md)), not as a pending charge. `check` and
+`semantic` finish their free axes on every call and return `ok`, with the price
+of the scanning axes under `data.offer`, which carries `axes` naming what the
+estimate would add. `data.axes_run` names what completed, and reading both is
+how a caller tells "grain found nothing" from "grain did not run", which the
+status used to imply.
 
 **A baseline reports its own coverage, and the axes only compare what it
 covers.** `maintain snapshot` pins the exploration cache, and a cache is thin
@@ -987,15 +983,11 @@ connector reads it in its own namespace vocabulary: a `dataset` on BigQuery, a
 `catalog.schema` on Databricks, a `schema` on Postgres. It is never written back
 to config, so `connect test --scope X` works before a connector block exists.
 
-Two rules make it a cost control rather than a hint:
-
-- **Scope narrows, never widens.** When `.dex/config.yml` commits a source
-  allowlist, that allowlist is a cost boundary and every `--scope` entry must
-  resolve inside it. A scope that reaches outside is refused.
-- **A scope is honored or named in an error, never dropped.** An entry that
-  names nothing refuses and lists what exists. `--project` and `--dataset` are
-  BigQuery vocabulary and error on any other connector; DuckDB has no namespace
-  to scope and refuses all three (its target is `--path`).
+Two rules make it a cost control rather than a hint, both in
+[`cost-controls.md`](cost-controls.md): it narrows and never widens, and it is
+honored or named in an error, never dropped. `--project` and `--dataset` are
+BigQuery vocabulary and error on any other connector; DuckDB has no namespace to
+scope and refuses all three (its target is `--path`).
 
 ## The query firewall
 
@@ -1053,22 +1045,12 @@ The gate, in order:
    sample passes a mid-command gate afterward: a budget too small for the sample
    returns `needs_confirmation` with the profile already saved, rather than
    refusing and discarding it.
-3. **Classify the projection.** Output may carry values only from profiled
-   columns whose PII flag is absent or below the blocking threshold. A flag at
-   confidence 0.5 or above blocks projection; the threshold is a hard-coded
-   engine constant, uniform across categories, deliberately not configurable.
-   Every value path from a blocking column must pass through a measuring
-   aggregate (COUNT, APPROX_COUNT_DISTINCT, AVG, SUM, STDDEV, ...).
-   Value-carrying aggregates (MIN, MAX, ANY_VALUE, STRING_AGG, ...) do not
-   qualify, unknown functions fail closed, and `SELECT *` is refused when the
-   expansion includes a blocking column. Projecting a column whose flag sits
-   below the threshold (de-rated by value-shape evidence at profile time) runs,
-   with an envelope warning naming the column, category, and confidence.
-   Filters, join conditions, GROUP BY and ORDER BY are unrestricted: values
-   flow in, not out. A column a human has reviewed as not PII is cleared by a
-   `pii_overrides` entry in `.dex/config.yml` (fully qualified column, optional
-   reason), which unblocks querying immediately and suppresses the flag durably
-   on every later profile.
+3. **Classify the projection.** Output may carry values only from columns the
+   PII policy clears, which is what the profiles gathered in step 2 are for:
+   the firewall cannot judge a column whose flags it does not have. Which
+   aggregates carry a value out, what a sub-threshold flag does, and how a human
+   clears one are in [`pii-policy.md`](pii-policy.md). Filters, join conditions,
+   GROUP BY and ORDER BY are unrestricted: values flow in, not out.
 4. **Bound the result.** LIMIT is clamped (default 50 rows), long cells are cut
    (default 256 chars), the payload is byte-capped (default 16 KiB), at most 10
    statements ride in one call, and every cut is announced in `notes`. A watchdog
@@ -1132,11 +1114,9 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
 
 Rules the envelope enforces, all of them Tier-2 eval targets:
 
-- **Cost before spend.** `cost` is a preflight estimate. Any command that would
-  spend returns `needs_confirmation` unless given `--confirm` (and a `--budget`
-  on billed connectors; DuckDB is free, so the confirm handshake alone gates it).
-  An estimate over the ceiling is refused outright; confirmation cannot override
-  it.
+- **Cost before spend.** `cost` is a preflight estimate, and any command that
+  would spend returns `needs_confirmation` until it is confirmed and budgeted.
+  The handshake in full is in [`cost-controls.md`](cost-controls.md).
 - **An estimate says how much it is worth.** `estimate_quality` is `exact` on
   BigQuery, where a dry run is what the job will bill, and `approximate` on every
   connector that models a run instead. `unknown` means dex tried to price the
@@ -1155,11 +1135,6 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   `ok` as settled preflight for work that ran. `needs_confirmation` stays
   reserved for work the caller asked for and has not authorized, which is the
   only case where dex is genuinely blocked.
-  On billed connectors the estimate comes from free dry-runs, the confirmed
-  run re-checks every statement against the budget with a server-side cap as
-  backstop, actual spend is reported under `data.spend`, and every billed byte
-  is appended to the `.dex/spend.jsonl` ledger, against which the optional
-  `budget.session_ceiling` binds cumulatively per UTC day.
 - **`data.spend` reports settled spend for every billed command**, including
   `transform build`, and always matches what the same command appended to the
   ledger. It carries the connector's unit (`bytes_billed` or `seconds_billed`)
@@ -1185,107 +1160,12 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   binding ceiling and ledger unit, and adds approximate compute-unit-hours from
   live per-replica memory plus optional USD from the configured price. Missing
   or partial capacity refuses before billed work.
-- **The ledger is a readable artifact, and every row says what it is.**
-  `.dex/spend.jsonl` is one JSON object per line, appended and never rewritten.
-  Every row carries the same keys, `null` where one does not apply, so the file
-  parses to a stable schema and no reader has to interpret an absent key:
-
-  | key | what it holds |
-  |---|---|
-  | `at` | UTC ISO-8601 stamp of the write |
-  | `connector` | the connector that billed. Several can share one file, so filter on it before summing |
-  | `command` | the command that wrote the row |
-  | `entry` | the kind: `reservation`, `settlement` or `release`, and nothing else |
-  | `reservation_id` | ties one command's rows together. `null` on a `transform build` settlement, which settles outside any gate because dbt runs the statements |
-  | `billed_bytes` or `billed_seconds` | the magnitude, in the connector's unit. Signed |
-  | `estimate` | the whole-command preflight figure the settlement was admitted on. `null` on the other two kinds, and on a settlement whose pricing degraded to no estimate at all |
-  | `job_id` | the warehouse's identifier for the job, where it has one |
-  | `statement_sha256` | a hash of the statement. Never its text, never a value |
-
-  **Settled spend is the `entry == "settlement"` filter**, summed over one
-  connector's unit. That is not the same number as `session_spent_today`
-  whenever a command is still in flight: a reservation is positive and its
-  release is the same magnitude negative, so the three kinds net to actual spend
-  once a command has settled, and until then the day's total legitimately reads
-  higher by the headroom being held. A process killed outright leaves its
-  reservation standing until the UTC rollover. So the two figures agree exactly
-  when nothing is running, and where they differ the difference is held
-  headroom rather than an accounting error. Sum what you are given; clamping the
-  negative would leave a release uncancelled.
-
-  **A ledger holding settlements alone is not a ledger missing rows.** A
-  reservation exists to be seen by a concurrent command settling against
-  `budget.session_ceiling`, so a project that has never set a daily cap has
-  nothing for one to protect and writes none, and no release either. Both kinds
-  appear from the first billed command after a ceiling is set.
-
-  **A row with no `entry` at all was written by a dex older than v1.5.1**, and it
-  is a settlement. The ledger is an append-only audit trail and dex does not
-  rewrite it, so a project that has been running since before that release has
-  both shapes in one file. Filter on `entry` being `"settlement"` or absent to
-  include them. dex's own reads already sum them correctly, because the day's
-  total does not branch on kind.
-
-- **The spend ledger is a dependency of billing, not of every command.** A gate
-  is built at every connection assembly on a billed connector, free commands
-  included, but nothing reads the ledger until something needs the day's total.
-  Billed admission reads it and fails closed if it cannot: the refusal is named
-  (`reason: guard`), carries the cost, and says nothing ran, so re-issuing the
-  same command is safe. Settlement tolerates a read failure instead, so a backend
-  that goes away mid-command does not turn a command that already ran into a
-  refusal. A command that cannot spend never reaches the ledger, so a store
-  keeping it on a network can be unreachable without taking down a cache-served
-  answer. Two fields can therefore report `null`: `data.spend.session_spent_today`
-  when the ledger failed at settlement (what that command billed is still exact,
-  because the warehouse said so; only the day's total is unavailable), and
-  `connect test`'s `budget.session_spent_today`, which takes one guarded read
-  because reporting the budget is that command's job.
-- **The cumulative ceiling binds across commands that overlap in time**, not
-  only across commands that follow one another. An admitted command books its
-  estimate against the day's headroom before it runs and releases the unspent
-  part when it settles, so a second command issued while the first is still
-  running is measured against what is genuinely left, and the server-side cap
-  each statement carries is bounded by that booking rather than by the whole
-  ceiling. Three consequences a caller can see:
-  - `cost.ceiling` on a refusal reflects headroom another command is holding, so
-    two runs of the same command can be refused against different numbers.
-  - `session_spent_today` counts headroom held by commands still in flight, so
-    while another billed command is running it reads higher than settled spend
-    and can briefly exceed `session_ceiling` without anything having overspent.
-    Run commands one at a time and it is exactly settled spend.
-  - A command killed outright leaves its estimate booked until the UTC rollover.
-    Every softer exit, including an interrupt, releases. This errs conservative
-    on purpose: the alternative is a hold that expires while its command is
-    still spending.
-- **A billed command with no cumulative ceiling warns.** `budget.ceiling` is
-  *refused* when missing, because nothing runs unbudgeted;
-  `budget.session_ceiling` is only warned about, because refusing would break
-  every project that never set one. Without the warning the two are
-  indistinguishable from outside, and an unset daily cap reads as one that
-  bound. Config is read from `<repo_root>/.dex/config.yml` and does not inherit,
-  so a second repo root has its own budget or none, and the warning says so.
-- **And a project is asked for one, once.** The warning above is accurate and it
-  is also the default state of every new project, so it repeated on every billed
-  command, which is the condition under which warnings stop being read: several
-  billed commands can run bound by their per-command caps alone, each carrying
-  the same sentence, with the aggregate bounded by nothing. So the first billed
-  command in a project with no recorded decision returns `needs_confirmation`
-  naming a `suggested_session_ceiling` (five times that command's own estimate,
-  in the connector's unit, as a starting point) and a `session_ceiling_hint`
-  spelling out both answers, under its own key because a two-phase command's
-  findings payload owns `hint`. Answer it with `--session-ceiling <value>` to
-  set one or `--no-session-ceiling` to record that the project runs unbounded;
-  either answer is written to `.dex/config.yml` and nothing asks again in that
-  project. The ask is the *last* check before
-  spend, so an unanswered one has run nothing, booked no headroom, and reached
-  the ledger not at all, and the unconfirmed cost ask that precedes it carries
-  the suggestion in `notes` so one re-run can answer both. Three cases are never
-  asked: a project that already set `budget.session_ceiling` (nothing changes
-  for it), one that recorded a decline, and a config-free ad-hoc read, which has
-  no committed file to record an answer in and keeps the warning alone. A
-  decline records a decision and loosens nothing: the warning still fires on
-  every billed command, and now names the decline so a reader can tell a settled
-  choice from a project that was never asked.
+- **Spend, the ledger, and the daily ceiling are governed by
+  [`cost-controls.md`](cost-controls.md).** That file owns the
+  `.dex/spend.jsonl` row shape, how reservations and settlements net, the
+  cumulative `budget.session_ceiling` and its one-time ask, and what a ledger
+  that cannot be read does to a billed command. This section states only what
+  the envelope carries.
 - **`cost.paradigm` names the connector the command ran against**, not what the
   command happened to cost. A free metadata command on BigQuery reports
   `bytes_scanned` with a null estimate, so a caller learns what a billed command

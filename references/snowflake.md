@@ -118,7 +118,7 @@ no warehouse), while any data scan costs warehouse runtime. So dex guards
 - **Billed:** profiling aggregates, `explore query`, relationship verification
   probes, and `transform build`.
 
-`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statements rather than added afterward, so the estimate you confirm is the whole cost. A call carrying several statements is quoted once for all of them, itemized per statement, and an object two of them share is scanned once rather than twice. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+`explore query` and `explore cluster` bill an auto-profile of an object this connection has that the `.dex/` cache cannot adjudicate, priced into the same handshake as the statements: see [`cost-controls.md`](cost-controls.md). Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
 
 Budgets (`budget.ceiling`, `--budget`, `budget.session_ceiling`) are
 warehouse-seconds: the number you budget is the number the server enforces.
@@ -137,16 +137,10 @@ probe against a cold warehouse is quoted at what the account will actually
 see. The same estimator prices `transform build`: each compiled model,
 snapshot, and test is estimated and summed into the build's upfront cost.
 
-`transform build --verify` prices its row counts into the same estimate as the
-build itself, as a `(row counts)` entry in the per-table breakdown, so one
-`--budget` covers both phases. Only a relation the warehouse keeps no row count
-for costs anything, which is any view (dbt's default materialization); a table's
-count is free metadata, and a verdict resting on it is reported `exact: false`
-to say so. On a cold dev target the counts cannot be priced before the build has
-written the relations, so a note says so and they are priced again afterwards as
-a phase drawn against the reservation the build is already holding. A phase that
-does not fit returns `ok` with the counts in `data.offer`, never
-`needs_confirmation` for a build that has already run and billed.
+`transform build --verify` costs only where the warehouse keeps no row
+count, so a table's count is free metadata; how the counts are priced into
+the build's own estimate is in
+[`cost-controls.md`](cost-controls.md).
 
 `--verify` also folds `snowflake.dev_database` / `snowflake.dev_schema` into its read scope for the length of that one
 command, because dbt writes the relations it is judging there and that namespace
@@ -159,14 +153,10 @@ billed statement the session's `STATEMENT_TIMEOUT_IN_SECONDS` is set to the
 remaining budget, so a wrong heuristic cannot overrun the ceiling: Snowflake
 kills the statement and dex reports the over-ceiling refusal. Actual spend is
 wall-clock seconds per statement (including any resume the statement caused),
-recorded to `.dex/spend.jsonl` as `billed_seconds` and summed into the daily
-session ceiling. Every session is tagged `QUERY_TAG = 'dex'` for attribution.
+recorded as `billed_seconds` in the ledger. Every session is tagged `QUERY_TAG = 'dex'` for attribution.
 
-The handshake is the same strict two-step as every billed connector: a
-scanning command without `--confirm` returns `needs_confirmation` carrying the
-seconds estimate (per table where relevant) and its credit translation;
-re-issue with `--confirm --budget <seconds>`. Nothing executes unconfirmed or
-without a ceiling, and an estimate over the ceiling is refused outright.
+The estimate carries its credit translation; the handshake itself is in
+[`cost-controls.md`](cost-controls.md).
 
 ## Read-only, enforced in depth
 

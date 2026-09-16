@@ -340,6 +340,9 @@ More info in the package's [`README.md`](packages/dex-core/README.md)
   command contract, the source of truth and the `.dex/` cache, the semantic layer
   and Ossie compatibility, the project, storage and host-integration seams,
   methodology, and evaluation.
+- The two guardrails that cut across all of it:
+  [`references/pii-policy.md`](references/pii-policy.md) and
+  [`references/cost-controls.md`](references/cost-controls.md).
 
 ## Contributing
 

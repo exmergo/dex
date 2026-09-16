@@ -287,14 +287,15 @@ DuckDB `t, UNNEST(json_keys(doc)) AS u(k)`, ClickHouse
 join; ARRAY JOIN is the expansion). The unnested value must come from
 a column of a table in the query (bare, or through a JSON/array function);
 unnesting a subquery, another table, a literal, or a generator is refused,
-and the unnest's outputs inherit the source column's PII flags. A column whose flag was de-rated below the 0.5
-blocking threshold projects normally, with an envelope warning naming it; treat
-the warning as information for the user, not an error to fix. If the user says a
-refused column is not personal data, recommend a `pii_overrides` entry in
-`.dex/config.yml` (fully qualified column, optional reason): it unblocks
-querying immediately, survives re-profiles, and is reviewable in git. Never
-hand-edit `.dex/cache.json` to clear a flag. Never fall back to raw Python or a
-database CLI to run SQL; the firewall path is the only sanctioned one.
+and the unnest's outputs inherit the source column's PII flags. A column whose
+flag was de-rated below the blocking threshold projects normally, with an
+envelope warning naming it; treat the warning as information for the user, not
+an error to fix. If the user says a refused column is not personal data,
+recommend a `pii_overrides` entry in `.dex/config.yml` (fully qualified column,
+optional reason): it unblocks querying immediately, survives re-profiles, and is
+reviewable in git. Never hand-edit `.dex/cache.json` to clear a flag. Never fall
+back to raw Python or a database CLI to run SQL; the firewall path is the only
+sanctioned one.
 
 ## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift, ClickHouse)
 
@@ -315,25 +316,17 @@ entry or `SNOWFLAKE_*` env; for Databricks `databricks auth login` or
 paste a key, token, or password.
 
 On a metered connector, scanning commands (`profile`, `map`, `relationships`,
-`query`) run a two-step handshake. The first call returns
-`needs_confirmation` with an estimate in `cost.estimate` (and a per-table
-breakdown where relevant): an exact dry-run byte figure on BigQuery, a
-heuristic labeled `estimate_quality: "heuristic"` in warehouse-seconds on
-Snowflake (credits alongside), a floor labeled `estimate_quality: "low"` in
-warehouse-seconds on Databricks (DBUs alongside; it sharpens itself inside
-the confirmed budget), a heuristic in compute-seconds on Redshift (RPU-hours
-alongside; Serverless estimates carry the 60-second wake minimum once), and
-database-seconds on Postgres (no dollars; the guarded quantity is load on
-the operational database) and on ClickHouse (self-hosted, also no dollars;
-estimated free by the non-executing `EXPLAIN ESTIMATE`, which prices after
-primary-key pruning, and reporting `estimate_basis` so you can tell a pruned
-plan estimate from a whole-relation fallback). Surface the
-estimate to the user in human units, get an explicit budget from them, and
-re-issue the same command with `--confirm` and `--budget <magnitude>` in the
-paradigm's unit. Never invent a budget the user did not agree to, and never
-retry with a raised budget on an over-ceiling refusal without asking.
-Metadata is free (`connect test`, `inventory` run immediately), and OK
-envelopes report actual spend under `data.spend`.
+`query`) run a two-step handshake. The first call returns `needs_confirmation`
+with an estimate in `cost.estimate`, a per-table breakdown where relevant, and
+the unit it is counted in: bytes on BigQuery, warehouse-seconds on Snowflake
+(credits alongside) and Databricks (DBUs), compute-seconds on Redshift
+(RPU-hours), database-seconds on Postgres and ClickHouse (no dollars; the
+guarded quantity is load). Surface the estimate to the user in human units, get
+an explicit budget from them, and re-issue the same command with `--confirm` and
+`--budget <magnitude>` in that unit. Never invent a budget the user did not
+agree to, and never retry with a raised budget on an over-ceiling refusal
+without asking. Metadata is free (`connect test`, `inventory` run immediately),
+and OK envelopes report actual spend under `data.spend`.
 
 An over-ceiling refusal now carries a calibration line drawn from
 `.dex/spend.jsonl`: what this connector's last few settled commands actually
@@ -386,3 +379,5 @@ thing to reach for on a warehouse whose full map would be expensive.
   cross the envelope only from profiled columns whose flag is absent or below
   the blocking threshold, bounded and capped. Only a human's `pii_overrides`
   entry clears a flag entirely; never suggest weakening the detection.
+- The two policies in full, in the engine repository:
+  `references/pii-policy.md` and `references/cost-controls.md`.
