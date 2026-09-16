@@ -740,3 +740,42 @@ def test_the_legend_names_both_sources_of_a_solid_line():
 
     legend = next(line for line in mermaid.splitlines() if "solid lines" in line)
     assert "relationships test" in legend and "semantic-layer entity" in legend
+
+
+def test_a_near_unique_anchor_is_drawn_without_claiming_a_key():
+    """A table whose only "keys" were artifacts of a near-unique column has no
+    key to draw, but the column carrying that finding must still appear: a
+    diagram that omitted it would answer past the question. It is drawn with no
+    key mark, because it is not a key, which is the whole point."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, KeyEvidence
+    from exmergo_dex_core.explore.diagram import render_er_mermaid
+
+    items = Dataset(
+        identifier="shop.main.order_items",
+        row_count=14000,
+        columns=[
+            ColumnProfile(
+                name="order_item_id",
+                data_type="BIGINT",
+                distinct_count=13000,
+                distinct_count_exact=True,
+                is_unique=False,
+                null_fraction=0.0,
+            ),
+            ColumnProfile(name="filler", data_type="VARCHAR"),
+        ],
+        key_evidence=[
+            KeyEvidence(
+                columns=["order_item_id"],
+                status="suppressed",
+                reason="order_item_id is already unique for 92.9% of rows",
+            )
+        ],
+    )
+    mermaid = render_er_mermaid(DexCache(datasets=[items]), full=True).mermaid
+
+    assert "order_item_id" in mermaid
+    line = next(row for row in mermaid.splitlines() if "order_item_id" in row)
+    for mark in (" PK", " UK", " FK"):
+        assert mark not in line, line

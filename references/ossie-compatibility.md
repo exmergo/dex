@@ -131,7 +131,8 @@ many screens the wrong column and reports the verdict as evidence-backed.
 
 PII linkage follows exactly this table. A dimension dex cannot resolve to a
 column is screened by the name heuristic and says so, rather than being screened
-against a column that is not behind it.
+against a column that is not behind it. The policy that linkage feeds is in
+[`pii-policy.md`](pii-policy.md).
 
 ## Keys, relationships, snapshots, and authoring
 

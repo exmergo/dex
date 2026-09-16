@@ -742,7 +742,10 @@ def test_own_key_duplicates_produce_fan_out_warning():
     notes = data_quality_notes(hosts)
     warning = next(n for n in notes if "not unique" in n)
     assert "ID is not unique: ~9590 distinct over 14111 rows" in warning
-    assert "4521 duplicate rows" in warning
+    # The surplus is stated as what it is, a number of rows to remove, and not
+    # as "duplicate ids": those differ, and only this one follows from the counts.
+    assert "~4521 rows would have to be removed for it to be unique" in warning
+    assert "unique for ~68.0% of rows" in warning
     assert "fan out" in warning
     assert any("grain unknown" in n for n in notes)
 

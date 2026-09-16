@@ -1634,6 +1634,33 @@ def test_profile_reuses_fresh_cached_profile(
     assert refreshed["data"]["cache_hit_count"] == 0
 
 
+def test_a_cache_written_before_the_current_schema_version_is_not_reused(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """A profile written by an older cache schema can carry verdicts this
+    version would no longer reach (a composite key later recognized as an
+    artifact of a near-unique column). Reusing one would keep a superseded
+    answer alive and keep a metered connector paying to re-check it, so the
+    bump heals itself on the next profile instead of needing `--refresh`."""
+
+    from exmergo_dex_core.cache import CACHE_SCHEMA_VERSION
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+    store = FilesystemStore(repo)
+
+    stale = store.load_cache()
+    stale.schema_version = CACHE_SCHEMA_VERSION - 1
+    store.save_cache(stale)
+
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    assert payload["data"]["profiled_count"] == 1
+    assert payload["data"]["cache_hit_count"] == 0
+    # And the re-scan writes the current version back, so it happens once.
+    assert store.load_cache().schema_version == CACHE_SCHEMA_VERSION
+
+
 def test_profile_freshness_zero_disables_reuse(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
@@ -1840,7 +1867,9 @@ class _StubAdapter:
     """Metadata-only double: crafted approximate aggregates, recorded escalations
     and composite probes. ``combos`` maps a column tuple to its exact distinct
     combination count; unlisted tuples come back just below the row count, so
-    they read as probed-but-not-unique."""
+    they read as probed-but-not-unique. ``types`` overrides the declared type of
+    named columns (everything else is INTEGER), which is what the measure and
+    ordinal rules read."""
 
     name = "stub"
     dialect = "duckdb"
@@ -1852,12 +1881,14 @@ class _StubAdapter:
         nulls: dict[str, float] | None = None,
         combos: dict[tuple[str, ...], int] | None = None,
         domains: dict[str, object] | None = None,
+        types: dict[str, str] | None = None,
     ):
         self.rows = rows
         self.approx = approx
         self.nulls = nulls or {}
         self.combos = combos or {}
         self.domains = domains or {}
+        self.types = types or {}
         self.calls: list[list[str]] = []
         self.combo_calls: list[list[list[str]]] = []
         self.domain_calls: list[list[str]] = []
@@ -1875,7 +1906,12 @@ class _StubAdapter:
             column_count=len(self.approx),
         )
         columns = [
-            ColumnMeta(name=n, data_type="INTEGER", nullable=True, ordinal=i)
+            ColumnMeta(
+                name=n,
+                data_type=self.types.get(n, "INTEGER"),
+                nullable=True,
+                ordinal=i,
+            )
             for i, n in enumerate(self.approx)
         ]
         return meta, columns
@@ -2137,14 +2173,19 @@ def test_composite_probe_reports_the_minimal_grain_when_two_pairs_prove():
     """Filling the cap makes two proven composites reachable on one table, and
     consumers read the first entry as the grain. ``(order_id, product_id)`` is
     two id-shaped columns so it wins the probe ranking, but it is a superkey of
-    the parent-plus-line grain, so the tighter pair has to come back first."""
+    the parent-plus-line grain, so the tighter pair has to come back first.
+
+    ``product_id`` is kept well below the near-unique anchor bar on purpose. A
+    decoy at 90%+ of the rows would be pruned as an anchor before it could be
+    probed, and this test is about ordering two proven pairs rather than about
+    that prune."""
 
     from exmergo_dex_core.explore import profile as profile_mod
     from exmergo_dex_core.explore import relationships as rel_mod
 
     adapter = _StubAdapter(
         rows=1000,
-        approx={"order_id": 250, "line_number": 4, "product_id": 900},
+        approx={"order_id": 250, "line_number": 4, "product_id": 300},
         combos={("order_id", "line_number"): 1000, ("product_id", "order_id"): 1000},
     )
     datasets = profile_mod.profile(adapter, ["db.s.order_items"])
@@ -2176,6 +2217,270 @@ def test_parent_line_grain_detected_end_to_end(parent_line_grain_duckdb: Path, c
     assert ds["composite_keys"] == [["order_id", "line_number"]]
     assert ds["grain"] == ["order_id", "line_number"]
     assert not any("grain unknown" in n for n in ds["data_quality"])
+
+
+# --- artifact suppression in composite keys (#292) ------------------------------
+
+
+def test_continuous_measure_columns_never_enter_a_composite_pair():
+    """A money column pairs with anything high-cardinality and means nothing, so
+    it leaves the pool before a pair is priced. Nothing here is near-unique, so
+    this isolates the measure rule from the anchor rule."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 400, "grand_total": 700, "subtotal": 650, "status": 4},
+        types={"grand_total": "DECIMAL(10,2)", "subtotal": "DECIMAL(10,2)"},
+        # The junk pair would prove if it were ever asked.
+        combos={("grand_total", "order_id"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.orders"])
+
+    probed = adapter.combo_calls[0]
+    assert not any("grand_total" in pair or "subtotal" in pair for pair in probed)
+    assert ["order_id", "status"] in probed, probed
+    assert datasets[0].composite_keys == []
+
+
+def test_a_measure_named_in_integer_minor_units_is_still_a_measure():
+    """Money stored as an integer count of cents survives the fractional-type
+    test, so the name is what catches it. `qty` sits in the same table at low
+    cardinality and must stay a key member, which is why a name never decides
+    on its own."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 250, "amount_cents": 700, "qty": 30},
+        combos={("amount_cents", "order_id"): 1000, ("order_id", "qty"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.orders"])
+
+    probed = adapter.combo_calls[0]
+    assert not any("amount_cents" in pair for pair in probed)
+    assert probed == [["order_id", "qty"]]
+    assert datasets[0].composite_keys == [["order_id", "qty"]]
+
+
+def test_a_snowflake_style_numeric_ordinal_still_completes_the_grain():
+    """Snowflake reports every NUMBER as the bare token FIXED with the scale
+    dropped, so a type-only measure rule would delete `NUMBER(38,0)` key members
+    on that whole connector. A low-cardinality ordinal is a bounded enumeration
+    whatever its type string says."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 250, "fiscal_period": 24},
+        types={"order_id": "FIXED", "fiscal_period": "FIXED"},
+        combos={("order_id", "fiscal_period"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_facts"])
+
+    assert datasets[0].composite_keys == [["order_id", "fiscal_period"]]
+
+
+def test_a_pair_anchored_on_a_near_unique_column_is_never_probed():
+    """The issue's shape at stub scale: `order_id` is unique on all but a
+    handful of rows, so every high-cardinality column completes it. No pair is
+    priced at all, the grain comes back unknown rather than wrong, and the note
+    names the one column worth looking at."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        # Every one of these escalates to 990 exact, so all three are anchors.
+        approx={
+            "order_id": 950,
+            "created_at": 980,
+            "grand_total": 940,
+            "customer_id": 400,
+        },
+        types={"created_at": "TIMESTAMP", "grand_total": "DECIMAL(10,2)"},
+        # The artifact would prove if it were ever asked.
+        combos={("order_id", "customer_id"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.orders"])
+    ds = datasets[0]
+
+    assert adapter.combo_calls == [], "no combination statement is issued at all"
+    assert ds.composite_keys == []
+    assert rel_mod.candidate_keys(ds) == []
+    assert rel_mod.detect_grain(ds) is None
+
+    notes = rel_mod.data_quality_notes(ds)
+    closest = [n for n in notes if "closest thing to one" in n]
+    assert len(closest) == 1, notes
+    assert "order_id" in closest[0]
+    # A near-unique timestamp is not news, and a measure is never the key
+    # anyone meant, so neither is offered as the closest thing to a key.
+    assert "created_at" not in closest[0] and "grand_total" not in closest[0]
+
+    # The evidence is complete where the prose is bounded: every anchor whose
+    # pairs were dropped is recorded, including the timestamp the note leaves
+    # out, so a host reading key_evidence sees the whole suppression and a
+    # human reading the notes gets the one column worth acting on.
+    # `grand_total` never became an anchor because it left the pool as a
+    # measure first, which is the documented test order.
+    suppressed = [e for e in ds.key_evidence if e.status == "suppressed"]
+    assert [e.columns for e in suppressed] == [["created_at"], ["order_id"]]
+    assert all("already unique for 99.0% of rows" in e.reason for e in suppressed)
+
+
+def test_a_near_unique_anchor_still_pairs_with_a_bounded_enumeration():
+    """The over-reach guard, and why the anchor rule is a pair test rather than
+    a member test. On a parent-line table where most orders have a single line,
+    `order_id` is near-unique and `(order_id, line_number)` is still the real
+    grain: a three-value partner separates the duplicates on purpose, where a
+    wider one would separate them by accident."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 950, "line_number": 3},
+        combos={("order_id", "line_number"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_items"])
+
+    assert adapter.combo_calls[0] == [["order_id", "line_number"]]
+    assert datasets[0].composite_keys == [["order_id", "line_number"]]
+
+
+def test_the_measure_and_anchor_rules_do_not_apply_below_the_minimum_row_count():
+    """Cardinality-versus-rows reasoning says nothing on a tiny table: every
+    column looks near-unique and every measure looks continuous, so both rules
+    would suppress grains rather than junk. The probe is nearly free at this
+    size, so everything is asked and the exact count decides."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    below = _StubAdapter(
+        rows=profile_mod._COMPOSITE_MIN_ROWS - 1,
+        approx={"order_id": 90, "amount": 95},
+        types={"amount": "DOUBLE"},
+        combos={("amount", "order_id"): profile_mod._COMPOSITE_MIN_ROWS - 1},
+    )
+    datasets = profile_mod.profile(below, ["db.s.t"])
+    assert below.combo_calls[0] == [["amount", "order_id"]]
+    assert datasets[0].composite_keys == [["amount", "order_id"]]
+
+    at_bar = _StubAdapter(
+        rows=profile_mod._COMPOSITE_MIN_ROWS,
+        approx={"order_id": 90, "amount": 95},
+        types={"amount": "DOUBLE"},
+    )
+    profile_mod.profile(at_bar, ["db.s.t"])
+    # `amount` leaves the pool and one column cannot make a pair.
+    assert at_bar.combo_calls == []
+
+
+def test_key_evidence_reports_every_candidate_in_candidate_keys_order():
+    """The invariant that keeps the two fields from drifting: the reported half
+    of key_evidence is exactly candidate_keys, in order."""
+
+    from exmergo_dex_core.explore import commands as cmd_mod
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 250, "line_number": 4, "product_id": 300},
+        combos={("order_id", "line_number"): 1000, ("product_id", "order_id"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_items"])
+    cmd_mod._annotate_grain(datasets, None)
+    ds = datasets[0]
+
+    assert ds.candidate_keys == [
+        ["order_id", "line_number"],
+        ["product_id", "order_id"],
+    ]
+    reported = [e.columns for e in ds.key_evidence if e.status == "reported"]
+    assert reported == ds.candidate_keys
+    assert all(e.reason for e in ds.key_evidence)
+    assert "it is the grain" in ds.key_evidence[0].reason
+    assert "ranks behind order_id, line_number" in ds.key_evidence[1].reason
+
+
+def test_a_near_unique_timestamp_does_not_get_the_enumeration_escape():
+    """The escape exists for a parent identifier whose rows a position column
+    enumerates. A near-unique timestamp is a per-row event time, so a
+    low-cardinality dimension beside it separates rows by accident just as a
+    wider partner would, and `(status, created_at)` is not a grain."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"created_at": 980, "status": 4, "customer_id": 300},
+        types={"created_at": "TIMESTAMP"},
+        combos={("created_at", "status"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.events"])
+
+    probed = (adapter.combo_calls or [[]])[0]
+    assert not any("created_at" in pair for pair in probed), probed
+    assert datasets[0].composite_keys == []
+
+
+def test_a_near_unique_key_is_reported_instead_of_composites_built_on_it(
+    near_unique_key_duckdb: Path, capsys
+):
+    """The issue's acceptance case, end to end against a real warehouse. Five
+    combinations are genuinely unique on this table and every one of them is an
+    artifact of `order_id`'s 110 duplicate rows, so none is reported: the grain
+    comes back unknown and the duplicates come back exactly."""
+
+    payload = _run(
+        ["explore", "profile", "orders", "--path", str(near_unique_key_duckdb)],
+        capsys,
+    )
+    ds = payload["data"]["datasets"][0]
+
+    assert ds["row_count"] == 2037
+    assert ds["candidate_keys"] == []
+    assert ds["grain"] is None
+    assert ds["composite_keys"] == []
+
+    notes = " ".join(ds["data_quality"])
+    assert (
+        "order_id is not unique: 1927 distinct over 2037 rows (110 rows would "
+        "have to be removed for it to be unique, so it is unique for 94.6% of "
+        "rows)"
+    ) in notes
+    # The suppression is stated in prose as well as in the field, and it says
+    # a probe ran, which is what separates this from a probe that never did.
+    assert "suppressed every one of them as an artifact" in notes
+    assert "order_id is the closest thing to one" in notes
+    # Two notes, not four: one column's arithmetic is stated once.
+    assert len(ds["data_quality"]) == 2, ds["data_quality"]
+    # Exact numbers throughout: the distinct count was escalated and the column
+    # has no nulls, so nothing here is marked approximate.
+    assert "~" not in notes
+
+    evidence = ds["key_evidence"]
+    assert [e["columns"] for e in evidence if e["status"] == "reported"] == []
+    # The two money columns never reach the evidence at all: they left the pool
+    # as measures before the anchor test ran, which is the documented order.
+    reasons = " ".join(e["reason"] for e in evidence)
+    assert "subtotal" not in reasons and "grand_total" not in reasons
+    # The near-unique timestamps do appear, but as anchors whose pairs were
+    # dropped, never as a member of a key that was reported.
+    suppressed = sorted(tuple(e["columns"]) for e in evidence)
+    assert suppressed == [("created_at",), ("order_id",), ("updated_at",)]
+
+    # The suppression names the anchor and never the filler it was paired with,
+    # so `columns_with_findings` does not drag four extra columns back into the
+    # serialized `columns` that the finding summary correctly elides.
+    assert "customer_id" not in notes
+    assert "customer_id" not in {c["name"] for c in ds["columns"]}
+    assert ds["elided_column_count"] >= 1
 
 
 # --- value-domain reporting (#203) -----------------------------------------------

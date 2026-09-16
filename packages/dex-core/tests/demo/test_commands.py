@@ -185,6 +185,23 @@ def test_the_generated_warehouse_drives_the_whole_explore_tour(tmp_path: Path, c
     assert any("order_item_id is not unique" in n for n in notes)
     assert any("mixes value shapes" in n for n in notes)
 
+    # The shipped-artifact regression for the double-loaded batch: this table's
+    # story is 1,000 duplicate order_item_ids, and it used to be told as a
+    # composite grain of (unit_price, order_id), a money column paired with a
+    # foreign key. Nothing is reported as a key now, and the duplicates are.
+    items = next(
+        d
+        for d in profiled["data"]["datasets"]
+        if d["identifier"].endswith("order_items")
+    )
+    assert items["grain"] is None
+    assert items["candidate_keys"] == []
+    assert not any("unit_price" in e["reason"] for e in items["key_evidence"])
+    assert any(
+        "1000 rows would have to be removed for it to be unique" in n
+        for n in items["data_quality"]
+    )
+
     verified = _run(["explore", "relationships", "--verify"], capsys)["data"]
     edges = {
         (r["from_dataset"].split(".")[-1], r["from_columns"][0]): r

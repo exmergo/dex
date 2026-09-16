@@ -74,7 +74,7 @@ uniqueness to a double-loaded batch, a key mixing two id schemes from a merged
 catalogue, a join whose columns share a name and none of their values, a table an
 interrupted load left empty, two columns whose declared type contradicts their
 content, and personal data alongside two deliberate false positives. `explore map`
-finds 6 PII columns, 5 joins, and 5 data-quality findings; `explore query "select
+finds 6 PII columns, 5 joins, and 6 data-quality findings; `explore query "select
 email from customers"` is refused, and the same count over the same column is not.
 
 The generation is create-only: it writes a new file and refuses rather than replace
@@ -246,7 +246,8 @@ on its own path, never through a connector, which is what keeps the read-only ru
 true everywhere else.
 
 `explore`: ranks what matters in an unfamiliar warehouse, profiles columns
-selectively, flags PII, surfaces grain and data-quality warnings, infers joins
+selectively, flags PII, surfaces grain and data-quality warnings with the ranked
+keys and the reasoning behind each, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
 ad-hoc SELECTs behind a PII-aware query firewall (`explore query`, which takes
 several statements per call, or a `--sql-file`, and adjudicates each on its own),

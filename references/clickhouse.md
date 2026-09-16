@@ -313,17 +313,9 @@ fine; what it cannot do is be capped. dex **warns** in that case rather than
 refusing, and the build result says the run was uncapped rather than claiming a
 cap it never injected.
 
-`transform build --verify` prices its row counts into the same estimate as the
-build itself, as a `(row counts)` entry in the per-table breakdown, so one
-`--budget` covers both phases. Only a relation the warehouse keeps no row count
-for costs anything, which is any view (dbt's default materialization); a table's
-count is free `system.tables` metadata, and a verdict resting on it is reported
-`exact: false` to say so. On a cold dev target the counts cannot be priced
-before the build has written the relations, so a note says so and they are
-priced again afterwards as a phase drawn against the reservation the build is
-already holding. A phase that does not fit returns `ok` with the counts in
-`data.offer`, never `needs_confirmation` for a build that has already run and
-billed.
+`transform build --verify` costs only where the warehouse keeps no row count, so a
+table's count is free `system.tables` metadata; how the counts are priced into the
+build's own estimate is in [`cost-controls.md`](cost-controls.md).
 
 `transform test --mutate` prices its whole batch as one number and confirms it
 once, then runs one dbt invocation per mutant. Nothing is materialized: a mutant

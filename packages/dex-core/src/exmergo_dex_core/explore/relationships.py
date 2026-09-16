@@ -22,10 +22,11 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from ..adapters.base import Adapter
+from ..adapters.base import Adapter, is_temporal_type
 from ..cache import (
     ColumnProfile,
     Dataset,
+    KeyEvidence,
     Relationship,
     RelationshipKind,
     match_identifier,
@@ -34,7 +35,13 @@ from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
 from ..progress import ProgressReporter
 from ..semantic_catalog import EntityJoin
-from .profile import NEAR_UNIQUE_RATIO
+from .profile import (
+    KEY_MEMBER_ANCHOR,
+    NEAR_UNIQUE_RATIO,
+    format_uniqueness_fraction,
+    key_member_verdict,
+    uniqueness_shortfall,
+)
 
 # Warehouse-layer prefixes stripped from a table name before entity matching, so
 # RAW_HOSTS, stg_races, and dim_customers all match FKs named after the bare entity.
@@ -427,6 +434,7 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
     notes: list[str] = []
     if not dataset.row_count:
         return notes
+    counted: set[str] = set()
 
     entity = entity_of(dataset.identifier.rsplit(".", 1)[-1])
     for col in dataset.columns:
@@ -445,18 +453,163 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
             # noise (an approx 500 distinct over 1,125 rows) still warns.
             continue
         if col.distinct_count < dataset.row_count:
-            duplicates = dataset.row_count - col.distinct_count
-            # An unescalated count is honest about being approximate.
-            marker = "" if col.distinct_count_exact else "~"
-            notes.append(
-                f"{col.name} is not unique: {marker}{col.distinct_count} distinct "
-                f"over {dataset.row_count} rows (~{duplicates} duplicate rows); "
-                "joins on it will fan out"
-            )
+            notes.append(_not_unique_note(col, dataset.row_count))
+            counted.add(col.name)
 
     if not candidate_keys(dataset):
-        notes.append("no candidate key detected; grain unknown")
+        notes.append(_grain_unknown_note(dataset, counted))
     return notes
+
+
+def _not_unique_note(col: ColumnProfile, row_count: int) -> str:
+    """How far a column is from keying its table, in the terms a caller acts on.
+
+    Three numbers: the distinct count, the row count, and how many rows would
+    have to be removed for the column to be unique. The last is what a caller
+    needs in order to decide, and deriving it from an approximate distinct
+    count was the thing they previously had to do by hand.
+
+    The `~` marker follows the arithmetic rather than the distinct count alone.
+    A surplus derived from two exact numbers is itself exact, so the marker
+    comes off there; with nulls the non-null count is derived from a fraction,
+    so it goes back on even though the distinct count is proven.
+    """
+
+    shortfall = uniqueness_shortfall(col.distinct_count, col.null_fraction, row_count)
+    distinct_marker = "" if col.distinct_count_exact else "~"
+    if shortfall is None:
+        return (
+            f"{col.name} is not unique: {distinct_marker}{col.distinct_count} "
+            f"distinct over {row_count} rows; joins on it will fan out"
+        )
+    surplus, fraction, exact = shortfall
+    marker = "" if (exact and col.distinct_count_exact) else "~"
+    return (
+        f"{col.name} is not unique: {distinct_marker}{col.distinct_count} distinct "
+        f"over {row_count} rows ({marker}{surplus} rows would have to be removed "
+        f"for it to be unique, so it is unique for "
+        f"{marker}{format_uniqueness_fraction(fraction)} of rows); joins on it "
+        "will fan out"
+    )
+
+
+def _grain_unknown_note(dataset: Dataset, counted: set[str]) -> str:
+    """ "Grain unknown", and where the reader should look instead.
+
+    A bare "no candidate key detected" leaves the most useful fact unsaid: on
+    the shape this exists for, one column very nearly keys the table and the
+    real defect is the duplicates in it. Naming that column turns the note from
+    an absence into an instruction.
+
+    Bounded to one column, the highest-cardinality anchor, so a wide table does
+    not get five of these. Temporal anchors are skipped as uninteresting to
+    report even though they still prune pairs: a per-row timestamp being
+    near-unique is not news, and it is never the key anyone meant.
+
+    ``counted`` is the columns that already have a non-uniqueness note above,
+    carrying the distinct count, the row count and the surplus. For one of
+    those this note points at them rather than restating them: several notes
+    repeating one column's arithmetic reads as padding and spends a budget
+    ``explore map`` caps per object.
+
+    Where the profile-time probe suppressed combinations, this sentence says so
+    too rather than leaving that to a note of its own. The two always co-occur
+    (a suppressed-everything probe is exactly a probe that proved no composite,
+    and the probe only runs when no single column is a key), so they are one
+    finding and belong in one sentence.
+    """
+
+    bare = "no candidate key detected; grain unknown"
+    suppressed = [e for e in dataset.key_evidence if e.status == "suppressed"]
+    probe = (
+        "; the composite-key probe found combinations that were unique and "
+        "suppressed every one of them as an artifact of that, and key_evidence "
+        "carries each with its reason"
+        if suppressed
+        else ""
+    )
+    if not dataset.row_count:
+        return bare
+    anchors = [
+        col
+        for col in dataset.columns
+        if col.pii is None
+        and col.null_fraction in (0.0, None)
+        and not is_temporal_type(col.data_type)
+        and key_member_verdict(
+            col.name,
+            col.data_type,
+            col.distinct_count,
+            distinct_count_exact=col.distinct_count_exact,
+            row_count=dataset.row_count,
+        )
+        == KEY_MEMBER_ANCHOR
+    ]
+    if not anchors:
+        return bare + probe
+    best = max(anchors, key=lambda c: c.distinct_count or 0)
+    shortfall = uniqueness_shortfall(
+        best.distinct_count, best.null_fraction, dataset.row_count
+    )
+    if shortfall is None:
+        return bare + probe
+    surplus, fraction, _exact = shortfall
+    if best.name in counted:
+        return (
+            f"{bare}: {best.name} is the closest thing to one, and the "
+            f"duplicates in it noted above are the reason{probe}"
+        )
+    return (
+        f"{bare}: {best.name} is the closest thing to one at "
+        f"{format_uniqueness_fraction(fraction)} unique ({best.distinct_count} "
+        f"distinct over {dataset.row_count} rows, {surplus} rows would have to "
+        "be removed), and a combination pairing it with any wider column would "
+        f"prove unique without describing the grain{probe}"
+    )
+
+
+def key_evidence(dataset: Dataset) -> list[KeyEvidence]:
+    """Why each of this dataset's keys is or is not reported, ranked.
+
+    The reported entries are in exactly ``candidate_keys`` order, which is the
+    invariant that keeps the two fields from drifting; the suppressed entries
+    the profile-time probe recorded follow. Composite reasons come from the
+    probe (only it measured the combination); single-column reasons are derived
+    here from the same column statistics ``candidate_keys`` reads.
+    """
+
+    from_probe = {
+        tuple(entry.columns): entry
+        for entry in dataset.key_evidence
+        if entry.status == "reported"
+    }
+    suppressed = [e for e in dataset.key_evidence if e.status == "suppressed"]
+    by_name = {col.name: col for col in dataset.columns}
+
+    reported: list[KeyEvidence] = []
+    for key in candidate_keys(dataset):
+        existing = from_probe.get(tuple(key))
+        if existing is not None:
+            reported.append(existing)
+            continue
+        col = by_name.get(key[0])
+        if col is None or len(key) != 1:
+            continue
+        rows = dataset.row_count
+        proof = (
+            "proven by an exact distinct count"
+            if col.distinct_count_exact
+            else "but its distinct count is still approximate, so this is a "
+            "signal rather than a proof"
+        )
+        reported.append(
+            KeyEvidence(
+                columns=list(key),
+                status="reported",
+                reason=f"{col.name} is unique and non-null on all {rows} rows, {proof}",
+            )
+        )
+    return reported + suppressed
 
 
 # Below this, a high orphan rate is still just weaker evidence for the

@@ -238,8 +238,54 @@ def test_profile_leads_with_the_verdict_not_columns(duckdb_file: Path, capsys):
     )
     keys = list(payload["data"]["datasets"][0].keys())
     assert keys.index("columns") == len(keys) - 2  # elided_column_count trails it
-    for verdict_field in ("grain", "candidate_keys", "data_quality", "row_count"):
+    for verdict_field in (
+        "grain",
+        "candidate_keys",
+        "key_evidence",
+        "data_quality",
+        "row_count",
+    ):
         assert keys.index(verdict_field) < keys.index("columns")
+    # `key_evidence` explains `grain` and `candidate_keys`, and a reason
+    # separated from them says nothing, so it sits directly beside them rather
+    # than merely somewhere ahead of `columns`.
+    assert keys.index("key_evidence") == keys.index("grain") + 1
+
+
+def test_key_evidence_reported_half_matches_candidate_keys_in_order(
+    duckdb_file: Path, capsys
+):
+    """The invariant that keeps the two fields from drifting. A caller reads the
+    ranking off `candidate_keys` and the reasoning off `key_evidence`, so the
+    reported entries have to be the same list in the same order."""
+
+    payload = _run(
+        ["explore", "profile", "customers,orders", "--path", str(duckdb_file)], capsys
+    )
+    for dataset in payload["data"]["datasets"]:
+        reported = [
+            e["columns"] for e in dataset["key_evidence"] if e["status"] == "reported"
+        ]
+        assert reported == dataset["candidate_keys"], dataset["identifier"]
+        for entry in dataset["key_evidence"]:
+            assert entry["columns"], entry
+            assert entry["status"] in {"reported", "suppressed"}
+            assert entry["reason"]
+
+
+def test_key_evidence_is_a_profile_field_and_not_a_map_field(duckdb_file: Path, capsys):
+    """`explore map` is budgeted at a handful of findings per object across many
+    objects; the full key ranking belongs to the command whose subject is one
+    relation in full. The same split already puts summarized columns in `map`
+    and every column in `profile`."""
+
+    from exmergo_dex_core.explore.summary import MapObject
+
+    assert "key_evidence" not in MapObject.model_fields
+
+    payload = _run(["explore", "map", "--path", str(duckdb_file)], capsys)
+    for obj in payload["data"]["objects"]:
+        assert "key_evidence" not in obj
 
 
 def test_profile_columns_default_summarizes_to_findings(

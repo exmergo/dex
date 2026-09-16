@@ -9,6 +9,140 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore profile` no longer offers composite keys that are artifacts of a
+  near-unique column or of a continuous measure, ranks the ones it does report,
+  and says why for each** ([#292]). On a 2,037-row orders table where `order_id`
+  held 1,927 distinct values, the profile returned five candidate keys and
+  elected a grain out of them: `order_id, customer_id`, and then `CREATED_AT`,
+  `SUBTOTAL`, `GRAND_TOTAL` and `UPDATED_AT` each paired with `order_id`. Four
+  of the five were one fact wearing four hats, that `order_id` is unique on all
+  but 110 rows so any wider column completes it. `(SUBTOTAL, order_id)` is not
+  a grain: it is the observation that two rows sharing an order id happened to
+  differ in their subtotal. The list carried no order, so a caller could not
+  tell the real key from the filler, and the one thing worth saying, that this
+  table has duplicate order ids, was the one thing the profile did not say.
+
+  The same bug shipped in the demo warehouse, where `order_items` reported a
+  grain of `(unit_price, order_id)`: a `DECIMAL(10,2)` money column paired with
+  a foreign key, on a table whose actual story is 1,000 duplicate
+  `order_item_id` rows from a double-loaded batch.
+
+  Two exclusions, both applied before a pair is priced. A pair whose member is a
+  **continuous measure** is dropped, because a measurement's cardinality grows
+  with the table and it completes a partner by arithmetic rather than by
+  meaning. A pair **anchored on a column already unique on almost every row** is
+  dropped too, unless its partner has a domain bounded by the fanout rather than
+  by the table: a few duplicate order ids separated by a three-value line number
+  really is that grain, where any wider partner separates them by accident. A
+  near-unique timestamp gets no such exception, since a per-row event time is
+  not an entity whose rows a position column enumerates. Neither rule applies
+  below a fixed row floor, where every column looks near-unique and every
+  measure looks continuous, so a small table has everything asked as before.
+
+  The measure test reads a declared type with an explicit nonzero scale, and a
+  measure-name vocabulary above a modest cardinality bar. The vocabulary is not
+  decoration: Snowflake's `SHOW COLUMNS` renders every `NUMBER` as the bare
+  token `FIXED` with the scale dropped, and BigQuery `NUMERIC` carries no scale
+  either, so on those connectors the type test goes silent by design and the
+  name is the only signal left. A name never decides alone, because `quantity`,
+  `amount` and `total` are legitimately low-cardinality members of real fact
+  grains.
+
+  Where nothing survives, `grain` is `null` and the profile names the near-unique
+  column with its counts, including how many rows would have to be removed for
+  it to be unique (`order_id is not unique: 1927 distinct over 2037 rows (110
+  rows would have to be removed for it to be unique, so it is unique for 94.6%
+  of rows)`). That figure needs no new measurement: it is the non-null row count
+  less the distinct count. It is phrased as rows to remove rather than as "110
+  duplicate order ids" because the arithmetic counts surplus rows and not values
+  that repeat, and the two differ. Two long-standing imprecisions in that
+  sentence are fixed with it: the surplus was computed against the total row
+  count rather than the non-null count, overstating it on a nullable column, and
+  it carried a `~` even when derived from two exact numbers. The marker now
+  follows the arithmetic, and a percentage that would round to `100.0%` prints
+  `>99.9%` rather than contradicting the sentence it sits in.
+
+  Suppression is not silence. One new field, `key_evidence`, carries an entry
+  per combination the profile considered, each with its `columns`, a `status` of
+  `reported` or `suppressed`, and the `reason` in the profile's own words; the
+  reported entries are in the same order as `candidate_keys`, which is the
+  invariant that keeps the two from drifting. `data_quality` states the
+  suppression too, and deliberately names only the anchor: a column named in a
+  note is kept in the serialized `columns`, so naming the filler would drag four
+  columns back into a payload that already elides them correctly.
+
+  Field-visible beyond `explore profile`, because five things read
+  `candidate_keys`. `explore diagram` stopped marking a money column `PK`, and
+  `order_id` on the demo's `order_items` reads `FK` rather than `PK`.
+  `explore map`'s best-ranked `candidate_key` and its column roles no longer
+  point at filler, while a column named by a suppressed entry stays in the
+  notable set with no role, so a map that reports duplicates in a column still
+  lists it. `transform plan --scaffold` reads `candidate_keys[0]` to decide
+  which columns get tests, so a scaffolded `schema.yml` no longer puts
+  `not_null` on a money column. And `maintain grain` re-probes every composite
+  in `candidate_keys` on every run, billed on metered connectors, so four
+  artifacts per table stop being a recurring charge. On the demo the pairs
+  actually probed fall from five to two. A declared grain still overrides all of
+  it, and both declared-grain notes now state their origin even when there was
+  no heuristic grain to disagree with, so a declaration that fills a gap says so
+  rather than applying silently.
+
+  `CACHE_SCHEMA_VERSION` moves to 4. An older engine reads a version-4 cache
+  fine, since an unknown key is ignored; the direction that breaks is a current
+  engine reading a version-3 one, where a suppressed combination still reads as
+  a ranked candidate and an empty `key_evidence` is indistinguishable from a run
+  that suppressed nothing. Rather than warn about it, the profile freshness gate
+  now treats a pre-4 profile as stale, so the first `explore profile` or
+  `explore map` after upgrading re-scans and the cache heals itself. The
+  `explore query` degradation on an older cache is unchanged and still refuses
+  nothing.
+
+  Deliberately unchanged: no flag. The issue's position is that a spurious key is
+  worse than nothing, so there is no opt-out to talk past it, and none is needed
+  since `key_evidence` hands back every suppressed combination and its reason in
+  the same payload. No `probed` boolean either, because the probe's existing
+  budget notes already say when it did not run, and duplicating them into a
+  field would be growth for nothing. `key_evidence` is not in `explore map`'s
+  payload, which is budgeted per object; the full ranking belongs to the command
+  whose subject is one relation in full. The demo warehouse's data is untouched,
+  since its determinism is a contract and it is the reproduction rather than
+  something to fix.
+
+### Changed
+
+- **The PII policy and the cost guard each have one document, and every other
+  document links to it.** Both guardrails cut across every connector, command and
+  backend, so neither had an owner: the PII blocking threshold was stated in five
+  places in four wordings, one paragraph about auto-profile pricing was copied
+  verbatim into five connector references, the `--confirm` handshake was fully
+  restated in roughly thirteen files, and the hosted dbt Cloud exception appeared
+  ten times across seven. `references/pii-policy.md` and
+  `references/cost-controls.md` now own the policy, the constants and the
+  end-to-end flow. Connector references keep their own cost models, which are
+  genuinely per-warehouse, and `references/storage.md` keeps the store protocol a
+  backend implements, which is a different reader's question. `AGENTS.md`
+  guardrails 4 and 6 state the invariant and point.
+
+  Two behaviors that lived only in this changelog are now documented: the
+  `pii_overrides` mismatch warning that `explore profile` and `explore map` both
+  emit, and the `column_name` plus `scope` pattern form of an override entry.
+
+  The three skills keep their copies, because `npx skills add exmergo/dex`
+  installs each one standalone with no engine repository to link into. What they
+  no longer carry is the constant: a skill states the consequence ("below the
+  blocking threshold it projects with a warning") and names the file that states
+  the number, so a skill can go stale on wording but not on the threshold.
+
+  `packages/dex-core/tests/test_docs_policy.py` holds this in place. It asserts
+  that any document stating the threshold states the engine's
+  `PII_BLOCK_CONFIDENCE`, that the set of files allowed to state it has not grown,
+  that the shared cost prose lives in one file, that every connector's
+  `session_ceiling` example keeps one wording, and that relative links between
+  documents resolve. `packages/dex-core/README.md` is deliberately untouched: the
+  PyPI package ships without `references/`, so that file stays self-contained.
+
 ### Added
 
 - **`transform test --mutate <model>` measures whether a model's tests would

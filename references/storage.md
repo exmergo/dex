@@ -358,37 +358,19 @@ principals. A host that splits stores for some other reason, one per repo root
 say, has split the budget too and will not be told.
 
 **The ledger read-then-write has to be atomic for the cumulative ceiling to
-bind**, and `SpendLock` below is how a backend provides it. The cost gate reads
-`spend_since`, decides whether the command fits under `budget.session_ceiling`,
-and appends, and two commands running that sequence at once read the same total
-and both decide yes. Implement the lock and dex serializes the sequence through
-it. Without one dex still books the headroom, which narrows the window from the
-length of a warehouse query to the microseconds around the read, and warns on
-every billed command that the ceiling is advisory on this backend.
+bind**, and `SpendLock` is how a backend provides it. See
+[Serializing the spend admission](#serializing-the-spend-admission) above, which
+states the obligation and what dex does for a backend that provides no lock.
 
-**Entries are stored, not interpreted.** Each carries an `entry` kind
-(`reservation`, `settlement`, `release`) and a `reservation_id` tying the three
-together, because the ceiling has to hold headroom for a command that has been
-admitted and has not finished paying. A release carries a **negative**
-magnitude, and that is the one thing to know here: a backend that clamps or
-filters on sign would leak held headroom for the rest of the UTC day. Sum what
-you are given.
-
-**Every entry has the same keys**, with `null` where one does not apply, because
-the ledger is an artifact other tooling reads and an absent key there is a claim
-of its own. So a reservation and a release carry `estimate`, `job_id` and
-`statement_sha256` as nulls, and a `transform build` settlement carries a null
-`reservation_id` rather than omitting it, which is how it says it settled outside
-any gate. A backend needs to know none of this, and that is the point: store the
-dict you were handed, whole, and the shape stays whatever dex wrote. A backend
-that drops keys it does not recognize breaks a reader joining settlements to
-reservations, and one that projects the entry onto columns of its own diverges
-the first time a key is added.
-
-`estimate` is the whole-command preflight figure the command was admitted on, so
-the ledger holds both halves of every "estimated this, billed that" pair rather
-than only the half a budget is measured against. `SpendHistory` is what reads it
-back.
+**Entries are stored, not interpreted.** A backend stores the dict it was
+handed, whole, and three properties of that dict are the whole obligation: a
+release carries a **negative** magnitude, so clamping or filtering on sign leaks
+held headroom for the rest of the UTC day; every entry carries the same keys with
+`null` where one does not apply, so dropping unrecognized keys breaks a reader
+joining settlements to reservations; and projecting the entry onto columns of
+your own diverges the first time dex adds a key. Sum what you are given. What
+each key holds, and what the three kinds mean to a reader, is in
+[`cost-controls.md`](cost-controls.md).
 
 Two properties follow, and neither required a change to any backend written
 before reservations existed:

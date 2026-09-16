@@ -282,6 +282,45 @@ def composite_grain_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def near_unique_key_duckdb(tmp_path: Path) -> Path:
+    """The field failure of issue #292: an orders table whose own key is unique
+    on all but 110 of 2,037 rows, so every high-cardinality column completes it.
+
+    Before the artifact rules, this table reported five candidate keys and
+    elected a grain out of them: `(order_id, customer_id)`, and `created_at`,
+    `subtotal`, `grand_total` and `updated_at` each paired with `order_id`. All
+    five are genuinely unique over these rows, so the fixture is a real
+    regression test rather than a mock of one: rows 1928..2037 repeat ids
+    1..110, and the twin rows differ in every one of those five columns.
+
+    No column is unique on its own, so the composite probe really runs.
+    `status` is functionally determined by `order_id` on purpose: it is a
+    bounded enumeration, so it is the one partner still asked, and it honestly
+    fails to prove.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "near_unique_key.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE orders AS SELECT "
+        "  (CASE WHEN r <= 1927 THEN r ELSE r - 1927 END)::BIGINT AS order_id, "
+        "  ((r % 640) + 1)::INTEGER AS customer_id, "
+        "  (['new', 'paid', 'shipped', 'closed'])"
+        "    [(CASE WHEN r <= 1927 THEN r ELSE r - 1927 END) % 4 + 1] AS status, "
+        "  (((r % 1900) * 7 + 13) / 100.0)::DECIMAL(12,2) AS subtotal, "
+        "  (((r % 1850) * 11 + 29) / 100.0)::DECIMAL(12,2) AS grand_total, "
+        "  (TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (r % 2000) SECOND) "
+        "    AS created_at, "
+        "  (TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (r % 1950) MINUTE) "
+        "    AS updated_at "
+        "FROM (SELECT UNNEST(range(1, 2038)) AS r)"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def parent_line_grain_duckdb(tmp_path: Path) -> Path:
     """The fact-table shape whose grain the pair probe used to discard: a
     parent-plus-line key sitting beside a second id column that pairs with the

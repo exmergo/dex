@@ -270,3 +270,5 @@ since detection surfaces as a conflict, never a silent overwrite.
   rather than overwriting.
 - The repository is the source of truth, on both axes; the `.dex/` snapshot is a
   non-canonical fingerprint used only to detect change.
+- The cost guard behind the scanning axes, in full, in the engine repository:
+  `references/cost-controls.md`.

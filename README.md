@@ -109,7 +109,7 @@ from a pinned seed, so what you see is what is written here.
 
 It is seeded to be **realistically broken**, because a first run that reports a clean
 bill of health teaches you nothing. `explore map` flags 6 columns as personal data,
-infers 5 joins, and reports 5 data-quality findings. Then:
+infers 5 joins, and reports 6 data-quality findings. Then:
 
 ```
 dex explore profile order_items products
@@ -117,8 +117,13 @@ dex explore relationships --verify
 dex explore query "select email from customers"
 ```
 
-- **A broken grain.** `order_item_id is not unique: 13000 distinct over 14000 rows`,
-  because a batch was loaded twice. Any join on it silently fans out.
+- **A broken grain, reported as duplicates rather than as a missing key.**
+  `order_item_id is not unique: 13000 distinct over 14000 rows (1000 rows would have
+  to be removed for it to be unique, so it is unique for 92.9% of rows)`, because a
+  batch was loaded twice. Any join on it silently fans out. The grain comes back
+  unknown rather than as one of the several column pairs that are technically unique
+  here only because `order_item_id` almost is; those are in `key_evidence` with the
+  reason each was suppressed.
 - **A key that mixes id schemes.** `sku` is `90% numeric, 10% 32-character
   hexadecimal (md5-shaped)`, from a merged catalogue. Cast it to a number and you
   drop 10% of your rows without an error.
@@ -335,6 +340,9 @@ More info in the package's [`README.md`](packages/dex-core/README.md)
   command contract, the source of truth and the `.dex/` cache, the semantic layer
   and Ossie compatibility, the project, storage and host-integration seams,
   methodology, and evaluation.
+- The two guardrails that cut across all of it:
+  [`references/pii-policy.md`](references/pii-policy.md) and
+  [`references/cost-controls.md`](references/cost-controls.md).
 
 ## Contributing
 

@@ -424,8 +424,9 @@ dex explore query "select country_code, count(*) as customers
 ```
 
 This route is governed, not a way around the guards. It runs through the query
-firewall and, on a metered warehouse, through the cost handshake. Profiling
-flagged `customers.email` at confidence 0.95, so:
+firewall ([`pii-policy.md`](pii-policy.md)) and, on a metered warehouse, through
+the cost handshake ([`cost-controls.md`](cost-controls.md)). Profiling flagged
+`customers.email` at confidence 0.95, so:
 
 ```
 dex explore query "select email from dex_demo.main.customers limit 5"
@@ -455,11 +456,19 @@ on it, and empty is an answer: `dex_demo.main.products` and
 which is what separates a load-bearing table from a merely large one.
 
 **The declared grain.** `order_items` has a composite `primary_key` in the
-document, and it overrides the heuristic, saying so rather than replacing it
-silently:
+document, and it supplies a grain measurement could not prove, saying where the
+grain came from rather than leaving that silent:
 
 > grain order_id, product_id comes from the project's declared composite key
-> (heuristic suggested unit_price, order_id)
+> (measurement found no key of its own)
+
+That is the case the declaration earns its keep in. Nothing keys this table:
+`order_item_id` is unique on 13,000 of its 14,000 rows because a batch was
+loaded twice, and the column pairs that are unique here are unique only because
+of that shortfall, so profiling reports none of them and says so in
+`key_evidence`. A declaration cannot fix duplicates, and it does not claim to.
+It states what the grain is meant to be, `maintain grain` is where that gets
+verified against the data, and the measurement keeps the finding.
 
 **The declared joins**, at confidence 1.0, with the composite kept whole:
 
