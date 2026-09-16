@@ -9,8 +9,10 @@ logic arrives.
 
 from __future__ import annotations
 
+import importlib
 import json
 import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -672,6 +674,161 @@ def test_build_verification_never_spends_unasked_on_a_metered_connector(
     assert verification.ran is False
     assert "--verify" in (verification.reason or "")
     assert verification.findings == [] and verification.offer is None
+
+
+class _EstimatingAdapter:
+    """The smallest adapter that can be asked what a statement will cost.
+
+    Deliberately not a connector's real adapter: the assertion is about the
+    order dex does things in, and a fake that prices every statement at a fixed
+    magnitude makes the handshake fire without any warehouse in the picture.
+    """
+
+    def __init__(self, connector: str):
+        from exmergo_dex_core.connect import paradigm_for
+        from exmergo_dex_core.guards.cost_guard import CostGate
+
+        self.connector = connector
+        self.dialect = "duckdb"
+        self.paradigm = paradigm_for(connector, DexConfig(connector=connector))
+        self.cost_gate = CostGate(
+            paradigm=self.paradigm,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector=connector,
+            command="transform test",
+        )
+
+    def query_estimate(self, sql: str) -> float:
+        return 1_000.0
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "connector",
+    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+)
+def test_mutation_coverage_prices_its_whole_batch_before_running_any_of_it(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """N dbt runs behind one handshake, and none of them before it.
+
+    This is the largest thing dex can be asked to run: one dbt invocation per
+    mutant, each of them a real query against the dev target. The cost rule is
+    the same as everywhere else, but the stakes are multiplied, so the ordering
+    matters more: the batch is priced and confirmed as one number, and an
+    unconfirmed call must execute nothing at all. A per-mutant ask would be
+    worse than useless, since the caller would answer twenty times for one
+    question and could not see the total before the first run.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+    from exmergo_dex_core.transform import commands as transform_commands
+
+    (dbt_project_dir / "models" / "staging" / "fct.sql").write_text(
+        "select o.id, o.amount from {{ ref('stg_customers') }} o where o.amount > 1\n",
+        encoding="utf-8",
+    )
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    invoked: list[str] = []
+
+    def fake_runner(timeout, cwd, env=None):
+        def run(argv):
+            invoked.append(argv[1])
+            target_path = Path(argv[argv.index("--target-path") + 1])
+            target_path.mkdir(parents=True, exist_ok=True)
+            (target_path / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"project_name": "dex_test"},
+                        "nodes": {
+                            "model.dex_test.fct": {
+                                "name": "fct",
+                                "unique_id": "model.dex_test.fct",
+                                "package_name": "dex_test",
+                                "language": "sql",
+                                "config": {"materialized": "ephemeral"},
+                                "depends_on": {"nodes": []},
+                                "compiled_code": (
+                                    "select id, amount from raw where amount > 1"
+                                ),
+                            },
+                            "test.dex_test.not_null_fct_id.abc": {
+                                "name": "not_null_fct_id",
+                                "unique_id": "test.dex_test.not_null_fct_id.abc",
+                                "resource_type": "test",
+                                "attached_node": "model.dex_test.fct",
+                                "depends_on": {"nodes": ["model.dex_test.fct"]},
+                                "compiled_code": (
+                                    "with __dbt__cte__fct as (select id from raw) "
+                                    "select id from __dbt__cte__fct"
+                                ),
+                            },
+                        },
+                        "unit_tests": {},
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake_runner)
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.dev_target"),
+        "check",
+        lambda *a, **k: [],
+    )
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(
+            connector=connector, dbt_target="dev", dbt_project_dir=dbt_project_dir.name
+        ),
+    )
+    monkeypatch.setattr(
+        DexEngine, "_adapter", lambda self, command=None: _EstimatingAdapter(connector)
+    )
+
+    with pytest.raises(ConfirmationRequiredError):
+        transform_commands.test_mutations(engine, "fct")
+    # Compiling to find the defects is free and never executes the model; what
+    # must not have happened is a test run, which is what spends.
+    assert "test" not in invoked
+
+
+@pytest.mark.parametrize(
+    "connector",
+    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+)
+def test_mutation_coverage_refuses_a_cap_above_the_engine_ceiling(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """The ceiling is a cost boundary, so a flag may narrow it and never widen
+    it, which is the same rule `--scope` follows against a committed allowlist.
+    Refused before anything opens a connection."""
+
+    from exmergo_dex_core.transform import commands as transform_commands
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a refused cap opened a connection")
+
+    monkeypatch.setattr(DexEngine, "_adapter", refuse)
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector=connector),
+    )
+    with pytest.raises(ValueError, match="above the engine ceiling"):
+        transform_commands.test_mutations(engine, "fct", max_mutants=10_000)
 
 
 def test_build_verification_findings_never_become_errors(
@@ -1968,6 +2125,112 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     # Planning returns reviewable diffs and touches nothing in the project.
     assert diffs and diffs[0]["unified"]
     assert not new_model.exists()
+
+
+def test_a_mutant_is_never_written_into_the_project(dbt_project_dir: Path, monkeypatch):
+    """Mutation coverage deliberately produces broken SQL, so where that SQL is
+    allowed to exist is the whole safety question.
+
+    Every mutant lives in a throwaway copy and dies with it. The project keeps
+    the bytes it had, and no file anywhere under it carries a mutated statement,
+    including after a run that was interrupted partway.
+    """
+
+    from exmergo_dex_core.transform import commands as transform_commands
+
+    model = dbt_project_dir / "models" / "staging" / "fct.sql"
+    model.write_text(
+        "select id, amount from {{ ref('stg_customers') }} where amount > 1\n",
+        encoding="utf-8",
+    )
+    before = {
+        path: path.read_bytes()
+        for path in dbt_project_dir.rglob("*")
+        if path.is_file() and "target" not in path.parts
+    }
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    seen_mutants: list[str] = []
+
+    def fake_runner(timeout, cwd, env=None):
+        def run(argv):
+            shadow = Path(argv[argv.index("--project-dir") + 1])
+            mutant = shadow / "models" / "staging" / "fct.sql"
+            if mutant.is_file():
+                seen_mutants.append(mutant.read_text())
+            target_path = Path(argv[argv.index("--target-path") + 1])
+            target_path.mkdir(parents=True, exist_ok=True)
+            (target_path / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"project_name": "dex_test"},
+                        "nodes": {
+                            "model.dex_test.fct": {
+                                "name": "fct",
+                                "unique_id": "model.dex_test.fct",
+                                "package_name": "dex_test",
+                                "language": "sql",
+                                "config": {"materialized": "ephemeral"},
+                                "depends_on": {"nodes": []},
+                                "compiled_code": (
+                                    "select id, amount from raw where amount > 1"
+                                ),
+                            },
+                            "test.dex_test.not_null_fct_id.abc": {
+                                "name": "not_null_fct_id",
+                                "unique_id": "test.dex_test.not_null_fct_id.abc",
+                                "resource_type": "test",
+                                "attached_node": "model.dex_test.fct",
+                                "depends_on": {"nodes": ["model.dex_test.fct"]},
+                            },
+                        },
+                        "unit_tests": {},
+                    }
+                )
+            )
+            if argv[1] == "test":
+                (target_path / "run_results.json").write_text(
+                    json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "unique_id": "test.dex_test.not_null_fct_id.abc",
+                                    "status": "pass",
+                                    "execution_time": 0.0,
+                                }
+                            ]
+                        }
+                    )
+                )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake_runner)
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.dev_target"),
+        "check",
+        lambda *a, **k: [],
+    )
+    engine = DexEngine(
+        connector="duckdb",
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(
+            connector="duckdb", dbt_target="dev", dbt_project_dir=dbt_project_dir.name
+        ),
+    )
+    transform_commands.test_mutations(engine, "fct")
+
+    # The mutants were real and they were written somewhere other than here.
+    assert any(">=" in text for text in seen_mutants)
+    for path, content in before.items():
+        assert path.read_bytes() == content, f"{path} changed"
+    assert model.read_text() == (
+        "select id, amount from {{ ref('stg_customers') }} where amount > 1\n"
+    )
 
 
 def test_a_house_convention_warns_and_never_imposes(dbt_project_dir: Path):

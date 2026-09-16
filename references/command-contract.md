@@ -259,6 +259,13 @@ dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: 
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
                                      filled in (dbt-parse-checked; apply like any plan)
+dex transform test --mutate <m>   -> measure the tests <m> already has: plant standard analytics
+                                     defects in its SQL one at a time, run its own tests against each,
+                                     and report which defects nothing caught. Dev-target only, and
+                                     every mutant builds as an ephemeral model in a throwaway copy, so
+                                     nothing is written to the project and nothing is materialized.
+                                     Capped at 20 mutants; --max-mutants only narrows. On a metered
+                                     connector the whole batch is priced and confirmed as one number
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
@@ -403,7 +410,58 @@ built, and costs nothing.
 inside a `schema.yml` (`data_tests:` on a model or a column). Unit tests are
 scaffolded by `transform test --scaffold <model>` into a `unit_tests:` block,
 also `schema_yml`. Singular tests and generic test *definitions* are files under
-`test-paths`, and those are what `test_sql` authors.
+`test-paths`, and those are what `test_sql` authors. `transform test --mutate`
+measures all three together, because dbt runs all three and a defect only has to
+get past every one of them to ship.
+
+### `transform test --mutate <model>`: what the tests are worth
+
+A passing suite says the tests ran. It does not say they would notice if the
+model were wrong, and no count of tests distinguishes the two. This plants one
+defect at a time in the model's compiled SQL and reports which ones nothing
+caught.
+
+The defect classes are the ones that recur in analytics code: a boundary
+comparison flipped to include or exclude its edge, a `WHERE` predicate dropped or
+negated, an inner join swapped for a left join or the reverse, a `CASE` branch
+removed, a ratio inverted, a window frame bound shifted by one, and `sum`
+swapped with `max`. Each finding is written as the defect rather than as a diff,
+and carries `suggested_test`, because the reader's next action is to write a
+test.
+
+**Where a mutant lives.** In a throwaway copy of the project, and nowhere else.
+Each one is written with `materialized='ephemeral'`, so dbt inlines it into each
+test as a CTE and materializes nothing: no relation is created, replaced or
+dropped, and there is nothing to clean up afterwards. The run uses `dbt test`
+rather than `dbt build`, which is what keeps a failing unit test from skipping
+the model and cascading that skip onto every data test attached to it. The
+project's `on-run-start` and `on-run-end` hooks are stripped from the copy,
+since dbt is invoked once per mutant and a hook that grants or audits should not
+fire N+1 times; a note says so when it happens.
+
+**What the verdicts mean.** `killed` is a defect at least one test caught, named
+in `caught_by`. `survived` is one nothing caught. `rejected` is one the warehouse
+refused outright, kept separate because a build would have failed on it anyway
+and counting it as caught would flatter the suite. `not_run` is a mutant the
+budget stopped. Every verdict is relative to the tests that passed against the
+unmutated model, and any test that did not is listed in `baseline.excluded` with
+the reason, so a suite measured against its own broken tests cannot read as
+clean. A run where nothing passes at baseline is an error, not a clean sweep.
+
+**Cost.** Free on DuckDB. On a metered connector each mutant is priced as the
+statements the warehouse will actually run, by splicing it into each test's
+compiled SQL, because a mutant that drops a partition predicate scans more than
+the model it came from. The whole batch is one estimate and one confirmation:
+`per_table_bytes` names `(baseline)` and each mutant, so the caller sees the
+total and the breakdown before anything executes. If the confirmed budget runs
+out partway, the run stops and the remaining mutants are reported `not_run`
+rather than the budget being exceeded. Spend settles per run under
+`command: "transform test"` in the ledger.
+
+**The cap.** 20 mutants, and `--max-mutants` may only lower it. Mutants are
+ordered round robin across the defect classes, so a capped run on a model with
+forty comparisons and one join still tests the join; what the cap cut is reported
+in `data.cap.elided`, per class.
 
 `seed_csv` is the first kind that puts **values**, not logic, into a reviewable
 diff, and a diff goes into git and stays there. So a seed's header is checked

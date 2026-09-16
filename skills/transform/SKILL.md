@@ -90,6 +90,8 @@ Generic tests are declared inside a `schema.yml` (`data_tests:` on a model or a
 column). Unit tests come from `transform test --scaffold <model>`, which writes a
 `unit_tests:` block, also `schema_yml`. Singular tests and generic test
 *definitions* are files under `test-paths`, and `test_sql` is the kind for those.
+`transform test --mutate <model>` measures all three at once, since a defect has
+to get past every one of them to reach production.
 
 **A seed puts values, not logic, into a diff, and a diff goes into git and stays
 there.** So a seed whose header names a column that looks like personal data is
@@ -362,6 +364,36 @@ check" note just means no connection was reachable at init time.
   back `ok` with a `data.offer`, the build is done and billed and the offer buys
   only the counts it could not afford; relay the number rather than re-running
   the build.
+- **`transform test --mutate <model>` answers "are these tests worth
+  anything".** Writing a test is not the same as writing a test that would catch
+  something, and nothing else in the dbt ecosystem tells the two apart. This
+  plants one standard analytics defect at a time in the model's SQL (a flipped
+  boundary, a dropped or negated filter, a swapped join type, a removed `CASE`
+  branch, an inverted ratio, a shifted window frame, `sum` for `max`), runs the
+  model's own tests against each, and reports which ones nothing caught.
+
+  Reach for it right after you author or scaffold tests, and before telling the
+  user the model is covered. It is also the honest answer when a user asks
+  whether their tests are any good, which is otherwise unanswerable.
+
+  Read `data.counts` and then the survivors, which are listed first. Each carries
+  `defect`, a sentence saying what would now be wrong, and `suggested_test`, the
+  test that would catch it. Relay those two: the user's next action is to write
+  that test, not to read the SQL. A `score` is reported but it is a ratio of two
+  small integers over one model, so quote it as context and never as a grade, and
+  never compare it between models.
+
+  Check `baseline.excluded` before trusting a clean-looking result. Every verdict
+  is relative to the tests that passed against the unmutated model, so a test
+  that was already failing is excluded and named there. And read `cap.elided`:
+  the run is capped at 20 mutants, so a model with more sites than that was
+  measured on a sample, spread across defect classes.
+
+  It writes nothing. Mutants build as ephemeral models in a throwaway copy, so
+  the project is untouched and no relation is created or replaced. On a billed
+  connector the whole batch is one estimate and one `--confirm`, and if the
+  budget runs out partway the rest come back `not_run`: relay that rather than
+  reading a short list as a clean bill.
 - `transform deps` installs dbt packages explicitly (also the refresh path when
   `dbt_packages/` exists but is stale). No confirmation needed: deps writes only
   inside the project and never touches the warehouse.

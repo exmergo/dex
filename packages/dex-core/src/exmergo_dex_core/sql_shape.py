@@ -14,11 +14,18 @@ and both spellings are inside the supported range, so every reader of a FROM or
 a WITH has to accept either. Spread across call sites that is a rename waiting
 to be half-applied; here it is absorbed once.
 
-Everything is a pure read of a parsed tree: nothing mutates, nothing executes,
-nothing opens a connection. The module imports sqlglot at the top, so a caller
-that must survive its absence (the base install carries no dialect engine)
-should reach it behind :func:`~.guards.dialect.ensure_available` and degrade on
-the refusal rather than importing unconditionally.
+Almost everything here is a pure read of a parsed tree. The one exception is
+:func:`set_predicates`, which is the inverse of :func:`predicates`: the reader
+flattens a WHERE across its top-level ANDs, and rebuilding the clause from a
+flattened list is the operation that undoes it. The two belong together, because
+a caller that splits a clause one way and reassembles it another produces a
+statement neither function describes.
+
+Nothing here executes anything or opens a connection. The module imports sqlglot
+at the top, so a caller that must survive its absence (the base install carries
+no dialect engine) should reach it behind
+:func:`~.guards.dialect.ensure_available` and degrade on the refusal rather than
+importing unconditionally.
 """
 
 from __future__ import annotations
@@ -75,6 +82,24 @@ def predicates(select: exp.Select, key: str) -> list[exp.Expression]:
         else:
             flat.append(node)
     return flat
+
+
+def set_predicates(select: exp.Select, key: str, preds: list[exp.Expression]) -> None:
+    """Rebuild a WHERE/HAVING/QUALIFY clause from flattened predicates, in place.
+
+    The inverse of :func:`predicates`. An empty list removes the clause outright
+    rather than leaving an empty wrapper, because a ``WHERE`` with nothing under
+    it is not something a generator can print.
+    """
+
+    if not preds:
+        select.set(key, None)
+        return
+    condition = preds[0]
+    for extra in preds[1:]:
+        condition = exp.And(this=condition, expression=extra)
+    wrapper = {"where": exp.Where, "having": exp.Having, "qualify": exp.Qualify}[key]
+    select.set(key, wrapper(this=condition))
 
 
 def text(node: exp.Expression | None) -> str:

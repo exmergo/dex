@@ -93,6 +93,7 @@ if TYPE_CHECKING:
         InitResult,
         MacroListResult,
         MacroResult,
+        MutationCoverageResult,
         PlacementResult,
         PlanExportResult,
         PlanListResult,
@@ -1331,6 +1332,30 @@ class DexEngine:
             for_plan=for_plan,
             for_plan_document=for_plan_document,
             dependencies=dependencies or DependencyPolicy.INSTALL,
+        )
+
+    def test_mutations(
+        self,
+        model: str,
+        *,
+        max_mutants: int | None = None,
+        target: str | None = None,
+    ) -> MutationCoverageResult:
+        """Measure a model's tests by planting defects and seeing what they catch.
+
+        Answers what a green suite cannot: whether the tests would notice if the
+        model were wrong. Each mutant is one standard analytics defect, built in
+        a throwaway copy as an ephemeral model, so nothing is written to the
+        project or materialized in the warehouse. Dev target only, and on a
+        billed connector the whole batch is priced and confirmed as one number.
+
+        ``max_mutants`` may only narrow the engine's ceiling, never raise it.
+        """
+
+        from .transform import commands as transform
+
+        return transform.test_mutations(
+            self, model, max_mutants=max_mutants, target=target
         )
 
     def deps(self) -> DepsResult:
