@@ -9,6 +9,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain verify` reports a built relation whose grain is not unique**
+  ([#229]). For every selected model, the intended grain is determined from a
+  declared `unique` test, a declared composite `unique_combination_of_columns`
+  (checked only when no single-column test exists for the model), or a
+  semantic model's declared primary entity (checked only when neither dbt
+  test exists), each verified with a real distinct-count scan against the
+  built relation. A model with no declaration at all falls to a free naming
+  heuristic instead: an `id`/`<entity>_id`-shaped column is checked with an
+  approximate distinct count first, escalating to an exact scan only when
+  already close to unique, so a column nowhere near unique is reported
+  straight from the cheap approximate count rather than paying for an exact
+  scan to confirm what is already obvious. A broken grain reports
+  `grain_broken` with the duplicate count; a model whose true grain the
+  heuristic could not find (a composite with no declaration, say) is named
+  once in the summary notes as unknown, never reported broken; a proven
+  unique grain reports nothing. The finding's `exact` flag is honest about
+  which of the two: `True` for every declared check and every heuristic
+  check the near-unique escalation reached, `False` only for the one case a
+  verdict rests on the approximate count alone.
+
 ## [1.12.2] - 2026-09-09
 
 ### Fixed

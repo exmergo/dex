@@ -1,7 +1,7 @@
 """maintain verify: a baseline-free sweep answering "is this project correct
 right now", as opposed to drift's "what changed since the baseline" (#224).
 
-Three finding classes live here. Build-status gaps (#225) read the compiled
+Four finding classes live here. Build-status gaps (#225) read the compiled
 manifest and the last run's ``run_results.json``: failed nodes, nodes skipped
 by a failed parent, models with no relation, and a project that does not
 compile. Column contract (#230) compares a built relation's actual columns
@@ -10,16 +10,23 @@ where a type is declared. Row population (#226) reads each model's compiled
 SQL to find the relation it is built *from*, and compares the two row counts:
 a model holding materially fewer rows than its driving parent, with nothing
 in its SQL that would account for the shortfall, has lost rows silently, and
-one holding materially more has fanned out on a join.
+one holding materially more has fanned out on a join. Grain (#229) checks
+that a model's intended grain -- a declared ``unique`` test, a semantic
+model's declared primary entity, or (absent either) a free naming heuristic
+-- still holds one row per key in the built relation.
 
-Detection is pure and reads only artifacts already on disk, with two
-exceptions, both metadata-only and free on every connector rather than a
-scan: the column contract's own ``adapter.table_metadata`` read, and
-:func:`relation_counts`, which is where a warehouse *scan* can happen at all
-and is separate for that reason: it decides between the catalog's free
-metadata, a free count, and a count that has to be paid for and is therefore
-offered rather than taken. Keeping that decision in one place is what lets
-every other function here be judged on artifacts (or free metadata) alone.
+Detection is pure and reads only artifacts already on disk, with three
+exceptions, all metadata-only or bounded-and-deliberate by the adapter's own
+contract rather than an open-ended scan: the column contract's own
+``adapter.table_metadata`` read, the grain check's ``adapter.
+exact_distinct_counts``/``distinct_combination_counts`` (called only on a
+declared or already-near-unique key, never speculatively across a table), and
+:func:`relation_counts`, which is where an open-ended warehouse *scan* can
+happen at all and is separate for that reason: it decides between the
+catalog's free metadata, a free count, and a count that has to be paid for
+and is therefore offered rather than taken. Keeping that decision in one
+place is what lets every other function here be judged on artifacts (or free,
+bounded metadata) alone.
 """
 
 from __future__ import annotations
@@ -31,8 +38,10 @@ from pathlib import Path
 
 from ..cache import match_identifier
 from ..dbt_project import strip_relation_quoting
+from ..explore.profile import NEAR_UNIQUE_RATIO
+from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
-from .drift import DriftFinding
+from .drift import DriftFinding, _grain_severity
 
 #: dbt's own run_results.json status strings that mean the node did not build.
 _FAILURE_STATUSES = frozenset({"error", "fail"})
@@ -443,6 +452,365 @@ def column_contract_findings(
         notes.append(
             f"{undeclared} model(s) considered declare no columns in "
             "schema.yml, so the column contract was not checked for them"
+        )
+    return findings, notes
+
+
+# --- grain: a built relation against its intended one-row-per-entity key -------
+
+
+@dataclass(frozen=True)
+class GrainCandidate:
+    """One model's intended grain, and where the claim came from (#229).
+
+    ``source`` is one of ``"unique_test"`` (a single column dbt's own
+    ``unique``/``data_tests: unique`` declares), ``"unique_test_composite"``
+    (``unique_combination_of_columns``, checked only when no single-column
+    test exists for the same model: a column-level test is the narrower,
+    more specific claim), ``"primary_entity"`` (a semantic model's declared
+    grain, checked only when neither dbt test exists: a real declaration, but
+    one MetricFlow's modeling layer makes rather than a test dbt itself
+    verifies), or ``"heuristic"`` (no declaration at all; a free naming guess,
+    see :func:`_heuristic_candidate`).
+    """
+
+    columns: list[str]
+    source: str
+
+
+def grain_plan(
+    definitions, *, scope: set[str] | None = None
+) -> dict[str, list[GrainCandidate]]:
+    """Every selected model's declared grain, straight from ``ProjectDefinitions``
+    (#229) -- no manifest walk of its own, unlike every other plan function
+    here: a declared unique test, a declared composite unique combination, and
+    a semantic model's primary entity are already fully resolved there (the
+    same object :func:`~exmergo_dex_core.maintain.commands.verify` already
+    reads for ``model_relations``), so re-deriving any of it from
+    ``target/manifest.json`` directly would only duplicate what
+    ``dbt_project.py``'s own readers already did.
+
+    A model absent from the returned mapping declares no grain at all by any
+    of the three sources; the findings step's own free naming heuristic and
+    "grain unknown" reporting cover it from there, since both need a live
+    relation's actual columns, which ``ProjectDefinitions`` does not carry.
+
+    Priority is per model, not per candidate: every column independently
+    declared ``unique`` is checked (a model can have more than one, each its
+    own claim); a declared composite is checked only when the model has no
+    single-column unique test; the primary entity is checked only when the
+    model has neither. A model can therefore only ever produce candidates
+    from one of the three sources, never a mix.
+
+    ``scope`` is compared lowercase, the same convention
+    :func:`column_contract_plan` follows and for the same reason: the caller
+    is `maintain verify`'s own ``objects`` argument, already lowered.
+    """
+
+    by_model: dict[str, list[GrainCandidate]] = {}
+    for key in definitions.declared_keys:
+        if not key.unique:
+            continue
+        if scope is not None and key.model.lower() not in scope:
+            continue
+        by_model.setdefault(key.model, []).append(
+            GrainCandidate(columns=[key.column], source="unique_test")
+        )
+    for combo in definitions.declared_composite_keys:
+        if combo.model in by_model:
+            continue
+        if scope is not None and combo.model.lower() not in scope:
+            continue
+        by_model.setdefault(combo.model, []).append(
+            GrainCandidate(columns=list(combo.columns), source="unique_test_composite")
+        )
+    for model, column in definitions.primary_entities.items():
+        if model in by_model:
+            continue
+        if scope is not None and model.lower() not in scope:
+            continue
+        by_model[model] = [GrainCandidate(columns=[column], source="primary_entity")]
+    return by_model
+
+
+_GRAIN_SOURCE_PHRASE = {
+    "unique_test": "declares",
+    "unique_test_composite": "declares the combination of",
+    "primary_entity": "declares as its semantic layer's primary entity",
+    "heuristic": "has no declared grain, but appears (by column name) to intend",
+}
+
+
+def _grain_broken_finding(
+    model: str,
+    columns: list[str],
+    row_count: int,
+    distinct_count: int,
+    *,
+    exact: bool,
+    source: str,
+    min_rows: int,
+) -> DriftFinding:
+    duplicates = row_count - distinct_count
+    severity, extra_data, note_suffix = _grain_severity(row_count, min_rows)
+    approx = "" if exact else "approximately "
+    columns_text = " and ".join(columns) if len(columns) < 3 else ", ".join(columns)
+    unique_word = "unique" if len(columns) == 1 else "jointly unique"
+    return DriftFinding(
+        axis="grain",
+        code="grain_broken",
+        identifier=model,
+        column=columns[0] if len(columns) == 1 else None,
+        severity=severity,
+        exact=exact,
+        detail=(
+            f"'{model}' {_GRAIN_SOURCE_PHRASE[source]} {columns_text} "
+            f"{unique_word}, but the built relation has {approx}{duplicates} "
+            f"duplicate row(s){note_suffix}"
+        ),
+        data={
+            "model": model,
+            "columns": columns,
+            "duplicate_count": duplicates,
+            "source": source,
+            **extra_data,
+        },
+    )
+
+
+def _declared_grain_findings(
+    adapter,
+    model: str,
+    identifier: str,
+    candidates: list[GrainCandidate],
+    min_rows: int,
+) -> tuple[list[DriftFinding], bool]:
+    """Check every declared candidate for one model. Returns ``(findings,
+    unchecked)``: ``unchecked`` is True when a composite candidate could not
+    be measured at all (a metered adapter declining an unaffordable scan,
+    per :meth:`Adapter.distinct_combination_counts`'s own contract), which is
+    a caveat for the caller's notes, not a clean bill of health."""
+
+    meta, _columns = adapter.table_metadata(identifier)
+    row_count = meta.row_count
+    if row_count is None:
+        return [], True
+
+    findings: list[DriftFinding] = []
+    unchecked = False
+
+    singles = [c for c in candidates if len(c.columns) == 1]
+    if singles:
+        counts = adapter.exact_distinct_counts(
+            identifier, [c.columns[0] for c in singles]
+        )
+        for c in singles:
+            distinct = counts.get(c.columns[0])
+            if distinct is None:
+                unchecked = True
+                continue
+            if distinct >= row_count:
+                continue
+            findings.append(
+                _grain_broken_finding(
+                    model,
+                    c.columns,
+                    row_count,
+                    distinct,
+                    exact=True,
+                    source=c.source,
+                    min_rows=min_rows,
+                )
+            )
+
+    for c in candidates:
+        if len(c.columns) == 1:
+            continue
+        result = adapter.distinct_combination_counts(identifier, [c.columns])
+        distinct = result.get(tuple(c.columns))
+        if distinct is None:
+            unchecked = True
+            continue
+        if distinct >= row_count:
+            continue
+        findings.append(
+            _grain_broken_finding(
+                model,
+                c.columns,
+                row_count,
+                distinct,
+                exact=True,
+                source=c.source,
+                min_rows=min_rows,
+            )
+        )
+
+    return findings, unchecked
+
+
+def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
+    """The free naming heuristic (#229): no declared grain at all, so this
+    looks for a column named ``id``/``<entity>_id`` or otherwise
+    :func:`~exmergo_dex_core.explore.relationships.is_id_shaped`, the same
+    shape :func:`~exmergo_dex_core.explore.relationships.detect_grain` prefers
+    -- but unlike that function, never trusts a naming match as proof by
+    itself. A guess from a name alone is the weakest of the three sources,
+    so it earns the cheapest possible check first: an approximate distinct
+    count, already free metadata this command reads for column contract.
+    Only a column that already looks near-unique in that approximate count
+    is worth a real (still cheap, single-column) exact scan to turn a guess
+    into a proof; a column nowhere close to unique is reported straight from
+    the approximate count instead, honestly marked ``exact=False``, since
+    escalating would only confirm what the approximation already made clear.
+
+    Returns ``(finding_or_None, reason)`` where ``reason`` is ``None`` (clean
+    or a finding was produced), ``"unknown"`` (no column even looked like a
+    key), or ``"unsupported"`` (the adapter cannot run the check this needs).
+    """
+
+    meta, columns = adapter.table_metadata(identifier)
+    row_count = meta.row_count
+    entity = entity_of(identifier.rsplit(".", 1)[-1])
+    named = (f"{entity}_id", f"{entity}id", "id")
+    candidate = next((c for c in columns if c.name.lower() in named), None)
+    if candidate is None:
+        candidate = next((c for c in columns if is_id_shaped(c.name)), None)
+    if candidate is None:
+        return None, "unknown"
+    if row_count is None:
+        return None, "unsupported"
+
+    aggregates_fn = getattr(adapter, "column_aggregates", None)
+    if aggregates_fn is None:
+        return None, "unsupported"
+    aggregates = aggregates_fn(identifier, [candidate])
+    agg = next((a for a in aggregates if a.name == candidate.name), None)
+    if agg is None or agg.distinct_count is None:
+        return None, "unsupported"
+    if agg.null_fraction not in (0.0, None):
+        # A key candidate with nulls is not a key: disqualified, not proven.
+        return None, "unknown"
+
+    non_null = round((1 - (agg.null_fraction or 0.0)) * row_count)
+    if non_null and agg.distinct_count >= NEAR_UNIQUE_RATIO * non_null:
+        exact_fn = getattr(adapter, "exact_distinct_counts", None)
+        if exact_fn is not None:
+            exact_counts = exact_fn(identifier, [candidate.name])
+            distinct = exact_counts.get(candidate.name)
+            if distinct is not None:
+                if distinct >= row_count:
+                    return None, None
+                return (
+                    _grain_broken_finding(
+                        model,
+                        [candidate.name],
+                        row_count,
+                        distinct,
+                        exact=True,
+                        source="heuristic",
+                        min_rows=min_rows,
+                    ),
+                    None,
+                )
+    if agg.distinct_count >= row_count:
+        return None, None
+    return (
+        _grain_broken_finding(
+            model,
+            [candidate.name],
+            row_count,
+            agg.distinct_count,
+            exact=False,
+            source="heuristic",
+            min_rows=min_rows,
+        ),
+        None,
+    )
+
+
+def grain_findings(
+    adapter,
+    declared: dict[str, list[GrainCandidate]],
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    all_models: set[str],
+    *,
+    min_rows: int = 100,
+) -> tuple[list[DriftFinding], list[str]]:
+    """A built relation's grain against what the project declares (or, absent
+    any declaration, a free naming guess), for every selected model (#229).
+
+    A declared source (unique test, composite, or primary entity) is checked
+    directly with an exact scan: the declaration itself is the justification
+    for spending on verification, the same reasoning ``maintain grain``'s own
+    ``declared_composite_checks`` already rests on. Only a model with no
+    declaration at all falls to the heuristic, which is free-first and
+    escalates to exact only when already close (see
+    :func:`_heuristic_candidate`) -- so a ``grain_broken`` finding's ``exact``
+    flag is always True except in exactly that one approximate-verdict case,
+    honestly naming the one place this check ever reports from a guess.
+
+    An unknown grain and a broken one are reported through different
+    channels on purpose (the issue's own framing): a broken grain is a
+    ``DriftFinding``; an unknown one is named once in ``notes`` rather than
+    given a finding of its own, since "dex could not tell" is not itself a
+    defect in the project.
+    """
+
+    findings: list[DriftFinding] = []
+    ambiguous: list[str] = []
+    unchecked: list[str] = []
+    unknown: list[str] = []
+
+    for model in sorted(all_models):
+        relation = model_relations.get(model)
+        if relation is None:
+            # missing_relation_findings already reports this model; nothing
+            # about its grain belongs in a second, unrelated finding class.
+            continue
+        matches = match_identifier(relation, live_identifiers)
+        if len(matches) != 1:
+            ambiguous.append(model)
+            continue
+        identifier = matches[0]
+
+        candidates = declared.get(model)
+        if candidates:
+            model_findings, was_unchecked = _declared_grain_findings(
+                adapter, model, identifier, candidates, min_rows
+            )
+            findings.extend(model_findings)
+            if was_unchecked:
+                unchecked.append(model)
+            continue
+
+        finding, reason = _heuristic_candidate(adapter, model, identifier, min_rows)
+        if finding is not None:
+            findings.append(finding)
+        elif reason == "unknown":
+            unknown.append(model)
+        elif reason == "unsupported":
+            unchecked.append(model)
+
+    notes: list[str] = []
+    if ambiguous:
+        notes.append(
+            "the grain was not checked for "
+            + ", ".join(sorted(ambiguous))
+            + ": no single relation in the warehouse matched"
+        )
+    if unchecked:
+        notes.append(
+            "the grain could not be measured for "
+            + ", ".join(sorted(unchecked))
+            + ": the connector could not run the distinct-count scan this needs"
+        )
+    if unknown:
+        notes.append(
+            "the grain could not be determined for "
+            + ", ".join(sorted(unknown))
+            + ": no declared unique test, no declared primary entity, and no "
+            "id-shaped column was found"
         )
     return findings, notes
 
