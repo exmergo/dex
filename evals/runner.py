@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from .suite import EvalCase, EvalSuite
+from .suite import Corpus, EvalCase, EvalSuite
 
 
 @dataclass
@@ -50,6 +50,49 @@ class Judge(Protocol):
     """Decides whether an agent result satisfies one assertion."""
 
     def grade(self, case: EvalCase, assertion: str, result: AgentResult) -> bool: ...
+
+
+@dataclass
+class ClassifyResult:
+    """One classification call: every skill marker found, or the error if the
+    call itself failed.
+
+    Mirrors :class:`AgentResult`'s ``error`` field, for the same reason: a
+    failed invocation (a crash, a timeout) and one that genuinely found no
+    skill both have nowhere else to be told apart, and collapsing them would
+    let infrastructure noise masquerade as a real classification. A
+    :class:`Classifier` implementation is expected to catch its own
+    per-*call* failures into ``error`` here (see :class:`ClaudeCliAgent.run`
+    for the pattern) and reserve a raised exception for a setup problem that
+    makes every subsequent call pointless too (the ``claude`` binary missing,
+    say) -- :func:`run_corpus` does not catch anything, so that kind of
+    failure aborts the whole run immediately rather than being recorded once
+    per case.
+
+    ``fired_skills`` may hold more than one name: a prompt two skills both
+    claim is real evidence of cross-skill contamination, exactly what this
+    corpus exists to catch, and picking a single "winner" would silently
+    discard the other one's finding.
+    """
+
+    fired_skills: frozenset[str] = field(default_factory=frozenset)
+    error: str | None = None
+
+
+@runtime_checkable
+class Classifier(Protocol):
+    """Runs one prompt with every skill available and reports which fired.
+
+    Deliberately not :class:`AgentRunner`: that protocol toggles one named
+    skill on or off for the uplift measurement, which presumes the question
+    is "does *this* skill help." A cross-skill corpus asks a different
+    question, "which skills, if any, claim this prompt out of all of them at
+    once," so it needs the names of whichever fired rather than a bool scoped
+    to one. One live call per prompt instead of one per (prompt, skill) pair,
+    too.
+    """
+
+    def classify(self, prompt: str) -> ClassifyResult: ...
 
 
 @dataclass
@@ -244,3 +287,167 @@ def _all_pass(
 
 def _rate(flags: list[bool]) -> float:
     return round(sum(flags) / len(flags), 4) if flags else 0.0
+
+
+@dataclass
+class CorpusCaseResult:
+    """One corpus prompt classified: what it should fire, what it did.
+
+    ``fired_skills`` is every marker the classifier found, not a single
+    winner: a case where two skills both fired is a real cross-skill
+    contamination finding, and this keeps it visible instead of quietly
+    picking one and discarding the other's evidence.
+
+    ``error`` is set instead of trusting ``fired_skills`` when the call
+    itself failed (CLI crash, timeout, malformed output): a failed call and a
+    call that genuinely found nothing both surface as an empty set from a
+    :class:`~evals.runner.Classifier`, and collapsing them would let
+    infrastructure noise masquerade as "correctly classified none" or as an
+    ordinary miss. A case with ``error`` set is never ``correct`` and is kept
+    out of every skill's precision/recall (see :func:`run_corpus`).
+    """
+
+    task_id: str
+    prompt: str
+    expected_skill: str | None
+    fired_skills: frozenset[str] = field(default_factory=frozenset)
+    error: str | None = None
+
+    @property
+    def actual_skill(self) -> str | None:
+        """The one fired skill, when exactly one did; ``None`` when none or
+        more than one did (``fired_skills`` carries the full picture either
+        way -- this is a display convenience for the common, unambiguous
+        case, not the source of truth ``correct`` and the per-skill scoring
+        below read from)."""
+        return next(iter(self.fired_skills)) if len(self.fired_skills) == 1 else None
+
+    @property
+    def correct(self) -> bool:
+        if self.error is not None:
+            return False
+        expected = {self.expected_skill} if self.expected_skill is not None else set()
+        return set(self.fired_skills) == expected
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "expected_skill": self.expected_skill,
+            "fired_skills": sorted(self.fired_skills),
+            "actual_skill": self.actual_skill,
+            "correct": self.correct,
+            "error": self.error,
+        }
+
+
+@dataclass
+class SkillPrecisionRecall:
+    """Precision/recall for one skill, computed as a one-vs-rest split of the
+    corpus: a true positive is this skill correctly firing, a false positive
+    is this skill firing when something else (or nothing) should have, a
+    false negative is this skill staying quiet when it should have fired."""
+
+    skill: str
+    true_positives: int = 0
+    false_positives: int = 0
+    false_negatives: int = 0
+
+    @property
+    def precision(self) -> float:
+        fired = self.true_positives + self.false_positives
+        return round(self.true_positives / fired, 4) if fired else 1.0
+
+    @property
+    def recall(self) -> float:
+        expected = self.true_positives + self.false_negatives
+        return round(self.true_positives / expected, 4) if expected else 1.0
+
+    @property
+    def f1(self) -> float:
+        p, r = self.precision, self.recall
+        return round(2 * p * r / (p + r), 4) if (p + r) else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "skill": self.skill,
+            "true_positives": self.true_positives,
+            "false_positives": self.false_positives,
+            "false_negatives": self.false_negatives,
+            "precision": self.precision,
+            "recall": self.recall,
+            "f1": self.f1,
+        }
+
+
+@dataclass
+class CorpusReport:
+    corpus_name: str
+    results: list[CorpusCaseResult] = field(default_factory=list)
+    per_skill: dict[str, SkillPrecisionRecall] = field(default_factory=dict)
+
+    @property
+    def accuracy(self) -> float:
+        return _rate([r.correct for r in self.results])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "corpus_name": self.corpus_name,
+            "case_count": len(self.results),
+            "accuracy": self.accuracy,
+            "per_skill": {name: pr.to_dict() for name, pr in self.per_skill.items()},
+            "results": [r.to_dict() for r in self.results],
+        }
+
+
+def run_corpus(corpus: Corpus, classifier: Classifier) -> CorpusReport:
+    """Classify every corpus prompt and score per-skill precision/recall.
+
+    One live call per prompt, with every skill available at once, is the
+    point: it is the shape a real request actually arrives in, unlike the
+    per-skill positive/negative lists in ``skills/<skill>/evals/evals.json``,
+    which each only ever see one skill enabled at a time and so cannot catch
+    a case where a *sibling's* description fires instead of the right one.
+
+    Nothing here is wrapped in a ``try``: a :class:`Classifier` is expected
+    to catch its own per-call failures into :class:`ClassifyResult.error`
+    (see that class), the same contract :class:`AgentRunner` already has with
+    :func:`run_triggering`/:func:`run_quality`. A call that raises anyway is
+    a setup problem, not a one-off flake (the ``claude`` binary missing is
+    the concrete case this matters for), and every case after it would fail
+    identically, so it is left to propagate to the caller immediately rather
+    than being recorded 30 times over.
+    """
+
+    results = []
+    for case in corpus.cases:
+        outcome = classifier.classify(case.prompt)
+        results.append(
+            CorpusCaseResult(
+                task_id=case.task_id,
+                prompt=case.prompt,
+                expected_skill=case.expected_skill,
+                fired_skills=outcome.fired_skills,
+                error=outcome.error,
+            )
+        )
+
+    scored = [r for r in results if r.error is None]
+    skills = sorted(
+        {r.expected_skill for r in scored if r.expected_skill is not None}
+        | {skill for r in scored for skill in r.fired_skills}
+    )
+    per_skill: dict[str, SkillPrecisionRecall] = {}
+    for skill in skills:
+        pr = SkillPrecisionRecall(skill=skill)
+        for r in scored:
+            expected = r.expected_skill == skill
+            actual = skill in r.fired_skills
+            if expected and actual:
+                pr.true_positives += 1
+            elif actual and not expected:
+                pr.false_positives += 1
+            elif expected and not actual:
+                pr.false_negatives += 1
+        per_skill[skill] = pr
+
+    return CorpusReport(corpus_name=corpus.name, results=results, per_skill=per_skill)

@@ -20,7 +20,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 
-from .runner import AgentResult
+from .runner import AgentResult, ClassifyResult
 from .suite import EvalCase
 
 
@@ -91,6 +91,45 @@ class ClaudeCliAgent:
     @property
     def _plugin(self) -> str:
         return "dex"
+
+
+@dataclass
+class ClaudeCliClassifier:
+    """Runs one prompt with every dex skill available and reports every
+    marker that showed up, for the cross-skill corpus (``run_corpus``).
+
+    Unlike :class:`ClaudeCliAgent`, this never suppresses a skill: ``args``
+    is whatever invokes Claude Code with the plugin installed normally, the
+    same condition a real request arrives in. Reports *every* marker found,
+    not just one: picking a single "winner" when two fire would hide the
+    unwanted one entirely, which is exactly the cross-skill contamination
+    this corpus exists to catch, not a detail to summarize away.
+    """
+
+    skill_names: tuple[str, ...] = ("explore", "transform", "maintain")
+    binary: str = "claude"
+    model: str | None = None
+    timeout: int = 180
+    args: list[str] = field(default_factory=list)
+    plugin: str = "dex"
+
+    def classify(self, prompt: str) -> ClassifyResult:
+        # _require_claude runs outside the try, same as ClaudeCliAgent.run:
+        # a missing binary is a setup problem every subsequent call would hit
+        # identically, so it raises here and propagates out of run_corpus
+        # rather than being caught into one case's error.
+        binary = _require_claude(self.binary)
+        args = list(self.args)
+        if self.model:
+            args += ["--model", self.model]
+        try:
+            output = _invoke(binary, args, prompt, self.timeout)
+        except Exception as exc:
+            return ClassifyResult(error=str(exc))
+        fired = frozenset(
+            name for name in self.skill_names if f"/{self.plugin}:{name}" in output
+        )
+        return ClassifyResult(fired_skills=fired)
 
 
 @dataclass
