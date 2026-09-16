@@ -340,6 +340,284 @@ def test_a_model_with_no_matching_relation_is_named_in_notes_not_a_finding():
     assert notes and "a" in notes[0]
 
 
+# --- grain_plan / grain_findings: pure (#229) -----------------------------------
+
+
+class _GrainAdapter:
+    """A fake adapter exposing exactly the grain-check surface: schema-only
+    metadata, exact distinct counts (single-column and combination), and
+    approximate column aggregates."""
+
+    def __init__(
+        self,
+        *,
+        row_counts: dict[str, int],
+        columns: dict[str, list[str]],
+        exact: dict[str, dict[str, int]] | None = None,
+        combos: dict[str, dict[tuple[str, ...], int]] | None = None,
+        approx: dict[str, dict[str, tuple[int, float | None]]] | None = None,
+    ):
+        self._row_counts = row_counts
+        self._columns = columns
+        self._exact = exact or {}
+        self._combos = combos or {}
+        self._approx = approx or {}
+
+    def table_metadata(self, identifier: str):
+        cols = [types.SimpleNamespace(name=name) for name in self._columns[identifier]]
+        meta = types.SimpleNamespace(
+            identifier=identifier, row_count=self._row_counts[identifier]
+        )
+        return meta, cols
+
+    def exact_distinct_counts(self, identifier: str, columns: list[str]):
+        return {
+            col: count
+            for col, count in self._exact.get(identifier, {}).items()
+            if col in columns
+        }
+
+    def distinct_combination_counts(
+        self, identifier: str, combinations: list[list[str]]
+    ):
+        wanted = {tuple(combo) for combo in combinations}
+        return {
+            combo: count
+            for combo, count in self._combos.get(identifier, {}).items()
+            if combo in wanted
+        }
+
+    def column_aggregates(self, identifier: str, columns):
+        result = []
+        for col in columns:
+            entry = self._approx.get(identifier, {}).get(col.name)
+            if entry is None:
+                continue
+            distinct_count, null_fraction = entry
+            result.append(
+                types.SimpleNamespace(
+                    name=col.name,
+                    distinct_count=distinct_count,
+                    null_fraction=null_fraction,
+                )
+            )
+        return result
+
+
+def _defs(*, keys=(), composites=(), primary=None):
+    from exmergo_dex_core.dbt_project import (
+        DeclaredCompositeKey,
+        DeclaredKey,
+        ProjectDefinitions,
+    )
+
+    return ProjectDefinitions(
+        present=True,
+        declared_keys=[
+            DeclaredKey(model=model, column=column, unique=unique, source="manifest")
+            for model, column, unique in keys
+        ],
+        declared_composite_keys=[
+            DeclaredCompositeKey(model=model, columns=list(columns), source="manifest")
+            for model, columns in composites
+        ],
+        primary_entities=dict(primary or {}),
+    )
+
+
+def test_grain_plan_prefers_a_declared_unique_test_over_a_primary_entity():
+    defs = _defs(
+        keys=[("a", "id", True)],
+        primary=[("a", "other_col")],
+    )
+    declared = verify_mod.grain_plan(defs)
+    assert len(declared["a"]) == 1
+    assert declared["a"][0].source == "unique_test"
+    assert declared["a"][0].columns == ["id"]
+
+
+def test_grain_plan_falls_back_to_a_composite_when_no_single_column_test_exists():
+    defs = _defs(composites=[("a", ["order_id", "line_no"])], primary=[("a", "id")])
+    declared = verify_mod.grain_plan(defs)
+    assert len(declared["a"]) == 1
+    assert declared["a"][0].source == "unique_test_composite"
+    assert declared["a"][0].columns == ["order_id", "line_no"]
+
+
+def test_grain_plan_falls_back_to_the_primary_entity_when_nothing_is_declared():
+    defs = _defs(primary=[("a", "order_id")])
+    declared = verify_mod.grain_plan(defs)
+    assert declared["a"] == [
+        verify_mod.GrainCandidate(columns=["order_id"], source="primary_entity")
+    ]
+
+
+def test_grain_plan_checks_every_independently_declared_unique_column():
+    defs = _defs(keys=[("a", "id", True), ("a", "email", True), ("a", "note", False)])
+    declared = verify_mod.grain_plan(defs)
+    assert {c.columns[0] for c in declared["a"]} == {"id", "email"}
+
+
+def test_grain_plan_scope_is_lowercase_like_column_contract_plan():
+    defs = _defs(keys=[("a", "id", True), ("b", "id", True)])
+    declared = verify_mod.grain_plan(defs, scope={"a"})
+    assert set(declared) == {"a"}
+
+
+def test_grain_plan_reports_nothing_for_a_model_with_no_declaration():
+    defs = _defs(keys=[("a", "id", True)])
+    declared = verify_mod.grain_plan(defs)
+    assert "b" not in declared
+
+
+def test_a_declared_unique_key_with_duplicates_is_reported():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "grain_broken"
+    assert finding.identifier == "a"
+    assert finding.exact is True
+    assert finding.data["duplicate_count"] == 1
+    assert finding.severity == "high"
+
+
+def test_a_declared_composite_with_duplicates_is_reported():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 10},
+        columns={"db.main.a": ["order_id", "line_no"]},
+        combos={"db.main.a": {("order_id", "line_no"): 8}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [
+                verify_mod.GrainCandidate(
+                    columns=["order_id", "line_no"], source="unique_test_composite"
+                )
+            ]
+        },
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].data["duplicate_count"] == 2
+    assert findings[0].data["columns"] == ["order_id", "line_no"]
+
+
+def test_a_proven_unique_declared_grain_reports_nothing():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 10},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 10}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == []
+
+
+def test_a_composite_the_heuristic_cannot_find_is_reported_unknown_not_broken():
+    # No declared source at all, and no id-shaped column exists: the model's
+    # true grain may well be a composite, but the free naming heuristic never
+    # invents one, so this must come back as "unknown", never "broken".
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 10},
+        columns={"db.main.a": ["status", "amount"]},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert findings == []
+    assert any("could not be determined" in n and "a" in n for n in notes)
+
+
+def test_the_heuristic_escalates_a_near_unique_id_shaped_column_to_an_exact_check():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 100},
+        columns={"db.main.a": ["order_id", "status"]},
+        approx={"db.main.a": {"order_id": (99, 0.0)}},
+        exact={"db.main.a": {"order_id": 98}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert notes == []
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.exact is True
+    assert finding.data["duplicate_count"] == 2
+    assert finding.data["source"] == "heuristic"
+
+
+def test_the_heuristic_reports_a_clearly_broken_grain_from_the_approximate_count():
+    # Far below near-unique, so this is reported straight from the
+    # approximate count rather than paying for an exact scan to confirm
+    # what is already obvious -- honestly marked exact=False.
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 100},
+        columns={"db.main.a": ["order_id"]},
+        approx={"db.main.a": {"order_id": (40, 0.0)}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert notes == []
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.exact is False
+    assert finding.data["duplicate_count"] == 60
+    assert "approximately" in finding.detail
+
+
+def test_the_heuristic_skips_a_column_with_nulls_as_a_key_candidate():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 100},
+        columns={"db.main.a": ["order_id"]},
+        approx={"db.main.a": {"order_id": (95, 0.1)}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert findings == []
+    assert any("could not be determined" in n for n in notes)
+
+
+def test_grain_is_not_checked_for_an_ambiguous_relation_match():
+    adapter = _GrainAdapter(row_counts={}, columns={})
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, [], {"a"}
+    )
+    assert findings == []
+    assert any("was not checked" in n and "a" in n for n in notes)
+
+
+def test_a_model_with_no_relation_is_silently_skipped():
+    # missing_relation_findings already reports this; grain adds nothing.
+    adapter = _GrainAdapter(row_counts={}, columns={})
+    findings, notes = verify_mod.grain_findings(adapter, {}, {}, [], {"a"})
+    assert findings == []
+    assert notes == []
+
+
 # --- compile_check: wraps shadow_parse -------------------------------------------
 
 
@@ -625,6 +903,136 @@ def test_verify_reports_no_columns_declared_once_at_summary_level(
     assert any("declare no columns" in w for w in payload["warnings"])
 
 
+def _unique_test_node(model_unique_id: str, column: str) -> dict:
+    """A compiled ``unique`` test node, the shape ``_declared_from_manifest``
+    reads: ``attached_node`` names the model this test belongs to."""
+
+    return {
+        "resource_type": "test",
+        "test_metadata": {"name": "unique", "kwargs": {"column_name": column}},
+        "attached_node": model_unique_id,
+    }
+
+
+def test_verify_reports_a_broken_grain_from_the_declared_primary_entity(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#229: `stg_orders` has no unique test in this manifest, so its
+    semantic layer's declared primary entity (`order_id`, read straight from
+    the project's own real semantic YAML, since there is no compiled
+    semantic manifest here) is what stands in as the intended grain."""
+
+    maintain_repo.sql("UPDATE stg_orders SET order_id = 1 WHERE order_id = 2")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."stg_orders"',
+            }
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [f for f in payload["data"]["findings"] if f["code"] == "grain_broken"]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["identifier"] == "stg_orders"
+    assert finding["data"]["source"] == "primary_entity"
+    assert finding["data"]["duplicate_count"] == 1
+    assert finding["exact"] is True
+
+
+def test_verify_reports_a_broken_grain_from_a_declared_unique_test(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#229's first acceptance bullet: a declared unique key with duplicates
+    is reported with a count. A unique test in the manifest outranks the
+    semantic layer's primary entity for the same model and column."""
+
+    maintain_repo.sql("UPDATE stg_orders SET order_id = 1 WHERE order_id = 2")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."stg_orders"',
+            },
+            "test.maintain_test.unique_stg_orders_order_id": _unique_test_node(
+                "model.maintain_test.stg_orders", "order_id"
+            ),
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [f for f in payload["data"]["findings"] if f["code"] == "grain_broken"]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["data"]["source"] == "unique_test"
+    assert finding["data"]["duplicate_count"] == 1
+    assert finding["severity"] == "high"
+
+
+def test_verify_reports_nothing_for_a_proven_unique_grain_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#229's third acceptance bullet: a model with a proven unique grain
+    reports nothing, even though a real distinct-count scan ran."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."stg_orders"',
+            },
+            "test.maintain_test.unique_stg_orders_order_id": _unique_test_node(
+                "model.maintain_test.stg_orders", "order_id"
+            ),
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert [f for f in payload["data"]["findings"] if f["code"] == "grain_broken"] == []
+    assert "grain" not in payload["data"]["suppressed"]
+
+
+def test_verify_finds_a_broken_grain_via_the_naming_heuristic_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#229's proposal: a model with no declared unique test and no semantic
+    entity still gets checked, via the free ``id``-shaped naming guess, using
+    the real ``customers`` table (a genuine warehouse object with no dbt
+    model wrapping it in this manifest)."""
+
+    maintain_repo.sql("UPDATE customers SET id = 1 WHERE id = 2")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.dim_customers": {
+                "name": "dim_customers",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."customers"',
+            }
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [f for f in payload["data"]["findings"] if f["code"] == "grain_broken"]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["identifier"] == "dim_customers"
+    assert finding["data"]["source"] == "heuristic"
+    assert finding["data"]["duplicate_count"] == 1
+
+
 def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
     maintain_repo, monkeypatch: pytest.MonkeyPatch
 ):
@@ -662,6 +1070,7 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "no_relation",
         "row_population",
         "column_contract",
+        "grain",
     }
 
 
