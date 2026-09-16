@@ -1801,6 +1801,7 @@ def test_the_er_diagram_marks_pii_and_carries_no_column_value():
     from exmergo_dex_core.cache import (
         Dataset,
         DexCache,
+        KeyEvidence,
         PIICategory,
         Relationship,
     )
@@ -1831,6 +1832,18 @@ def test_the_er_diagram_marks_pii_and_carries_no_column_value():
         ],
         candidate_keys=[["customer_id"]],
         grain=["customer_id"],
+        # A key reason is prose, so it is the one new place a value could get
+        # spliced in by a later change. The diagram must not read this field at
+        # all, and asserting it here is what confines it to `explore profile`
+        # by test rather than by accident: `notable_columns` is shared with the
+        # renderer and is one line away from consulting it.
+        key_evidence=[
+            KeyEvidence(
+                columns=["customer_id"],
+                status="reported",
+                reason="customer_id is unique and non-null, aaron@example.com",
+            )
+        ],
     )
     orders = Dataset(
         identifier="shop.main.orders",
@@ -1861,6 +1874,78 @@ def test_the_er_diagram_marks_pii_and_carries_no_column_value():
         assert "pii:government_id 0.90" in mermaid
 
 
+def test_profile_key_evidence_and_notes_carry_counts_not_values():
+    """Where the line between a measurement and a value falls, stated in a test
+    rather than left to a reviewer's judgement.
+
+    A value is a datum read out of a row and rendered as itself: a min, a max,
+    a value domain entry, an address, an id. A count, a distinct count, a ratio
+    and the number of rows that would have to go for a column to be unique are
+    measurements *over* rows, and they are the currency this whole guardrail is
+    denominated in. So the test forbids the first and **requires** the second:
+    a version that reported no numbers would pass a forbid-only assertion while
+    being useless.
+
+    Scoped to `data_quality` and `key_evidence` deliberately, not to the whole
+    payload. A profile legitimately carries min/max and a value domain for safe
+    columns, so a blanket "no sentinel anywhere" assertion would be wrong here
+    in a way it is not wrong for the diagram and the map.
+    """
+
+    from exmergo_dex_core.cache import (
+        Dataset,
+        KeyEvidence,
+        ValueCount,
+        ValueDomain,
+    )
+    from exmergo_dex_core.explore.relationships import data_quality_notes, key_evidence
+    from exmergo_dex_core.explore.results import _profile_dataset_payload
+
+    # Nothing here could hold a value, and the pinned field set is what makes
+    # that a fact rather than a claim about today's code.
+    assert set(KeyEvidence.model_fields) == {"columns", "status", "reason"}
+
+    orders = Dataset(
+        identifier="shop.main.orders",
+        row_count=2037,
+        columns=[
+            ColumnProfile(
+                name="order_id",
+                data_type="BIGINT",
+                distinct_count=1927,
+                distinct_count_exact=True,
+                is_unique=False,
+                null_fraction=0.0,
+                min_value=1,
+                max_value=987654,
+            ),
+            ColumnProfile(
+                name="tier",
+                data_type="VARCHAR",
+                distinct_count=2,
+                value_domain=ValueDomain(
+                    values=[ValueCount(value="platinum", count=3)]
+                ),
+            ),
+        ],
+    )
+    orders.key_evidence = key_evidence(orders)
+    orders.data_quality = data_quality_notes(orders)
+
+    payload = _profile_dataset_payload(orders, show_all_columns=True)
+    notes = " ".join(payload["data_quality"])
+    reasons = " ".join(e["reason"] for e in payload["key_evidence"])
+
+    for value in ("987654", "platinum"):
+        assert value not in notes, "a column value reached a data-quality note"
+        assert value not in reasons, "a column value reached a key reason"
+
+    # The positive half: the measurements a caller acts on are all present.
+    assert "1927 distinct over 2037 rows" in notes
+    assert "110 rows would have to be removed" in notes
+    assert "94.6% of rows" in notes
+
+
 def test_the_map_payload_marks_pii_and_carries_no_column_value():
     """`explore map` returns findings rather than a receipt (issue #202), which
     puts profile content into the envelope for the first time. The rule the
@@ -1876,6 +1961,7 @@ def test_the_map_payload_marks_pii_and_carries_no_column_value():
     from exmergo_dex_core.cache import (
         Dataset,
         DexCache,
+        KeyEvidence,
         PIICategory,
         Relationship,
         ValueCount,
@@ -1910,6 +1996,16 @@ def test_the_map_payload_marks_pii_and_carries_no_column_value():
         ],
         candidate_keys=[["customer_id"]],
         grain=["customer_id"],
+        # As in the diagram test: a key reason is prose, and this payload must
+        # not reach for it. `columns_with_findings` and `notable_columns` are
+        # both shared with this command and both one line from consulting it.
+        key_evidence=[
+            KeyEvidence(
+                columns=["customer_id"],
+                status="reported",
+                reason="customer_id is unique and non-null, aaron@example.com",
+            )
+        ],
     )
     orders = Dataset(
         identifier="shop.main.orders",

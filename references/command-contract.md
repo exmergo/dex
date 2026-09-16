@@ -887,10 +887,35 @@ leaving a stale claim. A project with no compiled semantic layer contributes
 neither direction and is not an error on this path; `explore semantic list` is the
 command whose subject is the layer, and it is the one that refuses by name.
 
+**A key is ranked, and the reason travels with it.** `candidate_keys` is ordered,
+tightest proven key first, so the first entry is the one `grain` elects and the
+rest are alternatives rather than an unordered set a caller has to guess through.
+`key_evidence` carries one entry per combination the profile considered, each with
+its `columns`, a `status` of `reported` or `suppressed`, and a `reason` in the
+profile's own words. The reported entries are in the same order as
+`candidate_keys`, which is the invariant that keeps the two fields from drifting;
+the suppressed ones follow.
+
+Suppression exists because unique is not the same as identifying. Where one column
+is unique on all but a handful of rows, every wider column in the table completes
+it, and the resulting combinations are the same fact restated: the column has
+duplicates. Reporting them as keys buries the real key among filler and puts a
+test in scaffolded dbt on a tuple nobody meant. So they are suppressed from
+`candidate_keys`, kept in `key_evidence` with the reason, and stated once in
+`data_quality` alongside the counts. A caller learns from `key_evidence` that a
+probe ran and found only artifacts; that a probe never ran, or was narrowed by the
+budget, is what the probe's own notes say, and the two are not the same answer.
+
+`key_evidence` is a `profile` field. `explore map` reports the best-ranked key as
+`candidate_key` and is budgeted per object, so the full ranking belongs to the
+command whose subject is one relation in full.
+
 **`explore map` returns the map, not a receipt for it.** Alongside the counts,
 `data.objects` carries each top-ranked object's row count, detected grain,
-candidate key, notable columns (each with the role that earned it a place:
-`grain`, `key`, `join`, or a PII flag) and data-quality findings, and `data.edges`
+best-ranked candidate key (the full ranking and the reason behind each key are
+`explore profile`'s `key_evidence`, which this payload deliberately does not
+carry), notable columns (each with the role that earned it a place: `grain`,
+`key`, `join`, or a PII flag) and data-quality findings, and `data.edges`
 carries the join edges in exactly the shape `explore relationships` returns them.
 It is budgeted the way `explore diagram` is budgeted: at most 25 objects kept by
 rank, 12 columns per object, 40 edges, and 5 data-quality findings per object.

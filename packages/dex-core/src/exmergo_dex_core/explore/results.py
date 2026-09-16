@@ -120,6 +120,9 @@ def _profile_dataset_payload(
         "byte_size": dataset.byte_size,
         "candidate_keys": dataset.candidate_keys,
         "grain": dataset.grain,
+        # Beside the two fields it explains, because a reason separated from
+        # them is meaningless and has to survive the same truncation.
+        "key_evidence": [e.model_dump(mode="json") for e in dataset.key_evidence],
         "composite_keys": dataset.composite_keys,
         "rank_score": dataset.rank_score,
         "data_quality": dataset.data_quality,

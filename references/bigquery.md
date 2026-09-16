@@ -94,6 +94,15 @@ rows, a table of nested or repeated columns only (no approximate distinct, which
 every probe starts from), a table too small for a value domain, or one with too
 few countable columns to form a composite pair.
 
+The reserve cannot mirror every reason a composite probe ends up issuing nothing.
+A pair built on a continuous measure, or one that merely completes a column
+already unique on almost every row, is excluded before the probe runs, and both
+verdicts come from distinct counts that do not exist at estimate time. So a table
+whose every candidate pair is excluded that way still carries its reserve and
+then spends nothing. That is the loose direction and it is the safe one:
+reserving for a query that does not run costs a caller headroom, while failing to
+reserve for one that does is an overrun.
+
 An object BigQuery keeps no row count for, meaning every view and every external
 table, reserves all three. Unknown is not empty: the count arrives inside the
 aggregate scan, so every probe can run, and at estimate time there is no number

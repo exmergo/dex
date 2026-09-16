@@ -39,6 +39,7 @@ from ..adapters.base import Adapter, ObjectMeta, name_list
 # same-named row carrier is only a type hint on one shaping helper.
 from ..adapters.base import QueryResult as AdapterQueryResult
 from ..cache import (
+    CACHE_SCHEMA_VERSION,
     ColumnProfile,
     Dataset,
     DexCache,
@@ -3923,6 +3924,9 @@ def _annotate_grain(
     for ds in datasets:
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
+        # After candidate_keys, because the reported half has to come back in
+        # exactly its order; the probe's suppressed entries ride through.
+        ds.key_evidence = rel_mod.key_evidence(ds)
         ds.data_quality.extend(rel_mod.data_quality_notes(ds))
         if orphaned and ds.identifier in orphaned:
             ds.data_quality.append(
@@ -3939,10 +3943,21 @@ def _annotate_grain(
             )
             if profiled is not None:
                 declared = [profiled.name]
-                if ds.grain and ds.grain != declared:
+                if ds.grain != declared:
+                    # Says where the grain came from either way. "Measurement
+                    # found none" is as much worth stating as a disagreement:
+                    # it is the case where the declaration is carrying the
+                    # answer on its own, and a reader who cannot tell that
+                    # apart from a confirmed guess does not know how much the
+                    # grain rests on.
+                    origin = (
+                        f"heuristic suggested {', '.join(ds.grain)}"
+                        if ds.grain
+                        else "measurement found no key of its own"
+                    )
                     ds.data_quality.append(
                         f"grain {profiled.name} comes from the project's declared "
-                        f"primary entity (heuristic suggested {', '.join(ds.grain)})"
+                        f"primary entity ({origin})"
                     )
                 ds.grain = declared
         for col in ds.columns:
@@ -3999,11 +4014,15 @@ def _annotate_grain(
                             f"table; using {', '.join(chosen)} (also declared: "
                             f"{others})"
                         )
-                    if ds.grain and ds.grain != chosen:
+                    if ds.grain != chosen:
+                        origin = (
+                            f"heuristic suggested {', '.join(ds.grain)}"
+                            if ds.grain
+                            else "measurement found no key of its own"
+                        )
                         ds.data_quality.append(
                             f"grain {', '.join(chosen)} comes from the project's "
-                            "declared composite key (heuristic suggested "
-                            f"{', '.join(ds.grain)})"
+                            f"declared composite key ({origin})"
                         )
                     ds.grain = chosen
 
@@ -4193,7 +4212,13 @@ def _split_fresh_stale(
     mismatched-connector or absent prior — mirroring ``cmd_map``'s reuse gate.
 
     Freshness is fail-closed: a missing or unparseable ``profiled_at``, or any
-    doubt, re-profiles rather than trusting a stale scan.
+    doubt, re-profiles rather than trusting a stale scan. A cache written before
+    the current ``CACHE_SCHEMA_VERSION`` is stale for the same reason: an older
+    profile can carry verdicts this version would no longer reach (a composite
+    key later recognized as an artifact of a near-unique column, say), and
+    reusing one would keep a superseded answer alive and keep charging a metered
+    connector to re-check it. One scan per table per upgrade, and no caller has
+    to know to pass ``--refresh``.
 
     This is the gate for a *deliberate* profile, which is why the age window
     belongs in it. The on-demand path asks a narrower question (see
@@ -4207,7 +4232,12 @@ def _split_fresh_stale(
     common, not on ``ObjectMeta``.
     """
 
-    if refresh or prior is None or prior.provenance.connector != connector:
+    if (
+        refresh
+        or prior is None
+        or prior.provenance.connector != connector
+        or prior.schema_version < CACHE_SCHEMA_VERSION
+    ):
         return list(identifiers), {}
 
     prior_by_id = {d.identifier: d for d in prior.datasets if d.columns}

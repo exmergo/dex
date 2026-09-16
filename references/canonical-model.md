@@ -54,10 +54,14 @@ informs proposals, never the source of truth:
 .dex/
   config.yml      non-secret config: connector + dbt target, budgets, ranking hints
   cache.json      exploration artifacts (DexCache): profiles, PII flags, relationships,
-                  candidate keys, grain, rankings, data-quality observations. A column
-                  profile records whether its distinct count is exact or approximate
-                  (distinct_count_exact); each dataset carries the time it was profiled
-                  (profiled_at) so carried-forward profiles stay attributable
+                  ranked candidate keys with the evidence behind each (key_evidence,
+                  including the combinations suppressed as artifacts and why), grain,
+                  rankings, data-quality observations. A column profile records whether
+                  its distinct count is exact or approximate (distinct_count_exact); each
+                  dataset carries the time it was profiled (profiled_at) so
+                  carried-forward profiles stay attributable, and the file carries a
+                  schema version, so a profile written before the artifact exclusions
+                  existed is re-profiled rather than read as if they had applied
   snapshot.json   the maintain baseline: a frozen fingerprint of the warehouse schema, the
                   transformation project's state, the semantic layer's definitions with the
                   relationships and keys they declare, and declared grain assumptions. The

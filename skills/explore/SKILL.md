@@ -51,8 +51,17 @@ Subcommands, in the usual order:
    never rows).
 3. `explore profile <objects>` (space- or comma-separated) returns column
    profiles, PII flags recorded as (column, category, confidence) and never
-   example values, plus candidate keys, the likely grain, and data-quality
-   warnings (e.g. a non-unique id that will fan out on joins). A generic
+   example values, plus ranked candidate keys, the likely grain, `key_evidence`,
+   and data-quality warnings (e.g. an id unique on all but 110 rows, which will
+   fan out on joins). `candidate_keys` is ordered, tightest proven key first,
+   and `key_evidence` gives one entry per combination considered with its
+   `status` (`reported` or `suppressed`) and the reason. Read it before you
+   trust a composite: a combination unique only because one member is unique on
+   almost every row, or because a money column completes it, is suppressed
+   rather than reported. Where a near-unique column is the real story the
+   warning says so with the ratio, the counts, and how many rows would have to
+   be removed for it to be unique. That last number is the one to act on: it
+   names a source defect to fix rather than a key to work around. A generic
    `*_name` flag's confidence is refined by value-shape evidence from the same
    scan, in both directions: person-shaped values corroborate it, a closed
    reference vocabulary or long labels de-rate it below the firewall's blocking
@@ -61,7 +70,9 @@ Subcommands, in the usual order:
    are approximate for scale, but any column that looks unique within
    approximation noise is escalated to an exact COUNT(DISTINCT)
    (`distinct_count_exact: true`), so uniqueness and grain verdicts rest on
-   proof; a `~` prefix in a warning marks a count that is still approximate.
+   proof; a `~` prefix marks a number that is still approximate, on a count and
+   on a percentage alike, so a figure quoted without one is exact arithmetic
+   over an exact distinct count on a column with no nulls.
    A requested object whose cached profile is still fresh (same connector,
    schema unchanged, within `profile_freshness_hours`, default 24) is served
    from the cache (`cache_hit_count`) instead of re-scanned, so profiling a
@@ -79,8 +90,8 @@ Subcommands, in the usual order:
    columns that share no name at all.
 5. `explore map` writes or updates the `.dex/` cache and returns the map
    (`--verify` works here too). Alongside the counts, `data.objects` gives each
-   top-ranked object its row count, detected grain, candidate key, notable
-   columns (each carrying the role that earned it a place: `grain`, `key`,
+   top-ranked object its row count, detected grain, best-ranked candidate key,
+   notable columns (each carrying the role that earned it a place: `grain`, `key`,
    `join`, or a PII flag) and data-quality findings, and `data.edges` gives the
    join edges in the same shape `explore relationships` returns. With
    `--use-project` each object also carries `semantic_models`, the semantic models
