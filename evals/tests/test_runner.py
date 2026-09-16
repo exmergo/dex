@@ -11,7 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from evals.runner import AgentResult, run_corpus, run_suite, run_triggering
+from evals.runner import (
+    AgentResult,
+    ClassifyResult,
+    run_corpus,
+    run_suite,
+    run_triggering,
+)
 from evals.suite import (
     Corpus,
     CorpusCase,
@@ -120,17 +126,17 @@ def test_failure_surfaces_failed_assertion():
 
 
 class FakeClassifier:
-    """Reports whichever skill's trigger word appears in the prompt, or None."""
+    """Reports every skill whose trigger word appears in the prompt."""
 
     def __init__(self, triggers: dict[str, str]):
         self.triggers = triggers  # word -> skill
 
-    def classify(self, prompt: str) -> str | None:
+    def classify(self, prompt: str) -> ClassifyResult:
         lowered = prompt.lower()
-        for word, skill in self.triggers.items():
-            if word in lowered:
-                return skill
-        return None
+        fired = frozenset(
+            skill for word, skill in self.triggers.items() if word in lowered
+        )
+        return ClassifyResult(fired_skills=fired)
 
 
 def _corpus() -> Corpus:
@@ -160,8 +166,9 @@ def test_run_corpus_is_perfect_when_every_case_classifies_correctly():
     assert report.per_skill["explore"].recall == 1.0
     assert report.per_skill["transform"].f1 == 1.0
     assert report.per_skill["maintain"].true_positives == 1
-    # "none" never fires by construction (classify returns None for it), so it
-    # earns no entry in per_skill: there is no skill named "none" to score.
+    # "none" never appears in fired_skills by construction (an empty set is
+    # how a classifier reports nothing fired), so it earns no entry in
+    # per_skill: there is no skill named "none" to score.
     assert "none" not in report.per_skill
 
 
@@ -188,6 +195,88 @@ def test_run_corpus_result_rows_say_which_cases_missed():
     wrong = [r for r in report.results if not r.correct]
     assert {r.task_id for r in wrong} == {"b", "c"}
     assert all(r.actual_skill is None for r in wrong)
+
+
+def test_run_corpus_never_hides_a_second_marker_behind_the_first():
+    # "did" spuriously fires explore on the maintain case, on top of "drift"
+    # correctly firing maintain there. A classifier that reported only the
+    # first name in some fixed order would pick one and hide the other, and
+    # this genuine cross-skill contamination would never show up -- the exact
+    # failure mode #216 exists to catch.
+    classifier = FakeClassifier(
+        {"explore": "explore", "did": "explore", "drift": "maintain"}
+    )
+    report = run_corpus(_corpus(), classifier)
+    contaminated = next(r for r in report.results if r.task_id == "c")
+    assert contaminated.fired_skills == frozenset({"explore", "maintain"})
+    assert contaminated.actual_skill is None  # ambiguous: more than one fired
+    assert contaminated.correct is False
+    # explore fired where it should not have (a real false positive for it,
+    # even though maintain -- the expected skill -- also fired on this case).
+    assert report.per_skill["explore"].false_positives >= 1
+    assert report.per_skill["maintain"].true_positives == 1
+
+
+class _FlakyClassifier:
+    """Reports a per-call failure the way a well-behaved Classifier should:
+    via ClassifyResult.error, not by raising (a raise means the whole run
+    should abort, see test_run_corpus_lets_a_setup_failure_abort_the_run)."""
+
+    def __init__(self, fails_on: str, otherwise):
+        self.fails_on = fails_on
+        self.otherwise = otherwise
+
+    def classify(self, prompt: str) -> ClassifyResult:
+        if prompt == self.fails_on:
+            return ClassifyResult(error="claude exited 1")
+        return self.otherwise.classify(prompt)
+
+
+def test_run_corpus_keeps_a_failed_call_out_of_precision_and_recall():
+    # The maintain case's call fails outright. A failed call is neither "fired"
+    # nor "did not fire": folding it into maintain's false-negative count would
+    # blame the skill description for an infrastructure failure it had nothing
+    # to do with, and folding it into "correctly classified none" would hide
+    # the failure entirely.
+    classifier = _FlakyClassifier(
+        fails_on="did anything drift",
+        otherwise=FakeClassifier(
+            {"explore": "explore", "build": "transform", "drift": "maintain"}
+        ),
+    )
+    report = run_corpus(_corpus(), classifier)
+    failed = next(r for r in report.results if r.task_id == "c")
+    assert failed.error is not None
+    assert failed.actual_skill is None
+    assert failed.correct is False
+    assert "maintain" not in report.per_skill or (
+        report.per_skill["maintain"].true_positives == 0
+        and report.per_skill["maintain"].false_negatives == 0
+    )
+    # The other three cases are unaffected.
+    assert report.per_skill["explore"].recall == 1.0
+    assert report.per_skill["transform"].recall == 1.0
+
+
+class _UnavailableClassifier:
+    """Raises on the very first call and never gets a chance to run again,
+    modeling ClaudeNotAvailableError: the CLI binary is missing, so every
+    call would fail identically, and there is nothing case-specific about
+    it."""
+
+    def classify(self, prompt: str) -> ClassifyResult:
+        raise RuntimeError("'claude' not found on PATH")
+
+
+def test_run_corpus_lets_a_setup_failure_abort_the_run():
+    # Unlike a per-call failure (reported via ClassifyResult.error and kept
+    # in the results list), a classifier that raises is a setup problem the
+    # whole run cannot proceed past. run_corpus does not catch it: it is left
+    # to propagate to the caller (main() catches ClaudeNotAvailableError
+    # specifically and exits 2), rather than being recorded once per corpus
+    # case with the CLI still reporting a clean, misleading exit.
+    with pytest.raises(RuntimeError, match="not found on PATH"):
+        run_corpus(_corpus(), _UnavailableClassifier())
 
 
 def test_the_committed_ade_bench_corpus_loads_and_validates():

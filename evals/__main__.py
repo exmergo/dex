@@ -105,12 +105,17 @@ def _print_corpus(report: CorpusReport) -> None:
             f"f1 {pr.f1:.0%}  (tp={pr.true_positives} fp={pr.false_positives} "
             f"fn={pr.false_negatives})"
         )
-    misses = [r for r in report.results if not r.correct]
+    errors = [r for r in report.results if r.error is not None]
+    misses = [r for r in report.results if not r.correct and r.error is None]
     if misses:
         print(f"  {len(misses)} miss(es):")
         for r in misses:
-            expected, actual = r.expected_skill, r.actual_skill
-            print(f"    {r.task_id}: expected {expected!r}, got {actual!r}")
+            fired = sorted(r.fired_skills) or ["none"]
+            print(f"    {r.task_id}: expected {r.expected_skill!r}, got {fired}")
+    if errors:
+        print(f"  {len(errors)} call(s) failed (excluded from precision/recall):")
+        for r in errors:
+            print(f"    {r.task_id}: {r.error}")
 
 
 def _print_triggering(skill: str, report) -> None:
