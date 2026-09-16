@@ -573,10 +573,19 @@ def _build_parser() -> argparse.ArgumentParser:
                     # calling one if a caller can ask for it cheaply and disagree.
                     sp.add_argument("--explain", action="store_true", default=False)
                 if group == "transform" and name == "test":
-                    # `test` is scaffold-only for now: the model to derive a
-                    # unit_tests: skeleton from. No bare `transform test`
-                    # mode exists yet, unlike `macro`'s list-when-bare shape.
-                    sp.add_argument("--scaffold", default=None)
+                    # Two modes, and they are opposites: `--scaffold` writes a
+                    # unit test, `--mutate` measures the tests that already
+                    # exist. Mutually exclusive rather than ordered, because
+                    # asking for both in one call names no coherent outcome. No
+                    # bare `transform test` mode exists, unlike `macro`'s
+                    # list-when-bare shape.
+                    mode = sp.add_mutually_exclusive_group()
+                    mode.add_argument("--scaffold", default=None)
+                    mode.add_argument("--mutate", default=None)
+                    # Only ever narrows: the engine ceiling is what keeps a run
+                    # that invokes dbt once per mutant predictable.
+                    sp.add_argument("--max-mutants", type=int, default=None)
+                    sp.add_argument("--target", default=None)
                 if group == "semantic" and name in {"define", "update", "plan"}:
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)

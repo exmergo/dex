@@ -115,6 +115,14 @@ would judge nothing in a default project. There is no dev-namespace fold to make
 either, since the dev target is a database file and the dev-target preflight
 already refuses a build whose profile and config disagree about which one.
 
+`transform test --mutate` is free here too, and it is the connector to learn the
+command on: every mutant is a full dbt run, so twenty of them against a local
+file cost nothing but a few seconds, and no handshake stands between the caller
+and the answer. Nothing is materialized either way, because a mutant builds as
+an ephemeral model, so the dev database holds exactly the relations it held
+before.
+
+
 
 The dev target being the source file is also why `transform init`'s content
 preflight skips DuckDB's base namespace: "the file already holds objects" is

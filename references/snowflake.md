@@ -142,6 +142,17 @@ count, so a table's count is free metadata; how the counts are priced into
 the build's own estimate is in
 [`cost-controls.md`](cost-controls.md).
 
+`transform test --mutate` prices the batch in warehouse-seconds, from the same
+heuristic the rest of this connector uses rather than from a dry run, so the
+estimate carries `estimate_quality: heuristic` and the resume minimum floors it
+like any other billed command here. One estimate and one confirmation cover
+every mutant; a budget that runs out partway stops the run and reports the rest
+as `not_run`. Settlement is the sum of the per-node execution seconds each run
+reports, ledgered under `command: "transform test"`. Nothing is materialized,
+because a mutant builds as an ephemeral model, so `snowflake.dev_database` holds
+exactly the objects it held before the run.
+
+
 `--verify` also folds `snowflake.dev_database` / `snowflake.dev_schema` into its read scope for the length of that one
 command, because dbt writes the relations it is judging there and that namespace
 is refused as a source everywhere else. The widening shows in the envelope's

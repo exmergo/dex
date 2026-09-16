@@ -1,6 +1,6 @@
 <img width="1280" height="563" alt="exmergo-dex-showcase" src="https://github.com/user-attachments/assets/9dd574c2-8598-47bc-ae90-7d5a3a4d2e18" />
 
-**Built by [Exmergo](https://exmergo.com)** · AI Agents for Your Data Stack.
+**Built by [Exmergo](https://exmergo.com)** · The AI Stack for Your Data Stack.
 
 [![PyPI](https://img.shields.io/pypi/v/exmergo-dex-core?logo=pypi&logoColor=white&color=165dfc)](https://pypi.org/project/exmergo-dex-core/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-165dfc)](LICENSE)

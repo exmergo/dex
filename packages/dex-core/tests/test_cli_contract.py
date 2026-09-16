@@ -655,9 +655,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     },
     ("transform", "test"): {
         "reason": (
-            "scaffold-only; reachable as "
-            "exmergo_dex_core.transform.test_scaffold.test_scaffold(engine, "
-            "scaffold), not a DexEngine method"
+            "two modes on one verb: --mutate is DexEngine.test_mutations, while "
+            "--scaffold is reachable as "
+            "exmergo_dex_core.transform.commands.test_scaffold(engine, scaffold) "
+            "and is not a DexEngine method"
         ),
     },
     ("semantic", "define"): {

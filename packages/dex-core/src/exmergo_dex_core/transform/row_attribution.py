@@ -287,17 +287,6 @@ class _Change:
         )
 
 
-def _set_predicates(select: exp.Select, key: str, preds: list[exp.Expression]) -> None:
-    if not preds:
-        select.set(key, None)
-        return
-    condition = preds[0]
-    for extra in preds[1:]:
-        condition = exp.And(this=condition, expression=extra)
-    wrapper = {"where": exp.Where, "having": exp.Having, "qualify": exp.Qualify}[key]
-    select.set(key, wrapper(this=condition))
-
-
 def _predicate_mutator(
     clause: str, dialect: str, *, drop: str | None = None, add: str | None = None
 ) -> Callable[[exp.Select], None]:
@@ -307,7 +296,7 @@ def _predicate_mutator(
             preds = [p for p in preds if sql_shape.match_key(p) != drop]
         if add is not None:
             preds.append(sqlglot.parse_one(add, dialect=dialect))
-        _set_predicates(select, clause, preds)
+        sql_shape.set_predicates(select, clause, preds)
 
     return mutate
 

@@ -280,3 +280,127 @@ def test_config_drift_from_the_rendered_profile_is_refused(
     assert "DEX_RETARGETED_ELSEWHERE" in error
     assert sf_scratch_database in error
     assert "disagree about the dev target" in error
+
+
+def test_mutation_coverage_prices_in_seconds_and_materializes_nothing(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """The compute-time half of the cost contract, and the isolation guarantee.
+
+    Snowflake prices the batch in warehouse-seconds from a heuristic rather than
+    a dry run, so what matters here is that one estimate covers every mutant and
+    that the confirmed run settles seconds against the same command. The dev
+    schema is checked before and after: an ephemeral mutant creates no object,
+    so a run that left one behind would be writing where dex promised not to.
+    """
+
+    root = str(tmp_path)
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+
+    model = "dex_mutation_probe"
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": f"models/staging/{model}.sql",
+                        "kind": "model_sql",
+                        "content": (
+                            "select column1 as id, column2 as amount\n"
+                            "from values (1, 10), (2, 200)\n"
+                            "where column2 > 5\n"
+                        ),
+                    },
+                    {
+                        "path": "models/staging/schema.yml",
+                        "kind": "schema_yml",
+                        "content": (
+                            "version: 2\n"
+                            "models:\n"
+                            f"  - name: {model}\n"
+                            "    columns:\n"
+                            "      - name: id\n"
+                            "        data_tests: [not_null, unique]\n"
+                        ),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "mutation probe",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    import snowflake.connector
+
+    from exmergo_dex_core.config import SnowflakeTarget
+    from exmergo_dex_core.connect import resolve_snowflake_connection
+
+    params, _method = resolve_snowflake_connection(
+        SnowflakeTarget(connection_name=sf_connection_name), os.environ, tmp_path
+    )
+    conn = snowflake.connector.connect(**params)
+
+    def objects() -> set:
+        cursor = conn.cursor()
+        cursor.execute(f'SHOW OBJECTS IN SCHEMA "{sf_scratch_database}"."DBT_DEV"')
+        return {row[1] for row in cursor.fetchall()}
+
+    try:
+        before = objects()
+
+        rc, unconfirmed = run_cli(
+            ["--repo-root", root, "transform", "test", "--mutate", model], capsys
+        )
+        assert unconfirmed["status"] == "needs_confirmation", unconfirmed
+        assert unconfirmed["cost"]["paradigm"] == "compute_time"
+        assert unconfirmed["cost"]["estimate"] is not None
+
+        rc, measured = run_cli(
+            [
+                "--repo-root",
+                root,
+                "transform",
+                "test",
+                "--mutate",
+                model,
+                "--max-mutants",
+                "2",
+                "--confirm",
+                "--budget",
+                str(SF_MAX_SECONDS * 10),
+            ],
+            capsys,
+        )
+        assert rc == 0, measured
+        assert measured["status"] == "ok"
+        data = measured["data"]
+        assert data["counts"]["generated"] == 2
+        assert data["spend"]["seconds_billed"] >= 0
+
+        assert objects() == before
+    finally:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'DROP VIEW IF EXISTS "{sf_scratch_database}"."DBT_DEV"."{model.upper()}"'
+        )
+        conn.close()

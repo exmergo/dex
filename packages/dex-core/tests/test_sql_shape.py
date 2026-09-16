@@ -152,6 +152,37 @@ def test_predicates_flatten_across_top_level_ands():
     assert len(sql_shape.predicates(tree, "where")) == 3
 
 
+def test_set_predicates_round_trips_what_predicates_flattened():
+    """The pair has to compose: whatever the reader splits, the writer must put
+    back unchanged, or a caller that drops one predicate silently rewrites the
+    rest of the clause too."""
+
+    tree = _parse("select * from t where a = 1 and b = 2 and c = 3")
+    sql_shape.set_predicates(tree, "where", sql_shape.predicates(tree, "where"))
+    assert [sql_shape.text(p) for p in sql_shape.predicates(tree, "where")] == [
+        "a = 1",
+        "b = 2",
+        "c = 3",
+    ]
+
+
+def test_set_predicates_removes_the_clause_when_nothing_is_left():
+    """An empty WHERE wrapper is not printable, so dropping the last predicate
+    has to drop the clause itself."""
+
+    tree = _parse("select * from t where a = 1")
+    sql_shape.set_predicates(tree, "where", [])
+    assert "where" not in tree.sql().lower()
+
+
+@pytest.mark.parametrize("clause", ["where", "having", "qualify"])
+def test_set_predicates_rebuilds_each_clause_it_can_read(clause):
+    tree = _parse(f"select a from t {clause} a = 1 and b = 2")  # noqa: S608
+    preds = sql_shape.predicates(tree, clause)
+    sql_shape.set_predicates(tree, clause, [preds[0]])
+    assert [sql_shape.text(p) for p in sql_shape.predicates(tree, clause)] == ["a = 1"]
+
+
 def test_group_by_reports_its_expressions_as_written():
     tree = _parse("select a, count(*) from t group by a")
     assert sql_shape.group_by(tree) == ["a"]
