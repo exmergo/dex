@@ -1,7 +1,7 @@
 """maintain verify: a baseline-free sweep answering "is this project correct
 right now", as opposed to drift's "what changed since the baseline" (#224).
 
-Four finding classes live here. Build-status gaps (#225) read the compiled
+Five finding classes live here. Build-status gaps (#225) read the compiled
 manifest and the last run's ``run_results.json``: failed nodes, nodes skipped
 by a failed parent, models with no relation, and a project that does not
 compile. Column contract (#230) compares a built relation's actual columns
@@ -13,16 +13,22 @@ in its SQL that would account for the shortfall, has lost rows silently, and
 one holding materially more has fanned out on a join. Grain (#229) checks
 that a model's intended grain -- a declared ``unique`` test, a semantic
 model's declared primary entity, or (absent either) a free naming heuristic
--- still holds one row per key in the built relation.
+-- still holds one row per key in the built relation. Join contract (#228)
+reads the same compiled SQL for every equality join a model writes, and
+measures the value overlap on each: a join whose keys find almost nothing on
+the other side is silently wrong in a way no dbt test catches, and is the
+most damaging defect this sweep can report.
 
-Detection is pure and reads only artifacts already on disk, with three
+Detection is pure and reads only artifacts already on disk, with four
 exceptions, all metadata-only or bounded-and-deliberate by the adapter's own
 contract rather than an open-ended scan: the column contract's own
 ``adapter.table_metadata`` read, the grain check's ``adapter.
 exact_distinct_counts``/``distinct_combination_counts`` (called only on a
-declared or already-near-unique key, never speculatively across a table), and
-:func:`relation_counts`, which is where an open-ended warehouse *scan* can
-happen at all and is separate for that reason: it decides between the
+declared or already-near-unique key, never speculatively across a table), the
+join contract's own overlap probe (:func:`join_contract_findings`, priced and
+offered exactly like :func:`relation_counts` below rather than taken), and
+:func:`relation_counts` itself, which is where an open-ended warehouse *scan*
+can happen at all and is separate for that reason: it decides between the
 catalog's free metadata, a free count, and a count that has to be paid for
 and is therefore offered rather than taken. Keeping that decision in one
 place is what lets every other function here be judged on artifacts (or free,
@@ -865,6 +871,26 @@ def _table_name(node) -> str:
     return ".".join(parts)
 
 
+def _cte_name(node, cte_scopes: dict) -> str | None:
+    """``node``'s own CTE name, if it is one -- and only when it is written
+    unqualified (``orders``, never ``main.orders`` or ``db.main.orders``).
+
+    A CTE has no schema of its own to be qualified with; a reference that
+    carries one is a real, physical table that merely shares a short name
+    with a CTE the query also declares (``with orders as (select * from
+    main.orders) ...``), and matching it against ``cte_scopes`` by bare name
+    alone would treat that physical table as a self-reference back to the
+    CTE itself, exactly the mistake this guards against.
+    """
+
+    from sqlglot import expressions as exp
+
+    if not isinstance(node, exp.Table) or node.catalog or node.db:
+        return None
+    name = node.name.lower()
+    return name if name in cte_scopes else None
+
+
 def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = None):
     """Follow a relation through this query's CTEs to the table behind it.
 
@@ -1300,6 +1326,750 @@ def row_population_findings(
             "counting it was not free)"
         )
     return findings, notes
+
+
+# --- join contract: a model's own joins against measured value overlap ---------
+
+#: A verified join's orphan fraction at or above this is a complete or
+#: near-complete miss: the join predicate connects to almost nothing on the
+#: other side. Deliberately the same value `explore relationships --verify`
+#: uses for its own catastrophic-orphan-rate finding (#207's
+#: `_ORPHAN_FINDING_THRESHOLD`), because it is the same judgement -- "this
+#: join found almost nothing" -- asked of a join the project wrote instead of
+#: one dex inferred. Kept as its own constant rather than imported, the same
+#: reasoning `_ROW_LOSS_HIGH_FRACTION` above already gives: the two axes are
+#: free to diverge on field evidence without dragging each other along.
+_JOIN_ZERO_OVERLAP_THRESHOLD = 0.9
+
+#: The floor a join's orphan fraction must clear to be worth reporting at
+#: all, below `_JOIN_ZERO_OVERLAP_THRESHOLD`. A left join whose right side is
+#: legitimately sparse sits here: real orphans, honestly measured, but not
+#: the catastrophic case `_JOIN_ZERO_OVERLAP_THRESHOLD` names. Below this, a
+#: join is healthy and reports nothing.
+_JOIN_ORPHANS_THRESHOLD = 0.2
+
+
+@dataclass(frozen=True)
+class JoinCandidate:
+    """One equality join a model's compiled SQL writes, both sides resolved
+    past their CTE aliases to the physical relation each reads.
+
+    ``from_relation``/``from_columns`` is the side already in scope when the
+    join is written (the FROM relation, or an earlier join in the same
+    chain) -- the "child" side whose key is expected to find a match.
+    ``to_relation``/``to_columns`` is the relation this join introduces --
+    the "parent" side the key is checked against. This is the same from/to
+    split :class:`~exmergo_dex_core.cache.Relationship` already uses, so a
+    candidate here converts to one with no re-derivation. The columns are
+    tuples, not one each: a join whose ON equates more than one column pair
+    between the same two relations (``a.order_id = b.order_id AND a.line_no
+    = b.line_no``) is one composite key, not two independent single-column
+    ones -- probing them separately would measure the overlap of each column
+    alone, a different and generally wrong question from whether the
+    combination matches.
+    """
+
+    from_relation: str
+    from_columns: tuple[str, ...]
+    to_relation: str
+    to_columns: tuple[str, ...]
+    side: str
+
+
+def _scope_relations(select, sql_shape) -> dict[str, object]:
+    """One scope's own alias -> raw, unresolved relation map: its FROM plus
+    every one of its own JOINs. The same map :func:`_model_joins` builds for
+    the outer scope it is walking, needed again here because resolving a
+    column projected from *inside* a CTE has to know that CTE's own
+    relations too -- a projection can read from any of them, not only the
+    CTE's FROM (see :func:`_resolve_within_scope`)."""
+
+    relations: dict[str, object] = {}
+    from_relation = sql_shape.from_relation(select)
+    if from_relation is not None:
+        relations[from_relation.alias_or_name.lower()] = from_relation
+    for join in sql_shape.joins(select):
+        relations[join.relation.alias_or_name.lower()] = join.relation
+    return relations
+
+
+def _qualified_source(column, scope_relations: dict[str, object]):
+    """Which of ``scope_relations`` a column reference names: its own table
+    qualifier, looked up directly, when it has one; the sole relation in
+    scope when it has none and there is only one candidate (an unqualified
+    column can only mean that one); ``None`` when it has none and more than
+    one relation could have written it -- unresolvable without a schema
+    read dex does not have at parse time, not a guess to make."""
+
+    qualifier = (column.table or "").lower()
+    if qualifier:
+        return scope_relations.get(qualifier)
+    if len(scope_relations) == 1:
+        return next(iter(scope_relations.values()))
+    return None
+
+
+def _resolve_within_scope(select, column_name: str, cte_scopes: dict, sql_shape, seen):
+    """Find ``column_name``'s own projection inside ``select``, and recurse
+    into *whichever of that scope's own relations it actually reads from*
+    -- its FROM, or one of its own JOINs, determined by
+    :func:`_qualified_source` exactly the way an outer join's own column
+    resolution is. A CTE that projects a joined relation's column
+    (``select o.order_id, c.region_id from orders o join customers c on
+    ...``) must resolve ``region_id`` through ``customers``, not blindly
+    through the CTE's FROM (``orders``, which does not have it) -- the
+    fix this function exists for.
+
+    A bare, unqualified ``SELECT *`` passes every name through unchanged,
+    but only when this scope has exactly one relation to have come from;
+    with more than one in scope, which table a star's column belongs to is
+    the same schema question a qualifier's absence already cannot answer,
+    so it is left unresolved rather than assumed.
+
+    Refuses -- rather than resolving through -- any scope that reduces rows
+    (:func:`~..sql_shape.reducing_clauses`: a WHERE, a HAVING, a GROUP BY, a
+    DISTINCT, a LIMIT). ``select * from customers where active = true``
+    projects the same column names the physical ``customers`` table has,
+    but not the same rows: probing a join against the whole table when the
+    project's own SQL joins against only the active subset can report a
+    join healthy that has zero real overlap once the filter is honored. The
+    join is skipped instead, not measured against semantics it does not
+    have.
+    """
+
+    from sqlglot import expressions as exp
+
+    if sql_shape.reducing_clauses(select):
+        return None
+
+    scope_relations = _scope_relations(select, sql_shape)
+    saw_unqualified_star = False
+    for proj in select.expressions:
+        if isinstance(proj, exp.Star):
+            saw_unqualified_star = True
+            continue
+        if isinstance(proj, exp.Alias):
+            if proj.alias.lower() != column_name.lower():
+                continue
+            inner = proj.this
+            if not isinstance(inner, exp.Column):
+                return None
+            source = _qualified_source(inner, scope_relations)
+            return (
+                None
+                if source is None
+                else _resolve_join_column(
+                    source, inner.name, cte_scopes, sql_shape, seen
+                )
+            )
+        if (
+            isinstance(proj, exp.Column)
+            and proj.alias_or_name.lower() == column_name.lower()
+        ):
+            source = _qualified_source(proj, scope_relations)
+            return (
+                None
+                if source is None
+                else _resolve_join_column(
+                    source, proj.name, cte_scopes, sql_shape, seen
+                )
+            )
+    if saw_unqualified_star and len(scope_relations) == 1:
+        (only_source,) = scope_relations.values()
+        return _resolve_join_column(
+            only_source, column_name, cte_scopes, sql_shape, seen
+        )
+    return None
+
+
+def _resolve_join_column(
+    node, column_name: str, cte_scopes: dict, sql_shape, seen=None
+):
+    """Follow one column from ``node`` (the raw relation a join predicate
+    qualified it with) through as many CTE or inline-subquery hops as it
+    takes to the physical relation and column it actually reads.
+
+    A compiled dbt model's own CTE can rename a column in its SELECT list
+    (``select customer_id as cid from orders``), or project one from a
+    relation it joins rather than its FROM; a join further downstream then
+    writes the CTE's own name for it (``cid``), which the physical table
+    underneath may not have, or may have under a different name. Probed as
+    written, that sends the adapter a column the relation does not carry,
+    and the probe fails outright. Resolved here instead, one hop at a time
+    via :func:`_resolve_within_scope`; the first hop that computes the
+    column, or that a star cannot disambiguate, returns ``None``, and the
+    caller treats the whole pair as unresolvable rather than guessing.
+
+    ``seen`` guards against a CTE cycle (a cycle needs invalid SQL, but the
+    guard costs nothing); an inline subquery needs no such guard, since
+    descending into one is always a strictly smaller, genuinely different
+    node -- there is no way back to one already visited.
+
+    Returns ``(physical_relation, physical_column_name)``, or ``None``.
+    """
+
+    from sqlglot import expressions as exp
+
+    seen = seen if seen is not None else set()
+
+    if isinstance(node, exp.Subquery):
+        inner = node.this
+        if not isinstance(inner, exp.Select):
+            return None
+        return _resolve_within_scope(inner, column_name, cte_scopes, sql_shape, seen)
+
+    if not isinstance(node, exp.Table):
+        return None
+    cte_name = _cte_name(node, cte_scopes)
+    if cte_name is None:
+        return node, column_name
+    if cte_name in seen:  # pragma: no cover - a cycle needs invalid SQL
+        return None
+    definition = cte_scopes[cte_name]
+    if not isinstance(definition, exp.Select):
+        # A set-operation CTE (a UNION and friends): its output column has
+        # no single physical source to resolve to -- each branch can read
+        # from an entirely different relation for the "same" column -- so
+        # this is unresolvable rather than a guess at which branch answers.
+        return None
+    return _resolve_within_scope(
+        definition, column_name, cte_scopes, sql_shape, seen | {cte_name}
+    )
+
+
+def _join_equality_pairs(join, in_scope_relations: list, sql_shape):
+    """The column-to-column equalities one join's condition requires
+    together, however it wrote them -- an ``ON``, or ``USING`` (each named
+    column implies ``left.col = right.col`` with no explicit qualifier on
+    either side, so this builds that pair itself).
+
+    A ``USING`` join is only resolved when exactly one relation is already
+    in scope: with a single preceding relation, that is unambiguously the
+    "left" side the using-column must belong to, but with two or more (a
+    third-plus join in a chain, ``... JOIN b USING (x) JOIN c USING (y)``
+    where ``y`` was ``b``'s column, not the original FROM's), which one
+    actually carries it is a schema question dex cannot answer from the SQL
+    text alone, so guessing the original FROM relation the way an earlier
+    version of this function did is exactly the bug this guards against.
+
+    Returns ``(pairs, skip_reason)``: ``skip_reason`` is ``None`` with empty
+    ``pairs`` for a join that carries neither (a CROSS JOIN, an UNNEST --
+    not a candidate for this check at all, not something to note either),
+    and a prose reason with empty ``pairs`` for one that carries a real
+    condition this could not turn into a composite key (see
+    :func:`~..sql_shape.conjunctive_equality_pairs` for why "some of the
+    equalities, dropping the rest" is never an acceptable partial answer).
+    """
+
+    from sqlglot import expressions as exp
+
+    if join.using:
+        if len(in_scope_relations) != 1:
+            reason = (
+                "a USING join with nothing already in scope to pair against"
+                if not in_scope_relations
+                else "a USING join with more than one relation already in scope: "
+                "which one carries the column cannot be determined from the "
+                "SQL text alone"
+            )
+            return [], reason
+        (from_relation,) = in_scope_relations
+        from_alias = from_relation.alias_or_name
+        to_alias = join.relation.alias_or_name
+        return [
+            (exp.column(col, table=from_alias), exp.column(col, table=to_alias))
+            for col in join.using
+        ], None
+    if join.on is None:
+        return [], None  # a CROSS JOIN/UNNEST: not this check's business
+    pairs = sql_shape.conjunctive_equality_pairs(join.on)
+    if pairs is None:
+        return [], "no conjunctive column-to-column equality"
+    return pairs, None
+
+
+def _select_branches(tree, sql_shape) -> list:
+    """Every leaf SELECT under a top-level set operation, flattened.
+
+    ``UNION``/``UNION ALL``/``INTERSECT``/``EXCEPT`` parse as a left-deep
+    binary tree (``A UNION B UNION C`` is ``Union(this=Union(this=A,
+    expression=B), expression=C)``), so a caller that only looks at the
+    outermost node's own FROM/JOINs (as :func:`_driving_parent` does, for
+    its own narrower purpose of finding one single driving relation) never
+    sees any branch's own joins at all -- a real join a branch writes,
+    orphans and all, is invisible from the top. Flattened here instead, so
+    every branch is walked for its own joins independently. A single
+    top-level SELECT is already its own one-element answer; anything else
+    (no FROM at all, a VALUES list) has no join to find and returns empty.
+    """
+
+    from sqlglot import expressions as exp
+
+    if isinstance(tree, exp.Select):
+        return [tree]
+    if sql_shape.SET_OPERATIONS and isinstance(tree, sql_shape.SET_OPERATIONS):
+        left = _select_branches(tree.this, sql_shape) if tree.this is not None else []
+        right_side = tree.args.get("expression")
+        right = (
+            _select_branches(right_side, sql_shape) if right_side is not None else []
+        )
+        return left + right
+    return []
+
+
+def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
+    """Every equality join reachable from a model's compiled SQL (#228),
+    both sides resolved past their CTE aliases to the physical relation and
+    column each reads.
+
+    Visits every scope the query reaches, not only the FROM chain a single
+    driving parent walks (:func:`_driving_parent`'s own narrower purpose):
+    a join naming a CTE that itself joins two other relations has that inner
+    join visited too, an inline subquery (``select * from (select ... join
+    ...) x``) is descended into the same way, queued the moment either kind
+    is named in a FROM or a JOIN, and a top-level set operation
+    (``UNION``/``UNION ALL``/``INTERSECT``/``EXCEPT``) has every one of its
+    branches walked independently (:func:`_select_branches`), sharing the
+    one ``WITH`` clause a compound statement's CTEs are scoped to as a
+    whole. A CTE or an inline subquery whose own body is a set operation
+    (rather than a plain SELECT) gets the same treatment: every branch is
+    still walked for its own joins (a CTE naming a real, written join in one
+    of its branches has that join checked, not silently skipped because the
+    CTE as a whole is a UNION), even though a *column* reference through
+    such a CTE is unresolvable (:func:`_resolve_join_column`) -- finding a
+    join and resolving a column through one are different questions, and a
+    UNION only makes the second one ill-posed, not the first. A visited set
+    (by CTE name) keeps a CTE referenced from more than one place from being
+    processed twice; an inline subquery needs no such guard, since it can
+    never be reached a second time by construction.
+
+    Returns ``(candidates, skipped)``. ``skipped`` names, in prose, every
+    join dex saw carrying a real condition it could not turn into a
+    candidate -- a non-conjunctive-equality condition (an OR, a range
+    predicate), a ``USING`` join ambiguous about which relation it pairs
+    against, or a column (a CTE's own computed expression, or one a star
+    could not disambiguate) that could not be resolved to a physical one --
+    so a non-equality join is stated rather than silently dropped (#228's
+    acceptance). If *any* equality pair the join's own condition requires
+    together is unresolvable, the whole join is skipped rather than probed
+    on the pairs that did resolve: a composite key with one component
+    guessed away is a narrower, wrong question, the same reasoning
+    :func:`~..sql_shape.conjunctive_equality_pairs` already applies to a
+    non-equality conjunct. A join with neither an ON nor a USING (a CROSS
+    JOIN, an UNNEST) is not a candidate for this check by construction and
+    is excluded without a note, the same as row population's own fanout
+    check already treats it (`sql_shape.ROW_MULTIPLIERS`).
+    """
+
+    from sqlglot import expressions as exp
+
+    branches = _select_branches(tree, sql_shape)
+    if not branches:
+        return [], []
+
+    # A local scan rather than sql_shape.scopes(): that function is typed
+    # (and used by its other callers, row population and transform plan) as
+    # SELECT-only CTEs, so a CTE whose own body is a set operation is
+    # dropped from its result entirely -- exactly the join-finding gap this
+    # fixes. #228's own traversal needs the raw body, Select or set
+    # operation alike, so it is read directly here instead of widening a
+    # shared primitive's contract for every other caller's sake.
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    cte_scopes: dict[str, exp.Expression] = (
+        {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        if with_clause is not None
+        else {}
+    )
+    candidates: list[JoinCandidate] = []
+    skipped: list[str] = []
+    visited_ctes: set[str] = set()
+    queue: list = list(branches)
+
+    def _enqueue(relation) -> None:
+        if isinstance(relation, exp.Subquery):
+            queue.extend(_select_branches(relation.this, sql_shape))
+            return
+        cte_name = _cte_name(relation, cte_scopes)
+        if cte_name is not None and cte_name not in visited_ctes:
+            visited_ctes.add(cte_name)
+            queue.extend(_select_branches(cte_scopes[cte_name], sql_shape))
+
+    while queue:
+        current = queue.pop()
+        from_relation = sql_shape.from_relation(current)
+        # alias -> the *raw*, unresolved relation node, so a column's own
+        # resolution (_resolve_join_column) can walk the same CTE/subquery
+        # chain a relation's own resolution does, rather than trusting a
+        # column name survived every hop unchanged.
+        alias_map: dict[str, exp.Expression] = {}
+        if from_relation is not None:
+            alias_map[from_relation.alias_or_name.lower()] = from_relation
+            _enqueue(from_relation)
+
+        for join in sql_shape.joins(current):
+            # Every relation already in scope *before* this join's own is
+            # added -- what a USING join's ambiguity check needs, and what
+            # an ON join's alias lookup already used implicitly.
+            in_scope_relations = list(alias_map.values())
+            join_alias = join.relation.alias_or_name.lower()
+            alias_map[join_alias] = join.relation
+            _enqueue(join.relation)
+
+            pairs, skip_reason = _join_equality_pairs(
+                join, in_scope_relations, sql_shape
+            )
+            if skip_reason is not None:
+                skipped.append(f"{join.label}: {skip_reason}")
+                continue
+            if not pairs:
+                continue  # a CROSS JOIN/UNNEST: not this check's business
+
+            # Grouped by (from relation, to relation): every equality pair
+            # between the same two relations is one composite key, not one
+            # candidate per pair (see JoinCandidate's own docstring).
+            grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            unresolved = False
+            for left, right in pairs:
+                left_relation = alias_map.get((left.table or "").lower())
+                right_relation = alias_map.get((right.table or "").lower())
+                if left_relation is None or right_relation is None:
+                    unresolved = True
+                    break
+                left_resolved = _resolve_join_column(
+                    left_relation, left.name, cte_scopes, sql_shape
+                )
+                right_resolved = _resolve_join_column(
+                    right_relation, right.name, cte_scopes, sql_shape
+                )
+                if left_resolved is None or right_resolved is None:
+                    unresolved = True
+                    break
+                left_table, left_col = left_resolved
+                right_table, right_col = right_resolved
+                if (left.table or "").lower() == join_alias:
+                    to_table, to_col = left_table, left_col
+                    from_table, from_col = right_table, right_col
+                elif (right.table or "").lower() == join_alias:
+                    to_table, to_col = right_table, right_col
+                    from_table, from_col = left_table, left_col
+                else:
+                    unresolved = True
+                    break
+                from_name, to_name = _table_name(from_table), _table_name(to_table)
+                grouped.setdefault((from_name, to_name), []).append((from_col, to_col))
+            if unresolved:
+                # Any unresolvable component drops the whole join, not just
+                # that pair: a composite key probed on only the pairs that
+                # happened to resolve is a narrower question than the join
+                # itself asks, and can read a genuinely broken join as
+                # healthy (#228's own review).
+                skipped.append(
+                    f"{join.label}: a join column could not be resolved to a "
+                    "physical relation and column"
+                )
+                continue
+            for (from_name, to_name), column_pairs in grouped.items():
+                from_cols = tuple(c for c, _ in column_pairs)
+                to_cols = tuple(c for _, c in column_pairs)
+                if from_name == to_name and from_cols == to_cols:
+                    # The literal same key read twice off the same relation
+                    # (t.col = t.col): every row matches itself, always --
+                    # nothing to orphan-check. A self-join on *different*
+                    # columns (employees.manager_id = managers.id, both
+                    # reading `employees`) is a real, checkable join and is
+                    # not excluded here.
+                    continue
+                candidates.append(
+                    JoinCandidate(
+                        from_relation=from_name,
+                        from_columns=from_cols,
+                        to_relation=to_name,
+                        to_columns=to_cols,
+                        side=join.side,
+                    )
+                )
+
+    return candidates, skipped
+
+
+def join_contract_plan(
+    project_dir: Path, dialect: str, *, scope: set[str] | None = None
+) -> tuple[dict[str, list[JoinCandidate]], list[str]]:
+    """Every selected model's own equality joins, read from its compiled SQL
+    (#228). Free: parses artifacts already on disk, opens no connection.
+
+    ``dialect`` is the connector's own dialect, the same parameter
+    :func:`row_population_plan` already takes for the same reason: compiled
+    SQL is written in the project's actual warehouse's dialect, and parsing
+    it as DuckDB regardless would misread dialect-specific syntax on every
+    other connector -- silently wrong candidates at best, a parse failure
+    that drops the model's joins entirely at worst.
+
+    ``scope`` is compared lowercase, the same convention
+    :func:`column_contract_plan` and :func:`grain_plan` follow.
+
+    Returns ``(candidates, notes)``. A model absent from ``candidates``
+    either declares no joins at all, or every join it writes was skipped
+    (named in ``notes``, prefixed by the model); the caller cannot tell
+    those apart from this return alone, which is fine, since neither is a
+    finding -- only a measured orphan fraction is.
+    """
+
+    from .. import sql_shape
+
+    nodes = _manifest_nodes(project_dir)
+    if nodes is None:
+        return (
+            {},
+            [
+                "no compiled manifest found; run `dbt compile` or `dbt build` "
+                "for join-contract findings"
+            ],
+        )
+
+    import sqlglot
+
+    by_model: dict[str, list[JoinCandidate]] = {}
+    notes: list[str] = []
+    for node in nodes.values():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        name = node.get("name")
+        if not (isinstance(name, str) and name):
+            continue
+        if scope is not None and name.lower() not in scope:
+            continue
+        sql = node.get("compiled_code")
+        if not isinstance(sql, str) or not sql.strip():
+            continue
+        try:
+            tree = sqlglot.parse_one(sql, read=dialect)
+        except Exception:  # noqa: S112 -- unparseable compiled SQL, not our defect
+            continue
+        candidates, skipped = _model_joins(tree, sql_shape)
+        if candidates:
+            by_model[name] = candidates
+        notes.extend(f"{name}: {reason}" for reason in skipped)
+    return by_model, notes
+
+
+def _resolve_join_relationships(
+    candidates_by_model: dict[str, list[JoinCandidate]],
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+):
+    """Every candidate turned into a :class:`~..cache.Relationship`, both
+    sides resolved to exactly one live identifier. Pure and adapter-free:
+    ``live_identifiers`` is already-read metadata, matching every other
+    resolution step in this module. Returns ``(pairs, unresolved)``, where
+    ``pairs`` keeps each relationship's owning model alongside it (a
+    ``Relationship`` itself carries no model name) and ``unresolved`` names
+    the models a join could not be resolved for."""
+
+    from ..cache import Relationship, RelationshipKind
+
+    pairs: list[tuple[str, Relationship]] = []
+    unresolved: list[str] = []
+    for model, candidates in candidates_by_model.items():
+        for candidate in candidates:
+            from_matches = match_identifier(candidate.from_relation, live_identifiers)
+            to_matches = match_identifier(candidate.to_relation, live_identifiers)
+            if len(from_matches) != 1 or len(to_matches) != 1:
+                unresolved.append(model)
+                continue
+            pairs.append(
+                (
+                    model,
+                    Relationship(
+                        from_dataset=from_matches[0],
+                        from_columns=list(candidate.from_columns),
+                        to_dataset=to_matches[0],
+                        to_columns=list(candidate.to_columns),
+                        kind=RelationshipKind.DECLARED,
+                    ),
+                )
+            )
+    return pairs, unresolved
+
+
+def join_probe_cost(adapter, relationships: list) -> tuple[float, int]:
+    """``(estimate, probe_count)`` for measuring every relationship here dex
+    has not yet measured, without running the probe.
+
+    Pure pricing, split out from :func:`join_contract_findings` so a caller
+    combining this estimate with another axis's own (row population's row
+    counts, in `maintain/commands.py`'s shared handshake) can price both
+    before asking once, rather than each axis asking on its own and
+    ``VerifyResult.pending_offer`` -- one slot -- silently keeping only
+    whichever asked last.
+    """
+
+    from .. import command_args
+    from ..explore import relationships as rel_mod
+
+    to_probe = rel_mod.probe_candidates(relationships)
+    if not to_probe or command_args.cost_gate(adapter) is None:
+        return 0.0, len(to_probe)
+    estimator = getattr(adapter, "query_estimate", None)
+    if estimator is None:
+        return 0.0, len(to_probe)
+    statements = rel_mod.probe_statements(relationships, adapter.dialect)
+    return sum(estimator(stmt) for stmt in statements), len(to_probe)
+
+
+def join_contract_cost(
+    project_dir: Path,
+    adapter,
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    *,
+    scope: set[str] | None = None,
+) -> tuple[float, int]:
+    """``(estimate, probe_count)`` for #228's whole axis, end to end but
+    without running anything: the plan (parse every selected model's
+    compiled SQL), the resolution (each join's relations against the live
+    warehouse), and the pricing (:func:`join_probe_cost`), composed into one
+    call. Exists so `maintain/commands.py`'s combined handshake can price
+    this axis lazily, alongside row population's own estimate, before either
+    axis asks once -- see that handshake's own docstring.
+    """
+
+    candidates, _plan_notes = join_contract_plan(
+        project_dir, adapter.dialect, scope=scope
+    )
+    pairs, _unresolved = _resolve_join_relationships(
+        candidates, model_relations, live_identifiers
+    )
+    return join_probe_cost(adapter, [rel for _model, rel in pairs])
+
+
+def _standalone_join_handshake(adapter) -> Callable[[float, int], object | None]:
+    """The ask this axis makes on its own, when the caller has not supplied a
+    shared one -- mirrors :func:`_standalone_handshake`'s reasoning exactly,
+    for the same reason: free findings elsewhere in the envelope are already
+    final, so this returns a request rather than raising."""
+
+    from .. import command_args
+
+    def ask(estimate: float, probe_count: int):
+        return command_args.confirmation_request(
+            "maintain verify",
+            adapter,
+            estimate,
+            per_table={"(join overlap probes)": estimate},
+            axes=["join_contract"],
+            notes=[
+                f"the estimate buys {probe_count} join overlap probe(s), which "
+                "is what a broken or sparse join is judged from"
+            ],
+        )
+
+    return ask
+
+
+def join_contract_findings(
+    adapter,
+    candidates_by_model: dict[str, list[JoinCandidate]],
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    *,
+    timeout_seconds: float = 30.0,
+    handshake: Callable[[float, int], object | None] | None = None,
+) -> tuple[list[DriftFinding], list[str], object | None]:
+    """A model's own joins measured against real value overlap (#228).
+
+    Reuses the exact probe `explore relationships --verify` already runs
+    (:func:`~..explore.relationships.verify_relationships`) rather than
+    authoring a second one: the question is identical (how many of this
+    side's non-null keys have no match on the other side), only the source
+    of the join differs (the project wrote this one; that command infers or
+    reads a declaration). Aggregate counts only, by that function's own
+    contract -- no key value ever leaves the engine.
+
+    A join at or above `_JOIN_ZERO_OVERLAP_THRESHOLD` orphan fraction is
+    `join_zero_overlap` (``high``): the join predicate connects to almost
+    nothing on the other side, which is the most damaging and least visible
+    defect this sweep can catch. One from `_JOIN_ORPHANS_THRESHOLD` up to
+    that is `join_orphans` (``medium``): real, measured orphans -- a left
+    join whose right side is legitimately sparse lands here, reported at its
+    fraction rather than characterized as broken. Below `_JOIN_ORPHANS_
+    THRESHOLD` a join is healthy and reports nothing.
+
+    Returns ``(findings, notes, offer)``. ``offer`` is non-``None`` only when
+    ``handshake`` deferred the probe; the caller folds it into
+    ``VerifyResult.pending_offer`` the same way row population's own scan
+    already does.
+    """
+
+    from ..explore import relationships as rel_mod
+
+    pairs, unresolved = _resolve_join_relationships(
+        candidates_by_model, model_relations, live_identifiers
+    )
+    notes: list[str] = []
+    if unresolved:
+        notes.append(
+            "the join contract was not checked for "
+            + ", ".join(sorted(set(unresolved)))
+            + ": a joined relation did not match exactly one live identifier"
+        )
+    if not pairs:
+        return [], notes, None
+
+    relationships = [rel for _model, rel in pairs]
+    estimate, probe_count = join_probe_cost(adapter, relationships)
+    if probe_count == 0:
+        return [], notes, None
+
+    ask = handshake if handshake is not None else _standalone_join_handshake(adapter)
+    offer = ask(estimate, probe_count)
+    if offer is not None:
+        notes.append(
+            f"the join contract was not measured: {probe_count} join(s) need "
+            "an overlap probe, offered above"
+        )
+        return [], notes, offer
+
+    rel_mod.verify_relationships(
+        adapter, relationships, timeout_seconds=timeout_seconds
+    )
+
+    findings: list[DriftFinding] = []
+    for model, rel in pairs:
+        if not rel.verified or rel.orphan_fraction is None:
+            continue
+        fraction = rel.orphan_fraction
+        if fraction >= _JOIN_ZERO_OVERLAP_THRESHOLD:
+            code, severity = "join_zero_overlap", "high"
+        elif fraction >= _JOIN_ORPHANS_THRESHOLD:
+            code, severity = "join_orphans", "medium"
+        else:
+            continue
+        from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in rel.from_columns)
+        to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in rel.to_columns)
+        findings.append(
+            DriftFinding(
+                axis="join_contract",
+                code=code,
+                identifier=model,
+                column=rel.from_columns[0] if len(rel.from_columns) == 1 else None,
+                severity=severity,
+                detail=(
+                    f"'{model}' joins ({from_key}) to ({to_key}), but "
+                    f"{fraction:.0%} of {rel.from_dataset} rows have no match "
+                    f"in {rel.to_dataset}"
+                ),
+                data={
+                    "model": model,
+                    "from_relation": rel.from_dataset,
+                    "from_columns": list(rel.from_columns),
+                    "to_relation": rel.to_dataset,
+                    "to_columns": list(rel.to_columns),
+                    "orphan_fraction": fraction,
+                },
+            )
+        )
+    return findings, notes, None
 
 
 # --- getting the counts the comparison needs -----------------------------------
