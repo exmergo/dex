@@ -11,6 +11,11 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- Databricks `from_json()` inside an unnest remains supported when SQLGlot
+  parses it as `FromJson`, as in 30.19.0. Older parser versions remain
+  supported, and PII, nested subqueries, and unapproved functions retain
+  their existing firewall checks.
+
 - **`transform plan --scaffold` merges into the shared sources file instead of
   reprinting it, so scaffolding a source one table per call no longer drops the
   ones an earlier call added** ([#439]). `_sources_edit` built
