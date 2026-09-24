@@ -5,7 +5,101 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+import yaml
+
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.transform.scaffold import ScaffoldError, _merge_sources
+
+
+def test_merge_preserves_existing_source_properties():
+    original = """version: 2
+# User configuration
+sources:
+  - name: main
+    schema: main
+    database: raw_db
+    tables:
+      - name: customers
+        identifier: raw_customers
+        description: Customer records
+        columns:
+          - name: id
+            tests: [unique]
+"""
+    merged = _merge_sources(original, {"main": {"events"}})
+    assert merged.replace("      - name: events\n", "") == original
+    assert (
+        yaml.safe_load(merged)["sources"][0]["tables"][1]["identifier"]
+        == "raw_customers"
+    )
+
+
+def test_merge_preserves_sources_sharing_a_schema():
+    original = """version: 2
+sources:
+  - name: app
+    schema: main
+    tables:
+      - name: customers
+  - name: billing
+    schema: main
+    tables:
+      - name: invoices
+"""
+    merged = _merge_sources(original, {"main": {"events"}})
+    sources = yaml.safe_load(merged)["sources"]
+    assert sources[1:] == yaml.safe_load(original)["sources"]
+    assert sources[0]["name"] == "main"
+    assert original[original.index("  - name: app") :] in merged
+
+
+def test_merge_existing_table_preserves_order_and_comments():
+    original = """version: 2
+sources:
+  - name: main # keep this
+    tables:
+      - name: orders
+      - name: customers
+"""
+    assert _merge_sources(original, {"main": {"customers"}}) == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        "version: 2\nsources: []\n",
+        "version: 2\n",
+        "version: 2\nsources:\n  - name: main\n",
+        "version: 2\nsources:\n  - name: main\n    tables: []\n",
+    ],
+)
+def test_merge_empty_declarations(original):
+    merged = _merge_sources(original, {"main": {"events"}})
+    assert yaml.safe_load(merged)["sources"][0]["tables"] == [{"name": "events"}]
+
+
+def test_merge_refuses_invalid_yaml():
+    with pytest.raises(ScaffoldError, match="invalid YAML"):
+        _merge_sources("version: 2\nsources: [\n", {"main": {"events"}})
+
+
+def test_merge_missing_tables_does_not_modify_next_source():
+    original = "version: 2\nsources:\n  - name: main\n  - name: other\n    tables: []\n"
+    parsed = yaml.safe_load(_merge_sources(original, {"main": {"events"}}))
+    assert parsed["sources"] == [
+        {"name": "main", "tables": [{"name": "events"}]},
+        {"name": "other", "tables": []},
+    ]
+
+
+def test_merge_refuses_alias_mutation():
+    original = (
+        "version: 2\nsources:\n  - name: main\n    tables: &tables\n"
+        "      - name: customers\n  - name: other\n    tables: *tables\n"
+    )
+    with pytest.raises(ScaffoldError, match="anchors or aliases"):
+        _merge_sources(original, {"main": {"events"}})
 
 
 def _run(argv: list[str], capsys) -> tuple[int, dict]:
@@ -148,6 +242,130 @@ def test_scaffold_without_cache_is_a_clean_error(
     assert rc == 1
     assert envelope["status"] == "error"
     assert "explore map" in envelope["errors"][0]
+
+
+def test_scaffold_sequential_calls_keep_earlier_sources(
+    dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
+):
+    """Scaffolding sources one table per call must not drop earlier tables.
+
+    Regression for the shared sources file being reprinted from only the
+    current call's tables (#439): a second `--scaffold` call for a different
+    table used to overwrite the file rather than add to it.
+    """
+
+    _seed_cache(tmp_path, duckdb_file, capsys)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold customers",
+            "--scaffold",
+            "customers",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold orders",
+            "--scaffold",
+            "orders",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    by_path = {d["path"]: d for d in envelope["diffs"]}
+    sources_diff = by_path["models/staging/_dex_sources.yml"]["unified"]
+    # The new table is the only addition; the earlier one is untouched context,
+    # not removed and re-added.
+    assert "      - name: customers" in sources_diff
+    assert "+      - name: orders" in sources_diff
+    assert "-      - name: customers" not in sources_diff
+
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    content = (dbt_project_dir / "models/staging/_dex_sources.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "- name: customers" in content
+    assert "- name: orders" in content
+
+
+def test_scaffold_already_declared_table_is_a_no_op_on_sources(
+    dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
+):
+    """Re-scaffolding a table the shared sources file already declares must not
+    even show up as a reordering: no diff for that file at all."""
+
+    _seed_cache(tmp_path, duckdb_file, capsys)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold customers",
+            "--scaffold",
+            "customers",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold customers again",
+            "--scaffold",
+            "customers",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    paths = {d["path"] for d in envelope["diffs"]}
+    assert "models/staging/_dex_sources.yml" not in paths
 
 
 def test_scaffold_unknown_table_is_a_clean_error(

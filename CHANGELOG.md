@@ -9,6 +9,29 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`transform plan --scaffold` merges into the shared sources file instead of
+  reprinting it, so scaffolding a source one table per call no longer drops the
+  ones an earlier call added** ([#439]). `_sources_edit` built
+  `models/staging/_dex_sources.yml`'s whole body from only the current call's
+  tables and emitted it as a full-file replacement, so a second `--scaffold`
+  call for a different table produced a plan whose diff declared that table
+  alone. The earlier tables' staging models still `ref()`'d sources the file no
+  longer declared, and the next build refused with a dangling `source()`.
+  Passing several tables to one call was always correct (`--scaffold` is
+  `action="append"`); only the sequential shape, natural for an agent
+  scaffolding a project table by table, lost them, and the deletion sat
+  beneath a routine-looking create in the same diff, easy to approve past.
+
+  Missing declarations are inserted into the existing YAML, preserving source
+  names, database settings, table identifiers, tests, comments, and ordering.
+  Sources sharing a physical schema remain separate. Invalid YAML and shapes
+  that cannot be safely extended are refused rather than regenerated.
+  Re-scaffolding a table the file already declares now produces no edit for it
+  at all, not even a reordering. A `--scaffold` run before any dbt project
+  exists is unaffected: there is nothing yet to merge with.
+
 ## [1.12.3] - 2026-09-15
 
 ### Fixed
