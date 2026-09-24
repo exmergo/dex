@@ -28,6 +28,13 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   and no action was upgraded: this is a pin, not a version bump. Reported by
   Sthenos Security in a CI/CD supply-chain review of v1.12.3.
 
+### Fixed
+
+- Databricks `from_json()` inside an unnest remains supported when SQLGlot
+  parses it as `FromJson`, as in 30.19.0. Older parser versions remain
+  supported, and PII, nested subqueries, and unapproved functions retain
+  their existing firewall checks.
+
 ## [1.12.3] - 2026-09-15
 
 ### Fixed
