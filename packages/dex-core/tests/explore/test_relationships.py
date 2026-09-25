@@ -41,6 +41,7 @@ from exmergo_dex_core.explore.relationships import (
     fold_replica_relationships,
     infer_relationships,
     probe_batches,
+    profile_findings,
     semantic_relationships,
     verify_relationships,
 )
@@ -790,6 +791,182 @@ def test_repeated_foreign_key_is_not_a_grain_defect():
 def test_empty_table_produces_no_grain_notes():
     empty = _ds("db.main.empty_t", [_col("id")], rows=0)
     assert data_quality_notes(empty) == []
+
+
+# --- profile findings (#291) ----------------------------------------------------
+
+
+def test_fully_null_column_is_a_high_severity_finding():
+    ds = _ds(
+        "db.main.orders",
+        [
+            _col("id", distinct=100, unique=True),
+            ColumnProfile(
+                name="legacy_order_id", data_type="VARCHAR", null_fraction=1.0
+            ),
+        ],
+        rows=100,
+    )
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    finding = next(f for f in findings if f.column == "legacy_order_id")
+    assert finding.code == "fully_null_column"
+    assert finding.severity == "high"
+    assert "100% NULL" in finding.detail
+    # The proven key is not itself flagged: null_fraction 0.0 crosses neither band.
+    assert not any(f.column == "id" for f in findings)
+
+
+def test_mostly_null_column_is_a_low_severity_finding_and_near_misses_are_silent():
+    ds = _ds(
+        "db.main.orders",
+        [
+            ColumnProfile(name="above_band", data_type="VARCHAR", null_fraction=0.97),
+            ColumnProfile(name="below_band", data_type="VARCHAR", null_fraction=0.5),
+        ],
+        rows=100,
+    )
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    assert [f.column for f in findings] == ["above_band"]
+    assert findings[0].code == "mostly_null_column"
+    assert findings[0].severity == "low"
+    assert "97.0% NULL" in findings[0].detail
+
+
+def test_high_null_fraction_threshold_is_configurable():
+    ds = _ds(
+        "db.main.orders",
+        [ColumnProfile(name="c", data_type="VARCHAR", null_fraction=0.8)],
+        rows=100,
+    )
+    assert profile_findings(ds, high_null_fraction=0.95) == []
+    findings = profile_findings(ds, high_null_fraction=0.7)
+    assert findings[0].code == "mostly_null_column"
+
+
+def test_nullable_grain_column_is_a_medium_severity_finding():
+    ds = _ds(
+        "db.main.orders",
+        [
+            ColumnProfile(
+                name="order_id",
+                data_type="INTEGER",
+                null_fraction=0.0,
+                nullable=True,
+                distinct_count=100,
+                is_unique=True,
+            )
+        ],
+        rows=100,
+    )
+    ds.grain = ["order_id"]
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    assert len(findings) == 1
+    assert findings[0].code == "nullable_grain_column"
+    assert findings[0].severity == "medium"
+    assert findings[0].column == "order_id"
+
+
+def test_not_nullable_grain_column_produces_no_finding():
+    ds = _ds(
+        "db.main.orders",
+        [
+            ColumnProfile(
+                name="order_id",
+                data_type="INTEGER",
+                null_fraction=0.0,
+                nullable=False,
+                distinct_count=100,
+                is_unique=True,
+            )
+        ],
+        rows=100,
+    )
+    ds.grain = ["order_id"]
+    assert profile_findings(ds, high_null_fraction=0.95) == []
+
+
+def test_findings_are_sorted_high_before_medium_before_low():
+    ds = _ds(
+        "db.main.orders",
+        [
+            ColumnProfile(name="mostly_null", data_type="VARCHAR", null_fraction=0.99),
+            ColumnProfile(
+                name="order_id",
+                data_type="INTEGER",
+                null_fraction=0.0,
+                nullable=True,
+                distinct_count=100,
+                is_unique=True,
+            ),
+            ColumnProfile(name="fully_null", data_type="VARCHAR", null_fraction=1.0),
+        ],
+        rows=100,
+    )
+    ds.grain = ["order_id"]
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    assert [f.severity for f in findings] == ["high", "medium", "low"]
+    assert [f.column for f in findings] == ["fully_null", "order_id", "mostly_null"]
+
+
+def test_empty_table_produces_no_findings():
+    empty = _ds(
+        "db.main.empty_t",
+        [ColumnProfile(name="id", data_type="INTEGER", null_fraction=1.0)],
+        rows=0,
+    )
+    assert profile_findings(empty, high_null_fraction=0.95) == []
+
+
+def test_unmeasured_null_fraction_produces_no_finding():
+    ds = _ds(
+        "db.main.orders",
+        [ColumnProfile(name="c", data_type="VARCHAR", null_fraction=None)],
+        rows=100,
+    )
+    assert profile_findings(ds, high_null_fraction=0.95) == []
+
+
+def test_explore_profile_envelope_carries_findings(tmp_path: Path, capsys):
+    """End-to-end: `explore profile`'s envelope surfaces the same finding a
+    caller would otherwise have to notice among several columns' own null
+    fractions, ordered severity-first ahead of the grain's own nullability
+    risk (DuckDB's `id INTEGER` carries no NOT NULL constraint)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "migration.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE customers (id INTEGER, email VARCHAR, legacy_order_id VARCHAR)"
+    )
+    conn.execute(
+        "INSERT INTO customers VALUES "
+        "(1, 'a@example.com', NULL), (2, 'b@example.com', NULL), "
+        "(3, 'c@example.com', NULL)"
+    )
+    conn.close()
+
+    payload = _run(["explore", "profile", "customers", "--path", str(db_path)], capsys)
+    dataset = payload["data"]["datasets"][0]
+    assert dataset["findings"] == [
+        {
+            "column": "legacy_order_id",
+            "code": "fully_null_column",
+            "severity": "high",
+            "detail": "legacy_order_id is 100% NULL",
+        },
+        {
+            "column": "id",
+            "code": "nullable_grain_column",
+            "severity": "medium",
+            "detail": (
+                "id participates in the detected grain but the warehouse "
+                "still allows it to be NULL"
+            ),
+        },
+    ]
+    # Additive, never a replacement: the column's own null_fraction is intact.
+    legacy = next(c for c in dataset["columns"] if c["name"] == "legacy_order_id")
+    assert legacy["null_fraction"] == 1.0
 
 
 # --- composite keys --------------------------------------------------------------
