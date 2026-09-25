@@ -9,6 +9,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Security
+
+- **Every third-party GitHub Action is pinned to a full commit SHA, with
+  Dependabot proposing the bumps** ([#472]). A mutable tag (`actions/checkout@v4`,
+  `astral-sh/setup-uv@v5`, and five others, 41 occurrences across
+  `.github/workflows/`) can be moved to different code by the action's owner or
+  by anyone who compromises them, and the next run executes that code with the
+  job's token, secrets, and OIDC permissions. `release.yml`'s `publish` and
+  `publish-stub` jobs (PyPI Trusted Publishing) and `integration.yml`'s cloud
+  jobs (OIDC federation into GCP, Snowflake, Databricks, and AWS, plus four
+  ClickHouse Cloud secrets) carried the highest exposure, but every workflow is
+  pinned so the rule has no exceptions. Each `uses:` now names a 40-character
+  SHA with the tag it resolves from kept as a trailing comment (`@<sha> # v4`);
+  `.github/dependabot.yml` adds the `github-actions` ecosystem on a weekly
+  schedule, grouped into one PR so a week of pin bumps does not arrive as a
+  dozen. No workflow's triggers, permissions, or environment bindings changed,
+  and no action was upgraded: this is a pin, not a version bump. Reported by
+  Sthenos Security in a CI/CD supply-chain review of v1.12.3.
+
 ## [1.12.3] - 2026-09-15
 
 ### Fixed
