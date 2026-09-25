@@ -9,6 +9,35 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Security
+
+- **The `clickhouse_cloud` integration job installs `clickhousectl` from a
+  pinned, checksum-verified GitHub release asset instead of piping
+  `https://clickhouse.com/cli` into a shell** ([#471]). The job's environment
+  holds four ClickHouse Cloud secrets, and the old installer ran whatever that
+  URL returned, unpinned, since it also resolved `releases/latest` from the
+  GitHub API at run time. The install step now downloads the pinned version's
+  bare `x86_64-unknown-linux-musl` binary from its GitHub release URL,
+  verifies its sha256 (read from the release's own asset digest, committed in
+  the workflow as `CLICKHOUSECTL_SHA256`) with `sha256sum -c` before doing
+  anything else with it, and only then installs it to `$HOME/.local/bin` and
+  adds that to `PATH`, exactly as before. No tarball, so no extraction step
+  either. Bumping the pinned version is a deliberate two-value edit
+  (`CLICKHOUSECTL_VERSION` and `CLICKHOUSECTL_SHA256`, the latter re-read from
+  the release rather than copied from anywhere else); Dependabot does not
+  track a version held in an `env:` key, so nothing proposes this bump
+  automatically. The job's trigger, repository gate, environment binding, and
+  inherited permissions are unchanged; only the install step is touched.
+  Reported by Sthenos Security in the same CI/CD supply-chain review as
+  [#472].
+
+### Fixed
+
+- Databricks `from_json()` inside an unnest remains supported when SQLGlot
+  parses it as `FromJson`, as in 30.19.0. Older parser versions remain
+  supported, and PII, nested subqueries, and unapproved functions retain
+  their existing firewall checks.
+
 ## [1.12.3] - 2026-09-15
 
 ### Fixed

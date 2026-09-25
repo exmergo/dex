@@ -399,8 +399,22 @@ jobs:
           done
       - name: Install clickhousectl
         working-directory: .
+        env:
+          CLICKHOUSECTL_VERSION: v0.4.2
+          # sha256 of the bare linux-musl x86_64 binary, read from the GitHub
+          # release's own asset digest:
+          #   gh release view ${CLICKHOUSECTL_VERSION} -R ClickHouse/clickhousectl \
+          #     --json assets --jq '.assets[] | select(.name ==
+          #     "clickhousectl-x86_64-unknown-linux-musl") | .digest'
+          # Re-read it from the release when bumping the version; do not take
+          # it from anywhere else.
+          CLICKHOUSECTL_SHA256: 70f4cd93fd159198ba8bd093c2aa32743479513b1789d80cdff8e844c8861c5b
         run: |
-          curl -fsSL https://clickhouse.com/cli | sh
+          asset="clickhousectl-x86_64-unknown-linux-musl"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/ClickHouse/clickhousectl/releases/download/${CLICKHOUSECTL_VERSION}/$asset"
+          echo "${CLICKHOUSECTL_SHA256}  $RUNNER_TEMP/$asset" | sha256sum -c -
+          install -D -m 0755 "$RUNNER_TEMP/$asset" "$HOME/.local/bin/clickhousectl"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Usage preflight before any SQL connection
         id: preflight
