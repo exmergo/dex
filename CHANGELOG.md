@@ -9,6 +9,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- Databricks `from_json()` inside an unnest remains supported when SQLGlot
+  parses it as `FromJson`, as in 30.19.0. Older parser versions remain
+  supported, and PII, nested subqueries, and unapproved functions retain
+  their existing firewall checks.
+
+### Added
+
+- **`explore profile` adds a severity-ordered `findings` array so a column
+  worth acting on is no longer indistinguishable from every other column's own
+  `null_fraction`** ([#291]). On a reference 107-column staging table, 89
+  columns had a non-zero null fraction and 11 sat at exactly 1.0; every one of
+  those 89 was reported identically, as a number on a column object, with no
+  ordering and no verdict. A 103-trial agent run showed the cost: the string
+  `null_fraction` appeared 438 times across one task's transcript, and the
+  task still failed on a NULL in a required output column, because dex had
+  the answer and never said which of the 89 numbers it was.
+
+  Three checks, each producing a `ProfileFinding` (`column`, `code`,
+  `severity`, `detail`): a column **entirely** NULL in a table that has rows
+  (`fully_null_column`, high severity, the visible symptom of a join that
+  matched nothing or a rename that missed); a column **mostly** but not
+  entirely NULL, at or above `profile_high_null_fraction` (default 0.95,
+  configurable in `.dex/config.yml`) (`mostly_null_column`, low severity, a
+  quieter band since a near-miss is frequently legitimate sparse data); and a
+  column the detected or declared **grain** depends on that the warehouse
+  still allows to be NULL (`nullable_grain_column`, medium severity, a
+  structural risk to that grain regardless of whether any row is null today).
+  The list is sorted high severity first, so a caller reading only the front
+  of it still sees what matters most.
+
+  Deliberately additive: every column's own `null_fraction` is unchanged, and
+  `findings` sits beside `data_quality`'s free-text notes rather than
+  replacing them. Shared with `explore map`'s annotation pass, so the same
+  three checks run wherever grain is detected, though only `profile`
+  serializes them today.
+
+  `CACHE_SCHEMA_VERSION` moves to 5. An older engine reads a version-5 cache
+  fine (an unknown key is ignored); a current engine handed a pre-5 profile
+  would read an empty `findings` as "nothing found" rather than "never
+  computed", so a pre-5 profile is treated as stale and re-profiled once, the
+  same way the version-4 upgrade healed itself.
+
 ## [1.12.3] - 2026-09-15
 
 ### Fixed

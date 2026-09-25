@@ -893,6 +893,12 @@ class DexConfig(BaseModel):
     # (`adapters.base.VALUE_DOMAIN_CAP`), so nothing is cut unless a repo asks;
     # lowering it trims the payload and never what is probed or cached.
     profile_value_domain_cap: int = 25
+    # `explore profile`'s quieter finding band (issue #291): a column at or
+    # above this null fraction, but short of fully NULL, is reported as
+    # `mostly_null_column` rather than only carrying the number on its own
+    # `null_fraction`. Below it, nothing is reported -- a near-miss is
+    # frequently legitimate sparse data, not a defect.
+    profile_high_null_fraction: float = 0.95
     # Whether `explore query` and `explore cluster` may profile an object the
     # connection has but the cache cannot speak for, instead of refusing. Priced
     # and disclosed when it happens. Top-level rather than under `query:` because
