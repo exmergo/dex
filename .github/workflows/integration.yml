@@ -89,15 +89,15 @@ jobs:
       DEX_TEST_BQ_DATASET: dex_ci
       DEX_TEST_BQ_MAX_BYTES: "104857600" # 100 MB per query
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Exports Application Default Credentials (credential file plus
       # GOOGLE_APPLICATION_CREDENTIALS/GOOGLE_CLOUD_PROJECT), which is exactly
       # the discovery path the engine uses: no CI special-casing anywhere.
-      - uses: google-github-actions/auth@v3
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_INTEGRATION_SA }}
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (bigquery + duckdb + dev extras)
@@ -130,19 +130,19 @@ jobs:
       SNOWFLAKE_AUTHENTICATOR: WORKLOAD_IDENTITY
       SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER: OIDC
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Mint the GitHub OIDC token Snowflake validates (audience pinned to
       # what the service user's OIDC_AUDIENCE_LIST expects) and hand it to the
       # connector through the same SNOWFLAKE_* discovery path the engine uses
       # everywhere: no CI special-casing.
       - name: Mint GitHub OIDC token for Snowflake
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const token = await core.getIDToken('snowflakecomputing.com')
             core.setSecret(token)
             core.exportVariable('SNOWFLAKE_TOKEN', token)
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (snowflake + duckdb + dev extras)
@@ -207,13 +207,13 @@ jobs:
       DEX_TEST_DATABRICKS_CATALOG: ${{ vars.DEX_TEST_DATABRICKS_CATALOG }}
       DEX_TEST_DATABRICKS_MAX_SECONDS: "60"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Exchange the GitHub OIDC token for a Databricks OAuth token through
       # the service principal's federation policy, then hand it to the engine
       # and dbt through the same DATABRICKS_TOKEN discovery path a PAT would
       # use: no CI special-casing anywhere downstream.
       - name: Exchange GitHub OIDC token for a Databricks token
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const githubToken = await core.getIDToken(process.env.DATABRICKS_HOST)
@@ -235,7 +235,7 @@ jobs:
             const token = (await response.json()).access_token
             core.setSecret(token)
             core.exportVariable('DATABRICKS_TOKEN', token)
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (databricks + duckdb + dev extras)
@@ -270,16 +270,16 @@ jobs:
       # pinned to main, so a pull request cannot reach it.
       DEX_TEST_REDSHIFT_DEV_PASSWORD: ${{ secrets.DEX_TEST_REDSHIFT_DEV_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Assume the OIDC-trusted role, exporting AWS_* credentials into the
       # default chain, which is exactly the discovery path the engine uses:
       # no CI special-casing anywhere.
       - name: Assume the Redshift integration role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.DEX_TEST_REDSHIFT_ROLE_ARN }}
           aws-region: ${{ vars.DEX_TEST_REDSHIFT_REGION }}
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (redshift + duckdb + dev extras)
@@ -312,7 +312,7 @@ jobs:
       DEX_TEST_PG_DSN: postgresql://dex_ro:dex_ro@localhost:5432/dex_dogfood
       DEX_TEST_PG_DEV_PASSWORD: dbt_dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The same seed the local dogfood container uses; psql ships on
       # ubuntu-latest runners.
       - name: Seed the service container
@@ -323,7 +323,7 @@ jobs:
             -c "CREATE DATABASE dex_dogfood"
           PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
             -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (postgres + duckdb + dev extras)
@@ -344,7 +344,7 @@ jobs:
       DEX_TEST_CH_DSN: clickhouse://dex_ro:dex_ro@localhost:8124/app
       DEX_TEST_CH_DEV_PASSWORD: dbt_dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Not a `services:` container. The seed is multi-statement and the HTTP
       # interface refuses multi-statement bodies, so it has to go through
       # clickhouse-client inside the container, which means the job needs a
@@ -353,7 +353,7 @@ jobs:
       - name: Start and seed ClickHouse
         working-directory: .
         run: scripts/setup_clickhouse_dev.sh
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (clickhouse + duckdb + dev extras)
@@ -384,7 +384,7 @@ jobs:
       DEX_TEST_CH_CLOUD_API_KEY: ${{ secrets.DEX_TEST_CH_CLOUD_API_KEY }}
       DEX_TEST_CH_CLOUD_API_SECRET: ${{ secrets.DEX_TEST_CH_CLOUD_API_SECRET }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Require the protected Cloud configuration
         run: |
           for name in \
@@ -406,7 +406,7 @@ jobs:
         id: preflight
         working-directory: .
         run: scripts/clickhouse_cloud/preflight.sh
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
       - name: Sync (clickhouse + duckdb + dev extras)

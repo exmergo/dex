@@ -19,8 +19,8 @@ jobs:
       run:
         working-directory: packages/dex-core
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       # The cloud extras stay in the gate: their safety families importorskip
       # on the client libraries, and a release gate that silently skips
       # safety-critical assertions is a hole, not a speedup.
@@ -40,7 +40,7 @@ jobs:
   verify-coupling:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Wrapper pins must match the tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -73,12 +73,12 @@ jobs:
       run:
         working-directory: packages/dex-core
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # hatch-vcs derives the version from the tag; it needs full history
           # and the tags, which the default shallow checkout omits.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Build sdist + wheel
         run: uv build
       - name: Assert built version matches the tag
@@ -118,8 +118,8 @@ jobs:
       run:
         working-directory: packages/dex-core-stub
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Reserve dex-core on PyPI (once; no-op if the name already exists)
         run: |
           # Publish only on a definite 404 (name not yet reserved). On 200 the
