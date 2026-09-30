@@ -1129,6 +1129,45 @@ def definitions(
     return defs
 
 
+def manifest_node_label(unique_id: str, node: dict[str, Any] | None = None) -> str:
+    """dbt's own readable name for a manifest node, the one a reader scans.
+
+    A versioned model is labelled ``<name>.v<version>``, which is how dbt spells
+    it in its ``fqn``, in ``dbt ls``, and in ``--select``. The version is always
+    part of the label, the latest one included: two versions of one model are
+    two relations that coexist in the manifest under one ``name``, so the bare
+    name cannot tell them apart. Every other node is its manifest ``name``.
+
+    Without the node, the label is read off the unique id: ``model.<package>.
+    <name>`` is at its name, a versioned model adds a ``v<N>`` segment, and a
+    generic test ``test.<package>.<name>.<hash>`` ends in a content hash, so its
+    name is the segment before it. Taking the last segment for everything named
+    versioned models ``v2`` and warning tests ``3249b83c15``.
+
+    Keep scopes and lookups keyed on the unique id and use this only for what
+    is shown: the label is unique per node, but the id is what run results and
+    the manifest cross-reference on.
+    """
+
+    if isinstance(node, dict):
+        name = node.get("name")
+        if isinstance(name, str) and name:
+            version = node.get("version")
+            if node.get("resource_type") == "model" and version not in (None, ""):
+                return f"{name}.v{version}"
+            return name
+    parts = unique_id.split(".")
+    if len(parts) < 3:
+        return parts[-1] if parts else unique_id
+    if parts[0] == "model" and len(parts) == 4:
+        return f"{parts[2]}.{parts[3]}"
+    # A singular test is `test.<package>.<name>` like a model, so segment count
+    # decides, not the resource type: a three-part id is already at its name.
+    if parts[0] == "test" and len(parts) > 3:
+        return parts[-2]
+    return parts[-1]
+
+
 def strip_relation_quoting(relation: str) -> str:
     """``"db"."schema"."table"`` / `` `project.dataset.table` `` / bracketed
     forms down to plain dotted parts, matching adapter-normalized identifiers."""
@@ -1202,9 +1241,15 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
     nodes = manifest.get("nodes") or {}
     sources = manifest.get("sources") or {}
 
-    # unique_id -> referable name, and referable name -> physical relation.
+    # unique_id -> label, and label -> physical relation. A versioned model's
+    # label carries its version, so each version keeps its own relation;
+    # `written` keeps the unversioned name a `ref()` or `source()` spells, which
+    # is what a relationships test's `to:` is matched against.
     names: dict[str, str] = {}
+    written: dict[str, str] = {}
     relations: dict[str, str] = {}
+    model_relations: dict[str, str] = {}
+    source_relations: dict[str, str] = {}
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
             continue
@@ -1214,12 +1259,14 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
         name = node.get("name")
         if not isinstance(name, str) or not name:
             continue
-        names[uid] = name
+        label = manifest_node_label(uid, node)
+        names[uid] = label
+        written[uid] = name
         relation = node.get("relation_name")
         # Ephemeral models compile with a null relation_name: referable in the
         # project but not physically resolvable, so they stay out of relations.
         if isinstance(relation, str) and relation:
-            relations[name] = strip_relation_quoting(relation)
+            relations[label] = model_relations[label] = strip_relation_quoting(relation)
     for uid, node in sources.items():
         if not isinstance(node, dict):
             continue
@@ -1227,10 +1274,10 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
         if not (isinstance(source_name, str) and isinstance(table, str)):
             continue
         key = f"{source_name}.{table}"
-        names[uid] = key
+        names[uid] = written[uid] = key
         relation = node.get("relation_name")
         if isinstance(relation, str) and relation:
-            relations[key] = strip_relation_quoting(relation)
+            relations[key] = source_relations[key] = strip_relation_quoting(relation)
 
     def attached_name(node: dict[str, Any], exclude: str | None = None) -> str | None:
         attached = node.get("attached_node")
@@ -1245,6 +1292,26 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
             if name is not None and name != exclude:
                 return name
         return None
+
+    def referenced_name(node: dict[str, Any], to: str) -> str:
+        """The label of the node a relationships test's ``to:`` names.
+
+        Read off the test's own dependencies rather than the ``to:`` string,
+        because dbt has already resolved the reference there: a bare
+        ``ref('dim_customers')`` depends on the latest version's node and
+        ``ref('dim_customers', v=1)`` on v1's, and neither is recoverable from
+        the name alone. The child is excluded first so a test between two
+        versions of one model lands on the other version; a self-referencing
+        test depends on its child alone and lands there. The written name is
+        kept when the dependencies do not settle it.
+        """
+
+        attached = node.get("attached_node")
+        depends = node.get("depends_on")
+        dep_nodes = depends.get("nodes") if isinstance(depends, dict) else None
+        spelled = [dep for dep in dep_nodes or [] if written.get(dep) == to]
+        matches = [dep for dep in spelled if dep != attached] or spelled
+        return names[matches[0]] if len(matches) == 1 else to
 
     keys: dict[tuple[str, str], DeclaredKey] = {}
     composite_keys: dict[tuple[str, tuple[str, ...]], DeclaredCompositeKey] = {}
@@ -1290,6 +1357,7 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
             field = kwargs.get("field")
             if not to_model or not isinstance(field, str) or not field:
                 continue
+            to_model = referenced_name(node, to_model)
             child = attached_name(node, exclude=to_model)
             if child is None:
                 continue
@@ -1324,7 +1392,8 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
 
     defs.declared_keys = list(keys.values())
     defs.declared_composite_keys = list(composite_keys.values())
-    defs.model_relations.update(relations)
+    defs.model_relations.update(model_relations)
+    defs.source_relations.update(source_relations)
     defs.manifest_loaded = True
     defs.relationship_source = "manifest"
 
@@ -1975,6 +2044,11 @@ def _semantic_from_manifest(payload: dict[str, Any], defs: ProjectDefinitions) -
     when manifest.json is absent). ``input_measures`` is pre-resolved there, so
     ratio/derived chains need no chasing."""
 
+    # A semantic model names its relation by alias, which for a versioned or
+    # aliased model is not the model's label. Where the compiled manifest has
+    # already placed a model on that relation, its grain is filed under that
+    # model, so one relation is never two models to a consumer.
+    owner_of = {relation: label for label, relation in defs.model_relations.items()}
     measure_owner: dict[str, str] = {}
     for entry in payload.get("semantic_models") or []:
         if not isinstance(entry, dict):
@@ -1987,11 +2061,14 @@ def _semantic_from_manifest(payload: dict[str, Any], defs: ProjectDefinitions) -
         if not isinstance(model, str) or not model:
             continue
         relation = node_relation.get("relation_name")
+        owner = model
         if isinstance(relation, str) and relation:
-            defs.model_relations.setdefault(model, strip_relation_quoting(relation))
+            physical = strip_relation_quoting(relation)
+            owner = owner_of.get(physical, model)
+            defs.model_relations.setdefault(owner, physical)
         grain = _primary_entity_column(entry.get("entities"))
         if grain:
-            defs.primary_entities[model] = grain
+            defs.primary_entities[owner] = grain
         for measure in entry.get("measures") or []:
             if isinstance(measure, dict) and isinstance(measure.get("name"), str):
                 measure_owner[measure["name"]] = model

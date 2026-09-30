@@ -383,3 +383,50 @@ def test_a_corrupt_run_results_is_not_run_rather_than_an_empty_pass(project, edi
     assert build_evidence(project, target="dev", edits=edits).outcome is (
         BuildOutcome.NOT_RUN
     )
+
+
+def test_a_versioned_model_answers_to_every_name_dbt_selects_it_by(dbt_project_dir):
+    """A versioned model's node is labelled `dim_customers.v2`, and it was
+    built whether the selector named that label, the model's bare name (which
+    dbt reads as every version), or a plan edited the file that defines it."""
+
+    (dbt_project_dir / "models" / "dim_customers_v2.sql").write_text(
+        MART, encoding="utf-8"
+    )
+    write_manifest_nodes(
+        dbt_project_dir,
+        {
+            "model.dex_test.dim_customers.v2": {
+                "name": "dim_customers",
+                "resource_type": "model",
+                "version": 2,
+                "original_file_path": "models/dim_customers_v2.sql",
+                "relation_name": '"dev"."main"."dim_customers_v2"',
+                "config": {"materialized": "table"},
+            }
+        },
+    )
+    write_run_results(
+        dbt_project_dir,
+        [{"unique_id": "model.dex_test.dim_customers.v2", "status": "success"}],
+    )
+    edits = [
+        PlanEdit(
+            path="models/dim_customers_v2.sql",
+            new_content=MART,
+            op=EditOp.UPSERT,
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+
+    for select in ("dim_customers.v2", "dim_customers"):
+        evidence = build_evidence(
+            dbt_project_dir, target="dev", select=select, edits=edits
+        )
+        assert [n.name for n in evidence.nodes] == ["dim_customers.v2"]
+        assert evidence.selection.matched == ["dim_customers.v2"]
+        assert evidence.selection.complete is True, select
+        assert evidence.coverage.missing == [], select
+
+    missed = build_evidence(dbt_project_dir, target="dev", select="dim_customers.v1")
+    assert missed.selection.unmatched == ["dim_customers.v1"]

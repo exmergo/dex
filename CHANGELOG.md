@@ -9,6 +9,56 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A versioned dbt model is verified as its own model, and named with its
+  version, in `transform build --verify` and `maintain verify`** ([#478]). dbt
+  writes a versioned model's id as `model.shop.dim_customers.v2` and keeps its
+  `name` as `dim_customers` across every version. dex read a model's name off
+  the last segment of that id in some places and off the shared `name` in
+  others, and neither tells two versions apart.
+
+  Reading the last segment put `v2` in the `--verify` scope, which matches no
+  model, so the version dropped out of row population without a note. A build
+  of only versioned models was then suppressed as "no model this build ran
+  could be lined up against a driving parent", which names the wrong cause.
+  Measured on dbt 1.11 against DuckDB, BigQuery and Snowflake: a `dim_customers`
+  v2 that fans out 4 rows to 5 was reported by none of them, and was reported
+  as `row_fanout` on `dim_customers.v2` once fixed.
+
+  Reading the shared `name` collapsed the versions onto one entry, and the last
+  one read won. With `dim_customers_v1` dropped from the warehouse, whole-project
+  `maintain verify` reported no `no_relation` finding at all, because v1 was
+  being checked against v2's relation. Two versions in one compile overwrote
+  each other in the per-node build estimate, so the breakdown summed to less
+  than the total. Findings and notes named `dim_customers` without saying which
+  version.
+
+  A versioned model is now labelled `dim_customers.v2` wherever a model is
+  named: the build's `nodes`, the per-node estimate, the `--verify` scope,
+  finding identifiers, notes and build evidence. This is dbt's own spelling,
+  from `fqn`, `dbt ls` and `--select`. The latest version carries its version
+  too, since two versions are two relations. Unversioned models read exactly
+  as before. The `--verify` sweep is scoped by unique id, so a build of
+  `dim_customers.v2` never judges `dim_customers.v1`. As with dbt's own
+  selector, `maintain verify dim_customers` selects every version and
+  `maintain verify dim_customers.v2` selects one. A relationships test written
+  `to: ref('dim_customers')` resolves to the version dbt resolved it to (the
+  latest), read from the test's dependencies rather than from the string.
+
+### Changed
+
+- **`ProjectDefinitions` keeps models and sources in separate maps** ([#478]).
+  `model_relations` now holds only what the project builds, keyed by the model's
+  label, and a new `source_relations` holds what it reads (`source.table` for
+  dbt). A dot in a key used to be what told a source from a model, and
+  `maintain verify` dropped every dotted key before checking models, which a
+  versioned model's label would have been caught by. The Ossie semantic
+  source's datasets, which a document reads and never builds, now arrive in
+  `source_relations` as well. A third-party project format that put sources
+  into `model_relations` should move them to `source_relations`, or `maintain
+  verify` will check them as models.
+
 ## [1.12.3] - 2026-09-15
 
 ### Fixed

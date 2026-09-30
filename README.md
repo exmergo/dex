@@ -365,6 +365,7 @@ Connect with the Analytics Engineering Community (Data Engineers welcome as well
 and discover how Exmergo brings AI Agents to Your Data Stack.
 
 - 🌟 [Star Us on GitHub](https://github.com/exmergo/dex/)
+- 👾 [Join Our Discord Community](https://www.exmergo.com/discord)
 - 🔗 [Follow Us on LinkedIn](https://www.linkedin.com/company/exmergo/)
 - 🐦 [Follow Us on X](https://x.com/exmergo)
 - 🔨 [Follow Us on GitHub](https://github.com/exmergo/)

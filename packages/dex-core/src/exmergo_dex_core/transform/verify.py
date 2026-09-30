@@ -85,21 +85,24 @@ class BuildVerification:
         }
 
 
-def built_models(summary: dict[str, Any]) -> set[str]:
-    """The models this build ran, by dbt's own name for each.
+def built_models(summary: dict[str, Any]) -> dict[str, str]:
+    """The models this build ran, as unique id to label.
 
-    Read from the node ids dbt wrote rather than from the manifest, because the
-    manifest is the whole project and this is one build's selection. A model's
-    unique id is ``model.<package>.<name>``, so the last segment is already
-    the name the project calls it; nothing else in the run results is needed.
+    Read from the nodes dbt reported rather than from the manifest, because the
+    manifest is the whole project and this is one build's selection. Keyed by
+    unique id, which is what scopes the sweep: two versions of one model share
+    a name, and a build that ran one of them did not run the other. The label
+    is the build summary's own node name, the one the envelope shows.
     """
 
-    names: set[str] = set()
+    from ..dbt_project import manifest_node_label
+
+    built: dict[str, str] = {}
     for node in summary.get("nodes") or []:
         unique_id = str(node.get("unique_id") or "")
         if unique_id.startswith(_MODEL_PREFIX):
-            names.add(unique_id.rsplit(".", 1)[-1])
-    return names
+            built[unique_id] = str(node.get("name") or manifest_node_label(unique_id))
+    return built
 
 
 def dev_source_scope(config, connector: str) -> tuple[str, list[str]] | None:
@@ -225,8 +228,9 @@ def verify_build(
     from ..maintain import drift as drift_mod
     from ..maintain import verify as verify_mod
 
-    scope = built_models(summary)
-    result = BuildVerification(ran=True, scope=sorted(scope))
+    built = built_models(summary)
+    scope = set(built)
+    result = BuildVerification(ran=True, scope=sorted(built.values()))
 
     findings, notes = verify_mod.build_status_findings(project_dir)
     result.warnings.extend(notes)

@@ -123,15 +123,107 @@ def test_the_scope_is_the_models_this_build_ran():
             _node("snapshot.shop.snap_hosts"),
         ]
     )
-    assert built_models(summary) == {"stg_orders", "fct_orders"}
+    assert built_models(summary) == {
+        "model.shop.stg_orders": "stg_orders",
+        "model.shop.fct_orders": "fct_orders",
+    }
 
 
 def test_a_summary_without_unique_ids_scopes_to_nothing():
     """A build from before ids were carried is not a build of every model."""
 
-    assert (
-        built_models({"nodes": [{"name": "stg_orders", "status": "success"}]}) == set()
+    assert built_models({"nodes": [{"name": "stg_orders", "status": "success"}]}) == {}
+
+
+# --- versioned models ---------------------------------------------------------
+#
+# dbt writes a versioned model's id as `model.<package>.<name>.v<N>` and keeps
+# its `name` across versions. The sweep's scope once read `v2` off the id, so a
+# versioned model dropped out of row population and nothing said so.
+
+
+def _versioned_project(project: Path) -> None:
+    nodes = {
+        "model.shop.fct_orders": {
+            "name": "fct_orders",
+            "resource_type": "model",
+            "relation_name": '"warehouse"."dbt_dev"."fct_orders"',
+            "compiled_code": 'select * from "warehouse"."raw"."orders"',
+            "config": {"materialized": "table"},
+        },
+        **{
+            f"model.shop.dim_customers.v{v}": {
+                "name": "dim_customers",
+                "resource_type": "model",
+                "version": v,
+                "latest_version": 2,
+                "relation_name": f'"warehouse"."dbt_dev"."dim_customers_v{v}"',
+                "compiled_code": 'select * from "warehouse"."raw"."customers"',
+                "config": {"materialized": "table"},
+            }
+            for v in (1, 2)
+        },
+    }
+    _artifacts(project, nodes=nodes, results=[])
+
+
+def _versioned_warehouse(counts: dict[str, int]) -> _StubAdapter:
+    """A free connector counts with one batched query, answered in the order
+    the batch names its relations, which is sorted."""
+
+    relations = [
+        "warehouse.raw.orders",
+        "warehouse.raw.customers",
+        "warehouse.dbt_dev.fct_orders",
+        "warehouse.dbt_dev.dim_customers_v1",
+        "warehouse.dbt_dev.dim_customers_v2",
+    ]
+    return _StubAdapter(
+        [_Meta(relation) for relation in relations],
+        counts=dict(sorted(counts.items())),
     )
+
+
+def test_a_versioned_model_the_build_ran_is_in_the_scope(tmp_path: Path):
+    _versioned_project(tmp_path)
+    summary = _summary(
+        [
+            {"unique_id": "model.shop.fct_orders", "status": "success"},
+            {"unique_id": "model.shop.dim_customers.v2", "status": "success"},
+        ]
+    )
+    adapter = _versioned_warehouse(
+        {
+            "warehouse.dbt_dev.dim_customers_v2": 40,
+            "warehouse.dbt_dev.fct_orders": 100,
+            "warehouse.raw.customers": 100,
+            "warehouse.raw.orders": 100,
+        }
+    )
+    result = _sweep(tmp_path, summary, adapter)
+    assert result.scope == ["dim_customers.v2", "fct_orders"]
+    assert "row_population" not in result.suppressed, result.suppressed
+    assert [(f.code, f.identifier) for f in result.findings] == [
+        ("row_loss", "dim_customers.v2")
+    ]
+
+
+def test_a_build_of_one_version_does_not_judge_the_other(tmp_path: Path):
+    """Both versions share a name, which is why the scope is keyed by id: a
+    build that ran v2 neither counts v1 nor names it."""
+
+    _versioned_project(tmp_path)
+    adapter = _versioned_warehouse(
+        {"warehouse.dbt_dev.dim_customers_v2": 40, "warehouse.raw.customers": 100}
+    )
+    summary = _summary(
+        [{"unique_id": "model.shop.dim_customers.v2", "status": "success"}]
+    )
+    result = _sweep(tmp_path, summary, adapter)
+    assert result.scope == ["dim_customers.v2"]
+    assert [f.identifier for f in result.findings] == ["dim_customers.v2"]
+    assert not any("dim_customers_v1" in q for q in adapter.queries)
+    assert not any("dim_customers.v1" in w for w in result.warnings)
 
 
 # --- what always runs, and what never does ------------------------------------
@@ -583,14 +675,17 @@ def test_only_relations_the_warehouse_keeps_no_count_for_are_priced(tmp_path: Pa
 
     _priceable_manifest(tmp_path, materialized="view")
     adapter = _Estimator()
-    price, notes = price_verification(adapter, tmp_path, scope={"fct_orders"})
+    price, notes = price_verification(adapter, tmp_path, scope={"model.p.fct_orders"})
     assert price == 1024.0 and notes == []
     assert '"wh"."dbt_dev"."fct_orders"' in adapter.sql[0]
     assert adapter.sql[0].lstrip().upper().startswith("SELECT"), "aggregate only"
 
     _priceable_manifest(tmp_path, materialized="table")
     adapter = _Estimator()
-    assert price_verification(adapter, tmp_path, scope={"fct_orders"}) == (0.0, [])
+    assert price_verification(adapter, tmp_path, scope={"model.p.fct_orders"}) == (
+        0.0,
+        [],
+    )
     assert adapter.sql == [], "a table's count is free metadata, so nothing is priced"
 
 
@@ -602,7 +697,7 @@ def test_a_cold_dev_target_degrades_to_a_note_rather_than_failing(tmp_path: Path
 
     _priceable_manifest(tmp_path, materialized="view")
     adapter = _Estimator(raises=RuntimeError("Not found: Dataset wh:dbt_dev"))
-    price, notes = price_verification(adapter, tmp_path, scope={"fct_orders"})
+    price, notes = price_verification(adapter, tmp_path, scope={"model.p.fct_orders"})
     assert price == 0.0
     assert len(notes) == 1
     assert "could not price this build's verification upfront" in notes[0]
@@ -620,7 +715,9 @@ def test_a_connector_with_no_dry_run_prices_nothing_and_says_nothing(tmp_path: P
     class _NoEstimator:
         dialect = "postgres"
 
-    assert price_verification(_NoEstimator(), tmp_path, scope={"fct_orders"}) == (
+    assert price_verification(
+        _NoEstimator(), tmp_path, scope={"model.p.fct_orders"}
+    ) == (
         0.0,
         [],
     )

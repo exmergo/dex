@@ -809,11 +809,17 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         suppressed["column_contract"] = "no dbt project found"
         suppressed["grain"] = "no dbt project found"
     else:
-        model_relations = {
-            name: relation
-            for name, relation in definitions.model_relations.items()
-            if "." not in name
-        }
+        model_relations = dict(definitions.model_relations)
+        if wanted:
+            # A bare model name selects every version of it, the way dbt's own
+            # `--select dim_customers` does; `dim_customers.v2` selects one.
+            # Model names cannot contain a dot, so a label's first segment is
+            # the name it was versioned from.
+            wanted |= {
+                label.lower()
+                for label in model_relations
+                if label.split(".", 1)[0].lower() in wanted
+            }
         try:
             adapter = engine._adapter("maintain verify")
         except DexError as exc:

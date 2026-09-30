@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..cache import match_identifier
-from ..dbt_project import strip_relation_quoting
+from ..dbt_project import manifest_node_label, strip_relation_quoting
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
@@ -148,10 +148,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
         )
 
     def name_of(uid: str) -> str:
-        node = nodes.get(uid)
-        if node and node.get("name"):
-            return str(node["name"])
-        return uid.rsplit(".", 1)[-1]
+        return manifest_node_label(uid, nodes.get(uid))
 
     status_by_uid = {
         r["unique_id"]: str(r.get("status", "unknown"))
@@ -238,10 +235,9 @@ def missing_relation_findings(
     ``already_reported`` names models a build-status finding already
     explained (a node that failed or was skipped never produced a relation
     either, and reporting that twice under a different code would say the
-    same thing about the same node in two places). ``model_relations`` is
-    expected pre-filtered to model names (no ``.``): a source's own
-    "declared but absent" case belongs to the schema axis, which already
-    reports dangling sources against a baseline.
+    same thing about the same node in two places). ``model_relations`` holds
+    models only: a source's own "declared but absent" case belongs to the
+    schema axis, which already reports dangling sources against a baseline.
     """
 
     findings: list[DriftFinding] = []
@@ -310,12 +306,12 @@ def column_contract_plan(
 
     declared_by_model: dict[str, dict[str, str | None]] = {}
     undeclared = 0
-    for node in nodes.values():
+    for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
             continue
-        name = node.get("name")
-        if not (isinstance(name, str) and name):
+        if not (isinstance(node.get("name"), str) and node["name"]):
             continue
+        name = manifest_node_label(uid, node)
         if scope is not None and name.lower() not in scope:
             continue
         columns = node.get("columns")
@@ -1039,11 +1035,13 @@ def row_population_plan(
     unfollowable chain and a clean model are the same empty result otherwise,
     and only one of them means the model was checked.
 
-    ``scope`` narrows to a set of model names, which is what a caller verifying
-    one build rather than a whole project has: the notes narrow with it, so a
-    model outside the scope is neither checked nor reported as unchecked. Both
-    halves matter, because a note naming models this caller never asked about
-    reads as a gap in the answer it did ask for.
+    ``scope`` narrows to a set of model unique ids, which is what a caller
+    verifying one build rather than a whole project has: the notes narrow with
+    it, so a model outside the scope is neither checked nor reported as
+    unchecked. Both halves matter, because a note naming models this caller
+    never asked about reads as a gap in the answer it did ask for. Ids rather
+    than names, because two versions of one model share a name and a build
+    that ran one of them did not run the other.
     """
 
     import sqlglot
@@ -1061,13 +1059,12 @@ def row_population_plan(
         )
 
     relations: dict[str, str] = {}
-    for node in list(nodes.values()) + list(_manifest_sources(project_dir).values()):
+    for uid, node in list(nodes.items()) + list(_manifest_sources(project_dir).items()):
         if not isinstance(node, dict):
             continue
         relation = node.get("relation_name")
-        name = node.get("name")
-        if isinstance(relation, str) and relation and isinstance(name, str):
-            relations[strip_relation_quoting(relation)] = name
+        if isinstance(relation, str) and relation and isinstance(node.get("name"), str):
+            relations[strip_relation_quoting(relation)] = manifest_node_label(uid, node)
 
     known = sorted(relations)
 
@@ -1088,16 +1085,16 @@ def row_population_plan(
     notes: list[str] = []
     incremental: list[str] = []
     unfollowable: list[str] = []
-    for node in nodes.values():
+    for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
             continue
-        name = node.get("name")
         relation = node.get("relation_name")
         code = node.get("compiled_code")
-        if not (isinstance(name, str) and name):
+        if not (isinstance(node.get("name"), str) and node["name"]):
             continue
-        if scope is not None and name not in scope:
+        if scope is not None and uid not in scope:
             continue
+        name = manifest_node_label(uid, node)
         # An ephemeral model compiles with no relation of its own and is inlined
         # into whatever reads it, so it has no row count to compare; a model
         # with no compiled SQL was never compiled and says nothing either.

@@ -720,6 +720,15 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   verify` returns them, and `suppressed`, naming every finding class that did
   not run and why.
 
+  **Model names.** A model is named the way dbt selects it, here and in `maintain
+  verify`, in the build's `nodes`, and in the per-node estimate. A versioned
+  model carries its version, `dim_customers.v2`, the latest one included, because
+  two versions are two relations that share one `name` and either can fail, lose
+  rows, or go missing on its own. The sweep's scope is the exact nodes the build
+  ran, so a build of `dim_customers.v2` never judges `dim_customers.v1`. As in
+  dbt's `--select`, `maintain verify dim_customers` selects every version and
+  `maintain verify dim_customers.v2` selects one.
+
   **Findings never fail the build.** A build dbt completed is a build that
   completed; whether a `row_loss` should gate a pipeline is a caller's policy,
   so findings stay out of `errors` and never change the status. A pointer line

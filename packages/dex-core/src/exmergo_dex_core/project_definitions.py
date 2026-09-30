@@ -106,8 +106,13 @@ class ProjectDefinitions(BaseModel):
     consumers degrade instead of erroring. ``relationship_source`` and
     ``semantic_source`` record where each half came from (for dbt, ``"manifest"``
     is exact and ``"yaml"`` resolves by name; another format names its own
-    channels). ``model_relations`` maps referable names (for dbt, model names and
-    ``source.table``) to quote-stripped physical relations. ``primary_entities``
+    channels). ``model_relations`` maps each model the project builds to its
+    quote-stripped physical relation, keyed by the model's label (for dbt, the
+    model name, and ``<name>.v<N>`` for a versioned model, one entry per
+    version); every key is a model, so a consumer never has to tell a model
+    from a source by its spelling. ``source_relations`` maps what the project
+    reads but does not build (for dbt, ``source.table``) the same way.
+    ``primary_entities``
     maps model names to their declared grain column; ``metric_models`` lists
     models reachable from any metric. ``declared_composite_keys`` carries
     multi-column grain declarations -- something a column-level test structurally
@@ -131,6 +136,7 @@ class ProjectDefinitions(BaseModel):
     declared_keys: list[DeclaredKey] = Field(default_factory=list)
     declared_composite_keys: list[DeclaredCompositeKey] = Field(default_factory=list)
     model_relations: dict[str, str] = Field(default_factory=dict)
+    source_relations: dict[str, str] = Field(default_factory=dict)
     primary_entities: dict[str, str] = Field(default_factory=dict)
     metric_models: list[str] = Field(default_factory=list)
     built_relation_names: list[str] = Field(default_factory=list)

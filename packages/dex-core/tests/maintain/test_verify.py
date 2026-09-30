@@ -1608,9 +1608,7 @@ def test_the_plan_can_be_scoped_to_one_build_s_models(tmp_path: Path):
         json.dumps({"nodes": nodes, "sources": {}}), encoding="utf-8"
     )
 
-    checks, notes = verify_mod.row_population_plan(
-        tmp_path, "duckdb", scope={"fct_orders"}
-    )
+    checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb", scope={"m.2"})
     assert [c.model for c in checks] == ["fct_orders"]
     # The incremental model is outside the scope, so its skip is not this
     # caller's business either.
@@ -1693,3 +1691,127 @@ def test_the_injected_handshake_can_defer_the_counts(tmp_path: Path):
     assert measured.offer is sentinel
     assert measured.deferred == {"wh.main.a_view"}
     assert measured.counts == {}
+
+
+# --- versioned models: each version is its own model ---------------------------
+#
+# dbt writes a versioned model's id as `model.<package>.<name>.v<N>` and keeps
+# one `name` across its versions, so neither the id's last segment (`v2`) nor
+# the name tells two versions apart. Both are separate relations a build can
+# lose independently.
+
+
+def _versioned_nodes(v1_relation: str, v2_relation: str) -> dict:
+    return {
+        f"model.maintain_test.dim_orders.v{version}": {
+            "name": "dim_orders",
+            "resource_type": "model",
+            "version": version,
+            "latest_version": 2,
+            "relation_name": relation,
+        }
+        for version, relation in ((1, v1_relation), (2, v2_relation))
+    }
+
+
+def test_a_missing_version_is_reported_as_that_version_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The two versions once collapsed onto one `model_relations` entry, and
+    whichever came last was the only one checked: v1's missing relation was
+    reported nowhere."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes=_versioned_nodes(
+            '"warehouse"."main"."dim_orders_v1"', '"warehouse"."main"."stg_orders"'
+        ),
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    missing = [f for f in payload["data"]["findings"] if f["code"] == "no_relation"]
+    assert [f["identifier"] for f in missing] == ["dim_orders.v1"]
+
+
+def test_a_bare_model_name_scopes_in_every_version(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The way dbt's own `--select dim_orders` does; the versioned label
+    selects one."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes=_versioned_nodes(
+            '"warehouse"."main"."dim_orders_v1"', '"warehouse"."main"."stg_orders"'
+        ),
+        results=[],
+    )
+
+    def missing(*objects: str) -> list[str]:
+        rc, payload = maintain_repo.dex("maintain", "verify", *objects)
+        assert rc == 0 and payload["status"] == "ok", payload
+        return [
+            f["identifier"]
+            for f in payload["data"]["findings"]
+            if f["code"] == "no_relation"
+        ]
+
+    assert missing("dim_orders") == ["dim_orders.v1"]
+    assert missing("dim_orders.v1") == ["dim_orders.v1"]
+    assert missing("dim_orders.v2") == []
+
+
+def test_a_failed_version_is_named_with_its_version(tmp_path: Path):
+    _write_artifacts(
+        tmp_path,
+        nodes=_versioned_nodes("wh.main.dim_orders_v1", "wh.main.dim_orders_v2"),
+        results=[
+            {"unique_id": "model.maintain_test.dim_orders.v1", "status": "success"},
+            {
+                "unique_id": "model.maintain_test.dim_orders.v2",
+                "status": "error",
+                "message": "boom",
+            },
+        ],
+    )
+    findings, _notes = build_status_findings(tmp_path)
+    assert [(f.code, f.identifier) for f in findings] == [
+        ("node_failed", "dim_orders.v2")
+    ]
+
+
+def test_row_population_scopes_by_id_so_one_version_does_not_bring_the_other(
+    tmp_path: Path,
+):
+    nodes = {
+        uid: node | {"compiled_code": 'select * from "wh"."main"."orders"'}
+        for uid, node in _versioned_nodes(
+            '"wh"."main"."dim_orders_v1"', '"wh"."main"."dim_orders_v2"'
+        ).items()
+    }
+    _plan(tmp_path, nodes)
+
+    checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb")
+    assert sorted(c.model for c in checks) == ["dim_orders.v1", "dim_orders.v2"]
+
+    checks, notes = verify_mod.row_population_plan(
+        tmp_path, "duckdb", scope={"model.maintain_test.dim_orders.v2"}
+    )
+    assert [c.model for c in checks] == ["dim_orders.v2"] and notes == []
+
+
+def test_an_unfollowable_version_is_named_once_per_version(tmp_path: Path):
+    """The note once read `dim_orders (...), dim_orders (...)`: two entries
+    and no way to tell which was which."""
+
+    nodes = {
+        uid: node | {"compiled_code": "select 1 as id"}
+        for uid, node in _versioned_nodes(
+            '"wh"."main"."dim_orders_v1"', '"wh"."main"."dim_orders_v2"'
+        ).items()
+    }
+    _plan(tmp_path, nodes)
+    _checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb")
+    assert len(notes) == 1
+    assert "dim_orders.v1 (" in notes[0] and "dim_orders.v2 (" in notes[0]

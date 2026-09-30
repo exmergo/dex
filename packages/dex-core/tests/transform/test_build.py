@@ -1886,6 +1886,38 @@ def test_compile_estimate_sums_priced_nodes_and_skips_the_unbilled_ones(
     assert notes == []
 
 
+def test_compile_estimate_prices_each_version_of_a_model_separately(
+    dbt_project_dir: Path, monkeypatch
+):
+    """Two versions share a `name`, so keying the per-node estimate on it kept
+    one of them and the breakdown stopped adding up to the total."""
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    nodes = {
+        f"model.p.dim_customers.v{v}": {
+            "resource_type": "model",
+            "name": "dim_customers",
+            "version": v,
+            "compiled_code": f"select {v}",
+            "config": {"materialized": "table"},
+        }
+        for v in (1, 2)
+    }
+    _write_manifest(dbt_project_dir, nodes)
+    _compile_runner(
+        monkeypatch,
+        dbt_project_dir,
+        {"results": [{"unique_id": uid} for uid in nodes]},
+    )
+    total, per_node, _notes = build_mod.compile_estimate(
+        dbt_project_dir, _EstimatingAdapter(), target="dev"
+    )
+    assert per_node == {"dim_customers.v1": 10.0, "dim_customers.v2": 10.0}
+    assert total == sum(per_node.values())
+    assert build_mod.compiled_model_ids(dbt_project_dir) == set(nodes)
+
+
 def test_compile_estimate_skips_and_notes_unpriceable_nodes(
     dbt_project_dir: Path, monkeypatch
 ):
@@ -2249,6 +2281,53 @@ def test_a_warning_test_node_is_named_rather_than_hashed(
     )
     # A model's id has no trailing hash, so its name is untouched.
     assert by_status["success"]["name"] == "stg_customers"
+
+
+def test_a_versioned_model_is_named_with_its_version(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """dbt's id for a versioned model ends in `v<N>`, so the last segment named
+    it `v2`, and the manifest's `name` is shared by every version of it. The
+    envelope names it the way `dbt ls` and `--select` do."""
+
+    _write_manifest(
+        dbt_project_dir,
+        {
+            f"model.dex_test.dim_customers.v{v}": {
+                "resource_type": "model",
+                "name": "dim_customers",
+                "version": v,
+                "latest_version": 2,
+            }
+            for v in (1, 2)
+        },
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            dbt_project_dir / "target" / "run_results.json",
+            _node_results(
+                *(
+                    {
+                        "unique_id": f"model.dex_test.dim_customers.v{v}",
+                        "status": "success",
+                        "execution_time": 1.0,
+                    }
+                    for v in (1, 2)
+                )
+            ),
+        ),
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--confirm"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert sorted(n["name"] for n in envelope["data"]["nodes"]) == [
+        "dim_customers.v1",
+        "dim_customers.v2",
+    ]
 
 
 # --- --verify: the sweep folded onto the build --------------------------------

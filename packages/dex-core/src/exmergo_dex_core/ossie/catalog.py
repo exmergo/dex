@@ -474,7 +474,9 @@ def definitions(
         declared_relationships=declared_relationships,
         declared_keys=keys,
         declared_composite_keys=composite,
-        model_relations=relations,
+        # Every dataset is a relation the document reads, never one it builds,
+        # so none of them is a model a build could have failed to produce.
+        source_relations=relations,
         notes=found,
     )
 

@@ -468,6 +468,12 @@ deliberate: it is already what `definitions()` returns and already what every
 consumer reads, so a second format reuses the vocabulary rather than introducing a
 parallel one that has to be mapped at every call site.
 
+Physical relations go in two maps. `model_relations` holds what the project
+builds, keyed by the name a finding should carry, one entry per relation; `maintain
+verify` checks every key there as a built model, so a relation the project only
+reads belongs in `source_relations` instead. The dbt format keys a versioned model
+as `<name>.v<N>`, one entry per version, and a source as `source_name.table`.
+
 Where your format's shape and this model's shape disagree, say so in `notes` rather
 than inventing a value. A fabricated field is indistinguishable from a measured one
 by the time a finding is shown to a human.

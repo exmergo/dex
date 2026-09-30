@@ -36,6 +36,7 @@ from ..dbt_project import (
     Edit,
     EditOp,
     contained_path,
+    manifest_node_label,
     profiles_dir,
 )
 from ..dbt_project import load as load_project
@@ -941,8 +942,8 @@ def compile_estimate(
     return total, per_node, notes
 
 
-def compiled_model_names(project: Path) -> set[str]:
-    """The models dbt's last compile selected, by name.
+def compiled_model_ids(project: Path) -> set[str]:
+    """The models dbt's last compile selected, by unique id.
 
     The same ``run_results.json`` the estimate is built from, which is what
     makes this the build's own selection rather than the whole project: a
@@ -957,7 +958,7 @@ def compiled_model_names(project: Path) -> set[str]:
     except (OSError, json.JSONDecodeError):
         return set()
     return {
-        str(r["unique_id"]).rsplit(".", 1)[-1]
+        str(r["unique_id"])
         for r in results
         if str(r.get("unique_id", "")).startswith("model.")
     }
@@ -1032,7 +1033,7 @@ def _assert_compiled_functions(
 
 
 def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
-    """The (short name, compiled SQL) of each priced node dbt just compiled.
+    """The (label, compiled SQL) of each priced node dbt just compiled.
 
     The selected set comes from compile's ``run_results.json`` (which honors the
     same ``--select`` a build would), joined to ``manifest.json`` for each node's
@@ -1060,7 +1061,7 @@ def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
         code = node.get("compiled_code")
         if not code or not str(code).strip():
             continue
-        priced.append((node.get("name") or uid.split(".")[-1], str(code)))
+        priced.append((manifest_node_label(uid, node), str(code)))
     return priced
 
 
@@ -1303,37 +1304,15 @@ def _collect_messages(
     return messages
 
 
-def _display_name(unique_id: str) -> str:
-    """dbt's own name for a node, read off its unique id.
-
-    A model is ``model.<package>.<name>``, so the last segment is the name. A
-    generic test is ``test.<package>.<name>.<hash>``, where the hash is content
-    derived, so the name is the segment before it. Taking the last segment for
-    everything is what made a green build report seventeen warning tests under
-    names like ``3249b83c15``: correct, unique, and useless to a reader trying
-    to tell which test warned.
-    """
-
-    parts = unique_id.split(".")
-    if len(parts) < 3:
-        return parts[-1] if parts else unique_id
-    # Only the generic-test spelling carries a trailing hash. A singular test is
-    # `test.<package>.<name>` like a model, so segment count decides, not the
-    # resource type: a three-part id is already at its name.
-    if parts[0] == "test" and len(parts) > 3:
-        return parts[-2]
-    return parts[-1]
-
-
 def _summarize(
     project: Path, target: str, completed: subprocess.CompletedProcess
 ) -> dict[str, Any]:
     """Reduce a dbt run to a sanitized summary; raw log text stays behind.
 
-    Each node carries both its ``unique_id`` and the readable ``name`` derived
-    from it. The id is the only unambiguous identifier (it names the resource
-    type and the package, and it is what `run_results.json` can be
-    cross-referenced on); the name is what a reader scans.
+    Each node carries both its ``unique_id`` and its readable ``name``, the
+    label the manifest gives it. The id is the only unambiguous identifier (it
+    names the resource type and the package, and it is what `run_results.json`
+    can be cross-referenced on); the name is what a reader scans.
     """
 
     nodes: list[dict[str, Any]] = []
@@ -1343,12 +1322,24 @@ def _summarize(
     run_results = project / "target" / "run_results.json"
     if run_results.is_file():
         results = json.loads(run_results.read_text(encoding="utf-8")).get("results", [])
+        # The manifest names each node the way a reader knows it; without one
+        # (a build that died before writing it) the label falls back to the id.
+        manifest_nodes: dict[str, Any] = {}
+        with contextlib.suppress(OSError, json.JSONDecodeError, AttributeError):
+            manifest_nodes = (
+                json.loads(
+                    (project / "target" / "manifest.json").read_text(encoding="utf-8")
+                ).get("nodes")
+                or {}
+            )
         for result in results:
             status = str(result.get("status", "unknown"))
             unique_id = str(result.get("unique_id", ""))
             nodes.append(
                 {
-                    "name": _display_name(unique_id),
+                    "name": manifest_node_label(
+                        unique_id, manifest_nodes.get(unique_id)
+                    ),
                     "unique_id": unique_id,
                     "status": status,
                     "execution_time": result.get("execution_time"),

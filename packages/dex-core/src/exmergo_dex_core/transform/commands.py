@@ -2512,13 +2512,13 @@ def _price_build(
             # The compile above wrote the manifest this reads, so the sweep's
             # scan can be priced here and confirmed with the build rather than
             # asked about again once the build has already spent.
-            from .build import compiled_model_names
+            from .build import compiled_model_ids
             from .verify import price_verification
 
             scan, scan_notes = price_verification(
                 adapter,
                 Path(project),
-                scope=compiled_model_names(Path(project)),
+                scope=compiled_model_ids(Path(project)),
             )
             notes = [*notes, *scan_notes]
             if scan:

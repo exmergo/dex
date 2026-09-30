@@ -343,7 +343,12 @@ def build_evidence(
     """
 
     from ..dbt_project import load as load_project
-    from ..dbt_project import manifest_freshness, strip_relation_quoting
+    from ..dbt_project import (
+        manifest_freshness,
+        manifest_node_label,
+        node_name,
+        strip_relation_quoting,
+    )
 
     root = Path(project)
     run_results_path = root / "target" / "run_results.json"
@@ -371,6 +376,11 @@ def build_evidence(
     manifest_nodes = manifest.get("nodes") or {}
 
     nodes: list[BuildNode] = []
+    # Every name a built node answers to, not only its label: a selector or an
+    # edit can name a versioned model by its unversioned name (which selects
+    # every version) or by the file it is defined in (`dim_customers_v2.sql`),
+    # and each of those did build this node.
+    answers: set[str] = set()
     generated: list[str] = []
     errors: list[dict[str, str]] = []
     for result in results:
@@ -379,13 +389,9 @@ def build_evidence(
         config = node.get("config") if isinstance(node.get("config"), dict) else {}
         relation = node.get("relation_name")
         status = str(result.get("status") or "unknown")
-        # The manifest's own `name` where there is one. A test's unique_id ends
-        # in a disambiguating hash (`test.pkg.not_null_orders_id.3249b83c15`),
-        # so the last segment is a checksum rather than a name a reader can look
-        # up, and the fallback only fires for a node the manifest does not carry.
         built = BuildNode(
             unique_id=unique_id,
-            name=str(node.get("name") or unique_id.split(".")[-1]),
+            name=manifest_node_label(unique_id, node or None),
             resource_type=node.get("resource_type"),
             status=status,
             execution_time=result.get("execution_time"),
@@ -401,6 +407,13 @@ def build_evidence(
             ),
         )
         nodes.append(built)
+        answers.add(built.name)
+        if isinstance(node.get("name"), str):
+            answers.add(node["name"])
+        if node.get("resource_type") == "model" and isinstance(
+            node.get("original_file_path"), str
+        ):
+            answers.add(node_name(node["original_file_path"]))
         if status.lower() in FAILED_STATUSES:
             errors.append({"node": built.name, "message": built.message or status})
         elif built.relation and built.resource_type in {"model", "snapshot", "seed"}:
@@ -411,8 +424,8 @@ def build_evidence(
         requested=select,
         matched=matched,
         empty=not matched,
-        complete=_selection_complete(select, matched),
-        unmatched=_unmatched(select, matched),
+        complete=_selection_complete(select, answers),
+        unmatched=_unmatched(select, answers),
     )
 
     coverage = None
@@ -420,11 +433,11 @@ def build_evidence(
     if edits is not None:
         drift = plan_drift(edits, root)
         required, basis = required_nodes(edits, root)
-        covered = [name for name in required if name in matched]
+        covered = [name for name in required if name in answers]
         coverage = BuildCoverage(
             required=required,
             covered=covered,
-            missing=[name for name in required if name not in matched],
+            missing=[name for name in required if name not in answers],
             basis=basis,
         )
 
@@ -467,7 +480,7 @@ def build_evidence(
     )
 
 
-def _selection_complete(select: str | None, matched: list[str]) -> bool | None:
+def _selection_complete(select: str | None, answers: set[str]) -> bool | None:
     """Whether everything the selector literally named was built.
 
     ``None`` for a selector dex does not evaluate. dbt's selector language has
@@ -477,16 +490,16 @@ def _selection_complete(select: str | None, matched: list[str]) -> bool | None:
     """
 
     if select is None:
-        return bool(matched)
+        return bool(answers)
     if any(op in select for op in _SELECTOR_OPERATORS) or " " in select.strip():
         names = [part for part in select.split() if part]
         if any(any(op in name for op in _SELECTOR_OPERATORS) for name in names):
             return None
-        return all(name in matched for name in names)
-    return select in matched
+        return all(name in answers for name in names)
+    return select in answers
 
 
-def _unmatched(select: str | None, matched: list[str]) -> list[str]:
+def _unmatched(select: str | None, answers: set[str]) -> list[str]:
     """Literal names in the selector that no node answered to."""
 
     if select is None:
@@ -494,4 +507,4 @@ def _unmatched(select: str | None, matched: list[str]) -> list[str]:
     names = [part for part in select.split() if part]
     if any(any(op in name for op in _SELECTOR_OPERATORS) for name in names):
         return []
-    return [name for name in names if name not in matched]
+    return [name for name in names if name not in answers]

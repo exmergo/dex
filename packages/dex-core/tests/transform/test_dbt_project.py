@@ -741,3 +741,163 @@ def test_jinja_reads_a_keyword_argument_as_unread():
 def test_jinja_regions_returns_a_region_that_calls_nothing():
     regions, _masked = jinja_regions("select {{ some_var }}")
     assert [(r.kind, r.calls) for r in regions] == [("expression", [])]
+
+
+# --- versioned models ----------------------------------------------------------
+
+
+def test_a_manifest_node_is_labelled_the_way_dbt_selects_it():
+    label = dbt_project.manifest_node_label
+    versioned = {"resource_type": "model", "name": "dim_customers", "version": 2}
+    assert label("model.shop.dim_customers.v2", versioned) == "dim_customers.v2"
+    assert (
+        label("model.shop.fct_orders", {"resource_type": "model", "name": "fct_orders"})
+        == "fct_orders"
+    )
+    # Without the node, the id alone settles it.
+    assert label("model.shop.dim_customers.v2") == "dim_customers.v2"
+    assert label("model.shop.fct_orders") == "fct_orders"
+    assert label("test.shop.not_null_orders_id.3249b83c15") == "not_null_orders_id"
+    assert label("test.shop.assert_positive") == "assert_positive"
+
+
+def _versioned_manifest(project: Path, *, relationship_to: str, depends_on: list[str]):
+    """Two versions of `dim_customers`, an unversioned `fct_orders` with a
+    relationships test to it, and one source, spelled the way dbt writes them."""
+
+    def model(name: str, relation: str, **extra) -> dict:
+        return {
+            "resource_type": "model",
+            "name": name,
+            "relation_name": relation,
+            "config": {"enabled": True},
+            **extra,
+        }
+
+    nodes = {
+        "model.dex_test.fct_orders": model("fct_orders", '"dev"."main"."fct_orders"'),
+        **{
+            f"model.dex_test.dim_customers.v{v}": model(
+                "dim_customers",
+                f'"dev"."main"."dim_customers_v{v}"',
+                version=v,
+                latest_version=2,
+            )
+            for v in (1, 2)
+        },
+        "test.dex_test.unique_dim_customers_v1_id.aaa": {
+            "resource_type": "test",
+            "name": "unique_dim_customers_v1_id",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            "attached_node": "model.dex_test.dim_customers.v1",
+            "depends_on": {"nodes": ["model.dex_test.dim_customers.v1"]},
+        },
+        "test.dex_test.relationships_fct_orders.bbb": {
+            "resource_type": "test",
+            "name": "relationships_fct_orders_customer_id",
+            "test_metadata": {
+                "name": "relationships",
+                "kwargs": {
+                    "column_name": "customer_id",
+                    "to": relationship_to,
+                    "field": "id",
+                },
+            },
+            "attached_node": "model.dex_test.fct_orders",
+            "depends_on": {"nodes": depends_on},
+        },
+    }
+    sources = {
+        "source.dex_test.raw.customers": {
+            "resource_type": "source",
+            "source_name": "raw",
+            "name": "customers",
+            "relation_name": '"dev"."raw"."customers"',
+        }
+    }
+    target = project / "target"
+    target.mkdir(exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps({"nodes": nodes, "sources": sources}), encoding="utf-8"
+    )
+
+
+def test_each_version_keeps_its_own_relation_and_sources_are_apart(
+    dbt_project_dir: Path,
+):
+    """One `name` across versions once collapsed them onto one entry, the last
+    one read, so a missing v1 relation was checked against v2's."""
+
+    _versioned_manifest(
+        dbt_project_dir,
+        relationship_to="ref('dim_customers')",
+        depends_on=["model.dex_test.dim_customers.v2", "model.dex_test.fct_orders"],
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.model_relations == {
+        "fct_orders": "dev.main.fct_orders",
+        "dim_customers.v1": "dev.main.dim_customers_v1",
+        "dim_customers.v2": "dev.main.dim_customers_v2",
+    }
+    assert defs.source_relations == {"raw.customers": "dev.raw.customers"}
+    (key,) = defs.declared_keys
+    assert (key.model, key.relation) == (
+        "dim_customers.v1",
+        "dev.main.dim_customers_v1",
+    )
+
+
+@pytest.mark.parametrize(
+    "to,depends_on,model,relation",
+    [
+        # A bare ref is the latest version, which dbt has already resolved.
+        (
+            "ref('dim_customers')",
+            ["model.dex_test.dim_customers.v2", "model.dex_test.fct_orders"],
+            "dim_customers.v2",
+            "dev.main.dim_customers_v2",
+        ),
+        (
+            "ref('dim_customers', v=1)",
+            ["model.dex_test.dim_customers.v1", "model.dex_test.fct_orders"],
+            "dim_customers.v1",
+            "dev.main.dim_customers_v1",
+        ),
+        # No usable dependency: the written name stands, and resolves nothing.
+        ("ref('dim_customers')", [], "dim_customers", None),
+    ],
+)
+def test_a_relationships_target_is_the_node_dbt_resolved(
+    dbt_project_dir: Path, to, depends_on, model, relation
+):
+    _versioned_manifest(dbt_project_dir, relationship_to=to, depends_on=depends_on)
+    (fk,) = definitions(dbt_project_dir).foreign_keys
+    assert (fk.model, fk.to_model, fk.to_relation) == ("fct_orders", model, relation)
+
+
+def test_a_semantic_model_s_grain_lands_on_the_version_it_reads(dbt_project_dir: Path):
+    """The semantic manifest names the relation by alias, `dim_customers_v2`,
+    which is not a model's label; filing the grain there made one relation two
+    models to every consumer."""
+
+    _versioned_manifest(
+        dbt_project_dir, relationship_to="ref('dim_customers')", depends_on=[]
+    )
+    write_semantic_manifest(
+        dbt_project_dir,
+        semantic_models=[
+            {
+                "name": "customers",
+                "model": "ref('dim_customers')",
+                "node_relation": {
+                    "alias": "dim_customers_v2",
+                    "relation_name": '"dev"."main"."dim_customers_v2"',
+                },
+                "entities": [{"name": "customer", "type": "primary", "expr": "id"}],
+            }
+        ],
+        metrics=[],
+    )
+    defs = definitions(dbt_project_dir)
+    assert "dim_customers_v2" not in defs.model_relations
+    assert defs.primary_entities == {"dim_customers.v2": "id"}
