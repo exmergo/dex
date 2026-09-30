@@ -712,10 +712,92 @@ def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(grain_drift(engine, getattr(args, "objects", None)))
 
 
+def _combined_scan_handshake(adapter, join_cost):
+    """Two handshakes, ``(row_ask, join_ask)``, sharing one cached decision
+    for row population's row-count scan and join contract's overlap probe
+    (#228), the two paid scans `maintain verify` can run.
+
+    ``VerifyResult.pending_offer`` holds exactly one offer. Without this,
+    whichever of the two axes asked second would silently discard the
+    first's price the moment both are deferred on a metered connector: the
+    caller would see one offer that named only one axis's cost, understating
+    what confirming would actually spend.
+
+    Two closures, not one shared between both callers: :func:`~..maintain.
+    verify.relation_counts` calls its handshake as ``ask(row_estimate,
+    row_relation_count)`` and :func:`~..maintain.verify.join_contract_
+    findings` calls its as ``ask(join_estimate, join_probe_count)`` -- the
+    same two-``float``-then-``int`` shape, but meaning a different axis's
+    numbers each time. One shared closure receiving both calls has no way to
+    tell which axis is on the line; trusting the second call's own arguments
+    as "the other axis's real numbers" while *also* asking ``join_cost()``
+    again double-counted whichever axis called second (#228's own review).
+
+    ``row_ask`` always calls ``join_cost()`` (a zero-argument callable
+    pricing join contract's own axis, lazily) to learn the other axis's
+    contribution. ``join_ask`` does not: `verify()` calls row population
+    before join contract, so by the time ``join_ask`` runs, either
+    ``row_ask`` already ran (and cached the combined decision, which this
+    reads rather than asking again) or it never ran at all, which only
+    happens when row population had nothing to count -- a real, legitimate
+    zero contribution, not a number this needs to compute a second time.
+    """
+
+    cache: dict[str, object] = {}
+
+    def _resolve(
+        row_estimate: float, row_count: int, join_estimate: float, join_count: int
+    ):
+        if "offer" in cache:
+            return cache["offer"]
+        if not row_count and not join_count:
+            cache["offer"] = None
+            return None
+        per_table: dict[str, float] = {}
+        axes: list[str] = []
+        if row_count:
+            per_table["(row counts)"] = row_estimate
+            axes.append("row_population")
+        if join_count:
+            per_table["(join overlap probes)"] = join_estimate
+            axes.append("join_contract")
+        offer = command_args.confirmation_request(
+            "maintain verify",
+            adapter,
+            row_estimate + join_estimate,
+            per_table=per_table,
+            axes=axes,
+            notes=[
+                "the build-status, no-relation, column-contract and grain "
+                "findings in this envelope are final; the estimate buys "
+                f"{row_count} row count(s) and {join_count} join overlap "
+                "probe(s), which is what row loss, fanout, and a broken or "
+                "sparse join are judged from"
+            ],
+        )
+        cache["offer"] = offer
+        return offer
+
+    def row_ask(row_estimate: float, row_relation_count: int):
+        join_estimate, join_probe_count = join_cost()
+        return _resolve(
+            row_estimate, row_relation_count, join_estimate, join_probe_count
+        )
+
+    def join_ask(join_estimate: float, join_probe_count: int):
+        if "offer" in cache:
+            return cache["offer"]
+        # row_ask never ran: row population's own to-count set was empty,
+        # so its contribution is legitimately zero, not an unknown to price.
+        return _resolve(0.0, 0, join_estimate, join_probe_count)
+
+    return row_ask, join_ask
+
+
 def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     """Is the project correct right now, with no baseline required (#224).
 
-    Four finding classes. Build-status gaps (#225) read the compiled manifest
+    Five finding classes. Build-status gaps (#225) read the compiled manifest
     and the last run's ``run_results.json`` (failed nodes, nodes skipped by a
     failed parent), plus models the project declares that have no relation in
     the warehouse. Column contract (#230) compares a built relation's actual
@@ -726,16 +808,22 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     account for it, or one that fanned out on a join. Grain (#229) checks that
     a model's intended grain -- a declared unique test, a semantic model's
     declared primary entity, or (absent either) a free naming guess -- still
-    holds one row per key in the built relation.
+    holds one row per key in the built relation. Join contract (#228) reads
+    every equality join a model's compiled SQL writes and measures the real
+    value overlap on each, reporting a join whose keys find almost nothing on
+    the other side, or fewer but still materially many.
 
     Free wherever the answer is free, which is most of it: the manifest read
-    touches no connection, the relation check, the column contract, and the
-    row counts all read cheap object metadata, and on a connector with no cost
-    gate the row counts are made exact because doing so bills nothing. Only
-    the row counts a warehouse keeps no metadata for cost anything, and those
-    are offered rather than taken: the envelope returns its free findings as
-    the complete answer they are, with the scan priced beside them, exactly as
-    `maintain check` and `maintain semantic` do.
+    touches no connection, the relation check, the column contract, and grain
+    all read cheap object metadata or bounded distinct counts, and on a
+    connector with no cost gate the row counts are made exact because doing
+    so bills nothing. The row counts a warehouse keeps no metadata for, and
+    the join contract's own overlap probe, are the two things that cost
+    anything, and both are offered rather than taken, combined into one
+    priced ask when both need one (see `_combined_scan_handshake`): the
+    envelope returns its free findings as the complete answer they are, with
+    the scan priced beside them, exactly as `maintain check` and `maintain
+    semantic` do.
 
     A project that does not compile is reported first and suppresses every
     other check here, since a finding computed from a manifest a broken
@@ -755,6 +843,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "no_relation": str(exc),
                 "column_contract": str(exc),
                 "grain": str(exc),
+                "join_contract": str(exc),
                 "compile": str(exc),
             },
             warnings=[f"maintain verify needs a dbt project: {exc}"],
@@ -773,11 +862,12 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "row_population": reason,
                 "column_contract": reason,
                 "grain": reason,
+                "join_contract": reason,
             },
             warnings=[
-                "build-status, no-relation, row-population, column-contract "
-                "and grain findings suppressed: the project does not compile, "
-                "so its manifest cannot be trusted"
+                "build-status, no-relation, row-population, column-contract, "
+                "grain and join-contract findings suppressed: the project "
+                "does not compile, so its manifest cannot be trusted"
             ],
         )
         return result
@@ -808,6 +898,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         suppressed["row_population"] = "no dbt project found"
         suppressed["column_contract"] = "no dbt project found"
         suppressed["grain"] = "no dbt project found"
+        suppressed["join_contract"] = "no dbt project found"
     else:
         model_relations = {
             name: relation
@@ -821,6 +912,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             suppressed["row_population"] = f"warehouse unreachable: {exc}"
             suppressed["column_contract"] = f"warehouse unreachable: {exc}"
             suppressed["grain"] = f"warehouse unreachable: {exc}"
+            suppressed["join_contract"] = f"warehouse unreachable: {exc}"
         else:
             cost = command_args.preflight_cost(adapter)
             live = adapter.list_objects()
@@ -844,13 +936,40 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             warnings.extend(grain_warnings)
             if grain_reason is not None:
                 suppressed["grain"] = grain_reason
+
+            row_ask, join_ask = _combined_scan_handshake(
+                adapter,
+                lambda: verify_mod.join_contract_cost(
+                    project_dir,
+                    adapter,
+                    model_relations,
+                    [o.identifier for o in live],
+                    scope=wanted,
+                ),
+            )
             row_findings, row_warnings, row_reason, offer = _row_population(
-                engine, adapter, project_dir, live
+                engine, adapter, project_dir, live, handshake=row_ask
             )
             findings.extend(row_findings)
             warnings.extend(row_warnings)
             if row_reason is not None:
                 suppressed["row_population"] = row_reason
+            join_findings, join_warnings, join_reason, join_offer = _join_contract(
+                engine,
+                project_dir,
+                adapter,
+                model_relations,
+                live,
+                scope=wanted,
+                handshake=join_ask,
+            )
+            findings.extend(join_findings)
+            warnings.extend(join_warnings)
+            if join_reason is not None:
+                suppressed["join_contract"] = join_reason
+            # Both axes ask through the same shared cache, so a non-None
+            # offer from either names both; take whichever answered.
+            offer = offer or join_offer
 
     if wanted:
         findings = [f for f in findings if (f.identifier or "").lower() in wanted]
@@ -940,13 +1059,55 @@ def _grain_contract(adapter, definitions, model_relations, live, *, scope=None):
     return findings, notes, None
 
 
-def _row_population(engine: DexEngine, adapter, project_dir, live):
+def _join_contract(
+    engine: DexEngine,
+    project_dir,
+    adapter,
+    model_relations,
+    live,
+    *,
+    scope=None,
+    handshake=None,
+):
+    """The join-contract half of `maintain verify`, end to end (#228).
+
+    Has a cost decision, unlike column contract or grain beside it: the
+    overlap probe is a real warehouse scan, priced and offered the same way
+    row population's row counts are, not bounded-and-deliberate by an
+    adapter contract the way grain's distinct counts are. ``handshake`` is
+    how `verify()` folds this axis's price into the one combined ask it
+    makes together with row population, so a metered connector sees one
+    priced offer naming both rather than the second one silently discarding
+    the first in ``VerifyResult.pending_offer``.
+    """
+
+    candidates, plan_notes = verify_mod.join_contract_plan(
+        project_dir, adapter.dialect, scope=scope
+    )
+    findings, finding_notes, offer = verify_mod.join_contract_findings(
+        adapter,
+        candidates,
+        model_relations,
+        [o.identifier for o in live],
+        timeout_seconds=engine.config.query.timeout_seconds,
+        handshake=handshake,
+    )
+    return findings, plan_notes + finding_notes, None, offer
+
+
+def _row_population(engine: DexEngine, adapter, project_dir, live, *, handshake=None):
     """The row-loss and fanout half of `maintain verify`, end to end.
 
     Split out because it is the only part of the command with a cost decision
     in it, and because its inert cases are its own: an install with no dialect
     engine, a project never compiled, a model whose driving parent cannot be
     identified. Returns ``(findings, warnings, suppressed_reason, offer)``.
+
+    ``handshake`` is passed straight through to :func:`~..maintain.verify.
+    relation_counts`; the default (``None``) is that function's own
+    standalone ask, unchanged from before #228. A caller pricing more than
+    this one axis (see `verify()`'s combined handshake with join contract)
+    supplies its own instead.
     """
 
     try:
@@ -968,7 +1129,11 @@ def _row_population(engine: DexEngine, adapter, project_dir, live):
 
     wanted = sorted({relation for check in checks for relation in check.relations})
     measured = verify_mod.relation_counts(
-        adapter, wanted, live, timeout_seconds=engine.config.query.timeout_seconds
+        adapter,
+        wanted,
+        live,
+        timeout_seconds=engine.config.query.timeout_seconds,
+        handshake=handshake,
     )
     findings, finding_notes = verify_mod.row_population_findings(
         checks,
