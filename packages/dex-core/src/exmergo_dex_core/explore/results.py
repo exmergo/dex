@@ -126,6 +126,10 @@ def _profile_dataset_payload(
         "composite_keys": dataset.composite_keys,
         "rank_score": dataset.rank_score,
         "data_quality": dataset.data_quality,
+        # Severity-ordered, structured: which of `data_quality`'s free-text
+        # notes and which columns' own `null_fraction` are worth acting on
+        # (#291), not a replacement for either.
+        "findings": [f.model_dump(mode="json") for f in dataset.findings],
         "profiled_at": dataset.profiled_at,
         "semantic_models": dataset.semantic_models,
         "suppressed_fields": suppressed,

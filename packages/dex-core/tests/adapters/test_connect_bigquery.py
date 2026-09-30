@@ -512,6 +512,112 @@ def test_billing_rounding_retry_still_refuses_past_the_confirmed_ceiling(
     assert len(non_dry) == 1
 
 
+def _refuse_to_plan(fake_bq_client, monkeypatch, message: str) -> None:
+    """A dry run BigQuery will not plan. The real client raises `BadRequest`
+    from `query()` itself, on the `jobs.insert` POST, which the fake does not
+    model: it raises only at `result()`, the execution door."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    plan = fake_bq_client.query
+
+    def refuse(sql, job_config=None, location=None):
+        if job_config is not None and job_config.dry_run:
+            raise api_exceptions.BadRequest(message)
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse)
+
+
+def test_an_estimate_for_a_statement_bigquery_will_not_plan_is_a_typed_refusal(
+    fake_bq_client, monkeypatch
+):
+    """`query_estimate` is the first door a host's statement crosses, on the
+    free call. A `BadRequest` there used to leave the adapter untyped and read
+    `internal` at the envelope, which a host reads as a crash and retries; the
+    same refusal met at execution was already typed (issue #480)."""
+
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    refusal = (
+        "Column n contains an aggregation function, which is not allowed in GROUP BY"
+    )
+    _refuse_to_plan(fake_bq_client, monkeypatch, refusal)
+    adapter = make_adapter(fake_bq_client)
+
+    with pytest.raises(WarehouseQueryError) as exc_info:
+        adapter.query_estimate(
+            "SELECT id, COUNT(*) AS n FROM `test-proj`.`shop`.`customers` "
+            "GROUP BY id, n"
+        )
+    assert reason_for(exc_info.value) is Reason.EXECUTION_FAILURE
+    assert refusal in str(exc_info.value)  # BigQuery's own words, not a dex message
+    # Nothing was asked to execute, and nothing was billed.
+    assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
+
+
+def test_a_run_whose_dry_run_is_refused_is_the_same_typed_refusal(
+    fake_bq_client, monkeypatch
+):
+    """The preflight inside `run_query` is the other door: a caller that was
+    priced elsewhere, or not at all, still dry-runs before the billed run, and
+    the refusal there is typed the way `_run` types its own."""
+
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    refusal = "Unrecognized name: emial at [1:8]"
+    _refuse_to_plan(fake_bq_client, monkeypatch, refusal)
+    adapter = make_adapter(fake_bq_client)
+
+    with pytest.raises(WarehouseQueryError) as exc_info:
+        adapter.run_query(
+            "SELECT emial FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert reason_for(exc_info.value) is Reason.EXECUTION_FAILURE
+    assert refusal in str(exc_info.value)
+    assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
+
+
+def test_the_profiles_own_aggregate_still_degrades_on_a_refused_dry_run(
+    fake_bq_client, monkeypatch
+):
+    """The other side of the two above, kept as it was. The profile's aggregate
+    statements cross the same dry run through `_execute`, and their caller
+    degrades to metadata on a `BadRequest` there (an external table whose
+    source is unreadable, found only at planning) rather than failing the
+    profile. Typing the host's two doors must not reach this one."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_unreadable",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=5_000,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[table.identifier] = table
+    _refuse_to_plan(
+        fake_bq_client, monkeypatch, "Permission denied while getting Drive credentials"
+    )
+    adapter = make_adapter(fake_bq_client)
+    _meta, columns = adapter.table_metadata(table.identifier)
+
+    aggregates = adapter.column_aggregates(table.identifier, columns)
+
+    assert len(aggregates) == len(columns)  # metadata-only rows, not an exception
+    assert any(
+        "aggregate profiling failed and was skipped" in note
+        for note in adapter.table_notes(table.identifier)
+    )
+    assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
+
+
 def test_a_bytes_billed_refusal_reported_as_a_server_error_still_retries(
     fake_bq_client,
 ):

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from exmergo_dex_core import sql_shape
 from exmergo_dex_core.maintain import verify as verify_mod
 from exmergo_dex_core.maintain.verify import (
     build_status_findings,
@@ -1071,6 +1072,7 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "row_population",
         "column_contract",
         "grain",
+        "join_contract",
     }
 
 
@@ -1536,6 +1538,929 @@ def test_a_project_that_was_never_compiled_says_so(
     assert rc == 0 and payload["status"] == "ok", payload
     assert "no compiled manifest" in payload["data"]["suppressed"]["row_population"]
     assert any("dbt compile" in w for w in payload["warnings"])
+
+
+# --- join contract: a model's own joins against measured overlap (#228) --------
+
+
+def _parsed(sql: str):
+    import sqlglot
+
+    return sqlglot.parse_one(sql, read="duckdb")
+
+
+def test_a_simple_equality_join_is_one_candidate():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id from "wh"."main"."orders" o '
+            'inner join "wh"."main"."customers" c on o.customer_id = c.id'
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.from_relation == "wh.main.orders"
+    assert candidate.from_columns == ("customer_id",)
+    assert candidate.to_relation == "wh.main.customers"
+    assert candidate.to_columns == ("id",)
+    assert candidate.side == "inner"
+
+
+def test_a_composite_equality_join_is_one_candidate_not_two():
+    # ON equates two column pairs between the same two relations: one
+    # composite key, not two independent single-column ones -- probing them
+    # separately would measure a different, generally wrong question.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id from "wh"."main"."order_items" o '
+            'inner join "wh"."main"."orders" x '
+            "on o.order_id = x.order_id and o.region = x.region"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    assert candidates[0].from_columns == ("order_id", "region")
+    assert candidates[0].to_columns == ("order_id", "region")
+
+
+def test_a_range_join_is_skipped_and_stated():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id from "wh"."main"."orders" o '
+            'inner join "wh"."main"."promos" p on o.amount < p.threshold'
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "no conjunctive column-to-column equality" in skipped[0]
+
+
+def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
+    # o.customer_id = c.id OR o.backup_id = c.id matches on EITHER pair, not
+    # both together: probing it as one composite key would demand a
+    # stricter match than the join itself does, and a healthy join could
+    # then read as completely orphaned.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id from "wh"."main"."orders" o '
+            'inner join "wh"."main"."customers" c '
+            "on o.customer_id = c.id or o.backup_id = c.id"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "no conjunctive column-to-column equality" in skipped[0]
+
+
+def test_a_cte_renamed_column_resolves_to_the_physical_one():
+    # `select customer_id as cid from orders` renames the join key; probing
+    # it as written (`orders.cid`) would send the adapter a column the
+    # physical table does not have.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'with x as (select customer_id as cid from "wh"."main"."orders") '
+            'select * from x inner join "wh"."main"."customers" c on x.cid = c.id'
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.orders"
+    assert candidates[0].from_columns == ("customer_id",)
+
+
+def test_a_cte_computed_column_is_unresolvable_and_skipped():
+    # `upper(status) as st` is not a passthrough: dex cannot know what
+    # physical column (if any) it corresponds to, so it must not guess.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'with x as (select upper(status) as st from "wh"."main"."orders") '
+            'select * from x inner join "wh"."main"."promos" p on x.st = p.code'
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "could not be resolved" in skipped[0]
+
+
+def test_a_select_star_cte_passes_the_column_through_unchanged():
+    candidates, _skipped = verify_mod._model_joins(
+        _parsed(
+            'with x as (select * from "wh"."main"."orders") '
+            'select * from x inner join "wh"."main"."customers" c '
+            "on x.customer_id = c.id"
+        ),
+        sql_shape,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.orders"
+    assert candidates[0].from_columns == ("customer_id",)
+
+
+def test_a_join_inside_a_joined_cte_is_also_visited():
+    # The model's own FROM chain never passes through `cust_regions`'s own
+    # join, but that join still writes real SQL the project wrote, and
+    # #228 asks about every join a model's compiled SQL contains.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "with cust_regions as ("
+            "  select c.id, r.region_name from "
+            '  "wh"."main"."customers" c '
+            '  inner join "wh"."main"."regions" r on c.region_id = r.id'
+            ") "
+            'select * from "wh"."main"."orders" o '
+            "inner join cust_regions cr on o.customer_id = cr.id"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    pairs = {(c.from_relation, c.to_relation) for c in candidates}
+    assert pairs == {
+        ("wh.main.orders", "wh.main.customers"),
+        ("wh.main.customers", "wh.main.regions"),
+    }
+
+
+def test_a_using_join_is_an_equality_candidate():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select * from "wh"."main"."orders" o '
+            'inner join "wh"."main"."customers" c using (customer_id)'
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.from_relation == "wh.main.orders"
+    assert candidate.from_columns == ("customer_id",)
+    assert candidate.to_relation == "wh.main.customers"
+    assert candidate.to_columns == ("customer_id",)
+
+
+def test_a_chained_using_join_with_two_relations_in_scope_is_skipped():
+    # region_id was introduced by the customers join, not the original FROM
+    # (orders): which relation actually carries it cannot be determined
+    # from the SQL text alone, so this must not guess the original FROM
+    # table the way an earlier version of this check did.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select * from "wh"."main"."orders" o '
+            'inner join "wh"."main"."customers" c using (customer_id) '
+            'inner join "wh"."main"."regions" r using (region_id)'
+        ),
+        sql_shape,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].to_relation == "wh.main.customers"
+    assert len(skipped) == 1
+    assert "more than one relation already in scope" in skipped[0]
+
+
+def test_a_cte_column_projected_from_a_joined_relation_resolves_correctly():
+    # `c.region_id` inside the CTE comes from `customers`, joined there, not
+    # from the CTE's own FROM relation (`orders`, which has no region_id).
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "with x as ("
+            "  select o.order_id, c.region_id from "
+            '  "wh"."main"."orders" o '
+            '  inner join "wh"."main"."customers" c on o.customer_id = c.id'
+            ") "
+            'select * from x inner join "wh"."main"."regions" r '
+            "on x.region_id = r.id"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    region_candidate = next(c for c in candidates if c.to_relation == "wh.main.regions")
+    assert region_candidate.from_relation == "wh.main.customers"
+    assert region_candidate.from_columns == ("region_id",)
+
+
+def test_one_unresolvable_composite_component_skips_the_whole_join():
+    # A computed second key column must not leave the first, resolvable one
+    # behind as a partial candidate: probing only `order_id` when the real
+    # condition also requires a computed `region` match is a different,
+    # looser question, and could read a genuinely broken join as healthy.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "with x as ("
+            "  select order_id, upper(region) as region from "
+            '  "wh"."main"."orders"'
+            ") "
+            'select * from x inner join "wh"."main"."regions" r '
+            "on x.order_id = r.order_id and x.region = r.region"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "could not be resolved" in skipped[0]
+
+
+def test_a_join_inside_an_inline_subquery_is_still_visited():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "select * from ("
+            "  select o.id from "
+            '  "wh"."main"."orders" o '
+            '  inner join "wh"."main"."customers" c on o.customer_id = c.id'
+            ") x"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.orders"
+    assert candidates[0].to_relation == "wh.main.customers"
+
+
+def test_a_qualified_table_sharing_a_ctes_short_name_is_not_a_self_reference():
+    # The CTE is named "orders"; `main.orders` is a real, qualified table
+    # that merely shares its bare name. Matching on short name alone would
+    # treat this as the CTE resolving back into itself and drop the join.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'with orders as (select * from "wh"."main"."orders") '
+            'select * from orders o inner join "wh"."main"."customers" c '
+            "on o.customer_id = c.id"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.orders"
+
+
+def test_every_union_branch_is_walked_for_its_own_joins():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id from "wh"."main"."orders_a" o '
+            'inner join "wh"."main"."customers" c on o.customer_id = c.id '
+            "union all "
+            'select o.id from "wh"."main"."orders_b" o '
+            'inner join "wh"."main"."customers" c on o.customer_id = c.id'
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert {c.from_relation for c in candidates} == {
+        "wh.main.orders_a",
+        "wh.main.orders_b",
+    }
+
+
+def test_a_union_inside_a_cte_still_has_its_branches_walked():
+    # `sql_shape.scopes()` excludes a CTE whose own body is a set
+    # operation entirely, so the join in the first branch must not be
+    # silently skipped just because the CTE as a whole is a UNION.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "with x as ("
+            '  select o.id from "wh"."main"."orders" o '
+            '  inner join "wh"."main"."customers" c on o.customer_id = c.id '
+            '  union all select id from "wh"."main"."archive"'
+            ") "
+            "select * from x"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.orders"
+    assert candidates[0].to_relation == "wh.main.customers"
+
+
+def test_a_union_inside_an_inline_subquery_still_has_its_branches_walked():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "select * from ("
+            '  select o.id from "wh"."main"."orders" o '
+            '  inner join "wh"."main"."customers" c on o.customer_id = c.id '
+            '  union all select id from "wh"."main"."archive"'
+            ") x"
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.orders"
+    assert candidates[0].to_relation == "wh.main.customers"
+
+
+def test_a_column_read_through_a_union_cte_is_unresolvable():
+    # A join whose own key references the union's output column directly
+    # cannot know which branch's physical column it means -- different
+    # branches can read from entirely different relations for the "same"
+    # output name -- so this must be skipped, not guessed.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "with x as ("
+            '  select id from "wh"."main"."orders" '
+            '  union all select id from "wh"."main"."archive"'
+            ") "
+            'select * from x inner join "wh"."main"."customers" c on x.id = c.id'
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "could not be resolved" in skipped[0]
+
+
+def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
+    # `where active = true` means the real join is against only the active
+    # subset; probing the whole physical table instead can report a join
+    # healthy that has zero overlap once the filter is honored.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            "with active_customers as ("
+            '  select * from "wh"."main"."customers" where active = true'
+            ") "
+            'select * from "wh"."main"."orders" o '
+            "inner join active_customers c on o.customer_id = c.id"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "could not be resolved" in skipped[0]
+
+
+def test_a_cross_join_is_silently_excluded():
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id, t.tag from "wh"."main"."orders" o '
+            "cross join unnest(o.tags) as t(tag)"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert skipped == []
+
+
+def test_a_self_join_on_different_columns_is_a_real_candidate():
+    # employees.manager_id = managers.id can have completely disjoint values
+    # even when both aliases read the same physical table: this is a real,
+    # checkable join, not the trivial "t.col = t.col" case below.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select e.id from "wh"."main"."employees" e '
+            'inner join "wh"."main"."employees" m on e.manager_id = m.id'
+        ),
+        sql_shape,
+    )
+    assert skipped == []
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.from_relation == candidate.to_relation == "wh.main.employees"
+    assert candidate.from_columns == ("manager_id",)
+    assert candidate.to_columns == ("id",)
+
+
+def test_a_trivial_self_match_is_excluded():
+    # a.id = b.id on the same table matches every row against itself,
+    # always -- nothing to orphan-check, unlike a self-join on different
+    # columns.
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select a.id from "wh"."main"."orders" a '
+            'inner join "wh"."main"."orders" b on a.id = b.id'
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert skipped == []
+
+
+def test_multiple_joins_in_one_model_are_all_candidates():
+    candidates, _skipped = verify_mod._model_joins(
+        _parsed(
+            'select o.id from "wh"."main"."orders" o '
+            'inner join "wh"."main"."customers" c on o.customer_id = c.id '
+            'left join "wh"."main"."promos" p on o.promo_id = p.id'
+        ),
+        sql_shape,
+    )
+    assert {c.to_relation for c in candidates} == {
+        "wh.main.customers",
+        "wh.main.promos",
+    }
+
+
+def test_a_join_through_a_cte_chain_resolves_to_the_physical_relation():
+    candidates, _skipped = verify_mod._model_joins(
+        _parsed(
+            'with orders as (select * from "wh"."main"."stg_orders"), '
+            'customers as (select * from "wh"."main"."stg_customers") '
+            "select orders.id from orders inner join customers "
+            "on orders.customer_id = customers.id"
+        ),
+        sql_shape,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].from_relation == "wh.main.stg_orders"
+    assert candidates[0].to_relation == "wh.main.stg_customers"
+
+
+def test_no_manifest_is_a_note_not_a_finding_for_join_contract(tmp_path: Path):
+    candidates, notes = verify_mod.join_contract_plan(tmp_path, "duckdb")
+    assert candidates == {}
+    assert notes and "no compiled manifest found" in notes[0]
+
+
+def test_join_contract_plan_returns_a_models_candidates(tmp_path: Path):
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "m.1": _model(
+                "fct_orders",
+                'select o.id from "wh"."main"."orders" o '
+                'inner join "wh"."main"."customers" c on o.customer_id = c.id',
+            )
+        },
+        results=[],
+    )
+    candidates, notes = verify_mod.join_contract_plan(tmp_path, "duckdb")
+    assert notes == []
+    assert set(candidates) == {"fct_orders"}
+    assert candidates["fct_orders"][0].to_relation == "wh.main.customers"
+
+
+def test_join_contract_plan_scope_is_lowercase(tmp_path: Path):
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "m.1": _model(
+                "a",
+                'select o.id from "wh"."main"."orders" o '
+                'inner join "wh"."main"."customers" c on o.customer_id = c.id',
+            ),
+            "m.2": _model(
+                "b",
+                'select o.id from "wh"."main"."orders" o '
+                'inner join "wh"."main"."promos" p on o.promo_id = p.id',
+            ),
+        },
+        results=[],
+    )
+    candidates, _notes = verify_mod.join_contract_plan(tmp_path, "duckdb", scope={"a"})
+    assert set(candidates) == {"a"}
+
+
+def test_join_contract_plan_parses_with_the_connectors_own_dialect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # row_population_plan takes the connector's dialect for the same
+    # reason: compiled SQL is written in the project's actual warehouse
+    # dialect, and parsing it as DuckDB regardless on every other connector
+    # is silently wrong at best, a parse failure at worst.
+    import sqlglot
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "m.1": _model(
+                "a",
+                'select o.id from "wh"."main"."orders" o '
+                'inner join "wh"."main"."customers" c on o.customer_id = c.id',
+            )
+        },
+        results=[],
+    )
+    seen_dialects = []
+    real_parse_one = sqlglot.parse_one
+
+    def spy_parse_one(sql, read=None, **kwargs):
+        seen_dialects.append(read)
+        return real_parse_one(sql, read=read, **kwargs)
+
+    monkeypatch.setattr(sqlglot, "parse_one", spy_parse_one)
+    verify_mod.join_contract_plan(tmp_path, "snowflake")
+    assert seen_dialects == ["snowflake"]
+
+
+class _FreeAdapter:
+    """No ``cost_gate`` attribute at all, the same shape a free connector
+    (DuckDB) has -- everything through `command_args.cost_gate` reads free."""
+
+    dialect = "duckdb"
+
+
+def _fake_verify_relationships(fractions_by_from_column: dict[str, float]):
+    """A stand-in for `explore.relationships.verify_relationships` that sets
+    ``verified``/``orphan_fraction`` from a lookup keyed by the driving
+    column, instead of running the real probe SQL: #228's own logic (the
+    threshold grading, the finding shape, the handshake wiring) is what
+    these tests check, not the probe `explore relationships --verify`
+    already owns and already tests."""
+
+    def verify(adapter, relationships, *, timeout_seconds=30.0, progress=None):
+        for rel in relationships:
+            fraction = fractions_by_from_column.get(rel.from_columns[0])
+            rel.verified = fraction is not None
+            rel.orphan_fraction = fraction
+
+    return verify
+
+
+def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
+    import exmergo_dex_core.explore.relationships as rel_mod
+
+    monkeypatch.setattr(
+        rel_mod,
+        "verify_relationships",
+        _fake_verify_relationships({"customer_id": 0.95}),
+    )
+    candidates = {
+        "fct_orders": [
+            verify_mod.JoinCandidate(
+                from_relation="a",
+                from_columns=("customer_id",),
+                to_relation="b",
+                to_columns=("id",),
+                side="inner",
+            )
+        ]
+    }
+    findings, notes, offer = verify_mod.join_contract_findings(
+        _FreeAdapter(), candidates, {"fct_orders": "a"}, ["a", "b"]
+    )
+    assert offer is None
+    assert notes == []
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "join_zero_overlap"
+    assert finding.severity == "high"
+    assert finding.data["orphan_fraction"] == 0.95
+
+
+def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
+    monkeypatch,
+):
+    import exmergo_dex_core.explore.relationships as rel_mod
+
+    monkeypatch.setattr(
+        rel_mod,
+        "verify_relationships",
+        _fake_verify_relationships({"customer_id": 0.3}),
+    )
+    candidates = {
+        "fct_orders": [
+            verify_mod.JoinCandidate(
+                from_relation="a",
+                from_columns=("customer_id",),
+                to_relation="b",
+                to_columns=("id",),
+                side="left",
+            )
+        ]
+    }
+    findings, _notes, _offer = verify_mod.join_contract_findings(
+        _FreeAdapter(), candidates, {"fct_orders": "a"}, ["a", "b"]
+    )
+    assert len(findings) == 1
+    assert findings[0].code == "join_orphans"
+    assert findings[0].severity == "medium"
+
+
+def test_a_healthy_join_reports_nothing(monkeypatch):
+    import exmergo_dex_core.explore.relationships as rel_mod
+
+    monkeypatch.setattr(
+        rel_mod,
+        "verify_relationships",
+        _fake_verify_relationships({"customer_id": 0.01}),
+    )
+    candidates = {
+        "fct_orders": [
+            verify_mod.JoinCandidate(
+                from_relation="a",
+                from_columns=("customer_id",),
+                to_relation="b",
+                to_columns=("id",),
+                side="inner",
+            )
+        ]
+    }
+    findings, notes, offer = verify_mod.join_contract_findings(
+        _FreeAdapter(), candidates, {"fct_orders": "a"}, ["a", "b"]
+    )
+    assert findings == []
+    assert notes == []
+    assert offer is None
+
+
+def test_an_unresolved_relation_is_noted_not_a_finding():
+    candidates = {
+        "fct_orders": [
+            verify_mod.JoinCandidate(
+                from_relation="does_not_exist",
+                from_columns=("customer_id",),
+                to_relation="b",
+                to_columns=("id",),
+                side="inner",
+            )
+        ]
+    }
+    findings, notes, offer = verify_mod.join_contract_findings(
+        _FreeAdapter(), candidates, {"fct_orders": "does_not_exist"}, ["b"]
+    )
+    assert findings == []
+    assert offer is None
+    assert any("was not checked" in n and "fct_orders" in n for n in notes)
+
+
+def test_the_handshake_defers_when_supplied(monkeypatch):
+    import exmergo_dex_core.explore.relationships as rel_mod
+
+    monkeypatch.setattr(
+        rel_mod,
+        "verify_relationships",
+        _fake_verify_relationships({"customer_id": 0.95}),
+    )
+    candidates = {
+        "fct_orders": [
+            verify_mod.JoinCandidate(
+                from_relation="a",
+                from_columns=("customer_id",),
+                to_relation="b",
+                to_columns=("id",),
+                side="inner",
+            )
+        ]
+    }
+    sentinel = object()
+    findings, notes, offer = verify_mod.join_contract_findings(
+        _FreeAdapter(),
+        candidates,
+        {"fct_orders": "a"},
+        ["a", "b"],
+        handshake=lambda estimate, count: sentinel,
+    )
+    assert findings == []
+    assert offer is sentinel
+    assert any("was not measured" in n for n in notes)
+
+
+def test_the_combined_handshake_prices_both_axes_in_one_ask(monkeypatch):
+    """#228: row population's row-count scan and join contract's overlap
+    probe share one handshake, so a metered connector sees one priced offer
+    naming both axes rather than the second one silently discarding the
+    first's price -- `VerifyResult.pending_offer` holds only one."""
+
+    import exmergo_dex_core.command_args as command_args_mod
+    from exmergo_dex_core.maintain.commands import _combined_scan_handshake
+
+    calls = []
+
+    def fake_confirmation_request(command, adapter, estimate, **kwargs):
+        calls.append((estimate, kwargs))
+        return "the-one-offer"
+
+    monkeypatch.setattr(
+        command_args_mod, "confirmation_request", fake_confirmation_request
+    )
+
+    join_cost_calls = []
+
+    def join_cost():
+        join_cost_calls.append(1)
+        return 5.0, 2
+
+    row_ask, join_ask = _combined_scan_handshake(adapter=object(), join_cost=join_cost)
+
+    # row_ask runs first, the way `verify()` itself calls row population
+    # before join contract.
+    first = row_ask(10.0, 3)
+    second = join_ask(5.0, 2)  # join contract's own real numbers
+
+    assert first == "the-one-offer"
+    assert second == "the-one-offer"
+    # One combined ask, not two: join_ask reads the cache row_ask filled.
+    assert len(calls) == 1
+    estimate, kwargs = calls[0]
+    assert estimate == 15.0  # 10.0 (row) + 5.0 (join), not 20.0
+    assert kwargs["per_table"] == {
+        "(row counts)": 10.0,
+        "(join overlap probes)": 5.0,
+    }
+    assert set(kwargs["axes"]) == {"row_population", "join_contract"}
+    # join_cost is lazy: computed once, by row_ask, not again by join_ask.
+    assert join_cost_calls == [1]
+
+
+def test_join_ask_alone_does_not_double_count_its_own_estimate(monkeypatch):
+    """#228's own review: when row population has nothing to count,
+    `relation_counts` never calls a handshake at all, so `join_ask` is the
+    *first* real call. It must price join contract's own numbers once, not
+    once from its own arguments and again from `join_cost()`."""
+
+    import exmergo_dex_core.command_args as command_args_mod
+    from exmergo_dex_core.maintain.commands import _combined_scan_handshake
+
+    calls = []
+    monkeypatch.setattr(
+        command_args_mod,
+        "confirmation_request",
+        lambda command, adapter, estimate, **kwargs: (
+            calls.append((estimate, kwargs)) or "offer"
+        ),
+    )
+
+    join_cost_calls = []
+
+    def join_cost():
+        join_cost_calls.append(1)
+        return 5.0, 2
+
+    _row_ask, join_ask = _combined_scan_handshake(adapter=object(), join_cost=join_cost)
+    offer = join_ask(5.0, 2)  # row_ask never called: row had nothing to count
+
+    assert offer == "offer"
+    estimate, kwargs = calls[0]
+    assert estimate == 5.0  # not 10.0
+    assert kwargs["axes"] == ["join_contract"]
+    assert kwargs["per_table"] == {"(join overlap probes)": 5.0}
+    # join_ask never needed the lazy getter: it already had its own numbers.
+    assert join_cost_calls == []
+
+
+def test_the_combined_handshake_names_only_the_axis_that_needs_one(monkeypatch):
+    """If row population has nothing to count (every relation already had a
+    row count), the combined ask names only join contract, not a
+    zero-relation-count row-population axis nobody asked about."""
+
+    import exmergo_dex_core.command_args as command_args_mod
+    from exmergo_dex_core.maintain.commands import _combined_scan_handshake
+
+    calls = []
+    monkeypatch.setattr(
+        command_args_mod,
+        "confirmation_request",
+        lambda command, adapter, estimate, **kwargs: (
+            calls.append((estimate, kwargs)) or "offer"
+        ),
+    )
+
+    row_ask, _join_ask = _combined_scan_handshake(
+        adapter=object(), join_cost=lambda: (5.0, 2)
+    )
+    offer = row_ask(0.0, 0)  # row population: nothing to count
+
+    assert offer == "offer"
+    estimate, kwargs = calls[0]
+    assert estimate == 5.0
+    assert kwargs["axes"] == ["join_contract"]
+    assert kwargs["per_table"] == {"(join overlap probes)": 5.0}
+
+
+def test_the_combined_handshake_returns_none_when_neither_axis_has_work(monkeypatch):
+    import exmergo_dex_core.command_args as command_args_mod
+    from exmergo_dex_core.maintain.commands import _combined_scan_handshake
+
+    monkeypatch.setattr(
+        command_args_mod,
+        "confirmation_request",
+        lambda *a, **k: pytest.fail("should not be asked with nothing to price"),
+    )
+
+    row_ask, join_ask = _combined_scan_handshake(
+        adapter=object(), join_cost=lambda: (0.0, 0)
+    )
+    assert row_ask(0.0, 0) is None
+    assert join_ask(0.0, 0) is None
+
+
+def _join_node(name: str, sql: str) -> dict:
+    return {
+        "name": name,
+        "resource_type": "model",
+        "relation_name": f'"warehouse"."main"."{name}"',
+        "compiled_code": sql,
+    }
+
+
+def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#228's first acceptance bullet: a model joining two relations with
+    disjoint keys is reported, at the top of the ranking (`join_zero_overlap`
+    is severity `high`, the top rank)."""
+
+    maintain_repo.sql("UPDATE customers SET id = id + 1000")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id, c.name from "warehouse"."main"."stg_orders" o '
+                'inner join "warehouse"."main"."customers" c '
+                "on o.customer_id = c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = payload["data"]["findings"]
+    assert findings[0]["code"] == "join_zero_overlap"
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["data"]["orphan_fraction"] == 1.0
+
+
+def test_verify_reports_nothing_for_a_healthy_join_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#228's second acceptance bullet: a healthy join reports nothing.
+    `stg_orders.customer_id` is fully covered by the unmodified fixture's
+    `customers.id`."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id, c.name from "warehouse"."main"."stg_orders" o '
+                'inner join "warehouse"."main"."customers" c '
+                "on o.customer_id = c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] in ("join_zero_overlap", "join_orphans")
+    ] == []
+    assert "join_contract" not in payload["data"]["suppressed"]
+
+
+def test_verify_reports_sparse_orphans_as_join_orphans_not_broken_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#228's third acceptance bullet: a left join whose right side is
+    legitimately sparse is reported at its measured orphan fraction and is
+    not characterized as broken. Deleting a quarter of `customers` orphans a
+    quarter of `stg_orders` (`customer_id` cycles evenly through every
+    customer id), well below the zero-overlap threshold."""
+
+    maintain_repo.sql("DELETE FROM customers WHERE id <= 10")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id, c.name from "warehouse"."main"."stg_orders" o '
+                'left join "warehouse"."main"."customers" c '
+                "on o.customer_id = c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [f for f in payload["data"]["findings"] if f["code"] == "join_orphans"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "medium"
+    assert 0.2 <= findings[0]["data"]["orphan_fraction"] < 0.9
+    assert not any(
+        f["code"] == "join_zero_overlap" for f in payload["data"]["findings"]
+    )
+
+
+def test_verify_states_a_skipped_non_equality_join_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#228's fourth acceptance bullet: non-equality joins are skipped, and
+    the skip is stated rather than silent."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id from "warehouse"."main"."stg_orders" o '
+                'left join "warehouse"."main"."customers" c '
+                "on o.amount < c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert any(
+        "stg_orders" in w and "no conjunctive column-to-column equality" in w
+        for w in payload["warnings"]
+    )
 
 
 # --- seams the build-time sweep shares with this one --------------------------

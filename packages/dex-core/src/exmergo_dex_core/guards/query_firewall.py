@@ -180,7 +180,20 @@ _UNNEST_FUNCS: dict[str, tuple[tuple[type, ...], frozenset[str]]] = {
         frozenset(),
     ),
     "databricks": (
-        (exp.Explode, exp.JSONKeys, exp.JSONExtractScalar, exp.ParseJSON),
+        # Newer sqlglot releases parse from_json as FromJson rather than
+        # Anonymous. Keep both forms without requiring the new class on
+        # older supported releases.
+        tuple(
+            cls
+            for cls in (
+                exp.Explode,
+                exp.JSONKeys,
+                exp.JSONExtractScalar,
+                exp.ParseJSON,
+                getattr(exp, "FromJson", None),
+            )
+            if isinstance(cls, type)
+        ),
         frozenset({"from_json", "variant_explode", "try_parse_json"}),
     ),
     "postgres": (

@@ -614,6 +614,19 @@ def test_unnest_allowed(dialect: str, sql: str, json_cache: DexCache):
 
 UNNEST_REFUSED = [
     (
+        "databricks",
+        "SELECT e.value FROM RAW_HOSTS, "
+        "LATERAL explode(from_json((SELECT ATTRS FROM RAW_HOSTS), "
+        "'map<string,string>')) e",
+        "table or subquery",
+    ),
+    (
+        "databricks",
+        "SELECT e.value FROM RAW_HOSTS, "
+        "LATERAL explode(from_json(some_udf(ATTRS), 'map<string,string>')) e",
+        "not a permitted",
+    ),
+    (
         "bigquery",
         "SELECT e FROM RAW_HOSTS, UNNEST((SELECT ATTRS FROM RAW_HOSTS)) AS e",
         "not permitted",
@@ -685,6 +698,11 @@ def test_unnest_refused(dialect: str, sql: str, fragment: str, json_cache: DexCa
 
 
 UNNEST_PII_BLOCKED = [
+    (
+        "databricks",
+        "SELECT e.value FROM RAW_HOSTS, "
+        "LATERAL explode(from_json(PROFILE, 'map<string,string>')) e",
+    ),
     ("bigquery", "SELECT k FROM RAW_HOSTS, UNNEST(JSON_KEYS(PROFILE)) AS k"),
     ("bigquery", "SELECT pos FROM RAW_HOSTS, UNNEST(PROFILE) AS e WITH OFFSET pos"),
     ("snowflake", "SELECT f.index FROM RAW_HOSTS, LATERAL FLATTEN(input => PROFILE) f"),

@@ -29,7 +29,13 @@ from pydantic import BaseModel, Field
 # ranked candidate and an empty `key_evidence` is indistinguishable from "this
 # run suppressed nothing". So a pre-4 profile is treated as stale rather than
 # reused (see `_split_fresh_stale`), and the cache heals on the next profile.
-CACHE_SCHEMA_VERSION = 4
+#
+# 5 added `Dataset.findings` (#291): the null-fraction and nullable-grain
+# verdicts `explore profile` now reports instead of leaving a caller to notice
+# them among every column's own `null_fraction`. A pre-5 profile predates the
+# check and would read as "nothing found" rather than "never computed", so it
+# is treated as stale the same way a pre-4 one is.
+CACHE_SCHEMA_VERSION = 5
 
 
 class PIICategory(str, Enum):
@@ -102,6 +108,25 @@ class KeyEvidence(BaseModel):
     reason: str
 
 
+class ProfileFinding(BaseModel):
+    """One column worth a caller's attention, ordered by severity.
+
+    Every column already carries its own `null_fraction`; on a wide table with
+    many legitimately-nullable columns that field alone does not say which one
+    matters (#291). This is the answer to "which one", not a new measurement:
+    `code` is a short, matchable discriminator (`fully_null_column`,
+    `mostly_null_column`, `nullable_grain_column`) and `detail` is the prose a
+    caller reads. `severity` is `high`, `medium`, or `low`; the list a dataset
+    carries is sorted by severity, high first, so a caller reading only the
+    front of it still sees what matters most.
+    """
+
+    column: str
+    code: str
+    severity: Literal["high", "medium", "low"]
+    detail: str
+
+
 class ColumnProfile(BaseModel):
     """Aggregate-derived understanding of one column, built from SQL aggregates and
     never from raw rows in context."""
@@ -163,6 +188,11 @@ class Dataset(BaseModel):
     key_evidence: list[KeyEvidence] = Field(default_factory=list)
     rank_score: float | None = None
     data_quality: list[str] = Field(default_factory=list)
+    #: Structured, severity-ordered column findings (#291): a fully- or
+    #: mostly-NULL column, or a nullable column in the reported grain. Additive
+    #: to `data_quality`'s free-text notes and to each column's own
+    #: `null_fraction`, never a replacement for either.
+    findings: list[ProfileFinding] = Field(default_factory=list)
     profiled_at: str | None = None
     #: The semantic models that sit on this relation, from the project's own
     #: semantic layer. This is the physical catalog's half of a link the semantic

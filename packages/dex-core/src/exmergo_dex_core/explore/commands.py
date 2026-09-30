@@ -585,7 +585,9 @@ def _profile_into_cache(
     except OverCeilingError:
         raise _budget_exhausted(store, adapter, accumulated, len(identifiers)) from None
 
-    _annotate_grain(profiled, defs)
+    _annotate_grain(
+        profiled, defs, high_null_fraction=config.profile_high_null_fraction
+    )
     cache, stats = _merge_profiles(prior, profiled, adapter.name, now)
     locator = store.save_cache(cache, now=now)
     note = _persist_note(stats, len(profiled), keeps_relationships=True)
@@ -919,7 +921,9 @@ def relationships(
     # Annotate before persisting so cached datasets carry candidate_keys and
     # grain, the same shape a `map`-written cache has. Only the freshly profiled
     # need it; the fresh-cached already carry theirs from the cache write.
-    _annotate_grain(profiled, defs)
+    _annotate_grain(
+        profiled, defs, high_null_fraction=config.profile_high_null_fraction
+    )
 
     # Fold same-lineage duplicates before the merge, as `map` does, so the folded
     # set flows into both the cache and the result. Relationships profiles the
@@ -2051,7 +2055,12 @@ def map(
     # scanned this run or reused. Only the freshly profiled need annotation;
     # the reused already carry theirs from the cache write that stored them.
     all_selected = profiled + list(fresh_reused.values())
-    _annotate_grain(profiled, defs, orphaned=orphaned)
+    _annotate_grain(
+        profiled,
+        defs,
+        orphaned=orphaned,
+        high_null_fraction=config.profile_high_null_fraction,
+    )
     suppressed: list[rel_mod.SuppressedMatch] = []
     affix_matches: list[rel_mod.AffixMatch] = []
     inferred = rel_mod.infer_relationships(
@@ -3870,10 +3879,13 @@ def _annotate_grain(
     defs: dbt_project.ProjectDefinitions | None = None,
     *,
     orphaned: set[str] | None = None,
+    high_null_fraction: float = 0.95,
 ) -> None:
     """Attach the interpretation layer to raw profiles: candidate keys, the likely
-    grain, and the data-quality warnings an analyst would write (non-unique own
-    key, unknown grain). Shared by profile and map so a single-table profile
+    grain, the data-quality warnings an analyst would write (non-unique own
+    key, unknown grain), and the severity-ordered column findings (#291,
+    ``high_null_fraction`` is ``profile_high_null_fraction`` in
+    ``.dex/config.yml``). Shared by profile and map so a single-table profile
     surfaces a broken grain without requiring a full map.
 
     With project definitions, the declared truth refines the heuristics: a
@@ -4025,6 +4037,14 @@ def _annotate_grain(
                             f"declared composite key ({origin})"
                         )
                     ds.grain = chosen
+
+        # After every grain refinement above (heuristic, declared single,
+        # declared composite): the nullable-grain-column check has to read the
+        # grain this dataset ends up with, not the heuristic one a declaration
+        # might still override.
+        ds.findings = rel_mod.profile_findings(
+            ds, high_null_fraction=high_null_fraction
+        )
 
 
 def _relationship_notes(
