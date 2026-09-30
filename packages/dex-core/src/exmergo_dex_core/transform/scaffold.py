@@ -7,8 +7,10 @@ and its per-model YAML with key tests and PII flags propagated into column
 bridge that carries them into emitted dbt; the agent then refines the skeleton
 through the normal edits-file flow.
 
-Per-model YAML files (plus one shared sources file) keep the scaffold merge-free:
-it never has to rewrite an existing hand-written schema.yml.
+Per-model YAML files keep the scaffold merge-free: it never has to rewrite an
+existing hand-written schema.yml. The one shared sources file is the exception,
+since every scaffolded model needs it to declare the same source consistently;
+`_merge_sources` inserts what a call adds into it rather than reprinting it.
 
 Shipped macros: dbt macro files carried as package assets and scaffolded into
 the user's project through the same plan/apply flow (`transform macro <name>`).
@@ -19,9 +21,13 @@ shipped version.
 from __future__ import annotations
 
 from importlib import resources
+from pathlib import Path
+
+import yaml
 
 from ..cache import Dataset
-from ..dbt_project import DbtProjectView
+from ..dbt_project import DbtProjectError, DbtProjectView
+from ..dbt_project import load as load_dbt_project
 from ..errors import DexError
 from ..storage import ExploreStore, readable_cache
 from .plans import EditKind, PlanEdit
@@ -52,8 +58,16 @@ class ScaffoldError(DexError):
     pass
 
 
-def scaffold_edits(tables: list[str], store: ExploreStore) -> list[PlanEdit]:
-    """Build the plan edits that scaffold staging models for the named tables."""
+def scaffold_edits(
+    tables: list[str], store: ExploreStore, project_dir: Path | None = None
+) -> list[PlanEdit]:
+    """Build the plan edits that scaffold staging models for the named tables.
+
+    ``project_dir``, when given, lets the shared sources file be merged with
+    whatever it already declares (see `_sources_edit`) rather than reprinted
+    from only this call's tables; omitted, the first call in a project with no
+    sources file yet behaves exactly as before.
+    """
 
     cache = readable_cache(store)
     if cache is None:
@@ -71,7 +85,8 @@ def scaffold_edits(tables: list[str], store: ExploreStore) -> list[PlanEdit]:
             + "; re-run `explore map` (or `explore profile`) on them first"
         )
 
-    edits = [_sources_edit(datasets)]
+    sources_edit = _sources_edit(datasets, _existing_sources_content(project_dir))
+    edits = [sources_edit] if sources_edit is not None else []
     for dataset in datasets:
         edits.extend(model_edits(dataset))
     return edits
@@ -188,27 +203,185 @@ def _source_schema(identifier: str) -> str:
     return parts[-2] if len(parts) >= 2 else "main"
 
 
-def _sources_edit(datasets: list[Dataset]) -> PlanEdit:
-    # One shared sources file for everything dex scaffolds, so per-table YAML
-    # files never redeclare (and thus never collide on) the source name.
-    schemas: dict[str, list[str]] = {}
+def _sources_edit(
+    datasets: list[Dataset], existing_content: str | None
+) -> PlanEdit | None:
+    requested: dict[str, set[str]] = {}
     for dataset in datasets:
-        schema = _source_schema(dataset.identifier)
-        schemas.setdefault(schema, []).append(_table_name(dataset.identifier))
-
-    lines = ["version: 2", "", "sources:"]
-    for schema in sorted(schemas):
-        lines += [
-            f"  - name: {schema}",
-            f"    schema: {schema}",
-            "    tables:",
-        ]
-        lines += [f"      - name: {table}" for table in sorted(schemas[schema])]
+        requested.setdefault(_source_schema(dataset.identifier), set()).add(
+            _table_name(dataset.identifier)
+        )
+    content = _merge_sources(existing_content, requested)
+    if content == existing_content:
+        return None
     return PlanEdit(
         path=_SOURCES_FILE,
         kind=EditKind.SCHEMA_YML,
-        new_content="\n".join(lines) + "\n",
+        new_content=content,
     )
+
+
+def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
+    """Insert missing declarations without serializing existing user content.
+
+    Match the logical source name used by the generated source() calls, not
+    its physical schema: several independent sources can share a schema.
+    YAML marks locate block insertions; unsupported shapes refuse a rewrite.
+    """
+    original = content or "version: 2\n\n"
+    try:
+        root = yaml.compose(original)
+    except yaml.YAMLError as exc:
+        raise ScaffoldError("cannot merge _dex_sources.yml: invalid YAML") from exc
+
+    def fields(node):
+        if not isinstance(node, yaml.MappingNode):
+            raise ScaffoldError("cannot merge _dex_sources.yml: expected a mapping")
+        result = {}
+        for key, value in node.value:
+            if key.value in result or key.value == "<<":
+                raise ScaffoldError("cannot merge duplicate keys or YAML merge keys")
+            result[key.value] = value
+        return result
+
+    def scalar(value: str) -> str:
+        return yaml.safe_dump(value, default_flow_style=True).split("\n...")[0].strip()
+
+    def line_start(node):
+        return original.rfind("\n", 0, node.start_mark.index) + 1
+
+    edits: list[tuple[int, int, str]] = []
+    newline = "\r\n" if "\r\n" in original else "\n"
+    sources = fields(root).get("sources")
+    if sources is not None and not isinstance(sources, yaml.SequenceNode):
+        raise ScaffoldError("cannot merge _dex_sources.yml: sources must be a list")
+    by_name = {}
+    for source in sources.value if sources is not None else []:
+        source_fields = fields(source)
+        name = source_fields.get("name")
+        if not isinstance(name, yaml.ScalarNode) or name.value in by_name:
+            raise ScaffoldError("cannot merge unnamed or duplicate sources")
+        by_name[name.value] = (source, source_fields)
+
+    new_sources = []
+    for name, tables in sorted(requested.items()):
+        if name not in by_name:
+            new_sources.append((name, sorted(tables)))
+            continue
+        source, source_fields = by_name[name]
+        table_node = source_fields.get("tables")
+        if table_node is not None and not isinstance(table_node, yaml.SequenceNode):
+            raise ScaffoldError("cannot merge _dex_sources.yml: tables must be a list")
+        declared = set()
+        for table in table_node.value if table_node is not None else []:
+            table_name = fields(table).get("name")
+            if not isinstance(table_name, yaml.ScalarNode):
+                raise ScaffoldError("cannot merge a table without a name")
+            declared.add(table_name.value)
+        missing = sorted(tables - declared)
+        if not missing:
+            continue
+        if root.flow_style or sources.flow_style or source.flow_style:
+            raise ScaffoldError("cannot extend flow-style sources; use block YAML")
+        if table_node is not None and table_node.value:
+            if table_node.flow_style:
+                raise ScaffoldError("cannot extend flow-style tables; use block YAML")
+            first = table_node.value[0]
+            indent = first.start_mark.column - 2
+            offset = line_start(first)
+            addition = "".join(
+                " " * indent + "- name: " + scalar(t) + newline for t in missing
+            )
+            edits.append((offset, offset, addition))
+        elif table_node is not None:
+            indent = source.start_mark.column + 2
+            addition = newline + "".join(
+                " " * indent + "- name: " + scalar(t) + newline for t in missing
+            )
+            edits.append(
+                (
+                    table_node.start_mark.index,
+                    table_node.end_mark.index,
+                    addition.rstrip("\r\n"),
+                )
+            )
+        else:
+            # Insert the field before the second key, or after the source's
+            # final line when name is its only key.
+            if len(source.value) > 1:
+                offset = line_start(source.value[1][0])
+            else:
+                end = original.find("\n", source.value[0][1].end_mark.index)
+                offset = end + 1 if end >= 0 else len(original)
+            indent = source.start_mark.column
+            addition = " " * indent + "tables:" + newline
+            addition += "".join(
+                " " * (indent + 2) + "- name: " + scalar(t) + newline for t in missing
+            )
+            if offset and original[offset - 1] != "\n":
+                addition = newline + addition
+            edits.append((offset, offset, addition))
+
+    if new_sources:
+        if root.flow_style or (
+            sources is not None and sources.flow_style and sources.value
+        ):
+            raise ScaffoldError("cannot extend flow-style sources; use block YAML")
+        indent = (
+            sources.value[0].start_mark.column - 2
+            if sources is not None and sources.value
+            else 2
+        )
+        addition = ""
+        for name, tables in new_sources:
+            addition += " " * indent + "- name: " + scalar(name) + newline
+            addition += " " * (indent + 2) + "schema: " + scalar(name) + newline
+            addition += " " * (indent + 2) + "tables:" + newline
+            addition += "".join(
+                " " * (indent + 4) + "- name: " + scalar(t) + newline for t in tables
+            )
+        if sources is not None and sources.value:
+            offset = line_start(sources.value[0])
+            edits.append((offset, offset, addition))
+        elif sources is not None:
+            edits.append(
+                (
+                    sources.start_mark.index,
+                    sources.end_mark.index,
+                    newline + addition.rstrip("\r\n"),
+                )
+            )
+        else:
+            prefix = "" if original.endswith("\n") else newline
+            edits.append(
+                (len(original), len(original), prefix + "sources:" + newline + addition)
+            )
+    if edits and any(
+        isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None)
+        for event in yaml.parse(original)
+    ):
+        raise ScaffoldError("cannot extend YAML anchors or aliases; expand them first")
+    for start, end, addition in sorted(edits, reverse=True):
+        original = original[:start] + addition + original[end:]
+    return original
+
+
+def _existing_sources_content(project_dir: Path | None) -> str | None:
+    """The shared sources file's current content, or ``None`` if there is none.
+
+    A missing dbt project (scaffold run before `transform init`) is not an
+    error here: it means there is nothing to merge with yet, the same as a
+    project that exists but has not scaffolded a source file so far.
+    """
+
+    if project_dir is None:
+        return None
+    try:
+        view = load_dbt_project(project_dir)
+    except DbtProjectError:
+        return None
+    existing = view.files.get(_SOURCES_FILE)
+    return existing.content if existing is not None else None
 
 
 def _model_sql(dataset: Dataset) -> str:
