@@ -139,12 +139,19 @@ def relation_key(node: exp.Expression | None) -> str:
 
 @dataclass
 class Join:
-    """One join in a select: how it joins, what it joins, and on what."""
+    """One join in a select: how it joins, what it joins, and on what.
+
+    ``using`` is ``JOIN ... USING (col, ...)``'s own column list: bare names,
+    unqualified by either side, each an implicit ``left.col = right.col``.
+    Empty for an ``ON``-conditioned join or one with neither (a CROSS JOIN,
+    an UNNEST).
+    """
 
     side: str
     relation: exp.Expression
     on: exp.Expression | None
     node: exp.Join
+    using: tuple[str, ...] = ()
 
     @property
     def key(self) -> str:
@@ -166,12 +173,14 @@ def joins(select: exp.Select) -> list[Join]:
         side = " ".join(
             part for part in (node.side or "", node.kind or "") if part
         ).lower()
+        using = node.args.get("using") or []
         out.append(
             Join(
                 side=side or "inner",
                 relation=node.this,
                 on=node.args.get("on"),
                 node=node,
+                using=tuple(u.name for u in using),
             )
         )
     return out
@@ -259,6 +268,30 @@ def multiplies_rows(node: exp.Expression) -> bool:
     )
 
 
+def equality_column_pairs(
+    on: exp.Expression | None,
+) -> list[tuple[exp.Column, exp.Column]]:
+    """The column-to-column equalities an ON condition contains, as the raw
+    nodes rather than rendered text.
+
+    A range predicate or a column compared against a literal or an expression
+    is excluded already: only a bare ``column = column`` counts, since a key
+    is a pair of columns and nothing else identifies one. Kept as nodes
+    (rather than :func:`equality_columns`'s strings) because a caller that
+    needs to know which *relation* each side belongs to -- attributing a join
+    predicate to the two tables it equates, not just displaying it -- needs
+    each column's own table qualifier, which text alone throws away.
+    """
+
+    if on is None:
+        return []
+    return [
+        (node.this, node.expression)
+        for node in on.find_all(exp.EQ)
+        if isinstance(node.this, exp.Column) and isinstance(node.expression, exp.Column)
+    ]
+
+
 def equality_columns(on: exp.Expression | None) -> list[str]:
     """The column pairs an ON condition equates, rendered as written.
 
@@ -268,14 +301,67 @@ def equality_columns(on: exp.Expression | None) -> list[str]:
     alongside the one part that identifies the grain.
     """
 
+    return [
+        f"{text(left)} = {text(right)}" for left, right in equality_column_pairs(on)
+    ]
+
+
+def _flatten_and(node: exp.Expression) -> list[exp.Expression]:
+    """A condition flattened across its top-level ANDs -- the same walk
+    :func:`predicates` does for a WHERE/HAVING/QUALIFY clause, lifted out so
+    an ON condition (which carries no such clause wrapper) can use it too."""
+
+    flat: list[exp.Expression] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, exp.And):
+            stack.extend((current.expression, current.this))
+        elif isinstance(current, exp.Paren) and isinstance(current.this, exp.And):
+            stack.append(current.this)
+        else:
+            flat.append(current)
+    return flat
+
+
+def conjunctive_equality_pairs(
+    on: exp.Expression | None,
+) -> list[tuple[exp.Column, exp.Column]] | None:
+    """The column-to-column equalities an ON condition *requires together*
+    for a row to match -- every top-level ANDed conjunct, and only when
+    every one of them is a plain ``column = column`` equality.
+
+    Unlike :func:`equality_column_pairs`, which finds every ``column =
+    column`` anywhere in the tree regardless of Boolean structure, this
+    respects it. An equality sitting inside an OR is not required for the
+    join to match at all (``a.x = b.x OR a.y = b.y`` matches on either), so
+    folding it into a composite key alongside a real conjunct would demand a
+    stricter match than the join itself does; probed as a composite, a
+    healthy join could then read as completely orphaned. A range predicate
+    or anything else non-equality shares the same problem in the other
+    direction: it narrows the join in a way no probed equality reflects.
+
+    Returns ``None`` -- rather than a partial list -- the moment any
+    top-level conjunct is not a plain column-to-column equality, so a caller
+    never probes a subset of the real condition and calls it the join's key;
+    an ON with nothing conjunctive at all in it (no ``AND`` at the top,
+    itself not a plain equality) is the same case, one conjunct that fails
+    the test.
+    """
+
     if on is None:
-        return []
-    pairs = []
-    for node in on.find_all(exp.EQ):
-        left, right = node.this, node.expression
-        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-            pairs.append(f"{text(left)} = {text(right)}")
-    return pairs
+        return None
+    pairs: list[tuple[exp.Column, exp.Column]] = []
+    for conjunct in _flatten_and(on):
+        if isinstance(conjunct, exp.Paren):
+            conjunct = conjunct.this
+        if not isinstance(conjunct, exp.EQ):
+            return None
+        left, right = conjunct.this, conjunct.expression
+        if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+            return None
+        pairs.append((left, right))
+    return pairs or None
 
 
 def from_relation(select: exp.Select) -> exp.Expression | None:

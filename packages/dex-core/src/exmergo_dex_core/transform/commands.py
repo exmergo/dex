@@ -256,9 +256,21 @@ def plan(
 
     edits = list(edits or [])
     if scaffold:
+        from ..dbt_project import DbtProjectError
         from . import scaffold as scaffold_mod
 
-        edits = scaffold_mod.scaffold_edits(scaffold, engine.store) + edits
+        try:
+            scaffold_project_dir = engine.project_dir()
+        except DbtProjectError:
+            # No project yet (or an ambiguous one): scaffold proceeds exactly as
+            # it always has, with nothing to merge the shared sources file
+            # against. `_make_plan` below raises this same error with its own
+            # message once it needs a project directory to store the plan.
+            scaffold_project_dir = None
+        edits = (
+            scaffold_mod.scaffold_edits(scaffold, engine.store, scaffold_project_dir)
+            + edits
+        )
 
     if not edits:
         raise ValueError(

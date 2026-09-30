@@ -27,6 +27,7 @@ from ..cache import (
     ColumnProfile,
     Dataset,
     KeyEvidence,
+    ProfileFinding,
     Relationship,
     RelationshipKind,
     match_identifier,
@@ -566,6 +567,86 @@ def _grain_unknown_note(dataset: Dataset, counted: set[str]) -> str:
         "be removed), and a combination pairing it with any wider column would "
         f"prove unique without describing the grain{probe}"
     )
+
+
+_FINDING_SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def profile_findings(
+    dataset: Dataset, *, high_null_fraction: float
+) -> list[ProfileFinding]:
+    """The columns worth a caller's attention, out of every one profiled (#291).
+
+    On a wide table most columns carry *some* null fraction, so restating it
+    per column never tells a caller which one actually matters; on a reference
+    107-column table, 89 did, and the one that mattered -- a required output
+    column NULL 100% of the time -- was indistinguishable from the other 88.
+    Three checks, in the order the issue asks for them:
+
+    A column that is **entirely** NULL in a table that has rows is reported
+    individually and at high severity: it is the visible symptom of a join
+    that matched nothing or a rename that missed, worth acting on rather than
+    noticing by accident. A column **mostly** but not entirely NULL crosses
+    ``high_null_fraction`` (``profile_high_null_fraction`` in
+    ``.dex/config.yml``, default 0.95) and is reported too, at low severity: a
+    quieter band, since a near-miss is frequently legitimate (sparse optional
+    data) rather than broken. And a column the detected or declared **grain**
+    depends on that the warehouse still allows to be NULL is a structural risk
+    to that grain regardless of whether any row is null today, reported at
+    medium severity.
+
+    Returned sorted by severity, high first, so a caller reading only the
+    front of the list still sees what matters most; ties keep the column order
+    the checks ran in (null-fraction checks, in column order, then the grain
+    check). Deliberately additive: every column's own ``null_fraction`` is
+    unchanged, and this never replaces a ``data_quality`` note.
+    """
+
+    findings: list[ProfileFinding] = []
+    if dataset.row_count:
+        for col in dataset.columns:
+            if col.null_fraction is None:
+                continue
+            if col.null_fraction == 1.0:
+                findings.append(
+                    ProfileFinding(
+                        column=col.name,
+                        code="fully_null_column",
+                        severity="high",
+                        detail=f"{col.name} is 100% NULL",
+                    )
+                )
+            elif col.null_fraction >= high_null_fraction:
+                findings.append(
+                    ProfileFinding(
+                        column=col.name,
+                        code="mostly_null_column",
+                        severity="low",
+                        detail=(
+                            f"{col.name} is "
+                            f"{format_uniqueness_fraction(col.null_fraction)} NULL"
+                        ),
+                    )
+                )
+
+    if dataset.grain:
+        by_name = {col.name: col for col in dataset.columns}
+        for name in dataset.grain:
+            col = by_name.get(name)
+            if col is not None and col.nullable:
+                findings.append(
+                    ProfileFinding(
+                        column=col.name,
+                        code="nullable_grain_column",
+                        severity="medium",
+                        detail=(
+                            f"{col.name} participates in the detected grain "
+                            "but the warehouse still allows it to be NULL"
+                        ),
+                    )
+                )
+
+    return sorted(findings, key=lambda f: _FINDING_SEVERITY_RANK[f.severity])
 
 
 def key_evidence(dataset: Dataset) -> list[KeyEvidence]:

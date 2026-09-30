@@ -536,6 +536,22 @@ def _client_with_a_view(fake_bq_client):
     return fake_bq_client
 
 
+def _row_and_probe_resolver(row_count: int):
+    """A ``row_resolver`` answering both query shapes a confirmed `maintain
+    verify` run can now issue (#228): the row-count aggregate this suite
+    already exercised, and the join-overlap probe alongside it, since the
+    model's own compiled SQL join to `events` is now a real join-contract
+    candidate too. Reports the join healthy (zero orphans) so it never adds
+    a finding these tests are not about."""
+
+    def resolve(sql: str):
+        if "nonnull_fk_0" in sql:
+            return [{"nonnull_fk_0": 100, "orphans_0": 0}]
+        return [{"dex_rows_0": row_count}]
+
+    return resolve
+
+
 def test_unconfirmed_verify_answers_and_offers_the_counts(
     fake_bq_client, route_adapter, tmp_path, monkeypatch
 ):
@@ -548,7 +564,11 @@ def test_unconfirmed_verify_answers_and_offers_the_counts(
     envelope = _dispatch(tmp_path, "verify")
     assert envelope.status == "ok", envelope.model_dump()
     offer = envelope.data["offer"]
-    assert offer["axes"] == ["row_population"]
+    # The model's own compiled SQL joins customers to events (#228), so a
+    # confirmed run would price that overlap probe too, alongside the row
+    # count BigQuery keeps no metadata for; the combined handshake prices
+    # both axes in one ask rather than the second one discarding the first.
+    assert offer["axes"] == ["row_population", "join_contract"]
     assert offer["estimated_bytes"] > 0
     assert any("row population was not judged" in w for w in envelope.warnings)
     # What this run cost, beside what the offer would cost: the free half spent
@@ -569,7 +589,7 @@ def test_confirmed_verify_counts_what_the_catalog_does_not_keep(
 
     _seed_verify_project(tmp_path, monkeypatch)
     client = _client_with_a_view(fake_bq_client)
-    client.row_resolver = lambda sql: [{"dex_rows_0": 42}]
+    client.row_resolver = _row_and_probe_resolver(42)
     route_adapter(client)
 
     envelope = _dispatch(tmp_path, "verify", confirm=True, budget=100 * MB)
@@ -594,7 +614,7 @@ def test_the_counting_statement_is_one_aggregate_only_query(
 
     _seed_verify_project(tmp_path, monkeypatch)
     client = _client_with_a_view(fake_bq_client)
-    client.row_resolver = lambda sql: [{"dex_rows_0": 42}]
+    client.row_resolver = _row_and_probe_resolver(42)
     route_adapter(client)
 
     _dispatch(tmp_path, "verify", confirm=True, budget=100 * MB)
