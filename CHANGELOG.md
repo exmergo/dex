@@ -16,6 +16,27 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   supported, and PII, nested subqueries, and unapproved functions retain
   their existing firewall checks.
 
+- **`transform plan --scaffold` merges into the shared sources file instead of
+  reprinting it, so scaffolding a source one table per call no longer drops the
+  ones an earlier call added** ([#439]). `_sources_edit` built
+  `models/staging/_dex_sources.yml`'s whole body from only the current call's
+  tables and emitted it as a full-file replacement, so a second `--scaffold`
+  call for a different table produced a plan whose diff declared that table
+  alone. The earlier tables' staging models still `ref()`'d sources the file no
+  longer declared, and the next build refused with a dangling `source()`.
+  Passing several tables to one call was always correct (`--scaffold` is
+  `action="append"`); only the sequential shape, natural for an agent
+  scaffolding a project table by table, lost them, and the deletion sat
+  beneath a routine-looking create in the same diff, easy to approve past.
+
+  Missing declarations are inserted into the existing YAML, preserving source
+  names, database settings, table identifiers, tests, comments, and ordering.
+  Sources sharing a physical schema remain separate. Invalid YAML and shapes
+  that cannot be safely extended are refused rather than regenerated.
+  Re-scaffolding a table the file already declares now produces no edit for it
+  at all, not even a reordering. A `--scaffold` run before any dbt project
+  exists is unaffected: there is nothing yet to merge with.
+
 ### Added
 
 - **`explore profile` adds a severity-ordered `findings` array so a column
@@ -52,6 +73,93 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   would read an empty `findings` as "nothing found" rather than "never
   computed", so a pre-5 profile is treated as stale and re-profiled once, the
   same way the version-4 upgrade healed itself.
+
+- **`maintain verify` reports a model's own equality joins whose keys have no
+  value overlap** ([#228]). Every equality join reachable from a selected
+  model's compiled SQL, not only ones on its single driving-parent chain
+  (a join inside a CTE that is itself joined in later is visited too), is
+  measured with the exact overlap probe `explore relationships --verify`
+  already runs (`explore.relationships.verify_relationships`), applied to a
+  join the project actually wrote rather than one dex inferred or declared.
+  A join at or near a complete orphan rate is `join_zero_overlap` (high
+  severity, the most damaging and least visible defect this sweep can
+  report); one with real but non-catastrophic orphans is `join_orphans`
+  (medium), which is also where a left join whose right side is legitimately
+  sparse lands, reported at its measured fraction rather than characterized
+  as broken. `JOIN ... USING (col)` is recognized as the equality it implies,
+  the same as a written `ON`. A join whose condition is not a plain
+  conjunction of column-to-column equalities (an `OR`, a range predicate, a
+  condition mixing a real equality with something else) is skipped rather
+  than probed as a partial key, since a probe built from only part of the
+  real condition can under- or over-report the true orphan rate; the skip is
+  named in `warnings` rather than silent. A composite equality (`ON a.x =
+  b.x AND a.y = b.y`) is measured as one combined key, not two independent
+  single-column probes, which would answer a different and generally wrong
+  question. A self-join is only excluded when both sides are the literal
+  same key on the same relation (`t.col = t.col`, which matches every row
+  against itself by construction); one on different columns (`employees.
+  manager_id = managers.id`, both reading `employees`) is a real, checkable
+  join. A join whose key passes through a CTE that renames or computes it
+  (`select customer_id as cid from orders`), or that projects it from a
+  relation the CTE itself joins rather than its FROM (`select o.order_id,
+  c.region_id from orders o join customers c on ...`), is resolved to the
+  physical relation and column the rename or projection actually reads,
+  through as many CTE or inline-subquery hops as it takes, rather than
+  probing a column name the wrong relation does not have; a computed
+  projection, or a `select *` spanning more than one relation a plain name
+  could have come from, is unresolvable and the join is skipped instead of
+  guessed. If any one column in a composite key cannot be resolved this way,
+  the whole join is skipped, not just that column: probing the pairs that
+  did resolve is a narrower, different question from the join's real
+  condition, and can read a genuinely broken join as healthy. A join inside
+  an inline subquery (`select * from (select ... join ...) x`), not only one
+  inside a named CTE, is visited too. `JOIN ... USING` is only turned into a
+  candidate when exactly one relation is already in scope to pair it
+  against; chained (`... JOIN b USING (x) JOIN c USING (y)`, where `y` is
+  `b`'s own column, not the original FROM's), which relation actually
+  carries the column is a schema question the SQL text alone cannot answer,
+  so it is skipped rather than guessed against the original FROM table.
+
+  A table reference sharing a CTE's own short name but qualified with a
+  schema or database (``main.orders`` beside a CTE literally named
+  ``orders``) is never mistaken for a self-reference back into that CTE,
+  since a CTE can only ever be referenced unqualified. A model's compiled
+  SQL that is itself a `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` has every
+  branch walked for its own joins independently, not only the outermost
+  scope (which a set operation does not have a FROM/JOIN of its own to
+  read); the same is true one level down, when a CTE or an inline subquery's
+  own body is itself a set operation (`with x as (select ... join ... union
+  all select ...) select * from x`) rather than a plain SELECT, since a join
+  written inside one of its branches is a join the project wrote regardless
+  of what the CTE as a whole looks like. A CTE or subquery that filters or
+  aggregates before a join reads it (`select * from customers where active
+  = true`) is resolved no further and the join is skipped: probing the
+  whole physical table when the project's own SQL joins against only a
+  subset of it can report a join healthy that has zero real overlap once
+  the filter is honored. A column read directly off a set-operation CTE
+  (rather than a join written inside one of its branches) is unresolvable
+  the same way: different branches can read the "same" output column from
+  entirely different relations, so there is no single physical source to
+  resolve it to. `join_contract_plan` parses each model's compiled SQL in
+  the connector's own dialect, `row_population_plan`'s existing parameter
+  and existing reasoning: compiled SQL is written in the project's real
+  warehouse dialect, and parsing it as DuckDB regardless on every other
+  connector is silently wrong at best, a parse failure at worst.
+
+  `sql_shape.equality_column_pairs` is a new shared primitive (the raw
+  columns behind `equality_columns`'s existing rendered-text pairs), and
+  `sql_shape.conjunctive_equality_pairs` builds on it to also respect the
+  condition's Boolean structure, both needed because attributing a join
+  predicate to the two relations and columns it actually equates needs more
+  than rendered text.
+
+  The overlap probe is a real warehouse scan, priced and offered the same
+  way row population's row counts already are, not taken outright. Since
+  `VerifyResult.pending_offer` holds only one offer and both row population
+  and join contract can each need a scan on a metered connector, the two
+  share one combined handshake naming both axes, so confirming buys what the
+  estimate actually described instead of a metered connector silently seeing
+  only whichever axis asked last.
 
 ## [1.12.3] - 2026-09-15
 
