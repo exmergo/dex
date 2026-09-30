@@ -1778,6 +1778,70 @@ def test_a_refused_statement_reports_its_reason_its_object_and_its_spend(
     assert payload["cost"]["paradigm"] == Paradigm.BYTES_SCANNED.value
 
 
+def test_a_statement_bigquery_will_not_plan_is_refused_not_classified_internal(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    """The refusal one step before the one above. A statement BigQuery will not
+    plan never reaches `job.result()`: it fails on the free dry run the cost
+    handshake makes first, and the real client raises `BadRequest` from
+    `query()` itself. Untyped, that left the adapter as a bare API exception and
+    read `internal`, so a host branching on `reason` retried a statement the
+    warehouse had already refused (issue #480)."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    _seed_query_cache(tmp_path)
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(100 * MB)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+
+    # The one behaviour the fake does not model: a dry run BigQuery will not
+    # plan raises on the `jobs.insert` POST, not at `result()`.
+    refusal = (
+        "Column n contains an aggregation function, which is not allowed in "
+        "GROUP BY at [1:8]"
+    )
+    plan = fake_bq_client.query
+
+    def refuse_to_plan(sql, job_config=None, location=None):
+        if job_config is not None and job_config.dry_run:
+            raise api_exceptions.BadRequest(refusal)
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse_to_plan)
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "query",
+            "SELECT id, COUNT(*) AS n FROM `test-proj`.`shop`.`customers` "
+            "GROUP BY id, n",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["status"] == "error"
+    # The warehouse said no before anything was spent: a refusal, not a crash.
+    assert payload["reason"] == Reason.EXECUTION_FAILURE.value
+    assert refusal in payload["errors"][0]  # BigQuery's own words reach the host
+    # Nothing got past the dry run, so no statement was asked to execute.
+    assert all(call.dry_run for call in fake_bq_client.query_calls)
+
+
 def test_a_refusal_that_never_reached_the_warehouse_reports_no_spend(
     fake_bq_client, monkeypatch, tmp_path, capsys
 ):

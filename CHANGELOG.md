@@ -30,6 +30,21 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore query` on BigQuery reports a statement the warehouse will not plan
+  as `execution_failure` with BigQuery's own message, not as `internal`**
+  ([#480]). The execution door already typed the refusal it meets from
+  `job.result()`, so an invalid statement that got as far as running answered
+  `execution_failure`. A statement BigQuery refuses to plan never gets that far:
+  it fails on the free dry run first, during the cost handshake, where the
+  `BadRequest` left the adapter untyped, reached the CLI's last-resort handler,
+  and was classified `internal`, "not a deliberate dex refusal". A host
+  branching on `reason`, as the enum invites, could not tell BigQuery refusing
+  the statement from a crash, and retried it. The dry run behind
+  `query_estimate` and the preflight inside `run_query` now raise the same
+  typed refusal `_run` does. The profile's own aggregate statements are
+  unchanged: their callers degrade to metadata on a refused dry run rather
+  than failing the profile, and still do.
+
 - Databricks `from_json()` inside an unnest remains supported when SQLGlot
   parses it as `FromJson`, as in 30.19.0. Older parser versions remain
   supported, and PII, nested subqueries, and unapproved functions retain

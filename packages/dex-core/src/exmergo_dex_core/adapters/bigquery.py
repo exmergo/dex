@@ -1016,7 +1016,7 @@ class BigQueryAdapter:
         the estimate the agent budgets against is not decorative on small data."""
 
         checked = assert_select_only(sql, dialect=self.dialect)
-        return max(self._dry_run(checked), self._min_billed_floor(checked))
+        return max(self._typed_dry_run(checked), self._min_billed_floor(checked))
 
     def describe_estimate(
         self, estimate: float, per_table: dict[str, float] | None = None
@@ -1120,9 +1120,17 @@ class BigQueryAdapter:
         """Execute one firewall-approved SELECT, bounded in rows, wall time,
         and billed bytes (client preflight plus server-side cap)."""
 
-        _job, iterator = self._execute(
-            sql, timeout_seconds=timeout_seconds, max_results=max_rows + 1
-        )
+        try:
+            _job, iterator = self._execute(
+                sql, timeout_seconds=timeout_seconds, max_results=max_rows + 1
+            )
+        except self._api_exceptions.BadRequest as exc:
+            # BigQuery refused the statement before running it: at the dry run
+            # inside `_execute`, or at admission. `_run` already types the
+            # refusal it meets at execution; this is the same verdict a step
+            # earlier, typed the same way, so a host reads `execution_failure`
+            # and BigQuery's own words rather than `internal` (issue #480).
+            raise warehouse_refusal(str(exc)) from exc
         rows = list(iterator)
         schema = list(iterator.schema)
         return QueryResult(
@@ -1242,6 +1250,27 @@ class BigQueryAdapter:
             sql, job_config=job_config, location=self.target.location
         )
         return float(getattr(job, "total_bytes_processed", 0) or 0)
+
+    def _typed_dry_run(self, sql: str) -> float:
+        """The dry run for a host's own statement.
+
+        A statement BigQuery will not plan fails here first, on the free call,
+        and the real client raises ``BadRequest`` from ``query()`` itself. Typed
+        the way ``_run`` types the refusal it meets at execution, so the
+        envelope carries ``execution_failure`` and BigQuery's own words rather
+        than the ``internal`` an untyped API exception falls through to, which
+        a host reads as a crash and retries (issue #480).
+
+        ``_dry_run`` stays untyped on purpose: the profile's own aggregate
+        statements cross it through ``_execute`` and the scan estimate, and
+        those callers degrade to metadata on a ``BadRequest`` rather than
+        failing the profile.
+        """
+
+        try:
+            return self._dry_run(sql)
+        except self._api_exceptions.BadRequest as exc:
+            raise warehouse_refusal(str(exc)) from exc
 
     def _request(self, operation: Callable[[], Any]) -> Any:
         try:
