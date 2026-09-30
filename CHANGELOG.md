@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.12.4] - 2026-09-30
+
 ### Security
 
 - **The `clickhouse_cloud` integration job installs `clickhousectl` from a
