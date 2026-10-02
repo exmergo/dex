@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
+from .adapters.base import scope_within
 from .config import (
     CacheConfig,
     DexConfig,
@@ -224,6 +225,9 @@ class DexEngine:
         # discovers later in `git status`.
         self.config_diffs: list[dict[str, Any]] = []
         self._adapter_instance: Adapter | None = None
+        # The dev namespace the last command's adapter was told to read, kept
+        # only so provenance can show it; `_adapter` is what sets and clears it.
+        self._dev_target_read: str | None = None
         # The project seam, in its two shapes. `_project_format` is an instance a
         # host handed us and always wins; `_project_factory` is what a configured
         # name resolved to, called fresh per command. See `project_format()` for
@@ -308,6 +312,7 @@ class DexEngine:
         *,
         budget: float | None = None,
         confirmed: bool | None = None,
+        reads_dev_target: bool = False,
     ) -> Adapter:
         """The open adapter, opening it on first use. The only opener in the tree.
 
@@ -332,6 +337,20 @@ class DexEngine:
         itself already, on its own way out; this covers the command that raised
         past that point, so the headroom it booked is released by the next
         command rather than held until the UTC rollover.
+
+        ``reads_dev_target`` is per call for the same reason the gate is. A
+        verified build judges the relations dbt writes into the dev namespace,
+        which every other command refuses as a source so exploration never
+        mistakes a built model for a source table. Reading it is not a
+        visibility choice the principal made, which is what ``scopes`` is and
+        why that one belongs to the engine: it is dex reading its own output
+        for one command, and the next command on a held engine must not
+        inherit it. Nor is it a ``--scope``, which may only narrow a committed
+        allowlist because that allowlist is a cost boundary; the spend the dev
+        namespace attracts is still bound by the budget and the handshake. It
+        is handed to the adapter rather than folded into ``config``, so the
+        committed entries keep their own rules (one that names nothing is still
+        refused) and the dev namespace keeps its (absent until dbt creates it).
         """
 
         budget = self.budget if budget is None else budget
@@ -357,20 +376,33 @@ class DexEngine:
                 command=command,
                 connection=self.connection,
             )
-            return self._adapter_instance
+            adapter = self._adapter_instance
+        else:
+            adapter = self._adapter_instance
+            outgoing = command_args.cost_gate(adapter)
+            if outgoing is not None:
+                outgoing.settle()
+                adapter.cost_gate = connect.new_cost_gate(
+                    adapter.name,
+                    self.config,
+                    self.store,
+                    budget=budget,
+                    confirmed=confirmed,
+                    command=command,
+                )
 
-        adapter = self._adapter_instance
-        outgoing = command_args.cost_gate(adapter)
-        if outgoing is not None:
-            outgoing.settle()
-            adapter.cost_gate = connect.new_cost_gate(
-                adapter.name,
-                self.config,
-                self.store,
-                budget=budget,
-                confirmed=confirmed,
-                command=command,
-            )
+        # After opening, because nothing resolves a scope at open time, and on
+        # every call, so a command that does not ask clears what the last one
+        # set. An adapter without the method reads no namespace to begin with.
+        read_dev_target = getattr(adapter, "read_dev_target", None)
+        entry = None
+        if read_dev_target is not None:
+            if reads_dev_target:
+                entry = connect.dev_target_scope(
+                    adapter.name, getattr(self.config, adapter.name, None)
+                )
+            read_dev_target(entry)
+        self._dev_target_read = entry
         return adapter
 
     def _record_budget_decision(
@@ -579,6 +611,15 @@ class DexEngine:
                 if value is not None and value != [] and value != ""
             }
 
+        def shown(allowlist: list[str] | None) -> list[str] | None:
+            # The scope this command read, which for a verified build includes
+            # the dev namespace it judged. Not added to an empty allowlist, which
+            # already means everything, nor twice to one that covers it.
+            dev = self._dev_target_read
+            if not allowlist or not dev or scope_within(dev, allowlist):
+                return allowlist
+            return [*allowlist, dev]
+
         if connector == "duckdb":
             path = getattr(adapter, "path", None) or self.path
             if path is None and configured is not None:
@@ -596,30 +637,32 @@ class DexEngine:
                 project=getattr(adapter, "project", None)
                 or self.project
                 or getattr(configured, "project", None),
-                datasets=self.datasets
-                or self.scopes
-                or getattr(configured, "datasets", None),
+                datasets=shown(
+                    self.datasets
+                    or self.scopes
+                    or getattr(configured, "datasets", None)
+                ),
             )
         if connector == "snowflake":
             return compact(
                 account=getattr(adapter, "account", None)
                 or getattr(configured, "account", None),
                 warehouse=getattr(configured, "warehouse", None),
-                databases=self.scopes or getattr(configured, "databases", None),
+                databases=shown(self.scopes or getattr(configured, "databases", None)),
             )
         if connector == "databricks":
             return compact(
                 host=getattr(adapter, "host", None)
                 or getattr(configured, "host", None),
                 warehouse=getattr(configured, "warehouse", None),
-                catalogs=self.scopes or getattr(configured, "catalogs", None),
+                catalogs=shown(self.scopes or getattr(configured, "catalogs", None)),
             )
         if connector in {"postgres", "redshift"}:
             return compact(
                 host=getattr(configured, "host", None),
                 database=getattr(adapter, "_database", None)
                 or getattr(configured, "dbname", None),
-                schemas=self.scopes or getattr(configured, "schemas", None),
+                schemas=shown(self.scopes or getattr(configured, "schemas", None)),
                 workgroup=getattr(configured, "workgroup", None),
                 cluster=getattr(configured, "cluster_identifier", None),
             )
@@ -628,7 +671,7 @@ class DexEngine:
                 host=getattr(configured, "host", None),
                 database=getattr(adapter, "_database", None)
                 or getattr(configured, "database", None),
-                databases=self.scopes or getattr(configured, "databases", None),
+                databases=shown(self.scopes or getattr(configured, "databases", None)),
             )
         return {}
 

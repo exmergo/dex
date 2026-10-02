@@ -630,6 +630,37 @@ def scope_origin(connector: str, flag: str | None) -> str:
     return flag or f"{connector}.{_SCOPE_FIELDS[connector]} in .dex/config.yml"
 
 
+def dev_target_scope(connector: str, target) -> str | None:
+    """The namespace dbt dev builds write into, spelled as a scope entry of
+    ``connector``, or ``None`` when the config names none.
+
+    Spelled in the allowlist's own vocabulary because that is what the adapter
+    folds it into: Snowflake and Databricks scope by the container above the
+    schema, so both parts are required there, and a bare dev schema names
+    nothing they could read. DuckDB has no namespace: its dev target is a file,
+    and the dev-target preflight already refuses a build whose profile and
+    config disagree about which file that is.
+    """
+
+    if target is None:
+        return None
+    if connector == "bigquery":
+        return target.dev_dataset or None
+    if connector == "snowflake":
+        if target.dev_database and target.dev_schema:
+            return f"{target.dev_database}.{target.dev_schema}"
+        return None
+    if connector == "databricks":
+        if target.dev_catalog and target.dev_schema:
+            return f"{target.dev_catalog}.{target.dev_schema}"
+        return None
+    if connector in {"postgres", "redshift"}:
+        return target.dev_schema or None
+    if connector == "clickhouse":
+        return target.dev_database or None
+    return None
+
+
 def _open_bigquery(
     config: DexConfig,
     repo_root: str | Path,

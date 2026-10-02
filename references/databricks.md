@@ -108,10 +108,12 @@ held before. A budget that runs out partway stops the run, and the remaining
 mutants are reported `not_run` rather than the budget being exceeded.
 
 
-`--verify` also folds `databricks.dev_schema` into its read scope for the length of that one
-command, because dbt writes the relations it is judging there and that namespace
-is refused as a source everywhere else. The widening shows in the envelope's
-`connection.target`; nothing is written back to `.dex/config.yml`.
+`--verify` also reads the dev schema (`databricks.dev_catalog` /
+`databricks.dev_schema`) for the length of that one command, because dbt writes
+the relations it is judging there and that schema is refused as a source
+everywhere else. The schema need not exist yet: dbt creates it on a first
+build, and dex lists it after dbt has run. How that read is bounded is under
+**Read scope** in [`command-contract.md`](command-contract.md).
 
 
 **The budget is hard-enforced regardless of estimate quality.** Before every

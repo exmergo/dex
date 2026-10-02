@@ -24,7 +24,9 @@ a standalone sweep:
   confirms one number rather than two.
 - **The dev target is the subject.** Every other command treats the namespace
   dbt writes to as off limits, which is why it is refused as a source. This one
-  reads it, because the relations dbt just wrote are the whole point.
+  reads it, because the relations dbt just wrote are the whole point, and reads
+  it after dbt has written: on a first build it did not exist before, and on a
+  rebuild the counts listed before the build are the last build's.
 """
 
 from __future__ import annotations
@@ -103,50 +105,6 @@ def built_models(summary: dict[str, Any]) -> dict[str, str]:
         if unique_id.startswith(_MODEL_PREFIX):
             built[unique_id] = str(node.get("name") or manifest_node_label(unique_id))
     return built
-
-
-def dev_source_scope(config, connector: str) -> tuple[str, list[str]] | None:
-    """The allowlist field and entry that let this command read its own output.
-
-    A build's output is normally outside what dex reads: every connector's dev
-    namespace is refused as a source, so exploration can never mistake a built
-    model for a source table, and `transform init` enforces it. Verification is
-    the one command whose subject *is* that output, so it adds exactly that one
-    namespace to its own source scope and nothing else.
-
-    Returned as ``(field, [entry])`` rather than applied here, because the entry
-    has to be spelled in the allowlist's own vocabulary and the two differ per
-    connector: Snowflake and Databricks scope by the container above the schema,
-    so a bare dev schema means nothing to them and the qualified pair is what
-    goes in.
-
-    ``None`` for DuckDB, which declares no dev namespace at all: its dev target
-    is a database file, and the dev-target preflight already refuses a build
-    whose profile and config disagree about which file that is, so dex is
-    connected to the right one before this question arises.
-    """
-
-    def qualified(container: str | None, schema: str | None) -> str | None:
-        if not schema:
-            return None
-        return f"{container}.{schema}" if container else schema
-
-    target = getattr(config, connector, None)
-    if target is None:
-        return None
-    if connector == "bigquery":
-        return ("datasets", [target.dev_dataset]) if target.dev_dataset else None
-    if connector == "snowflake":
-        entry = qualified(target.dev_database, target.dev_schema)
-        return ("databases", [entry]) if entry else None
-    if connector == "databricks":
-        entry = qualified(target.dev_catalog, target.dev_schema)
-        return ("catalogs", [entry]) if entry else None
-    if connector in {"postgres", "redshift"}:
-        return ("schemas", [target.dev_schema]) if target.dev_schema else None
-    if connector == "clickhouse":
-        return ("databases", [target.dev_database]) if target.dev_database else None
-    return None
 
 
 def price_verification(
@@ -319,14 +277,25 @@ def _row_population(
             else "no model this build ran could be lined up against a driving parent"
         )
 
-    live = adapter.list_objects()
+    try:
+        live = adapter.list_objects()
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        from ..envelope import redact
+
+        return redact(
+            "the relations this build wrote could not be listed "
+            f"({type(exc).__name__}: {exc})"
+        )
     identifiers = [meta.identifier for meta in live]
     if not any(match_identifier(check.relations[0], identifiers) for check in checks):
         return (
             f"the dev target this build wrote to is outside dex's read scope "
             f"(dex sees {len(identifiers)} object(s), none of them the "
-            "relations this build produced); name the dev namespace in the "
-            "connector's source scope to judge row loss and fanout on it"
+            "relations this build produced); --verify reads the configured dev "
+            "namespace, so a relation built anywhere else, such as a custom "
+            "schema, is not judged"
         )
 
     wanted = sorted({relation for check in checks for relation in check.relations})

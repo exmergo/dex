@@ -4,6 +4,7 @@ client and the (simulated) server."""
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -1526,3 +1527,69 @@ def test_an_external_table_with_a_composite_grain_scaffolds_the_right_tests(
     # which is the test suite a lakehouse staging model should ship with.
     assert "tests: [unique, not_null]" not in yaml_text
     assert yaml_text.count("tests: [not_null]") == 3
+
+
+# --- a warehouse that changes mid-command, and the dev target ----------------------
+
+
+def _identifiers(adapter) -> list[str]:
+    return [o.identifier for o in adapter.list_objects()]
+
+
+def _dev_table(dataset: str = "dbt_dev", num_rows: int = 4):
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    return FakeTable(
+        project="test-proj",
+        dataset_id=dataset,
+        table_id="dim_customers",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=num_rows,
+        num_bytes=1_000,
+    )
+
+
+def test_forgetting_metadata_fetches_what_was_written_since(fake_bq_client):
+    """Table facts are cached per command, so a table dbt rebuilt reads its new
+    row count only once the build says the warehouse changed."""
+
+    adapter = make_adapter(fake_bq_client, target=BigQueryTarget(datasets=["shop"]))
+    rows = {o.identifier: o.row_count for o in adapter.list_objects()}
+    assert rows["test-proj.shop.customers"] == 100
+    # dbt replaces the table, so the fake gets a new object rather than a
+    # mutated one (the fake serves its own objects, which a cache would share).
+    rebuilt = dataclasses.replace(
+        fake_bq_client.tables["test-proj.shop.customers"], num_rows=150
+    )
+    fake_bq_client.tables["test-proj.shop.customers"] = rebuilt
+    assert {o.identifier: o.row_count for o in adapter.list_objects()} == rows
+
+    adapter.forget_metadata()
+    refreshed = {o.identifier: o.row_count for o in adapter.list_objects()}
+    assert refreshed["test-proj.shop.customers"] == 150
+
+
+def test_a_dev_dataset_that_does_not_exist_yet_reads_as_empty(fake_bq_client):
+    """dbt-bigquery creates its dev dataset. A build that wrote nothing into it
+    (every model in a custom schema) never creates it at all, and the sweep
+    that lists after that build must read it as empty rather than raise."""
+
+    adapter = make_adapter(fake_bq_client, target=BigQueryTarget(datasets=["shop"]))
+    adapter.read_dev_target("dbt_dev")
+    assert _identifiers(adapter) == [
+        "test-proj.shop.customers",
+        "test-proj.shop.events",
+    ]
+
+    fake_bq_client.tables["test-proj.dbt_dev.dim_customers"] = _dev_table()
+    adapter.forget_metadata()
+    assert "test-proj.dbt_dev.dim_customers" in _identifiers(adapter)
+    assert fake_bq_client.query_calls == []
+
+
+def test_a_committed_dataset_that_names_nothing_is_still_refused(fake_bq_client):
+    adapter = make_adapter(fake_bq_client, target=BigQueryTarget(datasets=["gone"]))
+    adapter.read_dev_target("dbt_dev")
+    with pytest.raises(BigQueryConnectionError, match="does not exist"):
+        adapter.list_objects()

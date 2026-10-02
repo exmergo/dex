@@ -61,6 +61,7 @@ from .base import (
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
     warehouse_refusal,
+    with_dev_target,
 )
 
 PARADIGM = "compute_time"
@@ -199,20 +200,9 @@ class SnowflakeAdapter:
         from snowflake.connector import errors as sf_errors
 
         self._sf_errors = sf_errors
-        # SHOW results are cached per command: the estimate pass and the
-        # confirmed run share table facts, and each SHOW is free but a
-        # round-trip.
-        self._objects: dict[str, dict] = {}
-        # Row counts learned from a profiling aggregate, which for a view is the
-        # only count there is: SHOW TABLES maintains none. Supersedes the SHOW
-        # figure for the rest of the command, so uniqueness proofs and grain
-        # verdicts compare against rows that were counted rather than reported.
-        self._exact_rows: dict[str, int] = {}
-        self._columns: dict[str, list[ColumnMeta]] = {}
-        self._inventory_loaded = False
-        self._resolved_scopes: list[str] | None = None
         self._visible_databases: set[str] | None = None
-        self._schemas_by_database: dict[str, set[str]] = {}
+        self._dev_target: str | None = None
+        self.forget_metadata()
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
         # The 60s resume minimum is charged once per command, by whichever
@@ -263,6 +253,47 @@ class SnowflakeAdapter:
         return caps
 
     # --- introspection (free SHOW metadata; no warehouse, no billing) ----------
+
+    def forget_metadata(self) -> None:
+        """Drop everything this command has listed, because the warehouse changed.
+
+        SHOW results are cached per command: the estimate pass and the confirmed
+        run share table facts, and each SHOW is free but a round-trip. That
+        holds while the warehouse holds still, and a build is the one command
+        where it does not: dbt writes between the pricing pass and the
+        verification that judges its output, so a schema that did not exist, or
+        a table's row count, is stale by then.
+
+        What survives is what this command has paid for or what dbt cannot
+        change: the session, the warehouse facts, the resume charge, and the
+        visible databases (dbt creates schemas, never a database).
+        """
+
+        self._objects: dict[str, dict] = {}
+        # Row counts learned from a profiling aggregate, which for a view is the
+        # only count there is: SHOW TABLES maintains none. Supersedes the SHOW
+        # figure for the rest of the command, so uniqueness proofs and grain
+        # verdicts compare against rows that were counted rather than reported.
+        self._exact_rows: dict[str, int] = {}
+        self._columns: dict[str, list[ColumnMeta]] = {}
+        self._inventory_loaded = False
+        self._resolved_scopes: list[str] | None = None
+        self._schemas_by_database: dict[str, set[str]] = {}
+
+    def read_dev_target(self, scope: str | None) -> None:
+        """Also read ``DATABASE.SCHEMA``, the namespace this command's build
+        writes into, or stop reading it with ``None``.
+
+        Kept apart from ``target.databases`` because it is not a source the
+        user committed: it is dex reading its own output for one command, and
+        it may not exist yet (see :func:`with_dev_target`). A change forgets
+        what was listed, since the scope that produced it has changed.
+        """
+
+        scope = scope.strip().upper() if scope else None
+        if scope != self._dev_target:
+            self._dev_target = scope
+            self.forget_metadata()
 
     def list_objects(self, *, include_views: bool = True) -> list[ObjectMeta]:
         self._load_inventory()
@@ -389,7 +420,8 @@ class SnowflakeAdapter:
             return True
 
     def _scopes(self) -> list[str]:
-        """Every source scope this command reads, resolved and proven to exist.
+        """Every source scope this command reads, resolved and proven to exist,
+        plus the dev target when this command reads one and it exists.
 
         Resolution is free (SHOW only, no warehouse) and cached for the command.
         It runs before anything is estimated, because an unresolvable scope that
@@ -414,8 +446,13 @@ class SnowflakeAdapter:
                 )
         else:
             configured = sorted(self._databases())
+
+        def exists(scope: str) -> bool:
+            database, _, schema = scope.partition(".")
+            return database in self._databases() and schema in self._schemas(database)
+
         if not self._scope_override:
-            return configured
+            return with_dev_target(configured, self._dev_target, exists)
 
         # A --scope searches only the databases the config already allows, so a
         # bare schema name can never resolve into a database outside the committed
@@ -435,7 +472,7 @@ class SnowflakeAdapter:
                 f"(snowflake.databases: {name_list(configured)}); --scope narrows "
                 "the configured scope, it never widens it"
             )
-        return requested
+        return with_dev_target(requested, self._dev_target, exists)
 
     def _resolve_scope(self, entry: str, searchable: list[str]) -> str:
         """One scope entry, resolved to ``DATABASE`` or ``DATABASE.SCHEMA`` and

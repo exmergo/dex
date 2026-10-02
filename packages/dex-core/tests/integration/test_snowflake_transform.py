@@ -153,6 +153,81 @@ def test_init_plan_apply_build_into_the_scratch_database(
         conn.close()
 
 
+def test_a_first_verified_build_judges_the_dev_schema_it_creates(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """The dev schema does not exist until this build creates it, so the sweep
+    has to resolve and list it after dbt has written, not while pricing."""
+
+    import uuid
+
+    import snowflake.connector
+
+    from exmergo_dex_core.config import SnowflakeTarget
+    from exmergo_dex_core.connect import resolve_snowflake_connection
+
+    root = str(tmp_path)
+    dev_schema = f"DBT_DEV_{uuid.uuid4().hex[:8].upper()}"
+    seed_repo(
+        tmp_path,
+        sf_scratch_database,
+        sf_warehouse,
+        sf_connection_name,
+        dev_schema=dev_schema,
+    )
+    params, _method = resolve_snowflake_connection(
+        SnowflakeTarget(connection_name=sf_connection_name), os.environ, tmp_path
+    )
+    conn = snowflake.connector.connect(**params)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SHOW SCHEMAS LIKE '{dev_schema}' IN DATABASE \"{sf_scratch_database}\""
+        )
+        assert not cursor.fetchall(), "the dev schema must not exist before the build"
+
+        rc, envelope = run_cli(
+            ["--repo-root", root, "transform", "init", "analytics"], capsys
+        )
+        assert_ok(rc, envelope)
+        model = tmp_path / "analytics" / "models" / "marts" / "dim_nation.sql"
+        model.parent.mkdir(parents=True, exist_ok=True)
+        model.write_text(
+            "{{ config(materialized='table') }}\n"
+            "select n_nationkey, n_name from SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.NATION\n",
+            encoding="utf-8",
+        )
+
+        rc, built = run_cli(
+            [
+                "--repo-root",
+                root,
+                "transform",
+                "build",
+                "--verify",
+                "--confirm",
+                "--budget",
+                str(SF_MAX_SECONDS * 10),  # a dbt build resumes the warehouse
+            ],
+            capsys,
+        )
+        assert rc == 0, built
+        assert built["status"] == "ok"
+        verification = built["data"]["verification"]
+        assert verification["ran"] is True
+        assert verification["scope"] == ["dim_nation"]
+        assert "row_population" not in verification["suppressed"], verification
+        assert (
+            f"{sf_scratch_database}.{dev_schema}"
+            in (built["connection"]["target"]["databases"])
+        )
+    finally:
+        conn.cursor().execute(
+            f'DROP SCHEMA IF EXISTS "{sf_scratch_database}"."{dev_schema}" CASCADE'
+        )
+        conn.close()
+
+
 def test_unpivot_json_object_macro_builds_live(
     tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
 ):

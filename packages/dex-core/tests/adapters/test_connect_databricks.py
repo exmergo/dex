@@ -981,3 +981,103 @@ def test_list_namespace_objects_reads_an_absent_namespace_as_empty(fake_databric
     assert adapter.list_namespace_objects("not_there", "dbt_dev") == []
     assert adapter.list_namespace_objects("shop", "not_there") == []
     assert fake_databricks.connect_count == 0
+
+
+# --- a warehouse that changes mid-command, and the dev target ----------------------
+
+
+def _dev_table(schema: str = "dbt_dev", name: str = "dim_customers"):
+    from fakes.databricks import FakeDatabricksTable
+
+    return FakeDatabricksTable(
+        catalog="shop",
+        schema=schema,
+        name=name,
+        columns=[("id", "bigint", False)],
+        rows=4,
+        bytes=1_000,
+    )
+
+
+def _identifiers(adapter) -> list[str]:
+    return [o.identifier for o in adapter.list_objects()]
+
+
+def test_forgetting_metadata_lists_what_was_written_since(fake_databricks):
+    """Free throughout, and the SQL session stays closed: opening one can wake
+    the warehouse, which a re-listing has no reason to do."""
+
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.core"]),
+    )
+    before = _identifiers(adapter)
+    fake_databricks.tables.append(_dev_table(schema="core", name="orders"))
+    assert _identifiers(adapter) == before, "cached"
+
+    adapter.forget_metadata()
+    assert "shop.core.orders" in _identifiers(adapter)
+    calls = fake_databricks.workspace.metadata_calls
+    # dbt creates schemas, never a catalog, so the catalog list is kept.
+    assert calls.count("catalogs.list") == 1
+    assert calls.count("schemas.list:shop") == 2
+    assert fake_databricks.connect_count == 0
+
+
+def test_a_dev_target_that_does_not_exist_yet_reads_as_empty(fake_databricks):
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.core"]),
+    )
+    adapter.read_dev_target("shop.dbt_dev")
+    assert "shop.dbt_dev.dim_customers" not in _identifiers(adapter)
+
+    fake_databricks.tables.append(_dev_table())
+    adapter.forget_metadata()
+    assert "shop.dbt_dev.dim_customers" in _identifiers(adapter)
+    assert fake_databricks.connect_count == 0
+
+
+def test_a_dev_target_in_a_catalog_that_does_not_exist_reads_as_empty(
+    fake_databricks,
+):
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.core"]),
+    )
+    adapter.read_dev_target("no_such_catalog.dbt_dev")
+    assert _identifiers(adapter) == ["shop.core.customers", "shop.core.events"]
+
+
+def test_an_existing_empty_dev_target_is_read(fake_databricks):
+    fake_databricks.workspace.empty_schemas.add("shop.dbt_dev")
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.core"]),
+    )
+    adapter.read_dev_target("SHOP.DBT_DEV")
+    adapter.list_objects()
+    assert "tables.list:shop.dbt_dev" in fake_databricks.workspace.metadata_calls
+
+
+def test_a_dev_target_inside_a_committed_catalog_is_read_once(fake_databricks):
+    fake_databricks.tables.append(_dev_table())
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop"]),
+    )
+    adapter.read_dev_target("shop.dbt_dev")
+    assert _identifiers(adapter).count("shop.dbt_dev.dim_customers") == 1
+    assert (
+        fake_databricks.workspace.metadata_calls.count("tables.list:shop.dbt_dev") == 1
+    )
+
+
+def test_a_committed_entry_that_names_nothing_is_still_refused(fake_databricks):
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.gone"]),
+    )
+    adapter.read_dev_target("shop.dbt_dev")
+    with pytest.raises(DatabricksConnectionError, match="does not exist"):
+        adapter.list_objects()

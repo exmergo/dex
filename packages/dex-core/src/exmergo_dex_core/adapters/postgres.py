@@ -68,6 +68,7 @@ from .base import (
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
     warehouse_refusal,
+    with_dev_target,
 )
 
 PARADIGM = "db_load"
@@ -200,16 +201,8 @@ class PostgresAdapter:
         from psycopg import errors as pg_errors
 
         self._pg_errors = pg_errors
-        # Catalog results are cached per command: the estimate pass and the
-        # confirmed run share table facts, and each lookup is free but a
-        # round-trip.
-        self._objects: dict[str, dict] = {}
-        self._columns: dict[str, list[ColumnMeta]] = {}
-        self._stats: dict[str, dict[str, float]] = {}
-        self._exact_rows: dict[str, int] = {}
-        self._inventory_loaded = False
-        self._resolved_schemas: list[str] | None = None
-        self._visible_schemas: set[str] | None = None
+        self._dev_target: str | None = None
+        self.forget_metadata()
         self._database: str | None = None
         self._notes: dict[str, list[str]] = {}
         self._session_prepared = False
@@ -384,14 +377,55 @@ class PostgresAdapter:
             self._resolved_schemas = self._resolve_schemas()
         return self._resolved_schemas
 
+    def forget_metadata(self) -> None:
+        """Drop everything this command has listed, because the warehouse changed.
+
+        Catalog results are cached per command: the estimate pass and the
+        confirmed run share table facts, and each lookup is free but a
+        round-trip. That holds while the warehouse holds still, and a build is
+        the one command where it does not: dbt writes between the pricing pass
+        and the verification that judges its output, so a schema that did not
+        exist, or a table's row estimate, is stale by then. The schema list goes
+        too, since dbt creates its dev schema.
+
+        What survives is what this command has paid for or prepared: the
+        session, the connected database, and its notes.
+        """
+
+        self._objects: dict[str, dict] = {}
+        self._columns: dict[str, list[ColumnMeta]] = {}
+        self._stats: dict[str, dict[str, float]] = {}
+        self._exact_rows: dict[str, int] = {}
+        self._inventory_loaded = False
+        self._resolved_schemas: list[str] | None = None
+        self._visible_schemas: set[str] | None = None
+
+    def read_dev_target(self, scope: str | None) -> None:
+        """Also read ``dev_schema``, the schema this command's build writes into,
+        or stop reading it with ``None``.
+
+        Kept apart from the committed allowlist because it is not a source the
+        user committed: it is dex reading its own output for one command, and it
+        may not exist yet (see :func:`~exmergo_dex_core.adapters.base.with_dev_target`).
+        A change forgets what was listed, since the scope that produced it has
+        changed.
+        """
+
+        scope = scope.strip() if scope else None
+        if scope != self._dev_target:
+            self._dev_target = scope
+            self.forget_metadata()
+
     def _resolve_schemas(self) -> list[str]:
         visible = self._schemas()
         if not self.target.schemas:
+            # Every visible schema, which includes the dev target once it exists.
             return sorted(visible)
         with blame(self._scope_origin, PostgresConnectionError):
-            return sorted(
+            scopes = sorted(
                 {self._resolve_schema(entry, visible) for entry in self.target.schemas}
             )
+        return with_dev_target(scopes, self._dev_target, visible.__contains__)
 
     def _resolve_schema(self, entry: str, visible: set[str]) -> str:
         """One scope entry, proven to exist. A Postgres scope is always a bare

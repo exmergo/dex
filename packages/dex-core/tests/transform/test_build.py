@@ -172,6 +172,7 @@ def _fake_runner_factory(
     stdout: str = "",
     stderr: str = "",
     run_results_json: tuple[Path, str] | None = None,
+    on_run=None,
 ):
     """Replace _default_runner with a recorder returning a canned dbt result.
 
@@ -180,6 +181,10 @@ def _fake_runner_factory(
     part of running rather than beforehand (`build()` clears any stale one
     right before invocation, so pre-seeding it ahead of the call would just
     have it deleted unread).
+
+    ``on_run(argv)``, when given, runs first on every invocation: it is how a
+    fake dbt writes into a fake warehouse, the way a real build changes what
+    an adapter listed before it ran.
     """
 
     import subprocess
@@ -190,6 +195,8 @@ def _fake_runner_factory(
     def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
             calls.append({"argv": argv, "cwd": cwd, "env": env})
+            if on_run is not None:
+                on_run(argv)
             if run_results_json is not None:
                 path, content = run_results_json
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -2766,3 +2773,448 @@ def test_a_verified_build_whose_dev_target_is_out_of_scope_says_so(
     assert rc == 0, envelope
     suppressed = envelope["data"]["verification"]["suppressed"]
     assert "outside dex's read scope" in suppressed["row_population"]
+
+
+# --- a verified build reads what dbt wrote, after dbt wrote it ---------------------
+#
+# A real Snowflake adapter over the fake connection, opened through the engine's
+# own funnel and priced by the real `compile_estimate`, with a fake dbt that writes
+# into the fake warehouse when it builds. What the earlier verify tests stub
+# (resolving the dev namespace, the listing the sweep judges) is the subject here.
+
+_SF_MODEL = "model.dex_test.dim_customers"
+_SF_RELATION = "DEV.DBT_DEV.DIM_CUSTOMERS"
+
+
+def _sf_table(database: str, schema: str, name: str, rows: int):
+    from fakes.snowflake import FakeSnowflakeTable
+
+    return FakeSnowflakeTable(
+        database=database,
+        schema=schema,
+        name=name,
+        columns=[("ID", "FIXED", False)],
+        rows=rows,
+        bytes=rows * 1_000_000,
+    )
+
+
+@dataclass
+class _SnowflakeBuild:
+    connection: object
+    ledger: Path
+    dbt: list
+
+
+def _snowflake_build(
+    monkeypatch,
+    project: Path,
+    repo: Path,
+    *,
+    built_rows: int,
+    rows_before: int | None = None,
+    empty_dev_schema: bool = False,
+    databases: tuple[str, ...] = ("RAW.PUBLIC",),
+    listing_fails: bool = False,
+) -> _SnowflakeBuild:
+    """One project, one model, and a warehouse dbt is about to write into.
+
+    ``dim_customers`` left-joins orders onto customers, so a build that lands
+    more rows than the 4 customers is a fanout. ``rows_before`` is a relation
+    an earlier build left behind; without it the dev schema does not exist
+    until dbt creates it, unless ``empty_dev_schema`` says it was created empty.
+    """
+
+    pytest.importorskip("snowflake.connector")
+    from fakes.snowflake import FakeSnowflakeConnection, FakeWarehouse
+
+    from exmergo_dex_core import connect
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+    from exmergo_dex_core.transform import dev_target
+
+    tables = [
+        _sf_table("RAW", "PUBLIC", "CUSTOMERS", 4),
+        _sf_table("RAW", "PUBLIC", "ORDERS", 5),
+    ]
+    if rows_before is not None:
+        tables.append(_sf_table("DEV", "DBT_DEV", "DIM_CUSTOMERS", rows_before))
+    connection = FakeSnowflakeConnection(
+        tables=tables,
+        warehouses=[FakeWarehouse(name="DEX_WH", size="X-Small", state="SUSPENDED")],
+        empty_databases=["DEV"],
+        empty_schemas=["DEV.DBT_DEV"] if empty_dev_schema else [],
+    )
+
+    def opener(**kwargs):
+        config = kwargs["config"]
+        adapter = SnowflakeAdapter(
+            connection=connection,
+            cost_gate=connect.new_cost_gate(
+                "snowflake",
+                config,
+                kwargs["store"],
+                budget=kwargs.get("budget"),
+                confirmed=kwargs.get("confirmed", False),
+                command=kwargs.get("command"),
+            ),
+            target=config.snowflake,
+            account="TESTORG-TESTACCT",
+            auth_method="named_connection:key_pair",
+            scope_override=kwargs.get("scopes"),
+            clock=connection.clock,
+        )
+        if listing_fails:
+
+            def boom(*, include_views: bool = True):
+                raise RuntimeError("the metadata service went away")
+
+            adapter.list_objects = boom
+        return adapter
+
+    monkeypatch.setattr(connect, "open_adapter", opener)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+
+    (repo / ".dex").mkdir(exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        "connector: snowflake\n"
+        "dbt_project_dir: analytics\n"
+        "snowflake:\n"
+        "  connection_name: fake\n"
+        "  warehouse: DEX_WH\n"
+        f"  databases: [{', '.join(databases)}]\n"
+        "  dev_database: DEV\n"
+        "  dev_schema: DBT_DEV\n"
+        "budget:\n"
+        "  session_ceiling: 3600\n",
+        encoding="utf-8",
+    )
+    target = project / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": {
+                    f"source.dex_test.raw.{name}": {
+                        "name": name,
+                        "relation_name": f"RAW.PUBLIC.{name.upper()}",
+                    }
+                    for name in ("customers", "orders")
+                },
+                "nodes": {
+                    _SF_MODEL: {
+                        "name": "dim_customers",
+                        "resource_type": "model",
+                        "relation_name": _SF_RELATION,
+                        "config": {"materialized": "table"},
+                        "compiled_code": (
+                            "select c.id, o.amount from RAW.PUBLIC.CUSTOMERS c "
+                            "left join RAW.PUBLIC.ORDERS o on o.customer_id = c.id"
+                        ),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def dbt_writes(argv: list[str]) -> None:
+        if "build" not in argv:
+            return
+        connection.tables[:] = [
+            t for t in connection.tables if t.identifier.upper() != _SF_RELATION
+        ]
+        connection.tables.append(
+            _sf_table("DEV", "DBT_DEV", "DIM_CUSTOMERS", built_rows)
+        )
+
+    dbt = _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            target / "run_results.json",
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "unique_id": _SF_MODEL,
+                            "status": "success",
+                            "execution_time": 1.5,
+                        }
+                    ]
+                }
+            ),
+        ),
+        on_run=dbt_writes,
+    )
+    return _SnowflakeBuild(
+        connection=connection, ledger=repo / ".dex" / "spend.jsonl", dbt=dbt
+    )
+
+
+def _sf_build_verify(repo: Path, capsys, *flags: str, confirm: bool = True):
+    argv = ["--repo-root", str(repo), *flags]
+    if confirm:
+        argv += ["--confirm", "--budget", "600"]
+    return _run([*argv, "transform", "build", "--verify"], capsys)
+
+
+def _settled_seconds(ledger: Path) -> float:
+    """What the build's own settlement row ledgered: dbt bills outside the gate,
+    so this row is the only record of its seconds."""
+
+    entries = [json.loads(line) for line in ledger.read_text().splitlines()]
+    return sum(
+        float(e.get("billed_seconds") or 0)
+        for e in entries
+        if e.get("entry") == "settlement" and e.get("command") == "transform build"
+    )
+
+
+def test_a_first_verified_snowflake_build_judges_the_schema_it_created(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The dev schema does not exist until dbt creates it. Before, that priced
+    every node at nothing (each one failed to resolve the dev namespace), and
+    once dbt had built and billed, listing it raised: the envelope said `error`
+    and the build's seconds never reached the ledger."""
+
+    run = _snowflake_build(monkeypatch, dbt_project_dir, tmp_path, built_rows=6)
+
+    rc, priced = _sf_build_verify(tmp_path, capsys, confirm=False)
+    assert rc == 0, priced
+    assert priced["status"] == "needs_confirmation"
+    assert priced["data"]["per_table_seconds"]["dim_customers"] > 0
+    assert not any("could not be priced" in n for n in priced["data"]["notes"])
+
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    verification = envelope["data"]["verification"]
+    assert "row_population" not in verification["suppressed"]
+    fanout = [f for f in verification["findings"] if f["code"] == "row_fanout"]
+    assert [(f["identifier"], f["data"]["row_count"]) for f in fanout] == [
+        ("dim_customers", 6)
+    ]
+    assert envelope["connection"]["target"]["databases"] == [
+        "RAW.PUBLIC",
+        "DEV.DBT_DEV",
+    ]
+    assert envelope["data"]["spend"]["seconds_billed"] == pytest.approx(1.5)
+    assert _settled_seconds(run.ledger) == pytest.approx(1.5)
+    assert run.connection.data_statements == [], "the counts came from the catalog"
+
+
+def test_a_first_verified_snowflake_build_into_an_empty_schema_judges_it(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The schema exists and holds nothing, so before the build the listing is
+    empty. Judging on that listing reported the dev target as out of scope."""
+
+    _snowflake_build(
+        monkeypatch, dbt_project_dir, tmp_path, built_rows=6, empty_dev_schema=True
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc == 0, envelope
+    verification = envelope["data"]["verification"]
+    assert "row_population" not in verification["suppressed"]
+    assert "row_fanout" in [f["code"] for f in verification["findings"]]
+
+
+@pytest.mark.parametrize(
+    ("rows_before", "built_rows", "codes"),
+    [(4, 6, ["row_fanout"]), (6, 4, [])],
+    ids=["introduces-a-fanout", "fixes-a-fanout"],
+)
+def test_a_verified_rebuild_is_judged_on_the_counts_dbt_just_wrote(
+    dbt_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    rows_before,
+    built_rows,
+    codes,
+):
+    """A table's count comes from the catalog, and the catalog was listed while
+    pricing, before dbt rebuilt it. Judged on that, a rebuild that introduced a
+    fanout read clean, and one that fixed it was still flagged."""
+
+    _snowflake_build(
+        monkeypatch,
+        dbt_project_dir,
+        tmp_path,
+        rows_before=rows_before,
+        built_rows=built_rows,
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc == 0, envelope
+    findings = envelope["data"]["verification"]["findings"]
+    assert [f["code"] for f in findings if f["axis"] == "row_population"] == codes
+
+
+def test_a_verified_build_whose_listing_fails_still_settles_and_ledgers_its_spend(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """dbt has built and billed by the time the sweep lists, so a failure there
+    is a reason the sweep could not judge, never the command's result."""
+
+    run = _snowflake_build(
+        monkeypatch, dbt_project_dir, tmp_path, built_rows=6, listing_fails=True
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    reason = envelope["data"]["verification"]["suppressed"]["row_population"]
+    assert reason.startswith("the relations this build wrote could not be listed")
+    assert envelope["data"]["spend"]["seconds_billed"] == pytest.approx(1.5)
+    assert _settled_seconds(run.ledger) == pytest.approx(1.5)
+
+
+def test_a_verified_build_narrowed_by_a_scope_flag_still_reads_its_dev_target(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """`--scope` narrows the sources; it does not take away the build's subject."""
+
+    _snowflake_build(
+        monkeypatch, dbt_project_dir, tmp_path, built_rows=6, databases=("RAW",)
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys, "--scope", "RAW.PUBLIC")
+    assert rc == 0, envelope
+    verification = envelope["data"]["verification"]
+    assert "row_fanout" in [f["code"] for f in verification["findings"]]
+    assert envelope["connection"]["target"]["databases"] == [
+        "RAW.PUBLIC",
+        "DEV.DBT_DEV",
+    ]
+
+
+def test_a_dev_target_covered_by_the_allowlist_is_judged_on_a_first_build(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """An allowlist naming the whole dev database already covers the dev schema.
+    The old fold appended the schema anyway, as text, and a first build then
+    failed to resolve it."""
+
+    _snowflake_build(
+        monkeypatch,
+        dbt_project_dir,
+        tmp_path,
+        built_rows=6,
+        databases=("RAW.PUBLIC", "DEV"),
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc == 0, envelope
+    assert "row_fanout" in [
+        f["code"] for f in envelope["data"]["verification"]["findings"]
+    ]
+    assert envelope["connection"]["target"]["databases"] == ["RAW.PUBLIC", "DEV"]
+
+
+def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """BigQuery prices with a dry run that never resolves the scope, and lists
+    afresh each time, so a dev dataset dbt creates reads after the build. The
+    one case left is a build that writes nothing into it (every model in a
+    custom schema), so it is never created. That listing once raised after the
+    build had billed; it is the out-of-scope suppression it should have been."""
+
+    pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+    from google.cloud import bigquery
+
+    from exmergo_dex_core import connect
+    from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+    from exmergo_dex_core.transform import dev_target
+
+    def table(dataset: str, name: str, rows: int) -> FakeTable:
+        return FakeTable(
+            project="dex-test",
+            dataset_id=dataset,
+            table_id=name,
+            schema=[bigquery.SchemaField("id", "INTEGER")],
+            num_rows=rows,
+            num_bytes=rows * 100,
+        )
+
+    client = FakeBigQueryClient(project="dex-test", tables=[table("raw", "orders", 5)])
+
+    def opener(**kwargs):
+        config = kwargs["config"]
+        return BigQueryAdapter(
+            project="dex-test",
+            cost_gate=connect.new_cost_gate(
+                "bigquery",
+                config,
+                kwargs["store"],
+                budget=kwargs.get("budget"),
+                confirmed=kwargs.get("confirmed", False),
+                command=kwargs.get("command"),
+            ),
+            target=config.bigquery,
+            client=client,
+            principal_type="user",
+        )
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    monkeypatch.setattr(connect, "open_adapter", opener)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    monkeypatch.setattr(build_module, "compile_estimate", lambda *a, **k: (0.0, {}, []))
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: bigquery\n"
+        "dbt_project_dir: analytics\n"
+        "bigquery:\n"
+        "  project: dex-test\n"
+        "  datasets: [raw]\n"
+        "  dev_dataset: dbt_dev\n",
+        encoding="utf-8",
+    )
+    target = bigquery_project_dir / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.dex_test.fct_orders": {
+                        "name": "fct_orders",
+                        "resource_type": "model",
+                        "relation_name": "`dex-test`.`dbt_dev_marts`.`fct_orders`",
+                        "config": {"materialized": "table"},
+                        "compiled_code": "select o.id from `dex-test`.`raw`.`orders` o",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def dbt_writes(argv: list[str]) -> None:
+        if "build" in argv:
+            client.tables["dex-test.dbt_dev_marts.fct_orders"] = table(
+                "dbt_dev_marts", "fct_orders", 5
+            )
+
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(target / "run_results.json", _built_run_results()),
+        on_run=dbt_writes,
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--confirm",
+            "--budget",
+            "1000000",
+            "transform",
+            "build",
+            "--verify",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    reason = envelope["data"]["verification"]["suppressed"]["row_population"]
+    assert "outside dex's read scope" in reason
+    assert "custom schema" in reason

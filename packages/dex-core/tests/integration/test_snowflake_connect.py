@@ -28,12 +28,15 @@ def seed_repo(
     *,
     databases: list[str] | None = None,
     budget: float | None = None,
+    dev_schema: str | None = None,
 ) -> None:
     snowflake: dict = {
         "warehouse": warehouse,
         "databases": databases if databases is not None else [SAMPLE_SCOPE],
         "dev_database": scratch_database,
     }
+    if dev_schema:
+        snowflake["dev_schema"] = dev_schema
     if connection_name:
         snowflake["connection_name"] = connection_name
     config: dict = {

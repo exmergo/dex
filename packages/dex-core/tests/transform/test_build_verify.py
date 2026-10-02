@@ -20,7 +20,6 @@ from exmergo_dex_core.guards.cost_guard import OverCeilingError
 from exmergo_dex_core.transform.verify import (
     MAX_FINDINGS,
     built_models,
-    dev_source_scope,
     verify_build,
 )
 
@@ -433,121 +432,80 @@ def test_a_clean_sweep_is_distinguishable_from_one_that_never_ran(tmp_path: Path
     assert "row_population" in payload["suppressed"]
 
 
-# --- the dev-namespace fold ---------------------------------------------------
+# --- a listing that fails after the build -------------------------------------
 
 
-def test_the_dev_scope_is_spelled_in_each_connector_s_own_vocabulary():
-    """Snowflake and Databricks scope by the container above the schema, so a
-    bare dev schema means nothing to them and the qualified pair is what goes
-    into the allowlist."""
+def _built_with_a_warning(project: Path) -> dict:
+    """One model the sweep can line up against its parent, and a test that
+    warned, so a build-status finding exists whatever row population meets."""
 
-    from exmergo_dex_core.config import (
-        BigQueryTarget,
-        ClickHouseTarget,
-        DatabricksTarget,
-        DexConfig,
-        PostgresTarget,
-        SnowflakeTarget,
+    _artifacts(
+        project,
+        nodes={
+            "model.shop.fct_orders": {
+                "name": "fct_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_orders"',
+                "compiled_code": 'select * from "warehouse"."raw"."orders"',
+                "config": {"materialized": "table"},
+            },
+            "test.shop.unique_fct_orders_id.abc123": {
+                "name": "unique_fct_orders_id",
+                "resource_type": "test",
+            },
+        },
+        results=[
+            {"unique_id": "model.shop.fct_orders", "status": "success"},
+            {
+                "unique_id": "test.shop.unique_fct_orders_id.abc123",
+                "status": "warn",
+                "message": "got 1 result, configured to warn if != 0",
+            },
+        ],
     )
-
-    cases = {
-        "bigquery": (
-            DexConfig(bigquery=BigQueryTarget(dev_dataset="dbt_dev")),
-            ("datasets", ["dbt_dev"]),
-        ),
-        "snowflake": (
-            DexConfig(
-                snowflake=SnowflakeTarget(
-                    dev_database="ANALYTICS", dev_schema="DBT_DEV"
-                )
-            ),
-            ("databases", ["ANALYTICS.DBT_DEV"]),
-        ),
-        "databricks": (
-            DexConfig(
-                databricks=DatabricksTarget(dev_catalog="main", dev_schema="dbt_dev")
-            ),
-            ("catalogs", ["main.dbt_dev"]),
-        ),
-        "postgres": (
-            DexConfig(postgres=PostgresTarget(dev_schema="dbt_dev")),
-            ("schemas", ["dbt_dev"]),
-        ),
-        "clickhouse": (
-            DexConfig(clickhouse=ClickHouseTarget(dev_database="dbt_dev")),
-            ("databases", ["dbt_dev"]),
-        ),
-    }
-    for connector, (config, expected) in cases.items():
-        assert dev_source_scope(config, connector) == expected, connector
+    return _summary([_node("model.shop.fct_orders")])
 
 
-def test_a_connector_with_no_dev_namespace_widens_nothing():
-    from exmergo_dex_core.config import BigQueryTarget, DexConfig
+class _ListingFails(_StubAdapter):
+    def __init__(self, error: Exception):
+        super().__init__([])
+        self._error = error
 
-    assert dev_source_scope(DexConfig(connector="duckdb"), "duckdb") is None
-    assert dev_source_scope(DexConfig(bigquery=BigQueryTarget()), "bigquery") is None
+    def list_objects(self, *, include_views: bool = True):
+        raise self._error
 
 
-def test_the_fold_extends_a_committed_allowlist_in_memory_only():
-    """The committed allowlist is a cost boundary and a `--scope` flag may only
-    narrow it. This is not a flag: it adds the one namespace the config itself
-    names as the dev target, for one command, and writes nothing back."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        DexError("scope 'ANALYTICS.DBT_DEV' does not exist"),
+        RuntimeError("the metadata service went away"),
+    ],
+    ids=["dex-error", "unexpected"],
+)
+def test_a_listing_that_fails_after_the_build_suppresses_rather_than_raises(
+    tmp_path: Path, error: Exception
+):
+    """By the time the sweep lists, dbt has built and billed. A raise here would
+    lose the build's own result, and its spend, to a failure in judging it."""
 
-    from exmergo_dex_core.config import BigQueryTarget, DexConfig
-    from exmergo_dex_core.transform.commands import _widen_scope_to_the_dev_target
+    summary = _built_with_a_warning(tmp_path)
+    result = _sweep(tmp_path, summary, _ListingFails(error))
+    assert result.ran is True
+    reason = result.suppressed["row_population"]
+    assert reason.startswith("the relations this build wrote could not be listed")
+    assert type(error).__name__ in reason
+    assert [f.code for f in result.findings] == ["node_warned"]
 
-    class _E:
-        connector = "bigquery"
-        config = DexConfig(
-            connector="bigquery",
-            bigquery=BigQueryTarget(
-                project="p", datasets=["dex_ci"], dev_dataset="dbt_dev"
-            ),
+
+def test_a_cost_refusal_while_listing_is_still_raised(tmp_path: Path):
+    summary = _built_with_a_warning(tmp_path)
+    with pytest.raises(OverCeilingError):
+        _sweep(
+            tmp_path,
+            summary,
+            _ListingFails(OverCeilingError("estimated cost exceeds the ceiling")),
         )
-
-    engine = _E()
-    before = engine.config
-    _widen_scope_to_the_dev_target(engine)
-    assert engine.config.bigquery.datasets == ["dex_ci", "dbt_dev"]
-    assert before.bigquery.datasets == ["dex_ci"], "the original config is untouched"
-
-
-def test_the_fold_is_idempotent():
-    from exmergo_dex_core.config import BigQueryTarget, DexConfig
-    from exmergo_dex_core.transform.commands import _widen_scope_to_the_dev_target
-
-    class _E:
-        connector = "bigquery"
-        config = DexConfig(
-            connector="bigquery",
-            bigquery=BigQueryTarget(
-                project="p", datasets=["dex_ci", "dbt_dev"], dev_dataset="dbt_dev"
-            ),
-        )
-
-    engine = _E()
-    _widen_scope_to_the_dev_target(engine)
-    assert engine.config.bigquery.datasets == ["dex_ci", "dbt_dev"]
-
-
-def test_an_empty_allowlist_is_left_empty():
-    """Empty already means every namespace this connection can see, so pinning
-    it to the dev one would be a narrowing dressed as a widening."""
-
-    from exmergo_dex_core.config import BigQueryTarget, DexConfig
-    from exmergo_dex_core.transform.commands import _widen_scope_to_the_dev_target
-
-    class _E:
-        connector = "bigquery"
-        config = DexConfig(
-            connector="bigquery",
-            bigquery=BigQueryTarget(project="p", dev_dataset="dbt_dev"),
-        )
-
-    engine = _E()
-    _widen_scope_to_the_dev_target(engine)
-    assert engine.config.bigquery.datasets == []
 
 
 def test_counts_that_do_not_fit_the_ceiling_come_back_as_an_offer(monkeypatch):
