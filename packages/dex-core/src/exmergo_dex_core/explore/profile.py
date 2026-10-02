@@ -668,7 +668,9 @@ def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | No
 # Below this, a second shape reads as a handful of typos/outliers, not a
 # second real population; the issue's own worked example floors here at 10%,
 # so 5% catches a genuine minority scheme with margin to spare while staying
-# on this codebase's side of under- rather over-reporting.
+# on this codebase's side of under- rather over-reporting. The hex length floor
+# in `adapters.base.HEX_PATTERN` is set so that a short code spelt in the hex
+# alphabet by chance stays under this share; lower one and recheck the other.
 _HETEROGENEOUS_KEY_MIN_SHARE = 0.05
 
 # Friendly names for the hash lengths this shape recurs as in practice;
@@ -708,11 +710,17 @@ def _hex_shape_label(agg: ColumnAggregate) -> str:
 
 def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str | None:
     """A candidate-key column that mixes two or more value shapes (numeric,
-    UUID, fixed-length hex, or an unclassified remainder) in a meaningful
-    share each -- the shape that survives a partial migration or a merged
-    upstream, where a downstream cast or numeric comparison silently drops
-    the group it can't parse. Fractions and a length-derived shape label
-    only; never a value.
+    UUID, hex of at least the length floor, or an unclassified remainder) in
+    a meaningful share each -- the shape that survives a partial migration or
+    a merged upstream, where a downstream cast, join, or filter silently
+    drops the group it was not written for. Fractions and a length-derived
+    shape label only; never a value.
+
+    The consequence named follows the groups reported, not the raw
+    fractions: the cast warning only when numeric is one of them, since with
+    no numeric group nobody is casting, and what goes wrong instead is a join
+    or filter written for one shape missing the other. A numeric remnant
+    under the share does not bring the cast warning back.
     """
 
     if agg is None:
@@ -733,10 +741,18 @@ def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str |
     if len(present) < 2:
         return None
     parts = ", ".join(f"{frac:.0%} {name}" for name, frac in present)
+    if any(name == "numeric" for name, _ in present):
+        consequence = (
+            "casting to a number or comparing numerically will silently drop "
+            "the non-numeric group(s)"
+        )
+    else:
+        consequence = (
+            "a join or filter written for one shape will silently miss the "
+            "other group(s)"
+        )
     return (
-        f"{col_name} is a candidate key but mixes value shapes: {parts}; "
-        "casting to a number or comparing numerically will silently drop "
-        "the non-numeric group(s)"
+        f"{col_name} is a candidate key but mixes value shapes: {parts}; {consequence}"
     )
 
 
