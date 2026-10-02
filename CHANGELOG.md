@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.12.5] - 2026-10-02
+
 ### Fixed
 
 - **`transform build --verify` judges the dev schema a first build creates, and
