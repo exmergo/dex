@@ -87,7 +87,11 @@ time. `dex` owns exactly that loop.
   the semantic layer against the last snapshot, surface schema, volume, grain,
   and definition drift ranked by blast radius, and propose edits. The two project
   axes are fingerprinted independently, so a repository with a semantic layer and
-  no dbt project still gets a baseline.
+  no dbt project still gets a baseline. `maintain verify` also reads the project
+  format seam directly: relation-existence and grain checks run from its declared
+  model relations, while compile, build-status, row-population, column-contract,
+  and join-contract checks are explicitly suppressed when the format cannot
+  provide dbt `target/` artifacts.
 
 <img width="484" height="344" alt="image" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
 
@@ -357,7 +361,8 @@ pass the Lint workflow and CI before it can merge.
 #### **[dagster-dex](https://github.com/catincloud-labs/dagster-dex)**
 A rigorously-tested project format that allows `dex` to read a Dagster asset graph, maintained by CatInCloud Labs.  
 Instead of requiring a dbt project, `dagster-dex` maps your Dagster definitions directly into `dex`, allowing you to 
-run schema-drift maintenance and exploration natively against your orchestrated assets.
+run schema-drift maintenance and exploration natively against your orchestrated assets. `maintain verify` uses those
+definitions for relation-existence and grain checks and reports the dbt artifact-dependent checks as suppressed.
 
 ### Connect with the Community
 
