@@ -33,9 +33,10 @@ build itself, as a `(row counts)` entry in the per-table breakdown, so one
 `--budget` covers both phases. Only a relation the warehouse keeps no row count
 for costs anything, which is any view; a table's count is free metadata, and a
 verdict resting on it is reported `exact: false` to say so. On a cold dev target
-the counts cannot be priced before the build has written the relations, so a
-note says so and they are priced again afterwards as a phase drawn against the
-reservation the build is already holding.
+the relations to count do not exist before the build writes them, so the counts
+are priced again afterwards as a phase drawn against the reservation the build
+is already holding; where the estimator cannot price them upfront at all, a note
+says so.
 
 **A priced phase the caller did not request is an offer, not a refusal.** When a
 command's free half is a complete answer in its own right, the envelope is `ok`

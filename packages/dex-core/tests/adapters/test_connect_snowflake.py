@@ -1070,3 +1070,183 @@ def test_the_aggregate_supplies_the_count_show_tables_does_not_maintain(
     adapter.column_aggregates("SHOP.PUBLIC.V_CUSTOMERS", columns)
     refreshed, _ = adapter.table_metadata("SHOP.PUBLIC.V_CUSTOMERS")
     assert refreshed.row_count == 42
+
+
+# --- a warehouse that changes mid-command, and the dev target ----------------------
+#
+# A build is the one command where the warehouse changes under the adapter: dbt
+# writes between the pricing pass and the verification that judges its output.
+# The dev namespace dbt writes into is read for that command only, and may not
+# exist until dbt creates it.
+
+
+def _shows(connection, prefix: str) -> list[str]:
+    return [s.sql for s in connection.statements if s.sql.upper().startswith(prefix)]
+
+
+def _dev_table(schema: str = "DBT_DEV", name: str = "DIM_CUSTOMERS", rows: int = 4):
+    from fakes.snowflake import FakeSnowflakeTable
+
+    return FakeSnowflakeTable(
+        database="RAW",
+        schema=schema,
+        name=name,
+        columns=[("ID", "FIXED", False)],
+        rows=rows,
+        bytes=1_000,
+    )
+
+
+def test_forgetting_metadata_lists_what_was_written_since(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW.PUBLIC"]),
+    )
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"]
+
+    multi_db_connection.tables.append(_dev_table(schema="PUBLIC", name="ORDERS"))
+    multi_db_connection.tables[4].rows = 99
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"], "cached"
+
+    adapter.forget_metadata()
+    listed = {o.identifier: o.row_count for o in adapter.list_objects()}
+    assert listed == {"RAW.PUBLIC.EVENTS": 99, "RAW.PUBLIC.ORDERS": 4}
+    # dbt creates schemas, never a database, so the database list is kept.
+    assert len(_shows(multi_db_connection, "SHOW DATABASES")) == 1
+    assert data_statements(multi_db_connection) == []
+
+
+def test_forgetting_metadata_keeps_the_session_and_the_resume_charge(
+    fake_sf_connection,
+):
+    """What a forget keeps is what the command has paid for: re-preparing the
+    session or re-quoting the resume minimum would bill a second time for a
+    warehouse the build already woke."""
+
+    fake_sf_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = make_adapter(fake_sf_connection)
+    sql = 'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    adapter.run_query(sql, max_rows=10, timeout_seconds=200)
+    warm = adapter.query_estimate(sql)
+
+    adapter.forget_metadata()
+    assert adapter.query_estimate(sql) == pytest.approx(warm)
+    adapter.run_query(sql, max_rows=10, timeout_seconds=200)
+    assert len([u for u in fake_sf_connection.used if "USE WAREHOUSE" in u]) == 1
+
+
+def test_a_dev_target_that_does_not_exist_yet_reads_as_empty(multi_db_connection):
+    """A first build: dbt creates the dev schema, so before it runs there is
+    nothing there to read and nothing wrong. Refusing here priced every node
+    of the build at nothing, and judged none of what it wrote."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW.PUBLIC"]),
+    )
+    adapter.read_dev_target("RAW.DBT_DEV")
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"]
+
+    multi_db_connection.tables.append(_dev_table())
+    adapter.forget_metadata()
+    assert _scoped_identifiers(adapter) == [
+        "RAW.DBT_DEV.DIM_CUSTOMERS",
+        "RAW.PUBLIC.EVENTS",
+    ]
+    assert data_statements(multi_db_connection) == []
+
+
+def test_a_dev_target_in_a_database_that_does_not_exist_reads_as_empty(
+    multi_db_connection,
+):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW.PUBLIC"]),
+    )
+    adapter.read_dev_target("NO_SUCH_DB.DBT_DEV")
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"]
+
+
+def test_an_existing_empty_dev_target_is_read(multi_db_connection):
+    multi_db_connection.empty_schemas.add("RAW.DBT_DEV")
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW.PUBLIC"]),
+    )
+    adapter.read_dev_target("raw.dbt_dev")
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"]
+    assert 'SHOW TABLES IN SCHEMA "RAW"."DBT_DEV"' in _shows(
+        multi_db_connection, "SHOW TABLES"
+    )
+
+
+def test_a_dev_target_inside_a_committed_database_is_read_once(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW"]),
+    )
+    adapter.read_dev_target("RAW.STAGING")
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS", "RAW.STAGING.SEEDS"]
+    assert not any("IN SCHEMA" in s for s in _shows(multi_db_connection, "SHOW"))
+
+
+def test_an_empty_allowlist_reads_the_dev_target_once(multi_db_connection):
+    adapter = make_adapter(multi_db_connection)
+    adapter.read_dev_target("RAW.STAGING")
+    identifiers = _scoped_identifiers(adapter)
+    assert identifiers.count("RAW.STAGING.SEEDS") == 1
+    assert not any("IN SCHEMA" in s for s in _shows(multi_db_connection, "SHOW"))
+
+
+def test_a_scope_flag_cannot_name_the_dev_target(multi_db_connection):
+    """`--scope` narrows the committed allowlist and nothing else, so it can no
+    more reach the dev namespace than any other one outside the allowlist."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW.PUBLIC"]),
+        scope_override=["RAW.STAGING"],
+    )
+    adapter.read_dev_target("RAW.STAGING")
+    with pytest.raises(SnowflakeConnectionError, match="never widens"):
+        adapter.list_objects()
+
+
+def test_a_scope_flag_keeps_the_dev_target(multi_db_connection):
+    """A verified build narrowed to some sources still judges what it wrote."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["SAMPLE.TPCH_SF1"],
+    )
+    adapter.read_dev_target("RAW.STAGING")
+    assert _scoped_identifiers(adapter) == [
+        "RAW.STAGING.SEEDS",
+        "SAMPLE.TPCH_SF1.CUSTOMER",
+        "SAMPLE.TPCH_SF1.ORDERS",
+    ]
+
+
+def test_a_committed_entry_that_names_nothing_is_still_refused(multi_db_connection):
+    """The dev target is the one lenient entry; the allowlist beside it is not."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE.__GONE__"]),
+    )
+    adapter.read_dev_target("RAW.DBT_DEV")
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    assert "[from snowflake.databases in .dex/config.yml]" in str(exc.value)
+
+
+def test_changing_the_dev_target_forgets_what_was_listed(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["RAW.PUBLIC"]),
+    )
+    adapter.read_dev_target("RAW.STAGING")
+    assert "RAW.STAGING.SEEDS" in _scoped_identifiers(adapter)
+    adapter.read_dev_target(None)
+    assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"]

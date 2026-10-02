@@ -196,8 +196,16 @@ class FakeCursor:
             self._emit([{"name": name} for name in names])
         elif upper.startswith("SHOW SCHEMAS"):
             like = self._like_pattern(sql)
+            database = self._in_database(sql)
+            empty = {
+                schema
+                for db, _, schema in (
+                    e.partition(".") for e in self._conn.empty_schemas
+                )
+                if database is None or db == database.upper()
+            }
             names = sorted(
-                {t.schema for t in self._scoped(sql)} | {"INFORMATION_SCHEMA"}
+                {t.schema for t in self._scoped(sql)} | empty | {"INFORMATION_SCHEMA"}
             )
             self._emit(
                 [
@@ -261,9 +269,13 @@ class FakeCursor:
             db, schema = (part.strip('"') for part in scope.split(".", 1))
             if db.upper() not in {d.upper() for d in self._conn.databases}:
                 raise _object_does_not_exist()
-            if schema.upper() not in {
-                t.schema.upper() for t in tables if t.database.upper() == db.upper()
-            }:
+            if (
+                schema.upper()
+                not in {
+                    t.schema.upper() for t in tables if t.database.upper() == db.upper()
+                }
+                and f"{db}.{schema}".upper() not in self._conn.empty_schemas
+            ):
                 raise _object_does_not_exist()
             return [
                 t
@@ -282,6 +294,13 @@ class FakeCursor:
             ident = scope.replace('"', "")
             return [t for t in tables if t.identifier.upper() == ident.upper()]
         return tables
+
+    @staticmethod
+    def _in_database(sql: str) -> str | None:
+        upper = sql.upper()
+        if " IN DATABASE " not in upper:
+            return None
+        return sql[upper.index(" IN DATABASE ") + len(" IN DATABASE ") :].strip('" ')
 
     @staticmethod
     def _like_pattern(sql: str) -> str | None:
@@ -310,6 +329,7 @@ class FakeSnowflakeConnection:
         row_resolver: Callable[[str], FakeResult | list[dict]] | None = None,
         resume_seconds: float = 60.0,
         empty_databases: list[str] | None = None,
+        empty_schemas: list[str] | None = None,
     ):
         self.tables = tables or []
         # Databases exist independently of their contents. `empty_databases` is
@@ -318,6 +338,11 @@ class FakeSnowflakeConnection:
         self.databases = sorted(
             {t.database for t in self.tables} | set(empty_databases or [])
         )
+        # Schemas, otherwise derived from the tables in them, likewise:
+        # `DATABASE.SCHEMA` entries that exist and hold nothing, the state of a
+        # dev schema created by hand, or by a dbt build that wrote no relation.
+        # A set, so a test can create one mid-command the way dbt would.
+        self.empty_schemas = {entry.upper() for entry in empty_schemas or []}
         self.warehouses = warehouses or [FakeWarehouse(name="DEX_WH")]
         self.clock = clock or FakeClock()
         self.row_resolver = row_resolver

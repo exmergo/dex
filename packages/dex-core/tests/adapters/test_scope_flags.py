@@ -15,10 +15,17 @@ from exmergo_dex_core.config import (
     BigQueryTarget,
     ClickHouseTarget,
     DatabricksTarget,
+    DuckDBTarget,
     PostgresTarget,
     RedshiftTarget,
+    SnowflakeTarget,
 )
-from exmergo_dex_core.connect import ScopeError, assert_scope_vocabulary, narrow_target
+from exmergo_dex_core.connect import (
+    ScopeError,
+    assert_scope_vocabulary,
+    dev_target_scope,
+    narrow_target,
+)
 
 
 def _assert(connector, *, project=None, datasets=None, scopes=None):
@@ -154,3 +161,56 @@ def test_clickhouse_scope_narrows_and_never_widens():
 
     with pytest.raises(ScopeError, match="never widens"):
         narrow_target(committed, "clickhouse", ["marketing"])
+
+
+# --- the dev target ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "expected"),
+    [
+        ("bigquery", BigQueryTarget(dev_dataset="dbt_dev"), "dbt_dev"),
+        (
+            "snowflake",
+            SnowflakeTarget(dev_database="ANALYTICS", dev_schema="DBT_DEV"),
+            "ANALYTICS.DBT_DEV",
+        ),
+        (
+            "databricks",
+            DatabricksTarget(dev_catalog="main", dev_schema="dbt_dev"),
+            "main.dbt_dev",
+        ),
+        ("postgres", PostgresTarget(dev_schema="dbt_dev"), "dbt_dev"),
+        ("redshift", RedshiftTarget(dev_schema="dbt_dev"), "dbt_dev"),
+        ("clickhouse", ClickHouseTarget(dev_database="dbt_dev"), "dbt_dev"),
+    ],
+)
+def test_the_dev_target_is_spelled_in_each_connector_s_own_vocabulary(
+    connector, target, expected
+):
+    """Spelled as that connector's allowlist entries are, because that is what
+    the adapter folds it into."""
+
+    assert dev_target_scope(connector, target) == expected
+
+
+@pytest.mark.parametrize(
+    ("connector", "target"),
+    [
+        ("snowflake", SnowflakeTarget(dev_schema="DBT_DEV")),
+        ("snowflake", SnowflakeTarget(dev_database="ANALYTICS")),
+        ("databricks", DatabricksTarget(dev_schema="dbt_dev")),
+        ("databricks", DatabricksTarget(dev_catalog="main")),
+    ],
+)
+def test_snowflake_and_databricks_need_both_parts_of_the_dev_target(connector, target):
+    """Both scope by the container above the schema, so a bare dev schema names
+    nothing they could read, and a bare container would read all of it."""
+
+    assert dev_target_scope(connector, target) is None
+
+
+def test_a_connector_with_no_dev_namespace_has_no_dev_target_scope():
+    assert dev_target_scope("duckdb", DuckDBTarget(path="dev.duckdb")) is None
+    assert dev_target_scope("bigquery", BigQueryTarget()) is None
+    assert dev_target_scope("snowflake", None) is None

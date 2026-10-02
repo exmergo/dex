@@ -62,6 +62,7 @@ from .base import (
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
     warehouse_refusal,
+    with_dev_target,
 )
 
 PARADIGM = "compute_time"
@@ -236,20 +237,14 @@ class DatabricksAdapter:
         self._scope_origin = scope_origin or "databricks.catalogs in .dex/config.yml"
         self._clock = clock
         self._conn: Any = None
-        self._objects: dict[str, dict] = {}
-        self._columns: dict[str, list[ColumnMeta]] = {}
-        self._inventory_loaded = False
-        self._resolved_scopes: list[tuple[str, str | None]] | None = None
         self._visible_catalogs: set[str] | None = None
-        self._schemas_by_catalog: dict[str, set[str]] = {}
+        self._dev_target: str | None = None
+        self.forget_metadata()
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
         # The startup floor is charged once per command, by whichever billed
         # statement runs first.
         self._startup_floor_pending: bool | None = None
-        # Identifiers DESCRIBE DETAIL has been attempted for (successfully or
-        # not), so a refused or unaffordable probe is not retried per batch.
-        self._detail_attempted: set[str] = set()
         self._cap_was_wall = False
 
     # --- capabilities (free) ---------------------------------------------------
@@ -327,6 +322,46 @@ class DatabricksAdapter:
                 "check databricks.catalogs in .dex/config.yml"
             )
         return entry
+
+    def forget_metadata(self) -> None:
+        """Drop everything this command has listed, because the warehouse changed.
+
+        Listings are cached per command, which holds while the warehouse holds
+        still. A build is the one command where it does not: dbt writes between
+        the pricing pass and the verification that judges its output, so a
+        schema that did not exist, or a table's size, is stale by then.
+
+        What survives is what this command has paid for or what dbt cannot
+        change: the SQL session (opening one can wake the warehouse), the
+        warehouse facts, the startup charge, and the visible catalogs (dbt
+        creates schemas, never a catalog).
+        """
+
+        self._objects: dict[str, dict] = {}
+        self._columns: dict[str, list[ColumnMeta]] = {}
+        self._inventory_loaded = False
+        self._resolved_scopes: list[tuple[str, str | None]] | None = None
+        self._schemas_by_catalog: dict[str, set[str]] = {}
+        # Identifiers DESCRIBE DETAIL has been attempted for (successfully or
+        # not), so a refused or unaffordable probe is not retried per batch. The
+        # facts it learned lived on the objects dropped above.
+        self._detail_attempted: set[str] = set()
+
+    def read_dev_target(self, scope: str | None) -> None:
+        """Also read ``catalog.schema``, the namespace this command's build
+        writes into, or stop reading it with ``None``.
+
+        Kept apart from ``target.catalogs`` because it is not a source the user
+        committed: it is dex reading its own output for one command, and it may
+        not exist yet (see :func:`~exmergo_dex_core.adapters.base.with_dev_target`).
+        A change forgets what was listed, since the scope that produced it has
+        changed.
+        """
+
+        scope = scope.strip().lower() if scope else None
+        if scope != self._dev_target:
+            self._dev_target = scope
+            self.forget_metadata()
 
     def _load_inventory(self) -> None:
         if self._inventory_loaded:
@@ -439,17 +474,36 @@ class DatabricksAdapter:
     def _resolve_scopes(self) -> list[tuple[str, str | None]]:
         if not self.target.catalogs:
             # Nothing committed: every catalog the principal can see is the
-            # allowlist by definition, so there is nothing to prove.
+            # allowlist by definition, so there is nothing to prove, and the dev
+            # target is already inside it.
             return [
                 (catalog, None)
                 for catalog in sorted(self._catalogs())
                 if catalog != "system"
             ]
         with blame(self._scope_origin, DatabricksConnectionError):
-            return [
+            scopes = [
                 self._resolve_scope(entry)
                 for entry in sorted({e.lower() for e in self.target.catalogs})
             ]
+
+        # The dev target joins by the same rule as on every connector, over the
+        # dotted spelling of these pairs; `--scope` was already folded into the
+        # target, so it can neither reach nor drop it.
+        def exists(scope: str) -> bool:
+            catalog, _, schema = scope.partition(".")
+            if catalog not in {name.lower() for name in self._catalogs()}:
+                return False
+            return schema in {name.lower() for name in self._schemas(catalog)}
+
+        dotted = [f"{c}.{s}" if s else c for c, s in scopes]
+        return [
+            (catalog, schema or None)
+            for catalog, _, schema in (
+                entry.partition(".")
+                for entry in with_dev_target(dotted, self._dev_target, exists)
+            )
+        ]
 
     def _resolve_scope(self, entry: str) -> tuple[str, str | None]:
         """One scope entry, proven to exist. Unity Catalog names are always

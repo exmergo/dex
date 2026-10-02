@@ -1091,3 +1091,58 @@ def test_timeout_codes_that_are_not_budget_bound_read_as_a_timeout(
     with pytest.raises(TimeoutError, match="narrow it"):
         adapter._run_rows("SELECT 1", timeout_seconds=5)
     assert TIMEOUT_EXCEEDED and TOO_MANY_BYTES  # codes are the fake's, not invented
+
+
+# --- a warehouse that changes mid-command, and the dev target ----------------------
+
+
+def _identifiers(adapter) -> list[str]:
+    return [o.identifier for o in adapter.list_objects()]
+
+
+def _dev_table(database: str = "dbt_dev", rows: int = 4) -> FakeClickHouseTable:
+    return FakeClickHouseTable(
+        database=database,
+        name="dim_customers",
+        columns=[("id", "UInt64", True)],
+        total_rows=rows,
+        total_bytes=1_000,
+    )
+
+
+def test_forgetting_metadata_lists_what_was_written_since(fake_clickhouse_connection):
+    """dbt-clickhouse creates its dev database, so the database list goes with
+    the inventory rather than being kept."""
+
+    adapter = make_adapter(
+        fake_clickhouse_connection, target=ClickHouseTarget(databases=["shop"])
+    )
+    adapter.read_dev_target("dbt_dev")
+    before = _identifiers(adapter)
+    fake_clickhouse_connection.tables.append(_dev_table())
+    assert _identifiers(adapter) == before, "cached"
+
+    adapter.forget_metadata()
+    listed = {o.identifier: o.row_count for o in adapter.list_objects()}
+    assert listed["dbt_dev.dim_customers"] == 4
+
+
+def test_a_dev_target_that_does_not_exist_yet_reads_as_empty(
+    fake_clickhouse_connection,
+):
+    adapter = make_adapter(
+        fake_clickhouse_connection, target=ClickHouseTarget(databases=["shop"])
+    )
+    adapter.read_dev_target("dbt_dev")
+    assert all(i.startswith("shop.") for i in _identifiers(adapter))
+
+
+def test_a_committed_entry_that_names_nothing_is_still_refused(
+    fake_clickhouse_connection,
+):
+    adapter = make_adapter(
+        fake_clickhouse_connection, target=ClickHouseTarget(databases=["gone"])
+    )
+    adapter.read_dev_target("dbt_dev")
+    with pytest.raises(ClickHouseConnectionError, match="names no database"):
+        adapter.list_objects()

@@ -52,6 +52,7 @@ from .base import (
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
     warehouse_refusal,
+    with_dev_target,
 )
 
 PARADIGM = "bytes_scanned"
@@ -210,16 +211,8 @@ class BigQueryAdapter:
         self._client = client or bigquery.Client(
             project=project, credentials=credentials
         )
-        # get_table results are cached per command so the estimate pass and the
-        # confirmed profiling pass do not re-fetch (each fetch is a free API
-        # call, but table facts also back the notes and sampling decisions).
-        self._tables: dict[str, Any] = {}
-        # Row counts learned from a profiling aggregate, which is the only place
-        # a count exists for an object kind BigQuery keeps no metadata count for.
-        # Per command, like `_tables`, and it supersedes the metadata rather than
-        # merging with it: the aggregate counted, the metadata guessed or lied.
-        self._exact_rows: dict[str, int] = {}
-        self._resolved_datasets: list[str] | None = None
+        self._dev_target: str | None = None
+        self.forget_metadata()
         self._notes: dict[str, list[str]] = {}
         # What the last profile estimate was made of, so the handshake and the
         # over-ceiling refusal can attribute the number they quote. Per command,
@@ -254,6 +247,47 @@ class BigQueryAdapter:
         }
 
     # --- introspection (free API metadata; no queries, no billing) ------------
+
+    def forget_metadata(self) -> None:
+        """Drop everything this command has fetched, because the warehouse changed.
+
+        Table facts are cached per command, which holds while the warehouse
+        holds still. A build is the one command where it does not: dbt writes
+        between the pricing pass and the verification that judges its output,
+        so a dataset that did not exist, or a table's row count, is stale by
+        then. The client, the notes, and the estimate composition survive: they
+        describe this command, not the warehouse.
+        """
+
+        # get_table results are cached per command so the estimate pass and the
+        # confirmed profiling pass do not re-fetch (each fetch is a free API
+        # call, but table facts also back the notes and sampling decisions).
+        self._tables: dict[str, Any] = {}
+        # Row counts learned from a profiling aggregate, which is the only place
+        # a count exists for an object kind BigQuery keeps no metadata count for.
+        # Per command, like `_tables`, and it supersedes the metadata rather than
+        # merging with it: the aggregate counted, the metadata guessed or lied.
+        self._exact_rows: dict[str, int] = {}
+        self._resolved_datasets: list[str] | None = None
+
+    def read_dev_target(self, scope: str | None) -> None:
+        """Also read ``dev_dataset``, the dataset this command's build writes into,
+        or stop reading it with ``None``. A bare name qualifies against
+        ``self.project``, as allowlist entries do.
+
+        Kept apart from ``target.datasets`` because it is not a source the user
+        committed: it is dex reading its own output for one command, and it may
+        not exist yet (see :func:`~exmergo_dex_core.adapters.base.with_dev_target`).
+        A change forgets what was fetched, since the scope that produced it has
+        changed.
+        """
+
+        token = scope.strip() if scope else None
+        if token and "." not in token:
+            token = f"{self.project}.{token}"
+        if token != self._dev_target:
+            self._dev_target = token
+            self.forget_metadata()
 
     def list_objects(self, *, include_views: bool = True) -> list[ObjectMeta]:
         objects: list[ObjectMeta] = []
@@ -366,11 +400,24 @@ class BigQueryAdapter:
             datasets = self._request(
                 lambda: list(self._client.list_datasets(self.project))
             )
-            return sorted(f"{self.project}.{item.dataset_id}" for item in datasets)
-        with blame(self._scope_origin, BigQueryConnectionError):
-            return sorted(
-                {self._resolve_dataset(entry) for entry in self.target.datasets}
-            )
+            scopes = sorted(f"{self.project}.{item.dataset_id}" for item in datasets)
+        else:
+            with blame(self._scope_origin, BigQueryConnectionError):
+                scopes = sorted(
+                    {self._resolve_dataset(entry) for entry in self.target.datasets}
+                )
+
+        # The same proof `_resolve_dataset` uses, with NotFound meaning "dbt has
+        # not created it yet" rather than a refusal. A dev dataset in another
+        # project is the case the empty-allowlist listing above cannot cover.
+        def exists(qualified: str) -> bool:
+            try:
+                self._request(lambda: self._client.get_dataset(qualified))
+            except self._api_exceptions.NotFound:
+                return False
+            return True
+
+        return with_dev_target(scopes, self._dev_target, exists)
 
     def _resolve_dataset(self, entry: str) -> str:
         """One scope entry, qualified and proven to exist.

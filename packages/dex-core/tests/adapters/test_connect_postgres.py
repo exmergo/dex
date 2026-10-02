@@ -932,3 +932,51 @@ def test_list_namespace_objects_lists_only_the_asked_schema(fake_pg_connection):
     assert adapter.list_namespace_objects("shop") == ["customers", "events"]
     assert adapter.list_namespace_objects("not_there") == []
     assert fake_pg_connection.data_statements == []
+
+
+# --- a warehouse that changes mid-command, and the dev target ----------------------
+
+
+def _identifiers(adapter) -> list[str]:
+    return [o.identifier for o in adapter.list_objects()]
+
+
+def _dev_table(schema: str = "dbt_dev", reltuples: float = 4.0) -> FakePostgresTable:
+    return FakePostgresTable(
+        schema=schema,
+        name="dim_customers",
+        columns=[("id", "bigint", False)],
+        reltuples=reltuples,
+        total_bytes=8_192,
+    )
+
+
+def test_forgetting_metadata_lists_what_was_written_since(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
+    before = _identifiers(adapter)
+    fake_pg_connection.tables.append(_dev_table(schema="shop"))
+    assert _identifiers(adapter) == before, "cached"
+
+    adapter.forget_metadata()
+    assert "dexdb.shop.dim_customers" in _identifiers(adapter)
+
+
+def test_a_dev_target_that_does_not_exist_yet_reads_as_empty(fake_pg_connection):
+    """dbt creates the dev schema on a first build; until then there is nothing
+    to read and nothing wrong, and the committed scope reads as before."""
+
+    adapter = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
+    adapter.read_dev_target("dbt_dev")
+    before = _identifiers(adapter)
+    assert before == ["dexdb.shop.customers", "dexdb.shop.events"]
+
+    fake_pg_connection.tables.append(_dev_table())
+    adapter.forget_metadata()
+    assert _identifiers(adapter) == ["dexdb.dbt_dev.dim_customers", *before]
+
+
+def test_a_committed_entry_that_names_nothing_is_still_refused(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["gone"]))
+    adapter.read_dev_target("dbt_dev")
+    with pytest.raises(PostgresConnectionError, match=r"postgres\.schemas"):
+        adapter.list_objects()

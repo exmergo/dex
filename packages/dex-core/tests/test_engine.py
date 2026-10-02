@@ -593,6 +593,101 @@ def test_each_call_gets_its_own_cost_gate(monkeypatch: pytest.MonkeyPatch, tmp_p
     second.cost_gate.charge(600.0)  # would raise if the first charge carried over
 
 
+class _DevTargetRecorder:
+    """An adapter that only records what the funnel asks it to read. No cost
+    gate, so the funnel has nothing to rebuild and only the dev target moves."""
+
+    name = "snowflake"
+    dialect = "snowflake"
+    paradigm = Paradigm.COMPUTE_TIME
+    cost_gate = None
+
+    def __init__(self) -> None:
+        self.dev_targets: list[str | None] = []
+
+    def read_dev_target(self, scope: str | None) -> None:
+        self.dev_targets.append(scope)
+
+    def close(self) -> None:
+        pass
+
+
+def _snowflake_engine(monkeypatch, *, databases, scopes=None):
+    import exmergo_dex_core.connect as connect_mod
+    from exmergo_dex_core.config import SnowflakeTarget
+
+    adapter = _DevTargetRecorder()
+    monkeypatch.setattr(connect_mod, "open_adapter", lambda **_kwargs: adapter)
+    config = DexConfig(
+        connector="snowflake",
+        snowflake=SnowflakeTarget(
+            warehouse="WH",
+            databases=databases,
+            dev_database="SHOP",
+            dev_schema="DBT_DEV",
+        ),
+    )
+    return DexEngine(config=config, store=MemoryStore(), scopes=scopes), adapter
+
+
+def test_the_dev_target_is_read_only_by_the_command_that_asks(monkeypatch):
+    """Per call, like the gate: a verified build reads the namespace dbt writes
+    into, and the next command on a held engine must not inherit it. The
+    committed config is never rewritten to get there."""
+
+    engine, adapter = _snowflake_engine(monkeypatch, databases=["SHOP.PUBLIC"])
+    config = engine.config
+
+    built = engine._adapter("transform build", reads_dev_target=True)
+    assert engine.connection_provenance().target["databases"] == [
+        "SHOP.PUBLIC",
+        "SHOP.DBT_DEV",
+    ]
+    explored = engine._adapter("explore inventory")
+
+    assert built is explored
+    assert adapter.dev_targets == ["SHOP.DBT_DEV", None]
+    assert engine.config is config
+    assert config.snowflake.databases == ["SHOP.PUBLIC"]
+    assert engine.connection_provenance().target["databases"] == ["SHOP.PUBLIC"]
+
+
+@pytest.mark.parametrize(
+    ("databases", "scopes", "shown"),
+    [
+        (["SHOP"], None, ["SHOP"]),
+        (["SHOP"], ["SHOP.PUBLIC"], ["SHOP.PUBLIC", "SHOP.DBT_DEV"]),
+        ([], None, None),
+    ],
+    ids=["covered-by-the-allowlist", "under-a-scope-flag", "empty-allowlist"],
+)
+def test_provenance_shows_the_dev_target_where_it_widens_what_is_read(
+    monkeypatch, databases, scopes, shown
+):
+    engine, _adapter = _snowflake_engine(
+        monkeypatch, databases=databases, scopes=scopes
+    )
+    engine._adapter("transform build", reads_dev_target=True)
+    assert engine.connection_provenance().target.get("databases") == shown
+
+
+def test_an_adapter_without_the_dev_target_convention_opens_as_before(
+    duckdb_file: Path,
+):
+    engine = DexEngine(
+        config=DexConfig(
+            connector="duckdb", duckdb=DuckDBTarget(path=str(duckdb_file))
+        ),
+        store=MemoryStore(),
+    )
+    with engine:
+        adapter = engine._adapter("transform build", reads_dev_target=True)
+        assert not hasattr(adapter, "read_dev_target")
+        assert engine.connection_provenance().target == {
+            "path": str(duckdb_file.resolve())
+        }
+
+
 def test_a_per_call_confirmation_overrides_the_engine_default(
     duckdb_file: Path, tmp_path: Path
 ):

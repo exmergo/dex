@@ -895,6 +895,75 @@ def test_build_verification_findings_never_become_errors(
 
 
 @pytest.mark.parametrize(
+    "error",
+    [DexError("scope 'DEV.DBT_DEV' does not exist"), RuntimeError("went away")],
+    ids=["dex-error", "unexpected"],
+)
+def test_a_build_that_ran_is_reported_whatever_its_sweep_meets(
+    error, dbt_project_dir: Path
+):
+    """Cost surfaced: the sweep runs after dbt has built and billed, and the
+    build's spend is settled and ledgered only once the sweep returns. A sweep
+    that raised on a listing it could not take reported `error` for a build
+    that had run, and its seconds never reached the ledger. Only a cost-guard
+    refusal may escape, because that one is the caller's own budget."""
+
+    from exmergo_dex_core.transform.commands import _verify_build
+
+    target = dbt_project_dir / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.dex_test.fct_orders": {
+                        "name": "fct_orders",
+                        "resource_type": "model",
+                        "relation_name": "warehouse.dbt_dev.fct_orders",
+                        "config": {"materialized": "table"},
+                        "compiled_code": "select * from warehouse.raw.orders",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "run_results.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    {"unique_id": "model.dex_test.fct_orders", "status": "success"}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _ListingFails:
+        dialect = "duckdb"
+        cost_gate = None
+
+        def list_objects(self, *, include_views: bool = True):
+            raise error
+
+    engine = DexEngine(
+        connector="duckdb",
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector="duckdb"),
+    )
+    summary = {
+        "success": True,
+        "nodes": [{"unique_id": "model.dex_test.fct_orders", "status": "success"}],
+    }
+    verification = _verify_build(
+        engine, dbt_project_dir, summary, True, adapter=_ListingFails()
+    )
+    assert verification.ran is True
+    assert "could not be listed" in verification.suppressed["row_population"]
+
+
+@pytest.mark.parametrize(
     "paradigm",
     [env.Paradigm.BYTES_SCANNED, env.Paradigm.COMPUTE_TIME, env.Paradigm.DB_LOAD],
 )
@@ -4290,6 +4359,212 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
     assert fake_databricks.connect_count == 0
     assert fake_pg_connection.data_statements == []
     assert fake_redshift_connection.data_statements == []
+
+
+def test_the_dev_target_is_the_one_scope_that_may_be_absent(
+    fake_bq_client,
+    fake_databricks,
+    fake_pg_connection,
+    fake_redshift_connection,
+    fake_clickhouse_connection,
+    fake_sf_connection,
+):
+    # Family 2, and its one deliberate exception. A verified build reads the
+    # namespace dbt writes into, which dbt creates on a first build, so before
+    # that build it reads as empty rather than refusing. The exception is that
+    # entry alone: beside it, a committed entry that names nothing still
+    # refuses, and an absent dev target never widens the read to anything the
+    # allowlist did not name. Free throughout, on every metered connector.
+    from exmergo_dex_core.adapters.bigquery import (
+        BigQueryAdapter,
+        BigQueryConnectionError,
+    )
+    from exmergo_dex_core.adapters.clickhouse import (
+        ClickHouseAdapter,
+        ClickHouseConnectionError,
+    )
+    from exmergo_dex_core.adapters.databricks import (
+        DatabricksAdapter,
+        DatabricksConnectionError,
+    )
+    from exmergo_dex_core.adapters.postgres import (
+        PostgresAdapter,
+        PostgresConnectionError,
+    )
+    from exmergo_dex_core.adapters.redshift import (
+        RedshiftAdapter,
+        RedshiftConnectionError,
+    )
+    from exmergo_dex_core.adapters.snowflake import (
+        SnowflakeAdapter,
+        SnowflakeConnectionError,
+    )
+    from exmergo_dex_core.config import (
+        BigQueryTarget,
+        ClickHouseTarget,
+        DatabricksTarget,
+        PostgresTarget,
+        RedshiftTarget,
+        SnowflakeTarget,
+    )
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    def gate(paradigm, connector):
+        return CostGate(
+            paradigm=paradigm,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=True,
+            connector=connector,
+        )
+
+    connectors = {
+        "bigquery": (
+            lambda scope: BigQueryAdapter(
+                project="test-proj",
+                cost_gate=gate(env.Paradigm.BYTES_SCANNED, "bigquery"),
+                target=BigQueryTarget(datasets=[scope]),
+                client=fake_bq_client,
+            ),
+            ("shop", "__not_a_dataset__", "dbt_dev"),
+            BigQueryConnectionError,
+        ),
+        "snowflake": (
+            lambda scope: SnowflakeAdapter(
+                connection=fake_sf_connection,
+                cost_gate=gate(env.Paradigm.COMPUTE_TIME, "snowflake"),
+                target=SnowflakeTarget(warehouse="DEX_WH", databases=[scope]),
+                clock=fake_sf_connection.clock,
+            ),
+            ("SHOP.PUBLIC", "SHOP.__NOT_A_SCHEMA__", "SHOP.DBT_DEV"),
+            SnowflakeConnectionError,
+        ),
+        "databricks": (
+            lambda scope: DatabricksAdapter(
+                workspace=fake_databricks.workspace,
+                sql_connect=fake_databricks.sql_connect,
+                cost_gate=gate(env.Paradigm.COMPUTE_TIME, "databricks"),
+                target=DatabricksTarget(warehouse="fake-wh", catalogs=[scope]),
+                clock=fake_databricks.clock,
+            ),
+            ("shop.core", "shop.__not_a_schema__", "shop.dbt_dev"),
+            DatabricksConnectionError,
+        ),
+        "postgres": (
+            lambda scope: PostgresAdapter(
+                connection=fake_pg_connection,
+                cost_gate=gate(env.Paradigm.DB_LOAD, "postgres"),
+                target=PostgresTarget(schemas=[scope]),
+                clock=fake_pg_connection.clock,
+            ),
+            ("shop", "__not_a_schema__", "dbt_dev"),
+            PostgresConnectionError,
+        ),
+        "redshift": (
+            lambda scope: RedshiftAdapter(
+                connection=fake_redshift_connection,
+                cost_gate=gate(env.Paradigm.COMPUTE_TIME, "redshift"),
+                target=RedshiftTarget(schemas=[scope]),
+                clock=fake_redshift_connection.clock,
+            ),
+            ("shop", "__not_a_schema__", "dbt_dev"),
+            RedshiftConnectionError,
+        ),
+        "clickhouse": (
+            lambda scope: ClickHouseAdapter(
+                connection=fake_clickhouse_connection,
+                cost_gate=gate(env.Paradigm.DB_LOAD, "clickhouse"),
+                target=ClickHouseTarget(databases=[scope]),
+            ),
+            ("shop", "__not_a_database__", "dbt_dev"),
+            ClickHouseConnectionError,
+        ),
+    }
+
+    for name, (make, (committed, missing, dev), error) in connectors.items():
+        unread = [o.identifier for o in make(committed).list_objects()]
+        reading = make(committed)
+        reading.read_dev_target(dev)
+        assert [o.identifier for o in reading.list_objects()] == unread, name
+
+        strict = make(missing)
+        strict.read_dev_target(dev)
+        with pytest.raises(error):
+            strict.list_objects()
+
+    assert fake_bq_client.query_calls == []
+    assert fake_sf_connection.data_statements == []
+    assert fake_databricks.connection.data_statements == []
+    assert fake_databricks.connect_count == 0
+    assert fake_pg_connection.data_statements == []
+    assert fake_redshift_connection.data_statements == []
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_a_scope_flag_cannot_reach_the_dev_target(fake_sf_connection):
+    # Family 2: `--scope` narrows the committed allowlist and nothing else. The
+    # dev target a verified build reads is not in that allowlist, so the flag
+    # can no more name it than any other namespace outside it. Snowflake narrows
+    # inside the adapter; every other connector narrows in `narrow_target`.
+    from exmergo_dex_core.adapters.snowflake import SnowflakeConnectionError
+    from exmergo_dex_core.config import PostgresTarget
+    from exmergo_dex_core.connect import ScopeError, narrow_target
+
+    fake_sf_connection.empty_schemas.add("SHOP.DBT_DEV")
+    adapter = _sf_adapter(
+        fake_sf_connection, databases=["SHOP.PUBLIC"], scope_override=["SHOP.DBT_DEV"]
+    )
+    adapter.read_dev_target("SHOP.DBT_DEV")
+    with pytest.raises(SnowflakeConnectionError, match="never widens"):
+        adapter.list_objects()
+    assert fake_sf_connection.data_statements == []
+
+    with pytest.raises(ScopeError, match="never widens"):
+        narrow_target(PostgresTarget(schemas=["shop"]), "postgres", ["dbt_dev"])
+
+
+def test_the_dev_target_is_read_only_by_the_command_that_asked(
+    monkeypatch, fake_sf_connection
+):
+    # Family 2: reading the dev target is dex judging its own output for one
+    # command. On an engine held across commands, the next one reads exactly
+    # the committed scope again, on the same connection.
+    from fakes.snowflake import FakeSnowflakeTable
+
+    import exmergo_dex_core.connect as connect_mod
+    from exmergo_dex_core.config import DexConfig, SnowflakeTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import MemoryStore
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="DBT_DEV",
+            name="DIM_CUSTOMERS",
+            columns=[("ID", "FIXED", False)],
+        )
+    )
+    adapter = _sf_adapter(fake_sf_connection, databases=["SHOP.PUBLIC"])
+    monkeypatch.setattr(connect_mod, "open_adapter", lambda **_kwargs: adapter)
+    engine = DexEngine(
+        config=DexConfig(
+            connector="snowflake",
+            snowflake=SnowflakeTarget(
+                warehouse="DEX_WH",
+                databases=["SHOP.PUBLIC"],
+                dev_database="SHOP",
+                dev_schema="DBT_DEV",
+            ),
+        ),
+        store=MemoryStore(),
+    )
+
+    built = engine._adapter("transform build", reads_dev_target=True)
+    assert "SHOP.DBT_DEV.DIM_CUSTOMERS" in [o.identifier for o in built.list_objects()]
+    explored = engine._adapter("explore inventory")
+    assert explored is built
+    assert all(o.identifier.startswith("SHOP.PUBLIC.") for o in explored.list_objects())
 
 
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):

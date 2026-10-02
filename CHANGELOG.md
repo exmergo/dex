@@ -9,6 +9,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`transform build --verify` judges the dev schema a first build creates, and
+  judges a rebuild on the row counts dbt just wrote** ([#484]). `--verify` reads
+  the dev namespace dbt writes into, and dex resolved and listed it while
+  pricing, before dbt had run. Measured on Snowflake:
+
+  - A dev schema that did not exist yet failed to resolve, and every node of
+    the build was reported as unpriced, including nodes that read only
+    sources. The estimate came to 0 seconds. Once confirmed, dbt built and
+    billed, and the listing raised: the envelope said `error`, `data` was
+    empty, and the build's seconds never reached the spend ledger.
+  - A dev schema that existed but was empty was listed empty, and row
+    population was suppressed as "outside dex's read scope" for relations
+    that were in it.
+  - A rebuild was judged on the catalog row counts listed before dbt rebuilt
+    the table. A rebuild that introduced a fanout (4 customers to 6 rows) read
+    clean, and the rebuild that fixed it was still reported as `row_fanout`.
+
+  The same timing affected Databricks, Redshift, ClickHouse, and Postgres
+  wherever pricing lists the inventory. On BigQuery, pricing is a dry run and
+  the listing is not cached, so only a `dev_dataset` no model lands in (every
+  model built into a custom schema) failed, raising after the build.
+
+  The dev namespace is now held apart from the committed allowlist and read for
+  the one command that asks. It need not exist: before a first build it reads
+  as empty, and a committed entry that names nothing is still refused. Once dbt
+  has run, the adapter forgets what it listed, so the sweep judges what dbt
+  wrote. A listing that still fails after the build becomes a row-population
+  suppression rather than an error, so the build's result and spend are always
+  reported. An allowlist that already covers the dev namespace (the whole dev
+  database) reads it once, where before it was appended as text and failed on
+  a first build. `--scope` narrows the sources and no longer drops the dev
+  namespace from a verified build.
+
+  Two behaviors change. `--scope` naming the dev namespace is now outside the
+  committed allowlist like any other namespace, so a verified build given one
+  reports the refusal as its row-population suppression. The suppression for
+  relations dex cannot see no longer advises adding the dev namespace to the
+  source allowlist: `--verify` reads it without that. A dev namespace added to
+  `<connector>.databases`, `schemas`, `catalogs` or `datasets` on that advice
+  can be removed, and while it stays it is a committed entry, refused whenever
+  it names nothing.
+
 ## [1.12.4] - 2026-09-30
 
 ### Security

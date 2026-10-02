@@ -1820,8 +1820,6 @@ def build(
     connector = engine.connector or config.connector
 
     project = engine.project_dir()
-    if verify:
-        _widen_scope_to_the_dev_target(engine)
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
@@ -1930,6 +1928,13 @@ def build(
         )
         raise
 
+    # dbt has just written to the warehouse this adapter listed while pricing,
+    # so what it listed (a dev schema that did not exist, a table's row count)
+    # is stale for anything that reads after the build. On the free path the
+    # adapter is first opened after dbt, so there is nothing to forget there.
+    forget = getattr(adapter, "forget_metadata", None)
+    if forget is not None:
+        forget()
     # Between the run and the shaping, deliberately: `_shape_build_result`
     # settles the gate, and a statement issued after that is charged against a
     # reservation that has already been released.
@@ -1983,53 +1988,9 @@ def _verify_build(
     opener = (
         (lambda: adapter)
         if adapter is not None
-        else (lambda: engine._adapter("transform build"))
+        else (lambda: engine._adapter("transform build", reads_dev_target=True))
     )
     return verify_build(engine, Path(project), summary, resolve_adapter=opener)
-
-
-def _widen_scope_to_the_dev_target(engine: DexEngine) -> None:
-    """Let this command read the namespace dbt is about to write into.
-
-    Every other command refuses that namespace as a source, so exploration can
-    never mistake a built model for a source table. Verification is the one
-    whose subject *is* that output: without this, a metered connector reports
-    that it can see nothing to judge, because dbt writes to a namespace the
-    source allowlist deliberately excludes.
-
-    Applied to this command's own copy of the config, not through the
-    ``--scope`` override. That override may only narrow, by design: a committed
-    allowlist is a cost boundary and a flag must not reach past it. This is not
-    a flag. It is dex adding the one namespace its own config already names as
-    the dev target, for the length of one command, and the spend that namespace
-    can attract is still bound by the budget and the handshake like any other.
-
-    Called before anything opens a connection, because the adapter resolves its
-    scope once on the first open and caches it for the command. Nothing is
-    written back to `.dex/config.yml`, and the widened scope is what the
-    envelope's connection block reports, so it is visible rather than silent.
-    """
-
-    from .verify import dev_source_scope
-
-    connector = engine.connector or engine.config.connector
-    widening = dev_source_scope(engine.config, connector)
-    if widening is None:
-        return
-    field, entries = widening
-    target = getattr(engine.config, connector)
-    committed = [str(entry) for entry in getattr(target, field)]
-    # An empty allowlist already means "everything this connection can see", so
-    # narrowing it to the dev namespace would be a widening in name and a
-    # narrowing in fact.
-    if not committed:
-        return
-    widened = [*committed, *(e for e in entries if e not in committed)]
-    if widened == committed:
-        return
-    engine.config = engine.config.model_copy(
-        update={connector: target.model_copy(update={field: widened})}
-    )
 
 
 def _for_plan_document(args: argparse.Namespace) -> Any:
@@ -2485,7 +2446,10 @@ def _price_build(
     cloud_capacity_proved = False
     adapter = None
     try:
-        adapter = engine._adapter("transform build")
+        # A verified build reads the dev namespace while pricing too: on a
+        # rebuild its relations exist, and the downstream nodes and the counts
+        # that judge them price against their real sizes.
+        adapter = engine._adapter("transform build", reads_dev_target=verify)
         if cloud_capacity_required:
             # Unlike the other build translations, ClickHouse Cloud's rate is
             # discovered live rather than configured. Prove and cache it before

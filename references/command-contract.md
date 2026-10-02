@@ -759,12 +759,26 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
 
   **Read scope.** Every other command refuses the namespace dbt writes to as a
   source, so exploration can never mistake a built model for a source table.
-  `--verify` folds that namespace into its own read scope for the length of the
-  command, because the relations dbt just wrote are its subject; the widening
-  shows in the envelope's `connection.target` and nothing is written back to
-  `.dex/config.yml`. Where the built relations still cannot be seen, row
-  population is suppressed with a reason that names the gap rather than
-  comparing nothing and reporting clean.
+  `--verify` also reads that namespace for the length of the command, because
+  the relations dbt just wrote are its subject. It is held apart from the
+  committed allowlist and bounded by its own rules:
+
+  - It need not exist. dbt creates it on a first build, so before that build it
+    reads as empty, and the build is priced on its sources as usual. A committed
+    allowlist entry that names nothing is still refused.
+  - It is listed after dbt has run, so a first build sees the relations it
+    created, and a rebuild is judged on the row counts dbt just wrote rather
+    than on the ones listed while pricing.
+  - `--scope` narrows the sources and nothing else: it can neither name the dev
+    namespace nor drop it from the build that is judging it.
+  - An allowlist that already covers it (the whole dev database, or an empty
+    allowlist) reads it once.
+
+  The dev namespace shows in the envelope's `connection.target` while it is
+  read, and nothing is written back to `.dex/config.yml`. Where the built
+  relations still cannot be seen (a model built into a custom schema lands
+  outside the configured dev namespace), row population is suppressed with a
+  reason that names the gap rather than comparing nothing and reporting clean.
 - `semantic define` refuses names that already exist in the project (use
   `update`); `update` refuses names that do not (use `define`); `semantic plan`
   accepts a mix and classifies per name, reporting `defined`, `updated`,

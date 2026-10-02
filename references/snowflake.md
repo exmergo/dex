@@ -153,10 +153,12 @@ because a mutant builds as an ephemeral model, so `snowflake.dev_database` holds
 exactly the objects it held before the run.
 
 
-`--verify` also folds `snowflake.dev_database` / `snowflake.dev_schema` into its read scope for the length of that one
-command, because dbt writes the relations it is judging there and that namespace
-is refused as a source everywhere else. The widening shows in the envelope's
-`connection.target`; nothing is written back to `.dex/config.yml`.
+`--verify` also reads the dev schema (`snowflake.dev_database` /
+`snowflake.dev_schema`) for the length of that one command, because dbt writes
+the relations it is judging there and that schema is refused as a source
+everywhere else. The schema need not exist yet: dbt creates it on a first
+build, and dex lists it after dbt has run. How that read is bounded is under
+**Read scope** in [`command-contract.md`](command-contract.md).
 
 
 **The budget is hard-enforced regardless of estimate quality.** Before every

@@ -210,6 +210,36 @@ def scope_within(scope: str, committed: list[str]) -> bool:
     )
 
 
+def with_dev_target(
+    scopes: list[str], dev_target: str | None, exists: Callable[[str], bool]
+) -> list[str]:
+    """The resolved source scope, plus the dev namespace when this command reads it.
+
+    The dev namespace is where dbt writes, and every command refuses it as a
+    source except a build judging its own output (see ``read_dev_target`` on
+    the adapters). It is held apart from the committed allowlist because it
+    obeys different rules, and this is where they are applied:
+
+    - **Absent reads as empty.** dbt creates the namespace on a first build, so
+      before that build there is nothing to read and nothing wrong. A committed
+      entry that names nothing is still refused, by the resolution that
+      produced ``scopes``; only this one entry is lenient.
+    - **Folded after ``--scope``.** ``scopes`` has already been narrowed, so the
+      flag can neither reach the dev namespace nor drop it from the build that
+      is judging it.
+    - **Never twice.** An allowlist that already covers it (a whole database,
+      or an empty allowlist resolved to everything) reads it once.
+
+    ``exists`` is the connector's free existence check, asked only when the
+    namespace is not already covered, with the entry spelled as the adapter
+    normalized it.
+    """
+
+    if not dev_target or scope_within(dev_target, scopes) or not exists(dev_target):
+        return scopes
+    return sorted({*scopes, dev_target})
+
+
 SUGGESTION_CAP = 12
 
 
@@ -898,6 +928,19 @@ class Adapter(Protocol):
     Connection state lives inside the adapter instance (class DI): it holds the
     open handle and the raw-data access, so nothing leaks past the engine. The
     agent only ever sees the sanitized envelope.
+
+    Two optional methods, found with ``getattr`` rather than declared here so a
+    host-supplied adapter that has not grown them still satisfies the protocol:
+
+    - ``forget_metadata()``: an adapter that caches what it listed (scope
+      resolution, the object inventory, catalog row counts) for the length of a
+      command must implement it. A build calls it once dbt has written, because
+      that is the one point mid-command where the warehouse changes under the
+      adapter, and a verdict on what dbt wrote must not rest on what was listed
+      before it ran.
+    - ``read_dev_target(scope)``: also read the namespace this command's own
+      build writes into (``None`` stops), applied through
+      :func:`with_dev_target`. The engine's adapter funnel sets it per command.
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".

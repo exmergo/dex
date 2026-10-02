@@ -96,6 +96,7 @@ class FakeWorkspaceClient:
         warehouse: FakeWarehouse | None = None,
         omit_list_columns: bool = False,
         empty_catalogs: list[str] | None = None,
+        empty_schemas: list[str] | None = None,
         principal: str = "dex@example.com",
         owners: dict[str, str] | None = None,
         grants: dict[str, set[str]] | None = None,
@@ -105,6 +106,10 @@ class FakeWorkspaceClient:
         # is in before a first build, which a table-derived registry cannot
         # otherwise express.
         self._empty_catalogs = list(empty_catalogs or [])
+        # `catalog.schema` entries that exist and hold nothing, the state of a dev
+        # schema created ahead of a first build. A set, so a test can create one
+        # mid-command the way dbt would.
+        self.empty_schemas = {entry.lower() for entry in empty_schemas or []}
         # Who this client authenticates as, who owns each securable (by full name),
         # and what the principal is granted on each. Ownership and grants are
         # separate on purpose: Unity Catalog does not report ownership through the
@@ -160,7 +165,14 @@ class FakeWorkspaceClient:
 
     def _list_schemas(self, catalog_name: str):
         self.metadata_calls.append(f"schemas.list:{catalog_name}")
-        names = sorted({t.schema for t in self._tables if t.catalog == catalog_name})
+        empty = {
+            schema
+            for catalog, _, schema in (e.partition(".") for e in self.empty_schemas)
+            if catalog == catalog_name
+        }
+        names = sorted(
+            {t.schema for t in self._tables if t.catalog == catalog_name} | empty
+        )
         return [SimpleNamespace(name=name) for name in names]
 
     def _list_tables(

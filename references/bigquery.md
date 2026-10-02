@@ -201,10 +201,13 @@ count, so a table's count is free metadata; how the counts are priced into
 the build's own estimate is in
 [`cost-controls.md`](cost-controls.md).
 
-`--verify` also folds `bigquery.dev_dataset` into its read scope for the length of that one
-command, because dbt writes the relations it is judging there and that namespace
-is refused as a source everywhere else. The widening shows in the envelope's
-`connection.target`; nothing is written back to `.dex/config.yml`.
+`--verify` also reads `bigquery.dev_dataset` for the length of that one command,
+because dbt writes the relations it is judging there and that dataset is refused
+as a source everywhere else. The dataset need not exist yet: dbt creates it on a
+first build. A build that writes every model into a custom schema never creates
+it, and row population is then suppressed with a reason that names the gap. How
+that read is bounded is under **Read scope** in
+[`command-contract.md`](command-contract.md).
 
 `transform test --mutate` prices the whole batch upfront and confirms it once.
 Each mutant is spliced into each of the model's compiled data tests and dry-run

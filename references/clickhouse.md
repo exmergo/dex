@@ -324,11 +324,12 @@ held before. A budget that runs out partway stops the run, and the remaining
 mutants are reported `not_run` rather than the budget being exceeded.
 
 
-`--verify` also folds `clickhouse.dev_database` into its read scope for the
-length of that one command, because dbt writes the relations it is judging there
-and that database is refused as a source everywhere else. The widening shows in
-the envelope's `connection.target`; nothing is written back to
-`.dex/config.yml`.
+`--verify` also reads `clickhouse.dev_database` for the length of that one
+command, because dbt writes the relations it is judging there and that database
+is refused as a source everywhere else. The database need not exist yet:
+dbt-clickhouse creates it on a first build, and dex lists it after dbt has run.
+How that read is bounded is under **Read scope** in
+[`command-contract.md`](command-contract.md).
 
 The shipped `unpivot_json_object` macro has a ClickHouse implementation built on
 `ARRAY JOIN` over `JSONExtractKeysAndValuesRaw`, since ClickHouse has no lateral
