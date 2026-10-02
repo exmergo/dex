@@ -68,6 +68,18 @@ class GraphProject:
         return SemanticLayer(notes=[_NOTE])
 
 
+class VerifyGraphProject(GraphProject):
+    """A graph format with enough physical declarations for portable verify."""
+
+    def definitions(self) -> ProjectDefinitions:
+        return ProjectDefinitions(
+            present=True,
+            built_relation_names=["orders", "ghost"],
+            model_relations={"orders": "orders", "ghost": "ghost"},
+            notes=[_NOTE],
+        )
+
+
 @pytest.fixture
 def graph_repo(maintain_repo, monkeypatch):
     """The baseline repo, reconfigured to read the graph format instead of dbt."""
@@ -97,6 +109,47 @@ def test_a_named_non_dbt_format_becomes_the_drift_baseline(graph_repo):
 
     assert payload["data"]["transform_layer"]["model_count"] == 1
     assert payload["data"]["transform_layer"]["file_count"] == 0
+    assert _NOTE in payload["warnings"]
+
+
+def test_verify_runs_portable_checks_through_the_project_format(
+    graph_repo, monkeypatch
+):
+    """No dbt project is needed for relation existence and grain checks.
+
+    The format declares one relation that exists and one that does not. Removing
+    the coincidental dbt project from the shared fixture pins the original
+    failure mode: ``engine.project_dir()`` would refuse before the format seam
+    could answer anything.
+    """
+
+    monkeypatch.setattr(
+        sys.modules["dex_graph_format"], "graph_project", VerifyGraphProject
+    )
+    (graph_repo.root / "dbt_project.yml").unlink()
+
+    rc, payload = graph_repo.dex("maintain", "verify")
+
+    assert rc == 0 and payload["status"] == "ok", payload
+    missing = [
+        finding
+        for finding in payload["data"]["findings"]
+        if finding["code"] == "no_relation"
+    ]
+    assert [finding["identifier"] for finding in missing] == ["ghost"]
+    assert "no_relation" not in payload["data"]["suppressed"]
+    assert "grain" not in payload["data"]["suppressed"]
+    assert set(payload["data"]["suppressed"]) == {
+        "compile",
+        "build_status",
+        "row_population",
+        "column_contract",
+        "join_contract",
+    }
+    assert all(
+        "'graph' project format does not provide dbt target/ artifacts" in reason
+        for reason in payload["data"]["suppressed"].values()
+    )
     assert _NOTE in payload["warnings"]
 
 

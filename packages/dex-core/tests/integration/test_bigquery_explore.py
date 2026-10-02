@@ -1,9 +1,9 @@
 """Live explore against public BigQuery data: free inventory, the confirm
 handshake with a real dry-run estimate, the over-ceiling refusal (free), a
-firewalled query, and temporal continuity over a DATETIME column. Reads
-bigquery-public-data plus one tiny table this suite writes into the scratch
-dataset; bills to the test project; every scan is capped by the suite's byte
-ceiling."""
+firewalled query, temporal continuity over a DATETIME column, and key value
+shapes. Reads bigquery-public-data plus three tiny tables this suite writes
+into the scratch dataset; bills to the test project; every scan is capped by
+the suite's byte ceiling."""
 
 from __future__ import annotations
 
@@ -315,6 +315,95 @@ def test_temporal_continuity_reports_the_seeded_hour_grain_hole(
     assert occurred["temporal_distinct_periods"] == 45
     assert occurred["temporal_missing_periods"] == 3
     assert occurred["temporal_largest_gap"] == 3
+
+
+# --- key value shapes over written fixtures -------------------------------------------
+
+KEY_SHAPE_GEO = "dex_key_shape_geo"
+KEY_SHAPE_SKUS = "dex_key_shape_skus"
+# Five of the twenty (25% of rows) are spelt in the letters A to F only.
+KEY_SHAPE_COUNTRIES = "AD BE CA DE EC US GB FR IT JP NL NO SE PL PT IN MX ZA KR NZ"
+
+
+@pytest.fixture
+def bq_key_shape_tables(bq_project: str, bq_scratch_dataset: str):
+    """Two tiny tables for the key value-shape check, one per direction.
+
+    ``dex_key_shape_geo`` is keyed by ``(day, country)`` over two-letter
+    country codes, a fifth of them spelt only in A to F, so it must stay
+    silent (#481). ``dex_key_shape_skus`` is the merged-catalogue key: 270
+    numeric ids and 30 md5 hashes, so it must still report both shapes.
+
+    Written and dropped by this fixture, under the same scratch-dataset rules
+    as ``bq_continuity_table``.
+    """
+
+    from google.cloud import bigquery
+
+    geo = f"{bq_project}.{bq_scratch_dataset}.{KEY_SHAPE_GEO}"
+    skus = f"{bq_project}.{bq_scratch_dataset}.{KEY_SHAPE_SKUS}"
+    codes = ", ".join(f"'{c}'" for c in KEY_SHAPE_COUNTRIES.split())
+    client = bigquery.Client(project=bq_project)
+    try:
+        # DDL over generated literals: no table is read, so this scans nothing.
+        client.query(
+            f"CREATE OR REPLACE TABLE `{geo}` AS SELECT "  # noqa: S608
+            "DATE_ADD(DATE '2026-09-01', INTERVAL d DAY) AS day, country "
+            f"FROM UNNEST(GENERATE_ARRAY(0, 9)) AS d, UNNEST([{codes}]) AS country"
+        ).result()
+        client.query(
+            f"CREATE OR REPLACE TABLE `{skus}` AS SELECT "  # noqa: S608
+            "i AS product_id, IF(i <= 270, CAST(400000 + i AS STRING), "
+            "TO_HEX(MD5(CONCAT('catalog-merge-', CAST(i AS STRING))))) AS sku "
+            "FROM UNNEST(GENERATE_ARRAY(1, 300)) AS i"
+        ).result()
+        yield geo, skus
+    finally:
+        client.delete_table(geo, not_found_ok=True)
+        client.delete_table(skus, not_found_ok=True)
+        client.close()
+
+
+def test_key_value_shapes_ignore_short_codes_and_still_catch_mixed_ids(
+    tmp_path: Path,
+    capsys,
+    bq_project: str,
+    bq_scratch_dataset: str,
+    bq_key_shape_tables: tuple[str, str],
+):
+    """The key-shape check's regexes run inside BigQuery, so this is the only
+    place their reading of the shared patterns is proven: a country-code key
+    is one shape here, and a numeric key with md5 hashes merged into it is
+    two, with the cast warning."""
+
+    seed_repo(tmp_path, bq_project, datasets=[f"{bq_project}.{bq_scratch_dataset}"])
+    datasets: dict[str, dict] = {}
+    for table in (KEY_SHAPE_GEO, KEY_SHAPE_SKUS):
+        rc, envelope = run_cli(
+            [
+                "--repo-root",
+                str(tmp_path),
+                "explore",
+                "profile",
+                table,
+                "--confirm",
+                "--budget",
+                str(MAX_BYTES),
+            ],
+            capsys,
+        )
+        assert_ok(rc, envelope)
+        (datasets[table],) = envelope["data"]["datasets"]
+
+    geo = datasets[KEY_SHAPE_GEO]
+    # The country column is a key member, so the check did look at it.
+    assert set(geo["grain"]) == {"day", "country"}, geo["key_evidence"]
+    geo_notes = " ".join(geo["data_quality"])
+    assert "mixes value shapes" not in geo_notes, geo_notes
+    sku_notes = " ".join(datasets[KEY_SHAPE_SKUS]["data_quality"])
+    assert "sku is a candidate key but mixes value shapes" in sku_notes, sku_notes
+    assert "90% numeric, 10% 32-character hexadecimal (md5-shaped)" in sku_notes
+    assert "casting to a number or comparing numerically" in sku_notes
 
 
 # --- scope resolution against the live project (free: metadata GET, no query) ---------

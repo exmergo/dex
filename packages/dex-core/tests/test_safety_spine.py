@@ -230,7 +230,9 @@ def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
 def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
     """#205: neither a concrete numeric id nor a concrete hash string may
     reach the generated data-quality note text -- only fractions and a
-    length-derived shape label."""
+    length-derived shape label. Both consequence clauses are covered: `id`
+    mixes numeric ids with hashes (the cast warning), `ref` mixes hashes with
+    slugs and no numeric group (the join warning, #481)."""
 
     import hashlib
 
@@ -240,15 +242,21 @@ def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
 
     path = tmp_path / "heterogeneous_key.duckdb"
     conn = duckdb.connect(str(path))
-    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY)")
-    rows = [(str(1000 + i),) for i in range(90)]
+    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY, ref VARCHAR UNIQUE)")
     # md5-shaped test fixture data only, not a security use.
     hashes = [
         hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
         for i in range(10)
     ]
-    rows += [(h,) for h in hashes]
-    conn.executemany("INSERT INTO t VALUES (?)", rows)
+    ref_hashes = [
+        hashlib.md5(f"ref-{i}".encode(), usedforsecurity=False).hexdigest()
+        for i in range(50)
+    ]
+    slugs = [f"legacy-{i:03d}" for i in range(50)]
+    ids = [str(1000 + i) for i in range(90)] + hashes
+    conn.executemany(
+        "INSERT INTO t VALUES (?, ?)", list(zip(ids, ref_hashes + slugs, strict=True))
+    )
     conn.close()
 
     adapter = DuckDBAdapter(path)
@@ -261,10 +269,14 @@ def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
     assert "mixes value shapes" in notes
     for i in range(90):
         assert str(1000 + i) not in notes, "no concrete numeric id in note text"
-    for h in hashes:
+    for h in hashes + ref_hashes:
         assert h not in notes, "no concrete hash value in note text"
+    for slug in slugs:
+        assert slug not in notes, "no concrete slug in note text"
     # Only the fraction and the length-derived shape label appear.
     assert "90% numeric" in notes and "md5-shaped" in notes
+    assert "50% other" in notes
+    assert "a join or filter written for one shape" in notes
 
 
 # `dex demo` is the one verb that creates a data file, so the read-only rule has

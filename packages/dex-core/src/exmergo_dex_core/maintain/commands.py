@@ -825,37 +825,22 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     the scan priced beside them, exactly as `maintain check` and `maintain
     semantic` do.
 
-    A project that does not compile is reported first and suppresses every
+    A dbt project that does not compile is reported first and suppresses every
     other check here, since a finding computed from a manifest a broken
     project could not have produced honestly is not a finding at all
-    (#172's inertness requirement, #225's third acceptance bullet).
+    (#172's inertness requirement, #225's third acceptance bullet). Other
+    project formats still serve the checks whose inputs are part of the project
+    seam: missing relations and grain. Checks that specifically read dbt's
+    ``target/`` artifacts are suppressed by name rather than preventing those
+    portable checks from running.
     """
 
     from pathlib import Path
 
-    suppressed: dict[str, str] = {}
-    try:
-        project_dir = Path(engine.project_dir())
-    except (ProjectError, RepoRootRequiredError) as exc:
+    project, project_reason = _read_project(engine)
+    if project is None:
+        reason = project_reason or "no readable project format found"
         return VerifyResult(
-            suppressed={
-                "build_status": str(exc),
-                "no_relation": str(exc),
-                "column_contract": str(exc),
-                "grain": str(exc),
-                "join_contract": str(exc),
-                "compile": str(exc),
-            },
-            warnings=[f"maintain verify needs a dbt project: {exc}"],
-        )
-
-    findings: list = []
-    compile_finding, compile_notes = verify_mod.compile_check(project_dir)
-    if compile_finding is not None:
-        findings.append(compile_finding)
-        reason = "the project does not compile"
-        result = VerifyResult(
-            findings=drift_mod.rank_findings(findings),
             suppressed={
                 "build_status": reason,
                 "no_relation": reason,
@@ -863,23 +848,72 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "column_contract": reason,
                 "grain": reason,
                 "join_contract": reason,
+                "compile": reason,
             },
-            warnings=[
-                "build-status, no-relation, row-population, column-contract, "
-                "grain and join-contract findings suppressed: the project "
-                "does not compile, so its manifest cannot be trusted"
-            ],
+            warnings=[f"maintain verify could not read the project format: {reason}"],
         )
-        return result
 
-    warnings = list(compile_notes)
-    build_findings, build_notes = verify_mod.build_status_findings(project_dir)
-    findings.extend(build_findings)
-    warnings.extend(build_notes)
-    if build_notes:
-        suppressed["build_status"] = build_notes[0]
+    definitions = project.definitions()
+    suppressed: dict[str, str] = {}
+    findings: list = []
+    warnings = list(definitions.notes)
+    project_dir: Path | None = None
+    artifact_reason: str | None = None
+    if project.name == "dbt":
+        try:
+            project_dir = Path(engine.project_dir())
+        except (ProjectError, RepoRootRequiredError) as exc:
+            artifact_reason = f"dbt target/ artifacts are unavailable: {exc}"
+    else:
+        artifact_reason = (
+            f"the '{project.name}' project format does not provide dbt target/ "
+            "artifacts"
+        )
 
-    definitions = engine.project_format().definitions()
+    if artifact_reason is not None:
+        for finding_class in (
+            "compile",
+            "build_status",
+            "row_population",
+            "column_contract",
+            "join_contract",
+        ):
+            suppressed[finding_class] = artifact_reason
+        warnings.append(
+            "maintain verify ran no-relation and grain through the project "
+            f"format seam; dbt target-dependent checks were suppressed: "
+            f"{artifact_reason}"
+        )
+    if project_dir is not None:
+        compile_finding, compile_notes = verify_mod.compile_check(project_dir)
+        if compile_finding is not None:
+            findings.append(compile_finding)
+            reason = "the project does not compile"
+            result = VerifyResult(
+                findings=drift_mod.rank_findings(findings),
+                suppressed={
+                    "build_status": reason,
+                    "no_relation": reason,
+                    "row_population": reason,
+                    "column_contract": reason,
+                    "grain": reason,
+                    "join_contract": reason,
+                },
+                warnings=[
+                    "build-status, no-relation, row-population, column-contract, "
+                    "grain and join-contract findings suppressed: the project "
+                    "does not compile, so its manifest cannot be trusted"
+                ],
+            )
+            return result
+
+        warnings.extend(compile_notes)
+        build_findings, build_notes = verify_mod.build_status_findings(project_dir)
+        findings.extend(build_findings)
+        warnings.extend(build_notes)
+        if build_notes:
+            suppressed["build_status"] = build_notes[0]
+
     wanted = (
         {
             name.strip().lower()
@@ -894,11 +928,13 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     adapter = None
     offer = None
     if not definitions.present:
-        suppressed["no_relation"] = "no dbt project found"
-        suppressed["row_population"] = "no dbt project found"
-        suppressed["column_contract"] = "no dbt project found"
-        suppressed["grain"] = "no dbt project found"
-        suppressed["join_contract"] = "no dbt project found"
+        reason = "the project format returned no readable project declarations"
+        suppressed["no_relation"] = reason
+        suppressed["grain"] = reason
+        if project_dir is not None:
+            suppressed["row_population"] = reason
+            suppressed["column_contract"] = reason
+            suppressed["join_contract"] = reason
     else:
         model_relations = dict(definitions.model_relations)
         if wanted:
@@ -915,10 +951,11 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             adapter = engine._adapter("maintain verify")
         except DexError as exc:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
-            suppressed["row_population"] = f"warehouse unreachable: {exc}"
-            suppressed["column_contract"] = f"warehouse unreachable: {exc}"
             suppressed["grain"] = f"warehouse unreachable: {exc}"
-            suppressed["join_contract"] = f"warehouse unreachable: {exc}"
+            if project_dir is not None:
+                suppressed["row_population"] = f"warehouse unreachable: {exc}"
+                suppressed["column_contract"] = f"warehouse unreachable: {exc}"
+                suppressed["join_contract"] = f"warehouse unreachable: {exc}"
         else:
             cost = command_args.preflight_cost(adapter)
             live = adapter.list_objects()
@@ -928,13 +965,6 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                     model_relations, [o.identifier for o in live], already
                 )
             )
-            column_findings, column_warnings, column_reason = _column_contract(
-                project_dir, adapter, model_relations, live, scope=wanted
-            )
-            findings.extend(column_findings)
-            warnings.extend(column_warnings)
-            if column_reason is not None:
-                suppressed["column_contract"] = column_reason
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter, definitions, model_relations, live, scope=wanted
             )
@@ -943,39 +973,48 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             if grain_reason is not None:
                 suppressed["grain"] = grain_reason
 
-            row_ask, join_ask = _combined_scan_handshake(
-                adapter,
-                lambda: verify_mod.join_contract_cost(
+            if project_dir is not None:
+                column_findings, column_warnings, column_reason = _column_contract(
+                    project_dir, adapter, model_relations, live, scope=wanted
+                )
+                findings.extend(column_findings)
+                warnings.extend(column_warnings)
+                if column_reason is not None:
+                    suppressed["column_contract"] = column_reason
+
+                row_ask, join_ask = _combined_scan_handshake(
+                    adapter,
+                    lambda: verify_mod.join_contract_cost(
+                        project_dir,
+                        adapter,
+                        model_relations,
+                        [o.identifier for o in live],
+                        scope=wanted,
+                    ),
+                )
+                row_findings, row_warnings, row_reason, offer = _row_population(
+                    engine, adapter, project_dir, live, handshake=row_ask
+                )
+                findings.extend(row_findings)
+                warnings.extend(row_warnings)
+                if row_reason is not None:
+                    suppressed["row_population"] = row_reason
+                join_findings, join_warnings, join_reason, join_offer = _join_contract(
+                    engine,
                     project_dir,
                     adapter,
                     model_relations,
-                    [o.identifier for o in live],
+                    live,
                     scope=wanted,
-                ),
-            )
-            row_findings, row_warnings, row_reason, offer = _row_population(
-                engine, adapter, project_dir, live, handshake=row_ask
-            )
-            findings.extend(row_findings)
-            warnings.extend(row_warnings)
-            if row_reason is not None:
-                suppressed["row_population"] = row_reason
-            join_findings, join_warnings, join_reason, join_offer = _join_contract(
-                engine,
-                project_dir,
-                adapter,
-                model_relations,
-                live,
-                scope=wanted,
-                handshake=join_ask,
-            )
-            findings.extend(join_findings)
-            warnings.extend(join_warnings)
-            if join_reason is not None:
-                suppressed["join_contract"] = join_reason
-            # Both axes ask through the same shared cache, so a non-None
-            # offer from either names both; take whichever answered.
-            offer = offer or join_offer
+                    handshake=join_ask,
+                )
+                findings.extend(join_findings)
+                warnings.extend(join_warnings)
+                if join_reason is not None:
+                    suppressed["join_contract"] = join_reason
+                # Both axes ask through the same shared cache, so a non-None
+                # offer from either names both; take whichever answered.
+                offer = offer or join_offer
 
     if wanted:
         findings = [f for f in findings if (f.identifier or "").lower() in wanted]

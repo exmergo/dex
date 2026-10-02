@@ -1,11 +1,13 @@
 """Live explore against Snowflake sample data: free inventory, the confirm
 handshake with a heuristic seconds estimate (credits alongside), the
-over-ceiling refusal (free), and a firewalled query. Reads only
-SNOWFLAKE_SAMPLE_DATA; warehouse time bills to the pinned X-Small, capped per
-statement by the suite's second ceiling."""
+over-ceiling refusal (free), a firewalled query, and key value shapes. Reads
+SNOWFLAKE_SAMPLE_DATA plus two tiny tables this suite writes into its own
+schema of the scratch database; warehouse time bills to the pinned X-Small,
+capped per statement by the suite's second ceiling."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -278,3 +280,112 @@ def test_bigquery_flags_are_refused_on_snowflake(
     assert rc == 1
     assert "--dataset" in envelope["errors"][0]
     assert "--scope" in envelope["errors"][0]
+
+
+# --- key value shapes over written fixtures -------------------------------------------
+
+KEY_SHAPE_SCHEMA = "KEY_SHAPE"
+# Five of the twenty (25% of rows) are spelt in the letters A to F only.
+KEY_SHAPE_COUNTRIES = "AD BE CA DE EC US GB FR IT JP NL NO SE PL PT IN MX ZA KR NZ"
+
+
+@pytest.fixture
+def sf_key_shape_tables(
+    tmp_path: Path, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """Two tiny transient tables for the key value-shape check, one per
+    direction, in a schema of the scratch database this fixture owns.
+
+    ``GEO`` is keyed by ``(DAY, COUNTRY)`` over two-letter country codes, a
+    fifth of them spelt only in A to F, so it must stay silent (#481).
+    ``SKUS`` is the merged-catalogue key: 270 numeric ids and 30 md5 hashes,
+    so it must still report both shapes. The schema is dropped afterwards;
+    the transient database is the backstop for a crashed run.
+    """
+
+    import snowflake.connector
+
+    from exmergo_dex_core.config import SnowflakeTarget
+    from exmergo_dex_core.connect import resolve_snowflake_connection
+
+    params, _method = resolve_snowflake_connection(
+        SnowflakeTarget(connection_name=sf_connection_name), os.environ, tmp_path
+    )
+    schema = f'"{sf_scratch_database}".{KEY_SHAPE_SCHEMA}'
+    codes = ", ".join(f"('{c}')" for c in KEY_SHAPE_COUNTRIES.split())
+    conn = snowflake.connector.connect(**params)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f'USE WAREHOUSE "{sf_warehouse}"')
+        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        cursor.execute(
+            f"CREATE OR REPLACE TRANSIENT TABLE {schema}.GEO AS "  # noqa: S608
+            "SELECT DATEADD(day, d.n, '2026-09-01'::DATE) AS DAY, "
+            "c.column1::VARCHAR AS COUNTRY "
+            "FROM (SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS n "
+            "FROM TABLE(GENERATOR(ROWCOUNT => 10))) d "
+            f"CROSS JOIN (VALUES {codes}) c"
+        )
+        cursor.execute(
+            f"CREATE OR REPLACE TRANSIENT TABLE {schema}.SKUS AS "  # noqa: S608
+            "SELECT i AS PRODUCT_ID, IFF(i <= 270, (400000 + i)::VARCHAR, "
+            "MD5('catalog-merge-' || i)) AS SKU "
+            "FROM (SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) AS i "
+            "FROM TABLE(GENERATOR(ROWCOUNT => 300)))"
+        )
+        yield f"{sf_scratch_database}.{KEY_SHAPE_SCHEMA}"
+    finally:
+        try:
+            conn.cursor().execute(f"DROP SCHEMA IF EXISTS {schema}")
+        finally:
+            conn.close()
+
+
+def test_key_value_shapes_ignore_short_codes_and_still_catch_mixed_ids(
+    tmp_path: Path,
+    capsys,
+    sf_scratch_database,
+    sf_warehouse,
+    sf_connection_name,
+    sf_key_shape_tables: str,
+):
+    """The key-shape check's regexes run inside Snowflake, whose RLIKE
+    anchors implicitly, so this is the only place its reading of the shared
+    patterns is proven: a country-code key is one shape here, and a numeric
+    key with md5 hashes merged into it is two, with the cast warning."""
+
+    seed_repo(
+        tmp_path,
+        sf_scratch_database,
+        sf_warehouse,
+        sf_connection_name,
+        databases=[sf_key_shape_tables],
+    )
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "profile",
+            "GEO",
+            "SKUS",
+            "--confirm",
+            "--budget",
+            str(SF_MAX_SECONDS),
+        ],
+        capsys,
+    )
+    assert_ok(rc, envelope)
+    datasets = {
+        d["identifier"].rsplit(".", 1)[-1]: d for d in envelope["data"]["datasets"]
+    }
+
+    geo = datasets["GEO"]
+    # The country column is a key member, so the check did look at it.
+    assert set(geo["grain"]) == {"DAY", "COUNTRY"}, geo["key_evidence"]
+    geo_notes = " ".join(geo["data_quality"])
+    assert "mixes value shapes" not in geo_notes, geo_notes
+    sku_notes = " ".join(datasets["SKUS"]["data_quality"])
+    assert "SKU is a candidate key but mixes value shapes" in sku_notes, sku_notes
+    assert "90% numeric, 10% 32-character hexadecimal (md5-shaped)" in sku_notes
+    assert "casting to a number or comparing numerically" in sku_notes

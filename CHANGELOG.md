@@ -53,6 +53,35 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   can be removed, and while it stays it is a committed entry, refused whenever
   it names nothing.
 
+- **`explore profile` no longer reports a key of short codes as mixing value
+  shapes because some of them are spelt in the letters A to F** ([#481]). A
+  table keyed by day and ISO country code was reported as *"country is a
+  candidate key but mixes value shapes: 11% 2-character hexadecimal, 89%
+  other"*, on a column where every value is a two-letter code. Fifteen codes
+  (AD, AE, AF, BA, BE, CA, DE, EC and seven more) use only the letters A to F,
+  and the hexadecimal shape tested the character set alone, so they counted
+  as hex. The same went for airline seats (`12A` through `40K`), grid
+  references, and three-letter currency codes such as `CAD`. A value now counts
+  as hexadecimal only at 8 characters or more. Below that, ordinary codes are
+  spelt in the hex alphabet by chance often enough to clear the 5% share the
+  note reports from (a random two-letter code is 5.3% of the time); at 8 the
+  chance is 0.15%, and 8 hex characters (32 bits) is the shortest hex id in
+  common use. md5, sha1, sha256, dashless UUIDs and mixed-length hex columns
+  are reported exactly as before.
+
+  A hex value shorter than 8 characters now counts as `other` instead, so a
+  population of short hashes (7-character git short SHAs, say) mixed into a
+  numeric key is still reported, as `90% numeric, 10% other` rather than `90%
+  numeric, 10% 7-character hexadecimal`. The only mix that stops being reported
+  is a short code split across the two groups by its spelling.
+
+  The note's consequence clause now follows the groups it reports. *"casting to
+  a number or comparing numerically will silently drop the non-numeric
+  group(s)"* is kept, word for word, whenever a numeric group is one of them. A
+  mix with no numeric group (md5 hashes beside slugs, UUIDs beside sha1 hashes)
+  had the same warning about a cast nobody makes, and now ends with *"a join or
+  filter written for one shape will silently miss the other group(s)"*.
+
 ## [1.12.4] - 2026-09-30
 
 ### Security

@@ -115,6 +115,22 @@ rather than implied, and the suppressed ones follow. That is also what makes a
 probe that ran and found only artifacts distinguishable from one that never ran,
 which the probe's own budget notes say instead.
 
+A candidate key held as a string is also checked for **mixed value shapes**, the
+trace a partial migration or a merged upstream leaves in an id column. The
+profiling scan sorts every non-null value into one of four groups, numeric, dashed
+UUID, hexadecimal, or other, and returns only the fraction in each. When two or
+more groups each hold at least 5% of the values, the profile names them in a
+data-quality note. A value counts as hexadecimal only at 8 characters or more:
+below that, ordinary codes such as two-letter country codes or airline seats like
+`12A` are spelt in the letters A to F by chance often enough to clear 5% on their
+own. A shorter hex value counts as other instead, so a population of short hashes
+mixed into a numeric key is still reported, under that name. The note ends with
+the consequence that fits the groups it names: with a numeric group, a cast or
+numeric comparison silently drops the rest; without one, a join or filter written
+for one shape silently misses the others. Only the fractions and a label derived
+from the hex lengths (`32-character hexadecimal (md5-shaped)`) leave the engine,
+never a value.
+
 Two safety rules are enforced at the source, in the SQL that is generated:
 
 - **min and max are surfaced only where the extreme value is not itself

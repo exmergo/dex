@@ -113,9 +113,10 @@ class ColumnAggregate:
     #: engine requested via ``key_shape_stats`` (non-PII string columns).
     #: The numeric bucket reuses ``numeric_string_fraction`` above unchanged;
     #: ``hex_string_fraction`` explicitly excludes anything numeric already
-    #: claimed, so the two never double-count the same value. ``None`` means
-    #: not computed (not requested, ineligible type, or the dialect could
-    #: not).
+    #: claimed, so the two never double-count the same value, and counts only
+    #: values at or above the hex length floor (see ``HEX_PATTERN``). ``None``
+    #: means not computed (not requested, ineligible type, or the dialect
+    #: could not).
     uuid_string_fraction: float | None = None
     hex_string_fraction: float | None = None
     hex_string_min_length: int | None = None
@@ -563,15 +564,19 @@ UUID_PATTERN = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
-# Charset-only: length is measured separately (MIN/MAX in
-# key_shape_expressions), not baked into the pattern, since a real hash
-# column is fixed-length but this predicate must still catch a *mixed*-length
-# hex column so there is something to report on.
-HEX_PATTERN = r"^[0-9a-fA-F]+$"
-
-# Friendly names for the hash lengths this shape recurs as in practice;
-# anything else is reported by its bare length instead of guessing further.
-_HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
+# A length floor and no ceiling. The floor keeps ordinary short codes out of
+# the bucket: below 8 characters a code is spelt in the hex alphabet by chance
+# often enough to clear the minority share in
+# `explore.profile._HETEROGENEOUS_KEY_MIN_SHARE` on its own. A random
+# two-letter code is 5.3% of the time, and AD, BE, CA and twelve more put the
+# ISO country codes at 11%. At 8 characters the chance for letters and digits
+# drawn evenly is 0.15%, and 8 characters (32 bits) is the shortest hex
+# identifier in common use. Lower the floor or the share and recheck the
+# other. No ceiling, because a real hash column is fixed-length but this
+# predicate must still catch a *mixed*-length hex column so there is
+# something to report on; the length itself is measured separately (MIN/MAX
+# in key_shape_expressions).
+HEX_PATTERN = r"^[0-9a-fA-F]{8,}$"
 
 # What a shape-gated CAST reads on every row the shape predicate rejects, so
 # the cast's argument is digit-only for the whole column and the cast is total
@@ -758,11 +763,18 @@ def key_shape_expressions(
     numeric pattern already claimed (a pure-digit string like ``"123456"``
     is valid input to a hex-charset pattern too), which is what keeps
     ``numeric_string_fraction`` directly reusable here unchanged and keeps
-    the two buckets from double-counting the same value. Plain boolean
-    predicates ANDed together cast nothing, so the total-CAST discipline
-    ``type_contradiction_expressions`` has to keep does not apply here and
-    nothing in these expressions can raise on any dialect, whatever it
-    chooses to evaluate. ``qcol`` must already be quoted/escaped by the
+    the two buckets from double-counting the same value.
+
+    A hex-alphabet value shorter than the floor in ``HEX_PATTERN`` lands in
+    other rather than hex, so the floor can relabel a short hex population but
+    never takes it out of the note: mixed with numeric ids, it is still
+    reported, as numeric plus other. What the floor removes is a short code
+    split across hex and other by its spelling alone.
+
+    Plain boolean predicates ANDed together cast nothing, so the total-CAST
+    discipline ``type_contradiction_expressions`` has to keep does not apply
+    here and nothing in these expressions can raise on any dialect, whatever
+    it chooses to evaluate. ``qcol`` must already be quoted/escaped by the
     calling adapter.
     """
 
