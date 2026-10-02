@@ -82,6 +82,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   had the same warning about a cast nobody makes, and now ends with *"a join or
   filter written for one shape will silently miss the other group(s)"*.
 
+- **`maintain verify` runs its relation-existence and grain checks on a project
+  format that is not dbt** ([#479]). `verify` resolved the dbt project
+  directory before it consulted the project format, so a repository configured
+  with another format (`dagster-dex`, say) and no dbt project had every check
+  suppressed with *"maintain verify needs a dbt project"*. The command answered
+  `ok` with no findings, and a model the format declared but the warehouse did
+  not hold went unreported, although `maintain snapshot` read the same format on
+  the same root. `no_relation` and `grain` were already computed from the
+  format's declarations, past the one call that refused.
+
+  `verify` now reads the project format first. For a format other than dbt,
+  `no_relation` and `grain` run from the model relations it declares, and the
+  five checks that read dbt's `target/` artifacts (`compile`, `build_status`,
+  `row_population`, `column_contract`, `join_contract`) are suppressed with
+  *"the '<name>' project format does not provide dbt target/ artifacts"*. On a
+  dbt project the checks run as before, and `warnings` now also carries the
+  project's declaration notes, such as a manifest older than the model sources.
+
+  A repository on the dbt format with no dbt project still has every check
+  suppressed, under new reasons: the five artifact checks report *"dbt target/
+  artifacts are unavailable"* with the project error, and `no_relation` and
+  `grain` report *"the project format returned no readable project
+  declarations"*. `row_population` is now listed among them, where before it was
+  missing from `suppressed`.
+
 ## [1.12.4] - 2026-09-30
 
 ### Security
