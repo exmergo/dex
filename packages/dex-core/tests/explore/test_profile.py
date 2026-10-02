@@ -1036,6 +1036,188 @@ def test_heterogeneous_key_end_to_end_real_duckdb(tmp_path: Path):
     assert "comments" not in notes
 
 
+_CAST_CLAUSE = "casting to a number or comparing numerically"
+_JOIN_CLAUSE = "a join or filter written for one shape will silently miss"
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "clause"),
+    [
+        # Numeric beside a hash: the cast is the hazard.
+        (
+            {
+                "numeric_string_fraction": 0.9,
+                "hex_string_fraction": 0.1,
+                "hex_string_min_length": 32,
+                "hex_string_max_length": 32,
+            },
+            _CAST_CLAUSE,
+        ),
+        # Numeric beside an unclassified remainder: still a cast hazard.
+        ({"numeric_string_fraction": 0.9}, _CAST_CLAUSE),
+        # Hashes beside slugs: nothing numeric to cast, a join misses instead.
+        (
+            {
+                "hex_string_fraction": 0.5,
+                "hex_string_min_length": 32,
+                "hex_string_max_length": 32,
+            },
+            _JOIN_CLAUSE,
+        ),
+        # UUIDs beside sha1 hashes, again with no numeric group.
+        (
+            {
+                "uuid_string_fraction": 0.6,
+                "hex_string_fraction": 0.4,
+                "hex_string_min_length": 40,
+                "hex_string_max_length": 40,
+            },
+            _JOIN_CLAUSE,
+        ),
+        # A numeric remnant under the share is not a reported group, so it
+        # does not bring the cast warning back.
+        (
+            {
+                "numeric_string_fraction": 0.03,
+                "hex_string_fraction": 0.5,
+                "hex_string_min_length": 32,
+                "hex_string_max_length": 32,
+            },
+            _JOIN_CLAUSE,
+        ),
+    ],
+)
+def test_heterogeneous_key_note_consequence_follows_the_groups_reported(
+    agg_kwargs: dict, clause: str
+):
+    """#481: the cast warning is only true when a numeric group is one of
+    the shapes reported; otherwise the note names the join hazard."""
+
+    from exmergo_dex_core.explore.profile import _heterogeneous_key_note
+
+    note = _heterogeneous_key_note("id", _aggregate(**agg_kwargs))
+    assert note is not None
+    assert clause in note, note
+    other = _JOIN_CLAUSE if clause == _CAST_CLAUSE else _CAST_CLAUSE
+    assert other not in note, note
+
+
+# ISO 3166-1 alpha-2, as the issue's reproduction lists them. Fifteen (AD AE AF
+# BA BB BD BE BF CA CC CD CF DE EC EE) are spelt in the letters A to F only.
+_ISO_COUNTRY_CODES = (
+    "AD AE AF AG AL AM AO AR AT AU AZ BA BB BD BE BF BG BH BJ BN BO BR BS BW BY BZ "
+    "CA CC CD CF CG CH CI CL CM CN CO CR CU CY CZ DE DK DO DZ EC EE EG ES ET FI FJ FR "
+    "GA GB GE GH GR GT HK HN HR HU ID IE IL IN IQ IR IS IT JM JO JP KE KG KH KR KW KZ "
+    "LA LB LK LT LU LV MA MD MG MK ML MM MN MT MX MY MZ NG NI NL NO NP NZ OM PA PE PH "
+    "PK PL PT PY QA RO RS RU SA SE SG SI SK SN SV TH TN TR TW TZ UA UG US UY UZ VE VN "
+    "ZA ZM ZW"
+)
+
+
+def test_a_key_of_short_codes_spelt_in_a_to_f_reads_as_one_shape_real_duckdb(
+    tmp_path: Path,
+):
+    """#481: a key of two-letter country codes, and a key of airline seats,
+    each hold one shape. Before the hex length floor, the codes and seats
+    spelt only in A to F (11% of the countries, 60% of the seats) were
+    counted as hexadecimal and both keys read as mixing shapes."""
+
+    from datetime import date, timedelta
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "short_codes.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE geo (day DATE, country VARCHAR)")
+    conn.executemany(
+        "INSERT INTO geo VALUES (?, ?)",
+        [
+            (date(2026, 9, 1) + timedelta(days=d), code)
+            for d in range(5)
+            for code in _ISO_COUNTRY_CODES.split()
+        ],
+    )
+    conn.execute("CREATE TABLE seats (flight_no INTEGER, seat VARCHAR)")
+    conn.executemany(
+        "INSERT INTO seats VALUES (?, ?)",
+        [
+            (flight, f"{row}{letter}")
+            for flight in (117, 118, 119)
+            for row in range(1, 41)
+            for letter in "ABCDEFGHJK"
+        ],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        geo, seats = profile_fn(
+            adapter, ["short_codes.main.geo", "short_codes.main.seats"]
+        )
+    finally:
+        adapter.close()
+
+    assert {"day", "country"} in [set(k) for k in geo.composite_keys]
+    assert {"flight_no", "seat"} in [set(k) for k in seats.composite_keys]
+    for dataset in (geo, seats):
+        notes = " ".join(dataset.data_quality)
+        assert "mixes value shapes" not in notes, notes
+        assert "hexadecimal" not in notes, notes
+
+
+def test_the_hex_floor_relabels_short_hex_and_never_hides_a_numeric_mix_real_duckdb(
+    tmp_path: Path,
+):
+    """#481: the length floor sits at 8 characters. A 7-character hex
+    population beside numeric ids is still reported, as other; an
+    8-character one is still named hexadecimal."""
+
+    import hashlib
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    def short_hex(length: int) -> list[str]:
+        # md5-shaped test fixture data only, not a security use. A prefix
+        # with no letter would be claimed by the numeric bucket, so skip it.
+        out: list[str] = []
+        token = 0
+        while len(out) < 10:
+            digest = hashlib.md5(str(token).encode(), usedforsecurity=False)
+            prefix = digest.hexdigest()[:length]
+            if not prefix.isdigit() and prefix not in out:
+                out.append(prefix)
+            token += 1
+        return out
+
+    db_path = tmp_path / "hex_floor.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE t (id7 VARCHAR UNIQUE, id8 VARCHAR UNIQUE)")
+    numeric = [str(400000 + i) for i in range(90)]
+    conn.executemany(
+        "INSERT INTO t VALUES (?, ?)",
+        list(zip(numeric + short_hex(7), numeric + short_hex(8), strict=True)),
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["hex_floor.main.t"])
+    finally:
+        adapter.close()
+
+    notes = {note.split(" ", 1)[0]: note for note in dataset.data_quality}
+    assert "90% numeric, 10% other" in notes["id7"], notes
+    assert "hexadecimal" not in notes["id7"], notes
+    assert _CAST_CLAUSE in notes["id7"], notes
+    assert "90% numeric, 10% 8-character hexadecimal" in notes["id8"], notes
+
+
 # --- boolean-shaped flag with more than two values (#218) ----------------------
 
 
