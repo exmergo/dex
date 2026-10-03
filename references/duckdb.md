@@ -122,6 +122,11 @@ and the answer. Nothing is materialized either way, because a mutant builds as
 an ephemeral model, so the dev database holds exactly the relations it held
 before.
 
+Each survivor is also compared with the unmutated model on the dev data, free
+and unasked here: one aggregate `dbt show` per survivor, plus one self-check of
+the unmutated model against itself, labels it `equivalent` or
+`distinguishable`. `--no-check-equivalence` turns that off.
+
 
 
 The dev target being the source file is also why `transform init`'s content

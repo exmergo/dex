@@ -405,7 +405,9 @@ class ShadowRun:
     :func:`shadow_parse` copies a project to parse it once. This is the same
     isolation held open across a sequence of invocations, which is what mutation
     coverage needs: one copy, then a compile and N test runs against it, each
-    with a different version of one model's file.
+    with a different version of one model's file, and an aggregate ``show`` for
+    each survivor. The verbs are ``parse``, ``compile``, ``test`` and ``show``,
+    never ``run`` or ``build``: none of them can materialize a relation.
 
     Stateful by nature, hence a class rather than a function taking the same six
     arguments each call: it owns the copy's lifetime, and dbt's partial-parse
@@ -458,6 +460,13 @@ class ShadowRun:
         path = contained_path(self._require_shadow(), rel_path, self.view)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+
+    def remove(self, rel_path: str) -> None:
+        """Take a file back out of the copy, confined the same way as ``write``."""
+
+        contained_path(self._require_shadow(), rel_path, self.view).unlink(
+            missing_ok=True
+        )
 
     def strip_run_hooks(self) -> bool:
         """Drop ``on-run-start`` and ``on-run-end`` from the copy. True if any went.
@@ -516,6 +525,35 @@ class ShadowRun:
         if not results.is_file():
             return None
         return _summarize(self._require_shadow(), self.target, completed)
+
+    def show(
+        self, select: str
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+        """Run one node's SELECT and hand back its first row, for an aggregate.
+
+        Only for a node whose every projection is an aggregate dex wrote itself,
+        because what comes back is the row. ``dbt show`` executes the compiled
+        SELECT and nothing else: no materialization, no DDL, no hook.
+
+        The summary settles spend exactly as a test run's does, and it carries
+        no dbt messages: a warehouse error can quote a value from the data it
+        failed on, and nothing here is worth that risk. The rows are ``None``
+        when dbt failed or printed no preview.
+        """
+
+        completed = self._invoke(
+            "show", "--select", select, "--limit", "1", "--output", "json"
+        )
+        results = self._require_shadow() / "target" / "run_results.json"
+        summary = None
+        if results.is_file():
+            summary = {
+                **_summarize(self._require_shadow(), self.target, completed),
+                "messages": [],
+            }
+        if completed.returncode != 0:
+            return summary, None
+        return summary, _show_preview(completed)
 
     def _invoke(self, verb: str, *args: str) -> subprocess.CompletedProcess:
         shadow = self._require_shadow()
@@ -1302,6 +1340,34 @@ def _collect_messages(
     if trimmed and log_hint is not None:
         messages.append(f"full output: {log_hint}")
     return messages
+
+
+def _show_preview(
+    completed: subprocess.CompletedProcess,
+) -> list[dict[str, Any]] | None:
+    """The rows ``dbt show --output json`` printed, from its ``ShowNode`` event.
+
+    ``None`` when no such event was logged or its preview is not a JSON list of
+    objects. The caller decides what a row may contain; this only finds it.
+    """
+
+    for line in (completed.stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if (event.get("info") or {}).get("name") != "ShowNode":
+            continue
+        try:
+            rows = json.loads((event.get("data") or {}).get("preview") or "")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+            return rows
+        return None
+    return None
 
 
 def _summarize(

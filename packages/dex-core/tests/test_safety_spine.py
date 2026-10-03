@@ -816,6 +816,147 @@ def test_mutation_coverage_prices_its_whole_batch_before_running_any_of_it(
     assert "test" not in invoked
 
 
+def _mutation_dbt(invoked: list[str], *, show_stdout: str = "", on_run=None):
+    """A dbt stand-in for mutation coverage: one model, one test, one comparison.
+
+    Every invocation writes the same manifest (the comparison node carries
+    compiled SQL that reads the model's CTE, so it can be priced), a test run
+    passes, and a show prints ``show_stdout``.
+    """
+
+    def factory(timeout, cwd, env=None):
+        def run(argv):
+            invoked.append(argv[1])
+            if on_run is not None:
+                on_run(argv)
+            target_path = Path(argv[argv.index("--target-path") + 1])
+            target_path.mkdir(parents=True, exist_ok=True)
+            shadow = Path(argv[argv.index("--project-dir") + 1])
+            # As in dbt, the comparison is a node once its file is in the copy.
+            comparison = {
+                "model.dex_test.dex_mutation_equivalence": {
+                    "name": "dex_mutation_equivalence",
+                    "unique_id": "model.dex_test.dex_mutation_equivalence",
+                    "resource_type": "model",
+                    "compiled_code": (
+                        "with __dbt__cte__fct as (select id from raw) "
+                        "select count(*) from __dbt__cte__fct"
+                    ),
+                }
+            }
+            if not list(shadow.rglob("dex_mutation_equivalence.sql")):
+                comparison = {}
+            (target_path / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"project_name": "dex_test"},
+                        "nodes": {
+                            **comparison,
+                            "model.dex_test.fct": {
+                                "name": "fct",
+                                "unique_id": "model.dex_test.fct",
+                                "package_name": "dex_test",
+                                "language": "sql",
+                                "config": {"materialized": "ephemeral"},
+                                "depends_on": {"nodes": []},
+                                "compiled_code": (
+                                    "select id, amount from raw where amount > 1"
+                                ),
+                            },
+                            "test.dex_test.not_null_fct_id.abc": {
+                                "name": "not_null_fct_id",
+                                "unique_id": "test.dex_test.not_null_fct_id.abc",
+                                "resource_type": "test",
+                                "attached_node": "model.dex_test.fct",
+                                "depends_on": {"nodes": ["model.dex_test.fct"]},
+                                "compiled_code": (
+                                    "with __dbt__cte__fct as (select id from raw) "
+                                    "select id from __dbt__cte__fct"
+                                ),
+                            },
+                        },
+                        "unit_tests": {},
+                    }
+                )
+            )
+            if argv[1] in {"test", "show"}:
+                (target_path / "run_results.json").write_text(
+                    json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "unique_id": "test.dex_test.not_null_fct_id.abc",
+                                    "status": "pass",
+                                    "execution_time": 0.0,
+                                }
+                            ]
+                        }
+                    )
+                )
+            stdout = show_stdout if argv[1] == "show" else ""
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=stdout, stderr=""
+            )
+
+        return run
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    "connector",
+    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+)
+def test_the_equivalence_check_is_priced_into_the_one_batch_estimate(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """Comparing each survivor with the model is spend on every connector but
+    DuckDB, so asked for it is priced into the batch the caller already
+    confirms: one number, as if every mutant survived, and nothing runs first.
+    Where dex has no verified comparison it is left out of the number entirely
+    rather than priced and then skipped."""
+
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+    from exmergo_dex_core.transform import commands as transform_commands
+
+    (dbt_project_dir / "models" / "staging" / "fct.sql").write_text(
+        "select o.id, o.amount from {{ ref('stg_customers') }} o where o.amount > 1\n",
+        encoding="utf-8",
+    )
+    invoked: list[str] = []
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.build"),
+        "_default_runner",
+        _mutation_dbt(invoked),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.dev_target"),
+        "check",
+        lambda *a, **k: [],
+    )
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(
+            connector=connector, dbt_target="dev", dbt_project_dir=dbt_project_dir.name
+        ),
+    )
+    monkeypatch.setattr(
+        DexEngine, "_adapter", lambda self, command=None: _EstimatingAdapter(connector)
+    )
+
+    with pytest.raises(ConfirmationRequiredError) as raised:
+        transform_commands.test_mutations(engine, "fct", check_equivalence=True)
+
+    lines = raised.value.request.data["per_table_bytes"]
+    verified = connector in {"bigquery", "snowflake"}
+    assert ("(equivalence self-check)" in lines) is verified
+    assert ("(equivalence checks, if every mutant survives)" in lines) is verified
+    assert raised.value.request.data["estimated_bytes"] == sum(lines.values())
+    assert "test" not in invoked and "show" not in invoked
+
+
 @pytest.mark.parametrize(
     "connector",
     ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
@@ -2328,6 +2469,7 @@ def test_a_mutant_is_never_written_into_the_project(dbt_project_dir: Path, monke
 
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
     seen_mutants: list[str] = []
+    seen_comparison: list[str] = []
 
     def fake_runner(timeout, cwd, env=None):
         def run(argv):
@@ -2335,6 +2477,9 @@ def test_a_mutant_is_never_written_into_the_project(dbt_project_dir: Path, monke
             mutant = shadow / "models" / "staging" / "fct.sql"
             if mutant.is_file():
                 seen_mutants.append(mutant.read_text())
+            seen_comparison.extend(
+                path.name for path in shadow.rglob("dex_mutation_*.sql")
+            )
             target_path = Path(argv[argv.index("--target-path") + 1])
             target_path.mkdir(parents=True, exist_ok=True)
             (target_path / "manifest.json").write_text(
@@ -2408,6 +2553,11 @@ def test_a_mutant_is_never_written_into_the_project(dbt_project_dir: Path, monke
     assert model.read_text() == (
         "select id, amount from {{ ref('stg_customers') }} where amount > 1\n"
     )
+    # So were the unmutated twin and the comparison the equivalence check adds:
+    # present in the copy, absent from the project.
+    assert "dex_mutation_baseline.sql" in seen_comparison
+    assert "dex_mutation_equivalence.sql" in seen_comparison
+    assert not list(dbt_project_dir.rglob("dex_mutation_*"))
 
 
 def test_a_house_convention_warns_and_never_imposes(dbt_project_dir: Path):
@@ -3843,6 +3993,60 @@ def test_no_payload_is_keyed_by_a_warehouse_object_name(capsys):
     )
     env.emit(envelope)  # raises SanitizationError if any object name became a key
     assert capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "preview",
+    [
+        [{"only_in_mutant": "someone@example.com", "only_in_baseline": 0,
+          "mutant_rows": 1, "baseline_rows": 1}],
+        [{"only_in_mutant": 0, "only_in_baseline": 0, "mutant_rows": 1,
+          "baseline_rows": 1, "email": "someone@example.com"}],
+        [{"id": 1, "email": "someone@example.com"}],
+    ],
+)  # fmt: skip
+def test_the_equivalence_check_lets_only_counts_out_of_the_warehouse(
+    preview, dbt_project_dir: Path, monkeypatch, capsys
+):
+    """The comparison reads one row back from the warehouse, so that row is a
+    boundary. dex writes a statement that projects four counts and nothing
+    else; if anything other than exactly those came back, the reader treats it
+    as a comparison that did not run, and none of it reaches stdout."""
+
+    from exmergo_dex_core.transform import commands as transform_commands
+
+    (dbt_project_dir / "models" / "staging" / "fct.sql").write_text(
+        "select id, amount from {{ ref('stg_customers') }} where amount > 1\n",
+        encoding="utf-8",
+    )
+    stdout = json.dumps(
+        {"info": {"name": "ShowNode"}, "data": {"preview": json.dumps(preview)}}
+    )
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.build"),
+        "_default_runner",
+        _mutation_dbt([], show_stdout=stdout),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.dev_target"),
+        "check",
+        lambda *a, **k: [],
+    )
+    engine = DexEngine(
+        connector="duckdb",
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(
+            connector="duckdb", dbt_target="dev", dbt_project_dir=dbt_project_dir.name
+        ),
+    )
+
+    result = transform_commands.test_mutations(engine, "fct")
+    env.emit(to_envelope(result))
+
+    out = capsys.readouterr().out
+    assert "someone@example.com" not in out
+    assert result.equivalence["self_check"] == "failed"
 
 
 # --- BigQuery: the billed connector exercises every family ---------------------

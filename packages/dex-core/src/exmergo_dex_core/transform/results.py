@@ -327,6 +327,13 @@ class MutationCoverageResult(Result):
     tests that passed before anything was mutated, so the excluded ones have to
     be visible: a suite whose only real test was already failing would otherwise
     report a clean sweep of survivors and read as though it had been measured.
+
+    ``equivalence`` says whether the survivors were compared with the model on
+    the dev data, how many differ and how many do not, and the self-check that
+    makes the comparison worth trusting. It is present even when the check was
+    off, carrying the reason, because an absent key would read as "nothing to
+    compare". Equivalent survivors stay in ``score``: a fixture can still catch
+    them, and leaving them out would flatter the suite.
     """
 
     model: str = ""
@@ -337,6 +344,7 @@ class MutationCoverageResult(Result):
     score: float | None = None
     cap: dict[str, Any] = Field(default_factory=dict)
     runs: int = 0
+    equivalence: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         return {
@@ -348,6 +356,7 @@ class MutationCoverageResult(Result):
             "score": self.score,
             "cap": self.cap,
             "runs": self.runs,
+            "equivalence": self.equivalence,
         }
 
 
