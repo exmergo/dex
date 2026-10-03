@@ -12,6 +12,7 @@ switch to the explicit ``--path`` form.
 from __future__ import annotations
 
 import argparse
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -105,7 +106,8 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     Takes the engine for signature consistency with every other command shim and
     deliberately does not use it: demo reaches no warehouse, no store, and no
     project, so anything it read off the engine would be a connection it has no
-    business resolving.
+    business resolving. The directory it writes into is ``--repo-root`` (the
+    shell cwd by default), read straight off ``args`` for the same reason.
     """
 
     read_path = getattr(args, "path", None)
@@ -116,20 +118,36 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             f"this is the one command that writes one. Use `dex demo {read_path}`"
         )
 
-    target = Path(getattr(args, "target", None) or DEMO_FILENAME)
+    # The raw run directory, not `repo_root(args)` and not `engine.repo_root`:
+    # both walk up to whichever config owns the tree, and `dex --repo-root R demo`
+    # has to land exactly where `cd R && dex demo` does, so that the shadowing
+    # check below still sees a config above R as one to leave alone. An absolute
+    # target ignores the run directory, because pathlib's join drops the left
+    # side when the right one is absolute.
+    run_dir = Path(getattr(args, "repo_root", None) or ".")
+    named = Path(getattr(args, "target", None) or DEMO_FILENAME)
+    target = run_dir / named
     warehouse = generate_demo_warehouse(target)
 
     # The config goes beside the warehouse, and only where nothing above already
     # owns one: `resolve_dex_root` is the same walk every command uses to find
     # its project, so agreeing with it here is what stops the demo shadowing a
-    # real config with one of its own.
+    # real config with one of its own. What gets reported is relative to the run
+    # directory, the way every writer reports the files it wrote under its root.
     root = target.parent
     config_path = root / DEX_DIR / CONFIG_FILE
-    config_rel = str(config_path)
+    config_rel = str(named.parent / DEX_DIR / CONFIG_FILE)
     existing_root = resolve_dex_root(root)
-    created = [str(target)]
+    created = [str(named)]
     diffs: list[dict[str, Any]] = []
     warnings: list[str] = []
+
+    # The printed commands are typed into the caller's shell, wherever this one
+    # ran from. So they carry the same --repo-root, or the cache `explore map`
+    # writes would land in the cwd, and a --path is spelled from the cwd too,
+    # because a live --path resolves against the shell rather than the root.
+    rerun = "" if run_dir == Path() else f" --repo-root {shlex.quote(str(run_dir))}"
+    explicit = f"{rerun} --path {shlex.quote(str(target))}"
     if existing_root is None:
         save_config(
             DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=target.name)), root
@@ -138,20 +156,20 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         diffs.append(
             file_diff(config_rel, None, config_path.read_text(encoding="utf-8"))
         )
-        # Bare commands only work from the directory the config landed in, so the
-        # flagless tour is offered only when that is where the caller already is.
-        flags = "" if root == Path() else f" --path {target}"
+        # The config only resolves for commands rooted where it landed, so the
+        # tour names the file unless that is the run directory itself.
+        flags = rerun if named.parent == Path() else explicit
     else:
         warnings.append(
             f"'{existing_root}' already has a .dex/config.yml and it was left "
             "untouched; the commands below name the demo warehouse explicitly "
             "rather than repointing your project at it"
         )
-        flags = f" --path {target}"
+        flags = explicit
 
     return to_envelope(
         DemoResult(
-            path=str(target),
+            path=str(named),
             seed=warehouse.seed,
             row_count=warehouse.row_count,
             tables=[

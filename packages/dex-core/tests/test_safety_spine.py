@@ -3293,6 +3293,21 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     assert committed.read_text(encoding="utf-8") == before
     assert any("left untouched" in w for w in payload["warnings"])
 
+    # And driven from elsewhere with --repo-root, both artifacts land in the
+    # named root and nothing lands in the cwd, however well a .gitignore there
+    # would hide them. The root is its own git checkout, so the project config
+    # above does not own it and the demo writes its config too.
+    elsewhere, repo = tmp_path / "elsewhere", tmp_path / "repo"
+    elsewhere.mkdir()
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+    assert main(["--repo-root", str(repo), "demo"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["created"] == ["dex_demo.duckdb", ".dex/config.yml"]
+    written = sorted(str(p.relative_to(repo)) for p in repo.rglob("*") if p.is_file())
+    assert written == sorted(payload["data"]["created"])
+    assert list(elsewhere.iterdir()) == []
+
 
 def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys):
     # Init bakes the connector into a durable artifact (the generated

@@ -68,8 +68,11 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (7
                                      29,512 rows) plus a .dex/config.yml beside it, so a
                                      first run needs no warehouse and no credentials;
                                      reports both under data.created and names what to
-                                     run next under data.next_steps. Create-only and not
-                                     confirmable: an existing target refuses, no
+                                     run next under data.next_steps. A relative path
+                                     resolves against --repo-root and is reported
+                                     relative to it; the next steps carry the same
+                                     --repo-root so they run as printed. Create-only
+                                     and not confirmable: an existing target refuses, no
                                      directory is ever created, and an existing config
                                      at or above the target is left alone with a warning
 dex connect test                  -> {capabilities, dialect, read_only: true}
@@ -1057,6 +1060,10 @@ config found anywhere and no explicit `--connector`/`--path`, the engine refuses
 and names the fix rather than defaulting to DuckDB. A committed relative
 `duckdb.path` resolves against the project root the config lives in, so the same
 target opens from any subdirectory; a live `--path` stays relative to the shell cwd.
+`dex demo`'s positional path differs because it names a file to write rather than
+one to read: a relative one resolves against the `--repo-root` directory itself
+(not the walked-up project root), so the demo writes exactly what
+`cd <repo-root> && dex demo` would.
 
 `--scope` is repeatable and narrows the source allowlist for one command. Each
 connector reads it in its own namespace vocabulary: a `dataset` on BigQuery, a

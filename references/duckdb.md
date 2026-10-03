@@ -46,8 +46,10 @@ dex explore map     # no flags: the config demo wrote points at the file it made
 (`customers` 1,200, `products` 300, `orders` 5,000, `order_items` 14,000,
 `web_events` 9,000, `warehouse_locations` 12, and `returns`, which an interrupted
 load left empty). No credentials, no cloud account, no network. The path is
-positional and resolves against the working directory; `--path` is refused there,
-because everywhere else it names the warehouse dex reads.
+positional and resolves against `--repo-root`, which defaults to the working
+directory, so `dex --repo-root R demo` writes both files into `R` and the commands
+it prints carry the same `--repo-root`. `--path` is refused there, because
+everywhere else it names the warehouse dex reads.
 
 **Generated, not committed.** DuckDB's storage format has broken backward
 compatibility across releases before, so a committed file could stop opening for a
