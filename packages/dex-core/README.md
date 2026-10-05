@@ -107,7 +107,7 @@ config selects, which defaults to plain files under `.dex/`). The `Store` protoc
 is public, so a host can back state with its own session store or database
 instead, and a backend published as its own package is selectable by name from
 `cache.backend` without a change to dex. See
-[`references/storage.md`](../../references/storage.md).
+[`references/storage.md`](https://github.com/exmergo/dex/blob/main/references/storage.md).
 
 [`examples/quickstart.py`](examples/quickstart.py) is the whole flow in one
 runnable file: map a warehouse, read the inferred joins and the data-quality
@@ -210,7 +210,7 @@ dex connect test
 
 The CLI is the API's first consumer rather than a parallel implementation: it
 parses arguments, builds an engine, and wraps the result it gets back. See
-[`references/command-contract.md`](../../references/command-contract.md) for the
+[`references/command-contract.md`](https://github.com/exmergo/dex/blob/main/references/command-contract.md) for the
 full surface and the envelope spec.
 
 ## Status
@@ -357,9 +357,9 @@ asks for keys). Metadata is free; every scan is dry-run first, returned as a
 capped server-side by `maximum_bytes_billed` and recorded in a local
 `.dex/spend.jsonl` ledger (one JSON object per line, every row declaring its
 kind, documented in
-[`references/command-contract.md`](../../references/command-contract.md)). dbt
+[`references/command-contract.md`](https://github.com/exmergo/dex/blob/main/references/command-contract.md)). dbt
 builds go to a dedicated dev dataset via dbt-bigquery, which the `[bigquery]`
-extra carries. See [`references/bigquery.md`](../../references/bigquery.md).
+extra carries. See [`references/bigquery.md`](https://github.com/exmergo/dex/blob/main/references/bigquery.md).
 
 Snowflake: connects through discovered credentials (`connections.toml`,
 `SNOWFLAKE_*` env, or a dbt profile; dex never asks for or persists a
@@ -372,7 +372,7 @@ per-statement server-side `STATEMENT_TIMEOUT_IN_SECONDS`, and actual seconds
 land in the same `.dex/spend.jsonl` ledger. Billed work runs only on the
 warehouse the config pins. dbt builds go to a dedicated dev database.schema
 via dbt-snowflake, which the `[snowflake]` extra carries. See
-[`references/snowflake.md`](../../references/snowflake.md).
+[`references/snowflake.md`](https://github.com/exmergo/dex/blob/main/references/snowflake.md).
 
 Databricks: the lakehouse connector. Connects through the Databricks SDK's
 unified auth chain (`databricks auth login`, `DATABRICKS_*` env, or a dbt
@@ -386,7 +386,7 @@ per-statement server-side `STATEMENT_TIMEOUT`, and actual seconds land in the
 same `.dex/spend.jsonl` ledger. Billed work runs only on the SQL warehouse
 the config pins. dbt builds go to a dedicated dev catalog.schema via
 dbt-databricks, which the `[databricks]` extra carries. See
-[`references/databricks.md`](../../references/databricks.md).
+[`references/databricks.md`](https://github.com/exmergo/dex/blob/main/references/databricks.md).
 
 Amazon Redshift: Serverless-first and provisioned-compatible. Connects through
 the AWS default credential chain (a pinned Serverless `workgroup` or provisioned
@@ -402,7 +402,7 @@ minimum; the budget is hard-enforced by a per-statement server-side
 ledger. Profiling uses `HLL(...)` approximate distincts with exact escalation
 in-budget; the session is read-only at the server. dbt builds go to a dedicated
 dev schema via dbt-redshift, which the `[redshift]` extra carries. See
-[`references/redshift.md`](../../references/redshift.md).
+[`references/redshift.md`](https://github.com/exmergo/dex/blob/main/references/redshift.md).
 
 PostgreSQL: the operational-database connector. Connects through discovered
 credentials (`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a
@@ -417,7 +417,7 @@ server (`default_transaction_read_only = on`), profiling leans on the
 planner's own statistics instead of scanning distincts, and dbt builds go to
 a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
 carries, with the ceiling injected as a statement timeout through
-`PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
+`PGOPTIONS`. See [`references/postgres.md`](https://github.com/exmergo/dex/blob/main/references/postgres.md).
 
 ClickHouse: the self-hosted analytical connector and ClickHouse Cloud warehouse.
 Connects through discovered
@@ -439,7 +439,7 @@ rather than what the client waited. The session sends `readonly = 2` and
 database via dbt-clickhouse, which the `[clickhouse]` extra carries, with the
 ceiling injected through the profile's `custom_settings`. Cloud corroborates
 `cloud_mode` and fails closed unless every replica reports its capacity. See
-[`references/clickhouse.md`](../../references/clickhouse.md).
+[`references/clickhouse.md`](https://github.com/exmergo/dex/blob/main/references/clickhouse.md).
 
 ## License
 

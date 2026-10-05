@@ -8,6 +8,7 @@ structure failure is a bad document, a missing-extra failure is a bad install.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -167,7 +168,9 @@ def test_an_unknown_structural_key_reports_incompatibility_not_a_cause(
     """The document may be wrong or it may be newer, and dex cannot tell which.
 
     A message that picks one sends half the readers to the wrong fix, so it
-    reports the incompatibility and names where the pinned draft is recorded.
+    reports the incompatibility, names the pinned spec version, and carries the
+    fix for each case inline rather than pointing at a file the reader of an
+    envelope cannot open.
     """
 
     doc = reference_document()
@@ -178,8 +181,12 @@ def test_an_unknown_structural_key_reports_incompatibility_not_a_cause(
     found = [d for d in result.diagnostics if d.rule == "unknown_key"]
 
     assert found, rules(result)
-    assert "PROVENANCE" in found[0].message
-    assert "typo" in found[0].message and "newer draft" in found[0].message
+    message = found[0].message
+    pinned = json.loads(schema_bytes())["properties"]["version"]["const"]
+    assert f"spec version {pinned}" in message
+    assert "typo" in message and "newer draft" in message
+    assert "remove the key" in message and "dex release that pins" in message
+    assert ".md" not in message
 
 
 def test_a_nested_malformed_shape_collects_rather_than_raising(tmp_path: Path):

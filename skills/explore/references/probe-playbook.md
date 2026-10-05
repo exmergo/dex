@@ -153,6 +153,27 @@ FROM t
 `COUNTIF(cond)` is equivalent to `COUNT(*) FILTER (WHERE cond)` and passes the
 firewall the same way: the condition is a filter, not a projected value.
 
+## Unnesting JSON and arrays
+
+The FROM clause may unnest JSON and array columns in the connector's native
+idiom, which is the right way to explore schemaless data (for example "which keys
+appear across every row of this JSON column"):
+
+| Connector | Idiom |
+|---|---|
+| BigQuery | `t, UNNEST(JSON_KEYS(doc)) AS k` |
+| Snowflake | `t, LATERAL FLATTEN(input => doc) f` |
+| Databricks | `t LATERAL VIEW EXPLODE(json_object_keys(doc)) x AS k` |
+| Postgres | `t, jsonb_object_keys(doc) AS k` |
+| Redshift | `t, UNPIVOT t.doc AS v AT k` |
+| DuckDB | `t, UNNEST(json_keys(doc)) AS u(k)` |
+| ClickHouse | `t ARRAY JOIN JSONExtractKeysAndValuesRaw(doc) AS kv` (there is no lateral join; ARRAY JOIN is the expansion) |
+
+The unnested value must come from a column of a table in the query, bare or
+through a JSON or array function. Unnesting a subquery, another table, a
+literal, or a generator is refused, and the unnest's outputs inherit the source
+column's PII flags.
+
 ## When a probe is refused
 
 The refusal names the column, its PII category, and the fix. Rewrite once: swap
