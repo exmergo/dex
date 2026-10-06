@@ -43,7 +43,8 @@ from pathlib import Path
 from ..errors import DexError
 
 # The default target. A name rather than a path: where it lands is the command's
-# decision (the directory the user is standing in), not this module's.
+# decision (the `--repo-root` run directory, by default the one the user is
+# standing in), not this module's.
 DEMO_FILENAME = "dex_demo.duckdb"
 
 # Pinned. Changing it changes every count the documentation quotes, so it is a

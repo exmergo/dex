@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.12.6] - 2026-10-06
+
 ### Added
 
 - **`transform test --mutate` says which survivors the dev data could ever tell
@@ -64,6 +66,24 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   2,379 seconds, of which 2,340 were floors, and was refused at a 300-second
   budget it fit in. The same fix Redshift already carries for its wake minimum:
   the floor is quoted once, and charged once, by whichever statement runs first.
+
+- **`dex demo` writes into `--repo-root`, not the directory it was run from**
+  ([#509]). The demo built its target from the positional argument alone, so
+  `dex --repo-root R demo` wrote `dex_demo.duckdb` and `.dex/config.yml` into the
+  process's current directory and never touched `R`. Nothing reported it: the
+  envelope's `path` and `created` were relative and read as correct, and a
+  checkout that ignores both files kept `git status` clean.
+
+  A relative target now resolves against the `--repo-root` directory, on either
+  side of `demo`, so the command writes what `cd R && dex demo` would. That is
+  the directory as given, not the project root dex walks up to, so a config
+  above `R` is still left alone with a warning rather than shadowed. `path`,
+  `created`, and the config diff stay relative to that directory, the way
+  `transform init` reports its files. The printed next steps carry the same
+  `--repo-root`, because without it the cache `explore map` writes would land in
+  the current directory one command later, and any `--path` they name is
+  spelled from the caller's shell. An absolute target, and `dex demo` with no
+  `--repo-root`, behave as before.
 
 ## [1.12.5] - 2026-10-02
 
