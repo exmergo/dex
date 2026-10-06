@@ -523,7 +523,8 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   there.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
-  tests and PII flags in column `meta`) generated from the `.dex/` cache.
+  tests under `data_tests:` and PII flags in model and column `config.meta`)
+  generated from the `.dex/` cache.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

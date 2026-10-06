@@ -9,6 +9,35 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **dex writes its PII stamp under `config.meta` and its tests under
+  `data_tests:`** ([#490]). dbt moved `meta` under `config:`: a top-level `meta`
+  still parses in dbt-core 1.11 but is deprecated, dbt Fusion rejects it, and the
+  deprecation warning only fires when every adapter in the project is BigQuery,
+  Databricks, Redshift, or Snowflake, so a DuckDB, Postgres, or ClickHouse project
+  never saw it. A model entry carrying both forms is a dbt parse error, so a
+  staging model dex scaffolded with a PII column broke `dbt parse` as soon as
+  anyone added `config: {meta: ...}` to it.
+
+  - `transform plan --scaffold` and `maintain reconcile` now stamp
+    `contains_pii` and `pii_category` under model and column `config.meta`. The
+    key names are unchanged, because tools outside dex read them.
+  - Every reader of the stamp accepts both locations, preferring `config.meta`,
+    so a project scaffolded by an older dex keeps working without a rewrite.
+  - A `schema_yml` edit that leaves one model, seed, or snapshot entry with both
+    a top-level `meta` and `config.meta`, or one entry or column with both
+    `tests` and `data_tests`, is refused at plan time with the fix named rather
+    than reaching `dbt parse`.
+  - The scaffold writes `data_tests:`, dbt's current key. A test dex adds to a
+    column that already has a list keeps that list's key; a column with no list
+    takes the spelling the file already uses, and `data_tests` when it has none.
+  - The keys the writers emit and the keys the semantic request gate accepts now
+    come from one list. The gate also reads `pii_category` for the category it
+    names in a refusal.
+  - Messages that told a user to mark a dimension with `meta: {pii: ...}` now say
+    `config: {meta: {pii: ...}}`.
+
 ## [1.12.5] - 2026-10-02
 
 ### Fixed

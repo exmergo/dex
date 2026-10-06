@@ -26,6 +26,7 @@ import yaml
 from ..adapters.project import PlacingProject
 from ..cache import ColumnProfile
 from ..dbt_project import DbtProjectView
+from ..guards.pii_meta import CONTAINS_PII, entry_meta, says_pii, stamp_lines
 from ..transform.plans import EditKind, PlanEdit
 from ..transform.rewrite import (
     RewriteError,
@@ -207,9 +208,8 @@ class DeclarationEdits:
             # The flag propagates, never an example value: PII is flagged, not
             # surfaced, and the category is what a reviewer acts on.
             lines += [
-                f"{indent}  meta:\n",
-                f"{indent}    contains_pii: true\n",
-                f"{indent}    pii_category: {profile.pii.category.value}\n",
+                f"{line}\n"
+                for line in stamp_lines(f"{indent}  ", profile.pii.category.value)
             ]
             self._warn_model_meta(placed, profile.name, content)
         entry = self._staged.setdefault(placed.path, _Staged())
@@ -372,13 +372,16 @@ class DeclarationEdits:
             ),
             {},
         )
-        if (entry.get("meta") or {}).get("contains_pii"):
+        # Both locations, config.meta winning: a project scaffolded by an older
+        # dex carries the stamp at the top level, and one a human brought up to
+        # date carries it under config.
+        if says_pii(entry_meta(entry)):
             return
         self.warnings.append(
             f"'{column}' is flagged as possible PII, so its new entry in "
-            f"{placed.path} carries contains_pii; dex did not add a model-level "
-            f"meta block to '{placed.model}', so add contains_pii there yourself "
-            "if this format's readers expect it"
+            f"{placed.path} carries {CONTAINS_PII}; dex did not add a model-level "
+            f"config.meta block to '{placed.model}', so add {CONTAINS_PII} under "
+            "its config.meta yourself if this format's readers expect it"
         )
 
     def _disagreement(self, base: str, content: str, staged: _Staged) -> str | None:

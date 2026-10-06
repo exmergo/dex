@@ -116,8 +116,8 @@ often does not.
 - **A PII-flagged dimension on `values` refuses the command outright**, rather than
   being screened out of a larger answer, because the whole output is values. The
   refusal names the two durable ways to clear a dimension reviewed as not personal
-  data: a `pii_overrides` entry in `.dex/config.yml`, or `meta: {pii: false}` on
-  the dimension in the project that declares it. Do not work around it by querying
+  data: a `pii_overrides` entry in `.dex/config.yml`, or
+  `config: {meta: {pii: false}}` on the dimension in the project that declares it. Do not work around it by querying
   the same column another way.
 - **A PII-shaped `--group-by` or `--where` token refuses the query** before it
   runs. `user__email` is the standing example: the token's own shape is enough.

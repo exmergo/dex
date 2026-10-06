@@ -577,7 +577,8 @@ database, which is fine for model-only builds.
 - Propose, don't impose. Human edits to the project (SQL and semantic YAML) and
   to a native semantic document are authoritative; on conflict the engine
   surfaces a diff and asks rather than overwriting.
-- PII flags propagate from the cache into emitted dbt (model and column `meta`),
+- PII flags propagate from the cache into emitted dbt (model and column
+  `config.meta`),
   never example values. Stamping is presence-based at any confidence; only a
   column cleared by a human `pii_overrides` entry in `.dex/config.yml` is
   scaffolded without the meta.

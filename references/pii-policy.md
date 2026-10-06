@@ -31,7 +31,7 @@ confidence against the blocking threshold.
 | Surface | Gate | Effect |
 |---|---|---|
 | min and max suppression | presence, any confidence | the extremes are never computed, so no raw value leaves the engine |
-| dbt `meta` stamping | presence, any confidence | the flag is stamped into model and column `meta` |
+| dbt `meta` stamping | presence, any confidence | the flag is stamped into model and column `config.meta` |
 | cluster feature selection | presence, any confidence | flagged columns are excluded; naming one is opt-in and mean only |
 | the query firewall | threshold | at or above, projection is refused; below, it runs with a warning |
 | the seed header gate | threshold | a seed column at or above the threshold is refused |
@@ -40,6 +40,13 @@ confidence against the blocking threshold.
 A weak flag therefore still suppresses min and max and still stamps `meta`,
 while allowing a query that projects the column. What a weak flag means is the
 consumer's decision, and the consumers differ on purpose.
+
+The stamp is `contains_pii: true` on the model, and `contains_pii: true` plus
+`pii_category: <category>` on each flagged column, written under `config.meta`
+because dbt deprecated a top-level `meta` and dbt Fusion rejects it. The key names
+are unchanged from earlier releases, because tools outside dex read them. Readers
+accept a stamp in either location, preferring `config.meta`, so a project
+scaffolded by an older dex keeps working without a rewrite.
 
 ## The threshold
 
@@ -98,7 +105,8 @@ Two durable routes, both reviewable in git and both re-applied on every profile
 so they survive re-profiling:
 
 1. A `pii_overrides` entry in `.dex/config.yml`.
-2. `meta: {pii: false}` on the dimension in the project, for a semantic layer.
+2. `config: {meta: {pii: false}}` on the dimension in the project, for a
+   semantic layer.
 
 An override takes effect at query time immediately, without re-profiling, and
 leaves an audit trail in the cache recording which category the detector had

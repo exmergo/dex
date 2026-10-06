@@ -31,6 +31,7 @@ something to take on trust.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -1011,16 +1012,17 @@ def prevailing_test_key(content: str) -> str:
     """Whether this file spells its tests ``tests`` or ``data_tests``.
 
     dbt accepts both and a file that already chose one should not gain the other.
-    Decided by which spelling more column entries use; with no precedent, ``tests``,
-    which is what dex's own scaffold writes.
+    Decided by which spelling more entries use. With no precedent, or a tie,
+    ``data_tests``: it is dbt's current key, ``tests`` is a silent alias for it,
+    and it is what dex's own scaffold writes. Only a column with no test list
+    takes this answer; a list that exists keeps its own key.
     """
 
     counts = {
-        "tests": content.count("tests:"),
-        "data_tests": content.count("data_tests:"),
+        key: len(re.findall(rf"(?<![\w-]){key}:", content))
+        for key in ("tests", "data_tests")
     }
-    counts["tests"] -= counts["data_tests"]
-    return "data_tests" if counts["data_tests"] > counts["tests"] else "tests"
+    return "tests" if counts["tests"] > counts["data_tests"] else "data_tests"
 
 
 def column_tests_span(

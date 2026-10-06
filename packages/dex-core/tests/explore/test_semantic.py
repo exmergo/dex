@@ -597,7 +597,7 @@ def test_hosted_discloses_name_only_screening():
     # adjudicated by the layer, so absent; unknown to the layer, so named
     assert "user__pricing_tier" not in note
     assert "session__mode" in note
-    assert "meta: {pii: true}" in note
+    assert "config: {meta: {pii: true}}" in note
 
 
 def test_hosted_says_nothing_when_the_layer_adjudicated_everything():
