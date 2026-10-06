@@ -134,7 +134,7 @@ Plans a `unit_tests:` skeleton: a `given` block per `ref()`/`source()` input
 carrying only the columns the model reads, typed from the cache, and an `expect:`
 stub that fails until filled in.
 
-## `transform test --mutate <model> [--max-mutants <n>]`
+## `transform test --mutate <model> [--max-mutants <n>] [--check-equivalence|--no-check-equivalence]`
 
 Plants one standard analytics defect at a time in the model's compiled SQL (a
 flipped boundary, a dropped or negated filter, a swapped join type, a removed
@@ -143,6 +143,14 @@ the model's own tests against each, and reports which defects nothing caught.
 
 - Read `data.counts`, then the survivors, listed first. Each carries `defect` (what
   would now be wrong) and `suggested_test` (the test that would catch it).
+- Each survivor's `equivalence.status` says which test to suggest, and
+  `suggested_test` already follows it. `distinguishable` changes the model's
+  output on the dev data, so an assertion over that data would catch it today;
+  these are listed first. `equivalent` produces exactly the model's rows there,
+  so only a unit test fixture that reaches the case can catch it. The comparison
+  is four counts, never a row. It runs on its own on DuckDB; on BigQuery or
+  Snowflake it needs `--check-equivalence` and joins the same single estimate;
+  other connectors report `not_checked`, which carries a `reason`.
 - `score` is a ratio of two small integers over one model.
 - `baseline.excluded` names tests already failing against the unmutated model;
   every verdict is relative to the tests that passed.

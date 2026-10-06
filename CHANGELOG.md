@@ -19,6 +19,82 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   pinned spec version and carries both fixes inline instead of pointing at
   `PROVENANCE.md`, and the PyPI project description's links now resolve.
 
+## [1.12.6] - 2026-10-06
+
+### Added
+
+- **`transform test --mutate` says which survivors the dev data could ever tell
+  apart** ([#466]). A surviving mutant is a defect no test caught, and for some
+  survivors no test against today's data could have: an inner join where every
+  key resolves, a window frame no partition is long enough to reach, a dropped
+  status filter whose rows a join removes anyway. Those need a fixture that
+  reaches the case, not another assertion, and the report could not say which
+  was which. Each survivor is now compared with the unmutated model on the dev
+  target and labelled in `equivalence`: `equivalent` when they produce the same
+  rows, `distinguishable` when the data already differs, with the counts that
+  established it (`only_in_mutant`, `only_in_baseline`, `mutant_rows`,
+  `baseline_rows`). Distinguishable survivors are listed first, and
+  `suggested_test` follows the label: a fixture for an equivalent survivor, an
+  assertion over the data for a distinguishable one. Both kinds still count as
+  survived in `score`, since a fixture can catch either.
+
+  **Counts only, never a row.** The comparison fingerprints every row of each
+  side, counts the fingerprints as a multiset, so a mutant that only duplicates
+  rows still differs, and returns four integers. It runs through `dbt show` on
+  the same dev target the tests ran on, and anything back other than exactly
+  those four counts is treated as a comparison that did not run.
+
+  **The model has to reproduce itself first.** Before any survivor is compared,
+  the unmutated model is compared with itself. A `random()`, a uuid or a
+  `row_number()` over ties fails that self-check, and no survivor is labelled
+  rather than every one reading as different. `data.equivalence` reports the
+  self-check and the tally.
+
+  **Free on DuckDB, opt-in and priced once elsewhere.** On DuckDB it runs
+  unasked. On BigQuery and Snowflake it needs `--check-equivalence`, and the
+  comparisons join the batch's one estimate, priced as if every mutant survives,
+  so the run still confirms once. `--no-check-equivalence` turns it off
+  anywhere. Postgres, Databricks, ClickHouse and Redshift report survivors as
+  `not_checked` until dex has a verified whole-row comparison for them. Also
+  available as `DexEngine.test_mutations(model, check_equivalence=...)`.
+
+### Fixed
+
+- **`transform test --mutate` prices each mutant as its own statement** ([#466]).
+  The batch estimate was meant to splice each mutant into each test's compiled
+  SQL, so a mutant that widens a scan prices higher than the model it came from.
+  It spliced the mutant's dbt file instead, whose `{% raw %}` blocks and
+  `{{ ref() }}` calls no SQL parser reads, so every mutant fell back to the
+  baseline's price: the BigQuery estimates showed one identical line per
+  mutant. Live, on a date-partitioned source, dropping the partition filter now
+  prices at 202 MB and negating it at 229 MB, against a 136 MB baseline.
+
+- **Snowflake quotes the 60-second resume minimum once per command, not once
+  per priced statement** ([#466]). A command that priced several statements
+  against a suspended warehouse added the floor to every one of them. Mutation
+  coverage prices every test of every mutant, so a 39-statement batch quoted
+  2,379 seconds, of which 2,340 were floors, and was refused at a 300-second
+  budget it fit in. The same fix Redshift already carries for its wake minimum:
+  the floor is quoted once, and charged once, by whichever statement runs first.
+
+- **`dex demo` writes into `--repo-root`, not the directory it was run from**
+  ([#509]). The demo built its target from the positional argument alone, so
+  `dex --repo-root R demo` wrote `dex_demo.duckdb` and `.dex/config.yml` into the
+  process's current directory and never touched `R`. Nothing reported it: the
+  envelope's `path` and `created` were relative and read as correct, and a
+  checkout that ignores both files kept `git status` clean.
+
+  A relative target now resolves against the `--repo-root` directory, on either
+  side of `demo`, so the command writes what `cd R && dex demo` would. That is
+  the directory as given, not the project root dex walks up to, so a config
+  above `R` is still left alone with a warning rather than shadowed. `path`,
+  `created`, and the config diff stay relative to that directory, the way
+  `transform init` reports its files. The printed next steps carry the same
+  `--repo-root`, because without it the cache `explore map` writes would land in
+  the current directory one command later, and any `--path` they name is
+  spelled from the caller's shell. An absolute target, and `dex demo` with no
+  `--repo-root`, behave as before.
+
 ## [1.12.5] - 2026-10-02
 
 ### Fixed

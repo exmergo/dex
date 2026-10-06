@@ -208,6 +208,13 @@ a field, flag, or macro you need is not described here.
 - Relay each survivor's `defect` and `suggested_test`: the user's next action is
   to write that test. Quote `score` as context, never as a grade, and never
   compare it between models.
+- Each survivor's `equivalence.status` decides which test to suggest. Relay
+  `distinguishable` survivors first: an assertion over the dev data would catch
+  them today. An `equivalent` one can only be caught by a unit test fixture that
+  reaches the case, so say that rather than suggesting an assertion. On BigQuery
+  or Snowflake the check needs `--check-equivalence` and joins the same single
+  estimate, so ask the user before adding it. Relay a `not_checked` survivor's
+  `reason` rather than guessing a label.
 - Check `baseline.excluded` (tests already failing) and `cap.elided` (more sites
   than the 20-mutant cap) before calling a result clean, and relay any `not_run`
   rather than reading a short list as complete.

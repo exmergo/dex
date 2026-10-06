@@ -206,8 +206,9 @@ class SnowflakeAdapter:
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
         # The 60s resume minimum is charged once per command, by whichever
-        # billed statement runs first.
+        # billed statement runs first, and quoted into estimates once too.
         self._resume_floor_pending: bool | None = None
+        self._resume_floor_quoted = False
         self._session_prepared = False
 
     # --- capabilities (free) ---------------------------------------------------
@@ -726,16 +727,16 @@ class SnowflakeAdapter:
             ]
             batches = max((len(scan_columns) + _COLUMN_BATCH - 1) // _COLUMN_BATCH, 1)
             per_table[identifier] = batches * self._scan_seconds(meta.byte_size)
-        total = sum(per_table.values()) + self._resume_floor()
+        total = sum(per_table.values()) + self._estimate_floor()
         return total, per_table
 
     def query_estimate(self, sql: str) -> float:
         """The heuristic estimate for one firewall-approved query: the summed
         bytes of every referenced table over the scan rate, plus the resume
-        minimum when the warehouse is suspended."""
+        minimum once per command when the warehouse is suspended."""
 
         checked = assert_select_only(sql, dialect=self.dialect)
-        return self._statement_estimate(checked) + self._resume_floor()
+        return self._statement_estimate(checked) + self._estimate_floor()
 
     def _statement_estimate(self, sql: str) -> float:
         total_bytes = 0
@@ -764,6 +765,19 @@ class SnowflakeAdapter:
                 size_factor /= _GEN2_MULTIPLIER
         rate = _XSMALL_SCAN_BYTES_PER_SECOND * max(size_factor, 1.0)
         return max(byte_size / rate, _MIN_STATEMENT_SECONDS)
+
+    def _estimate_floor(self) -> float:
+        """The resume minimum's share of an estimate: included exactly once per
+        command. A command that prices many statements resumes the warehouse at
+        most once, so a sum of per-statement estimates (mutation coverage prices
+        every test of every mutant) must not multiply the floor into it
+        (verified live: a 39-statement batch quoted 2,379 seconds, of which
+        2,340 were floors)."""
+
+        if self._resume_floor() <= 0 or self._resume_floor_quoted:
+            return 0.0
+        self._resume_floor_quoted = True
+        return _RESUME_MINIMUM_SECONDS
 
     def _resume_floor(self) -> float:
         """60 once when the pinned warehouse is suspended (each resume bills a

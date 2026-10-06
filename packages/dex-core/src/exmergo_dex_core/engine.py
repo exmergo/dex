@@ -1383,6 +1383,7 @@ class DexEngine:
         *,
         max_mutants: int | None = None,
         target: str | None = None,
+        check_equivalence: bool | None = None,
     ) -> MutationCoverageResult:
         """Measure a model's tests by planting defects and seeing what they catch.
 
@@ -1393,12 +1394,22 @@ class DexEngine:
         billed connector the whole batch is priced and confirmed as one number.
 
         ``max_mutants`` may only narrow the engine's ceiling, never raise it.
+
+        ``check_equivalence`` labels each survivor by whether its output differs
+        from the model's on the dev data: one that does not needs a fixture that
+        reaches the case, one that does needs an assertion. ``None`` checks where
+        it is free (DuckDB), ``True`` checks and prices the comparisons into the
+        same batch on a billed connector, ``False`` never checks.
         """
 
         from .transform import commands as transform
 
         return transform.test_mutations(
-            self, model, max_mutants=max_mutants, target=target
+            self,
+            model,
+            max_mutants=max_mutants,
+            target=target,
+            check_equivalence=check_equivalence,
         )
 
     def deps(self) -> DepsResult:

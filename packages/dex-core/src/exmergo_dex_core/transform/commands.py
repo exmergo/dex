@@ -739,6 +739,7 @@ def test_mutations(
     *,
     max_mutants: int | None = None,
     target: str | None = None,
+    check_equivalence: bool | None = None,
 ) -> MutationCoverageResult:
     """Plant standard analytics defects in a model and report which tests miss them.
 
@@ -754,6 +755,12 @@ def test_mutations(
     then the whole batch is priced and confirmed once. N runs behind one
     handshake is the only shape that works here, since a per-mutant ask would
     make the caller answer twenty times for one question.
+
+    ``check_equivalence`` is tri-state, like ``--attribute-rows``. Comparing a
+    survivor's output with the model's on the dev data is free on DuckDB and
+    spend everywhere else, so ``None`` checks only where it bills nothing,
+    ``True`` checks and prices the comparisons into the same batch, and
+    ``False`` never checks.
     """
 
     from ..adapters import get_dialect
@@ -833,11 +840,30 @@ def test_mutations(
                     "or aggregate), so there is nothing to measure its tests against"
                 )
 
+            equivalence = _EquivalenceCheck.prepare(
+                shadow,
+                node,
+                model_path,
+                batch,
+                select=model,
+                requested=check_equivalence,
+                paradigm=paradigm,
+                connector=connector,
+                mutation_mod=mutation_mod,
+            )
+
             estimate = None
+            prices: dict[str, float] = {}
             if paradigm is not Paradigm.FREE_LOCAL:
                 adapter = engine._adapter("transform test")
-                estimate, per_mutant, price_notes = _price_mutations(
-                    adapter, shadow, model_path, batch, node, mutation_mod
+                estimate, per_table, prices, price_notes = _price_mutations(
+                    adapter,
+                    shadow,
+                    model_path,
+                    batch,
+                    node,
+                    mutation_mod,
+                    equivalence=equivalence,
                 )
                 warnings.extend(price_notes)
                 if estimate is not None:
@@ -845,7 +871,7 @@ def test_mutations(
                         "transform test",
                         adapter,
                         estimate,
-                        per_table=per_mutant or None,
+                        per_table=per_table or None,
                         notes=price_notes or None,
                     )
                 gate = command_args.cost_gate(adapter)
@@ -861,6 +887,8 @@ def test_mutations(
                 ceiling=ceiling,
                 estimate=estimate,
                 mutation_mod=mutation_mod,
+                prices=prices,
+                equivalence=equivalence,
             )
             runs, spend, run_warnings = result.pop("_meta")
             warnings.extend(run_warnings)
@@ -877,13 +905,7 @@ def test_mutations(
     if paradigm is Paradigm.FREE_LOCAL:
         warnings.extend(skipped_handshake_warning(paradigm, engine.confirmed))
 
-    survivors = result["counts"].get("survived", 0)
-    if survivors:
-        warnings.append(
-            f"{survivors} planted defect(s) survived this model's tests: no test "
-            "told the mutant apart, on the dev data or on the unit test fixtures. "
-            "They are in data.mutants, each with the test that would catch it"
-        )
+    warnings.extend(_survivor_warnings(result["counts"], result["equivalence"]))
     if batch.elided_total:
         warnings.append(
             f"{batch.elided_total} further mutant(s) were not run: the cap is "
@@ -904,10 +926,56 @@ def test_mutations(
             "elided": batch.elided,
         },
         runs=runs,
+        equivalence=result["equivalence"],
         spend=spend,
         cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
         warnings=warnings,
     )
+
+
+def _survivor_warnings(counts: dict, equivalence: dict | None) -> list[str]:
+    """The pointer line for the survivors, split by what the dev data said.
+
+    The split is the reason the comparison exists: a survivor the data already
+    tells apart is one an assertion would catch today, and one it cannot tell
+    apart needs a fixture before any assertion could see it. Saying "N
+    survived" without that would send the reader to write the wrong test for
+    half of them.
+    """
+
+    survivors = counts.get("survived", 0)
+    if not survivors:
+        return []
+    labelled = equivalence or {}
+    differ = labelled.get("distinguishable", 0)
+    same = labelled.get("equivalent", 0)
+    if not differ and not same:
+        warnings = [
+            f"{survivors} planted defect(s) survived this model's tests: no test "
+            "told the mutant apart, on the dev data or on the unit test "
+            "fixtures. They are in data.mutants, each with the test that would "
+            "catch it"
+        ]
+        if labelled.get("reason"):
+            warnings.append(
+                "the survivors are not labelled equivalent or distinguishable "
+                f"on the dev data: {labelled['reason']}"
+            )
+        return warnings
+    sentence = (
+        f"{survivors} planted defect(s) survived this model's tests. {differ} "
+        "change the model's output on the dev data, so a test asserting over "
+        f"that data would catch them today; {same} produce exactly the "
+        "unmutated model's rows there, so only a unit test fixture that reaches "
+        "the case can catch them"
+    )
+    unlabelled = labelled.get("not_checked", 0)
+    if unlabelled:
+        sentence += f"; {unlabelled} could not be compared"
+    return [
+        sentence + ". They are in data.mutants, the ones the data tells apart "
+        "first, each with the test that would catch it"
+    ]
 
 
 def _mutation_cost(paradigm, estimate, ceiling, adapter):
@@ -1071,8 +1139,15 @@ def _reference_jinja(parent: dict, unique_id: str) -> str:
     return f"{{{{ ref('{parent['name']}') }}}}"
 
 
-def _price_mutations(adapter, shadow, model_path, batch, node, mutation_mod):
-    """Price the whole batch upfront, per mutant, as one number to confirm.
+#: The per-table line for the comparisons, which are priced as a group because
+#: only the survivors will run one and nobody knows which those are yet.
+_EQUIVALENCE_LINE = "(equivalence checks, if every mutant survives)"
+
+
+def _price_mutations(
+    adapter, shadow, model_path, batch, node, mutation_mod, *, equivalence=None
+):
+    """Price the whole batch upfront, per statement, as one number to confirm.
 
     Each mutant is priced as the statements the warehouse will actually run,
     which means splicing it into each test's compiled SQL rather than pricing the
@@ -1080,11 +1155,25 @@ def _price_mutations(adapter, shadow, model_path, batch, node, mutation_mod):
     model it came from, and pricing the batch at the baseline's cost would
     under-report it. Under-reporting is the one direction a cost guard must never
     round.
+
+    The equivalence checks go into the same number, priced as if every mutant
+    survives. That is the ceiling, and the confirmed batch has to cover the
+    ceiling rather than a guess at how strong the suite is.
+
+    Returns the total, the per-table lines the handshake shows, the price of
+    each statement keyed the way the run loop asks for it, and notes.
     """
 
     estimator = getattr(adapter, "query_estimate", None)
     if estimator is None:
-        return None, {}, ["connector exposes no estimator; the batch is not priced"]
+        if equivalence is not None:
+            equivalence.disable("the comparisons could not be priced upfront")
+        return (
+            None,
+            {},
+            {},
+            ["connector exposes no estimator; the batch is not priced"],
+        )
 
     manifest = shadow.manifest()
     tests = [
@@ -1096,28 +1185,66 @@ def _price_mutations(adapter, shadow, model_path, batch, node, mutation_mod):
     if not tests:
         notes.append(
             "only unit tests read this model, and a unit test runs against "
-            "fixtures rather than the warehouse, so the batch prices at zero"
+            "fixtures rather than the warehouse, so the test runs price at zero"
+        )
+
+    def spliced(statement: str, body: str) -> str:
+        return (
+            mutation_mod.inline_into_test(
+                statement, model_name=node["name"], body=body, dialect=adapter.dialect
+            )
+            or statement
         )
 
     def price(body: str) -> float:
         total = 0.0
         for test_sql in tests:
-            spliced = mutation_mod.inline_into_test(
-                test_sql, model_name=node["name"], body=body, dialect=adapter.dialect
-            )
             with contextlib.suppress(Exception):
-                total += estimator(spliced if spliced is not None else test_sql)
+                total += estimator(spliced(test_sql, body))
         return total
 
-    per_mutant: dict[str, float] = {}
+    per_table: dict[str, float] = {}
+    prices: dict[str, float] = {}
     with contextlib.suppress(Exception):
-        per_mutant["(baseline)"] = price(batch.identity)
+        per_table["(baseline)"] = prices["(baseline)"] = price(batch.identity_compiled)
     for mutant in batch.mutants:
         with contextlib.suppress(Exception):
-            per_mutant[f"{mutant.id} {mutant.operator}"] = price(mutant.body)
-    if not per_mutant:
-        return None, {}, [*notes, "the batch could not be priced upfront"]
-    return sum(per_mutant.values()), per_mutant, notes
+            cost = price(mutant.compiled)
+            per_table[f"{mutant.id} {mutant.operator}"] = prices[mutant.id] = cost
+
+    if equivalence is not None and equivalence.enabled:
+        comparison = equivalence.compiled
+        try:
+            if not comparison:
+                raise ValueError("no compiled comparison")
+            self_check = estimator(comparison)
+            checks = {
+                mutant.id: estimator(spliced(comparison, mutant.compiled))
+                for mutant in batch.mutants
+            }
+        except Exception:
+            # On BigQuery this is a dry run, so a statement the warehouse would
+            # refuse is found here for free rather than once per survivor.
+            equivalence.disable(
+                "the comparison could not be priced upfront, so no survivor is "
+                "compared with the model on the dev data"
+            )
+        else:
+            per_table[_EquivalenceCheck.SELF_CHECK] = prices[
+                _EquivalenceCheck.SELF_CHECK
+            ] = self_check
+            per_table[_EQUIVALENCE_LINE] = sum(checks.values())
+            prices.update(
+                {f"{mutant_id} equivalence": cost for mutant_id, cost in checks.items()}
+            )
+            notes.append(
+                "the equivalence checks are priced as if every mutant survives; "
+                "only a survivor runs one, so the settled spend is at most this"
+            )
+
+    if not per_table:
+        return None, {}, {}, [*notes, "the batch could not be priced upfront"]
+    return sum(per_table.values()), per_table, prices, notes
 
 
 def _run_mutants(
@@ -1132,28 +1259,29 @@ def _run_mutants(
     ceiling: float | None,
     estimate: float | None,
     mutation_mod,
+    prices: dict[str, float] | None = None,
+    equivalence: _EquivalenceCheck | None = None,
 ):
-    """The baseline, then one run per mutant, stopping if the budget runs out."""
+    """The baseline, then one run per mutant, stopping if the budget runs out.
 
-    from ..envelope import Paradigm
+    A survivor is compared with the model on the dev data straight after its
+    own run, while its body is still the model file, so the comparison costs
+    one dbt invocation and no rewrite.
+    """
 
     warnings: list[str] = []
-    runs = 0
-    spent = 0.0
-    spend: dict[str, float | None] | None = None
-
-    shadow.write(model_path, batch.identity)
-    baseline_summary = shadow.test(model)
-    runs += 1
-    spend, _ = _settle_dbt_spend(
-        baseline_summary or {},
-        [],
+    meter = _BatchSpend(
         paradigm=paradigm,
         connector=connector,
         store=store,
-        estimate=None,
-        command="transform test",
+        ceiling=ceiling,
+        prices=prices,
+        fallback=(estimate or 0.0) / max(len(batch.mutants) + 1, 1),
     )
+
+    shadow.write(model_path, batch.identity)
+    baseline_summary = shadow.test(model)
+    meter.settle(baseline_summary, "(baseline)")
     baseline = _test_statuses(baseline_summary)
     excluded = [
         {"name": name, "status": status, "reason": _exclusion_reason(status)}
@@ -1168,55 +1296,55 @@ def _run_mutants(
             "then measure them"
         )
 
+    if equivalence is not None:
+        equivalence.run_self_check(meter, mutation_mod)
+
     mutants: list[dict] = []
     counts = {"killed": 0, "survived": 0, "rejected": 0, "not_run": 0}
-    per_run = (estimate or 0.0) / max(len(batch.mutants) + 1, 1)
-    for mutant in batch.mutants:
-        if (
-            paradigm is not Paradigm.FREE_LOCAL
-            and ceiling is not None
-            and spent + per_run > ceiling
-        ):
-            # An unknown settlement counts at its estimate, so the guard never
-            # rounds spend down on the way to deciding it can afford another run.
-            for remaining in batch.mutants[len(mutants) :]:
-                mutants.append({**remaining.payload(), "status": "not_run"})
-                counts["not_run"] += 1
-            warnings.append(
-                f"the confirmed budget covered {runs - 1} of {len(batch.mutants)} "
-                "mutants; the rest are reported as not_run. Re-run with a larger "
-                "--budget, or narrow the run with --max-mutants"
+    tested = 0
+
+    def stop(remaining) -> None:
+        for mutant in remaining:
+            mutants.append(
+                {**mutant.payload(), "status": "not_run", "equivalence": None}
             )
+            counts["not_run"] += 1
+        warnings.append(
+            f"the confirmed budget covered {tested} of {len(batch.mutants)} "
+            "mutants; the rest are reported as not_run. Re-run with a larger "
+            "--budget, or narrow the run with --max-mutants"
+        )
+
+    for index, mutant in enumerate(batch.mutants):
+        if not meter.affords(mutant.id):
+            stop(batch.mutants[index:])
             break
         shadow.write(model_path, mutant.body)
         summary = shadow.test(model)
-        runs += 1
-        run_spend, _ = _settle_dbt_spend(
-            summary or {},
-            [],
-            paradigm=paradigm,
-            connector=connector,
-            store=store,
-            estimate=None,
-            command="transform test",
-        )
-        spent += _spent_in_run(run_spend, paradigm, fallback=per_run)
-        spend = _merge_spend(spend, run_spend)
+        tested += 1
+        meter.settle(summary, mutant.id)
         verdict = mutation_mod.classify(baseline, _test_statuses(summary))
         counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
-        mutants.append(
-            {
-                **mutant.payload(),
-                "status": verdict.outcome,
-                "caught_by": verdict.caught_by,
-                "warn_only": verdict.warn_only,
-            }
+        record = {
+            **mutant.payload(),
+            "status": verdict.outcome,
+            "caught_by": verdict.caught_by,
+            "warn_only": verdict.warn_only,
+            "equivalence": None,
+        }
+        mutants.append(record)
+        if verdict.outcome != "survived" or equivalence is None:
+            continue
+        label = equivalence.check(meter, mutant.id, mutation_mod)
+        record["equivalence"] = label.payload()
+        record["suggested_test"] = mutation_mod.suggested_test(
+            mutant.operator, label.status
         )
+        if equivalence.out_of_budget:
+            stop(batch.mutants[index + 1 :])
+            break
 
-    # Survivors first: the reader is deciding which test to write next, and the
-    # mutants that were caught are the ones they need to read least.
-    order = {"survived": 0, "not_run": 1, "rejected": 2, "killed": 3}
-    mutants.sort(key=lambda m: (order.get(m["status"], 9), m["id"]))
+    mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
     decided = counts["killed"] + counts["survived"]
     return {
         "baseline": {
@@ -1229,8 +1357,289 @@ def _run_mutants(
         "mutants": mutants,
         "counts": {"generated": len(batch.mutants), **counts},
         "score": (counts["killed"] / decided) if decided else None,
-        "_meta": (runs, spend, warnings),
+        "equivalence": equivalence.summary() if equivalence is not None else None,
+        "_meta": (meter.runs, meter.spend, warnings),
     }
+
+
+def _survivor_rank(mutant: dict) -> int:
+    """Where a mutant sits in the report: the reader is choosing a test to write.
+
+    Survivors lead, and among them the ones the dev data already tells apart
+    come first, since an assertion over that data catches them today. An
+    unlabelled survivor ranks above an equivalent one, because a comparison
+    that never ran is no grounds for demoting it.
+    """
+
+    status = mutant.get("status")
+    if status == "survived":
+        label = (mutant.get("equivalence") or {}).get("status")
+        return {"distinguishable": 0, "equivalent": 2}.get(label, 1)
+    return {"not_run": 3, "rejected": 4, "killed": 5}.get(status, 9)
+
+
+class _BatchSpend:
+    """What one mutation batch has spent, and the rule that stops it.
+
+    A class because it carries state across every dbt invocation in the batch:
+    the running total the stop rule reads, the merged spend the envelope
+    reports, and the run count. Each statement asks it two things in order,
+    whether the next one fits and then what the finished one billed, and one
+    object answering both is what keeps the loop from threading the paradigm,
+    the connector, the store and the ceiling through every call.
+
+    Prices are per statement, keyed ``(baseline)``, a mutant's id, or
+    ``<id> equivalence``. A statement with no price of its own falls back to an
+    even share of the batch estimate.
+    """
+
+    def __init__(
+        self,
+        *,
+        paradigm,
+        connector: str,
+        store,
+        ceiling: float | None,
+        prices: dict[str, float] | None = None,
+        fallback: float = 0.0,
+    ):
+        self._paradigm = paradigm
+        self._connector = connector
+        self._store = store
+        self._ceiling = ceiling
+        self._prices = prices or {}
+        self._fallback = fallback
+        self._spent = 0.0
+        self.spend: dict[str, float | None] | None = None
+        self.runs = 0
+
+    def affords(self, key: str) -> bool:
+        """Whether the next statement still fits inside the confirmed budget."""
+
+        from ..envelope import Paradigm
+
+        if self._paradigm is Paradigm.FREE_LOCAL or self._ceiling is None:
+            return True
+        return self._spent + self._price(key) <= self._ceiling
+
+    def settle(self, summary: dict | None, key: str) -> None:
+        """Ledger one finished dbt invocation and add it to the running total."""
+
+        self.runs += 1
+        run_spend, _ = _settle_dbt_spend(
+            summary or {},
+            [],
+            paradigm=self._paradigm,
+            connector=self._connector,
+            store=self._store,
+            estimate=None,
+            command="transform test",
+        )
+        # An unknown settlement counts at its estimate, so the guard never rounds
+        # spend down on the way to deciding it can afford another run.
+        self._spent += _spent_in_run(
+            run_spend, self._paradigm, fallback=self._price(key)
+        )
+        self.spend = _merge_spend(self.spend, run_spend)
+
+    def _price(self, key: str) -> float:
+        return self._prices.get(key, self._fallback)
+
+
+class _EquivalenceCheck:
+    """Whether each survivor's output differs from the model's on the dev data.
+
+    A class because the self-check decides once, for the whole batch, whether
+    any comparison can be trusted: a model that does not reproduce its own
+    output (a ``random()``, a uuid, a ``row_number()`` over ties) would make
+    every survivor look different from it. Every check after that reads the
+    decision, and the tally the summary reports accumulates across them.
+
+    Built through :meth:`prepare`, which either writes the twin and the
+    comparison node into the copy or records why the check is off. Off is a
+    state with a reason, never an absence, because a survivor that was not
+    compared must say so rather than read as either label.
+    """
+
+    SELF_CHECK = "(equivalence self-check)"
+
+    def __init__(self, shadow=None, *, reason: str | None = None):
+        self._shadow = shadow
+        self.reason = reason
+        self.requested = reason is None
+        self.compiled: str | None = None
+        self.self_check: str | None = None
+        self.out_of_budget = False
+        self._tally = {"distinguishable": 0, "equivalent": 0, "not_checked": 0}
+
+    @classmethod
+    def prepare(
+        cls,
+        shadow,
+        node: dict,
+        model_path: str,
+        batch,
+        *,
+        select: str,
+        requested: bool | None,
+        paradigm,
+        connector: str,
+        mutation_mod,
+    ) -> _EquivalenceCheck:
+        """Write the twin and the comparison beside the model, or say why not.
+
+        Both files are compiled together with the model before anything runs.
+        That is the parse check, since a node dex added must never be the reason
+        the copy stops parsing and the tests stop running; it is also what puts
+        the comparison's compiled SQL in the manifest for pricing, next to the
+        tests', which a compile of the comparison alone would drop.
+        """
+
+        from ..adapters import get_dialect
+        from ..envelope import Paradigm
+        from .build import DbtRunError
+
+        free = paradigm is Paradigm.FREE_LOCAL
+        if requested is False:
+            return cls(reason="the equivalence check is off (--no-check-equivalence)")
+        if requested is None and not free:
+            return cls(
+                reason=(
+                    f"comparing a survivor with the model costs {connector} spend, "
+                    "so it is opt-in: re-run with --check-equivalence to price the "
+                    "comparisons into the same batch"
+                )
+            )
+        comparison = mutation_mod.equivalence_model(
+            _reference_jinja(node, node.get("unique_id", "")), get_dialect(connector)
+        )
+        if comparison is None:
+            return cls(
+                reason=(f"dex has no verified whole-row comparison for {connector} yet")
+            )
+        names = {
+            other.get("name") for other in shadow.manifest().get("nodes", {}).values()
+        }
+        taken = sorted(
+            {mutation_mod.BASELINE_TWIN, mutation_mod.EQUIVALENCE_NODE} & names
+        )
+        if taken:
+            return cls(
+                reason=(
+                    f"this project already has a node named {taken[0]}, which the "
+                    "comparison needs for itself"
+                )
+            )
+
+        folder = Path(model_path).parent
+        twin_path = (folder / f"{mutation_mod.BASELINE_TWIN}.sql").as_posix()
+        node_path = (folder / f"{mutation_mod.EQUIVALENCE_NODE}.sql").as_posix()
+        shadow.write(
+            twin_path, mutation_mod.twin_model(batch.identity, group=node.get("group"))
+        )
+        shadow.write(node_path, comparison)
+        try:
+            manifest = shadow.compile(f"{select} {mutation_mod.EQUIVALENCE_NODE}")
+        except DbtRunError:
+            shadow.remove(twin_path)
+            shadow.remove(node_path)
+            shadow.compile(select)
+            return cls(
+                reason=(
+                    "the comparison would not compile in this project, so no "
+                    "survivor is compared with the model on the dev data"
+                )
+            )
+        check = cls(shadow)
+        for other in manifest.get("nodes", {}).values():
+            if other.get("name") == mutation_mod.EQUIVALENCE_NODE:
+                check.compiled = other.get("compiled_code")
+        return check
+
+    @property
+    def enabled(self) -> bool:
+        return self.reason is None
+
+    def disable(self, reason: str) -> None:
+        if self.reason is None:
+            self.reason = reason
+
+    def run_self_check(self, meter: _BatchSpend, mutation_mod) -> None:
+        """Compare the unmutated model with its twin, while the model file holds it.
+
+        Anything but no difference at all means the model does not reproduce its
+        own output on the dev data, and a difference between a mutant and the
+        model would then be no evidence of anything.
+        """
+
+        if not self.enabled:
+            return
+        if not meter.affords(self.SELF_CHECK):
+            self.disable(
+                "the confirmed budget ran out before the self-check, so no "
+                "survivor is compared with the model on the dev data"
+            )
+            return
+        summary, rows = self._shadow.show(mutation_mod.EQUIVALENCE_NODE)
+        meter.settle(summary, self.SELF_CHECK)
+        measured = mutation_mod.read_equivalence(rows)
+        if measured is None:
+            self.self_check = "failed"
+            self.disable(
+                "the comparison did not run against the unmutated model on the dev "
+                "target, so no survivor could be compared with it"
+            )
+            return
+        if measured.status != "equivalent":
+            self.self_check = "not_reproducible"
+            differing = (measured.only_in_mutant or 0) + (
+                measured.only_in_baseline or 0
+            )
+            self.disable(
+                "the unmutated model does not reproduce its own output on the dev "
+                f"data ({differing} row(s) differ between two evaluations of it, "
+                "as a random(), a uuid, or a row_number() over ties would cause), "
+                "so a difference from it would not be evidence"
+            )
+            return
+        self.self_check = "reproducible"
+
+    def check(self, meter: _BatchSpend, mutant_id: str, mutation_mod):
+        """Label one survivor, whose body is the model file right now."""
+
+        key = f"{mutant_id} equivalence"
+        if self.enabled and not meter.affords(key):
+            self.out_of_budget = True
+            return self._count(
+                mutation_mod.Equivalence.unchecked(
+                    "the confirmed budget ran out before this survivor's "
+                    "comparison with the model"
+                )
+            )
+        if not self.enabled:
+            return self._count(mutation_mod.Equivalence.unchecked(self.reason))
+        summary, rows = self._shadow.show(mutation_mod.EQUIVALENCE_NODE)
+        meter.settle(summary, key)
+        measured = mutation_mod.read_equivalence(rows)
+        if measured is None:
+            return self._count(
+                mutation_mod.Equivalence.unchecked(
+                    "the comparison did not run on the dev target for this mutant"
+                )
+            )
+        return self._count(measured)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "checked": self.requested,
+            "self_check": self.self_check,
+            **self._tally,
+            "reason": self.reason,
+        }
+
+    def _count(self, label):
+        self._tally[label.status] = self._tally.get(label.status, 0) + 1
+        return label
 
 
 def _refresh_session_total(spend, gate, store, paradigm, connector):
@@ -1340,11 +1749,17 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
     scaffold = getattr(args, "scaffold", None)
     mutate = getattr(args, "mutate", None)
+    check_equivalence = getattr(args, "check_equivalence", None)
     try:
         if scaffold and mutate:
             raise ValueError(
                 "--scaffold writes a unit test and --mutate measures the tests "
                 "that exist; run one, then the other"
+            )
+        if check_equivalence is not None and not mutate:
+            raise ValueError(
+                "--check-equivalence and --no-check-equivalence label the "
+                "survivors of a mutation run, so they need --mutate <model>"
             )
         if mutate:
             return to_envelope(
@@ -1353,6 +1768,7 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     mutate,
                     max_mutants=getattr(args, "max_mutants", None),
                     target=getattr(args, "target", None),
+                    check_equivalence=check_equivalence,
                 )
             )
         result = test_scaffold(engine, scaffold)

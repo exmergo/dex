@@ -31,10 +31,21 @@ the ``{% if %}`` branches, so a model that plan-time attribution has to refuse
 for its jinja is mutated here without complaint. The cost is that the compiled
 form names physical relations, and a test fixture addresses its inputs by
 ``ref()``. :func:`prepare` restores those references so both halves work.
+
+A survivor is not always a gap in the assertions. Some mutants produce exactly
+the model's rows on the data the dev target holds (an inner join where every key
+resolves, a window frame no partition is long enough to reach), and no test over
+that data could ever tell them apart; only a fixture that reaches the case can.
+:func:`equivalence_model` measures that, as the size of the symmetric difference
+between the mutant's rows and the model's, counted over whole-row fingerprints.
+It counts a multiset rather than a set, so a mutant that only duplicates rows
+still differs, and it projects four integers and nothing else, so no row value
+can leave the warehouse through it.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -71,6 +82,60 @@ EPHEMERAL_HEADER = (
 #: dbt's own prefix for an inlined ephemeral parent.
 DBT_CTE_PREFIX = "__dbt__cte__"
 
+#: The unmutated model, written beside the mutant under a name of its own so the
+#: equivalence check has something to compare each survivor against. Both sides
+#: reach the warehouse through dbt's same ephemeral inlining, so a difference
+#: between them is the mutant's and never the harness's.
+BASELINE_TWIN = "dex_mutation_baseline"
+
+#: The aggregate comparison of whatever the model file holds against the twin.
+EQUIVALENCE_NODE = "dex_mutation_equivalence"
+
+#: How each warehouse fingerprints a whole row, given the alias it is read under.
+#: All three are type tolerant, so a mutant that turns a column into a typed NULL
+#: hashes differently instead of failing the join. A connector missing here gets
+#: no equivalence check rather than an unverified one: a fingerprint that quietly
+#: skipped a column would report a mutant that changes it as equivalent.
+_ROW_FINGERPRINT = {
+    "duckdb": "hash({alias})",
+    "bigquery": "farm_fingerprint(to_json_string({alias}))",
+    "snowflake": "hash(*)",
+}
+
+#: The four integers the comparison projects, and the only thing it may return.
+EQUIVALENCE_COUNTS = (
+    "mutant_rows",
+    "baseline_rows",
+    "only_in_mutant",
+    "only_in_baseline",
+)
+
+_EQUIVALENCE_SQL = """\
+with dex_mutant as (
+    select {mutant_row} as dex_row from {mutant} as dex_m
+),
+dex_baseline as (
+    select {baseline_row} as dex_row from {baseline} as dex_b
+),
+dex_mutant_rows as (
+    select dex_row, count(*) as dex_n from dex_mutant group by dex_row
+),
+dex_baseline_rows as (
+    select dex_row, count(*) as dex_n from dex_baseline group by dex_row
+)
+select
+    coalesce(sum(coalesce(m.dex_n, 0)), 0) as mutant_rows,
+    coalesce(sum(coalesce(b.dex_n, 0)), 0) as baseline_rows,
+    coalesce(sum(case when coalesce(m.dex_n, 0) > coalesce(b.dex_n, 0)
+        then coalesce(m.dex_n, 0) - coalesce(b.dex_n, 0) else 0 end), 0)
+        as only_in_mutant,
+    coalesce(sum(case when coalesce(b.dex_n, 0) > coalesce(m.dex_n, 0)
+        then coalesce(b.dex_n, 0) - coalesce(m.dex_n, 0) else 0 end), 0)
+        as only_in_baseline
+from dex_mutant_rows as m
+full outer join dex_baseline_rows as b on m.dex_row = b.dex_row
+"""
+
 #: What an operator hands back: the fragment before, the fragment after, and
 #: the sentence describing the defect. ``None`` when the site turned out not to
 #: be mutable after all.
@@ -95,6 +160,48 @@ _SUGGESTED_TEST = {
     "division": "a unit test pinning a known ratio",
     "window_frame": "a unit test over several rows in one partition",
     "aggregate": "a unit test with more than one row per group",
+}
+
+# Once the dev data has been compared, the two kinds of survivor need different
+# tests. One the data cannot tell apart needs a fixture that reaches the case at
+# all, since no assertion over today's rows can see it; one the data already
+# tells apart needs an assertion over those rows, which would catch it today.
+_SUGGESTED_BY_EQUIVALENCE = {
+    "comparison": (
+        "a unit test with a row exactly on the boundary",
+        "an `expression_is_true` test pinning which side of the boundary the "
+        "rows sitting on it belong to",
+    ),
+    "predicate_drop": (
+        "a unit test with a row the filter has to exclude",
+        "an `expression_is_true` test asserting the filter holds over the model's rows",
+    ),
+    "predicate_negate": (
+        "a unit test with a row the filter has to exclude",
+        "an `expression_is_true` test asserting the filter holds over the model's rows",
+    ),
+    "join_type": (
+        "a unit test with a row whose key has no match in the joined relation",
+        "a `relationships` test, or a row-count assertion against the parent",
+    ),
+    "case_branch": (
+        "a unit test with a row in the dropped branch's category",
+        "a singular test asserting that rows meeting the branch's condition "
+        "land in its category",
+    ),
+    "division": (
+        "a unit test pinning a known ratio",
+        "an `expression_is_true` test bounding the ratio",
+    ),
+    "window_frame": (
+        "a unit test with a partition longer than the frame",
+        "a unit test over several rows in one partition, since a data "
+        "assertion rarely pins a frame",
+    ),
+    "aggregate": (
+        "a unit test with more than one row per group",
+        "a singular test reconciling the total against its source",
+    ),
 }
 
 
@@ -123,7 +230,25 @@ class PreparedModel:
     tree: exp.Expression
     dialect: str
     refs: dict[str, str] = field(default_factory=dict)
+    rendered: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+
+    def compiled(self, tree: exp.Expression | None = None) -> str:
+        """The tree as the warehouse spells it, for pricing a statement.
+
+        The model file :func:`render` writes is jinja, which no SQL parser reads,
+        so it cannot be spliced into a test's compiled SQL to price what that
+        test will scan. This is the same tree with each placeholder put back as
+        the relation dbt compiled it to. An ephemeral parent comes back as its
+        ``__dbt__cte__`` alias rather than as a copy of its body, because dbt
+        hoists every ephemeral ancestor into the statement around the model as
+        a sibling CTE, and the alias is what resolves there.
+        """
+
+        sql = (tree if tree is not None else self.tree).sql(dialect=self.dialect)
+        return _PLACEHOLDER_RE.sub(
+            lambda match: self.rendered.get(match.group(0), match.group(0)), sql
+        )
 
     def readable(self, text: str) -> str:
         """The same text with dex's internal ref placeholders spelled as names.
@@ -143,7 +268,11 @@ class PreparedModel:
 
 @dataclass(frozen=True)
 class Mutant:
-    """One planted defect: what it is, where, and what would have caught it."""
+    """One planted defect: what it is, where, and what would have caught it.
+
+    ``body`` is the model file dbt runs; ``compiled`` is the same mutant as the
+    warehouse spells it, which is what pricing splices into a test's SQL.
+    """
 
     id: str
     operator: str
@@ -153,6 +282,7 @@ class Mutant:
     after: str
     suggested_test: str
     body: str
+    compiled: str = ""
 
     def payload(self) -> dict[str, object]:
         return {
@@ -182,6 +312,7 @@ class MutantBatch:
     considered: int = 0
     unparsed: int = 0
     cap: int = MAX_MUTANTS
+    identity_compiled: str = ""
 
     @property
     def elided_total(self) -> int:
@@ -195,6 +326,39 @@ class Verdict:
     outcome: str
     caught_by: list[str] = field(default_factory=list)
     warn_only: bool = False
+
+
+@dataclass(frozen=True)
+class Equivalence:
+    """Whether a survivor's output differs from the model's on the dev data.
+
+    ``equivalent`` means the mutant and the model produced the same rows, so no
+    test over that data could have told them apart. ``distinguishable`` means
+    the data already differs and no test looked. ``not_checked`` carries the
+    reason, because a survivor that was never compared must not read as either.
+    The counts are the comparison itself: aggregates, never a row.
+    """
+
+    status: str
+    mutant_rows: int | None = None
+    baseline_rows: int | None = None
+    only_in_mutant: int | None = None
+    only_in_baseline: int | None = None
+    reason: str | None = None
+
+    @classmethod
+    def unchecked(cls, reason: str) -> Equivalence:
+        return cls(status="not_checked", reason=reason)
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "only_in_mutant": self.only_in_mutant,
+            "only_in_baseline": self.only_in_baseline,
+            "mutant_rows": self.mutant_rows,
+            "baseline_rows": self.baseline_rows,
+            "reason": self.reason,
+        }
 
 
 # --- preparing the model -------------------------------------------------------
@@ -282,6 +446,7 @@ def prepare(
             continue
         token = _PLACEHOLDER.format(len(prepared.refs))
         prepared.refs[token] = jinja
+        prepared.rendered[token] = parent.rendered if parent is not None else bare
         table.set("this", exp.to_identifier(token, quoted=False))
         table.set("db", None)
         table.set("catalog", None)
@@ -583,7 +748,12 @@ def enumerate_mutants(
         planned.extend((operator.name, index) for index in range(found))
 
     ordered = _round_robin(planned)
-    batch = MutantBatch(identity=identity, considered=len(ordered), cap=cap)
+    batch = MutantBatch(
+        identity=identity,
+        considered=len(ordered),
+        cap=cap,
+        identity_compiled=prepared.compiled(),
+    )
     by_name = {operator.name: operator for operator in _OPERATORS}
 
     for operator_name, index in ordered:
@@ -623,6 +793,7 @@ def enumerate_mutants(
                 after=after,
                 suggested_test=_SUGGESTED_TEST[operator_name],
                 body=body,
+                compiled=prepared.compiled(tree),
             )
         )
     return batch
@@ -671,6 +842,97 @@ def classify(
     return Verdict(outcome="survived")
 
 
+def suggested_test(operator: str, equivalence: str | None = None) -> str:
+    """The test that would catch this survivor, once its label is known.
+
+    Without a label (the comparison did not run) the operator's general
+    suggestion stands. With one, an ``equivalent`` survivor gets the fixture
+    that reaches the case and a ``distinguishable`` one gets the assertion over
+    data that already differs.
+    """
+
+    pair = _SUGGESTED_BY_EQUIVALENCE.get(operator)
+    if pair is not None and equivalence == "equivalent":
+        return pair[0]
+    if pair is not None and equivalence == "distinguishable":
+        return pair[1]
+    return _SUGGESTED_TEST[operator]
+
+
+def equivalence_model(model_ref: str, dialect: str) -> str | None:
+    """The comparison node: the model file's rows against the twin's, as counts.
+
+    ``model_ref`` is the jinja that names the mutated model (a versioned model
+    needs its ``v=``). ``None`` when dex has no verified whole-row fingerprint
+    for the warehouse, which the caller reports rather than guessing at one.
+
+    The node is ephemeral like everything else written into the copy, so no
+    command could materialize it, and it projects exactly
+    :data:`EQUIVALENCE_COUNTS`.
+    """
+
+    fingerprint = _ROW_FINGERPRINT.get(dialect)
+    if fingerprint is None:
+        return None
+    body = _EQUIVALENCE_SQL.format(
+        mutant_row=fingerprint.format(alias="dex_m"),
+        baseline_row=fingerprint.format(alias="dex_b"),
+        mutant=model_ref,
+        baseline=f"{{{{ ref('{BASELINE_TWIN}') }}}}",
+    )
+    return body + EPHEMERAL_HEADER + "\n"
+
+
+def twin_model(identity: str, *, group: str | None = None) -> str:
+    """The unmutated model file, made fit to live under :data:`BASELINE_TWIN`.
+
+    The model's own ``group`` has to come with it. The identity is written from
+    compiled SQL, where the model's ``config()`` calls are gone, and a twin
+    outside the group cannot ``ref()`` a parent that is private to it: the
+    whole copy would then fail to parse and take every test run down with it.
+    """
+
+    if not group:
+        return identity
+    return identity + "{{ config(group=" + json.dumps(group) + ") }}\n"
+
+
+def read_equivalence(rows: object) -> Equivalence | None:
+    """The comparison's one row, read strictly, or ``None``.
+
+    Exactly one row, exactly the four counts, each a non-negative integer, and
+    consistent with each other: the mutant's rows less the model's equal what
+    only the mutant has less what only the model has. Anything else is treated
+    as a comparison that did not run rather than surfaced, which is what keeps
+    a value that is not a count from ever reaching the envelope through here.
+    Column names compare case-insensitively, since Snowflake upper-cases an
+    unquoted alias.
+    """
+
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return None
+    row = {str(key).lower(): value for key, value in rows[0].items()}
+    if set(row) != set(EQUIVALENCE_COUNTS):
+        return None
+    counts: dict[str, int] = {}
+    for key in EQUIVALENCE_COUNTS:
+        value = row[key]
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if not isinstance(value, int) or value < 0:
+            return None
+        counts[key] = value
+    if (
+        counts["mutant_rows"] - counts["baseline_rows"]
+        != counts["only_in_mutant"] - counts["only_in_baseline"]
+    ):
+        return None
+    differs = counts["only_in_mutant"] or counts["only_in_baseline"]
+    return Equivalence(status="distinguishable" if differs else "equivalent", **counts)
+
+
 def inline_into_test(
     test_sql: str, *, model_name: str, body: str, dialect: str
 ) -> str | None:
@@ -686,6 +948,9 @@ def inline_into_test(
     the text inside the test's CTE are different strings whenever the model has
     an ephemeral parent. Returns ``None`` when the CTE cannot be found or the
     test will not parse, and the caller prices that test at its baseline.
+
+    ``body`` is SQL as the warehouse spells it (:attr:`Mutant.compiled`), never
+    the model file, whose jinja no parser reads.
     """
 
     try:
