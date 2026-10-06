@@ -222,6 +222,17 @@ runs out partway, the run stops and the remaining mutants come back `not_run`.
 Nothing is materialized: mutants build as ephemeral models, so no table or view
 is created in `bigquery.dev_dataset` and none of the run needs cleaning up.
 
+Comparing each survivor with the unmutated model on the dev data is opt-in here,
+with `--check-equivalence`, and goes into the same estimate rather than a second
+ask. The comparison is dry-run priced once as the self-check and once per mutant
+with the mutant spliced in, since a mutant that widens a partition scan widens
+its comparison too. It is priced as if every mutant survives, as
+`(equivalence checks, if every mutant survives)`, and only survivors run one,
+so the settled spend is at most that line. Each comparison is one statement, and
+the 10 MB per-query minimum applies to each. A comparison the dry run refuses
+turns the check off with a reason, before anything is spent. Without the flag,
+survivors report `equivalence.status: not_checked`.
+
 
 
 With `--layered-schemas`, the scaffolded `generate_schema_name` override makes

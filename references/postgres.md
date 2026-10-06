@@ -150,7 +150,10 @@ say so.
 once, then runs one dbt invocation per mutant. Nothing is materialized: a mutant
 builds as an ephemeral model, so the dev namespace holds exactly the relations it
 held before. A budget that runs out partway stops the run, and the remaining
-mutants are reported `not_run` rather than the budget being exceeded.
+mutants are reported `not_run` rather than the budget being exceeded. Survivors
+are not yet compared with the model on the dev data on this connector, so each
+reports `equivalence.status: not_checked` with the reason, and nothing is
+priced or run for it.
 
 
 `--verify` also reads `postgres.dev_schema` for the length of that one command,

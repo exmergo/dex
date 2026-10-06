@@ -285,6 +285,25 @@ survivors are defects the current data cannot distinguish at all, such as an
 inner join where every key happens to match, which is exactly why the finding
 names the test that would catch it rather than claiming the model is wrong.
 
+dex measures which survivors those are. Each one is compared with the unmutated
+model on the dev target, and the two kinds need different tests: a survivor the
+data cannot tell apart needs a fixture that reaches the case, since no assertion
+over today's rows can see it, and one the data already tells apart needs an
+assertion over those rows. The comparison fingerprints every row of each side,
+counts the fingerprints, and reports how many rows each side has that the other
+does not. It counts a multiset rather than a set, so a mutant that only
+duplicates rows still differs, and it returns four integers and never a row.
+
+Two limits are worth knowing. The fingerprint is a 64-bit hash, so two
+different rows could in principle collide and read as the same; across the row
+counts a dev target holds that is vanishingly rare, but it is not impossible.
+And a model has to reproduce its own output for the comparison to mean
+anything, so the unmutated model is compared with itself first. A `random()`,
+a uuid or a `row_number()` over ties fails that self-check and no survivor is
+labelled. A floating-point aggregate can differ in its last digits between
+evaluations, and the self-check only catches that when it happens to show, so
+a `distinguishable` label on a model that sums floats deserves a second look.
+
 ## The draft map: composing and persisting
 
 `explore map` composes the above into the `.dex/` cache (never the source of

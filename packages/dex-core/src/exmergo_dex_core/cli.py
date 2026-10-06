@@ -586,6 +586,24 @@ def _build_parser() -> argparse.ArgumentParser:
                     # that invokes dbt once per mutant predictable.
                     sp.add_argument("--max-mutants", type=int, default=None)
                     sp.add_argument("--target", default=None)
+                    # Tri-state, and the default is the connector's, as with
+                    # --attribute-rows: comparing a survivor with the model on
+                    # the dev data is free on DuckDB and a scan elsewhere, so it
+                    # runs unasked only where it bills nothing.
+                    equivalence = sp.add_mutually_exclusive_group()
+                    equivalence.add_argument(
+                        "--check-equivalence",
+                        dest="check_equivalence",
+                        action="store_true",
+                        default=None,
+                        help="compare each survivor with the model on the dev data",
+                    )
+                    equivalence.add_argument(
+                        "--no-check-equivalence",
+                        dest="check_equivalence",
+                        action="store_false",
+                        help="report survivors without comparing them",
+                    )
                 if group == "semantic" and name in {"define", "update", "plan"}:
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)

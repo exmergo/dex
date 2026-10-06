@@ -461,6 +461,136 @@ def test_a_run_missing_a_test_that_should_have_reported_is_not_run():
     assert verdict.outcome == "not_run"
 
 
+# --- equivalence on the dev data -----------------------------------------------
+
+
+def _as_sql(node: str) -> str:
+    """The comparison node with its jinja replaced by plain relation names."""
+
+    import re
+
+    return re.sub(r"\{\{\s*ref\('([^']+)'\)\s*\}\}", r"\1", node.split("{{ config")[0])
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery", "snowflake"])
+def test_the_comparison_projects_four_counts_and_nothing_else(dialect):
+    """The structural half of the no-row-value guarantee: whatever the model
+    holds, the statement can only return the four aggregates it projects."""
+
+    node = mutation.equivalence_model("{{ ref('fct') }}", dialect)
+    assert node is not None
+    assert "{{ ref('fct') }}" in node
+    assert f"{{{{ ref('{mutation.BASELINE_TWIN}') }}}}" in node
+    assert node.rstrip().endswith(mutation.EPHEMERAL_HEADER)
+    tree = sqlglot.parse_one(_as_sql(node), read=dialect)
+    assert tuple(tree.named_selects) == mutation.EQUIVALENCE_COUNTS
+    for projection in tree.expressions:
+        assert projection.find(sqlglot.exp.AggFunc) is not None
+
+
+@pytest.mark.parametrize(
+    "dialect", ["postgres", "redshift", "databricks", "clickhouse"]
+)
+def test_a_warehouse_without_a_verified_fingerprint_gets_no_comparison(dialect):
+    """A fingerprint that silently skipped a column would label a mutant that
+    changes it as equivalent, so an unverified one is never guessed at."""
+
+    assert mutation.equivalence_model("{{ ref('fct') }}", dialect) is None
+
+
+def test_the_twin_carries_the_models_group():
+    """The identity is compiled SQL, so the model's own config() calls are gone,
+    and a twin outside the group cannot ref a parent private to it."""
+
+    assert mutation.twin_model("select 1\n") == "select 1\n"
+    twin = mutation.twin_model("select 1\n", group="finance")
+    assert twin.endswith('{{ config(group="finance") }}\n')
+
+
+def _row(**overrides):
+    row = {
+        "mutant_rows": 5,
+        "baseline_rows": 4,
+        "only_in_mutant": 1,
+        "only_in_baseline": 0,
+    }
+    row.update(overrides)
+    return [row]
+
+
+def test_a_zero_difference_is_equivalent_and_carries_its_counts():
+    label = mutation.read_equivalence(
+        _row(mutant_rows=4, only_in_mutant=0, baseline_rows=4)
+    )
+    assert label is not None and label.status == "equivalent"
+    assert label.payload()["baseline_rows"] == 4
+    assert label.payload()["only_in_mutant"] == 0
+
+
+def test_any_difference_is_distinguishable():
+    label = mutation.read_equivalence(_row())
+    assert label is not None and label.status == "distinguishable"
+    changed = mutation.read_equivalence(
+        _row(mutant_rows=4, only_in_mutant=2, only_in_baseline=2)
+    )
+    assert changed is not None and changed.status == "distinguishable"
+
+
+def test_an_upper_cased_or_float_spelled_row_is_still_read():
+    """Snowflake upper-cases an unquoted alias, and a preview may print a whole
+    number as a float."""
+
+    rows = [
+        {
+            "MUTANT_ROWS": 4.0,
+            "BASELINE_ROWS": 4,
+            "ONLY_IN_MUTANT": 0,
+            "ONLY_IN_BASELINE": 0.0,
+        }
+    ]
+    label = mutation.read_equivalence(rows)
+    assert label is not None and label.status == "equivalent"
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        None,
+        "not rows",
+        _row() + _row(),
+        [{**_row()[0], "email": "someone@example.com"}],
+        _row(only_in_mutant="someone@example.com"),
+        _row(only_in_mutant=-1),
+        _row(only_in_mutant=True),
+        _row(only_in_mutant=1.5),
+        _row(mutant_rows=9),
+    ],
+)
+def test_anything_but_four_consistent_counts_is_refused(rows):
+    """Anything that is not exactly the comparison's own shape is treated as a
+    comparison that did not run, never surfaced: that is what keeps a value
+    that is not a count out of the envelope even if the SQL were wrong."""
+
+    assert mutation.read_equivalence(rows) is None
+
+
+def test_every_operator_suggests_a_fixture_or_an_assertion_by_its_label():
+    """An equivalent survivor needs a fixture that reaches the case; one the data
+    already tells apart needs an assertion over that data. The same sentence
+    for both would send half the readers to write the wrong test."""
+
+    for operator in (op.name for op in mutation._OPERATORS):
+        fixture = mutation.suggested_test(operator, "equivalent")
+        assertion = mutation.suggested_test(operator, "distinguishable")
+        assert fixture and assertion and fixture != assertion
+        assert "unit test" in fixture
+        assert (
+            mutation.suggested_test(operator, None)
+            == mutation._SUGGESTED_TEST[operator]
+        )
+
+
 # --- pricing support -----------------------------------------------------------
 
 
@@ -476,6 +606,51 @@ def test_a_mutant_is_spliced_into_the_test_that_reads_it():
         test_sql, model_name="fct_orders", body="select a from t", dialect="duckdb"
     )
     assert out is not None and "a > 1" not in out
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery", "snowflake"])
+def test_every_mutant_splices_into_a_test_as_the_sql_the_warehouse_runs(dialect):
+    """The mutant's dbt file text is not SQL: it carries `{% raw %}` blocks and
+    `{{ ref() }}` calls, so splicing it failed to parse and every mutant was
+    priced at the baseline's cost. Its compiled spelling names the physical
+    relations the test SQL around it already uses."""
+
+    orders = _parents(dialect)[0].rendered
+    model = f"select a from {orders} where a > 1 and b > 2"  # noqa: S608
+    prepared = _prepare(model, dialect)
+    batch = mutation.enumerate_mutants(prepared)
+    test_sql = f"with __dbt__cte__fct as ({model}) select 1 from __dbt__cte__fct"  # noqa: S608
+    assert batch.mutants
+    for mutant in batch.mutants:
+        spliced = mutation.inline_into_test(
+            test_sql, model_name="fct", body=mutant.compiled, dialect=dialect
+        )
+        assert spliced is not None, mutant.id
+        assert "{%" not in spliced and "__dex_ref_" not in spliced
+        assert "stg_orders" in spliced.lower()
+    dropped = _of(batch, "predicate_drop")[0]
+    assert "a > 1" not in dropped.compiled.lower()
+    assert "a > 1" in batch.identity_compiled.lower()
+
+
+def test_the_compiled_spelling_names_an_ephemeral_parent_by_its_hoisted_cte():
+    """dbt hoists every ephemeral ancestor into each test as a sibling CTE, so
+    the compiled mutant reads the parent under that alias rather than inlining
+    a copy of it."""
+
+    prepared = _prepare(
+        "with __dbt__cte__stg_orders as (select 1 as a) "
+        "select a from __dbt__cte__stg_orders where a > 0",
+        parents=[
+            mutation.ParentRelation(
+                rendered="__dbt__cte__stg_orders", jinja=ORDERS, ephemeral=True
+            )
+        ],
+    )
+    compiled = prepared.compiled()
+    assert "__dbt__cte__stg_orders" in compiled
+    assert "select 1" not in compiled.lower()
+    assert "{{" not in compiled
 
 
 def test_splicing_a_test_that_does_not_read_the_model_returns_nothing():

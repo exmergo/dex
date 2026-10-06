@@ -208,6 +208,21 @@ def test_query_estimate_sums_referenced_tables(fake_sf_connection):
     assert joined > single > 0
 
 
+def test_resume_floor_counts_once_across_many_estimates(fake_sf_connection):
+    """A command that prices many statements resumes a suspended warehouse at
+    most once, so summing per-statement estimates must not multiply the floor
+    in (verified live: mutation coverage priced 39 statements and quoted 2,379
+    seconds, of which 2,340 were floors)."""
+
+    adapter = make_adapter(fake_sf_connection)
+    sql = 'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    first = adapter.query_estimate(sql)
+    second = adapter.query_estimate(sql)
+    assert first == pytest.approx(second + _RESUME_MINIMUM_SECONDS)
+    total, per_table = adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
+    assert total == pytest.approx(per_table["SHOP.PUBLIC.CUSTOMERS"])
+
+
 def test_describe_estimate_translates_to_credits(fake_sf_connection):
     adapter = make_adapter(
         fake_sf_connection,

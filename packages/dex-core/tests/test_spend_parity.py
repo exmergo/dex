@@ -260,7 +260,8 @@ def _route_mutation(monkeypatch, root: Path, project: Path) -> None:
     addition: this command prices its batch through the adapter's own
     ``query_estimate``, so the stub has to answer that, and it settles once per
     dbt invocation rather than once per command, which is the property the
-    ledger assertions below are here to pin.
+    ledger assertions below are here to pin. The run asks for the equivalence
+    check, so each survivor's `dbt show` is one of those invocations.
     """
 
     from exmergo_dex_core.transform import dev_target
@@ -287,32 +288,68 @@ def _route_mutation(monkeypatch, root: Path, project: Path) -> None:
     )
     monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
 
-    manifest = json.dumps(
+    nodes = {
+        "model.dex_test.stg_customers": {
+            "name": "stg_customers",
+            "unique_id": "model.dex_test.stg_customers",
+            "package_name": "dex_test",
+            "language": "sql",
+            "config": {"materialized": "ephemeral"},
+            "depends_on": {"nodes": []},
+            "compiled_code": "select id from raw where id > 1",
+        },
+        "test.dex_test.not_null_stg_customers_id.abc": {
+            "name": "not_null_stg_customers_id",
+            "unique_id": "test.dex_test.not_null_stg_customers_id.abc",
+            "resource_type": "test",
+            "attached_node": "model.dex_test.stg_customers",
+            "depends_on": {"nodes": ["model.dex_test.stg_customers"]},
+            "compiled_code": (
+                "with __dbt__cte__stg_customers as (select id from raw) "
+                "select id from __dbt__cte__stg_customers"
+            ),
+        },
+    }
+    # The comparison the equivalence check adds is a node once its file is in the
+    # copy, exactly as in dbt, and pricing reads its compiled SQL from there.
+    comparison = {
+        "model.dex_test.dex_mutation_equivalence": {
+            "name": "dex_mutation_equivalence",
+            "unique_id": "model.dex_test.dex_mutation_equivalence",
+            "resource_type": "model",
+            "compiled_code": (
+                "with __dbt__cte__stg_customers as (select id from raw) "
+                "select count(*) from __dbt__cte__stg_customers"
+            ),
+        }
+    }
+    show_results = json.dumps(
         {
-            "metadata": {"project_name": "dex_test"},
-            "nodes": {
-                "model.dex_test.stg_customers": {
-                    "name": "stg_customers",
-                    "unique_id": "model.dex_test.stg_customers",
-                    "package_name": "dex_test",
-                    "language": "sql",
-                    "config": {"materialized": "ephemeral"},
-                    "depends_on": {"nodes": []},
-                    "compiled_code": "select id from raw where id > 1",
-                },
-                "test.dex_test.not_null_stg_customers_id.abc": {
-                    "name": "not_null_stg_customers_id",
-                    "unique_id": "test.dex_test.not_null_stg_customers_id.abc",
-                    "resource_type": "test",
-                    "attached_node": "model.dex_test.stg_customers",
-                    "depends_on": {"nodes": ["model.dex_test.stg_customers"]},
-                    "compiled_code": (
-                        "with __dbt__cte__stg_customers as (select id from raw) "
-                        "select id from __dbt__cte__stg_customers"
-                    ),
-                },
+            "results": [
+                {
+                    "unique_id": "model.dex_test.dex_mutation_equivalence",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 2000},
+                }
+            ]
+        }
+    )
+    show_stdout = json.dumps(
+        {
+            "info": {"name": "ShowNode"},
+            "data": {
+                "preview": json.dumps(
+                    [
+                        {
+                            "mutant_rows": 3,
+                            "baseline_rows": 3,
+                            "only_in_mutant": 0,
+                            "only_in_baseline": 0,
+                        }
+                    ]
+                )
             },
-            "unit_tests": {},
         }
     )
     run_results = json.dumps(
@@ -332,13 +369,28 @@ def _route_mutation(monkeypatch, root: Path, project: Path) -> None:
         def run(argv: list[str]):
             target_path = Path(argv[argv.index("--target-path") + 1])
             target_path.mkdir(parents=True, exist_ok=True)
-            (target_path / "manifest.json").write_text(manifest, encoding="utf-8")
+            shadow = Path(argv[argv.index("--project-dir") + 1])
+            present = bool(list(shadow.rglob("dex_mutation_equivalence.sql")))
+            manifest = {
+                "metadata": {"project_name": "dex_test"},
+                "nodes": {**nodes, **(comparison if present else {})},
+                "unit_tests": {},
+            }
+            (target_path / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            stdout = ""
             if argv[1] == "test":
                 (target_path / "run_results.json").write_text(
                     run_results, encoding="utf-8"
                 )
+            if argv[1] == "show":
+                (target_path / "run_results.json").write_text(
+                    show_results, encoding="utf-8"
+                )
+                stdout = show_stdout
             return subprocess.CompletedProcess(
-                args=argv, returncode=0, stdout="", stderr=""
+                args=argv, returncode=0, stdout=stdout, stderr=""
             )
 
         return run
@@ -496,12 +548,16 @@ def billed_runs(
                 "stg_customers",
                 "--max-mutants",
                 "1",
+                "--check-equivalence",
                 "--confirm",
                 "--budget",
                 BUDGET,
             ],
             capsys,
         )["data"]
+    # The equivalence checks ran, so their shows settle rows of their own under
+    # the same command and the parity assertions below cover them too.
+    assert payloads["transform test"]["equivalence"]["self_check"] == "reproducible"
 
     fake_bq_client.row_resolver = _scan_resolver
 

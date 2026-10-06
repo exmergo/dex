@@ -3218,3 +3218,111 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
     reason = envelope["data"]["verification"]["suppressed"]["row_population"]
     assert "outside dex's read scope" in reason
     assert "custom schema" in reason
+
+
+# --- ShadowRun.show ------------------------------------------------------------
+
+
+def _show_runner(calls: list, *, returncode: int = 0, stdout: str = ""):
+    """A dbt stand-in for the copy: writes run_results where argv says, as dbt does."""
+
+    import subprocess
+
+    def run(argv: list[str]):
+        calls.append(argv)
+        target = Path(argv[argv.index("--target-path") + 1])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "run_results.json").write_text(
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "unique_id": "model.dex_test.dex_mutation_equivalence",
+                            "status": "success",
+                            "execution_time": 0.4,
+                            "adapter_response": {"bytes_billed": 10485760},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    return run
+
+
+def _show_node_line(rows) -> str:
+    return json.dumps(
+        {
+            "info": {"name": "ShowNode", "level": "info", "msg": "Previewing node"},
+            "data": {"node_name": "x", "preview": json.dumps(rows), "is_inline": False},
+        }
+    )
+
+
+def test_show_runs_one_select_in_the_copy_and_reads_its_row(dbt_project_dir: Path):
+    """`dbt show` executes the node's SELECT and nothing else, so it is the one
+    verb that can read an aggregate back without materializing anything."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    calls: list = []
+    rows = [{"only_in_mutant": 0}]
+    runner = _show_runner(calls, stdout="not json\n" + _show_node_line(rows))
+    with ShadowRun(dbt_project_dir, target="dev", runner=runner) as shadow:
+        summary, got = shadow.show("dex_mutation_equivalence")
+        copy = shadow.shadow
+
+    assert got == rows
+    argv = calls[0]
+    assert argv[1] == "show"
+    assert argv[argv.index("--select") + 1] == "dex_mutation_equivalence"
+    assert argv[argv.index("--limit") + 1] == "1"
+    assert argv[argv.index("--output") + 1] == "json"
+    assert argv[argv.index("--indirect-selection") + 1] == "eager"
+    assert Path(argv[argv.index("--project-dir") + 1]) == copy
+    assert summary["nodes"][0]["execution_time"] == 0.4
+    assert summary["bytes_billed"] == 10485760
+
+
+def test_show_carries_no_dbt_message_when_the_warehouse_refuses(dbt_project_dir: Path):
+    """A warehouse error can quote the value it failed on, so a failed show
+    hands back no rows and none of dbt's text."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    leaked = json.dumps(
+        {
+            "info": {
+                "name": "RunResultError",
+                "level": "error",
+                "msg": "Bad int64 value: 'someone@example.com'",
+            },
+            "data": {},
+        }
+    )
+    runner = _show_runner([], returncode=1, stdout=leaked)
+    with ShadowRun(dbt_project_dir, target="dev", runner=runner) as shadow:
+        summary, rows = shadow.show("dex_mutation_equivalence")
+
+    assert rows is None
+    assert summary["messages"] == []
+    assert "someone@example.com" not in json.dumps(summary)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", _show_node_line({"not": "a list"}), _show_node_line(["not a row"])],
+)
+def test_show_without_a_readable_preview_returns_no_rows(
+    dbt_project_dir: Path, stdout: str
+):
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    runner = _show_runner([], stdout=stdout)
+    with ShadowRun(dbt_project_dir, target="dev", runner=runner) as shadow:
+        _summary, rows = shadow.show("dex_mutation_equivalence")
+    assert rows is None
