@@ -8,8 +8,15 @@ from pathlib import Path
 import pytest
 import yaml
 
+from exmergo_dex_core.cache import Dataset
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.transform.scaffold import ScaffoldError, _merge_sources
+from exmergo_dex_core.transform.scaffold import (
+    ScaffoldError,
+    ScaffoldPrerequisiteError,
+    SourcesFileError,
+    _merge_sources,
+    _resolve_dataset,
+)
 
 
 def test_merge_preserves_existing_source_properties():
@@ -80,7 +87,7 @@ def test_merge_empty_declarations(original):
 
 
 def test_merge_refuses_invalid_yaml():
-    with pytest.raises(ScaffoldError, match="invalid YAML"):
+    with pytest.raises(SourcesFileError, match="invalid YAML"):
         _merge_sources("version: 2\nsources: [\n", {"main": {"events"}})
 
 
@@ -98,7 +105,7 @@ def test_merge_refuses_alias_mutation():
         "version: 2\nsources:\n  - name: main\n    tables: &tables\n"
         "      - name: customers\n  - name: other\n    tables: *tables\n"
     )
-    with pytest.raises(ScaffoldError, match="anchors or aliases"):
+    with pytest.raises(SourcesFileError, match="anchors or aliases"):
         _merge_sources(original, {"main": {"events"}})
 
 
@@ -242,6 +249,8 @@ def test_scaffold_without_cache_is_a_clean_error(
     assert rc == 1
     assert envelope["status"] == "error"
     assert "explore map" in envelope["errors"][0]
+    # The named command is the fix, and `reason` says so (#514).
+    assert envelope["reason"] == "prerequisite"
 
 
 def test_scaffold_sequential_calls_keep_earlier_sources(
@@ -378,3 +387,57 @@ def test_scaffold_unknown_table_is_a_clean_error(
     )
     assert rc == 1
     assert envelope["status"] == "error"
+    assert "explore map" in envelope["errors"][0]
+    assert envelope["reason"] == "prerequisite"
+
+
+def test_an_object_the_cache_does_not_hold_names_the_command_that_maps_it():
+    """`explore map` is what puts an object in the cache, so a name the cache
+    does not hold is a prerequisite refusal, the same family `explore` raises
+    for the same condition, and not the caller's input."""
+
+    with pytest.raises(ScaffoldPrerequisiteError, match="explore map"):
+        _resolve_dataset([Dataset(identifier="p.a.orders")], "nope")
+
+
+def test_an_ambiguous_name_is_the_callers_input():
+    """Two cached objects share the short name. No `explore` command resolves
+    that and no file needs editing; the caller qualifies the name. So the
+    refusal is the bare base, `request`, and carries neither other family."""
+
+    datasets = [Dataset(identifier="p.a.orders"), Dataset(identifier="p.b.orders")]
+    with pytest.raises(ScaffoldError, match="ambiguous") as caught:
+        _resolve_dataset(datasets, "orders")
+    assert not isinstance(caught.value, ScaffoldPrerequisiteError)
+    assert not isinstance(caught.value, SourcesFileError)
+
+
+def test_scaffold_into_an_unmergeable_sources_file_is_a_configuration_refusal(
+    dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
+):
+    """A flow-style `_dex_sources.yml` is a file the merge will not rewrite. The
+    call's input is fine and no `explore` command repairs the file, so the
+    envelope reads `configuration`, not `request` (#514): a host stops and
+    shows the message rather than telling the caller to change the request."""
+
+    _seed_cache(tmp_path, duckdb_file, capsys)
+    (dbt_project_dir / "models" / "staging" / "_dex_sources.yml").write_text(
+        "version: 2\nsources: [{name: main, tables: [{name: customers}]}]\n",
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "x",
+            "--scaffold",
+            "orders",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert "flow-style" in envelope["errors"][0]
+    assert envelope["reason"] == "configuration"

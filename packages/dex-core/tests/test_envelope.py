@@ -161,6 +161,11 @@ def test_reason_for_subclass_precedence():
         SemanticBackendError,
         SemanticQueryRefusedError,
     )
+    from exmergo_dex_core.transform.scaffold import (
+        ScaffoldError,
+        ScaffoldPrerequisiteError,
+        SourcesFileError,
+    )
 
     # SemanticQueryRefusedError IS-A SemanticBackendError, but is policy
     # (GUARD), not a backend failure (CONFIGURATION, its parent's bucket).
@@ -171,6 +176,15 @@ def test_reason_for_subclass_precedence():
     # step (PREREQUISITE), not the bare-input REQUEST its parent defaults to.
     assert env.reason_for(ClusterDependencyError("x")) is env.Reason.PREREQUISITE
     assert env.reason_for(ClusterError("x")) is env.Reason.REQUEST
+
+    # Both scaffold subclasses IS-A ScaffoldError (REQUEST, the bare base's
+    # bucket) and neither has an entry of its own: each reads the bucket of
+    # its second parent, which the list already holds above ScaffoldError. A
+    # setup refusal is PREREQUISITE, an unmergeable sources file CONFIGURATION,
+    # and the bare base (an ambiguous name) stays REQUEST (#514).
+    assert env.reason_for(ScaffoldPrerequisiteError("x")) is env.Reason.PREREQUISITE
+    assert env.reason_for(SourcesFileError("x")) is env.Reason.CONFIGURATION
+    assert env.reason_for(ScaffoldError("x")) is env.Reason.REQUEST
 
 
 def test_error_for_defaults_message_to_str_and_derives_reason():
