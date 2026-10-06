@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.12.6] - 2026-10-06
+
 ### Added
 
 - **`transform test --mutate` says which survivors the dev data could ever tell
