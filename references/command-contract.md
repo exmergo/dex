@@ -268,7 +268,10 @@ dex transform test --mutate <m>   -> measure the tests <m> already has: plant st
                                      every mutant builds as an ephemeral model in a throwaway copy, so
                                      nothing is written to the project and nothing is materialized.
                                      Capped at 20 mutants; --max-mutants only narrows. On a metered
-                                     connector the whole batch is priced and confirmed as one number
+                                     connector the whole batch is priced and confirmed as one number.
+                                     Each survivor is compared with the model on the dev data and
+                                     labelled equivalent or distinguishable: free and automatic on
+                                     DuckDB, --check-equivalence on BigQuery and Snowflake
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
@@ -451,15 +454,49 @@ unmutated model, and any test that did not is listed in `baseline.excluded` with
 the reason, so a suite measured against its own broken tests cannot read as
 clean. A run where nothing passes at baseline is an error, not a clean sweep.
 
+**Equivalent on the dev data.** A survivor is not always a gap in the
+assertions. Some mutants produce exactly the model's rows on the data the dev
+target holds (an inner join where every key resolves, a window frame no
+partition is long enough to reach), and no test over that data could tell them
+apart. So each survivor is compared with the unmutated model on the dev target,
+and `equivalence` on the mutant carries the answer: `status`, then
+`only_in_mutant` and `only_in_baseline` (rows one side has that the other does
+not, counted as a multiset, so duplicated rows count), and `mutant_rows` and
+`baseline_rows`. Counts only; no row value leaves the warehouse. `equivalent`
+means both difference counts are zero, so only a unit test fixture that reaches
+the case can catch it. `distinguishable` means the data already differs, so an
+assertion over that data would catch it today. Distinguishable survivors are
+listed first, then any that could not be compared, then equivalent ones, and
+`suggested_test` follows the label: a fixture for an equivalent survivor, an
+assertion for a distinguishable one. `not_checked` carries a `reason`. An
+equivalent survivor is still `survived` and still counts in `score`, since a
+fixture can catch it.
+
+Before any survivor is compared, the unmutated model is compared with itself.
+A model that does not reproduce its own output (a `random()`, a uuid, a
+`row_number()` over ties) would make every mutant look different from it, so in
+that case no survivor is labelled and `data.equivalence.self_check` says
+`not_reproducible`. `data.equivalence` also reports `checked`, the
+`distinguishable`, `equivalent` and `not_checked` counts, and a `reason` when
+the comparison did not run. The comparison is free and automatic on DuckDB. On
+BigQuery and Snowflake it is opt-in, with `--check-equivalence`, because it is
+spend; `--no-check-equivalence` turns it off anywhere. Other connectors report
+survivors as `not_checked` until dex has a verified whole-row comparison for
+them.
+
 **Cost.** Free on DuckDB. On a metered connector each mutant is priced as the
 statements the warehouse will actually run, by splicing it into each test's
 compiled SQL, because a mutant that drops a partition predicate scans more than
 the model it came from. The whole batch is one estimate and one confirmation:
 `per_table_bytes` names `(baseline)` and each mutant, so the caller sees the
-total and the breakdown before anything executes. If the confirmed budget runs
-out partway, the run stops and the remaining mutants are reported `not_run`
-rather than the budget being exceeded. Spend settles per run under
-`command: "transform test"` in the ledger.
+total and the breakdown before anything executes. With `--check-equivalence`,
+two more lines join the same estimate: `(equivalence self-check)` and
+`(equivalence checks, if every mutant survives)`. The checks are priced as if
+every mutant survives, because the suite's strength is not known until the run,
+so the settled spend is at most that line. If the confirmed budget runs out
+partway, the run stops and the remaining mutants are reported `not_run` rather
+than the budget being exceeded. Spend settles per run under
+`command: "transform test"` in the ledger, each comparison included.
 
 **The cap.** 20 mutants, and `--max-mutants` may only lower it. Mutants are
 ordered round robin across the defect classes, so a capped run on a model with

@@ -383,6 +383,17 @@ check" note just means no connection was reachable at init time.
   small integers over one model, so quote it as context and never as a grade, and
   never compare it between models.
 
+  Each survivor's `equivalence.status` says which test to suggest. A
+  `distinguishable` survivor changes the model's output on the dev data, so an
+  assertion over that data would catch it today; these are listed first, so relay
+  them first. An `equivalent` one produces exactly the model's rows there, so
+  only a unit test fixture that reaches the case can catch it; say so rather than
+  suggesting an assertion that cannot see it. `suggested_test` already follows
+  the label. The comparison runs on its own on DuckDB. On BigQuery or Snowflake
+  it needs `--check-equivalence` and joins the same single estimate, so ask the
+  user before adding it, as with any spend. A `not_checked` survivor carries a
+  `reason`; relay it rather than guessing a label.
+
   Check `baseline.excluded` before trusting a clean-looking result. Every verdict
   is relative to the tests that passed against the unmutated model, so a test
   that was already failing is excluded and named there. And read `cap.elided`:

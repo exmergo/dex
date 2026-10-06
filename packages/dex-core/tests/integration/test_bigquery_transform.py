@@ -354,6 +354,45 @@ def test_mutation_coverage_prices_the_batch_then_measures_the_tests(
         assert data["baseline"]["tests"], data["baseline"]
         assert data["spend"]["bytes_billed"] is not None
 
+        # Asked for, the equivalence check goes into the same single estimate,
+        # and the confirmed run labels the survivor from the dev data. The
+        # model reads literal rows, so what actually bills is tiny; the estimate
+        # is per-query floors, which is why the run is budgeted at the estimate
+        # it was quoted rather than at the integration cap.
+        equivalence_run = [
+            "--repo-root",
+            root,
+            "transform",
+            "test",
+            "--mutate",
+            model,
+            "--max-mutants",
+            "1",
+            "--check-equivalence",
+        ]
+        rc, unconfirmed = run_cli(equivalence_run, capsys)
+        assert unconfirmed["status"] == "needs_confirmation", unconfirmed
+        lines = unconfirmed["data"].get("per_table_bytes") or {}
+        assert "(equivalence self-check)" in lines, lines
+        assert "(equivalence checks, if every mutant survives)" in lines, lines
+
+        quoted = unconfirmed["cost"]["estimate"]
+        assert quoted <= 4 * MAX_BYTES, lines
+        rc, labelled = run_cli(
+            [*equivalence_run, "--confirm", "--budget", str(int(quoted))], capsys
+        )
+        assert rc == 0, (lines, labelled)
+        data = labelled["data"]
+        assert data["equivalence"]["self_check"] == "reproducible", data
+        survivor = data["mutants"][0]
+        # The amounts are 10 and 200, so no row sits on the boundary at 5 and
+        # the dev data cannot tell `> 5` from `>= 5`.
+        assert survivor["operator"] == "comparison"
+        assert survivor["equivalence"]["status"] == "equivalent", survivor
+        assert survivor["equivalence"]["baseline_rows"] == 2
+        assert data["runs"] == 4, data["runs"]
+        assert data["spend"]["bytes_billed"] is not None
+
         # Ephemeral mutants materialize nothing, so the dataset is unchanged.
         after = {
             t.table_id for t in client.list_tables(f"{bq_project}.{bq_scratch_dataset}")

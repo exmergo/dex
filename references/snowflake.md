@@ -152,6 +152,13 @@ reports, ledgered under `command: "transform test"`. Nothing is materialized,
 because a mutant builds as an ephemeral model, so `snowflake.dev_database` holds
 exactly the objects it held before the run.
 
+Comparing each survivor with the unmutated model on the dev data is opt-in here,
+with `--check-equivalence`, and is priced in seconds into the same estimate from
+the same heuristic: one line for the self-check, and one for the comparisons,
+priced as if every mutant survives. Only survivors run one, so the settled
+seconds are at most that line, ledgered under the same command. Without the
+flag, survivors report `equivalence.status: not_checked`.
+
 
 `--verify` also reads the dev schema (`snowflake.dev_database` /
 `snowflake.dev_schema`) for the length of that one command, because dbt writes

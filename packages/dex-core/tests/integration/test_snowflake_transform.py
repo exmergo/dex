@@ -472,6 +472,40 @@ def test_mutation_coverage_prices_in_seconds_and_materializes_nothing(
         assert data["counts"]["generated"] == 2
         assert data["spend"]["seconds_billed"] >= 0
 
+        # Asked for, the equivalence check goes into the same single estimate,
+        # in seconds, and the confirmed run labels the survivor.
+        equivalence_run = [
+            "--repo-root",
+            root,
+            "transform",
+            "test",
+            "--mutate",
+            model,
+            "--max-mutants",
+            "1",
+            "--check-equivalence",
+        ]
+        rc, unconfirmed = run_cli(equivalence_run, capsys)
+        assert unconfirmed["status"] == "needs_confirmation", unconfirmed
+        assert unconfirmed["cost"]["paradigm"] == "compute_time"
+        lines = unconfirmed["data"].get("per_table_seconds") or {}
+        assert "(equivalence self-check)" in lines, lines
+        assert "(equivalence checks, if every mutant survives)" in lines, lines
+
+        rc, labelled = run_cli(
+            [*equivalence_run, "--confirm", "--budget", str(SF_MAX_SECONDS * 10)],
+            capsys,
+        )
+        assert rc == 0, labelled
+        data = labelled["data"]
+        assert data["equivalence"]["self_check"] == "reproducible", data
+        survivor = data["mutants"][0]
+        # The amounts are 10 and 200, so no row sits on the boundary at 5.
+        assert survivor["operator"] == "comparison"
+        assert survivor["equivalence"]["status"] == "equivalent", survivor
+        assert survivor["equivalence"]["baseline_rows"] == 2
+        assert data["spend"]["seconds_billed"] >= 0
+
         assert objects() == before
     finally:
         cursor = conn.cursor()
