@@ -323,6 +323,64 @@ def test_query_estimate_floors_per_referenced_table(fake_bq_client):
     assert estimate == 2 * 10 * MB
 
 
+def test_a_cte_reference_is_not_a_billed_table(fake_bq_client):
+    # One physical table read through several CTEs: BigQuery floors at 10 MB
+    # for the one table, and a CTE reference parses as a table but bills
+    # nothing (#508). Before the fix this statement priced at 60 MB, which on
+    # small dev data was the whole estimate.
+    adapter = make_adapter(fake_bq_client)
+    estimate = adapter.query_estimate(
+        "WITH base AS (SELECT id FROM `test-proj`.`shop`.`customers`), "
+        "a AS (SELECT * FROM base), b AS (SELECT * FROM a), "
+        "c AS (SELECT * FROM b), d AS (SELECT * FROM c) "
+        "SELECT COUNT(*) FROM d"
+    )
+    assert estimate == 10 * MB
+    assert [c.dry_run for c in fake_bq_client.query_calls] == [True]
+
+
+def test_the_floor_still_counts_each_physical_table_behind_the_ctes(fake_bq_client):
+    # Two physical tables, each behind its own CTE and joined through a third:
+    # the floor is per physical table, so twice the minimum, and the three CTE
+    # names add nothing to it.
+    adapter = make_adapter(fake_bq_client)
+    estimate = adapter.query_estimate(
+        "WITH c AS (SELECT id FROM `test-proj`.`shop`.`customers`), "
+        "e AS (SELECT id FROM `test-proj`.`shop`.`events`), "
+        "j AS (SELECT c.id FROM c JOIN e ON c.id = e.id) "
+        "SELECT COUNT(*) FROM j"
+    )
+    assert estimate == 2 * 10 * MB
+
+
+@pytest.mark.parametrize(
+    ("sql", "count"),
+    [
+        # A CTE nested inside a subquery is a CTE too; a top-level-only walk
+        # would still count `inner_cte` as a table.
+        (
+            "WITH outer_cte AS (SELECT id FROM `p`.`d`.`t1`) "
+            "SELECT * FROM (WITH inner_cte AS (SELECT * FROM outer_cte) "
+            "SELECT * FROM inner_cte)",
+            1,
+        ),
+        # No physical table at all still floors at one, as before.
+        ("WITH rows AS (SELECT 1 AS id) SELECT COUNT(*) FROM rows", 1),
+        # A reference that carries a dataset is a physical table whatever it
+        # is called, even when the name matches a CTE's.
+        (
+            "WITH t1 AS (SELECT 1 AS id) SELECT * FROM t1 JOIN `p`.`d`.`t1` USING (id)",
+            1,
+        ),
+        # CTE names resolve case-insensitively, so they are compared that way.
+        ("WITH Base AS (SELECT id FROM `p`.`d`.`t1`) SELECT * FROM base", 1),
+    ],
+)
+def test_referenced_table_count_excludes_cte_names(fake_bq_client, sql, count):
+    adapter = make_adapter(fake_bq_client)
+    assert adapter._referenced_table_count(sql) == count
+
+
 def test_describe_estimate_names_the_per_query_floor(fake_bq_client):
     adapter = make_adapter(fake_bq_client)
     described = adapter.describe_estimate(

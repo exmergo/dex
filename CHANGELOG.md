@@ -9,6 +9,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **BigQuery's per-table billing floor no longer counts CTE names as tables**
+  ([#508]). `query_estimate` floors a statement at 10 MB per distinct table it
+  references, because that is BigQuery's minimum per table. A reference to a
+  CTE parsed as a table too, so one physical table read through five CTEs
+  floored at 60 MB, and every dbt data test on an ephemeral model, which dbt
+  wraps in `__dbt__cte__` blocks, was priced the same way; on small dev data
+  that inflation was the whole estimate, and it could push a run over a budget
+  it fit. The names a statement defines as CTEs, at any depth, are now excluded
+  before counting. A reference that carries a dataset or project is still a
+  table whatever it is called, and a statement that reads no physical table
+  still floors at one. The estimate stays an upper bound on what BigQuery
+  bills: a statement never prices below its real floor, and no longer prices
+  above it for the CTEs it names.
+
 ## [1.12.6] - 2026-10-06
 
 ### Added
