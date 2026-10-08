@@ -297,6 +297,13 @@ them.
 
 - DexEngine: `packages/dex-core/` (PyPI: `exmergo-dex-core`, Apache-2.0).
 - Connector and methodology notes: `references/`.
+- The skills' own lookup material, which holds the agent-facing detail the
+  skill bodies leave out: `skills/explore/references/` (probe and semantic
+  playbooks, each explore subcommand's fields, connector setup and cost units),
+  `skills/transform/references/` (the edits payload and every edit kind, each
+  transform subcommand, init and dev-target preparation, semantic-layer
+  authoring, shipped macros), and `skills/maintain/references/` (each drift axis,
+  the snapshot, `verify`'s finding classes, and what each axis costs).
 - The contract in full: `references/command-contract.md`.
 - The PII policy: what a flag means, which surfaces gate on presence and which
   on the threshold, and how a human clears one: `references/pii-policy.md`.

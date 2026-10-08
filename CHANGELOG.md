@@ -9,6 +9,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The skill bodies open with the procedure, and lookup detail moved into
+  per-skill reference files** ([#489]). Each `SKILL.md` now starts with the
+  explore, transform, maintain procedure and keeps every rule that changes what
+  an agent does; per-flag and per-connector detail moved to
+  `skills/<skill>/references/`. The Ossie `unknown_key` diagnostic now names the
+  pinned spec version and carries both fixes inline instead of pointing at
+  `PROVENANCE.md`, and the PyPI project description's links now resolve.
+  
 ### Fixed
 
 - **BigQuery's per-table billing floor no longer counts CTE names as tables**

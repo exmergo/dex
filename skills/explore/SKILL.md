@@ -6,378 +6,178 @@ description: 'Use this whenever you need to know what is actually in a database,
 # Explore
 
 Make sense of a warehouse or a local DuckDB database the way an analytics
-engineer does: rank what matters, drill selectively, and persist a draft map.
-This is the flagship, fully read-only skill. It absorbs profiling and
-relationship inference as capabilities; they are not separate skills.
+engineer does: rank what matters, drill selectively, and persist a draft map in
+`.dex/`. This skill is read-only: it writes nothing but the `.dex/` cache.
 
-## How to drive it
+<!-- dex:procedure:begin -->
+## Procedure
 
-Run the engine through the wrapper. It prints one sanitized JSON envelope and
-nothing else; read the envelope and decide the next step.
+dex works in one loop: explore, transform, maintain. Every step runs one engine
+command, reads the single JSON envelope it prints, and decides the next step
+from that envelope.
+
+1. **Explore before you write.** Before writing or fixing SQL against a table
+   whose columns, types, grain, or join keys you have not verified in this
+   session, run `explore map` (or `explore profile <tables>` for a few named
+   ones) and read its grain, keys, PII flags, and data-quality findings. Answer
+   ad-hoc questions with `explore query`, never with a raw database client.
+2. **Plan the change.** Author the file content and hand it to `transform plan`
+   (or `semantic define|update|plan` for the semantic layer). Nothing is written
+   yet. Read the diffs, the `warnings`, and, on a model that already exists,
+   `data.row_attribution`; re-plan until they describe the change you meant.
+3. **Apply it.** `transform apply <plan-id>` writes the plan as a reviewable git
+   diff. A human edit made since planning comes back as `needs_confirmation`:
+   re-plan against the current files.
+4. **Build and verify on dev.** Run `transform build --target dev --verify`. Read
+   `data.verification.ran` first, then relay the findings and anything under
+   `suppressed`. A green build says dbt ran, not that the rows are right.
+5. **Maintain.** `maintain check` compares the warehouse and the project with the
+   `.dex/snapshot.json` baseline, and `maintain verify` checks the project as it
+   is now with no baseline. `maintain reconcile` proposes the fix as a plan,
+   applied with `transform apply`. Take `maintain snapshot` after a known-good
+   build.
+
+At every step: a `needs_confirmation` envelope waits on the user's spend
+decision, never on yours; only a human clears a PII flag; and you never edit the
+dbt project, `.dex/cache.json`, or `.dex/plans/` by hand in place of the command
+that guards them.
+<!-- dex:procedure:end -->
+
+## Running the engine
 
 ```bash
 uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
-dex runs its engine through `uv`, which is a prerequisite and is not installed by
-Claude Code. If the shell reports `uv: command not found`, stop and tell the user
-to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
-`brew install uv`, or `pipx install uv`), then re-run. Never fall back to raw
-Python, `pip`, or a database CLI to do the work another way: the guardrails live in
-the engine, so any other path is unguarded.
+- `uv` is a prerequisite that Claude Code does not install. If the shell reports
+  `uv: command not found`, stop and tell the user to install it
+  (`curl -LsSf https://astral.sh/uv/install.sh | sh`, `brew install uv`, or
+  `pipx install uv`), then re-run. Never fall back to raw Python, `pip`, or a
+  database CLI: the guardrails live in the engine, so any other path is
+  unguarded.
+- The first command in a fresh environment installs the engine and can take tens
+  of seconds. Offer `run.py --warm` once at setup to pay that up front; do not run
+  it before ordinary commands.
+- With no warehouse to point at, `demo` generates a seeded local DuckDB warehouse
+  and its `.dex/config.yml`, after which every command runs with no flags. Offer
+  it rather than assume it: a user who has a warehouse wants that one read. It
+  only ever creates, and refuses rather than touch an existing file.
 
-The first command in a fresh environment installs the engine, so it can take tens
-of seconds where later ones take well under a second. `--warm` pays that install up
-front and exits without running anything:
+## Exploring, step by step
 
-```bash
-uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
-```
+1. `connect test` (`--path <file.duckdb>`, or `--connector <name>` for a
+   warehouse) confirms a read-only connection. To set up a warehouse connector,
+   read `${CLAUDE_SKILL_DIR}/references/connectors.md`.
+2. `explore inventory --rank` returns a ranked shortlist: counts and sizes, never
+   rows.
+3. `explore map` profiles the top-ranked objects, infers joins, writes `.dex/`,
+   and returns each object's grain, best key, notable columns, PII flags, and
+   findings, plus the join edges. **Read that payload instead of chaining
+   `profile` and `relationships` to re-derive it.** In a repo with a dbt project
+   or semantic layer, add `--use-project`: declared grain and joins count, and
+   each object names the `semantic_models` that read it (empty means nothing in
+   the layer does). Every cut is counted in `notes`, so an empty `notes` means
+   nothing was left out. `--detail` widens the view and spends nothing; `--full`
+   profiles more and does spend. On a large or metered warehouse, start with
+   `--scope <schema>`.
+4. `explore profile <objects>` gives one object in full, or a value domain.
+   Read `key_evidence` before you trust a composite key: a combination that is
+   unique only because one member is near-unique, or because a money column
+   completes it, is suppressed with its reason. Where `data_quality` says a
+   column is unique on almost every row, the count of rows to remove is a source
+   defect to report, not a key to work around. A `~` marks an approximate number;
+   one without it is exact. A fresh cached profile is reused for free;
+   `--refresh` re-scans when the data changed but the schema did not.
+5. `explore relationships [--verify] [--use-project]` returns the joins alone.
+   `--verify` measures each join's orphan fraction. An empty list comes with
+   notes saying what was examined, so it is an answer.
+6. `explore diagram [--full]` renders the cached map as Mermaid, free and
+   connectionless. Reproduce `data.mermaid` verbatim in a fenced ```mermaid
+   block, and write it to a file only when the user asks (the engine writes
+   none). **Never redraw or tidy it by hand.** The glyphs are claims derived from
+   evidence, and a cardinality you supplied is exactly the overclaim this
+   command exists to prevent. Read `notes` before presenting it.
+7. `explore query "<SELECT ...>" ["<SELECT ...>" ...]` answers questions the
+   fixed commands do not. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md`
+   before writing a probe, and follow the query rules below.
+8. `explore cluster <object> [--features a,b] [-k N]` finds segments. Run `map`
+   first, so the inferred joins keep foreign keys out of the features. Read the
+   notes before trusting a result: a cluster under 1% of the sample is an outlier
+   pocket, so report it as outlier detection or re-run with `-k`, and when
+   `sample_repeatable` is false, never compare one run with another.
+9. `explore semantic list|values|query` reads the semantic layer. Read
+   `${CLAUDE_SKILL_DIR}/references/semantic-playbook.md` before running a metric
+   query, because a metric's `time_axis`, `filter`, and measures decide what the
+   number is. Narrow `list` with `--metric`, `--for-dimension`, or `--search`
+   rather than `--full`. Run `values <dimension>` before writing a `--where`
+   filter. On a native Ossie layer, `values` and `query` refuse and name the
+   physical route instead (`explore profile`, then `explore query` on the
+   relation): take it.
 
-Offer it once at setup. It is not something to run before an ordinary command.
+Per-command fields, caps, and backend detail are in
+`${CLAUDE_SKILL_DIR}/references/commands.md`. Read it when a field or flag you
+need is not described here.
 
-If the user has no warehouse to point at and wants to see what dex does, `demo`
-generates one: a seeded local DuckDB warehouse plus the `.dex/config.yml` for it,
-with no credentials and no network, so every subcommand below then runs with no
-flags. It only ever creates, so it refuses rather than touch a file that already
-exists. Offer it rather than assuming it: a user who does have a warehouse wants
-that one read, not a fixture built beside it.
+## Rules that change what you do
 
-Subcommands, in the usual order:
+### Queries and PII
 
-1. `connect test --path <file.duckdb>` confirms a read-only connection and
-   reports capabilities.
-2. `explore inventory --rank` returns a ranked object summary (counts and sizes,
-   never rows).
-3. `explore profile <objects>` (space- or comma-separated) returns column
-   profiles, PII flags recorded as (column, category, confidence) and never
-   example values, plus ranked candidate keys, the likely grain, `key_evidence`,
-   and data-quality warnings (e.g. an id unique on all but 110 rows, which will
-   fan out on joins). `candidate_keys` is ordered, tightest proven key first,
-   and `key_evidence` gives one entry per combination considered with its
-   `status` (`reported` or `suppressed`) and the reason. Read it before you
-   trust a composite: a combination unique only because one member is unique on
-   almost every row, or because a money column completes it, is suppressed
-   rather than reported. Where a near-unique column is the real story the
-   warning says so with the ratio, the counts, and how many rows would have to
-   be removed for it to be unique. That last number is the one to act on: it
-   names a source defect to fix rather than a key to work around. A generic
-   `*_name` flag's confidence is refined by value-shape evidence from the same
-   scan, in both directions: person-shaped values corroborate it, a closed
-   reference vocabulary or long labels de-rate it below the firewall's blocking
-   threshold, and missing evidence changes nothing (the flag itself is never
-   removed). Distinct counts
-   are approximate for scale, but any column that looks unique within
-   approximation noise is escalated to an exact COUNT(DISTINCT)
-   (`distinct_count_exact: true`), so uniqueness and grain verdicts rest on
-   proof; a `~` prefix marks a number that is still approximate, on a count and
-   on a percentage alike, so a figure quoted without one is exact arithmetic
-   over an exact distinct count on a column with no nulls.
-   A requested object whose cached profile is still fresh (same connector,
-   schema unchanged, within `profile_freshness_hours`, default 24) is served
-   from the cache (`cache_hit_count`) instead of re-scanned, so profiling a
-   table `map` just wrote costs nothing to spend; pass `--refresh` to force a
-   re-scan when the source changed in a way the free metadata check cannot see.
-4. `explore relationships` returns inferred and declared joins with confidences,
-   plus notes explaining what the inference examined (so an empty list is
-   meaningful). Add `--verify` to measure each inferred join with an aggregate
-   overlap probe (orphan fraction, confidence adjusted). A declared join has two
-   sources: a `relationships` test, and (with `--use-project`) an entity two
-   semantic models share, which the layer states outright with the key named per
-   model. `declared_by` on an edge names that entity, `semantic_join_count` says
-   how many came that way, and the notes call out the ones name-based inference
-   did not find, which is the interesting set: a semantic layer routinely joins
-   columns that share no name at all.
-5. `explore map` writes or updates the `.dex/` cache and returns the map
-   (`--verify` works here too). Alongside the counts, `data.objects` gives each
-   top-ranked object its row count, detected grain, best-ranked candidate key,
-   notable columns (each carrying the role that earned it a place: `grain`, `key`,
-   `join`, or a PII flag) and data-quality findings, and `data.edges` gives the
-   join edges in the same shape `explore relationships` returns. With
-   `--use-project` each object also carries `semantic_models`, the semantic models
-   that sit on that relation, which is what separates a load-bearing table from a
-   merely large one: empty means nothing in the layer reads it. **Read that
-   payload instead of chaining `profile` and `relationships` to re-derive it**;
-   go to those two when you need one object in full, or a value domain, which
-   `map` never carries. It is budgeted: 25 objects by rank, 12 columns per
-   object, 40 edges, 5 findings per object. Every cap binds in every mode and
-   every elision is counted in `notes` and in an `elided_*` field, so an empty
-   `notes` means nothing was cut. `--detail` widens the selection to every column
-   and to objects that were inventoried but never profiled, and lifts no cap; it
-   spends nothing, unlike `--full`. Past 50 objects it profiles only the top 25
-   by rank and says so in `notes` (with `skipped_count`); pass `--full` to
-   profile everything. On a re-map, objects skipped this run keep their prior profiles
-   (`carried_forward_count`), each stamped with its own `profiled_at` so
-   staleness is visible instead of column detail silently vanishing. A selected
-   object whose cached profile is still fresh (same connector, schema unchanged,
-   profiled within `profile_freshness_hours`, default 24) is reused without a
-   re-scan (`cache_hit_count`), so re-runs cost nothing to spend; pass
-   `--refresh` to force a full re-profile when the source changed in a way the
-   free metadata check cannot see (e.g. rows changed but the schema did not).
-   `explore relationships` and the standalone `explore profile` reuse fresh
-   profiles the same way.
-6. `explore diagram [--full]` renders the cached map as a Mermaid ER diagram in
-   `data.mermaid`. Free and connectionless (it reads the cache, never the
-   warehouse), so it is safe to re-run while shaping the picture. **Reproduce the
-   string verbatim in a fenced ```mermaid block so the human can see it, and
-   write it to a `.mmd` or a markdown file when they want one on disk: the
-   engine deliberately writes no file.** Never redraw or "tidy up" the diagram
-   by hand. The glyphs are claims the engine derived from evidence, and a
-   plausible-looking cardinality you supplied is exactly the overclaim this
-   command exists to prevent: declared joins are solid, inferred dotted, and an
-   unverified inference never says "exactly one". A solid line labelled with a
-   semantic entity is a join the semantic layer declares; look the entity up with
-   `explore semantic list`. Read `notes` before presenting
-   it, since it states any object or column that was left out; `--full` widens
-   from the default (profiled, joined objects and their grain, key, join, and
-   PII columns) to everything eligible.
-7. `explore query "<SELECT ...>" ["<SELECT ...>" ...]` answers ad-hoc questions
-   the fixed commands don't cover: you write the SQL, the engine's query firewall
-   refuses or bounds it. Pass a statement per argument, or `--sql-file <path>`
-   for a longer list, and ask a whole chain of questions in one call rather than
-   one call each; each statement is judged and answered on its own, so a refusal
-   on one does not cost you the others, and `data.results` carries one entry per
-   statement. A table you have not profiled, including a model you just built, is
-   profiled for you and the statement then runs, so probing something new is one
-   call rather than three; the envelope says what it profiled, and on a metered
-   connector that profile is priced into the same confirmation as the statements.
-   Results come back row-major and capped; a refusal names the offending column
-   and the fix, so one rewrite is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
-   writing a probe: it maps common questions to effective probe shapes.
-8. `explore cluster <object> [--features a,b,c] [-k N]` runs k-means over a
-   bounded sample of the object's numeric columns and returns the segment
-   structure: per-cluster sizes and fractions, centroids (each coordinate is a
-   cluster's mean of that feature, an aggregate), the silhouette score, and,
-   when `-k` is omitted, the k it picked plus the silhouette sweep it chose from.
-   Requires the `.dex/` cache (run `map`/`profile` first) so features can be
-   auto-selected from profiled numeric, non-PII, non-key columns; pass
-   `--features` to choose them yourself (naming a PII column, or a key, opts it
-   in deliberately, and only its mean is ever reported). A key is never a
-   feature: its mean is meaningless, and a fact table is mostly keys plus a
-   handful of measures, so clustering on them just partitions surrogate ranges.
-   Keys are the unique columns, the columns that join out (from the joins `map`
-   inferred), and the columns named like one; prefer `map` over a bare
-   `profile` here, because without inferred joins a foreign key is caught only
-   if its name gives it away. The notes name every excluded column, so check
-   them before trusting a result. Two things the silhouette alone will not tell
-   you, both of which the notes will. A cluster holding under 1% of the sample
-   is an outlier pocket, not a segment, and it pushes the score up precisely
-   because it sits so far out: report that as outlier detection, or re-run with
-   `-k` to split the bulk. And on connectors that cannot seed a sample the draw
-   changes per run, so two runs can disagree on k; the envelope's
-   `sample_repeatable` says which case you are in, and comparing runs across
-   different draws is meaningless. Only aggregates cross the
-   boundary: the sample rows are clustered in-process and never enter context.
-   On a metered connector it takes the same cost handshake as the scanning
-   commands below (only the feature columns are scanned, and a dialect-aware
-   sample clause reads a fraction), so surface the estimate and get a budget
-   first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
-   automatically for this subcommand.
-9. `explore semantic list|values|query` reach the semantic layer: the metrics an
-   author defined, and the semantic models, measures, dimensions and entities
-   they are built out of. Distinct from the warehouse commands above, and from
-   the top-level `semantic` group, which *authors* the layer where this *queries*
-   it.
+- Prefer a fixed command when one answers the question. One probe answers one
+  question. Send related statements in one call: each is judged on its own, so a
+  refusal on one does not cost you the others.
+- An aggregate over a PII-flagged column must measure (`COUNT`,
+  `APPROX_COUNT_DISTINCT`, `AVG(LENGTH(...))`), never carry a value (`MIN`,
+  `ANY_VALUE`, `STRING_AGG`).
+- A refusal names the offending column and the fix. Rewrite once; do not retry
+  the same shape.
+- An unnest in the FROM clause must expand a column of a table in the query, and
+  its outputs inherit that column's PII flags. The per-connector idioms are in
+  the probe playbook.
+- A warning that a flag sits below the blocking threshold is information to pass
+  to the user, not an error to fix.
+- If the user says a refused column is not personal data, recommend a
+  `pii_overrides` entry in `.dex/config.yml` (the fully qualified column, with an
+  optional reason). Never hand-edit `.dex/cache.json` to clear a flag, and never
+  suggest weakening detection.
+- Never propose a write to source data, and never paste a full schema into
+  context.
 
-   `list` is discovery and returns the layer's objects rather than three lists of
-   names: semantic models (the unit the layer is organized around, each with the
-   transformation model it sits on, its default time dimension, and the physical
-   `relation` underneath), metrics (which dimensions each can be grouped by, the
-   measures it reads, a ratio's two sides, any filter that makes it a subset, the
-   grains it can be queried at, and `time_axis`, the physical time column a time
-   grouping resolves to), dimensions (the token to group by, plus the bare
-   definition, owning model, queryable grains and `column` behind it), entities
-   (one declaration per semantic model, each with its own join key, so the
-   declared join graph is readable), and measures (the aggregation and expression
-   the number is actually made of, which is often a conditional rather than a
-   column). An element defined as an expression carries no column rather than a
-   guessed one. So "which table is behind this metric" is the metric's
-   `semantic_models` followed to their relations, and `explore profile <relation>`
-   is the next call; `--api` exposes no relation at all and declares that in
-   `unavailable`, so use `--local` when you need the physical side.
+### Cost
 
-   Three free ways to narrow it, and they compose. `--metric <m>` keeps those
-   metrics and what they reach. `--for-dimension <d>` asks the reverse question,
-   returning the metrics groupable by all the named tokens, which is what you want
-   when you know the slice rather than the metric and is also the cheapest way to
-   find the metrics that can go on one chart against one axis. `--search <t>`
-   takes a word rather than a name and matches it against every element's name and
-   against the project's own label and description. Each names its scope in the
-   payload (`scoped_to`, `for_dimensions`, `searched_for`), so a subset is never
-   mistaken for the layer; an unknown metric or dimension is refused by name,
-   while a search term that matched nothing comes back as a note. The catalog is
-   also capped, with every cut counted in `elided` and named in `notes` and
-   `--full` to lift the caps. `elided` is always present, so all zeros and no cap
-   notes is the positive statement that this is the whole layer. Prefer narrowing
-   over `--full`: it decides which part comes back rather than letting a cap
-   decide.
+- On a metered connector, the scanning commands (`profile`, `map`,
+  `relationships`, `query`, `cluster`, and a local `semantic values` or `query`)
+  first return `needs_confirmation` with an estimate. Surface it in human units,
+  get an explicit budget from the user, then re-issue the same command with
+  `--confirm --budget <magnitude>` in the unit the estimate names. Metadata
+  (`connect test`, `inventory`) is free.
+- Never invent a budget. After an over-ceiling refusal, never retry with a raised
+  budget without asking. Relay the refusal's calibration line verbatim, and point
+  out that the ceiling binds on the estimate, so a budget set at the observed
+  fraction of the estimate is refused again.
+- A `suggested_session_ceiling` is the project's one-time ask for a daily cap.
+  Surface it, get the user's answer, and add `--session-ceiling <value>` or
+  `--no-session-ceiling` to the same re-issue. Never answer it for them.
+- On BigQuery, pass on the `reserved_bytes` split: whether the number is scan or
+  reserve decides whether a higher budget buys work or only headroom.
+- When an estimate is larger than the work deserves, narrow with `--scope`
+  instead of raising the budget.
+- `--api` (a hosted dbt Cloud layer) runs where no cost guard can reach. Relay
+  the warning every such result carries.
 
-   `values <dimension>` returns that dimension's value domain, which is what you
-   need before writing a `--where` filter and the one thing no other dex command
-   can reach on a hosted layer (`profile` cannot see a semantic dimension). A
-   PII-flagged dimension refuses this command outright rather than being screened,
-   because the whole output is values.
+### Credentials
 
-   `query` takes a positional metric after the explicit mode (with `--metric` kept
-   for compatibility), a `--group-by <entity__dim>`, and optional `--where`,
-   `--order-by`, `--grain` and `--limit`, and returns the metric's values as a
-   capped columnar result. Name flags take a comma-separated list or a repeated
-   flag (`--group-by a,b` is `--group-by a --group-by b`); `--where` is never
-   split, because a filter clause carries its own commas. `--grain` is checked
-   against the grains the layer reports for the metrics queried, so a refusal
-   names the ones that metric has.
+Credentials are discovered, never asked for. When an envelope reports missing or
+expired credentials, relay the fix it names
+(`${CLAUDE_SKILL_DIR}/references/connectors.md` lists them per connector). Never
+ask the user to paste a key, token, or password.
 
-   Two payload fields carry legitimate differences between the backends rather
-   than leaving them to be inferred: `dimension_scope` says whether a dimension
-   row is one declaration or one groupable path, which is why two backends can
-   report different dimension counts for one layer, and `unavailable` names fields
-   a backend structurally cannot supply. `--local` resolves the join graph through
-   MetricFlow where the `[semantic]` extra is installed, which is what makes its
-   dimension lists the tokens a query can actually use; without it the payload says
-   `declarations` and a note names the extra.
+## References
 
-   Three backends answer these commands, chosen by `.dex/config.yml`
-   `semantic.vendor` and `semantic.deployment` (the older `semantic.backend`
-   spelling still works),
-   overridable with `--local` / `--api`. Those two flags name **who executes**, not
-   which vendor, and every result reports it as `execution` (`dex` or `vendor`).
-   `--local` renders the SQL with MetricFlow and executes it through dex's own
-   connector and cost handshake, so cost is surfaced before spend (needs a dbt
-   project parsed at least once, and the `[semantic]` extra for `values` and
-   `query`; `list` reads the project and needs no extra). `--api` sends the query to
-   a hosted dbt Cloud deployment (needs a host, an environment id and a
-   `DBT_SL_TOKEN`, plus `[semantic-api]`, and no local project). The hosted backend
-   is the one place the cost guard cannot apply: dbt Cloud executes server-side, so
-   the result carries an explicit warning that spend is governed there and no
-   `--confirm` is asked. Either way a PII-shaped grouped or filtered dimension (for
-   example `user__email`) is refused before the query runs, and on `--api` the
-   layer's own PII metadata is fetched per metric so a multi-metric query stays
-   authoritative rather than falling back to names.
-
-   The third backend is `semantic.vendor: ossie`, native Apache Ossie documents
-   read out of the repository with no dbt project and no MetricFlow in the path
-   (needs the `[ossie]` extra). It is catalog-first: `list` answers, and `values`,
-   `query` and `--for-dimension` refuse by name, because Ossie specifies
-   interchange metadata and no portable query runtime. Those refusals are the
-   format's shape rather than a missing feature, and each one names the physical
-   route instead: a dimension carries its `semantic_model`, that model carries its
-   `relation`, and `explore profile` then `explore query` reach the values under
-   the firewall and the cost guard. `--api` is refused too; Ossie has no hosted
-   deployment.
-
-   Read `${CLAUDE_SKILL_DIR}/references/semantic-playbook.md` before running a
-   metric query: a metric's `time_axis`, `filter` and measures decide what the
-   number *is*, and the playbook covers the discovery order, the additivity and
-   time-axis traps this surface is full of, when `values` answers rather than a
-   query, and what changes when the layer is native Ossie.
-
-Rules of engagement for `query`: prefer the fixed commands when they answer the
-question; one probe answers one question; batch related measures into a single
-query rather than issuing many; aggregates over PII-flagged columns must be
-measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
-(MIN, ANY_VALUE, STRING_AGG). The FROM clause may unnest JSON and array
-columns in the connector's native idiom, which is the right way to explore
-schemaless data (for example "which keys appear across every row of this JSON
-column"): BigQuery `t, UNNEST(JSON_KEYS(doc)) AS k`, Snowflake
-`t, LATERAL FLATTEN(input => doc) f`, Databricks
-`t LATERAL VIEW EXPLODE(json_object_keys(doc)) x AS k`, Postgres
-`t, jsonb_object_keys(doc) AS k`, Redshift `t, UNPIVOT t.doc AS v AT k`,
-DuckDB `t, UNNEST(json_keys(doc)) AS u(k)`, ClickHouse
-`t ARRAY JOIN JSONExtractKeysAndValuesRaw(doc) AS kv` (there is no lateral
-join; ARRAY JOIN is the expansion). The unnested value must come from
-a column of a table in the query (bare, or through a JSON/array function);
-unnesting a subquery, another table, a literal, or a generator is refused,
-and the unnest's outputs inherit the source column's PII flags. A column whose
-flag was de-rated below the blocking threshold projects normally, with an
-envelope warning naming it; treat the warning as information for the user, not
-an error to fix. If the user says a refused column is not personal data,
-recommend a `pii_overrides` entry in `.dex/config.yml` (fully qualified column,
-optional reason): it unblocks querying immediately, survives re-profiles, and is
-reviewable in git. Never hand-edit `.dex/cache.json` to clear a flag. Never fall
-back to raw Python or a database CLI to run SQL; the firewall path is the only
-sanctioned one.
-
-## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift, ClickHouse)
-
-A remote warehouse or database replaces `--path` with connector config. Start
-with `connect test --connector <name>` (or set `connector:` plus the matching
-block in `.dex/config.yml`: `bigquery:` with `project` and a `datasets`
-allowlist, `snowflake:` with the pinned `warehouse` and a `databases`
-allowlist, `databricks:` with the pinned SQL `warehouse` and a `catalogs`
-allowlist, `postgres:` with a `schemas` allowlist, `redshift:` with the
-Serverless `workgroup` and a `schemas` allowlist). Credentials are
-discovered, never asked for: if the envelope reports missing or expired
-credentials, relay the fix it names (for BigQuery
-`gcloud auth application-default login`; for Snowflake a `connections.toml`
-entry or `SNOWFLAKE_*` env; for Databricks `databricks auth login` or
-`DATABRICKS_*` env; for Postgres `DATABASE_URL`, `PG*` env, or a
-`pg_service.conf` entry; for Redshift the AWS credential chain
-(`aws configure`, `AWS_*` env) or `REDSHIFT_*` env) and never ask the user to
-paste a key, token, or password.
-
-On a metered connector, scanning commands (`profile`, `map`, `relationships`,
-`query`) run a two-step handshake. The first call returns `needs_confirmation`
-with an estimate in `cost.estimate`, a per-table breakdown where relevant, and
-the unit it is counted in: bytes on BigQuery, warehouse-seconds on Snowflake
-(credits alongside) and Databricks (DBUs), compute-seconds on Redshift
-(RPU-hours), database-seconds on Postgres and ClickHouse (no dollars; the
-guarded quantity is load). Surface the estimate to the user in human units, get
-an explicit budget from them, and re-issue the same command with `--confirm` and
-`--budget <magnitude>` in that unit. Never invent a budget the user did not
-agree to, and never retry with a raised budget on an over-ceiling refusal
-without asking. Metadata is free (`connect test`, `inventory` run immediately),
-and OK envelopes report actual spend under `data.spend`.
-
-An over-ceiling refusal now carries a calibration line drawn from
-`.dex/spend.jsonl`: what this connector's last few settled commands actually
-billed as a fraction of what they were estimated at, or a sentence saying the
-project has too little history to say. On a partitioned or clustered warehouse a
-dry-run estimate is an upper bound, so this is often the difference between a
-budget that admits the work and one that does not. Relay it verbatim when you
-surface the refusal, and note the part callers get wrong: the ceiling is checked
-against the *estimate*, so a budget set at the observed fraction of the estimate
-is refused again. It is still the user's decision, never yours.
-
-When a `needs_confirmation` envelope carries `suggested_session_ceiling`, the
-project has never decided whether the *day's* total spend is bounded, and this is
-the one time it is asked. Surface it beside the per-command estimate and get the
-user's answer: `--session-ceiling <value>` sets a cumulative cap for the project
-(the suggestion is five times this command's estimate, a starting point, not a
-recommendation), and `--no-session-ceiling` records that the project runs
-unbounded. Either one is written to `.dex/config.yml` and reported as a diff, and
-nothing asks again. Add it to the same re-issue that carries `--confirm
---budget`, or the confirmed run will stop once to ask. Never answer it on the
-user's behalf: it is a durable project setting, not a per-command flag.
-
-On BigQuery a profiling estimate holds a 10 MB floor per table for each
-escalation query a profile may still issue after its aggregate scan, so on a
-warehouse of many small tables most of the number can be reserve for work that
-never happens. Both the handshake and the over-ceiling refusal report that split
-(`reserved_bytes` and `reserved_queries`, and in the prose). Pass it on when you
-surface the estimate: whether a number is scan or reserve changes whether
-raising the budget is buying work or headroom.
-
-When an estimate is larger than the work deserves, narrow the scope rather than
-raise the budget. `--scope` (repeatable) bounds a command to part of the
-configured source allowlist, in the connector's own vocabulary: a dataset on
-BigQuery, a `schema` or `database.schema` on Snowflake, a `catalog.schema` on
-Databricks, a schema on Postgres or Redshift, a database on ClickHouse (whose
-identifiers are two-part `database.table`: there is no catalog level). It is
-free to resolve, it can only narrow what
-`.dex/config.yml` already allows, and a scope that names nothing is refused with
-the schemas that do exist listed. So `explore map --scope <schema>` is the first
-thing to reach for on a warehouse whose full map would be expensive.
-
-## Guardrails (enforced in the engine, not here)
-
-- Read-only against data. The connection is opened read-only and generated SQL is
-  SELECT-only. Never propose a write to source data.
-- Sense-making, not enumeration. Rank and drill selectively; never paste a full
-  schema into context.
-- Profile, don't exfiltrate. Understanding comes from aggregates. PII is flagged,
-  never surfaced, and the query firewall enforces it on your own SQL: values
-  cross the envelope only from profiled columns whose flag is absent or below
-  the blocking threshold, bounded and capped. Only a human's `pii_overrides`
-  entry clears a flag entirely; never suggest weakening the detection.
-- The two policies in full, in the engine repository:
-  `references/pii-policy.md` and `references/cost-controls.md`.
+- `${CLAUDE_SKILL_DIR}/references/probe-playbook.md`: probe shapes for common
+  questions, unnest idioms, and what to do when a probe is refused.
+- `${CLAUDE_SKILL_DIR}/references/semantic-playbook.md`: the discovery order and
+  the traps in metric queries.
+- `${CLAUDE_SKILL_DIR}/references/commands.md`: each subcommand's fields, caps,
+  and flags.
+- `${CLAUDE_SKILL_DIR}/references/connectors.md`: warehouse setup, credential
+  fixes, cost units, and `--scope` vocabulary.
