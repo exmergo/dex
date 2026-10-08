@@ -103,6 +103,8 @@ _EXPORTS = {
     "RepoRootRequiredError": "errors",
     "RequestError": "errors",
     "Result": "results",
+    "ScaffoldError": "transform.scaffold",
+    "ScaffoldPrerequisiteError": "transform.scaffold",
     "ScopeError": "connect",
     "SemanticBackendError": "explore.semantic",
     "SemanticLayerError": "explore.semantic",
@@ -110,6 +112,7 @@ _EXPORTS = {
     "SemanticSource": "connect",
     "SessionCeilingDecisionRequiredError": "guards.cost_guard",
     "Snapshot": "maintain.snapshot",
+    "SourcesFileError": "transform.scaffold",
     "SpendHistory": "storage",
     "SpendLock": "storage",
     "SpendLockTimeoutError": "guards.cost_guard",
@@ -198,6 +201,11 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .transform.build import MissingPackagesError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
+    from .transform.scaffold import (
+        ScaffoldError,
+        ScaffoldPrerequisiteError,
+        SourcesFileError,
+    )
 
 try:
     __version__ = version("exmergo-dex-core")
@@ -260,6 +268,8 @@ __all__ = [
     "RepoRootRequiredError",
     "RequestError",
     "Result",
+    "ScaffoldError",
+    "ScaffoldPrerequisiteError",
     "ScopeError",
     "SemanticBackendError",
     "SemanticLayerError",
@@ -267,6 +277,7 @@ __all__ = [
     "SemanticSource",
     "SessionCeilingDecisionRequiredError",
     "Snapshot",
+    "SourcesFileError",
     "SpendHistory",
     "SpendLock",
     "SpendLockTimeoutError",

@@ -24,6 +24,23 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   still floors at one. The estimate stays an upper bound on what BigQuery
   bills: a statement never prices below its real floor, and no longer prices
   above it for the CTEs it names.
+  
+- **`transform plan --scaffold` says in `reason` what clears each refusal**
+  ([#514]). Every scaffold refusal was one class, `ScaffoldError`, classified
+  `request`, so a host branching on `reason` could not tell "run `explore map`
+  first" from "qualify the name" from "edit the sources file" without parsing
+  the message. The three setup refusals (no exploration cache, an object the
+  cache does not hold, a table with no column profile) are now
+  `ScaffoldPrerequisiteError`, a `PrerequisiteError`, and read `prerequisite`,
+  as the same condition already did from `explore`. The sources-file refusals
+  (a `_dex_sources.yml` the merge will not rewrite: invalid YAML, flow style,
+  anchors and aliases, duplicate keys, a shape it does not expect) are
+  `SourcesFileError`, a `ConfigurationError`, and read `configuration`: the
+  call's input is fine and a person edits the file. An ambiguous name and an
+  unknown macro stay `request`. Both subclasses are still `ScaffoldError`, so an
+  existing `except ScaffoldError` catches what it did, and all three classes are
+  importable from `exmergo_dex_core` rather than from the module that raises
+  them.
 
 ## [1.12.6] - 2026-10-06
 
