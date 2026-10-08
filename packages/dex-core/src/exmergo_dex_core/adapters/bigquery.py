@@ -1140,7 +1140,19 @@ class BigQueryAdapter:
     def _referenced_table_count(self, sql: str) -> int:
         """Distinct physical tables a query reads, for the billing floor. A parse
         failure falls back to one table (the estimate only ever floors upward, so
-        under-counting is the safe direction to be wrong)."""
+        under-counting is the safe direction to be wrong).
+
+        A reference to a CTE parses as a table too, and BigQuery bills nothing
+        for it: one physical table read through five CTEs floors at 10 MB, not
+        60 (#508). So every CTE the statement defines, at any depth, is excluded
+        by its bare name. A reference that carries a dataset or a project is a
+        physical table whatever it is called, and a physical table that shares
+        a bare name with a CTE is shadowed by the CTE inside the statement
+        anyway. A statement that reads no physical table at all (literal rows,
+        or CTEs over them) still floors at one, as before: the estimate is
+        meant to err upward, and a statement BigQuery may bill nothing for
+        costs nothing to over-price by one floor.
+        """
 
         try:
             import sqlglot
@@ -1149,9 +1161,11 @@ class BigQueryAdapter:
             parsed = sqlglot.parse_one(sql, read=self.dialect)
         except Exception:
             return 1
+        ctes = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot_exp.CTE)}
         tables = {
             ".".join(part for part in (t.catalog, t.db, t.name) if part)
             for t in parsed.find_all(sqlglot_exp.Table)
+            if t.catalog or t.db or t.name.lower() not in ctes
         }
         return max(len(tables), 1)
 
