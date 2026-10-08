@@ -321,7 +321,10 @@ build's own estimate is in [`cost-controls.md`](cost-controls.md).
 once, then runs one dbt invocation per mutant. Nothing is materialized: a mutant
 builds as an ephemeral model, so the dev namespace holds exactly the relations it
 held before. A budget that runs out partway stops the run, and the remaining
-mutants are reported `not_run` rather than the budget being exceeded.
+mutants are reported `not_run` rather than the budget being exceeded. Survivors
+are not yet compared with the model on the dev data on this connector, so each
+reports `equivalence.status: not_checked` with the reason, and nothing is
+priced or run for it.
 
 
 `--verify` also reads `clickhouse.dev_database` for the length of that one

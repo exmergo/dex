@@ -348,6 +348,19 @@ More info in the package's [`README.md`](packages/dex-core/README.md)
   [`references/pii-policy.md`](references/pii-policy.md) and
   [`references/cost-controls.md`](references/cost-controls.md).
 
+## Dex Enterprise
+
+Dex Enterprise runs `dex` as automated workflows in your own CI. It turns tickets
+into draft pull requests using `explore` and `transform`, and runs `maintain` on a
+schedule to turn detected drift into draft pull requests. Your engineers review
+each one. The workflows run in your repository's CI under your team's access
+controls, and no Exmergo service sits in the request path.
+
+Everything in this repository stays Apache-2.0. Dex Enterprise is built on the
+published `exmergo-dex-core` package and these skills.
+
+[Learn more about Dex Enterprise](https://www.exmergo.com/dex/enterprise).
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, the Ruff lint and

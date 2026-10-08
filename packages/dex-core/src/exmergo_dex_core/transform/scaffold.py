@@ -28,7 +28,7 @@ import yaml
 from ..cache import Dataset
 from ..dbt_project import DbtProjectError, DbtProjectView
 from ..dbt_project import load as load_dbt_project
-from ..errors import DexError
+from ..errors import ConfigurationError, DexError, PrerequisiteError
 from ..guards.pii_meta import stamp_lines
 from ..storage import ExploreStore, readable_cache
 from .plans import EditKind, PlanEdit
@@ -56,7 +56,40 @@ MACRO_ASSETS: dict[str, str] = {
 
 
 class ScaffoldError(DexError):
-    pass
+    """A scaffold refusal, and the base every one of them shares.
+
+    Raised bare for the caller's own input: a name that matches several cached
+    objects, or a macro the engine does not ship. The two subclasses below are
+    the other two things that can stop a scaffold, and a host tells them apart
+    because what clears each one is different (#514). All three are
+    ``ScaffoldError``, so a caller catching the base sees every refusal.
+    """
+
+
+class ScaffoldPrerequisiteError(ScaffoldError, PrerequisiteError):
+    """A named ``explore`` command has not been run, and the scaffold needs
+    what it produces.
+
+    The scaffold builds from the exploration cache: no cache, an object the
+    cache does not hold, or a table with no column profile each name the
+    command that fills the gap. The same condition reads ``prerequisite`` from
+    ``explore`` (``CacheRequiredError``), and a host that resolves one by
+    running the named command and retrying resolves this one the same way.
+    """
+
+
+class SourcesFileError(ScaffoldError, ConfigurationError):
+    """The project's shared sources file is in a shape the merge will not
+    rewrite.
+
+    ``_merge_sources`` inserts declarations into ``_dex_sources.yml`` without
+    serializing what a person already wrote there, so it declines a file it
+    cannot edit in place: invalid YAML, flow style, anchors and aliases,
+    duplicate keys, a root or a ``sources:`` that is not the shape it expects.
+    The call's input is fine and no command repairs the file; someone edits it
+    before any scaffold into that project can succeed. That is the repository
+    wired without something it needs, ``configuration``, not a bad request.
+    """
 
 
 def scaffold_edits(
@@ -72,7 +105,7 @@ def scaffold_edits(
 
     cache = readable_cache(store)
     if cache is None:
-        raise ScaffoldError(
+        raise ScaffoldPrerequisiteError(
             "no exploration cache yet; run `explore map` first so the scaffold has "
             "profiles and PII flags to build from"
         )
@@ -80,7 +113,7 @@ def scaffold_edits(
     datasets = [_resolve_dataset(cache.datasets, name) for name in tables]
     unprofiled = [d.identifier for d in datasets if not d.columns]
     if unprofiled:
-        raise ScaffoldError(
+        raise ScaffoldPrerequisiteError(
             "no column profiles cached for: "
             + ", ".join(unprofiled)
             + "; re-run `explore map` (or `explore profile`) on them first"
@@ -188,7 +221,9 @@ def _resolve_dataset(datasets: list[Dataset], name: str) -> Dataset:
         }
     )
     if not matches:
-        raise ScaffoldError(f"no cached object named '{name}'; run `explore map` first")
+        raise ScaffoldPrerequisiteError(
+            f"no cached object named '{name}'; run `explore map` first"
+        )
     if len(matches) > 1:
         raise ScaffoldError(f"'{name}' is ambiguous: {', '.join(matches)}; qualify it")
     by_id = {d.identifier: d for d in datasets}
@@ -233,15 +268,15 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
     try:
         root = yaml.compose(original)
     except yaml.YAMLError as exc:
-        raise ScaffoldError("cannot merge _dex_sources.yml: invalid YAML") from exc
+        raise SourcesFileError("cannot merge _dex_sources.yml: invalid YAML") from exc
 
     def fields(node):
         if not isinstance(node, yaml.MappingNode):
-            raise ScaffoldError("cannot merge _dex_sources.yml: expected a mapping")
+            raise SourcesFileError("cannot merge _dex_sources.yml: expected a mapping")
         result = {}
         for key, value in node.value:
             if key.value in result or key.value == "<<":
-                raise ScaffoldError("cannot merge duplicate keys or YAML merge keys")
+                raise SourcesFileError("cannot merge duplicate keys or YAML merge keys")
             result[key.value] = value
         return result
 
@@ -255,13 +290,13 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
     newline = "\r\n" if "\r\n" in original else "\n"
     sources = fields(root).get("sources")
     if sources is not None and not isinstance(sources, yaml.SequenceNode):
-        raise ScaffoldError("cannot merge _dex_sources.yml: sources must be a list")
+        raise SourcesFileError("cannot merge _dex_sources.yml: sources must be a list")
     by_name = {}
     for source in sources.value if sources is not None else []:
         source_fields = fields(source)
         name = source_fields.get("name")
         if not isinstance(name, yaml.ScalarNode) or name.value in by_name:
-            raise ScaffoldError("cannot merge unnamed or duplicate sources")
+            raise SourcesFileError("cannot merge unnamed or duplicate sources")
         by_name[name.value] = (source, source_fields)
 
     new_sources = []
@@ -272,21 +307,25 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
         source, source_fields = by_name[name]
         table_node = source_fields.get("tables")
         if table_node is not None and not isinstance(table_node, yaml.SequenceNode):
-            raise ScaffoldError("cannot merge _dex_sources.yml: tables must be a list")
+            raise SourcesFileError(
+                "cannot merge _dex_sources.yml: tables must be a list"
+            )
         declared = set()
         for table in table_node.value if table_node is not None else []:
             table_name = fields(table).get("name")
             if not isinstance(table_name, yaml.ScalarNode):
-                raise ScaffoldError("cannot merge a table without a name")
+                raise SourcesFileError("cannot merge a table without a name")
             declared.add(table_name.value)
         missing = sorted(tables - declared)
         if not missing:
             continue
         if root.flow_style or sources.flow_style or source.flow_style:
-            raise ScaffoldError("cannot extend flow-style sources; use block YAML")
+            raise SourcesFileError("cannot extend flow-style sources; use block YAML")
         if table_node is not None and table_node.value:
             if table_node.flow_style:
-                raise ScaffoldError("cannot extend flow-style tables; use block YAML")
+                raise SourcesFileError(
+                    "cannot extend flow-style tables; use block YAML"
+                )
             first = table_node.value[0]
             indent = first.start_mark.column - 2
             offset = line_start(first)
@@ -327,7 +366,7 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
         if root.flow_style or (
             sources is not None and sources.flow_style and sources.value
         ):
-            raise ScaffoldError("cannot extend flow-style sources; use block YAML")
+            raise SourcesFileError("cannot extend flow-style sources; use block YAML")
         indent = (
             sources.value[0].start_mark.column - 2
             if sources is not None and sources.value
@@ -361,7 +400,9 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
         isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None)
         for event in yaml.parse(original)
     ):
-        raise ScaffoldError("cannot extend YAML anchors or aliases; expand them first")
+        raise SourcesFileError(
+            "cannot extend YAML anchors or aliases; expand them first"
+        )
     for start, end, addition in sorted(edits, reverse=True):
         original = original[:start] + addition + original[end:]
     return original

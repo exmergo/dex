@@ -388,10 +388,15 @@ def _validate_structure(document: dict[str, Any], name: str) -> Iterable[Diagnos
 
     from jsonschema import Draft202012Validator
 
-    validator = Draft202012Validator(json.loads(schema_bytes()))
+    schema = json.loads(schema_bytes())
+    pinned = schema.get("properties", {}).get("version", {}).get("const", "unknown")
+    validator = Draft202012Validator(schema)
     for error in validator.iter_errors(document):
         path = _render_path(error.absolute_path)
         if error.validator == "additionalProperties":
+            # The fix rides in the message rather than behind a pointer to
+            # PROVENANCE.md: an agent reading the envelope cannot open a file
+            # inside the installed package, and both fixes fit in a sentence.
             yield Diagnostic(
                 file=name,
                 path=path,
@@ -400,10 +405,11 @@ def _validate_structure(document: dict[str, Any], name: str) -> Iterable[Diagnos
                 severity=ERROR,
                 message=(
                     f"{error.message}. That key is not in the Ossie schema dex "
-                    "pins, so this document is incompatible with it. It may be a "
-                    "typo or it may be authored for a newer draft; dex cannot "
-                    "tell which. See the pinned draft in "
-                    "exmergo_dex_core/ossie/schema/PROVENANCE.md"
+                    f"pins (spec version {pinned}), so this document is "
+                    "incompatible with it. It may be a typo or it may be authored "
+                    "for a newer draft; dex cannot tell which. If it is a typo, "
+                    "correct or remove the key; if the document targets a newer "
+                    "draft, it needs a dex release that pins that draft"
                 ),
             )
             continue

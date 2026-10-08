@@ -655,7 +655,9 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     },
     ("transform", "test"): {
         "reason": (
-            "two modes on one verb: --mutate is DexEngine.test_mutations, while "
+            "two modes on one verb: --mutate is DexEngine.test_mutations (with "
+            "--check-equivalence/--no-check-equivalence collapsing into its "
+            "check_equivalence tri-state, asserted separately), while "
             "--scaffold is reachable as "
             "exmergo_dex_core.transform.commands.test_scaffold(engine, scaffold) "
             "and is not a DexEngine method"
@@ -846,3 +848,44 @@ def test_maintain_check_accepts_an_object_scope_like_its_sibling_detectors():
     through like `schema_drift`/`volume_drift`/`grain_drift`/`semantic_drift`."""
 
     assert "objects" in inspect.signature(DexEngine.check).parameters
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [([], None), (["--check-equivalence"], True), (["--no-check-equivalence"], False)],
+)
+def test_the_equivalence_flag_pair_reaches_the_engine_as_one_tri_state(
+    flags, expected, monkeypatch
+):
+    """`transform test` is a reason-only parity entry, so its one negating pair
+    is checked here: absent means the connector decides, and either spelling
+    overrides it, all through the one engine keyword."""
+
+    from exmergo_dex_core.cli import _build_parser
+    from exmergo_dex_core.transform import commands
+
+    args = _build_parser().parse_args(["transform", "test", "--mutate", "fct", *flags])
+    assert args.check_equivalence is expected
+
+    seen: dict = {}
+
+    def capture(engine, model, **kwargs):
+        seen.update(kwargs, model=model)
+        raise ValueError("captured")
+
+    monkeypatch.setattr(commands, "test_mutations", capture)
+    commands.cmd_test(args, engine=None)
+    assert seen["model"] == "fct"
+    assert seen["check_equivalence"] is expected
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "transform",
+                "test",
+                "--mutate",
+                "fct",
+                "--check-equivalence",
+                "--no-check-equivalence",
+            ]
+        )

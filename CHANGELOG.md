@@ -11,6 +11,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **The skill bodies open with the procedure, and lookup detail moved into
+  per-skill reference files** ([#489]). Each `SKILL.md` now starts with the
+  explore, transform, maintain procedure and keeps every rule that changes what
+  an agent does; per-flag and per-connector detail moved to
+  `skills/<skill>/references/`. The Ossie `unknown_key` diagnostic now names the
+  pinned spec version and carries both fixes inline instead of pointing at
+  `PROVENANCE.md`, and the PyPI project description's links now resolve.
+
 - **dex writes its PII stamp under `config.meta` and its tests under
   `data_tests:`** ([#490]). dbt moved `meta` under `config:`: a top-level `meta`
   still parses in dbt-core 1.11 but is deprecated, dbt Fusion rejects it, and the
@@ -36,7 +44,116 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
     come from one list. The gate also reads `pii_category` for the category it
     names in a refusal.
   - Messages that told a user to mark a dimension with `meta: {pii: ...}` now say
-    `config: {meta: {pii: ...}}`.
+    `config: {meta: {pii: ...}}`. 
+
+### Fixed
+
+- **BigQuery's per-table billing floor no longer counts CTE names as tables**
+  ([#508]). `query_estimate` floors a statement at 10 MB per distinct table it
+  references, because that is BigQuery's minimum per table. A reference to a
+  CTE parsed as a table too, so one physical table read through five CTEs
+  floored at 60 MB, and every dbt data test on an ephemeral model, which dbt
+  wraps in `__dbt__cte__` blocks, was priced the same way; on small dev data
+  that inflation was the whole estimate, and it could push a run over a budget
+  it fit. The names a statement defines as CTEs, at any depth, are now excluded
+  before counting. A reference that carries a dataset or project is still a
+  table whatever it is called, and a statement that reads no physical table
+  still floors at one. The estimate stays an upper bound on what BigQuery
+  bills: a statement never prices below its real floor, and no longer prices
+  above it for the CTEs it names.
+  
+- **`transform plan --scaffold` says in `reason` what clears each refusal**
+  ([#514]). Every scaffold refusal was one class, `ScaffoldError`, classified
+  `request`, so a host branching on `reason` could not tell "run `explore map`
+  first" from "qualify the name" from "edit the sources file" without parsing
+  the message. The three setup refusals (no exploration cache, an object the
+  cache does not hold, a table with no column profile) are now
+  `ScaffoldPrerequisiteError`, a `PrerequisiteError`, and read `prerequisite`,
+  as the same condition already did from `explore`. The sources-file refusals
+  (a `_dex_sources.yml` the merge will not rewrite: invalid YAML, flow style,
+  anchors and aliases, duplicate keys, a shape it does not expect) are
+  `SourcesFileError`, a `ConfigurationError`, and read `configuration`: the
+  call's input is fine and a person edits the file. An ambiguous name and an
+  unknown macro stay `request`. Both subclasses are still `ScaffoldError`, so an
+  existing `except ScaffoldError` catches what it did, and all three classes are
+  importable from `exmergo_dex_core` rather than from the module that raises
+  them.
+
+## [1.12.6] - 2026-10-06
+
+### Added
+
+- **`transform test --mutate` says which survivors the dev data could ever tell
+  apart** ([#466]). A surviving mutant is a defect no test caught, and for some
+  survivors no test against today's data could have: an inner join where every
+  key resolves, a window frame no partition is long enough to reach, a dropped
+  status filter whose rows a join removes anyway. Those need a fixture that
+  reaches the case, not another assertion, and the report could not say which
+  was which. Each survivor is now compared with the unmutated model on the dev
+  target and labelled in `equivalence`: `equivalent` when they produce the same
+  rows, `distinguishable` when the data already differs, with the counts that
+  established it (`only_in_mutant`, `only_in_baseline`, `mutant_rows`,
+  `baseline_rows`). Distinguishable survivors are listed first, and
+  `suggested_test` follows the label: a fixture for an equivalent survivor, an
+  assertion over the data for a distinguishable one. Both kinds still count as
+  survived in `score`, since a fixture can catch either.
+
+  **Counts only, never a row.** The comparison fingerprints every row of each
+  side, counts the fingerprints as a multiset, so a mutant that only duplicates
+  rows still differs, and returns four integers. It runs through `dbt show` on
+  the same dev target the tests ran on, and anything back other than exactly
+  those four counts is treated as a comparison that did not run.
+
+  **The model has to reproduce itself first.** Before any survivor is compared,
+  the unmutated model is compared with itself. A `random()`, a uuid or a
+  `row_number()` over ties fails that self-check, and no survivor is labelled
+  rather than every one reading as different. `data.equivalence` reports the
+  self-check and the tally.
+
+  **Free on DuckDB, opt-in and priced once elsewhere.** On DuckDB it runs
+  unasked. On BigQuery and Snowflake it needs `--check-equivalence`, and the
+  comparisons join the batch's one estimate, priced as if every mutant survives,
+  so the run still confirms once. `--no-check-equivalence` turns it off
+  anywhere. Postgres, Databricks, ClickHouse and Redshift report survivors as
+  `not_checked` until dex has a verified whole-row comparison for them. Also
+  available as `DexEngine.test_mutations(model, check_equivalence=...)`.
+
+### Fixed
+
+- **`transform test --mutate` prices each mutant as its own statement** ([#466]).
+  The batch estimate was meant to splice each mutant into each test's compiled
+  SQL, so a mutant that widens a scan prices higher than the model it came from.
+  It spliced the mutant's dbt file instead, whose `{% raw %}` blocks and
+  `{{ ref() }}` calls no SQL parser reads, so every mutant fell back to the
+  baseline's price: the BigQuery estimates showed one identical line per
+  mutant. Live, on a date-partitioned source, dropping the partition filter now
+  prices at 202 MB and negating it at 229 MB, against a 136 MB baseline.
+
+- **Snowflake quotes the 60-second resume minimum once per command, not once
+  per priced statement** ([#466]). A command that priced several statements
+  against a suspended warehouse added the floor to every one of them. Mutation
+  coverage prices every test of every mutant, so a 39-statement batch quoted
+  2,379 seconds, of which 2,340 were floors, and was refused at a 300-second
+  budget it fit in. The same fix Redshift already carries for its wake minimum:
+  the floor is quoted once, and charged once, by whichever statement runs first.
+
+- **`dex demo` writes into `--repo-root`, not the directory it was run from**
+  ([#509]). The demo built its target from the positional argument alone, so
+  `dex --repo-root R demo` wrote `dex_demo.duckdb` and `.dex/config.yml` into the
+  process's current directory and never touched `R`. Nothing reported it: the
+  envelope's `path` and `created` were relative and read as correct, and a
+  checkout that ignores both files kept `git status` clean.
+
+  A relative target now resolves against the `--repo-root` directory, on either
+  side of `demo`, so the command writes what `cd R && dex demo` would. That is
+  the directory as given, not the project root dex walks up to, so a config
+  above `R` is still left alone with a warning rather than shadowed. `path`,
+  `created`, and the config diff stay relative to that directory, the way
+  `transform init` reports its files. The printed next steps carry the same
+  `--repo-root`, because without it the cache `explore map` writes would land in
+  the current directory one command later, and any `--path` they name is
+  spelled from the caller's shell. An absolute target, and `dex demo` with no
+  `--repo-root`, behave as before.
 
 ## [1.12.5] - 2026-10-02
 
