@@ -405,6 +405,10 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         (RequestError, Reason.REQUEST),
         (DbtParseError, Reason.REQUEST),
         (PlanError, Reason.REQUEST),  # PlanNotFoundError
+        # A scaffold refusal raised bare is the caller's input. Its two
+        # subclasses each carry a second parent listed above, and read that
+        # parent's bucket: ScaffoldPrerequisiteError through PrerequisiteError,
+        # SourcesFileError through ConfigurationError (#514).
         (ScaffoldError, Reason.REQUEST),
         (EditValidationError, Reason.REQUEST),
         (ClusterError, Reason.REQUEST),  # after ClusterDependencyError

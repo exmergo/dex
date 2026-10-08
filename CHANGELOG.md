@@ -18,6 +18,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `skills/<skill>/references/`. The Ossie `unknown_key` diagnostic now names the
   pinned spec version and carries both fixes inline instead of pointing at
   `PROVENANCE.md`, and the PyPI project description's links now resolve.
+  
+### Fixed
+
+- **BigQuery's per-table billing floor no longer counts CTE names as tables**
+  ([#508]). `query_estimate` floors a statement at 10 MB per distinct table it
+  references, because that is BigQuery's minimum per table. A reference to a
+  CTE parsed as a table too, so one physical table read through five CTEs
+  floored at 60 MB, and every dbt data test on an ephemeral model, which dbt
+  wraps in `__dbt__cte__` blocks, was priced the same way; on small dev data
+  that inflation was the whole estimate, and it could push a run over a budget
+  it fit. The names a statement defines as CTEs, at any depth, are now excluded
+  before counting. A reference that carries a dataset or project is still a
+  table whatever it is called, and a statement that reads no physical table
+  still floors at one. The estimate stays an upper bound on what BigQuery
+  bills: a statement never prices below its real floor, and no longer prices
+  above it for the CTEs it names.
+  
+- **`transform plan --scaffold` says in `reason` what clears each refusal**
+  ([#514]). Every scaffold refusal was one class, `ScaffoldError`, classified
+  `request`, so a host branching on `reason` could not tell "run `explore map`
+  first" from "qualify the name" from "edit the sources file" without parsing
+  the message. The three setup refusals (no exploration cache, an object the
+  cache does not hold, a table with no column profile) are now
+  `ScaffoldPrerequisiteError`, a `PrerequisiteError`, and read `prerequisite`,
+  as the same condition already did from `explore`. The sources-file refusals
+  (a `_dex_sources.yml` the merge will not rewrite: invalid YAML, flow style,
+  anchors and aliases, duplicate keys, a shape it does not expect) are
+  `SourcesFileError`, a `ConfigurationError`, and read `configuration`: the
+  call's input is fine and a person edits the file. An ambiguous name and an
+  unknown macro stay `request`. Both subclasses are still `ScaffoldError`, so an
+  existing `except ScaffoldError` catches what it did, and all three classes are
+  importable from `exmergo_dex_core` rather than from the module that raises
+  them.
 
 ## [1.12.6] - 2026-10-06
 

@@ -97,6 +97,10 @@ INTERNAL_REFUSALS = {
     # The transform surface. Every one of these needs a repo_root, so they sit
     # outside "reachable from the public API without a repo_root". Worth
     # revisiting as a family if a host ever drives transform programmatically.
+    # The scaffold refusals have already left, on their own (#514): a host
+    # driving `transform plan --scaffold` has to tell "run `explore map`" from
+    # "qualify the name" from "edit the sources file", and ScaffoldError goes
+    # with its two subclasses so `except ScaffoldError` works from the root too.
     "BuildFailedError",
     "DbtParseError",
     "DbtProjectError",
@@ -109,7 +113,6 @@ INTERNAL_REFUSALS = {
     "ProdTargetRefusedError",
     "PropagationRefusedError",
     "RewriteError",
-    "ScaffoldError",
     "TestScaffoldError",
 }
 
@@ -149,9 +152,10 @@ def test_the_prerequisite_family_is_what_a_host_retries_on():
         ConnectorError,
         NoBaselineError,
         PrerequisiteError,
+        ScaffoldPrerequisiteError,
     )
 
-    for cls in (CacheRequiredError, NoBaselineError):
+    for cls in (CacheRequiredError, NoBaselineError, ScaffoldPrerequisiteError):
         assert issubclass(cls, PrerequisiteError), cls
         assert not issubclass(cls, ConnectorError), cls
 
@@ -159,6 +163,31 @@ def test_the_prerequisite_family_is_what_a_host_retries_on():
 
     assert issubclass(DuckDBReadOnlyError, ConnectorError)
     assert not issubclass(DuckDBReadOnlyError, PrerequisiteError)
+
+
+def test_a_scaffold_refusal_says_what_clears_it():
+    """Three things stop a scaffold, and a host does something different about
+    each: run the named ``explore`` command and retry, change the name, or stop
+    and have someone edit the sources file (#514). Every one of them is a
+    ``ScaffoldError``, so a caller catching the base still sees them all, and
+    the two that are not the caller's input also carry the family that says
+    what clears them.
+    """
+
+    from exmergo_dex_core import (
+        PrerequisiteError,
+        ScaffoldError,
+        ScaffoldPrerequisiteError,
+        SourcesFileError,
+    )
+
+    assert issubclass(ScaffoldPrerequisiteError, ScaffoldError)
+    assert issubclass(ScaffoldPrerequisiteError, PrerequisiteError)
+    assert issubclass(SourcesFileError, ScaffoldError)
+    assert issubclass(SourcesFileError, ConfigurationError)
+    # The bare base is the caller's input and carries neither family.
+    assert not issubclass(ScaffoldError, PrerequisiteError)
+    assert not issubclass(ScaffoldError, ConfigurationError)
 
 
 def test_a_missing_credential_is_not_a_connector_failure():
