@@ -3,6 +3,9 @@
 # so an over-budget refusal cannot wake an idled service.
 
 set -euo pipefail
+# jq -e and a failed command substitution exit under set -e without a word, which
+# leaves a red CI step with nothing to go on; name the line instead.
+trap 'echo "preflight failed at line $LINENO (exit $?)" >&2' ERR
 
 ORGANIZATION="${DEX_TEST_CH_CLOUD_ORG_ID:-}"
 SERVICE="${DEX_TEST_CH_CLOUD_SERVICE_ID:-}"
@@ -46,8 +49,11 @@ COMPUTE_CHC=$(jq -er --arg service "$SERVICE" '
   [.costs[]? | select((.serviceId // .entityId) == $service) |
     (.metrics.computeCHC // 0)] | add // 0
 ' <<<"$USAGE_JSON")
-PROVISIONAL=$(jq -er --arg service "$SERVICE" '
-  any(.costs[]?; ((.serviceId // .entityId) == $service) and (.locked != true))
+# A boolean, so no -e: false is a valid answer, not a missing field. A day with no
+# row for the service yet has no final figure, so it reads as provisional too.
+PROVISIONAL=$(jq -r --arg service "$SERVICE" '
+  [.costs[]? | select((.serviceId // .entityId) == $service)]
+  | length == 0 or any(.[]; .locked != true)
 ' <<<"$USAGE_JSON")
 STATE=$(jq -er '.state' <<<"$SERVICE_JSON")
 
