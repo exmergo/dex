@@ -6,9 +6,10 @@
 # rewrites that version in all three wrappers so the tagged commit is
 # self-consistent: checking out the tag, or pinning the catalog to it, installs
 # exactly the engine the tag publishes. The connector extra is not part of the pin;
-# the wrapper selects it at runtime, so a release is connector-neutral. The release
-# workflow only verifies this coupling; it never writes back. Run this, review the
-# diff, commit, then tag.
+# the wrapper selects it at runtime, so a release is connector-neutral. It also
+# opens the release's dated section in CHANGELOG.md (the date is today in UTC). The
+# release workflow only verifies this coupling; it never writes back. Run this,
+# review the diff, commit, then tag.
 #
 # Usage:
 #   scripts/prepare_release.sh <engine-version> [plugin-semver]
@@ -42,6 +43,25 @@ if [ -n "${PLUGIN_VERSION}" ]; then
   sed -i.bak -E "s/(\"version\": \")[^\"]+(\")/\1${PLUGIN_VERSION}\2/" "$f"
   rm -f "${f}.bak"
   echo "bumped .claude-plugin/plugin.json -> ${PLUGIN_VERSION}"
+fi
+
+# Opening the release section directly under [Unreleased] moves every pending
+# entry into it and leaves a fresh, empty [Unreleased] above. A rerun for the same
+# version leaves the file alone rather than stacking a second heading.
+f="${ROOT}/CHANGELOG.md"
+heading="## [${ENGINE_VERSION}] - $(date -u +%Y-%m-%d)"
+if grep -qF "## [${ENGINE_VERSION}]" "$f"; then
+  echo "CHANGELOG.md already has a ${ENGINE_VERSION} section; left unchanged"
+elif grep -qxF "## [Unreleased]" "$f"; then
+  awk -v heading="${heading}" '
+    { print }
+    $0 == "## [Unreleased]" { print ""; print heading }
+  ' "$f" > "${f}.tmp"
+  mv "${f}.tmp" "$f"
+  echo "added \"${heading}\" to CHANGELOG.md"
+else
+  echo "CHANGELOG.md has no \"## [Unreleased]\" heading to release under" >&2
+  exit 1
 fi
 
 echo
