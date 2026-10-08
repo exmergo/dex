@@ -172,8 +172,8 @@ a field, flag, or macro you need is not described here.
 - A seed whose header looks like personal data is refused; the refusal names the
   `pii_overrides` entry a human can add to `.dex/config.yml`. Recommend it; never
   add it yourself.
-- PII flags are stamped into model and column `meta` at any confidence. Only a
-  human `pii_overrides` entry removes the stamp.
+- PII flags are stamped into model and column `config.meta` at any confidence.
+  Only a human `pii_overrides` entry removes the stamp.
 
 ### Building
 
@@ -218,25 +218,6 @@ a field, flag, or macro you need is not described here.
 - Check `baseline.excluded` (tests already failing) and `cap.elided` (more sites
   than the 20-mutant cap) before calling a result clean, and relay any `not_run`
   rather than reading a short list as complete.
-
-- Writes confined to the repo, and within it to two disjoint surfaces: the dbt
-  project's authored path families (models, macros, snapshots, seeds, tests,
-  analyses) plus the project-root manifests dbt keeps there, and the exact
-  native semantic documents named in `semantic.ossie.files`. Neither surface can
-  reach the other, an absolute path or a `..` escape is refused on both, and dex
-  never writes to source warehouse data.
-- Dev-target only. Prod-target execution is never initiated by dex.
-- Cost surfaced before any spend. A build that would spend requires explicit
-  confirmation and a session budget. The cost guard in full, in the engine
-  repository: `references/cost-controls.md`; the PII policy that governs what
-  a seed may carry and what gets stamped into `meta`: `references/pii-policy.md`.
-- Propose, don't impose. Human edits to the project (SQL and semantic YAML) and
-  to a native semantic document are authoritative; on conflict the engine
-  surfaces a diff and asks rather than overwriting.
-- PII flags propagate from the cache into emitted dbt (model and column `config.meta`),
-  never example values. Stamping is presence-based at any confidence; only a
-  column cleared by a human `pii_overrides` entry in `.dex/config.yml` is
-  scaffolded without the meta.
 
 ## References
 
