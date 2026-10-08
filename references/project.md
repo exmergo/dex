@@ -379,11 +379,17 @@ reads is the size of the change rather than the size of the file.
 
 | finding | what lands |
 |---|---|
-| `column_added` | a column entry at the end of the model's `columns:`, carrying `meta.contains_pii` and the category when the name scores as PII |
+| `column_added` | a column entry at the end of the model's `columns:`, carrying `config.meta.contains_pii` and the category when the name scores as PII |
 | `column_dropped` | the column's entry, removed with the lines that only described it |
 | `nullability_changed` | `not_null` added or removed on that column, in whichever direction the source moved |
 | `column_retyped` | nothing, and a proposal saying why |
 | `key_lost_uniqueness` | `unique` added to that column, subject to the declared-grain check below |
+
+A test added to a column that already has a list joins that list under the key it
+already uses, so an entry never gains both `tests` and `data_tests`, which dbt
+refuses to parse. A column with no list gets one under the spelling most of the
+file already uses, and under `data_tests`, dbt's current key, when the file has no
+precedent.
 
 **A retype is the one dex declines, and the reason is worth stating.** Nothing dex
 authors declares a type, and the type it holds is the connector's own spelling rather

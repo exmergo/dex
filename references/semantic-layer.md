@@ -561,7 +561,7 @@ billable.
 Where the floor was all that ran, the result says so, the same way the local
 backend discloses an unprofiled relation. The two silences are reported separately
 because their fixes differ: a layer that answered and carries no PII metadata for a
-dimension wants `meta: {pii: true}` on it in the dbt project, while a
+dimension wants `config: {meta: {pii: true}}` on it in the dbt project, while a
 dimension-metadata call that never answered (which degrades every ref to the
 heuristic at once) wants retrying.
 

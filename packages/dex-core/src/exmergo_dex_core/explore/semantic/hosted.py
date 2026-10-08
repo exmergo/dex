@@ -84,8 +84,8 @@ def _screening_notes(unknown: list[str], meta: dict[str, Any] | None) -> list[st
     return [
         "PII screening used the name heuristic alone for "
         f"{', '.join(unknown)}: the semantic layer carries no PII metadata for "
-        "them. Mark a dimension with `meta: {pii: true}` in the dbt project to "
-        "make the layer authoritative."
+        "them. Mark a dimension with `config: {meta: {pii: true}}` in the dbt "
+        "project to make the layer authoritative."
     ]
 
 

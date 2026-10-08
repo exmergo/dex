@@ -172,8 +172,8 @@ a field, flag, or macro you need is not described here.
 - A seed whose header looks like personal data is refused; the refusal names the
   `pii_overrides` entry a human can add to `.dex/config.yml`. Recommend it; never
   add it yourself.
-- PII flags are stamped into model and column `meta` at any confidence. Only a
-  human `pii_overrides` entry removes the stamp.
+- PII flags are stamped into model and column `config.meta` at any confidence.
+  Only a human `pii_overrides` entry removes the stamp.
 
 ### Building
 

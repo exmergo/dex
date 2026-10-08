@@ -594,6 +594,49 @@ def _seed_pii_warnings(
     return warnings
 
 
+#: The `schema.yml` sections whose entries are nodes dbt patches, and so where
+#: a doubled `meta` or test key is a parse error.
+_NODE_SECTIONS = ("models", "seeds", "snapshots")
+
+
+def assert_no_doubled_keys(path: str, parsed: dict) -> None:
+    """Refuse an entry spelling one dbt property two ways, which dbt cannot parse.
+
+    Two pairs, both the shape a project reaches by extending a file dex scaffolded
+    in an older release. A node entry with a top-level `meta` beside
+    `config.meta` is a dbt `ParsingError`. An entry or a column with both
+    `tests` and `data_tests` is another. Refused here with the fix named, rather
+    than surfacing as a parse failure at build time. A column carrying both
+    `meta` forms is merged by dbt rather than refused, so it passes.
+    """
+
+    for section in _NODE_SECTIONS:
+        for entry in parsed.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name", "?")
+            config = entry.get("config")
+            if "meta" in entry and isinstance(config, dict) and "meta" in config:
+                raise EditValidationError(
+                    f"{path}: '{name}' carries both a top-level 'meta' and "
+                    "'config.meta', which dbt refuses to parse. Move the keys of "
+                    "the top-level 'meta' under 'config.meta' and delete the "
+                    "top-level one"
+                )
+            holders = [(f"'{name}'", entry)] + [
+                (f"'{name}.{column.get('name', '?')}'", column)
+                for column in entry.get("columns") or []
+                if isinstance(column, dict)
+            ]
+            for label, holder in holders:
+                if "tests" in holder and "data_tests" in holder:
+                    raise EditValidationError(
+                        f"{path}: {label} lists both 'tests' and 'data_tests', "
+                        "which dbt refuses to parse. Keep one list: move the "
+                        "entries of one into the other and delete the empty key"
+                    )
+
+
 def validate_edit(
     edit: PlanEdit,
     *,
@@ -687,6 +730,8 @@ def validate_edit(
             from .semantic import validate_semantic_yaml
 
             warnings.extend(validate_semantic_yaml(edit.path, parsed))
+        elif edit.kind is EditKind.SCHEMA_YML:
+            assert_no_doubled_keys(edit.path, parsed)
         elif edit.kind is EditKind.PACKAGES_YML and not (
             parsed.get("packages") or parsed.get("dependencies")
         ):

@@ -340,8 +340,18 @@ class TestColumnDeclarations:
             )
             == "data_tests"
         )
-        # No precedent falls back to what the scaffold writes.
-        assert prevailing_test_key("models: []\n") == "tests"
+        # No precedent falls back to dbt's current key, which the scaffold writes.
+        assert prevailing_test_key("models: []\n") == "data_tests"
+
+    def test_a_unit_test_block_is_not_precedent_for_tests(self):
+        # `unit_tests:` ends in `tests:`; counting it would let one unit-test
+        # block decide the spelling of every generic test list in the file.
+        content = (
+            "models:\n  - name: orders\n    columns:\n      - name: a\n"
+            "unit_tests:\n  - name: t\n"
+        )
+
+        assert prevailing_test_key(content) == "data_tests"
 
     def test_a_list_that_already_says_it_produces_no_span(self):
         current = column_tests(self.FLOW, "orders", "order_id")

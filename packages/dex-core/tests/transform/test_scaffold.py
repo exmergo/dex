@@ -231,6 +231,125 @@ def test_scaffolded_plan_applies_cleanly(
     assert (dbt_project_dir / "models/staging/_dex_sources.yml").is_file()
 
 
+def test_the_pii_stamp_lands_under_config_meta_and_tests_under_data_tests():
+    """dbt moved `meta` under `config` and `tests` to `data_tests` (#490).
+
+    The stamp's keys are unchanged, because tools outside dex read them; only
+    where they sit moves.
+    """
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+    from exmergo_dex_core.transform.scaffold import model_edits
+
+    dataset = Dataset(
+        identifier="db.main.customers",
+        columns=[
+            ColumnProfile(name="id", data_type="INTEGER", nullable=False),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+            ),
+        ],
+        candidate_keys=[["id"]],
+    )
+    yaml_edit = next(e for e in model_edits(dataset) if e.path.endswith(".yml"))
+    entry = yaml.safe_load(yaml_edit.new_content)["models"][0]
+    columns = {c["name"]: c for c in entry["columns"]}
+
+    assert "meta" not in entry
+    assert entry["config"]["meta"] == {"contains_pii": True}
+    assert "meta" not in columns["email"]
+    assert columns["email"]["config"]["meta"] == {
+        "contains_pii": True,
+        "pii_category": "email",
+    }
+    assert columns["id"]["data_tests"] == ["unique", "not_null"]
+    assert not any("tests" in c for c in entry["columns"])
+
+
+def _plan_schema_edit(
+    tmp_path: Path, capsys, path: str, content: str
+) -> tuple[int, dict]:
+    payload = tmp_path / "schema-edit.json"
+    payload.write_text(
+        json.dumps(
+            {"edits": [{"path": path, "kind": "schema_yml", "content": content}]}
+        ),
+        encoding="utf-8",
+    )
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "edit the scaffolded declaration",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def test_a_scaffolded_duckdb_model_takes_config_meta_and_refuses_the_old_form(
+    dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
+):
+    """On DuckDB, where dbt raises no deprecation warning that would catch it.
+
+    A human adding `config.meta` to a model dex scaffolded is what dbt's own
+    documentation tells them to write, so it has to go through. A top-level
+    `meta` beside it is a dbt parse error, so dex refuses it at plan time with the
+    fix named instead of letting it reach `dbt parse`.
+    """
+
+    _seed_cache(tmp_path, duckdb_file, capsys)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold",
+            "--scaffold",
+            "customers",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    path = "models/staging/stg_customers.yml"
+    parsed = yaml.safe_load((dbt_project_dir / path).read_text(encoding="utf-8"))
+    entry = parsed["models"][0]
+    assert "meta" not in entry
+    assert entry["config"]["meta"]["contains_pii"] is True
+
+    entry["config"]["meta"]["owner"] = "data-team"
+    rc, envelope = _plan_schema_edit(
+        tmp_path, capsys, path, yaml.safe_dump(parsed, sort_keys=False)
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+
+    entry["meta"] = {"contains_pii": True}
+    rc, envelope = _plan_schema_edit(
+        tmp_path, capsys, path, yaml.safe_dump(parsed, sort_keys=False)
+    )
+    assert envelope["status"] == "error"
+    assert "both a top-level 'meta' and 'config.meta'" in envelope["errors"][0]
+    assert "Move the keys" in envelope["errors"][0]
+
+
 def test_scaffold_without_cache_is_a_clean_error(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

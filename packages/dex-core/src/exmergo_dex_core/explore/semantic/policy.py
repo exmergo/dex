@@ -13,12 +13,12 @@ from collections.abc import Callable
 from typing import Any
 
 from ...guards import PII_BLOCK_CONFIDENCE
+from ...guards.pii_meta import PII_CATEGORY, says_pii
 from ...semantic_catalog import SemanticCatalogView
 from ..profile import detect_pii
 from .backend import SemanticBackendError, SemanticQueryRefusedError
 from .model import SemanticQuery, ValuesRequest
 
-_PII_META_KEYS = ("pii", "contains_pii", "is_pii", "pii_category")
 _GRAIN_TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
 
@@ -78,10 +78,6 @@ def validate_grain(grain: str | None, *, available: list[str] | None) -> str | N
     return lowered
 
 
-def _meta_says_pii(meta: Any) -> bool:
-    return isinstance(meta, dict) and any(bool(meta.get(key)) for key in _PII_META_KEYS)
-
-
 def _meta_clears(meta: Any) -> bool:
     return isinstance(meta, dict) and meta.get("pii") is False
 
@@ -92,9 +88,9 @@ def merge_pii_meta(store: dict[str, Any], name: str | None, value: Any) -> None:
     if name is None:
         return
     current = store.get(name)
-    if _meta_says_pii(current):
+    if says_pii(current):
         return
-    if _meta_says_pii(value) or current is None:
+    if says_pii(value) or current is None:
         store[name] = value
 
 
@@ -106,8 +102,12 @@ def screen_dimension_refs(
     blocked: list[tuple[str, str]] = []
     for ref in refs:
         meta = meta_lookup(ref) if meta_lookup is not None else None
-        if _meta_says_pii(meta):
-            category = meta.get("category") if isinstance(meta, dict) else None
+        if says_pii(meta):
+            category = (
+                (meta.get(PII_CATEGORY) or meta.get("category"))
+                if isinstance(meta, dict)
+                else None
+            )
             reason = (
                 f"{category} (profiled and flagged)"
                 if category
@@ -135,7 +135,7 @@ def unadjudicated_refs(
     unknown: list[str] = []
     for ref in refs:
         meta = meta_lookup(ref)
-        if not _meta_says_pii(meta) and not _meta_clears(meta):
+        if not says_pii(meta) and not _meta_clears(meta):
             unknown.append(ref)
     return unknown
 
@@ -153,8 +153,9 @@ def screen_values_request(
             "nothing but the values of one dimension, so there is no aggregate to "
             "fall back to. PII is flagged, never surfaced. Ask for a different "
             "dimension; one reviewed as not PII is cleared durably with a "
-            "pii_overrides entry in .dex/config.yml, or with `meta: {pii: false}` "
-            "on the dimension in the project that declares it."
+            "pii_overrides entry in .dex/config.yml, or with "
+            "`config: {meta: {pii: false}}` on the dimension in the project that "
+            "declares it."
         )
     if not unadjudicated_refs([dimension], meta_lookup=meta_lookup):
         return []

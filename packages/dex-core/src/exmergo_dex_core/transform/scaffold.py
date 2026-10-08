@@ -29,6 +29,7 @@ from ..cache import Dataset
 from ..dbt_project import DbtProjectError, DbtProjectView
 from ..dbt_project import load as load_dbt_project
 from ..errors import ConfigurationError, DexError, PrerequisiteError
+from ..guards.pii_meta import stamp_lines
 from ..storage import ExploreStore, readable_cache
 from .plans import EditKind, PlanEdit
 
@@ -450,23 +451,19 @@ def _model_yaml(dataset: Dataset) -> str:
 
     lines = ["version: 2", "", "models:", f"  - name: stg_{table}"]
     if any(c.pii for c in dataset.columns):
-        lines += ["    meta:", "      contains_pii: true"]
+        lines += stamp_lines("    ")
     lines.append("    columns:")
     for column in dataset.columns:
         lines.append(f"      - name: {column.name}")
         if column.pii is not None:
-            # The flag propagates, never an example value (PII is flagged, not
-            # surfaced); confidence is the profiler's, recorded for reviewers.
-            lines += [
-                "        meta:",
-                "          contains_pii: true",
-                f"          pii_category: {column.pii.category.value}",
-            ]
+            # The flag and its category propagate, never an example value: PII
+            # is flagged, not surfaced.
+            lines += stamp_lines("        ", column.pii.category.value)
         tests = []
         if column.name in key_columns:
             tests = ["unique", "not_null"] if len(key_columns) == 1 else ["not_null"]
         elif column.nullable is False or column.null_fraction == 0.0:
             tests = ["not_null"]
         if tests:
-            lines.append(f"        tests: [{', '.join(tests)}]")
+            lines.append(f"        data_tests: [{', '.join(tests)}]")
     return "\n".join(lines) + "\n"
