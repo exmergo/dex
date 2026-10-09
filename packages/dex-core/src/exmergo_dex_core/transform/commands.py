@@ -42,7 +42,12 @@ from . import plans as plans_mod
 # dependency of its own; the rest of the build module stays deferred for
 # the reason stated above.
 from .build import DependencyPolicy
-from .native_semantic import edits_from_payload, plan_hint, read_payload_file
+from .native_semantic import (
+    edits_from_payload,
+    payload_from_file,
+    plan_hint,
+    read_payload_file,
+)
 from .plans import EditKind, PlanEdit, PlanError
 from .results import (
     ApplyResult,
@@ -237,17 +242,24 @@ def plan(
     intent: str,
     *,
     edits: list[PlanEdit] | None = None,
+    declarations: list[Any] | None = None,
     scaffold: list[str] | None = None,
     attribute_rows: bool | None = None,
 ) -> PlanResult:
     """Turn authored edits into a stored plan of reviewable diffs.
 
     ``scaffold`` prepends staging skeletons built from the exploration cache.
-    Deletes, project and profile edits, snapshots and seeds are gated by dbt's
-    own parser here rather than at build time, because a broken
+    Deletes, project and profile edits, snapshots, seeds and properties YAML are
+    gated by dbt's own parser here rather than at build time, because a broken
     ``dbt_project.yml`` breaks everything, an orphaning delete is cheaper to
-    catch before it is stored, and a snapshot's config and a seed's CSV are
-    shapes dbt's parser knows and a regex only approximates.
+    catch before it is stored, and a snapshot's config, a seed's CSV and a
+    model's properties are shapes dbt's parser knows and a regex only
+    approximates.
+
+    ``declarations`` is the payload's raw ``declarations`` list (see
+    :mod:`.declarations`). Each is validated and rendered into the model's YAML
+    entry as an ordinary ``schema_yml`` edit in this same plan, so it passes the
+    same gates and applies the same way as anything else in it.
 
     ``attribute_rows`` controls the row-population report (see
     :mod:`.row_attribution`), which runs after the plan is stored so that nothing
@@ -267,15 +279,22 @@ def plan(
             # against. `_make_plan` below raises this same error with its own
             # message once it needs a project directory to store the plan.
             scaffold_project_dir = None
-        edits = (
-            scaffold_mod.scaffold_edits(scaffold, engine.store, scaffold_project_dir)
-            + edits
+        generated, scaffold_notes = _keep_one_entry(
+            scaffold_project_dir,
+            scaffold_mod.scaffold_edits(scaffold, engine.store, scaffold_project_dir),
         )
+        edits = generated + edits
+    else:
+        scaffold_notes = []
+
+    declared, declaration_notes = _declare(engine, edits, declarations)
+    edits = declared
 
     if not edits:
         raise ValueError(
             "transform plan needs content: pass --edits-file <path|-> with the "
-            "authored edits, or --scaffold <table> for a staging skeleton"
+            "authored edits or declarations, or --scaffold <table> for a staging "
+            "skeleton"
         )
 
     parse_notes: list[str] = []
@@ -292,10 +311,14 @@ def plan(
             EditKind.PROFILES_YML,
             EditKind.SNAPSHOT_SQL,
             EditKind.SEED_CSV,
+            # A model's properties: a declaration lands here, and so does the
+            # shape dbt refuses that no structural check fully covers (a second
+            # entry for one model, a test whose arguments it cannot read).
+            EditKind.SCHEMA_YML,
         )
         for e in edits
     )
-    if has_delete or parser_owned:
+    if (has_delete or parser_owned) and _has_dbt_project(engine):
         # The secret-guard runs first, so an inlined credential is never handed
         # to the dbt subprocess.
         from ..dbt_project import load as load_project
@@ -328,7 +351,12 @@ def plan(
         # hard gate; the parse below is the authoritative backstop.
         if has_delete:
             plans_mod.validate_deletions(view, edits)
-        parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
+        blocker = _unparseable_reason(view, edits)
+        parse_result = (
+            {"available": False, "reason": blocker}
+            if blocker
+            else shadow_parse(project, edits, target=engine.config.dbt_target)
+        )
         if not parse_result["available"]:
             parse_notes.append(parse_result["reason"])
         elif not parse_result["success"]:
@@ -340,9 +368,201 @@ def plan(
             parse_notes = [f"dbt: {m}" for m in parse_result["messages"]]
 
     result = _make_plan(engine, intent, edits)
+    result.warnings.extend(scaffold_notes)
+    result.warnings.extend(declaration_notes)
     result.warnings.extend(parse_notes)
+    result.decisions = _plan_decisions(engine, edits, declarations)
     _attribute_rows(engine, result, edits, requested=attribute_rows)
     return result
+
+
+def _has_dbt_project(engine: DexEngine) -> bool:
+    """Whether this plan is a dbt project's, which is what dbt's parser can read.
+
+    A project format other than dbt places edits in its own keyspace and is
+    checked against its own surface, so neither dbt's parser nor dbt's path rules
+    are a reason to refuse its plan, even where a dbt project also resolves.
+    """
+
+    from ..adapters.project import DbtProject
+    from ..dbt_project import DbtProjectError
+
+    editable = engine.editable_project()
+    if editable is not None and not isinstance(editable, DbtProject):
+        return False
+    try:
+        engine.project_dir()
+    except DbtProjectError:
+        return False
+    return True
+
+
+def _unparseable_reason(view: Any, edits: list[PlanEdit]) -> str | None:
+    """Why dbt cannot parse the post-change project whatever these edits say.
+
+    One known case: semantic models with no MetricFlow time spine, which dbt
+    refuses outright. Semantic plans already skip their parse for it; a plan that
+    only touches a model's properties skips it the same way rather than being
+    refused for a gap it did not open.
+    """
+
+    from . import declarations as declarations_mod
+
+    files = declarations_mod.post_change_files(view, edits)
+    parsed = []
+    has_semantic = False
+    for path, content in files.items():
+        if not path.endswith((".yml", ".yaml")):
+            continue
+        try:
+            loaded = yaml.safe_load(content)
+        except yaml.YAMLError:
+            continue
+        if isinstance(loaded, dict) and loaded.get("semantic_models"):
+            has_semantic = True
+        parsed.append(loaded)
+    if not has_semantic or _semantic().time_spine_warning(view, parsed) is None:
+        return None
+    return (
+        "dbt parse skipped: the project declares semantic models and no time "
+        "spine, which dbt refuses to parse whatever this plan changes"
+    )
+
+
+def _keep_one_entry(
+    project_dir: Any, generated: list[PlanEdit]
+) -> tuple[list[PlanEdit], list[str]]:
+    """Drop a scaffolded YAML file that would declare a model a second time.
+
+    The scaffold writes ``stg_<table>.yml`` beside the model it writes. Where the
+    project already declares that model in another file (a shared
+    ``_staging.yml``), the two entries are a dbt parse error
+    (``DuplicatePatchPathError``), so the scaffold's file is left out and the
+    caller is told how to add what it carried to the entry that exists.
+    """
+
+    from ..dbt_project import DbtProjectError
+    from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+    from .rewrite import yaml_blocks
+
+    if project_dir is None:
+        return generated, []
+    try:
+        view = load_project(project_dir)
+    except DbtProjectError:
+        return generated, []
+    kept: list[PlanEdit] = []
+    notes: list[str] = []
+    for edit in generated:
+        if edit.kind is not EditKind.SCHEMA_YML or edit.new_content is None:
+            kept.append(edit)
+            continue
+        others = {
+            path: source.content
+            for path, source in view.files.items()
+            if path != edit.path
+        }
+        clashes = [
+            (block.name, found)
+            for block in yaml_blocks(edit.new_content)
+            if block.form == "yaml_model_entry"
+            and (found := declarations_mod.schema_path(others, block.name))
+        ]
+        if not clashes:
+            kept.append(edit)
+            continue
+        for model, found in clashes:
+            notes.append(
+                f"{model} is already declared in {found}, so the scaffold's "
+                f"{edit.path} (its key tests and PII stamps) was not written: a second "
+                "entry for one model is a dbt parse error. Add them to the existing "
+                "entry with a `declarations` payload or a `schema_yml` edit"
+            )
+    return kept, notes
+
+
+def _declare(
+    engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
+) -> tuple[list[PlanEdit], list[str]]:
+    """Render the payload's declarations into ``edits``, and warn where intent is
+    missing.
+
+    The undeclared-model warning runs even with no declarations at all: a plan
+    that writes a model's SQL and says nothing about what it means is the gap this
+    exists to close. It stays a warning, because dex declares its own output and
+    does not police a model a human wrote.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+
+    parsed = declarations_mod.parse_declarations(declarations)
+    if not _has_dbt_project(engine):
+        if parsed:
+            raise declarations_mod.DeclarationError(
+                "declarations are rendered into a dbt project's model YAML, and no "
+                "dbt project is the editable project here"
+            )
+        return edits, []
+    view = load_project(engine.project_dir())
+
+    warnings: list[str] = []
+    if parsed:
+        cache = None
+        if any(d.population and d.population.filters for d in parsed):
+            from ..storage import CacheUnreadableError
+
+            # An unreadable cache narrows the filter check to column names; it
+            # never stops the plan, and the narrowing is said out loud.
+            try:
+                cache = readable_cache(engine.store)
+            except CacheUnreadableError:
+                cache = None
+                warnings.append(
+                    "the exploration cache could not be read, so population filters "
+                    "were checked against their column names only"
+                )
+        edits, rendered_warnings = declarations_mod.apply_declarations(
+            parsed,
+            view,
+            edits,
+            cache=cache,
+            pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        )
+        warnings.extend(rendered_warnings)
+    warnings.extend(
+        declarations_mod.undeclared_model_warnings(
+            edits, view, (d.model for d in parsed)
+        )
+    )
+    return edits, warnings
+
+
+def _plan_decisions(
+    engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
+) -> list[dict[str, Any]] | None:
+    """Every assumption declared on the models this plan touches, post-change.
+
+    ``None`` where no dbt project resolves, which is a different answer from an
+    empty list: an empty list says the touched models declare no assumption.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+
+    if not _has_dbt_project(engine):
+        return None
+    view = load_project(engine.project_dir())
+    declared = [
+        entry.get("model")
+        for entry in declarations or []
+        if isinstance(entry, dict) and isinstance(entry.get("model"), str)
+    ]
+    return declarations_mod.decisions(
+        declarations_mod.post_change_files(view, edits),
+        declarations_mod.touched_models(edits, declared),
+    )
 
 
 def _attribute_rows(
@@ -398,10 +618,12 @@ def _attribute_rows(
 
 def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
+        edits, declarations = payload_from_file(getattr(args, "edits_file", None))
         result = plan(
             engine,
             getattr(args, "argument", None) or "",
-            edits=edits_from_payload(getattr(args, "edits_file", None)),
+            edits=edits,
+            declarations=declarations,
             scaffold=getattr(args, "scaffold", None),
             attribute_rows=getattr(args, "attribute_rows", None),
         )
@@ -1846,6 +2068,56 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
         written=outcome.written,
         conflicts_overridden=[c.path for c in outcome.conflicts],
         diffs=outcome.diffs,
+        decisions=(
+            None
+            if stored.edit_target == "semantic"
+            else _project_decisions(
+                engine, _declarations().touched_models(stored.edits)
+            )
+        ),
+    )
+
+
+def _declarations() -> Any:
+    from . import declarations
+
+    return declarations
+
+
+def _project_decisions(
+    engine: DexEngine, models: set[str]
+) -> list[dict[str, Any]] | None:
+    """The assumptions ``models`` declare, as the project on disk records them.
+
+    ``None`` where no dbt project resolves, the same answer a plan gives there.
+    """
+
+    from ..dbt_project import DbtProjectError
+    from ..dbt_project import load as load_project
+
+    try:
+        view = load_project(engine.project_dir())
+    except DbtProjectError:
+        return None
+    files = {path: source.content for path, source in view.files.items()}
+    return _declarations().decisions(files, models)
+
+
+def _built_decisions(engine: DexEngine, summary: dict) -> list[dict[str, Any]] | None:
+    """The assumptions declared on the models a build ran.
+
+    Read from the project as it stands after the build, keyed by the models in
+    dbt's own run results, so a build of one model reports that model's
+    decisions and not the whole project's.
+    """
+
+    return _project_decisions(
+        engine,
+        {
+            str(node.get("name"))
+            for node in summary.get("nodes", [])
+            if str(node.get("unique_id", "")).startswith("model.")
+        },
     )
 
 
@@ -2280,6 +2552,7 @@ def build(
             evidence=_build_evidence(
                 engine, project, target, select, for_plan, for_plan_document
             ),
+            decisions=_built_decisions(engine, summary),
         )
 
     dev_warnings = dev_check()
@@ -2355,6 +2628,7 @@ def build(
     # settles the gate, and a statement issued after that is charged against a
     # reservation that has already been released.
     verification = _verify_build(engine, project, summary, verify, adapter=adapter)
+    decisions = _built_decisions(engine, summary)
     return _shape_build_result(
         summary,
         cost,
@@ -2370,6 +2644,7 @@ def build(
         evidence=_build_evidence(
             engine, project, target, select, for_plan, for_plan_document
         ),
+        decisions=decisions,
     )
 
 
@@ -2493,6 +2768,7 @@ def semantic_define(
     *,
     definitions: list[semantic_mod.DefinitionEdit] | None = None,
     no_parse: bool = False,
+    declarations: list[Any] | None = None,
 ) -> PlanResult:
     """Author new semantic definitions (entities, dimensions, measures, metrics).
 
@@ -2501,7 +2777,13 @@ def semantic_define(
     """
 
     return _semantic_plan(
-        engine, intent, edits, mode="define", definitions=definitions, no_parse=no_parse
+        engine,
+        intent,
+        edits,
+        mode="define",
+        definitions=definitions,
+        no_parse=no_parse,
+        declarations=declarations,
     )
 
 
@@ -2512,6 +2794,7 @@ def semantic_update(
     *,
     definitions: list[semantic_mod.DefinitionEdit] | None = None,
     no_parse: bool = False,
+    declarations: list[Any] | None = None,
 ) -> PlanResult:
     """Evolve existing semantic definitions.
 
@@ -2520,7 +2803,13 @@ def semantic_update(
     """
 
     return _semantic_plan(
-        engine, intent, edits, mode="update", definitions=definitions, no_parse=no_parse
+        engine,
+        intent,
+        edits,
+        mode="update",
+        definitions=definitions,
+        no_parse=no_parse,
+        declarations=declarations,
     )
 
 
@@ -2531,6 +2820,7 @@ def semantic_plan(
     *,
     definitions: list[semantic_mod.DefinitionEdit] | None = None,
     no_parse: bool = False,
+    declarations: list[Any] | None = None,
 ) -> PlanResult:
     """Mixed-intent semantic authoring: one payload may evolve existing
     definitions and add the new ones they depend on; each name is classified
@@ -2538,7 +2828,13 @@ def semantic_plan(
     refused."""
 
     return _semantic_plan(
-        engine, intent, edits, mode="plan", definitions=definitions, no_parse=no_parse
+        engine,
+        intent,
+        edits,
+        mode="plan",
+        definitions=definitions,
+        no_parse=no_parse,
+        declarations=declarations,
     )
 
 
@@ -2576,16 +2872,18 @@ def _semantic_envelope(
     args: argparse.Namespace, engine: DexEngine, mode: str
 ) -> env.Envelope:
     try:
+        edits, declarations = payload_from_file(
+            getattr(args, "edits_file", None), default_kind=EditKind.SEMANTIC_YML
+        )
         result = _SEMANTIC_AUTHORING[mode](
             engine,
             getattr(args, "argument", None) or "",
-            edits_from_payload(
-                getattr(args, "edits_file", None), default_kind=EditKind.SEMANTIC_YML
-            ),
+            edits,
             definitions=_definitions_from_payload(
                 getattr(args, "definitions_file", None)
             ),
             no_parse=bool(getattr(args, "no_parse", False)),
+            declarations=declarations,
         )
     except _validation_error() as exc:
         return env.error_for(exc)
@@ -3012,6 +3310,7 @@ def _shape_build_result(
     adapter=None,
     evidence: dict | None = None,
     verification: BuildVerification | None = None,
+    decisions: list[dict[str, Any]] | None = None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -3095,6 +3394,7 @@ def _shape_build_result(
             cost=cost,
             spend=spend,
             warnings=[*notes, *messages],
+            decisions=decisions,
         )
         if verification is not None:
             result.verification = verification.payload()
@@ -3123,6 +3423,7 @@ def _shape_build_result(
         cost=cost,
         spend=spend,
         warnings=[*notes, *(messages[1:] if messages else [])],
+        decisions=decisions,
     )
     if verification is not None:
         # A failed build is when "which node failed, and which were skipped
@@ -3210,6 +3511,7 @@ def _semantic_plan(
     mode: str,
     definitions: list[semantic_mod.DefinitionEdit] | None = None,
     no_parse: bool = False,
+    declarations: list[Any] | None = None,
 ) -> PlanResult:
     from ..dbt_project import load as load_project
 
@@ -3276,6 +3578,11 @@ def _semantic_plan(
     )
     spine_warning = _semantic().time_spine_warning(view, parsed_edits)
 
+    # Declarations render after the semantic-only checks above, because what they
+    # produce is a model's properties (`schema_yml`), not a semantic definition,
+    # and before the parse below, so dbt reads the layer and the models together.
+    edits, declaration_notes = _declare(engine, edits, declarations)
+
     # The authoritative gate: a plan that dbt cannot parse is never stored.
     # Skipped when the time-spine warning fires (dbt would refuse to parse for
     # that already-surfaced reason, and authoring the spine comes next), or
@@ -3323,6 +3630,8 @@ def _semantic_plan(
     if parse_warning:
         result.warnings.append(parse_warning)
     result.warnings.extend(parse_deprecations)
+    result.warnings.extend(declaration_notes)
+    result.decisions = _plan_decisions(engine, edits, declarations)
     return result
 
 

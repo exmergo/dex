@@ -9,6 +9,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **Declarations: a model dex creates or edits can say what it means**
+  ([#491]). Models dex helped build carried almost no metadata, so the decisions
+  behind the SQL (which statuses count, what one row is, whether a column can be
+  summed, what a NULL means) lived only in an agent's transcript, and those are
+  the decisions agents get wrong. `transform plan` and `semantic define|update|plan`
+  now accept a `declarations` list beside `edits`: per model, a `description`, a
+  `grain`, a `population` (a rule and its filters), each column's `role`,
+  `null_rule`, `aggregation`, `additivity`, `unit` and `references`, and the
+  `assumptions` the model rests on, each with its `evidence` (`request`,
+  `contract`, `precedent`, `data`, `default`).
+
+  - Each declaration is rendered into the model's existing YAML entry, wherever
+    in the project it lives, as a `schema_yml` edit in the same plan: dbt's own
+    `description`, `unique`/`not_null` on a single-column grain, `not_null` for
+    `null_rule: never`, a `relationships` test for a referenced foreign key, and
+    `config.meta.dex` for the rest. A model with no entry gets one beside its SQL;
+    dex never writes a second entry for a model. Only those keys are written, and
+    every other byte of the file, comments included, is kept.
+  - A malformed declaration is refused with the fix named: a column or grain
+    column the model's SELECT list does not produce, a `references` target that
+    does not resolve, an unknown role, additivity, evidence or field, and a
+    population filter listing values on a column that looks like personal data.
+    Missing intent is a warning, never a refusal, including a model the plan
+    writes SQL for with no declaration at all.
+  - A plan carrying declarations or `schema_yml` edits is now parsed by dbt
+    against a throwaway copy of the post-change project before it is stored,
+    degrading to a named warning where dbt is not installed.
+  - The plan, apply and build envelopes carry `data.decisions`: every assumption
+    declared on the models the command touched (`model`, `decision`, `chosen`,
+    `evidence`), read back from the project's YAML.
+  - `maintain reconcile` finds a staging model's YAML and SQL where the project
+    keeps them (a shared `_staging.yml`, a subfolder) with the lookup
+    declarations and `transform place` use, rather than assuming
+    `models/staging/stg_<table>.yml`. A re-scaffold that would have landed beside
+    a model the project keeps elsewhere is refused as misplaced instead of
+    written as a second copy.
+
 ## [1.12.7] - 2026-10-08
 
 ### Changed

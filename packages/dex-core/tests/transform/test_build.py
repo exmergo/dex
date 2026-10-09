@@ -603,7 +603,11 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         "outcome",
         "evidence",
         "verification",
+        # The assumptions the built models declare (#491); empty here, since the
+        # fixture project declares none.
+        "decisions",
     }
+    assert envelope["data"]["decisions"] == []
     # `success` is dbt's exit code; `outcome` is whether anything was validated,
     # and this run built real nodes against current artifacts.
     assert envelope["data"]["outcome"] == "validated"

@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .. import envelope as env
 from ..edits import EditOp, SemanticEditTarget
@@ -128,21 +128,51 @@ def edits_from_payload(
 ) -> list[PlanEdit]:
     """Read the agent-authored edits payload (a file path, or ``-`` for stdin).
 
+    For the commands that take edits and nothing else. A payload carrying
+    ``declarations`` is refused here rather than read for its edits alone, because
+    a declaration dropped without a word is a model that reads as declared and is
+    not.
+    """
+
+    edits, declarations = payload_from_file(edits_file, default_kind)
+    if declarations is not None:
+        raise ValueError(
+            "this command does not take declarations; pass them to `transform "
+            "plan` or `semantic define|update|plan` instead"
+        )
+    return edits
+
+
+def payload_from_file(
+    edits_file: str | None, default_kind: EditKind | None = None
+) -> tuple[list[PlanEdit], list[Any] | None]:
+    """Read the payload once, returning its edits and its raw ``declarations``.
+
     Shape: ``{"edits": [{"path": ..., "kind": ..., "op": ..., "content": ...},
-    ...]}``. ``op`` defaults to ``"upsert"`` (create or update): those carry
-    ``content``. An ``op`` of ``"delete"`` removes the file and carries no
-    ``content``. ``kind`` may be omitted when the command implies it (semantic
-    define/update).
+    ...], "declarations": [...]}``. ``op`` defaults to ``"upsert"`` (create or
+    update): those carry ``content``. An ``op`` of ``"delete"`` removes the file
+    and carries no ``content``. ``kind`` may be omitted when the command implies it
+    (semantic define/update). ``edits`` may be omitted when ``declarations`` is
+    present, since declaring an existing model is a change on its own.
+
+    One read for both keys, because ``-`` is stdin and stdin can be read once.
+    ``declarations`` comes back unvalidated (``None`` when the key is absent);
+    :mod:`.declarations` is what knows its shape.
     """
 
     if edits_file is None:
-        return []
+        return [], None
     raw = sys.stdin.read() if edits_file == "-" else read_payload_file(edits_file)
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"edits payload is not valid JSON: {exc}") from exc
-    entries = payload.get("edits") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise ValueError('edits payload must be {"edits": [...]}')
+    declarations = payload.get("declarations")
+    entries = payload.get("edits")
+    if entries is None and declarations is not None:
+        entries = []
     if not isinstance(entries, list):
         raise ValueError('edits payload must be {"edits": [...]}')
 
@@ -176,7 +206,7 @@ def edits_from_payload(
                 new_content=entry.get("content"),
             )
         )
-    return edits
+    return edits, declarations
 
 
 def read_payload_file(path: str) -> str:

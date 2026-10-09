@@ -1212,6 +1212,7 @@ class DexEngine:
         intent: str,
         *,
         edits: list[PlanEdit] | None = None,
+        declarations: list[Any] | None = None,
         scaffold: list[str] | None = None,
         attribute_rows: bool | None = None,
     ) -> PlanResult:
@@ -1221,6 +1222,7 @@ class DexEngine:
             self,
             intent,
             edits=edits,
+            declarations=declarations,
             scaffold=scaffold,
             attribute_rows=attribute_rows,
         )

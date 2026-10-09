@@ -139,7 +139,10 @@ class DeclarationEdits:
             return Declined(path, f"{path} did not parse as YAML")
         if not isinstance(parsed, dict):
             return Declined(path, f"{path} did not parse as YAML")
-        model = PurePosixPath(path).stem
+        # The model's own file names it. The YAML's name only does when the format
+        # keeps one file per model, and a shared `_staging.yml` would otherwise
+        # name every model in it after the file.
+        model = PurePosixPath(self._placed(EditKind.MODEL_SQL, table) or path).stem
         named = [
             entry
             for entry in parsed.get("models") or []
