@@ -334,6 +334,17 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 ]}
 ```
 
+Beside `edits`, `transform plan` and `semantic define|update|plan` accept a
+`declarations` list: per model, what one row is, which rows are in, what each column
+is, and the assumptions the model rests on with their evidence. Each is rendered
+into the model's existing YAML entry as a `schema_yml` edit in the same plan, and
+`edits` may be omitted when the payload only declares models that exist. The plan,
+apply and build envelopes then carry `data.decisions`, every assumption declared on
+the models the command touched. A command that takes no declarations refuses a
+payload carrying them rather than dropping them. The full shape, the refusals and
+what each field renders into:
+[`skills/transform/references/declarations.md`](../skills/transform/references/declarations.md).
+
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
 `macro_sql`, `snapshot_sql`, `seed_csv`, `test_sql`, `analysis_sql`,

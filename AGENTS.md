@@ -194,6 +194,21 @@ solvable problem rather than a permanent block. The engine validates, diffs, and
 under `.dex/plans/`; nothing touches the dbt project until `transform apply`. See
 `references/command-contract.md`.
 
+The same payload carries a `declarations` key beside `edits` on `transform plan`
+and `semantic define|update|plan`: per model, what one row is (`grain`), which rows
+are in (`population`), what each column is (`role`, `null_rule`, `aggregation`,
+`additivity`, `unit`, `references`), and the decisions it rests on (`assumptions`,
+each with an `evidence` of `request`, `contract`, `precedent`, `data` or `default`).
+The engine renders each declaration into the model's existing YAML entry, wherever
+it lives (dbt's own `description` and tests where dbt has a construct,
+`config.meta.dex` for the rest), as a `schema_yml` edit in the same plan, and never
+writes a second entry for a model. A malformed declaration is refused with the fix
+named; missing intent, including a model the plan writes SQL for with no
+declaration, is a warning, never a refusal. A plan carrying declarations or
+`schema_yml` edits is parsed by dbt before it is stored. The plan, apply and build
+envelopes report every assumption declared on the models they touched under
+`data.decisions`. Every field: `skills/transform/references/declarations.md`.
+
 ### The envelope
 
 Every command prints exactly one JSON object and nothing else:
