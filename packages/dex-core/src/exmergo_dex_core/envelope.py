@@ -20,7 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .errors import DexError
+from .errors import DexError, StatementStage, WarehouseQueryError
 
 
 class Status(str, Enum):
@@ -433,14 +433,35 @@ def reason_for(exc: BaseException) -> Reason:
     return Reason.INTERNAL
 
 
+def stage_for(exc: BaseException) -> StatementStage | None:
+    """Which door a warehouse refusal came through, where the adapter said.
+
+    ``None`` for anything that is not a :class:`WarehouseQueryError`, and for one
+    raised by an adapter that cannot tell its doors apart. The two places an
+    exception becomes a ``reason`` a host reads (:func:`error_for`, and a batch
+    statement's own verdict in ``explore query``) both read the stage here, so
+    neither can carry one the other drops.
+    """
+
+    return exc.stage if isinstance(exc, WarehouseQueryError) else None
+
+
 def error_for(
     exc: BaseException, message: str | None = None, **kwargs: Any
 ) -> Envelope:
     """Build an error envelope from a caught exception: ``errors`` defaults to
     ``str(exc)`` (override via ``message`` for call sites that add context or
     redact), and ``reason`` is derived automatically via :func:`reason_for`.
+
+    ``data.stage`` is derived the same way, via :func:`stage_for`, and merged
+    into whatever ``data`` the call site passes. Doing it here rather than at
+    the call sites is what puts it on every error envelope a warehouse refusal
+    can reach, the CLI's catch-all included, and absent from every other one.
     """
 
+    stage = stage_for(exc)
+    if stage is not None:
+        kwargs["data"] = {**(kwargs.get("data") or {}), "stage": stage.value}
     return Envelope(
         status=Status.ERROR,
         errors=[message if message is not None else str(exc)],

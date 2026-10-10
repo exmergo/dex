@@ -677,6 +677,57 @@ def test_the_profiles_own_aggregate_still_degrades_on_a_refused_dry_run(
     assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
 
 
+def test_a_host_can_tell_a_statement_bigquery_would_not_plan_from_one_that_failed(
+    fake_bq_client, monkeypatch
+):
+    """The two doors above and `_run`'s own, side by side (issue #524).
+
+    A statement BigQuery will not plan was refused before anything ran or
+    billed, and the same bytes will be refused again, so the statement has to
+    change. One that planned, ran and failed may have billed, and its failure can
+    depend on the data. Both are `execution_failure`, which stays true of both,
+    so the door is a value of its own: without it the only difference a host
+    could read was the request line google-api-core happens to put in front of
+    the first, which is not a contract.
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.envelope import error_for
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    sql = "SELECT 1 / n AS r FROM `test-proj`.`shop`.`customers`"
+    adapter = make_adapter(fake_bq_client)
+    original_query = fake_bq_client.query
+
+    _refuse_to_plan(fake_bq_client, monkeypatch, "Unrecognized name: n at [1:12]")
+    with pytest.raises(WarehouseQueryError) as planned:
+        adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    assert not [c for c in fake_bq_client.query_calls if not c.dry_run]  # nothing ran
+
+    monkeypatch.setattr(fake_bq_client, "query", original_query)
+    fake_bq_client.result_error = api_exceptions.BadRequest(
+        "Query error: division by zero: 1 / 0 at [1:8]"
+    )
+    with pytest.raises(WarehouseQueryError) as ran:
+        adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    assert [c for c in fake_bq_client.query_calls if not c.dry_run]  # this one ran
+
+    a, b = error_for(planned.value), error_for(ran.value)
+    # Everything a host already branches on agrees, so no reason switch moves.
+    assert a.reason is b.reason is Reason.EXECUTION_FAILURE
+    assert type(planned.value) is type(ran.value)
+    assert planned.value.reading == ran.value.reading is None
+    assert a.model_dump(exclude={"errors", "data"}) == b.model_dump(
+        exclude={"errors", "data"}
+    )
+    # And the door is read from a field, not from the server's prose.
+    assert a.data == {"stage": "plan"}
+    assert b.data == {"stage": "run"}
+    assert planned.value.stage == "plan"
+    assert ran.value.stage == "run"
+
+
 def test_a_bytes_billed_refusal_reported_as_a_server_error_still_retries(
     fake_bq_client,
 ):

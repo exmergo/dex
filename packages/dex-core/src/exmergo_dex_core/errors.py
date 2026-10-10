@@ -32,6 +32,8 @@ redundant.
 
 from __future__ import annotations
 
+from enum import Enum
+
 
 class DexError(Exception):
     """Base for every refusal dex raises deliberately.
@@ -113,8 +115,30 @@ class ConnectorError(DexError):
     """
 
 
+class StatementStage(str, Enum):
+    """Where in a statement's life the warehouse refused it.
+
+    ``plan`` is a refusal before anything ran: the warehouse would not plan the
+    statement (on BigQuery, the dry run or the job insert answered 400), so
+    nothing ran and nothing was billed, and the same bytes will be refused again.
+    ``run`` is a refusal of a statement that planned and ran: it may have billed,
+    and the failure can depend on the data or on resources rather than on the SQL.
+
+    A code rather than prose because a host branches on it: an agent loop rewrites
+    a statement after ``plan`` and has a different decision to make after
+    ``run``. Only an adapter that can tell its two doors apart sets one (BigQuery
+    today), so an unset stage means the adapter did not say, never either value.
+    It lives here, beside :class:`WarehouseQueryError`, for the reason that class
+    does: the envelope reads it from the tier of imports that works on an install
+    with no connector extra at all.
+    """
+
+    PLAN = "plan"
+    RUN = "run"
+
+
 class WarehouseQueryError(DexError):
-    """A statement dex built ran against the warehouse and the server refused it.
+    """A statement dex built reached the warehouse and the server refused it.
 
     Neither a refusal dex made nor a bug in dex: the guards cleared the
     statement, the connection was open, and the server answered with an error.
@@ -141,6 +165,11 @@ class WarehouseQueryError(DexError):
     object is attached afterwards, by :meth:`naming`, rather than threaded
     down through every adapter's execution seam.
 
+    ``stage`` is the other way round: only the adapter knows which door the
+    refusal came through, so it is set where the exception is raised and every
+    later rebuild carries it (see :class:`StatementStage`). The message text is
+    the same whichever door it was, so nothing a host already matches moves.
+
     It lives here rather than beside the code that raises it, which is this
     module's usual rule, because six adapters raise this one class (there is no
     "the code that raises it") and because ``envelope._reason_overrides`` has to
@@ -148,9 +177,16 @@ class WarehouseQueryError(DexError):
     connector extra at all.
     """
 
-    def __init__(self, detail: str, *, reading: str | None = None):
+    def __init__(
+        self,
+        detail: str,
+        *,
+        reading: str | None = None,
+        stage: StatementStage | None = None,
+    ):
         self.detail = detail
         self.reading = reading
+        self.stage = stage
         super().__init__(self._message())
 
     def _message(self) -> str:
@@ -161,12 +197,14 @@ class WarehouseQueryError(DexError):
         """This failure with the object it was reading named.
 
         The first name wins: the innermost caller that knows one is the most
-        specific, so an outer handler re-naming it cannot make it vaguer.
+        specific, so an outer handler re-naming it cannot make it vaguer. The
+        stage is carried across, because the rebuilt exception is the one that
+        reaches the envelope and the adapter is not there to set it again.
         """
 
         if self.reading is not None:
             return self
-        return WarehouseQueryError(self.detail, reading=identifier)
+        return WarehouseQueryError(self.detail, reading=identifier, stage=self.stage)
 
 
 class NoConnectorSelectedError(ConfigurationError):

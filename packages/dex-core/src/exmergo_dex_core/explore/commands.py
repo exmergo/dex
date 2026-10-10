@@ -1294,6 +1294,9 @@ def query_batch(
                     if statement.error is None
                     else env.reason_for(statement.error).value
                 ),
+                stage=(
+                    None if statement.error is None else env.stage_for(statement.error)
+                ),
                 **(
                     {}
                     if statement.result is None

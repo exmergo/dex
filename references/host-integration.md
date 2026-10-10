@@ -326,6 +326,28 @@ macros. dbt compilation and the subsequent build still execute repository code
 and must run in the host's intended sandbox. The check does not freeze the
 repository or guarantee that nondeterministic templates render identically twice.
 
+### Which door a warehouse refusal came through
+
+A statement the warehouse itself refused reads `reason: execution_failure` on
+every connector. BigQuery can refuse one at two doors, and they mean different
+things for whatever the host does next, so the error envelope names the door in
+`data.stage`:
+
+| `data.stage` | what happened | what it means for a retry |
+|---|---|---|
+| `plan` | BigQuery would not plan it: the dry run, or the job insert, answered 400 | nothing ran and nothing was billed; the same statement is refused again until it changes |
+| `run` | the job was created, ran, and failed at `job.result()` | it may have billed, and the failure can depend on the data or on resources rather than on the SQL |
+| absent | the refusal was not the warehouse's, or came from a connector that cannot tell its doors apart | `reason` is the whole answer |
+
+Branch on the field, not on the text. Before it existed the only difference
+between the two was the request line google-api-core puts in front of a
+job-insert error (`400 POST https://bigquery.googleapis.com/...`), which depends
+on how a client library renders an HTTP error and on dex's trim of the server's
+words, and neither is a contract. In process, the same value is
+`WarehouseQueryError.stage`, a `StatementStage` importable from
+`exmergo_dex_core`. A multi-statement `explore query` carries it per statement,
+beside each entry's `reason`.
+
 ## 6. Cost, on both outcomes
 
 `cost` carries `estimate_quality` and `unit` alongside the magnitude:
@@ -377,9 +399,10 @@ protocol; these are for someone consuming a payload.
 
 Every existing public method keeps its signature and its result shape, and
 nothing here changes what an interactive user or an agent driving the command
-contract sees. Every new behavior is opt-in: no `for_plan`, no coverage; the
-default dependency policy still installs; the function allowlist is off until a
-project writes one.
+contract sees, except that a warehouse refusal's error envelope gains
+`data.stage`, which is additive. Every other new behavior is opt-in: no
+`for_plan`, no coverage; the default dependency policy still installs; the
+function allowlist is off until a project writes one.
 
 The engine does not implement admission policy. It reports what a plan contains,
 what it depends on, what the provider will enforce, and what a build established.

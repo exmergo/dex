@@ -116,6 +116,7 @@ _EXPORTS = {
     "SpendHistory": "storage",
     "SpendLock": "storage",
     "SpendLockTimeoutError": "guards.cost_guard",
+    "StatementStage": "errors",
     "Store": "storage",
     "StoreContext": "storage",
     "StoreFactory": "storage",
@@ -154,6 +155,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ProjectError,
         RepoRootRequiredError,
         RequestError,
+        StatementStage,
         StoreRequiredError,
         WarehouseQueryError,
     )
@@ -281,6 +283,7 @@ __all__ = [
     "SpendHistory",
     "SpendLock",
     "SpendLockTimeoutError",
+    "StatementStage",
     "Store",
     "StoreContext",
     "StoreFactory",

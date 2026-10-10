@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from ..adapters.base import VALUE_DOMAIN_CAP
 from ..cache import Dataset, DexCache, Relationship
+from ..errors import StatementStage
 from ..results import Result
 from .semantic import SemanticCatalog
 from .summary import MapObject
@@ -438,6 +439,12 @@ class QueryStatementResult(BaseModel):
 
     ``line`` is the line the statement started on when it came from a file, and
     None when it came from argv, where the position is the whole address.
+
+    ``stage`` sits beside ``reason`` for the same reason ``reason`` does: a
+    failed statement's verdict is reported here and not through the envelope's
+    own error, so which door the warehouse refused it at has to be here too. It
+    is None on every statement the warehouse did not refuse, and on one refused
+    by an adapter that cannot tell its doors apart.
     """
 
     index: int
@@ -456,6 +463,7 @@ class QueryStatementResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     reason: str | None = None
+    stage: StatementStage | None = None
 
 
 class QueryBatchResult(Result):

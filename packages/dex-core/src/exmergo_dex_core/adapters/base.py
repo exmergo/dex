@@ -27,7 +27,7 @@ from math import ceil
 from typing import Protocol, runtime_checkable
 
 from ..envelope import Paradigm
-from ..errors import WarehouseQueryError
+from ..errors import StatementStage, WarehouseQueryError
 
 
 @dataclass(frozen=True)
@@ -281,7 +281,12 @@ def blame(origin: str, error: type[Exception]):
 _SERVER_DETAIL_CAP = 400
 
 
-def warehouse_refusal(message: str, *, code: str | None = None) -> WarehouseQueryError:
+def warehouse_refusal(
+    message: str,
+    *,
+    code: str | None = None,
+    stage: StatementStage | None = None,
+) -> WarehouseQueryError:
     """The typed error for one server-side statement failure.
 
     Every adapter funnels through here so the envelope reads the same whichever
@@ -289,13 +294,19 @@ def warehouse_refusal(message: str, *, code: str | None = None) -> WarehouseQuer
     only (drivers append the statement, a caret diagram, or their whole error
     payload after it) and capped. ``code`` is the connector's own error code
     where it has one, which is what a caller looking the failure up needs.
+
+    ``stage`` is which door the refusal came through, for an adapter that can
+    tell (see :class:`~exmergo_dex_core.errors.StatementStage`). It is kept as a
+    field rather than appended to the text the way ``code`` is, because a host
+    branches on it, and a value a host has to parse back out of prose is not one
+    it can rely on.
     """
 
     first = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
     detail = first or "the server gave no message"
     if len(detail) > _SERVER_DETAIL_CAP:
         detail = detail[:_SERVER_DETAIL_CAP].rstrip() + "..."
-    return WarehouseQueryError(f"{detail} [{code}]" if code else detail)
+    return WarehouseQueryError(f"{detail} [{code}]" if code else detail, stage=stage)
 
 
 def json_safe(value: object | None) -> object | None:

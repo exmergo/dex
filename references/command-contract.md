@@ -1204,7 +1204,8 @@ envelope sanitizer's list-of-dicts raw-row rule intact as a backstop.
 A call carrying one statement puts that shape directly in `data`. A call carrying
 several puts one entry per statement under `data.results`, each with the same
 keys plus `index`, `status` (`ok`, `refused`, `failed`, `skipped`), `error`,
-`reason`, and the source `line` when the statement came from `--sql-file`;
+`reason`, `stage` (see the envelope rules below), and the source `line` when the
+statement came from `--sql-file`;
 `statement_count`, `ok_count` and `failed_count` sit beside them. A statement
 that failed makes the envelope's own status `error` while every answer stays in
 `data`, the same way `transform build` reports a run that failed partway: an `ok`
@@ -1300,6 +1301,24 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   resolved the field is `null` instead. A refusal carries the paradigm, the
   estimate, and the ceiling that bound it, so "was this refused over money?" is
   answerable from the structured fields without parsing the error prose.
+- **A warehouse refusal names the door it came through.** A statement the
+  warehouse itself refused reads `reason: execution_failure`, and on a connector
+  that can tell where the refusal happened, `data.stage` says which. `plan`: the
+  warehouse would not plan the statement (on BigQuery, the dry run or the job
+  insert answered 400), so nothing ran, nothing was billed, and the same
+  statement will be refused again until it changes. `run`: it planned, ran, and
+  failed, so it may have billed, and the failure can depend on the data or on
+  resources rather than on the SQL. BigQuery is the one connector that sets it
+  today. The key is absent, never null, on every other error envelope: a
+  refusal from a connector that cannot tell its doors apart, and every refusal
+  that is not the warehouse's. A multi-statement `explore query` reports each
+  statement's verdict in its own `data.results` entry, so `stage` sits there
+  beside that entry's `reason`, and is null on a statement that answered, one a
+  guard refused, and one whose connector named no stage, the same way `reason`
+  and `error` are always present in that shape. The error text is the same
+  whichever door it was, so a
+  host that matched on it keeps working and one that branches on the field no
+  longer has to.
 - **`connection` names the target that answered.** Its connector, safe target
   coordinates, and resolution source are stamped once at the CLI boundary so
   individual command handlers cannot omit or reshape them. The sanitizer scans

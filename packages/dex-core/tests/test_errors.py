@@ -319,3 +319,45 @@ def test_an_injected_connection_for_duckdb_is_a_configuration_error():
     with pytest.raises(ConfigurationError) as refusal:
         engine.connect_test()
     assert "duckdb" in str(refusal.value)
+
+
+# --- which door a warehouse refusal came through (#524) ----------------------
+
+
+def test_naming_a_refusal_keeps_the_door_it_came_through():
+    """`naming()` rebuilds the exception, and the rebuilt one is what reaches
+    the envelope. An attribute it did not carry would pass every adapter-level
+    test and vanish on the profile path, which is the one that names."""
+
+    from exmergo_dex_core import StatementStage, WarehouseQueryError
+
+    refused = WarehouseQueryError("Bad int64 value: pending", stage=StatementStage.RUN)
+    named = refused.naming("test-proj.shop.events")
+
+    assert named is not refused
+    assert named.reading == "test-proj.shop.events"
+    assert named.stage is StatementStage.RUN
+    # Named twice, the first name still wins, and the stage is still there.
+    assert named.naming("elsewhere").stage is StatementStage.RUN
+
+
+def test_the_stage_is_a_field_and_never_text():
+    """The text is what a host matched on before this existed, so the stage must
+    not move it: a refusal reads the same whichever door it came through, and a
+    connector that names no stage builds the same exception it always did."""
+
+    from exmergo_dex_core import StatementStage
+    from exmergo_dex_core.adapters.base import warehouse_refusal
+
+    message = "Unrecognized name: n at [1:12]\n  SELECT 1 / n\n         ^"
+    plain = warehouse_refusal(message)
+    planned = warehouse_refusal(message, stage=StatementStage.PLAN)
+    coded = warehouse_refusal(message, code="42703", stage=StatementStage.RUN)
+
+    assert plain.stage is None
+    assert planned.stage is StatementStage.PLAN
+    assert str(planned) == str(plain)
+    assert coded.stage is StatementStage.RUN
+    assert str(coded) == f"{plain} [42703]"
+    assert StatementStage.PLAN == "plan"
+    assert StatementStage.RUN == "run"

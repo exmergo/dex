@@ -23,7 +23,7 @@ from typing import Any
 
 from ..config import BigQueryTarget
 from ..envelope import EstimateQuality, Paradigm
-from ..errors import ConnectorError, PrerequisiteError
+from ..errors import ConnectorError, PrerequisiteError, StatementStage
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -1191,7 +1191,9 @@ class BigQueryAdapter:
             # refusal it meets at execution; this is the same verdict a step
             # earlier, typed the same way, so a host reads `execution_failure`
             # and BigQuery's own words rather than `internal` (issue #480).
-            raise warehouse_refusal(str(exc)) from exc
+            # Both are the plan door: nothing ran, so the statement itself has
+            # to change, and the stage says so without the text (issue #524).
+            raise warehouse_refusal(str(exc), stage=StatementStage.PLAN) from exc
         rows = list(iterator)
         schema = list(iterator.schema)
         return QueryResult(
@@ -1287,9 +1289,10 @@ class BigQueryAdapter:
             # rather than the `internal` an untyped API exception falls
             # through to. Anything else in the family is a transport or server
             # fault rather than a verdict on the statement, and is left to
-            # propagate exactly as it did before.
+            # propagate exactly as it did before. The job was created, so this
+            # is the run door: it may have billed, and it can fail on the data.
             if isinstance(exc, self._api_exceptions.BadRequest):
-                raise warehouse_refusal(str(exc)) from exc
+                raise warehouse_refusal(str(exc), stage=StatementStage.RUN) from exc
             raise
         except TimeoutError as exc:
             # concurrent.futures.TimeoutError is the builtin on Python 3.11+.
@@ -1326,12 +1329,15 @@ class BigQueryAdapter:
         statements cross it through ``_execute`` and the scan estimate, and
         those callers degrade to metadata on a ``BadRequest`` rather than
         failing the profile.
+
+        A refusal here is the plan door by definition, since a dry run runs
+        nothing, so it carries :attr:`StatementStage.PLAN` (issue #524).
         """
 
         try:
             return self._dry_run(sql)
         except self._api_exceptions.BadRequest as exc:
-            raise warehouse_refusal(str(exc)) from exc
+            raise warehouse_refusal(str(exc), stage=StatementStage.PLAN) from exc
 
     def _request(self, operation: Callable[[], Any]) -> Any:
         try:

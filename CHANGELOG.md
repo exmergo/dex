@@ -9,6 +9,27 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A BigQuery statement refused before it ran says so in `data.stage`, apart
+  from one that ran and failed** ([#524]). Since [#480] both read
+  `execution_failure`, which stays true of both, and nothing structured told
+  them apart. A statement BigQuery would not plan (the dry run, or the job
+  insert, answered 400) ran nothing, billed nothing, and will be refused again
+  until it changes; one that planned and then failed at `job.result()` may have
+  billed and can fail on the data. A host had to search the message for the
+  request line google-api-core puts in front of the first, which depends on how
+  a client library renders an HTTP error and is not a contract.
+  `WarehouseQueryError` now carries `stage` (`StatementStage.PLAN` or
+  `StatementStage.RUN`, importable from `exmergo_dex_core`), set at BigQuery's
+  three raise sites and kept by `naming()`, and `error_for` puts it in the error
+  envelope's `data.stage`, so every command and the CLI's catch-all carry it. A
+  multi-statement `explore query` carries it per statement, beside that
+  statement's `reason`. Downstream-visible and additive: `reason` and the error
+  text are unchanged, the key is absent on every other error envelope and every
+  other connector, and the profile's own aggregate statements still degrade on a
+  refused dry run rather than raising.
+
 ## [1.12.7] - 2026-10-08
 
 ### Changed
