@@ -23,7 +23,7 @@ transformation project or claiming dbt model writeback.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
 from ..errors import ConfigurationError, ProjectError, RepoRootRequiredError
@@ -266,7 +266,7 @@ def _files(value: Any) -> list[str]:
                 f"{listed}. The suffix is what tells dex a repository file is "
                 "one of the documents this source owns"
             )
-        if Path(name).is_absolute() or ".." in Path(name).parts:
+        if _leaves_the_repository(name):
             raise ConfigurationError(
                 f"'{name}' has to name a file inside the repository, written "
                 "relative to its root. dex reads native Ossie documents only "
@@ -280,3 +280,20 @@ def _files(value: Any) -> list[str]:
             "than a larger layer"
         )
     return files
+
+
+def _leaves_the_repository(name: str) -> bool:
+    """Whether a configured name is anchored, or climbs out, on either platform.
+
+    Asked of both path flavours rather than the running one, because the line
+    is committed and read wherever the repository is checked out. `/x` has a root
+    and no drive, so Windows calls it relative; `\\x`, `C:x` and `C:\\x` are
+    ordinary file names to a POSIX reader. Each is anchored on one of them, so a
+    line accepted on one platform could still name a file outside the repository
+    on the other.
+    """
+
+    return any(
+        bool(flavour(name).anchor) or ".." in flavour(name).parts
+        for flavour in (PurePosixPath, PureWindowsPath)
+    )

@@ -179,7 +179,7 @@ def test_no_source_file_carries_a_blanket_line_length_suppression():
     offenders = [
         str(path.relative_to(ROOT))
         for path in ROOT.rglob("*.py")
-        if "# ruff: noqa: E501" in path.read_text()
+        if "# ruff: noqa: E501" in path.read_text(encoding="utf-8")
     ]
 
     assert not offenders, offenders

@@ -8,6 +8,35 @@ The engine version is derived from the git tag and follows
 tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
+### Fixed
+
+- **`dex demo` names its paths with forward slashes on Windows too** ([#487]).
+  `data.path`, `data.created`, the `--repo-root` and `--path` its printed next
+  steps carry, and its two refusals that name a path all used the platform
+  separator, so on Windows the demo reported `.dex\config.yml` for the file
+  every other command and every document calls `.dex/config.yml`, and a
+  backslash path in a printed command came out in single quotes, which cmd
+  passes through as part of the path. Each is now spelled with forward slashes
+  on every platform, the rule `transform/dev_target.py` already follows for
+  the paths in its messages ([#264]). The printed commands still go through
+  `shlex.quote`, applied to that form, so an ordinary path prints unquoted and
+  types the same into any shell. Nothing changes on macOS or Linux; on Windows,
+  a consumer comparing `data.created` with a native path should compare them
+  as paths, or through `as_posix()`.
+
+- **A `semantic.ossie.files` entry that is anchored on either platform is
+  refused where it is configured, on every platform** ([#487]). The check
+  asked `Path.is_absolute()` and looked for `..` with the running platform's
+  rules: on Windows `/abs.ossie.yaml` has a root and no drive, so it is not
+  absolute and passed, and on Linux `\abs.ossie.yaml`, `C:abs.ossie.yaml` and
+  `..\out.ossie.yaml` are ordinary file names. A name that POSIX or Windows
+  path rules read as anchored, or as climbing out with `..`, is now refused
+  with the same message wherever the committed line is read. Nothing outside
+  the repository was ever read: the loader checks confinement on the resolved
+  path and still does. What changes is that such a line is refused where it is
+  written, and that `C:abs.ossie.yaml`, which Windows joins onto a repository
+  on drive `C:` as `abs.ossie.yaml` inside it and Linux reads as a file named
+  `C:abs.ossie.yaml`, no longer names a different file on each platform.
 
 ## [1.12.7] - 2026-10-08
 

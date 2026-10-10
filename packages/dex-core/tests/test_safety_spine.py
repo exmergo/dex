@@ -3424,8 +3424,9 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     monkeypatch.chdir(tmp_path)
     assert main(["demo"]) == 0
     payload = json.loads(capsys.readouterr().out)
+    # Listed with forward slashes, the spelling `created` uses on every platform.
     on_disk = sorted(
-        str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()
+        p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file()
     )
     assert on_disk == sorted(payload["data"]["created"])
 
@@ -3454,7 +3455,9 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     assert main(["--repo-root", str(repo), "demo"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["data"]["created"] == ["dex_demo.duckdb", ".dex/config.yml"]
-    written = sorted(str(p.relative_to(repo)) for p in repo.rglob("*") if p.is_file())
+    written = sorted(
+        p.relative_to(repo).as_posix() for p in repo.rglob("*") if p.is_file()
+    )
     assert written == sorted(payload["data"]["created"])
     assert list(elsewhere.iterdir()) == []
 
@@ -3709,10 +3712,16 @@ def test_the_skill_wrapper_never_installs_into_the_repo_it_is_pointed_at(
     spec.loader.exec_module(wrapper)
 
     monkeypatch.setattr(wrapper.shutil, "which", lambda _name: "/usr/local/bin/uv")
-    monkeypatch.setattr(wrapper.os, "name", "posix")
     issued: list[list[str]] = []
+    # The wrapper execs on POSIX and spawns elsewhere. Both are intercepted, so
+    # the command is asserted on whichever branch this platform takes, rather
+    # than forcing one by setting `os.name`, which `wrapper.os` shares with the
+    # whole process and pathlib reads to choose its path class.
     monkeypatch.setattr(
         wrapper.os, "execvp", lambda _file, cmd: issued.append(cmd) or None
+    )
+    monkeypatch.setattr(
+        wrapper.subprocess, "call", lambda cmd, **_kw: issued.append(cmd) or 0
     )
     monkeypatch.setattr(
         wrapper.subprocess,
@@ -5814,7 +5823,7 @@ def test_init_redshift_profile_is_dev_only_with_no_secrets(tmp_path: Path, monke
         def client(self, service):
             return _Client()
 
-    import boto3
+    boto3 = pytest.importorskip("boto3")
 
     monkeypatch.setattr(boto3, "Session", _Session)
     (tmp_path / DEX_DIR).mkdir()
@@ -7511,7 +7520,7 @@ def test_reading_an_ossie_layer_opens_no_warehouse_connection(
 
 
 def test_a_post_plan_symlink_cannot_move_an_ossie_write_out_of_the_repository(
-    tmp_path, capsys
+    tmp_path, capsys, symlinks
 ):
     """Family 4 + 3: the write surface is decided at apply time, not at plan time.
 

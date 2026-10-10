@@ -134,11 +134,14 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # its project, so agreeing with it here is what stops the demo shadowing a
     # real config with one of its own. What gets reported is relative to the run
     # directory, the way every writer reports the files it wrote under its root.
+    # Spelled with forward slashes on every platform, the rule `_relative` in
+    # `transform/dev_target.py` follows: these are labels a caller compares
+    # against paths in configuration, and `.dex/config.yml` is one everywhere.
     root = target.parent
     config_path = root / DEX_DIR / CONFIG_FILE
-    config_rel = str(named.parent / DEX_DIR / CONFIG_FILE)
+    config_rel = (named.parent / DEX_DIR / CONFIG_FILE).as_posix()
     existing_root = resolve_dex_root(root)
-    created = [str(named)]
+    created = [named.as_posix()]
     diffs: list[dict[str, Any]] = []
     warnings: list[str] = []
 
@@ -146,8 +149,13 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # ran from. So they carry the same --repo-root, or the cache `explore map`
     # writes would land in the cwd, and a --path is spelled from the cwd too,
     # because a live --path resolves against the shell rather than the root.
-    rerun = "" if run_dir == Path() else f" --repo-root {shlex.quote(str(run_dir))}"
-    explicit = f"{rerun} --path {shlex.quote(str(target))}"
+    # Forward slashes again: a backslash path comes out in single quotes, which
+    # cmd passes through as part of the path, while the POSIX form of an
+    # ordinary path needs no quoting and types the same into any shell.
+    rerun = (
+        "" if run_dir == Path() else f" --repo-root {shlex.quote(run_dir.as_posix())}"
+    )
+    explicit = f"{rerun} --path {shlex.quote(target.as_posix())}"
     if existing_root is None:
         save_config(
             DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=target.name)), root
@@ -169,7 +177,7 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
     return to_envelope(
         DemoResult(
-            path=str(named),
+            path=named.as_posix(),
             seed=warehouse.seed,
             row_count=warehouse.row_count,
             tables=[

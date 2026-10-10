@@ -438,6 +438,7 @@ def test_a_databricks_dev_schema_the_principal_cannot_write_is_warned_about(
     which is exactly what Unity Catalog answered live.
     """
 
+    pytest.importorskip("databricks.sql")
     from fakes.databricks import FakeDatabricksTable
 
     fake, adapter, config = _databricks(
@@ -475,6 +476,7 @@ def test_a_databricks_dev_schema_grant_is_not_warned_about_without_a_matching_no
     a manifest proving no node resolves into dev_schema means the missing
     privilege on it is not this build's problem either (issue #110)."""
 
+    pytest.importorskip("databricks.sql")
     from fakes.databricks import FakeDatabricksTable
 
     fake, adapter, config = _databricks(
@@ -514,6 +516,7 @@ def test_a_granted_databricks_dev_schema_passes(
     """Grants, not just ownership: a principal explicitly granted what dbt needs
     must not be warned at."""
 
+    pytest.importorskip("databricks.sql")
     from fakes.databricks import FakeDatabricksTable
 
     fake, adapter, config = _databricks(
@@ -766,6 +769,7 @@ def _postgres(dbt_project_dir: Path, role, *, dev: str = "dbt_dev", profile_user
 def test_a_writable_postgres_dev_schema_passes(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch
 ):
+    pytest.importorskip("psycopg")
     from fakes.postgres import FakeRole
 
     role = FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE", "CREATE"}})
@@ -778,6 +782,7 @@ def test_a_writable_postgres_dev_schema_passes(
 def test_an_unwritable_postgres_dev_schema_refuses_with_the_grant(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch
 ):
+    pytest.importorskip("psycopg")
     from fakes.postgres import FakeRole
 
     role = FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
@@ -798,6 +803,7 @@ def test_an_absent_postgres_dev_schema_the_role_cannot_create_refuses(
     """dbt creates the schema, but only if the role may, so the privilege is what
     is checked. The first build otherwise dies on a bare permission error."""
 
+    pytest.importorskip("psycopg")
     from fakes.postgres import FakeRole
 
     role = FakeRole(name="dbt_dev", may_create_in_database=False)
@@ -818,6 +824,7 @@ def test_an_absent_postgres_dev_schema_is_not_refused_without_a_matching_node(
     that never resolves into dev_schema means neither its absence nor the
     role's privilege on it is this build's problem (issue #110)."""
 
+    pytest.importorskip("psycopg")
     from fakes.postgres import FakeRole
 
     role = FakeRole(name="dbt_dev", may_create_in_database=False)
@@ -844,6 +851,7 @@ def test_the_postgres_privilege_is_asked_of_the_profile_role(
     so the question has to be asked of the role the profile names. The refusal
     naming that role, and not the one dex connects as, is the proof it was."""
 
+    pytest.importorskip("psycopg")
     from fakes.postgres import FakeRole
 
     builder = FakeRole(name="ci_builder", schema_privileges={"dbt_dev": {"USAGE"}})
@@ -935,6 +943,7 @@ def test_a_redshift_password_user_literally_named_iam_still_gets_the_preflight(
     """The IAM skip keys on the profile's method, not on the user's name, so a
     real database user that happens to be called iam keeps its privilege check."""
 
+    pytest.importorskip("redshift_connector")
     from fakes.redshift import FakeUser
 
     user = FakeUser(name="iam", schema_privileges={"dbt_dev": {"USAGE"}})
@@ -952,6 +961,7 @@ def test_a_redshift_password_user_literally_named_iam_still_gets_the_preflight(
 def test_an_unwritable_redshift_dev_schema_refuses_with_the_grant(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch
 ):
+    pytest.importorskip("redshift_connector")
     from fakes.redshift import FakeUser
 
     user = FakeUser(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
@@ -971,6 +981,7 @@ def test_an_unwritable_redshift_dev_schema_is_not_refused_without_a_matching_nod
 ):
     """Same connector-parity extension as Postgres (issue #110)."""
 
+    pytest.importorskip("redshift_connector")
     from fakes.redshift import FakeUser
 
     user = FakeUser(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
@@ -1339,6 +1350,7 @@ def _clickhouse(
 def test_a_writable_clickhouse_dev_database_passes(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch
 ):
+    pytest.importorskip("clickhouse_connect")
     from fakes.clickhouse import FakeGrant
 
     grants = [
@@ -1358,6 +1370,7 @@ def test_an_unwritable_clickhouse_dev_database_refuses_with_the_grant(
     failure; the privilege to create it is. The first build otherwise dies on a
     bare permission error naming neither the database nor the grant."""
 
+    pytest.importorskip("clickhouse_connect")
     from fakes.clickhouse import FakeGrant
 
     grants = [FakeGrant(user_name="dex_ro", access_type="SELECT", database="app")]
@@ -1396,6 +1409,7 @@ def test_a_partial_clickhouse_grant_read_may_clear_but_never_refuses(
     invisible role looks exactly like a missing one, so the partial read is only
     ever allowed to clear a target."""
 
+    pytest.importorskip("clickhouse_connect")
     from fakes.clickhouse import FakeGrant
 
     grants = [FakeGrant(user_name="dex_ro", access_type="SELECT", database="app")]
@@ -1423,6 +1437,7 @@ def test_a_dex_rendered_clickhouse_profile_can_be_capped(
     that makes the cap reachable at all.
     """
 
+    pytest.importorskip("clickhouse_connect")
     from fakes.clickhouse import FakeGrant
 
     grants = [
@@ -1442,6 +1457,7 @@ def test_a_hand_written_clickhouse_profile_warns_that_it_cannot_be_capped(
     statement that outruns it. That has to be said out loud: the alternative is
     a build that reports a cap it never had."""
 
+    pytest.importorskip("clickhouse_connect")
     from fakes.clickhouse import FakeGrant
 
     grants = [

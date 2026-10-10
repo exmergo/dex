@@ -514,19 +514,21 @@ def generate_demo_warehouse(
     empty string from NULL, and every column generated here is non-null.
     """
 
+    # Both refusals name the path with forward slashes, as `dex demo` reports
+    # everything it names, so one command never spells a path two ways.
     target = Path(path)
     if target.exists() or target.is_symlink():
         raise DemoTargetExistsError(
-            f"'{target}' already exists; dex demo only ever creates a new file and "
-            "never opens, inspects, or replaces one you already have. Name a "
-            "different path, for example `dex demo demo2.duckdb`"
+            f"'{target.as_posix()}' already exists; dex demo only ever creates a "
+            "new file and never opens, inspects, or replaces one you already have. "
+            "Name a different path, for example `dex demo demo2.duckdb`"
         )
     parent = target.parent
     if not parent.is_dir():
         raise DemoPathError(
-            f"'{parent}' is not an existing directory; dex demo writes one file and "
-            "creates no directories. Create it first, or name a path inside a "
-            "directory that exists"
+            f"'{parent.as_posix()}' is not an existing directory; dex demo writes "
+            "one file and creates no directories. Create it first, or name a path "
+            "inside a directory that exists"
         )
 
     try:

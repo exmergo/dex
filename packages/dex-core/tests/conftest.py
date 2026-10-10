@@ -36,6 +36,28 @@ def duckdb_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def symlinks(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Skip a test that needs a symlink where the platform will not make one.
+
+    Windows refuses `os.symlink` to a process without the symlink privilege
+    unless Developer Mode is on (WinError 1314). The probe links in a directory
+    of its own rather than catching the test's own link failing, because a
+    `FileExistsError` there is an `OSError` too and a broken test must not read
+    as an unsupported platform. Everywhere else, and on Windows with Developer
+    Mode, the test runs.
+    """
+
+    probe = tmp_path_factory.mktemp("symlink-probe")
+    try:
+        (probe / "link").symlink_to(probe / "target")
+    except OSError:
+        pytest.skip(
+            "this platform refuses symlinks without a privilege, so the "
+            "confinement check's symlink case is not exercised here"
+        )
+
+
+@pytest.fixture
 def fake_bq_client():
     """The standard populated fake BigQuery client (see tests/fakes/bigquery.py).
 

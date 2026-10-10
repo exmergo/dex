@@ -99,6 +99,12 @@ def test_an_option_the_source_cannot_honor_is_refused_by_name(repo: Path):
         (["schema.yml"], "not a native Ossie document"),
         (["../out.ossie.yaml"], "inside the repository"),
         (["/abs.ossie.yaml"], "inside the repository"),
+        # Anchored or climbing on one platform is refused on both, so the
+        # committed line fails the same way wherever it is checked out.
+        (["\\abs.ossie.yaml"], "inside the repository"),
+        (["C:abs.ossie.yaml"], "inside the repository"),
+        (["C:\\abs.ossie.yaml"], "inside the repository"),
+        (["..\\out.ossie.yaml"], "inside the repository"),
         (["a.ossie.yaml", "a.ossie.yaml"], "same document twice"),
     ],
 )

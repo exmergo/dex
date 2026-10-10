@@ -28,7 +28,8 @@ class RunFrom:
 
     ``rerun`` is the suffix the printed next steps must carry to resolve the same
     root from the caller's shell, and ``spell`` turns a path under ``root`` into
-    the spelling that shell resolves (a live ``--path`` is cwd-relative).
+    the spelling that shell resolves (a live ``--path`` is cwd-relative). Both
+    use forward slashes, as the demo does on every platform.
     """
 
     root: Path
@@ -39,7 +40,7 @@ class RunFrom:
         return [*self.prefix, *rest]
 
     def spell(self, relative: str) -> str:
-        return relative if not self.prefix else str(self.root / relative)
+        return relative if not self.prefix else (self.root / relative).as_posix()
 
 
 @pytest.fixture(params=["inside", "outside"])
@@ -66,6 +67,6 @@ def run_from(
     yield RunFrom(
         root=root,
         prefix=("--repo-root", str(root)),
-        rerun=f" --repo-root {shlex.quote(str(root))}",
+        rerun=f" --repo-root {shlex.quote(root.as_posix())}",
     )
     assert sorted(caller.rglob("*")) == [], "dex demo wrote into the caller's cwd"

@@ -85,7 +85,7 @@ def test_a_document_outside_the_repository_is_refused(tmp_path: Path):
     assert not result.documents
 
 
-def test_a_symlink_leaving_the_repository_is_refused(tmp_path: Path):
+def test_a_symlink_leaving_the_repository_is_refused(tmp_path: Path, symlinks: None):
     """Confinement is checked on the resolved path, so a symlink cannot cheat."""
 
     outside = tmp_path.parent / "linked.ossie.yaml"

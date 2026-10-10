@@ -36,7 +36,11 @@ def _run(argv: list[str], capsys) -> dict:
 
 
 def _files_under(root: Path) -> list[str]:
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+    # Forward slashes, so a listing compares equal to what the envelope reports
+    # on every platform rather than agreeing with it only where `/` is native.
+    return sorted(
+        p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()
+    )
 
 
 def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
@@ -158,17 +162,17 @@ def test_an_absolute_target_is_written_where_it_names(
 
     payload = _run([*prefix, "demo", str(target)], capsys)
 
-    assert payload["data"]["path"] == str(target)
+    assert payload["data"]["path"] == target.as_posix()
     assert payload["data"]["created"] == [
-        str(target),
-        str(elsewhere / ".dex" / "config.yml"),
+        target.as_posix(),
+        (elsewhere / ".dex" / "config.yml").as_posix(),
     ]
     assert _files_under(elsewhere) == [".dex/config.yml", "shop.duckdb"]
     assert _files_under(project) == []
     assert _files_under(caller) == []
-    rerun = f" --repo-root {project}" if with_repo_root else ""
+    rerun = f" --repo-root {project.as_posix()}" if with_repo_root else ""
     assert all(
-        step["command"].endswith(f"{rerun} --path {target}")
+        step["command"].endswith(f"{rerun} --path {target.as_posix()}")
         for step in payload["data"]["next_steps"]
     )
 

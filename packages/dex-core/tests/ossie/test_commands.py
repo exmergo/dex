@@ -343,7 +343,9 @@ def test_no_command_carries_a_vendor_branch():
         f"{path.relative_to(root)}:{number}"
         for path in root.rglob("*.py")
         if path.parts[-2] != "ossie"
-        for number, line in enumerate(path.read_text().splitlines(), start=1)
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        )
         if '"ossie"' in line
         and ("==" in line or "!=" in line)
         # config.py is where a vendor's own coordinates are declared and
