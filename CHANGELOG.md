@@ -9,6 +9,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A weekly run of the tier-1 unit tests on Windows** ([#487], part 4). A new
+  workflow, `.github/workflows/windows.yml`, runs `uv run pytest -q` on
+  `windows-latest` every Monday and on `workflow_dispatch`, with the same
+  connector-extra sync `ci.yml`'s `tests` job uses. It is not a required check
+  and does not run per pull request: Windows is not a claimed platform, the
+  suite takes a quarter of an hour on a Windows workstation, and a Windows leg
+  on every pull request would make Windows-only flakiness a merge blocker. What
+  it buys is that the class of regression [#264] and [#487] were (a platform
+  separator in a path the engine prints, a test that assumes POSIX) is caught
+  within a week rather than when the next Windows user reports it. Nothing
+  about the engine or the tests changes.
+
 ## [1.12.8] - 2026-10-11
 
 ### Fixed
