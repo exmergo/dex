@@ -71,6 +71,28 @@ def test_each_body_opens_with_the_procedure(skill: str):
     )
 
 
+@pytest.mark.parametrize("skill", SKILLS)
+def test_the_frontmatter_parses_as_yaml_with_a_string_description(skill: str):
+    """`npx skills install` reads the frontmatter with a strict YAML parser. A
+    `description` that is an unquoted plain scalar containing `: ` reads as a
+    nested mapping there, and the skill silently fails to install (the 1.0.1
+    fix). The descriptions are long and edited by hand (#233), so the parse is
+    held here rather than discovered by the next installer."""
+
+    import yaml
+
+    text = body(skill)
+    assert text.startswith("---\n"), f"skills/{skill}/SKILL.md opens with frontmatter"
+    frontmatter = text.split("\n---\n", 1)[0].removeprefix("---\n")
+    parsed = yaml.safe_load(frontmatter)
+    assert isinstance(parsed, dict), "the frontmatter is a mapping"
+    assert parsed.get("name") == skill
+    description = parsed.get("description")
+    assert isinstance(description, str) and description.strip(), (
+        f"skills/{skill}/SKILL.md's description is one string, not a mapping or empty"
+    )
+
+
 def test_the_three_procedure_sections_are_one_text():
     """Until #502 holds them to the engine's text, they are held to each other."""
 

@@ -25,7 +25,9 @@
       "Write the PR description for the branch I just pushed.",
       "Bump dbt-core to 1.10 in requirements.txt.",
       "Did my Ossie semantic layer drift from the warehouse?",
-      "What metrics does this repo's semantic layer define, and what tables are behind them?"
+      "What metrics does this repo's semantic layer define, and what tables are behind them?",
+      "This model is wrong, can you work out why?",
+      "Check my models against the warehouse."
     ]
   },
   "evals": [

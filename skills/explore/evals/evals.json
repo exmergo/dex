@@ -33,7 +33,8 @@
       "Rename the column cust_id to customer_id across models/staging/sap/, about 30 files, and keep the yml docs in sync.",
       "The CI job fails on dbt parse after I merged main. Jinja compilation error in macros/cents_to_dollars.sql, undefined variable. Fix the macro.",
       "Bump dbt-core to 1.10 in requirements.txt and fix the deprecation warnings in dbt_project.yml.",
-      "Add a revenue metric to my Ossie semantic model."
+      "Add a revenue metric to my Ossie semantic model.",
+      "Check my models against the warehouse."
     ]
   },
   "evals": [

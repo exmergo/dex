@@ -13,7 +13,15 @@
       "The unique test on order_id started failing yesterday and nobody changed the model. Figure out what happened.",
       "Our revenue dashboard dropped 40% overnight but the code has not changed. What is going on upstream?",
       "Did my Ossie semantic layer drift from the warehouse?",
-      "One of my semantic layer's relationships stopped resolving. What broke?"
+      "One of my semantic layer's relationships stopped resolving. What broke?",
+      "This model is wrong, can you work out why?",
+      "The numbers in fct_revenue look too high.",
+      "Some rows are missing from dim_customers.",
+      "The project is broken.",
+      "The shipped_at column in fct_orders is empty and it should not be.",
+      "Check my models against the warehouse.",
+      "There are duplicates in my fact table and I do not know where they come from.",
+      "Diagnose why the accepted_values test on order_status fails."
     ],
     "negative": [
       "What's in this warehouse and which tables matter?",
@@ -22,7 +30,9 @@
       "Build a staging model for raw orders.",
       "Define a revenue metric on top of fct_orders.",
       "I just rewrote stg_orders and now the not_null test fails. Fix my SQL.",
-      "Add a revenue metric to my Ossie semantic model."
+      "Add a revenue metric to my Ossie semantic model.",
+      "Rewrite fct_revenue so revenue is net of refunds.",
+      "Is this data any good?"
     ]
   },
   "evals": [

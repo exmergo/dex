@@ -9,6 +9,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`maintain`'s description claims the diagnostic intent, and states its two
+  modes** ([#233]). It opened on drift and said to reach for it "when something
+  that used to work has started failing", so a request that presupposes no
+  baseline and no change ("this model is wrong, work out why", "the numbers
+  look too high", "some rows are missing", "the project is broken", "check my
+  models against the warehouse") landed on no skill at all: not exploration,
+  since a project exists; not authoring, since the model exists; not drift,
+  since nothing is known to have moved. The description now opens on whether an
+  existing project is correct and why not, names `maintain verify` as the
+  no-baseline mode beside `check` and `reconcile` against the snapshot, carries
+  those phrasings, and restates the boundaries: writing the fix, or a model you
+  just edited and broke, is `transform`'s; a warehouse or data question with
+  no project in the picture is `explore`'s. The triggering suites gain the
+  phrasings as `maintain` positives and the mirror negatives in `transform`'s
+  and `explore`'s, and a test now holds every skill's frontmatter to parsing
+  as YAML with a string `description`, the property the 1.0.1 fix restored by
+  hand. Deliberately after [#224] and [#231] landed, as the issue required: a
+  description that triggers a skill which then refuses for want of a baseline
+  would be worse than one that does not trigger.
+
 ## [1.12.8] - 2026-10-11
 
 ### Fixed
