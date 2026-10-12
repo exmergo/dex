@@ -31,6 +31,82 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   description that triggers a skill which then refuses for want of a baseline
   would be worse than one that does not trigger.
 
+- **The maintain skill says how to triage a large drift report** ([#544]). A
+  `maintain check` against a week-old baseline returned hundreds of findings,
+  and the number that resolved the session came from the next command:
+  `maintain reconcile`'s `mechanical_count`, zero, beside `advisory_count`.
+  Mechanical proposals exist only where dex can author the fix itself, so zero
+  of them across hundreds of schema findings, with no dropped or retyped
+  columns or tables among the codes, means the baseline is behind the project
+  rather than the warehouse having moved. The result already returned both
+  counts and the skill defined both terms; nothing told the reader to use them
+  for triage. The *Reconcile proposals* section now opens with that heuristic
+  and points at the re-baseline discipline. Documentation only.
+
+### Fixed
+
+- **The skill wrapper installs the `ossie` extra for every command that can
+  read a native Ossie semantic layer** ([#536]). `_feature_extras` in
+  `skills/*/scripts/run.py` chose extras from the command and had branches for
+  `cluster` and the two semantic extras, none for Ossie, so with
+  `semantic.vendor: ossie` the engine was installed without `jsonschema` and
+  the loader refused by name. On BigQuery it worked by coincidence: that
+  connector's own dependency tree carries `jsonschema` at exactly the floor the
+  extra declares. `explore semantic`, `semantic ossie`, `maintain semantic`,
+  `maintain check` and `maintain snapshot` now resolve `ossie` on every
+  connector. Resolved from the command rather than from `semantic.vendor`,
+  which sits in a nested config block the stdlib-only wrapper does not parse;
+  the wrapper's own rule is to err toward a heavier install, and `jsonschema`
+  is small. One test per command, and a structural one over the wrapper's own
+  table of Ossie-reading commands.
+
+- **`maintain verify` resolves a declared grain column against the relation's
+  own spelling before quoting it** ([#483]). `schema.yml` spells a column the
+  way dbt wrote it, ordinarily lowercase, and the built relation spells it the
+  way the warehouse folded it, which on Snowflake is uppercase. The declared
+  spelling went straight into `COUNT(DISTINCT "id")` against a relation holding
+  `ID`, and Snowflake refused it as an invalid identifier. Each declared column
+  is now matched case-insensitively to the relation's columns, the comparison
+  the column-contract check already makes, and the statement carries the
+  relation's spelling while the finding keeps the declaration's. A declared
+  column the relation does not have is named in `notes` and never sent.
+
+- **A grain statement the warehouse refuses no longer fails the whole
+  command** ([#483]). The refusal propagated out of the grain class, so one
+  rejected `COUNT(DISTINCT)` turned every other finding into
+  `status: error`. It is now caught per model: that model's grain is reported
+  as unmeasured in `notes`, with the server's own words, and every other
+  model's grain and every other finding class still run.
+
+### Added
+
+- **A weekly run of the tier-1 unit tests on Windows** ([#487], part 4). A new
+  workflow, `.github/workflows/windows.yml`, runs `uv run pytest -q` on
+  `windows-latest` every Monday and on `workflow_dispatch`, with the same
+  connector-extra sync `ci.yml`'s `tests` job uses. It is not a required check
+  and does not run per pull request: Windows is not a claimed platform, the
+  suite takes a quarter of an hour on a Windows workstation, and a Windows leg
+  on every pull request would make Windows-only flakiness a merge blocker. What
+  it buys is that the class of regression [#264] and [#487] were (a platform
+  separator in a path the engine prints, a test that assumes POSIX) is caught
+  within a week rather than when the next Windows user reports it. The job
+  sets `core.autocrlf false` before checkout: Git for Windows converts text
+  files to CRLF by default, which moves the bundled Ossie schema's recorded
+  hash, and the wheel ships LF. Nothing about the engine or the tests changes.
+  
+- **`maintain check` and `maintain schema` say so when the warehouse read and
+  the baseline cover different datasets** ([#543]). Every object in a dataset
+  the baseline never covered was reported as `table_added`, and every object in
+  a dataset the read no longer lists as `table_dropped`, with nothing saying the
+  block was a difference of scope rather than the warehouse moving: a baseline
+  pinned when the map covered one environment's datasets, then a read that
+  lists another's, diluted the real drift in the same report. Both commands now
+  compare the dataset sets before reporting and carry one warning per
+  direction, naming the datasets and the number of findings they account for,
+  with the re-pin to make if the datasets belong in the baseline. The findings
+  themselves are unchanged, and the count the warning quotes honours the same
+  `<objects>` scope the findings do. Matching scopes add no warning.
+
 ## [1.12.8] - 2026-10-11
 
 ### Fixed

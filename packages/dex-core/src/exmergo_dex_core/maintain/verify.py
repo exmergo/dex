@@ -44,6 +44,7 @@ from pathlib import Path
 
 from ..cache import match_identifier
 from ..dbt_project import manifest_node_label, strip_relation_quoting
+from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
@@ -586,28 +587,68 @@ def _declared_grain_findings(
     identifier: str,
     candidates: list[GrainCandidate],
     min_rows: int,
-) -> tuple[list[DriftFinding], bool]:
+) -> tuple[list[DriftFinding], bool, list[str]]:
     """Check every declared candidate for one model. Returns ``(findings,
-    unchecked)``: ``unchecked`` is True when a composite candidate could not
-    be measured at all (a metered adapter declining an unaffordable scan,
+    unchecked, unresolved)``: ``unchecked`` is True when a candidate could
+    not be measured at all (a metered adapter declining an unaffordable scan,
     per :meth:`Adapter.distinct_combination_counts`'s own contract), which is
-    a caveat for the caller's notes, not a clean bill of health."""
+    a caveat for the caller's notes, not a clean bill of health; ``unresolved``
+    names every declared column the live relation does not have, which is
+    skipped rather than sent to the warehouse to fail there.
 
-    meta, _columns = adapter.table_metadata(identifier)
+    Each declared column is resolved against the relation's own columns
+    case-insensitively before it reaches the adapter (#483). ``schema.yml``
+    spells a column the way dbt wrote it, which is ordinarily lowercase;
+    the relation spells it the way the warehouse folded it, which on
+    Snowflake is uppercase. An adapter quotes the name it is handed, so
+    handing it the declared spelling produced ``COUNT(DISTINCT "id")`` against
+    a relation holding ``ID``, which Snowflake refuses as an invalid
+    identifier. The same lowered comparison :func:`column_contract_findings`
+    already makes. The finding keeps the declared spelling, because it speaks
+    about what the model declares; only the statement uses the relation's.
+
+    A statement the warehouse refuses (:class:`WarehouseQueryError`) is left
+    to propagate: :func:`grain_findings` catches it per model, so one refused
+    scan is reported against that model's grain and nothing else.
+    """
+
+    meta, columns = adapter.table_metadata(identifier)
     row_count = meta.row_count
     if row_count is None:
-        return [], True
+        return [], True, []
 
     findings: list[DriftFinding] = []
     unchecked = False
+    unresolved: list[str] = []
 
-    singles = [c for c in candidates if len(c.columns) == 1]
+    # Declared spelling -> the relation's spelling. With no column metadata to
+    # resolve against (an adapter that reports none) the declared spelling is
+    # the only one there is, so it is used as it was before this map existed.
+    live = {column.name.lower(): column.name for column in columns}
+
+    def resolve(c: GrainCandidate) -> list[str] | None:
+        if not live:
+            return list(c.columns)
+        names = [live.get(column.lower()) for column in c.columns]
+        missing = [
+            col for col, name in zip(c.columns, names, strict=True) if name is None
+        ]
+        if missing:
+            unresolved.extend(missing)
+            return None
+        return [name for name in names if name is not None]
+
+    resolved = [(c, resolve(c)) for c in candidates]
+
+    singles = [
+        (c, names) for c, names in resolved if names is not None and len(names) == 1
+    ]
     if singles:
         counts = adapter.exact_distinct_counts(
-            identifier, [c.columns[0] for c in singles]
+            identifier, [names[0] for _, names in singles]
         )
-        for c in singles:
-            distinct = counts.get(c.columns[0])
+        for c, names in singles:
+            distinct = counts.get(names[0])
             if distinct is None:
                 unchecked = True
                 continue
@@ -625,11 +666,11 @@ def _declared_grain_findings(
                 )
             )
 
-    for c in candidates:
-        if len(c.columns) == 1:
+    for c, names in resolved:
+        if names is None or len(names) == 1:
             continue
-        result = adapter.distinct_combination_counts(identifier, [c.columns])
-        distinct = result.get(tuple(c.columns))
+        result = adapter.distinct_combination_counts(identifier, [names])
+        distinct = result.get(tuple(names))
         if distinct is None:
             unchecked = True
             continue
@@ -647,7 +688,7 @@ def _declared_grain_findings(
             )
         )
 
-    return findings, unchecked
+    return findings, unchecked, unresolved
 
 
 def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
@@ -763,6 +804,8 @@ def grain_findings(
     ambiguous: list[str] = []
     unchecked: list[str] = []
     unknown: list[str] = []
+    unresolved: dict[str, list[str]] = {}
+    refused: dict[str, str] = {}
 
     for model in sorted(all_models):
         relation = model_relations.get(model)
@@ -776,17 +819,27 @@ def grain_findings(
             continue
         identifier = matches[0]
 
-        candidates = declared.get(model)
-        if candidates:
-            model_findings, was_unchecked = _declared_grain_findings(
-                adapter, model, identifier, candidates, min_rows
-            )
-            findings.extend(model_findings)
-            if was_unchecked:
-                unchecked.append(model)
-            continue
+        # A statement the warehouse refuses is this model's grain going
+        # unmeasured, not the command failing (#483): the other models' grains
+        # are still checked, and the other finding classes still run. The
+        # server's own words go to the notes, because they are the diagnosis.
+        try:
+            candidates = declared.get(model)
+            if candidates:
+                model_findings, was_unchecked, missing = _declared_grain_findings(
+                    adapter, model, identifier, candidates, min_rows
+                )
+                findings.extend(model_findings)
+                if was_unchecked:
+                    unchecked.append(model)
+                if missing:
+                    unresolved[model] = missing
+                continue
 
-        finding, reason = _heuristic_candidate(adapter, model, identifier, min_rows)
+            finding, reason = _heuristic_candidate(adapter, model, identifier, min_rows)
+        except WarehouseQueryError as exc:
+            refused[model] = exc.detail
+            continue
         if finding is not None:
             findings.append(finding)
         elif reason == "unknown":
@@ -813,6 +866,16 @@ def grain_findings(
             + ", ".join(sorted(unknown))
             + ": no declared unique test, no declared primary entity, and no "
             "id-shaped column was found"
+        )
+    for model, missing in sorted(unresolved.items()):
+        notes.append(
+            f"the declared grain on {model} names a column the relation does "
+            "not have, so it was not checked: " + ", ".join(missing)
+        )
+    for model, detail in sorted(refused.items()):
+        notes.append(
+            f"the grain could not be measured for {model}: the warehouse "
+            f"refused the distinct-count statement ({detail})"
         )
     return findings, notes
 

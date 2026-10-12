@@ -1,0 +1,59 @@
+name: Windows
+
+# A weekly run of the tier-1 unit tests on Windows (#487, part 4). Windows is
+# not a claimed platform, so this is not a required check and does not run per
+# pull request: the suite takes a quarter of an hour on a Windows workstation,
+# and a Windows leg on every pull request would be the slowest job in CI and
+# would add Windows-only flakiness (file locking on temp directories, DuckDB
+# file handles, subprocess differences) as a merge blocker. A weekly run still
+# catches the class of regression #264 and #487 were (a platform separator in
+# a path the engine prints, a test that assumes POSIX) within days, instead of
+# waiting for the next Windows user to report it.
+#
+# The sync is the one `ci.yml`'s `tests` job uses, every connector extra
+# included, so a test that would `importorskip` for want of a client library
+# runs here the same as it does there. One Python version rather than that
+# job's matrix: this run exists to catch platform defects, which do not vary
+# by interpreter, and three Windows runs a week would triple the cost of
+# finding each one once.
+
+on:
+  schedule:
+    # Mondays at 06:40 UTC (off the hour to avoid GitHub's cron congestion).
+    - cron: "40 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    # The full suite took just under eighteen minutes on a Windows workstation
+    # with every extra installed; a hosted runner is slower. A bound well above
+    # that, so a hung test fails the run rather than holding a runner for the
+    # six-hour default.
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      # Git for Windows defaults to core.autocrlf=true, and actions/checkout
+      # does not override it, so a plain checkout rewrites every text file
+      # with CRLF. Three tests hash the bundled Ossie schema's bytes and the
+      # loader records that hash as provenance, so a CRLF checkout reads as
+      # "the bundled schema moved" (its sha256 becomes bea4565d... instead of
+      # the recorded 27aab111...). The wheel ships LF, so the job checks out
+      # what the wheel ships. Before checkout, because that is when the
+      # conversion happens.
+      - name: Check out with the bytes the repository holds
+        run: git config --global core.autocrlf false
+        working-directory: ${{ github.workspace }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra dev --python 3.12
+      - name: Tier-1 unit tests
+        run: uv run pytest -q
