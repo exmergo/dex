@@ -38,6 +38,17 @@ jobs:
       run:
         working-directory: packages/dex-core
     steps:
+      # Git for Windows defaults to core.autocrlf=true, and actions/checkout
+      # does not override it, so a plain checkout rewrites every text file
+      # with CRLF. Three tests hash the bundled Ossie schema's bytes and the
+      # loader records that hash as provenance, so a CRLF checkout reads as
+      # "the bundled schema moved" (its sha256 becomes bea4565d... instead of
+      # the recorded 27aab111...). The wheel ships LF, so the job checks out
+      # what the wheel ships. Before checkout, because that is when the
+      # conversion happens.
+      - name: Check out with the bytes the repository holds
+        run: git config --global core.autocrlf false
+        working-directory: ${{ github.workspace }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
