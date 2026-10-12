@@ -92,7 +92,7 @@ BASELINE_TWIN = "dex_mutation_baseline"
 EQUIVALENCE_NODE = "dex_mutation_equivalence"
 
 #: How each warehouse fingerprints a whole row, given the alias it is read under.
-#: All three are type tolerant, so a mutant that turns a column into a typed NULL
+#: All four are type tolerant, so a mutant that turns a column into a typed NULL
 #: hashes differently instead of failing the join. A connector missing here gets
 #: no equivalence check rather than an unverified one: a fingerprint that quietly
 #: skipped a column would report a mutant that changes it as equivalent.
@@ -100,6 +100,7 @@ _ROW_FINGERPRINT = {
     "duckdb": "hash({alias})",
     "bigquery": "farm_fingerprint(to_json_string({alias}))",
     "snowflake": "hash(*)",
+    "postgres": "hashtextextended({alias}::text, 0)",
 }
 
 #: The four integers the comparison projects, and the only thing it may return.

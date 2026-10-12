@@ -196,3 +196,86 @@ def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(
     assert "may not create it" in error
     assert "CREATE SCHEMA IF NOT EXISTS dex_absent_dev_schema AUTHORIZATION" in error
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_mutation_equivalence_labels_survivors_live(
+    tmp_path: Path, capsys, dev_dsn, pg_dev_password
+):
+    """transform test --mutate: Postgres equivalence check labels equivalent
+    and distinguishable survivors (including one turning a column to NULL),
+    and prices the comparison lines in the compute estimate upfront."""
+
+    seed_repo(tmp_path, budget=300)
+    root = str(tmp_path)
+
+    # 1. Initialize dbt project for postgres
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "postgres",
+        ],
+        capsys,
+    )
+    assert_ok(rc, envelope)
+
+    # 2. Write our test model and schema
+    # - "amount > 5" gives a comparison mutant (values are 10 and 200, so
+    #   it's EQUIVALENT)
+    # - "case when flag then 'positive' end" gives a case_branch mutant that
+    #   turns the category column into NULL (so it's DISTINGUISHABLE)
+    model = "dex_mutation_probe"
+    staging_dir = tmp_path / "analytics" / "models" / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    (staging_dir / f"{model}.sql").write_text(
+        "SELECT id, amount, CASE WHEN flag THEN 'positive' END AS category\n"
+        "FROM (VALUES (1, 10, true), (2, 200, true)) AS t(id, amount, flag)\n"
+        "WHERE amount > 5\n",
+        encoding="utf-8",
+    )
+    (staging_dir / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        f"  - name: {model}\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [not_null, unique]\n",
+        encoding="utf-8",
+    )
+
+    equivalence_run = [
+        "--repo-root",
+        root,
+        "transform",
+        "test",
+        "--mutate",
+        model,
+        "--check-equivalence",
+    ]
+
+    # 3. Unconfirmed preflight: verify estimate includes the two comparison lines
+    rc, unconfirmed = run_cli(equivalence_run, capsys)
+    assert unconfirmed["status"] == "needs_confirmation", unconfirmed
+    assert unconfirmed["cost"]["estimate"] is not None
+    lines = unconfirmed["data"].get("per_table_seconds") or {}
+    assert "(equivalence self-check)" in lines, lines
+    assert "(equivalence checks, if every mutant survives)" in lines, lines
+
+    # 4. Confirmed run: verify survivor classifications on Postgres dev data
+    rc, labelled = run_cli(
+        [*equivalence_run, "--confirm", "--budget", "300"],
+        capsys,
+    )
+    assert rc == 0, labelled
+    assert labelled["status"] == "ok"
+    data = labelled["data"]
+    assert data["equivalence"]["self_check"] == "reproducible", data
+
+    labels = {m["operator"]: m["equivalence"] for m in data["mutants"]}
+    assert labels["comparison"]["status"] == "equivalent"
+    assert labels["case_branch"]["status"] == "distinguishable"
