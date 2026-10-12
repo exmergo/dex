@@ -9,6 +9,23 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The skill wrapper installs the `ossie` extra for every command that can
+  read a native Ossie semantic layer** ([#536]). `_feature_extras` in
+  `skills/*/scripts/run.py` chose extras from the command and had branches for
+  `cluster` and the two semantic extras, none for Ossie, so with
+  `semantic.vendor: ossie` the engine was installed without `jsonschema` and
+  the loader refused by name. On BigQuery it worked by coincidence: that
+  connector's own dependency tree carries `jsonschema` at exactly the floor the
+  extra declares. `explore semantic`, `semantic ossie`, `maintain semantic`,
+  `maintain check` and `maintain snapshot` now resolve `ossie` on every
+  connector. Resolved from the command rather than from `semantic.vendor`,
+  which sits in a nested config block the stdlib-only wrapper does not parse;
+  the wrapper's own rule is to err toward a heavier install, and `jsonschema`
+  is small. One test per command, and a structural one over the wrapper's own
+  table of Ossie-reading commands.
+
 ## [1.12.8] - 2026-10-11
 
 ### Fixed

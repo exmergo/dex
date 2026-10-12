@@ -201,6 +201,21 @@ _VALUE_FLAGS = (
 # either backend and therefore never needs the renderer.
 _SEMANTIC_RENDERING_MODES = ("values", "query")
 
+# The commands that can read a native Ossie semantic layer, as (group,
+# subcommand). The `ossie` extra is `jsonschema` and nothing heavier, so it is
+# taken whenever the layer *might* be read rather than resolved from
+# `semantic.vendor`, which sits in a nested config block this bootstrap does not
+# parse (#536). Without it the engine refuses by name when the vendor is `ossie`,
+# which is the correct refusal and the one this exists to prevent; on BigQuery it
+# worked only because that connector's own tree happened to carry `jsonschema`.
+_OSSIE_READING_COMMANDS = (
+    ("explore", "semantic"),
+    ("semantic", "ossie"),
+    ("maintain", "semantic"),
+    ("maintain", "check"),
+    ("maintain", "snapshot"),
+)
+
 
 def _positionals(argv: list[str]) -> list[str]:
     """The bare tokens of an invocation: group, subcommand, and whatever follows.
@@ -233,17 +248,23 @@ def _feature_extras(argv: list[str]) -> list[str]:
     that could execute either way takes both. That errs toward a heavier install
     and never toward a command that refuses for want of a dependency, which is the
     failure this exists to prevent.
+
+    The same rule gives every command in `_OSSIE_READING_COMMANDS` the `ossie`
+    extra: whether the layer is native Ossie is `semantic.vendor`, in that same
+    nested block, so the extra follows the command rather than the config.
     """
 
     positionals = _positionals(argv)
-    if positionals[:2] == ["explore", "cluster"]:
+    command = tuple(positionals[:2])
+    if command == ("explore", "cluster"):
         return ["cluster"]
-    if positionals[:2] != ["explore", "semantic"]:
-        return []
+    extras = ["ossie"] if command in _OSSIE_READING_COMMANDS else []
+    if command != ("explore", "semantic"):
+        return extras
     mode = positionals[2] if len(positionals) > 2 else "list"
     if mode in _SEMANTIC_RENDERING_MODES and "--api" not in argv:
-        return ["semantic-api", "semantic"]
-    return ["semantic-api"]
+        return [*extras, "semantic-api", "semantic"]
+    return [*extras, "semantic-api"]
 
 
 def _engine_spec(extras: str, skill_dir: Path | None = None) -> list[str]:
