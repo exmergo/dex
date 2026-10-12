@@ -9,8 +9,40 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+- **`maintain verify` resolves a declared grain column against the relation's
+  own spelling before quoting it** ([#483]). `schema.yml` spells a column the
+  way dbt wrote it, ordinarily lowercase, and the built relation spells it the
+  way the warehouse folded it, which on Snowflake is uppercase. The declared
+  spelling went straight into `COUNT(DISTINCT "id")` against a relation holding
+  `ID`, and Snowflake refused it as an invalid identifier. Each declared column
+  is now matched case-insensitively to the relation's columns, the comparison
+  the column-contract check already makes, and the statement carries the
+  relation's spelling while the finding keeps the declaration's. A declared
+  column the relation does not have is named in `notes` and never sent.
+
+- **A grain statement the warehouse refuses no longer fails the whole
+  command** ([#483]). The refusal propagated out of the grain class, so one
+  rejected `COUNT(DISTINCT)` turned every other finding into
+  `status: error`. It is now caught per model: that model's grain is reported
+  as unmeasured in `notes`, with the server's own words, and every other
+  model's grain and every other finding class still run.
+
 ### Added
 
+- **A weekly run of the tier-1 unit tests on Windows** ([#487], part 4). A new
+  workflow, `.github/workflows/windows.yml`, runs `uv run pytest -q` on
+  `windows-latest` every Monday and on `workflow_dispatch`, with the same
+  connector-extra sync `ci.yml`'s `tests` job uses. It is not a required check
+  and does not run per pull request: Windows is not a claimed platform, the
+  suite takes a quarter of an hour on a Windows workstation, and a Windows leg
+  on every pull request would make Windows-only flakiness a merge blocker. What
+  it buys is that the class of regression [#264] and [#487] were (a platform
+  separator in a path the engine prints, a test that assumes POSIX) is caught
+  within a week rather than when the next Windows user reports it. The job
+  sets `core.autocrlf false` before checkout: Git for Windows converts text
+  files to CRLF by default, which moves the bundled Ossie schema's recorded
+  hash, and the wheel ships LF. Nothing about the engine or the tests changes.
+  
 - **`maintain check` and `maintain schema` say so when the warehouse read and
   the baseline cover different datasets** ([#543]). Every object in a dataset
   the baseline never covered was reported as `table_added`, and every object in
