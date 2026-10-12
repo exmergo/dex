@@ -20,8 +20,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   on every pull request would make Windows-only flakiness a merge blocker. What
   it buys is that the class of regression [#264] and [#487] were (a platform
   separator in a path the engine prints, a test that assumes POSIX) is caught
-  within a week rather than when the next Windows user reports it. Nothing
-  about the engine or the tests changes.
+  within a week rather than when the next Windows user reports it. The job
+  sets `core.autocrlf false` before checkout: Git for Windows converts text
+  files to CRLF by default, which moves the bundled Ossie schema's recorded
+  hash, and the wheel ships LF. Nothing about the engine or the tests changes.
 
 ## [1.12.8] - 2026-10-11
 
