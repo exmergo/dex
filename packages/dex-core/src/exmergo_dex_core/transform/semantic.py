@@ -531,6 +531,26 @@ def _validate_with(
         validator.validate(document)
     except Exception as exc:
         first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        location = getattr(exc, "absolute_path", ())
+        if location:
+            parts: list[str] = []
+            node: Any = document
+            for segment in location:
+                if isinstance(segment, int):
+                    if parts:
+                        parts[-1] += f"[{segment}]"
+                    else:
+                        parts.append(f"[{segment}]")
+                    if isinstance(node, list) and 0 <= segment < len(node):
+                        node = node[segment]
+                    else:
+                        node = None
+                    if isinstance(node, dict) and isinstance(node.get("name"), str):
+                        parts[-1] += f" ({node['name']!r})"
+                else:
+                    parts.append(str(segment))
+                    node = node.get(segment) if isinstance(node, dict) else None
+            label += " > " + " > ".join(parts)
         raise EditValidationError(f"{path}: {label}: {first_line}") from exc
 
 
