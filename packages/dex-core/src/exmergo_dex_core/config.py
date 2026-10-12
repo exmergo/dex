@@ -15,7 +15,6 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
-from .diffs import file_diff
 from .envelope import Paradigm
 from .errors import ConfigurationError
 from .storage import DEX_DIR
@@ -534,6 +533,16 @@ _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
 }
 
 
+#: The environment variables that beat a ``semantic:`` coordinate at run time,
+#: keyed by the field they override. Declared once so the connection that reads
+#: them and ``dex config get``, which reports a setting the environment is
+#: overriding, cannot disagree about which variable wins.
+SEMANTIC_ENVIRONMENT: dict[str, str] = {
+    "host": "DBT_SL_HOST",
+    "environment_id": "DBT_SL_ENV_ID",
+}
+
+
 def canonical_semantic_deployment(value: str) -> str:
     """One deployment spelling, canonicalized. Unknown values pass through so the
     validator (or the backend resolver, for a duck-typed config) can refuse them
@@ -824,12 +833,23 @@ class DexConfig(BaseModel):
     # settings are not the ones in play would record a decision about the wrong
     # project's budget. See `session_ceiling_undecided`.
     _source_path: Path | None = PrivateAttr(default=None)
+    # What the file says that does not stop a command (a key the schema does not
+    # know, a key written twice), phrased for an envelope. Stamped by
+    # `load_config` beside the path, since only a config read from a file can
+    # have said anything wrong.
+    _load_warnings: list[str] = PrivateAttr(default_factory=list)
 
     @property
     def source_path(self) -> Path | None:
         """The file this config was loaded from, or None if it was not loaded."""
 
         return self._source_path
+
+    @property
+    def load_warnings(self) -> list[str]:
+        """Problems the file has that every command reports and none refuses."""
+
+        return list(self._load_warnings)
 
     # The DuckDB on-ramp: a config that omits `connector:` (or a bare `--path`
     # read with no config) means the free local connector. This default only
@@ -943,8 +963,12 @@ def record_session_ceiling_decision(
     Re-read from disk rather than amended in memory on purpose. The config the
     engine is holding may have been overridden for this run (``--connector``, an
     injected object), and writing that back would commit a one-run override as a
-    project setting. Only the budget field the decision names is touched.
+    project setting. Only the budget lines the decision names are touched: the
+    file is edited in place, so its comments, key order, and any key this release
+    does not read all survive the answer.
     """
+
+    from .config_document import ConfigDocument
 
     if (session_ceiling is None) == (not declined):
         raise ConfigurationError(
@@ -968,38 +992,39 @@ def record_session_ceiling_decision(
             "first (`dex transform init` writes one), or pass --budget alone "
             "for an ad-hoc read"
         )
-    old = path.read_text(encoding="utf-8")
-    config = DexConfig.model_validate(yaml.safe_load(old) or {})
+    before = ConfigDocument.read(path)
+    # Set before the other key is removed, so the block is never left empty
+    # in between (an emptied block goes with its last key, and re-adding it
+    # would move it to the end of the file).
     if declined:
-        config.budget.session_ceiling = None
-        config.budget.session_ceiling_declined = True
-        config.budget.model_fields_set.discard("session_ceiling")
+        after = before.with_value("budget.session_ceiling_declined", True).without(
+            "budget.session_ceiling"
+        )
     else:
-        config.budget.session_ceiling = session_ceiling
         # A ceiling supersedes an earlier decline, and once it does, the flag is
-        # noise in a committed file: dropped rather than written as an explicit
+        # noise in a committed file: removed rather than written as an explicit
         # `false` that reads like a second setting.
-        config.budget.session_ceiling_declined = False
-        config.budget.model_fields_set.discard("session_ceiling_declined")
-    # `budget` itself has to join `model_fields_set`, or `save_config`'s
-    # `exclude_unset` dump drops the whole block a nested assignment landed in.
-    config.budget = config.budget
-    save_config(config, root)
-    return config, file_diff(
-        f"{DEX_DIR}/{CONFIG_FILE}", old, path.read_text(encoding="utf-8")
-    )
+        after = before.with_value("budget.session_ceiling", session_ceiling).without(
+            "budget.session_ceiling_declined"
+        )
+    config = after.config()
+    after.write(path)
+    return config, after.diff_from(before)
 
 
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:
+    from .config_document import ConfigDocument
+
     path = Path(repo_root) / DEX_DIR / CONFIG_FILE
     if not path.is_file():
         return None
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    config = DexConfig.model_validate(raw)
+    document = ConfigDocument.read(path)
+    config = document.config()
     # Stamped here and nowhere else: this is the only function that turns a file
     # into a config, so it is the only one that can honestly say a config came
     # from one. See `DexConfig.source_path`.
     config._source_path = path
+    config._load_warnings = document.warnings()
     return config
 
 

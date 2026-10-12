@@ -53,6 +53,9 @@ names the fix for each, so both surface on the unconfirmed call.
 on. If a later config edit never reached it (a retargeted `dev_database`, a
 different warehouse), the build refuses and names both values and both files.
 The engine never rewrites `profiles.yml`, which may legitimately be hand-edited.
+Retarget the config side with `dex config set snowflake.dev_database <name>` (or
+the connector's own key), which shows the diff before writing; the profile
+still has to be changed to match.
 
 **A dev target that does not exist.**
 

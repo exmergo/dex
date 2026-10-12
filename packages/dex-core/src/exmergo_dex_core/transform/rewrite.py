@@ -42,6 +42,7 @@ from sqlglot import expressions as exp
 from ..dbt_project import jinja_regions, metric_inputs, physical_column
 from ..errors import DexError
 from ..references import blank_jinja
+from ..yaml_spans import before_trailing_blanks, block_end, indent_of
 
 
 class RewriteError(DexError):
@@ -895,7 +896,7 @@ def column_anchor(content: str, model: str) -> tuple[int, str] | None:
     precedent to read and no contract to keep current, so it answers ``None``
     rather than inventing one.
 
-    The offset is backed up over trailing blank lines: :func:`_block_end` walks
+    The offset is backed up over trailing blank lines: :func:`block_end` walks
     past them to find the next line with content, so the raw span end sits *after*
     the separator a human put before the next key, and an insertion there lands the
     new column on the far side of the gap.
@@ -1061,7 +1062,7 @@ def column_tests_span(
                 return (current.items[index - 1][1], span[1], "")
             return (span[0], current.items[index + 1][0], "")
         start = content.rfind("\n", 0, span[0]) + 1
-        return (start, _block_end(content, start, _indent_of(content, start)), "")
+        return (start, block_end(content, start, indent_of(content, start)), "")
 
     name = added[0]
     if current.key is None:
@@ -1080,8 +1081,8 @@ def column_tests_span(
         return (end - 1, end - 1, f", {name}" if current.values else name)
     last = max(current.items, key=lambda span: span[1])
     start = content.rfind("\n", 0, last[0]) + 1
-    item_indent = content[start : start + _indent_of(content, start)]
-    at = _block_end(content, start, _indent_of(content, start))
+    item_indent = content[start : start + indent_of(content, start)]
+    at = block_end(content, start, indent_of(content, start))
     return (at, at, f"{item_indent}- {name}\n")
 
 
@@ -1100,28 +1101,6 @@ def _column_node(root: Any, model: str, column: str) -> Any:
     return None
 
 
-def _indent_of(content: str, line_start: int) -> int:
-    rest = content[line_start:]
-    return len(rest) - len(rest.lstrip(" "))
-
-
-def before_trailing_blanks(content: str, end: int) -> int:
-    """``end`` backed up over the blank lines a block span swept up.
-
-    :func:`_block_end` walks past blank lines looking for the next line with
-    content, so an entry's span reaches past the separator a human wrote after it.
-    An insertion at the raw end lands on the far side of that gap, and a removal
-    eats it.
-    """
-
-    while end > 0 and content[end - 1] == "\n":
-        line_start = content.rfind("\n", 0, end - 1) + 1
-        if content[line_start : end - 1].strip():
-            break
-        end = line_start
-    return end
-
-
 def _entry_span(content: str, node: Any) -> tuple[int, int]:
     """A block entry's span: its own lines, and none of its sibling's.
 
@@ -1138,7 +1117,7 @@ def _entry_span(content: str, node: Any) -> tuple[int, int]:
     start = node.start_mark.index
     line_start = content.rfind("\n", 0, start) + 1
     indent = len(content[line_start:]) - len(content[line_start:].lstrip(" "))
-    return (line_start, _block_end(content, line_start, indent))
+    return (line_start, block_end(content, line_start, indent))
 
 
 def _pair_span(content: str, key_span: tuple[int, int], _value: Any) -> tuple[int, int]:
@@ -1146,30 +1125,7 @@ def _pair_span(content: str, key_span: tuple[int, int], _value: Any) -> tuple[in
 
     line_start = content.rfind("\n", 0, key_span[0]) + 1
     indent = len(content[line_start:]) - len(content[line_start:].lstrip(" "))
-    return (line_start, _block_end(content, line_start, indent))
-
-
-def _block_end(content: str, line_start: int, indent: int) -> int:
-    """Where the block starting at ``line_start`` with ``indent`` stops.
-
-    The first following line that carries content at ``indent`` or shallower.
-    Blank lines belong to whatever comes next, so a removal does not eat the
-    separator a human put between two entries.
-    """
-
-    position = content.find("\n", line_start)
-    while position >= 0:
-        line_begin = position + 1
-        if line_begin >= len(content):
-            return len(content)
-        line_end = content.find("\n", line_begin)
-        line = content[line_begin : len(content) if line_end < 0 else line_end]
-        if line.strip():
-            depth = len(line) - len(line.lstrip(" "))
-            if depth <= indent:
-                return line_begin
-        position = line_end
-    return len(content)
+    return (line_start, block_end(content, line_start, indent))
 
 
 def narrow_quotes(content: str, span: tuple[int, int]) -> tuple[int, int]:

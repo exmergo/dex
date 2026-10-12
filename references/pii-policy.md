@@ -110,7 +110,10 @@ so they survive re-profiling:
 
 An override takes effect at query time immediately, without re-profiling, and
 leaves an audit trail in the cache recording which category the detector had
-matched. **Never hand-edit `.dex/cache.json` to clear a flag**, and never
+matched. `dex config set pii_overrides '<list>'` writes the first route as an
+in-place edit, setting the list whole (existing entries included). It answers
+with the diff and writes only on `--confirm`, and that confirmation is the
+human's decision to clear the flag, never an agent's. **Never hand-edit `.dex/cache.json` to clear a flag**, and never
 suggest weakening detection: neither survives the next profile, and neither is
 reviewable.
 

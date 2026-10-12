@@ -217,11 +217,23 @@ class SanitizationError(DexError):
     """
 
 
+def secret_like(key: str) -> bool:
+    """Whether ``key`` reads as the name of a credential.
+
+    The one rule for it: the boundary scan below refuses such a key in ``data``,
+    and the config editor refuses to write one and withholds its value, so a name
+    that trips one trips the other.
+    """
+
+    lowered = str(key).lower()
+    return any(pat in lowered for pat in _SECRET_KEY_PATTERNS)
+
+
 def _scan(value: Any, path: str = "data") -> None:
     if isinstance(value, dict):
         for key, sub in value.items():
             key_l = str(key).lower()
-            if any(pat in key_l for pat in _SECRET_KEY_PATTERNS):
+            if secret_like(key):
                 raise SanitizationError(
                     f"secret-like key '{key}' at {path}: credentials never cross "
                     "the stdout boundary"

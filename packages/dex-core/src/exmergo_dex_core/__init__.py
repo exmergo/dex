@@ -60,6 +60,7 @@ _EXPORTS = {
     "ClusterDependencyError": "explore.cluster",
     "ClusterError": "explore.cluster",
     "ColumnProfile": "cache",
+    "ConfigEditError": "config_document",
     "ConfigurationError": "errors",
     "ConfirmationRequest": "results",
     "ConfirmationRequiredError": "guards.cost_guard",
@@ -82,6 +83,7 @@ _EXPORTS = {
     "Document": "storage",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "InvalidConfigError": "config_document",
     "LedgerUnreadableError": "guards.cost_guard",
     "MaintainStore": "storage",
     "MemoryStore": "storage",
@@ -130,6 +132,7 @@ _EXPORTS = {
 if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .cache import ColumnProfile, Dataset, DexCache, Relationship
     from .config import DexConfig
+    from .config_document import ConfigEditError, InvalidConfigError
     from .connect import (
         ConnectionSource,
         CredentialDiscoveryError,
@@ -228,6 +231,7 @@ __all__ = [
     "ClusterDependencyError",
     "ClusterError",
     "ColumnProfile",
+    "ConfigEditError",
     "ConfigurationError",
     "ConfirmationRequest",
     "ConfirmationRequiredError",
@@ -249,6 +253,7 @@ __all__ = [
     "Document",
     "ExploreStore",
     "FilesystemStore",
+    "InvalidConfigError",
     "LedgerUnreadableError",
     "MaintainStore",
     "MemoryStore",

@@ -4,6 +4,39 @@ Lookup detail for each subcommand the explore skill drives. What you must and
 must not do is in `SKILL.md`; this file says what a field means and what a flag
 changes.
 
+## `config get|validate|set`
+
+These read and change `.dex/config.yml` itself. They run before the engine is
+built, so they open no connection, need no connector extra, and still work when
+the file is broken enough that every other command refuses to start. The file is
+found the way every command finds it, by walking up to the git root.
+
+- `config validate` lists every problem by setting and line: syntax, a value the
+  schema refuses, a key dex does not read (with `suggestion`, the key it was
+  probably meant to be), a key written twice, a key that reads as a credential.
+  `fatal: true` marks the ones that stop every other command; the rest load and
+  show up in every envelope's `warnings`. Any problem makes it an error, so it
+  works as a CI check.
+- `config get [key]` returns `data.settings`, one row per value: `value`,
+  `source` (`file`, `default`, `derived` when a validator computed it from other
+  keys, or `environment` when `DBT_SL_HOST` or `DBT_SL_ENV_ID` overrides the
+  file), the `line` it is written on, and `as_written` when the file's spelling
+  was normalized. A key naming a block (`budget`) returns its settings. A value
+  under a credential-like name is `withheld`.
+- `config set <key> <value> [<key> <value>...]` edits the file in place, so its
+  comments, key order and blank lines survive. Without `--confirm` it returns
+  `needs_confirmation` with the diff and writes nothing; show the user the diff,
+  and re-run with `--confirm` only when they agree. `<value>` is YAML read the way
+  the field reads it: `5` is a number, `[raw, staging]` a list, `null` a null,
+  and `no` stays a string for a string field. A list is set whole. Several pairs
+  are one change, for settings only valid together
+  (`semantic.vendor ossie semantic.ossie.files '[semantics/x.ossie.yaml]'`).
+- `set` refuses a change that would add a problem stopping commands, and a key
+  that reads as a credential. A problem already in the file is a warning, not a
+  refusal, so a broken file can be repaired one key at a time. Per-run flags
+  (`--connector`, `--budget`, `--scope`, ...) are refused, because they would
+  change nothing in the file.
+
 ## `explore profile <objects>`
 
 Objects are space- or comma-separated. Each profile carries column profiles, PII

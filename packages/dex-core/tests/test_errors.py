@@ -90,6 +90,10 @@ INTERNAL_REFUSALS = {
     # An envelope-layer invariant, raised at the CLI boundary rather than
     # returned from the engine.
     "SanitizationError",
+    # `dex config set` refusing a change that would break the file. The config
+    # verbs run before any engine exists and have no DexEngine method, so a host
+    # never reaches it; it is a RequestError, which a host does import.
+    "ConfigChangeRefusedError",
     # Control flow inside row-population attribution, never a boundary event:
     # every one is caught and rendered as the `reason` on a finding that reports
     # it could not attribute a change. A consumer reads that field, not this type.

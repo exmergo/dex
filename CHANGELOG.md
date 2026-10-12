@@ -9,8 +9,84 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`maintain`'s description claims the diagnostic intent, and states its two
+  modes** ([#233]). It opened on drift and said to reach for it "when something
+  that used to work has started failing", so a request that presupposes no
+  baseline and no change ("this model is wrong, work out why", "the numbers
+  look too high", "some rows are missing", "the project is broken", "check my
+  models against the warehouse") landed on no skill at all: not exploration,
+  since a project exists; not authoring, since the model exists; not drift,
+  since nothing is known to have moved. The description now opens on whether an
+  existing project is correct and why not, names `maintain verify` as the
+  no-baseline mode beside `check` and `reconcile` against the snapshot, carries
+  those phrasings, and restates the boundaries: writing the fix, or a model you
+  just edited and broke, is `transform`'s; a warehouse or data question with
+  no project in the picture is `explore`'s. The triggering suites gain the
+  phrasings as `maintain` positives and the mirror negatives in `transform`'s
+  and `explore`'s, and a test now holds every skill's frontmatter to parsing
+  as YAML with a string `description`, the property the 1.0.1 fix restored by
+  hand. Deliberately after [#224] and [#231] landed, as the issue required: a
+  description that triggers a skill which then refuses for want of a baseline
+  would be worse than one that does not trigger.
+
+- **The maintain skill says how to triage a large drift report** ([#544]). A
+  `maintain check` against a week-old baseline returned hundreds of findings,
+  and the number that resolved the session came from the next command:
+  `maintain reconcile`'s `mechanical_count`, zero, beside `advisory_count`.
+  Mechanical proposals exist only where dex can author the fix itself, so zero
+  of them across hundreds of schema findings, with no dropped or retyped
+  columns or tables among the codes, means the baseline is behind the project
+  rather than the warehouse having moved. The result already returned both
+  counts and the skill defined both terms; nothing told the reader to use them
+  for triage. The *Reconcile proposals* section now opens with that heuristic
+  and points at the re-baseline discipline. Documentation only.
+
 ### Fixed
 
+- **Answering the one-time ceiling ask no longer rewrites `.dex/config.yml`**
+  ([#547]). `--session-ceiling` and `--no-session-ceiling` went through a full
+  YAML re-dump of the file, which dropped every comment, reordered the keys to
+  the schema's order, deleted any key the release did not read, rewrote `5` as
+  `5.0`, and dropped an explicit null, so `cluster.sample_seed` written as null
+  (a fresh draw per run) silently became the default `0`. The answer is now an
+  in-place edit of the budget lines alone, reported as the same `update` diff,
+  and the rest of the file is byte-for-byte what it was.
+
+- **The skill wrapper installs the `ossie` extra for every command that can
+  read a native Ossie semantic layer** ([#536]). `_feature_extras` in
+  `skills/*/scripts/run.py` chose extras from the command and had branches for
+  `cluster` and the two semantic extras, none for Ossie, so with
+  `semantic.vendor: ossie` the engine was installed without `jsonschema` and
+  the loader refused by name. On BigQuery it worked by coincidence: that
+  connector's own dependency tree carries `jsonschema` at exactly the floor the
+  extra declares. `explore semantic`, `semantic ossie`, `maintain semantic`,
+  `maintain check` and `maintain snapshot` now resolve `ossie` on every
+  connector. Resolved from the command rather than from `semantic.vendor`,
+  which sits in a nested config block the stdlib-only wrapper does not parse;
+  the wrapper's own rule is to err toward a heavier install, and `jsonschema`
+  is small. One test per command, and a structural one over the wrapper's own
+  table of Ossie-reading commands.
+
+- **`maintain verify` resolves a declared grain column against the relation's
+  own spelling before quoting it** ([#483]). `schema.yml` spells a column the
+  way dbt wrote it, ordinarily lowercase, and the built relation spells it the
+  way the warehouse folded it, which on Snowflake is uppercase. The declared
+  spelling went straight into `COUNT(DISTINCT "id")` against a relation holding
+  `ID`, and Snowflake refused it as an invalid identifier. Each declared column
+  is now matched case-insensitively to the relation's columns, the comparison
+  the column-contract check already makes, and the statement carries the
+  relation's spelling while the finding keeps the declaration's. A declared
+  column the relation does not have is named in `notes` and never sent.
+
+- **A grain statement the warehouse refuses no longer fails the whole
+  command** ([#483]). The refusal propagated out of the grain class, so one
+  rejected `COUNT(DISTINCT)` turned every other finding into
+  `status: error`. It is now caught per model: that model's grain is reported
+  as unmeasured in `notes`, with the server's own words, and every other
+  model's grain and every other finding class still run.
+  
 - **Nested MetricFlow schema errors identify the offending entity or measure**
   ([#537](https://github.com/exmergo/dex/issues/537),
   [#553](https://github.com/exmergo/dex/pull/553)). An invalid property previously
@@ -18,6 +94,77 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   YAML. The message now includes its index and name when available, for example
   `semantic model 'orders' > entities[1] ('customer')`. Validation rules and
   model-level error messages are unchanged.
+
+### Added
+
+- **`dex config get|validate|set` reads, checks and changes `.dex/config.yml`**
+  ([#547]). Every change to the file was a hand edit, and nothing could check a
+  value or show the effective config without running a data command.
+  `config validate` lists every problem by setting and line: syntax, a value
+  the schema refuses, a key dex does not read (with the key it was probably
+  meant to be), a key written twice, a key that reads as a credential. Any
+  problem makes it an error, so it gates CI on its own. `config get [key]`
+  reports each setting's effective value and where it came from (`file`,
+  `default`, `derived` by a validator, or `environment`), with the line it is
+  written on, and withholds a value under a credential-like name.
+  `config set KEY VALUE [KEY VALUE ...]` is an in-place edit that keeps every
+  comment, the key order and every other line, verified by reloading the
+  result before anything is written. It answers `needs_confirmation` with the
+  diff and writes nothing; the same command with `--confirm` writes it, the
+  handshake a billed command already uses, so a change to a committed file is
+  reviewed before it lands. Several pairs make one change, for settings only
+  valid together. A change that would add a problem stopping commands is
+  refused; a problem already in the file is a warning, so a broken file can be
+  repaired one key at a time. The verbs run before any engine is built: no
+  connection, no store, no connector extra, which is what lets them work on a
+  config every other command refuses to start on. Per-run flags such as
+  `--connector` or `--budget` are refused by name rather than ignored.
+
+- **A weekly run of the tier-1 unit tests on Windows** ([#487], part 4). A new
+  workflow, `.github/workflows/windows.yml`, runs `uv run pytest -q` on
+  `windows-latest` every Monday and on `workflow_dispatch`, with the same
+  connector-extra sync `ci.yml`'s `tests` job uses. It is not a required check
+  and does not run per pull request: Windows is not a claimed platform, the
+  suite takes a quarter of an hour on a Windows workstation, and a Windows leg
+  on every pull request would make Windows-only flakiness a merge blocker. What
+  it buys is that the class of regression [#264] and [#487] were (a platform
+  separator in a path the engine prints, a test that assumes POSIX) is caught
+  within a week rather than when the next Windows user reports it. The job
+  sets `core.autocrlf false` before checkout: Git for Windows converts text
+  files to CRLF by default, which moves the bundled Ossie schema's recorded
+  hash, and the wheel ships LF. Nothing about the engine or the tests changes.
+  
+- **`maintain check` and `maintain schema` say so when the warehouse read and
+  the baseline cover different datasets** ([#543]). Every object in a dataset
+  the baseline never covered was reported as `table_added`, and every object in
+  a dataset the read no longer lists as `table_dropped`, with nothing saying the
+  block was a difference of scope rather than the warehouse moving: a baseline
+  pinned when the map covered one environment's datasets, then a read that
+  lists another's, diluted the real drift in the same report. Both commands now
+  compare the dataset sets before reporting and carry one warning per
+  direction, naming the datasets and the number of findings they account for,
+  with the re-pin to make if the datasets belong in the baseline. The findings
+  themselves are unchanged, and the count the warning quotes honours the same
+  `<objects>` scope the findings do. Matching scopes add no warning.
+
+### Changed
+
+- **An invalid `.dex/config.yml` is `reason: configuration`, by setting and
+  line** ([#547]). A value the schema refused surfaced as pydantic's own
+  multi-line text with `reason: request`, which reads as the caller's input
+  being wrong, and a file that did not parse escaped as `reason: internal`.
+  Both now refuse every command with `reason: configuration` and one line per
+  problem (`line 12: query.max_rows: ...`), pointing at `dex config validate`.
+  For a host on the Python API, `DexEngine.from_repo` raises
+  `InvalidConfigError`, a `ConfigurationError` exported from the package root,
+  instead of pydantic's `ValidationError`; both are `ValueError`s.
+- **A key dex does not read now warns on every command** ([#547]). The loader
+  dropped unknown keys without a word, so a mistyped
+  `budget.session_celing` was a cumulative ceiling that silently did not
+  exist. Every envelope now carries a warning naming the key, its line, and
+  the key it was probably meant to be, and a key written twice warns the same
+  way. Neither refuses anything: a project carrying a key a later release
+  retired keeps working.
 
 ## [1.12.8] - 2026-10-11
 

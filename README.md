@@ -109,7 +109,9 @@ dex explore map
 `dex demo` writes two files in the directory you are standing in, and refuses rather
 than overwrite anything: `dex_demo.duckdb` (7 tables, 29,512 rows) and a
 `.dex/config.yml` so everything after it runs with no flags. The data is generated
-from a pinned seed, so what you see is what is written here.
+from a pinned seed, so what you see is what is written here. `dex config get` shows
+what that config resolves to, and `dex config set` changes it as a diff you confirm,
+keeping its comments.
 
 It is seeded to be **realistically broken**, because a first run that reports a clean
 bill of health teaches you nothing. `explore map` flags 6 columns as personal data,

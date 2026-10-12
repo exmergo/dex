@@ -233,6 +233,56 @@ def test_only_the_budget_is_touched_in_a_config_that_holds_other_settings(tmp_pa
         remaining = remaining[remaining.index(line) + 1 :]
 
 
+_HANDWRITTEN = """\
+# Budgets for this repo, raised after the backfill.
+connector: bigquery
+
+budget:
+  ceiling: 5   # per command
+  retired_key: true    # a key this release does not read
+
+cluster:
+  sample_seed: null   # a fresh draw per run
+"""
+
+
+def _answered(line: str) -> str:
+    """The hand-written file with one budget line added after its last one."""
+
+    marker = "  retired_key: true    # a key this release does not read\n"
+    return _HANDWRITTEN.replace(marker, marker + line)
+
+
+def test_the_answer_edits_only_the_budget_lines_of_a_hand_written_file(tmp_path):
+    """The answer is written into a committed file that carries its reasoning in
+    comments, so it may add its own line and must change nothing else: not the
+    comments, not the order, not a key this release ignores, and not an explicit
+    null whose absence would mean something different."""
+
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / CONFIG).write_text(_HANDWRITTEN, encoding="utf-8")
+    config, diff = record_session_ceiling_decision(tmp_path, session_ceiling=500.0)
+    assert (tmp_path / CONFIG).read_text(encoding="utf-8") == _answered(
+        "  session_ceiling: 500.0\n"
+    )
+    assert (diff["additions"], diff["deletions"]) == (1, 0)
+    assert config.budget.session_ceiling == 500.0
+    assert load_config(tmp_path).cluster.sample_seed is None
+
+
+def test_a_decline_and_a_later_ceiling_each_leave_one_budget_line(tmp_path):
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / CONFIG).write_text(_HANDWRITTEN, encoding="utf-8")
+    record_session_ceiling_decision(tmp_path, declined=True)
+    assert (tmp_path / CONFIG).read_text(encoding="utf-8") == _answered(
+        "  session_ceiling_declined: true\n"
+    )
+    record_session_ceiling_decision(tmp_path, session_ceiling=500.0)
+    assert (tmp_path / CONFIG).read_text(encoding="utf-8") == _answered(
+        "  session_ceiling: 500.0\n"
+    )
+
+
 def test_contradictory_answers_are_refused_rather_than_ranked(tmp_path):
     save_config(DexConfig(connector="bigquery"), tmp_path)
     with pytest.raises(ConfigurationError, match="not both and not neither"):

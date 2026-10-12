@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import sql_shape
+from exmergo_dex_core.errors import WarehouseQueryError
 from exmergo_dex_core.maintain import verify as verify_mod
 from exmergo_dex_core.maintain.verify import (
     build_status_findings,
@@ -617,6 +618,122 @@ def test_a_model_with_no_relation_is_silently_skipped():
     findings, notes = verify_mod.grain_findings(adapter, {}, {}, [], {"a"})
     assert findings == []
     assert notes == []
+
+
+def test_a_lowercase_declaration_is_resolved_against_the_relations_own_spelling():
+    # dbt-snowflake folds an unquoted `id` to `ID`, and schema.yml still says
+    # `id`. The scan has to quote the relation's spelling, and the finding the
+    # declaration's (#483). On a fake that answers only for the names it holds,
+    # the declared spelling would come back unmeasured.
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["ID"]},
+        exact={"db.main.a": {"ID": 199}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert [f.code for f in findings] == ["grain_broken"]
+    assert findings[0].column == "id"
+    assert findings[0].data["columns"] == ["id"]
+
+
+def test_a_lowercase_composite_declaration_is_resolved_the_same_way():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 10},
+        columns={"db.main.a": ["ORDER_ID", "LINE"]},
+        combos={"db.main.a": {("ORDER_ID", "LINE"): 10}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [
+                verify_mod.GrainCandidate(
+                    columns=["order_id", "line"], source="unique_test_composite"
+                )
+            ]
+        },
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == []
+
+
+def test_a_declared_column_the_relation_does_not_have_is_noted_and_never_scanned():
+    class _Recording(_GrainAdapter):
+        def exact_distinct_counts(self, identifier, columns):
+            raise AssertionError(f"scanned {columns} on {identifier}")
+
+    adapter = _Recording(row_counts={"db.main.a": 10}, columns={"db.main.a": ["id"]})
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["idd"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == [
+        "the declared grain on a names a column the relation does not have, "
+        "so it was not checked: idd"
+    ]
+
+
+def test_a_refused_grain_statement_is_that_models_note_not_the_commands_error():
+    # The server's refusal stays inside the grain class (#483): the refused
+    # model is named in the notes with the server's own words, the other
+    # model's grain is still checked, and nothing propagates to the command.
+    class _Refusing(_GrainAdapter):
+        def exact_distinct_counts(self, identifier, columns):
+            if identifier == "db.main.a":
+                raise WarehouseQueryError("000904 invalid identifier '\"id\"'")
+            return super().exact_distinct_counts(identifier, columns)
+
+    adapter = _Refusing(
+        row_counts={"db.main.a": 10, "db.main.b": 10},
+        columns={"db.main.a": ["id"], "db.main.b": ["id"]},
+        exact={"db.main.b": {"id": 9}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+            "b": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+        },
+        {"a": "db.main.a", "b": "db.main.b"},
+        ["db.main.a", "db.main.b"],
+        {"a", "b"},
+    )
+    assert [f.identifier for f in findings] == ["b"]
+    assert notes == [
+        "the grain could not be measured for a: the warehouse refused the "
+        "distinct-count statement (000904 invalid identifier '\"id\"')"
+    ]
+
+
+def test_a_refused_heuristic_escalation_is_a_note_too():
+    class _Refusing(_GrainAdapter):
+        def exact_distinct_counts(self, identifier, columns):
+            raise WarehouseQueryError("resources exceeded during query execution")
+
+    adapter = _Refusing(
+        row_counts={"db.main.a": 1000},
+        columns={"db.main.a": ["id", "amount"]},
+        approx={"db.main.a": {"id": (1000, 0.0)}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert findings == []
+    assert len(notes) == 1
+    assert "refused the distinct-count statement" in notes[0]
 
 
 # --- compile_check: wraps shadow_parse -------------------------------------------

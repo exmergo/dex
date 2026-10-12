@@ -8094,3 +8094,179 @@ def test_the_semantic_layer_read_costs_the_warehouse_nothing(
     )
     edges = [e for e in payload["data"]["edges"] if e["declared_by"]]
     assert edges and edges[0]["declared_by"] == "semantic entity 'customer'"
+
+
+# --- The config verbs are bound by the same spine ----------------------------------
+#
+# `dex config` writes the one committed file every other command is built from, and
+# runs before any engine exists, so it is held to the spine directly rather than by
+# way of the engine: propose before writing (Family 4), never carry a credential
+# (Family 5), and touch no data at all (Family 1).
+
+_COMMENTED_CONFIG = """\
+# Settings for this repo. Comments carry the reasoning.
+connector: duckdb
+
+budget:
+  ceiling: 5   # per command
+
+query:
+  max_rows: 50   # raised for the backfill review
+"""
+
+
+def _config_repo(root: Path, text: str = _COMMENTED_CONFIG) -> Path:
+    (root / ".dex").mkdir(parents=True, exist_ok=True)
+    path = root / ".dex" / "config.yml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {
+        str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()
+    }
+
+
+def test_an_unconfirmed_config_set_changes_nothing_on_disk(tmp_path, capsys):
+    """Family 4: the change is a diff to review, and nothing is written until the
+    same command comes back with --confirm."""
+
+    _config_repo(tmp_path)
+    before = _tree(tmp_path)
+    payload = _run(
+        ["--repo-root", str(tmp_path), "config", "set", "query.max_rows", "5"],
+        capsys,
+    )
+    assert payload["status"] == "needs_confirmation"
+    assert payload["diffs"][0]["op"] == "update"
+    assert _tree(tmp_path) == before
+
+
+def test_a_confirmed_config_set_changes_only_its_own_line(tmp_path, capsys):
+    """Family 4: the reviewed diff is the whole write, and every comment survives."""
+
+    path = _config_repo(tmp_path)
+    payload = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "config",
+            "set",
+            "query.max_rows",
+            "5",
+            "--confirm",
+        ],
+        capsys,
+    )
+    (diff,) = payload["diffs"]
+    assert (diff["additions"], diff["deletions"]) == (1, 1)
+    assert path.read_text(encoding="utf-8") == _COMMENTED_CONFIG.replace(
+        "max_rows: 50", "max_rows: 5"
+    )
+
+
+def test_config_set_cannot_leave_a_config_that_stops_every_command(tmp_path, capsys):
+    """Family 4: a write that would brick the repo is refused, not proposed."""
+
+    from exmergo_dex_core.config import load_config
+
+    _config_repo(tmp_path)
+    payload = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "config",
+            "set",
+            "query.max_rows",
+            "many",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert payload["status"] == "error"
+    assert load_config(tmp_path).query.max_rows == 50
+
+
+def test_the_ceiling_answer_keeps_every_comment_in_the_config(
+    tmp_path, capsys, duckdb_file
+):
+    """Family 4: a write dex makes on the caller's behalf amends the file; it
+    does not regenerate it."""
+
+    text = _COMMENTED_CONFIG + f"duckdb:\n  path: {duckdb_file}   # the demo\n"
+    path = _config_repo(tmp_path, text)
+    payload = _run(
+        ["--repo-root", str(tmp_path), "connect", "test", "--session-ceiling", "100"],
+        capsys,
+    )
+    (diff,) = payload["diffs"]
+    assert (diff["additions"], diff["deletions"]) == (1, 0)
+    assert path.read_text(encoding="utf-8") == text.replace(
+        "  ceiling: 5   # per command\n",
+        "  ceiling: 5   # per command\n  session_ceiling: 100.0\n",
+    )
+
+
+def test_config_get_withholds_a_credential_like_setting(tmp_path, capsys):
+    """Family 5: a credential that was committed anyway is flagged, never echoed."""
+
+    _config_repo(
+        tmp_path,
+        "connector: duckdb\ncache:\n  options:\n"
+        "    api_token: hunter2-not-a-real-one\n",
+    )
+    from exmergo_dex_core.cli import main
+
+    for verb in (["get"], ["get", "cache.options.api_token"], ["validate"]):
+        main(["--repo-root", str(tmp_path), "config", *verb])
+        out = capsys.readouterr().out
+        assert "hunter2" not in out
+        assert "api_token" in out, "the setting is named even though withheld"
+
+
+def test_config_set_refuses_to_write_a_credential_like_key(tmp_path, capsys):
+    """Family 5: the file is committed, so a credential is never written into it,
+    and the refusal does not repeat the value either."""
+
+    path = _config_repo(tmp_path)
+    before = path.read_bytes()
+    from exmergo_dex_core.cli import main
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "config",
+            "set",
+            "cache.options.client_secret",
+            "hunter2-not-a-real-one",
+            "--confirm",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "hunter2" not in out
+    assert path.read_bytes() == before
+
+
+def test_the_config_verbs_build_no_engine_and_open_no_connection(
+    tmp_path, capsys, monkeypatch
+):
+    """Family 1: reading and writing the config is not reading data."""
+
+    from exmergo_dex_core import connect
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a config verb reached the warehouse path")
+
+    monkeypatch.setattr(DexEngine, "from_repo", classmethod(refuse))
+    monkeypatch.setattr(connect, "open_adapter", refuse)
+    _config_repo(tmp_path)
+    root = ["--repo-root", str(tmp_path), "config"]
+    assert _run([*root, "validate"], capsys)["status"] == "ok"
+    assert _run([*root, "get"], capsys)["status"] == "ok"
+    assert (
+        _run([*root, "set", "query.max_rows", "5", "--confirm"], capsys)["status"]
+        == "ok"
+    )

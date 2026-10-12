@@ -105,13 +105,18 @@ def test_methods_return_domain_objects_never_envelopes(duckdb_file: Path):
 #: check. `test` carries two modes and only one of them is a method: `--mutate`
 #: is `test_mutations`, while `--scaffold` is reached as `test_scaffold`.
 #: `semantic *` is spelled `semantic_*`; `demo` writes a warehouse and is not a
-#: command a library caller drives. Everything else must have a method.
+#: command a library caller drives. `config *` reads the file an engine is built
+#: from, before one exists, so it has nothing to be a method of. Everything else
+#: must have a method.
 _NOT_ENGINE_METHODS = {
     ("transform", "test"),
     ("semantic", "define"),
     ("semantic", "update"),
     ("semantic", "plan"),
     ("viz", "preview"),
+    ("config", "get"),
+    ("config", "validate"),
+    ("config", "set"),
 }
 
 #: Where a subcommand's method is spelled differently from the subcommand.

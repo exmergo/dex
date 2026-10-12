@@ -37,10 +37,10 @@ from that envelope.
    applied with `transform apply`. Take `maintain snapshot` after a known-good
    build.
 
-At every step: a `needs_confirmation` envelope waits on the user's spend
-decision, never on yours; only a human clears a PII flag; and you never edit the
-dbt project, `.dex/cache.json`, or `.dex/plans/` by hand in place of the command
-that guards them.
+At every step: a `needs_confirmation` envelope waits on the user's decision (a
+spend, or a `dex config set` diff), never on yours; only a human clears a PII
+flag; and you never edit the dbt project, `.dex/config.yml`, `.dex/cache.json`,
+or `.dex/plans/` by hand in place of the command that guards them.
 <!-- dex:procedure:end -->
 
 ## Running the engine
@@ -63,6 +63,13 @@ uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [
   and its `.dex/config.yml`, after which every command runs with no flags. Offer
   it rather than assume it: a user who has a warehouse wants that one read. It
   only ever creates, and refuses rather than touch an existing file.
+- `config validate` checks `.dex/config.yml` and `config get [key]` shows what
+  each setting resolves to and where it came from, without running anything
+  else. Change a setting with `config set <key> <value>`, not by hand: it returns
+  the diff as `needs_confirmation`, and the same command with `--confirm` writes
+  it once the user agrees. A warning naming an unknown key is a typo in a setting
+  that is doing nothing; fix it. Fields are in
+  `${CLAUDE_SKILL_DIR}/references/commands.md`.
 
 ## Exploring, step by step
 
@@ -138,8 +145,10 @@ need is not described here.
   to the user, not an error to fix.
 - If the user says a refused column is not personal data, recommend a
   `pii_overrides` entry in `.dex/config.yml` (the fully qualified column, with an
-  optional reason). Never hand-edit `.dex/cache.json` to clear a flag, and never
-  suggest weakening detection.
+  optional reason), proposed with `dex config set pii_overrides '<list>'` (the
+  whole list, existing entries included) so the user confirms the diff; never
+  confirm it yourself. Never hand-edit `.dex/cache.json` to clear a flag, and
+  never suggest weakening detection.
 - Never propose a write to source data, and never paste a full schema into
   context.
 

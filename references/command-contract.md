@@ -59,9 +59,9 @@ from profiled, PII-cleared columns, bounded and capped by the query firewall.
 ## The command surface
 
 Capabilities, not final spelling. Implemented incrementally: `demo`, `connect test`,
-the `explore` group, the authoring surface (`transform`, `semantic`), and the
-`maintain` group are live; `viz preview` returns a valid `not_implemented`
-envelope until the Viz integration lands.
+the `config` group, the `explore` group, the authoring surface (`transform`,
+`semantic`), and the `maintain` group are live; `viz preview` returns a valid
+`not_implemented` envelope until the Viz integration lands.
 
 ```
 dex demo [path]                   -> generate a seeded local DuckDB warehouse (7 tables,
@@ -76,6 +76,31 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (7
                                      directory is ever created, and an existing config
                                      at or above the target is left alone with a warning
 dex connect test                  -> {capabilities, dialect, read_only: true}
+dex config get [key]              -> the effective value of every setting, or of those
+                                     under key, as flat rows under data.settings: value,
+                                     source (file, default, derived, or environment), the
+                                     line it was written on, and as_written when the
+                                     file's spelling was normalized. A value under a
+                                     credential-like name is withheld. Reads only the
+                                     file, before any engine exists: no connection, no
+                                     connector extra. Refuses a file no command could
+                                     load, naming its problems in data.problems
+dex config validate               -> every problem in .dex/config.yml by setting and line,
+                                     running nothing else: syntax, values the schema
+                                     refuses, keys dex does not read (with the key each
+                                     was probably meant to be), keys written twice,
+                                     credential-like keys. problems[].fatal marks the ones
+                                     that stop every other command. Any problem is status
+                                     error, reason configuration, so it gates CI alone
+dex config set <key> <value>      -> an in-place edit that keeps every comment, the key
+  [<key> <value>...]                 order and every other line: needs_confirmation with
+                                     the diff and nothing written, then the same command
+                                     with --confirm writes it. <value> is YAML read the
+                                     way the field reads it. Several pairs make one
+                                     change, for keys only valid together. Refuses a
+                                     change that adds a problem stopping commands; one
+                                     already in the file is a warning, so a broken file
+                                     is repaired one key at a time
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
   [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
                                      it; both no-ops without --rank
@@ -1088,14 +1113,22 @@ Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 one-time cumulative-ceiling ask below. Either one writes the answer into
 `.dex/config.yml` and reports the amendment as an `update` diff; they are answers
 to a question about the project, not per-command overrides, which is why they are
-durable and why `--budget` is unaffected by both.
+durable and why `--budget` is unaffected by both. The amendment edits the budget
+lines in place and nothing else, so the file's comments, key order, and any key
+this release does not read all survive it.
+
+The `config` verbs take none of these. They read and write the committed file
+before any engine is built, so a run override would be accepted and then do
+nothing; each one is refused by name instead, pointing at `dex config set`.
 
 `.dex/config.yml` is found by walking up from the `--repo-root` directory (default
 the shell cwd) to the enclosing git root, the way git and dbt locate their project,
 so a command run from a subdirectory resolves the project's config rather than the
 current directory's. The walk anchors on the config file (a subdirectory holding
 only a `.dex/` cache never shadows the real config higher up) and stops at the git
-root (a stray `.dex/config.yml` above the repo cannot capture the session). With no
+root (a stray `.dex/config.yml` above the repo cannot capture the session). The
+`config` verbs find the file the same way, so they read and change the config the
+next command will load. With no
 config found anywhere and no explicit `--connector`/`--path`, the engine refuses
 and names the fix rather than defaulting to DuckDB. A committed relative
 `duckdb.path` resolves against the project root the config lives in, so the same
@@ -1328,6 +1361,13 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   connector accidentally places one among its target coordinates.
 - **Diffs, not silent writes.** Proposed changes appear in `diffs`; being there
   does not apply them. The user applies through their normal review and PR flow.
+- **The config file speaks through `reason` and `warnings`.** A `.dex/config.yml`
+  no command can load (it does not parse, or a value fails the schema) refuses
+  every command except `config` with `reason: configuration`, naming each setting
+  and its line rather than repeating the validator's own text. A key dex does not
+  read, a key written twice, or a credential-like key does not refuse anything:
+  each rides the envelope's `warnings`, so a typo in a setting is never a setting
+  that silently does nothing. `dex config validate` reports all of them at once.
 - **No secrets, no uncleared values.** `data` is scanned before printing
   (`envelope.sanitize`): a secret-like key or a record-shaped raw-row payload is
   a hard failure, never a silent scrub. Result values appear only in `explore

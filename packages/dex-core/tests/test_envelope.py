@@ -68,6 +68,23 @@ def test_sanitize_refuses_secret_like_keys(data):
         env.sanitize(env.ok(data))
 
 
+@pytest.mark.parametrize(
+    "key",
+    ["password", "api_token_env", "Client_Secret", "region", "connection_name"],
+)
+def test_secret_like_is_the_rule_the_boundary_scan_applies(key):
+    """The config editor withholds and refuses by this predicate, so it has to
+    be exactly the one the scan enforces, not a second list that drifts."""
+
+    try:
+        env.sanitize(env.ok({key: 1}))
+    except env.SanitizationError:
+        tripped = True
+    else:
+        tripped = False
+    assert env.secret_like(key) is tripped
+
+
 def test_sanitize_scans_connection_target_too():
     with pytest.raises(env.SanitizationError):
         env.sanitize(

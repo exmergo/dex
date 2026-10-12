@@ -38,10 +38,10 @@ from that envelope.
    applied with `transform apply`. Take `maintain snapshot` after a known-good
    build.
 
-At every step: a `needs_confirmation` envelope waits on the user's spend
-decision, never on yours; only a human clears a PII flag; and you never edit the
-dbt project, `.dex/cache.json`, or `.dex/plans/` by hand in place of the command
-that guards them.
+At every step: a `needs_confirmation` envelope waits on the user's decision (a
+spend, or a `dex config set` diff), never on yours; only a human clears a PII
+flag; and you never edit the dbt project, `.dex/config.yml`, `.dex/cache.json`,
+or `.dex/plans/` by hand in place of the command that guards them.
 <!-- dex:procedure:end -->
 
 ## Running the engine
@@ -171,8 +171,10 @@ a field, flag, or macro you need is not described here.
   looked at: detection reads names and types, never values, so it cannot see
   personal data under a neutral column name.
 - A seed whose header looks like personal data is refused; the refusal names the
-  `pii_overrides` entry a human can add to `.dex/config.yml`. Recommend it; never
-  add it yourself.
+  `pii_overrides` entry a human can add to `.dex/config.yml`. Recommend it. If the
+  user agrees, propose it with `dex config set pii_overrides '<list>'` (the whole
+  list, existing entries included: read them with `dex config get pii_overrides`)
+  and let them confirm the diff; never confirm it yourself.
 - PII flags are stamped into model and column `config.meta` at any confidence.
   Only a human `pii_overrides` entry removes the stamp.
 

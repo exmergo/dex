@@ -39,6 +39,7 @@ import yaml
 from .adapters import get_adapter
 from .adapters.base import scope_within
 from .config import (
+    SEMANTIC_ENVIRONMENT,
     BigQueryTarget,
     ClickHouseTarget,
     DatabricksTarget,
@@ -2227,8 +2228,10 @@ def resolve_semantic_layer_connection(
             )
         return str(host), str(env_id), str(token), "host_supplied"
 
-    host = env.get("DBT_SL_HOST") or getattr(semantic, "host", None)
-    env_id = env.get("DBT_SL_ENV_ID") or getattr(semantic, "environment_id", None)
+    host = env.get(SEMANTIC_ENVIRONMENT["host"]) or getattr(semantic, "host", None)
+    env_id = env.get(SEMANTIC_ENVIRONMENT["environment_id"]) or getattr(
+        semantic, "environment_id", None
+    )
     if not host or not env_id:
         raise CredentialDiscoveryError(
             "the hosted semantic layer needs a host and environment id; set them "

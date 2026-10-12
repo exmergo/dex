@@ -1,6 +1,6 @@
 ---
 name: maintain
-description: 'Use this to keep a dbt project and its semantic layer correct as the warehouse and the business change, including a semantic layer that is native Apache Ossie documents rather than dbt. It detects drift on four axes and proposes the fix: schema drift (source columns and tables added, dropped, retyped, or renamed), volume drift (a row count that collapsed, a table that emptied, a load that half-failed), grain drift (a key that lost uniqueness, a changed row-per-entity cardinality, an increased join fanout), and semantic drift (a metric, measure, dimension, or entity definition that no longer matches, new categorical values, dangling semantic references). Reach for this when something that used to work has started failing or producing different numbers and the cause is more likely upstream than in the code you just wrote: a test that began failing with no code change, a dashboard whose numbers moved, a model that is suddenly empty or duplicated. Trigger it for requests like "what changed in the warehouse", "did anything drift", "is my dbt project still in sync", "my primary key has duplicates now", "the row count dropped", "did the load run", "the data stopped flowing", "the revenue metric definition changed", "reconcile my models with the source schema", "which models are stale", "did my Ossie semantic layer drift", or "is this relationship still valid". It reads the .dex/ snapshot and proposes reviewable diffs; it never overwrites hand-written work. To author new models or metrics from scratch, use transform. To learn an unfamiliar warehouse for the first time, use explore.'
+description: 'Use this to answer whether an existing dbt project is correct against the warehouse it is built on, and if not, why, including a semantic layer that is native Apache Ossie documents rather than dbt. It has two modes. With no baseline, `maintain verify` checks the project as it stands: build failures and skips, models with no relation, declared columns the built relation lacks, a declared key that holds duplicates, a model that lost rows or fanned out against its source, a join whose keys find nothing. Against a .dex/ snapshot, `maintain check` detects what drifted since and `maintain reconcile` proposes the fix, on four axes: schema drift (source columns and tables added, dropped, retyped, or renamed), volume drift (a row count that collapsed, a table that emptied, a load that half-failed), grain drift (a key that lost uniqueness, a changed row-per-entity cardinality, an increased join fanout), and semantic drift (a metric, measure, dimension, or entity definition that no longer matches, new categorical values, dangling semantic references). Reach for this whenever a project that already exists is suspected of being wrong, whether or not anything is known to have changed: "this model is wrong, work out why", "the numbers look too high", "some rows are missing from this table", "this column is empty and it should not be", "there are duplicates in my fact table", "the project is broken", "check my models against the warehouse", "diagnose why this test fails", "what changed in the warehouse", "did anything drift", "is my dbt project still in sync", "my primary key has duplicates now", "the row count dropped", "did the load run", "the data stopped flowing", "the revenue metric definition changed", "reconcile my models with the source schema", "which models are stale", "did my Ossie semantic layer drift", or "is this relationship still valid". Detection is read-only; it proposes reviewable diffs and never overwrites hand-written work. To write the fix, or to author or change a model, test, or metric, use transform: a model you just edited and broke is a transform task. To learn a warehouse, or answer a question about the data with no project in the picture, use explore.'
 ---
 
 # Maintain
@@ -39,10 +39,10 @@ from that envelope.
    applied with `transform apply`. Take `maintain snapshot` after a known-good
    build.
 
-At every step: a `needs_confirmation` envelope waits on the user's spend
-decision, never on yours; only a human clears a PII flag; and you never edit the
-dbt project, `.dex/cache.json`, or `.dex/plans/` by hand in place of the command
-that guards them.
+At every step: a `needs_confirmation` envelope waits on the user's decision (a
+spend, or a `dex config set` diff), never on yours; only a human clears a PII
+flag; and you never edit the dbt project, `.dex/config.yml`, `.dex/cache.json`,
+or `.dex/plans/` by hand in place of the command that guards them.
 <!-- dex:procedure:end -->
 
 ## Running the engine
@@ -127,6 +127,18 @@ is not described here.
 
 ### Reconcile proposals
 
+- **On a large `check` report, read the ratio before the findings.** Run
+  `maintain reconcile` and read `mechanical_count` and `advisory_count` beside
+  the finding codes, before the findings list. Mechanical proposals exist only
+  where dex can author the fix itself (the two cases below), so zero of them
+  across hundreds of schema findings, with no `column_dropped`,
+  `column_retyped` or `table_dropped` among the codes, usually means the
+  baseline is behind the project rather than the warehouse having moved: every
+  finding is additive, and most of them are the project's own recent work.
+  Re-baseline with the discipline above (`explore map --full`, then
+  `maintain snapshot`) before triaging findings one by one. A type change is
+  advisory on every format, so read the codes for retypes rather than inferring
+  them from the count.
 - **`mechanical`** (schema drift): re-scaffolds a dex-scaffolded staging model,
   or edits the drifted columns into a declaration. Still a reviewable diff: read
   it for hand-written logic the scaffold cannot know about before applying.

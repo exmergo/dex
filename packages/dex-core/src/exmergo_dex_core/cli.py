@@ -101,6 +101,10 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "verify",
     ],
     "viz": ["preview"],
+    # config: read, check and change `.dex/config.yml` itself. Routed in `main`
+    # before an engine is built, because every engine is built from that file
+    # and a file that cannot build one is exactly when these are needed.
+    "config": ["get", "validate", "set"],
     # demo: the on-ramp. No subcommands, because there is exactly one thing to
     # do and it is the first command a new user runs. It is also the only verb
     # that creates a data file, which is why it lives on its own path (see
@@ -211,6 +215,7 @@ _GROUP_HELP: dict[str, str] = {
     "semantic": "define dbt or native Ossie semantics as reviewable diffs",
     "maintain": "detect drift against the last snapshot and propose the fix",
     "viz": "preview the semantic layer (not yet implemented)",
+    "config": "read, check and change .dex/config.yml, as reviewable diffs",
     "demo": "create a seeded local DuckDB warehouse to try dex against "
     "(no credentials, no network)",
 }
@@ -286,6 +291,13 @@ def _build_parser() -> argparse.ArgumentParser:
             sub = gp.add_subparsers(dest="subcommand", required=True)
             for name in subcommands:
                 sp = sub.add_parser(name, parents=[common])
+                if group == "config" and name == "get":
+                    sp.add_argument("key", nargs="?", default=None)
+                if group == "config" and name == "set":
+                    # Pairs rather than one KEY VALUE, because some settings are
+                    # only valid together. Counted in the handler, not by
+                    # argparse, so a malformed call still gets an envelope.
+                    sp.add_argument("pairs", nargs="*", default=None)
                 if group == "maintain" and name == "snapshot":
                     sp.add_argument(
                         "--project-only", action="store_true", default=False
@@ -917,41 +929,49 @@ def main(argv: list[str] | None = None) -> int:
     # refusal raised here has to render as one like any other rather than as a
     # traceback the wrapper cannot parse.
     try:
-        # One engine per process, built from the resolved repo root. The default
-        # backend is what lets the subcommands stay stateless across invocations:
-        # `.dex/` on disk is how the exploration cache and the cumulative session
-        # budget survive from one command to the next, and any backend selected
-        # here has to be durable across processes for the same reason.
-        engine = DexEngine.from_repo(
-            repo_root(args),
-            cache_backend=getattr(args, "cache_backend", None),
-            project_format_name=getattr(args, "project_format", None),
-            connector=getattr(args, "connector", None),
-            path=getattr(args, "path", None),
-            project=getattr(args, "project", None),
-            datasets=getattr(args, "dataset", None),
-            scopes=getattr(args, "scope", None),
-            budget=getattr(args, "budget", None),
-            confirmed=getattr(args, "confirm", False),
-            session_ceiling=getattr(args, "session_ceiling", None),
-            decline_session_ceiling=getattr(args, "no_session_ceiling", False),
-        )
-        try:
-            envelope = dispatch(args, engine)
-        finally:
-            # Unlike an adapter, the paradigm survives a connection that could
-            # not be opened, so this still gives a refusal envelope something
-            # to name; taken in the `finally` so it reflects whatever the
-            # handler resolved, auto-detect included, not just construction.
-            paradigm = engine.paradigm
-            # Best-effort by design: a ledger that cannot be read must not
-            # replace the exception on its way out with a bookkeeping failure,
-            # which would lose the reason the command failed to report a
-            # number about it.
-            with contextlib.suppress(Exception):
-                spend = engine.settled_spend()
-            connection = engine.connection_provenance()
-            engine.close()
+        if args.group == "config":
+            # No engine, on purpose: see `config_commands`. With none, nothing
+            # below has a paradigm, a spend, or a connection to stamp, which is
+            # the truth for a verb that opens nothing.
+            from .config_commands import cmd_config
+
+            envelope = cmd_config(args)
+        else:
+            # One engine per process, built from the resolved repo root. The default
+            # backend is what lets the subcommands stay stateless across invocations:
+            # `.dex/` on disk is how the exploration cache and the cumulative session
+            # budget survive from one command to the next, and any backend selected
+            # here has to be durable across processes for the same reason.
+            engine = DexEngine.from_repo(
+                repo_root(args),
+                cache_backend=getattr(args, "cache_backend", None),
+                project_format_name=getattr(args, "project_format", None),
+                connector=getattr(args, "connector", None),
+                path=getattr(args, "path", None),
+                project=getattr(args, "project", None),
+                datasets=getattr(args, "dataset", None),
+                scopes=getattr(args, "scope", None),
+                budget=getattr(args, "budget", None),
+                confirmed=getattr(args, "confirm", False),
+                session_ceiling=getattr(args, "session_ceiling", None),
+                decline_session_ceiling=getattr(args, "no_session_ceiling", False),
+            )
+            try:
+                envelope = dispatch(args, engine)
+            finally:
+                # Unlike an adapter, the paradigm survives a connection that could
+                # not be opened, so this still gives a refusal envelope something
+                # to name; taken in the `finally` so it reflects whatever the
+                # handler resolved, auto-detect included, not just construction.
+                paradigm = engine.paradigm
+                # Best-effort by design: a ledger that cannot be read must not
+                # replace the exception on its way out with a bookkeeping failure,
+                # which would lose the reason the command failed to report a
+                # number about it.
+                with contextlib.suppress(Exception):
+                    spend = engine.settled_spend()
+                connection = engine.connection_provenance()
+                engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
         # loudly in tests and CI rather than shipping a leak.
@@ -983,6 +1003,13 @@ def main(argv: list[str] | None = None) -> int:
     # has nothing to carry.
     if engine is not None and engine.connection_warnings:
         envelope.warnings = list(engine.connection_warnings) + list(envelope.warnings)
+
+    # What the config file says that no command refuses (a key the schema does
+    # not know, a key written twice) rides out on every envelope the same way,
+    # since a typo in a setting is otherwise a setting that silently does
+    # nothing. The config verbs carry their own copy and build no engine.
+    if engine is not None and engine.config is not None:
+        envelope.warnings = list(engine.config.load_warnings) + list(envelope.warnings)
 
     # A config amendment dex performed on the caller's behalf (the answer to the
     # cumulative-ceiling ask, issue #283) rides out the same way, as a diff:

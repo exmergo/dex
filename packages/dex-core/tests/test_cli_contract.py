@@ -54,6 +54,12 @@ def _all_commands() -> list[list[str]]:
                     ]
                 if group == "semantic" and sub == "ossie":
                     argv.append("define")
+                if group == "config":
+                    # No config file there, so every config verb refuses cleanly
+                    # and `set` has nothing it could write to.
+                    if sub == "set":
+                        argv += ["connector", "duckdb"]
+                    argv += ["--repo-root", "missing-dex-fixture-dir"]
                 argvs.append(argv)
         elif group == "demo":
             # The one verb that creates a file. Pointed at a directory that does
@@ -736,6 +742,15 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "command a library caller drives through DexEngine"
         ),
     },
+    **{
+        ("config", sub): {
+            "reason": (
+                "reads the committed .dex/config.yml before an engine can exist "
+                "(config_commands.py); a host holding a DexConfig owns its config"
+            ),
+        }
+        for sub in ("get", "validate", "set")
+    },
 }
 
 # Dests every subcommand inherits from `_sub_connection_options()`, plus
@@ -889,3 +904,50 @@ def test_the_equivalence_flag_pair_reaches_the_engine_as_one_tri_state(
                 "--no-check-equivalence",
             ]
         )
+
+
+# --- the config file, as every command reads it -----------------------------------
+
+
+def _committed(root, text: str) -> None:
+    (root / ".dex").mkdir(parents=True, exist_ok=True)
+    (root / ".dex" / "config.yml").write_text(text, encoding="utf-8")
+
+
+def test_an_invalid_config_refuses_any_command_as_configuration(tmp_path, capsys):
+    """Not `request`, which reads as this call's input being wrong, and not
+    pydantic's text: the setting, its line, and the verb that lists the rest."""
+
+    _committed(
+        tmp_path,
+        "connector: duckdb\nduckdb:\n  path: x.duckdb\nquery:\n  max_rows: lots\n",
+    )
+    rc = main(["--repo-root", str(tmp_path), "connect", "test"])
+    payload = json.loads(capsys.readouterr().out)
+    assert (rc, payload["status"], payload["reason"]) == (1, "error", "configuration")
+    assert "line 5: query.max_rows" in payload["errors"][0]
+    assert "dex config validate" in payload["errors"][0]
+
+
+def test_a_config_that_does_not_parse_is_configuration_not_internal(tmp_path, capsys):
+    _committed(tmp_path, "connector: [\n")
+    main(["--repo-root", str(tmp_path), "connect", "test"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason"] == "configuration"
+
+
+def test_an_unknown_config_key_warns_on_every_command(tmp_path, capsys, duckdb_file):
+    """A typo in a setting is otherwise a setting that silently does nothing."""
+
+    _committed(
+        tmp_path,
+        f"connector: duckdb\nduckdb:\n  path: {duckdb_file}\n"
+        "budget:\n  session_celing: 5\n",
+    )
+    rc = main(["--repo-root", str(tmp_path), "connect", "test"])
+    payload = json.loads(capsys.readouterr().out)
+    assert (rc, payload["status"]) == (0, "ok")
+    assert (
+        ".dex/config.yml line 5: budget.session_celing is not a setting dex reads, "
+        "so it is ignored; did you mean budget.session_ceiling?"
+    ) in payload["warnings"]

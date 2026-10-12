@@ -168,7 +168,11 @@ project with no recorded decision returns `needs_confirmation` naming a
 connector's unit, as a starting point) and a `session_ceiling_hint` spelling out
 both answers. Answer with `--session-ceiling <value>` to set one or
 `--no-session-ceiling` to record that the project runs unbounded. Either answer
-is written to `.dex/config.yml` and nothing asks again in that project.
+is written to `.dex/config.yml` and nothing asks again in that project. The
+answer is an in-place edit of the budget lines, so the file's comments and key
+order survive it, and it is reported as an `update` diff. To set or change the
+ceiling outside the ask, `dex config set budget.session_ceiling <value>` proposes
+the same edit as a diff and writes it on `--confirm`.
 
 The ask is the last check before spend, so an unanswered one has run nothing,
 booked no headroom, and never reached the ledger. The unconfirmed cost ask that
