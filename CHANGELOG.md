@@ -9,6 +9,21 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain check` and `maintain schema` say so when the warehouse read and
+  the baseline cover different datasets** ([#543]). Every object in a dataset
+  the baseline never covered was reported as `table_added`, and every object in
+  a dataset the read no longer lists as `table_dropped`, with nothing saying the
+  block was a difference of scope rather than the warehouse moving: a baseline
+  pinned when the map covered one environment's datasets, then a read that
+  lists another's, diluted the real drift in the same report. Both commands now
+  compare the dataset sets before reporting and carry one warning per
+  direction, naming the datasets and the number of findings they account for,
+  with the re-pin to make if the datasets belong in the baseline. The findings
+  themselves are unchanged, and the count the warning quotes honours the same
+  `<objects>` scope the findings do. Matching scopes add no warning.
+
 ## [1.12.8] - 2026-10-11
 
 ### Fixed

@@ -152,6 +152,88 @@ def test_new_table_is_reported_added(maintain_repo):
     by_code = _by_code(payload)
     assert by_code["table_added"][0]["identifier"] == "warehouse.main.payments"
     assert by_code["table_added"][0]["severity"] == "low"
+    # Same dataset as the baseline: a new table is drift, not a scope artifact.
+    assert not _scope_warnings(payload)
+
+
+def _scope_warnings(payload: dict) -> list[str]:
+    return [w for w in payload["warnings"] if "dataset(s) are in the" in w]
+
+
+def test_a_dataset_outside_the_baselines_scope_is_named_beside_its_findings(
+    maintain_repo,
+):
+    """#543: objects in a dataset the baseline never covered are reported as
+    table_added, correctly, and one warning says the block is a scope
+    difference, naming the dataset and how many findings it accounts for."""
+
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "CREATE SCHEMA staging",
+        "CREATE TABLE staging.stg_a (id INTEGER)",
+        "CREATE TABLE staging.stg_b (id INTEGER)",
+    )
+
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0
+    added = {f["identifier"] for f in _by_code(payload)["table_added"]}
+    assert added == {"warehouse.staging.stg_a", "warehouse.staging.stg_b"}
+    warnings = _scope_warnings(payload)
+    assert len(warnings) == 1, payload["warnings"]
+    assert (
+        "1 dataset(s) are in the warehouse but outside the baseline's scope"
+        in (warnings[0])
+    )
+    assert "(warehouse.staging)" in warnings[0]
+    assert "the 2 object(s) in it are reported as table_added" in warnings[0]
+    assert "maintain snapshot" in warnings[0]
+
+
+def test_a_dataset_gone_from_the_warehouse_is_named_beside_its_table_dropped(
+    maintain_repo,
+):
+    maintain_repo.sql(
+        "CREATE SCHEMA staging",
+        "CREATE TABLE staging.stg_a (id INTEGER)",
+    )
+    # The baseline is pinned from the exploration cache, so the map has to see
+    # the new dataset before the snapshot can cover it.
+    rc, payload = maintain_repo.dex("explore", "map")
+    assert rc == 0 and payload["status"] == "ok"
+    maintain_repo.snapshot()
+    maintain_repo.sql("DROP SCHEMA staging CASCADE")
+
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0
+    dropped = {f["identifier"] for f in _by_code(payload)["table_dropped"]}
+    assert dropped == {"warehouse.staging.stg_a"}
+    warnings = _scope_warnings(payload)
+    assert len(warnings) == 1, payload["warnings"]
+    assert (
+        "1 dataset(s) are in the baseline but not in the warehouse read"
+        in (warnings[0])
+    )
+    assert "(warehouse.staging)" in warnings[0]
+    assert "the 1 object(s) in it are reported as table_dropped" in warnings[0]
+
+
+def test_a_scope_that_excludes_the_mismatched_dataset_gets_no_scope_warning(
+    maintain_repo,
+):
+    """The warning counts what the findings report. A run narrowed to an object
+    in the baseline's own dataset reports no table_added for the new dataset,
+    so it carries no warning about it either."""
+
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "CREATE SCHEMA staging",
+        "CREATE TABLE staging.stg_a (id INTEGER)",
+    )
+
+    rc, payload = maintain_repo.dex("maintain", "schema", "customers")
+    assert rc == 0
+    assert "table_added" not in _by_code(payload)
+    assert not _scope_warnings(payload)
 
 
 def test_orphan_relation_is_flagged_when_model_removed(maintain_repo):

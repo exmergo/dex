@@ -449,6 +449,73 @@ def uncomparable_volume(
     ]
 
 
+def _dataset_of(identifier: str) -> str:
+    """The namespace an identifier sits in: everything before its last segment
+    (BigQuery ``project.dataset``, DuckDB, Snowflake and Postgres
+    ``database.schema``). An identifier with no dot is its own namespace."""
+
+    head, sep, _ = identifier.rpartition(".")
+    return head if sep else identifier
+
+
+def scope_mismatch_warnings(
+    current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
+) -> list[str]:
+    """Datasets the live read and the baseline do not both cover (#543).
+
+    :func:`schema_drift` reports every object in a dataset the baseline never
+    covered as ``table_added``, and every object in a dataset the live read no
+    longer lists as ``table_dropped``. Both are right as comparisons and wrong
+    as diagnoses when the difference is one of scope: a baseline pinned from a
+    map that covered one environment's datasets, then a read that lists
+    another's, is a block of findings that says nothing about the warehouse
+    moving, sitting in the same report as the drift that does. The findings
+    stay, because the comparison did see those objects. This names the datasets
+    behind them and how many findings they account for, so a reader can tell a
+    scope artifact from drift and re-pin if the datasets belong in the baseline.
+
+    ``scope`` narrows the count the way :func:`schema_drift` narrows the
+    findings, so the number quoted is the number reported; a mismatch whose
+    objects all fall outside the scope reports nothing, like the findings.
+    """
+
+    baseline_ids = {d.identifier for d in snap.warehouse.datasets}
+    now_ids = {d.identifier for d in current}
+    baseline_datasets = {_dataset_of(i) for i in baseline_ids}
+    now_datasets = {_dataset_of(i) for i in now_ids}
+
+    def counted(identifiers: set[str], datasets: list[str]) -> int:
+        return sum(
+            1
+            for identifier in identifiers
+            if _dataset_of(identifier) in datasets
+            and (scope is None or identifier in scope)
+        )
+
+    warnings: list[str] = []
+    outside = sorted(now_datasets - baseline_datasets)
+    added = counted(now_ids - baseline_ids, outside)
+    if outside and added:
+        warnings.append(
+            f"{len(outside)} dataset(s) are in the warehouse but outside the "
+            f"baseline's scope ({', '.join(outside)}); the {added} object(s) in "
+            f"{'it' if len(outside) == 1 else 'them'} are reported as table_added. "
+            "Re-pin with `maintain snapshot` after `explore map --full` if they "
+            "belong in the baseline"
+        )
+    gone = sorted(baseline_datasets - now_datasets)
+    dropped = counted(baseline_ids - now_ids, gone)
+    if gone and dropped:
+        warnings.append(
+            f"{len(gone)} dataset(s) are in the baseline but not in the warehouse "
+            f"read ({', '.join(gone)}); the {dropped} object(s) in "
+            f"{'it' if len(gone) == 1 else 'them'} are reported as table_dropped. "
+            "If the dataset was removed, re-pin with `maintain snapshot`; if the "
+            "connector's dataset list was narrowed, widen it or re-pin"
+        )
+    return warnings
+
+
 def volume_drift(
     current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
 ) -> list[DriftFinding]:
