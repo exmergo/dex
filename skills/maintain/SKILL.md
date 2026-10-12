@@ -127,6 +127,18 @@ is not described here.
 
 ### Reconcile proposals
 
+- **On a large `check` report, read the ratio before the findings.** Run
+  `maintain reconcile` and read `mechanical_count` and `advisory_count` beside
+  the finding codes, before the findings list. Mechanical proposals exist only
+  where dex can author the fix itself (the two cases below), so zero of them
+  across hundreds of schema findings, with no `column_dropped`,
+  `column_retyped` or `table_dropped` among the codes, usually means the
+  baseline is behind the project rather than the warehouse having moved: every
+  finding is additive, and most of them are the project's own recent work.
+  Re-baseline with the discipline above (`explore map --full`, then
+  `maintain snapshot`) before triaging findings one by one. A type change is
+  advisory on every format, so read the codes for retypes rather than inferring
+  them from the count.
 - **`mechanical`** (schema drift): re-scaffolds a dex-scaffolded staging model,
   or edits the drifted columns into a declaration. Still a reviewable diff: read
   it for hand-written logic the scaffold cannot know about before applying.
