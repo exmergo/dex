@@ -34,6 +34,35 @@ def test_clean_world_reports_every_axis_clean(maintain_repo):
     assert payload["data"]["axes_run"] == ["grain", "schema", "semantic", "volume"]
 
 
+def test_check_names_a_dataset_the_baseline_never_covered(maintain_repo):
+    """#543: the sweep's schema axis reports every object in a dataset outside
+    the baseline's scope as table_added, and the report says so once, by name,
+    with the number of findings that block accounts for, so a reader can tell
+    a scope difference from the warehouse having moved."""
+
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "CREATE SCHEMA staging",
+        "CREATE TABLE staging.stg_a (id INTEGER)",
+        "CREATE TABLE staging.stg_b (id INTEGER)",
+        "CREATE TABLE staging.stg_c (id INTEGER)",
+    )
+
+    rc, payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0 and payload["status"] == "ok"
+    schema = payload["data"]["axes"]["schema"]
+    assert sorted(f["identifier"] for f in schema["findings"]) == [
+        "warehouse.staging.stg_a",
+        "warehouse.staging.stg_b",
+        "warehouse.staging.stg_c",
+    ]
+    assert {f["code"] for f in schema["findings"]} == {"table_added"}
+    scope_warnings = [w for w in payload["warnings"] if "dataset(s) are in the" in w]
+    assert len(scope_warnings) == 1, payload["warnings"]
+    assert "(warehouse.staging)" in scope_warnings[0]
+    assert "the 3 object(s) in it are reported as table_added" in scope_warnings[0]
+
+
 def test_check_sweeps_all_axes_and_ranks_by_blast_radius(maintain_repo):
     maintain_repo.snapshot()
     maintain_repo.sql(

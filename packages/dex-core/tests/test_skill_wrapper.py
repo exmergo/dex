@@ -57,39 +57,71 @@ def test_the_three_wrappers_stay_byte_identical():
         (["explore", "inventory"], []),
         (["explore", "query", "select 1"], []),
         (["transform", "plan", "add a model"], []),
-        (["maintain", "check"], []),
+        (["maintain", "schema"], []),
+        (["maintain", "reconcile"], []),
+        # dbt semantic authoring reads no Ossie document.
+        (["semantic", "define", "--edits-file", "edits.json"], []),
         # scikit-learn, and only where clustering actually runs.
         (["explore", "cluster", "orders"], ["cluster"]),
+        # jsonschema for every command that can read a native Ossie layer (#536):
+        # whether the layer is Ossie is `semantic.vendor`, in the nested config
+        # the wrapper does not parse, so the extra follows the command.
+        (["semantic", "ossie", "define", "--edits-file", "edits.json"], ["ossie"]),
+        (["semantic", "ossie", "update", "--edits-file", "edits.json"], ["ossie"]),
+        (["semantic", "ossie", "plan", "--edits-file", "edits.json"], ["ossie"]),
+        (["maintain", "semantic"], ["ossie"]),
+        (["maintain", "check"], ["ossie"]),
+        (["maintain", "snapshot"], ["ossie"]),
+        (["--connector", "bigquery", "maintain", "check"], ["ossie"]),
         # `list` renders no statement on either backend, so it never needs
-        # MetricFlow. Bare `explore semantic` is `list`.
-        (["explore", "semantic"], ["semantic-api"]),
-        (["explore", "semantic", "list"], ["semantic-api"]),
-        (["explore", "semantic", "list", "--local"], ["semantic-api"]),
-        (["explore", "semantic", "list", "--api"], ["semantic-api"]),
+        # MetricFlow. Bare `explore semantic` is `list`. It can read an Ossie
+        # layer, so it takes `ossie` as well.
+        (["explore", "semantic"], ["ossie", "semantic-api"]),
+        (["explore", "semantic", "list"], ["ossie", "semantic-api"]),
+        (["explore", "semantic", "list", "--local"], ["ossie", "semantic-api"]),
+        (["explore", "semantic", "list", "--api"], ["ossie", "semantic-api"]),
         # dbt Cloud renders and executes, so --api never needs MetricFlow either.
-        (["explore", "semantic", "values", "user__tier", "--api"], ["semantic-api"]),
-        (["explore", "semantic", "query", "orders", "--api"], ["semantic-api"]),
+        (
+            ["explore", "semantic", "values", "user__tier", "--api"],
+            ["ossie", "semantic-api"],
+        ),
+        (
+            ["explore", "semantic", "query", "orders", "--api"],
+            ["ossie", "semantic-api"],
+        ),
         # A statement rendered here needs the renderer.
         (
             ["explore", "semantic", "values", "user__tier", "--local"],
-            ["semantic-api", "semantic"],
+            ["ossie", "semantic-api", "semantic"],
         ),
         (
             ["explore", "semantic", "query", "orders", "--local"],
-            ["semantic-api", "semantic"],
+            ["ossie", "semantic-api", "semantic"],
         ),
         # No flag means the backend is ambient, and the wrapper does not read the
         # nested config that decides it: both go in, so the command cannot refuse
         # for want of a dependency.
         (
             ["explore", "semantic", "values", "user__tier"],
-            ["semantic-api", "semantic"],
+            ["ossie", "semantic-api", "semantic"],
         ),
-        (["explore", "semantic", "query", "orders"], ["semantic-api", "semantic"]),
+        (
+            ["explore", "semantic", "query", "orders"],
+            ["ossie", "semantic-api", "semantic"],
+        ),
     ],
 )
 def test_the_extras_follow_the_command(wrapper, argv, expected):
     assert wrapper._feature_extras(argv) == expected
+
+
+def test_every_ossie_reading_command_takes_the_ossie_extra(wrapper):
+    """Structural: the table in the wrapper is the claim, and each row of it
+    resolves to the extra whatever flags surround the command (#536)."""
+
+    for group, subcommand in wrapper._OSSIE_READING_COMMANDS:
+        argv = ["--connector", "snowflake", group, subcommand, "--repo-root", "."]
+        assert "ossie" in wrapper._feature_extras(argv), (group, subcommand)
 
 
 def test_the_extras_are_the_connector_plus_whatever_the_command_needs(
@@ -107,8 +139,14 @@ def test_the_extras_are_the_connector_plus_whatever_the_command_needs(
 
     assert wrapper._extras(["explore", "inventory"]) == ["duckdb"]
     assert wrapper._extras(["explore", "cluster", "orders"]) == ["duckdb", "cluster"]
-    assert wrapper._extras(["--connector", "bigquery", "maintain", "check"]) == [
+    assert wrapper._extras(["--connector", "bigquery", "maintain", "schema"]) == [
         "bigquery"
+    ]
+    # `maintain check` can read an Ossie layer, so it takes `ossie` on every
+    # connector, including the one whose own tree happens to carry jsonschema.
+    assert wrapper._extras(["--connector", "bigquery", "maintain", "check"]) == [
+        "bigquery",
+        "ossie",
     ]
     assert wrapper._extras(["--connector", "snowflake", "explore", "cluster", "o"]) == [
         "snowflake",
@@ -123,11 +161,12 @@ def test_a_flag_value_is_never_read_as_the_mode(wrapper):
     that needed the renderer."""
 
     assert wrapper._feature_extras(["explore", "semantic", "--metric", "query"]) == [
-        "semantic-api"
+        "ossie",
+        "semantic-api",
     ]
     assert wrapper._feature_extras(
         ["explore", "semantic", "list", "--for-dimension", "values"]
-    ) == ["semantic-api"]
+    ) == ["ossie", "semantic-api"]
     # And the connection flags still do not shift the group and subcommand.
     assert wrapper._feature_extras(
         ["--connector", "bigquery", "explore", "cluster", "orders"]
