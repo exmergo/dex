@@ -15,7 +15,6 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
-from .envelope import Paradigm
 from .errors import ConfigurationError
 from .storage import DEX_DIR
 
@@ -43,7 +42,6 @@ class Budget(BaseModel):
     should see in a diff.
     """
 
-    paradigm: Paradigm = Paradigm.FREE_LOCAL
     ceiling: float | None = None
     session_ceiling: float | None = None
     session_ceiling_declined: bool = False

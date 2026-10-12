@@ -9,6 +9,19 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Budget.paradigm` is removed; it validated and did nothing** ([#557]). A
+  command's cost paradigm comes from its connector (`connect.paradigm_for`),
+  never from the budget, so the field was accepted, type-checked against the
+  `Paradigm` enum, and then read by nothing: the accepted-and-ignored shape
+  this codebase refuses everywhere else (see the `ClickHouseTarget` deployment
+  checks). A committed `budget.paradigm: bytes_scanned` looked like it declared
+  the project's cost paradigm and changed nothing. The field is gone, and a
+  committed `budget.paradigm` now rides every envelope's `warnings` as an
+  `unknown_key` (`dex config get`/`dex config validate`, [#547]), the same as
+  any other key a later release retired, rather than silently doing nothing.
+
 ## [1.13.1] - 2026-10-13
 
 ### Added

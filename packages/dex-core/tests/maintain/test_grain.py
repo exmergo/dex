@@ -66,7 +66,6 @@ def test_clickhouse_collapsing_engine_note_stays_on_uniqueness_finding(
     from exmergo_dex_core.config import Budget
     from exmergo_dex_core.connect import ConnectionSource
     from exmergo_dex_core.dbt_project import ProjectDefinitions
-    from exmergo_dex_core.envelope import Paradigm
     from exmergo_dex_core.maintain.commands import grain_drift
     from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
 
@@ -93,7 +92,6 @@ def test_clickhouse_collapsing_engine_note_stays_on_uniqueness_finding(
     config = DexConfig(
         connector="clickhouse",
         budget=Budget(
-            paradigm=Paradigm.DB_LOAD,
             ceiling=600.0,
             session_ceiling=None,
         ),

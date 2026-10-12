@@ -9,6 +9,7 @@ import yaml
 
 from exmergo_dex_core.config import (
     BlobOverride,
+    Budget,
     CacheConfig,
     ConventionWarnings,
     DexConfig,
@@ -357,3 +358,26 @@ def test_a_file_that_loaded_before_loads_to_the_same_settings(
     _write(tmp_path, text)
     expected = DexConfig.model_validate(yaml.safe_load(text) or {})
     assert load_config(tmp_path).model_dump() == expected.model_dump()
+
+
+def test_budget_has_no_paradigm_field():
+    # A command's paradigm comes from its connector (connect.paradigm_for),
+    # never from the budget, so the field does not exist to be read (#557).
+    assert "paradigm" not in Budget.model_fields
+
+
+def test_budget_paradigm_loads_and_is_carried_as_an_unknown_key_warning(
+    tmp_path: Path,
+):
+    # `budget.paradigm` used to validate and do nothing: accepted, type-checked
+    # against the `Paradigm` enum, and read by nothing (#557). Removing the
+    # field does not make a config that still sets it fatal -- that would break
+    # every project carrying a key this release retired -- it rides every
+    # envelope's warnings instead, the same as any other key dex no longer reads.
+    _write(tmp_path, "connector: bigquery\nbudget:\n  paradigm: bytes_scanned\n")
+    config = load_config(tmp_path)
+    assert config is not None
+    assert config.load_warnings == [
+        ".dex/config.yml line 3: budget.paradigm is not a setting dex reads, so "
+        "it is ignored"
+    ]

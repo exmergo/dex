@@ -612,7 +612,11 @@ def test_a_value_is_read_the_way_its_field_reads_it(key, text, expected):
 @pytest.mark.parametrize(
     ("key", "match"),
     [
-        ("budget", "set its keys one at a time: budget.paradigm, budget.ceiling"),
+        (
+            "budget",
+            "set its keys one at a time: budget.ceiling, budget.session_ceiling, "
+            "budget.session_ceiling_declined",
+        ),
         ("budget.celing", "did you mean budget.ceiling"),
         ("session_ceiling", "did you mean budget.session_ceiling"),
         ("pii_overrides[0].column", "a list is set as a whole"),
@@ -805,7 +809,6 @@ def test_every_setting_says_where_its_value_came_from():
 
 def test_a_key_narrows_the_rows_to_its_own():
     assert set(_rows(_SOURCED, "budget")) == {
-        "budget.paradigm",
         "budget.ceiling",
         "budget.session_ceiling",
         "budget.session_ceiling_declined",
