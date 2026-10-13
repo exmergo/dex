@@ -9,6 +9,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The daily spend ceiling admits a command on its calibrated estimate**
+  ([#324]). `budget.session_ceiling` already charges the day what commands
+  billed, but each new command's dry-run estimate, an upper bound on a
+  partitioned or clustered warehouse, met the day's remainder raw. On BigQuery a
+  build billed 3.45 GB of a 6.70 GB estimate, and the 8.69 GB `explore map --full`
+  that re-baselining requires on the same day was refused against the 6.55 GB
+  real spending had left, so a project could not be re-baselined on any day it
+  was built.
+
+  - Against the cumulative ceiling, the estimate is now scaled by the worst
+    billed-over-estimated ratio among this connector's last settled commands, the
+    history the over-ceiling refusal already quotes. The re-map above is
+    admitted, since history puts it at about 59% of its estimate.
+  - Unchanged by design: `--budget` still meets the raw estimate, `cost.ceiling`
+    and the cap the warehouse is handed are still the real remainder, and a
+    running command still books its raw estimate.
+  - Calibration only ever loosens the check. With fewer than three settled
+    commands on the connector, a worst ratio at or above 100%, or a ratio of 0,
+    the raw estimate is compared as before. The history is read once per
+    command, outside the admission lock.
+  - A command admitted only because of calibration says so in `warnings`.
+
 ## [1.13.0] - 2026-10-12
 
 ### Changed

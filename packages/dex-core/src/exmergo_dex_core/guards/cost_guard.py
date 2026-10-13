@@ -831,6 +831,16 @@ class CostGate:
         # Nothing is admitted or refused on it, which is why a store without
         # `spend_entries` simply passes None here and loses a sentence.
         self._history = history
+        # The day's ceiling is checked against each command's estimate scaled by
+        # this connector's own settled history (#324). Read once per gate and
+        # cached, before the admission lock rather than inside it, so a ledger
+        # read never makes concurrent commands wait. `_ratio_read` separates
+        # "not read yet" from "read, and there is no usable ratio".
+        self._session_calibration: Calibration | None = None
+        self._ratio_read = False
+        # Whether a command was admitted only because its estimate was
+        # calibrated, so the envelope can say so (see `warnings`).
+        self._admitted_on_calibration = False
         self._estimated = 0.0
         self._billed = 0.0
         self._command_estimate: float | None = None
@@ -1045,6 +1055,79 @@ class CostGate:
         bounds = [b for b in (self.ceiling, remaining_session) if b is not None]
         return min(bounds) if bounds else None
 
+    def session_ratio(self) -> float | None:
+        """The factor an estimate is scaled by before it meets the day's remainder.
+
+        The worst (``high``) billed-over-estimated ratio among this connector's
+        recent settled commands (#324). A dry-run estimate on a partitioned or
+        clustered table is an upper bound, and the cumulative ceiling summed
+        those bounds as if they were bills, so the last command of a working day
+        was refused against headroom that real spending had never touched. The
+        worst observed ratio, not the median, because it never admits a command
+        the project's own history says would not have fit.
+
+        ``None``, meaning the raw estimate is compared as before, wherever the
+        answer would not be honest: no session ceiling, a free connector, no
+        history reader, too few settled commands (the same minimum the refusal's
+        calibration clause uses), a ratio at or above 1 (calibration only ever
+        loosens the daily check, never tightens it), a ratio of 0 (every recent
+        command billed nothing, which says nothing about the next), or a history
+        read that failed.
+
+        Read before the admission lock and cached, so it never holds the lock
+        across a ledger read; a reading a few milliseconds stale is the same
+        reading, since the ratio is a property of the day's history.
+        """
+
+        if not self._ratio_read:
+            self._ratio_read = True
+            if (
+                self.session_ceiling is not None
+                and self.paradigm is not Paradigm.FREE_LOCAL
+                and self._history is not None
+            ):
+                try:
+                    self._session_calibration = calibration_of(
+                        settled_ratios(
+                            self._history(),
+                            connector=self.connector,
+                            field=self.ledger_field(),
+                        )
+                    )
+                except Exception:
+                    # Same reasoning as `_calibrated`: the reader is a backend's
+                    # own code, and an unreadable history is a missing sentence of
+                    # evidence, never a reason to refuse or to admit.
+                    self._session_calibration = None
+        calibration = self._session_calibration
+        if calibration is None or not 0.0 < calibration.high < 1.0:
+            return None
+        return calibration.high
+
+    def admission_ceiling(self) -> float | None:
+        """The bound an estimate is admitted against: :meth:`effective_ceiling`
+        with its session term calibrated.
+
+        ``min(--budget, remaining / ratio)``, which is the same comparison as
+        ``estimate x ratio <= remaining``. The per-command ``--budget`` keeps
+        meeting the raw estimate, since that is the handshake the caller
+        confirmed. Everything that is not admission keeps the raw remainder:
+        :meth:`effective_ceiling` is what ``cost.ceiling`` reports and what
+        :meth:`statement_cap` hands the warehouse, so the day stays bounded
+        physically by what is really left whatever the estimate was scaled by.
+        """
+
+        ratio = self.session_ratio()
+        if ratio is None:
+            return self.effective_ceiling()
+        remaining_session = (
+            max(self.session_ceiling - self.session_spent, 0.0) / ratio
+            if self.session_ceiling is not None and self.session_spent is not None
+            else None
+        )
+        bounds = [b for b in (self.ceiling, remaining_session) if b is not None]
+        return min(bounds) if bounds else None
+
     def preflight_command(self, estimate: float) -> Cost:
         """The confirm handshake, called once per command with the free
         whole-command dry-run total.
@@ -1075,10 +1158,11 @@ class CostGate:
         """
 
         self._command_estimate = estimate
+        self.session_ratio()  # the history read, outside the lock
         try:
             with self._admission():
-                ceiling = self.effective_ceiling()
-                cost = self._cost(estimate, ceiling)
+                ceiling = self.admission_ceiling()
+                cost = self._cost(estimate)
                 if ceiling is not None and estimate > ceiling:
                     raise OverCeilingError(
                         f"estimated cost {estimate} exceeds the ceiling {ceiling} "
@@ -1086,6 +1170,7 @@ class CostGate:
                         "work",
                         cost=cost,
                     )
+                self._note_calibrated_admission(estimate)
                 if self.paradigm is not Paradigm.FREE_LOCAL:
                     if not self.confirmed:
                         raise ConfirmationRequiredError(cost)
@@ -1209,18 +1294,31 @@ class CostGate:
         fit against.
         """
 
+        self.session_ratio()  # the history read, outside the lock
         with self._admission():
-            ceiling = self.effective_ceiling()
+            ceiling = self.admission_ceiling()
             needed = self._estimated + estimate
-            cost = self._cost(needed, ceiling)
+            cost = self._cost(needed)
             if (
                 self.paradigm is not Paradigm.FREE_LOCAL
                 and ceiling is not None
                 and needed > ceiling
             ):
                 raise ConfirmationRequiredError(cost)
+            self._note_calibrated_admission(needed)
             self._reserve_to(needed)
         return cost
+
+    def _note_calibrated_admission(self, estimate: float) -> None:
+        """Remember that ``estimate`` fit only because it was calibrated.
+
+        Called inside admission, after the decision, with the reading the
+        decision was made on.
+        """
+
+        raw = self.effective_ceiling()
+        if raw is not None and estimate > raw:
+            self._admitted_on_calibration = True
 
     def charge(self, estimate: float) -> None:
         """Gate one statement on the confirmed run. Accumulates estimates so a
@@ -1247,22 +1345,25 @@ class CostGate:
         unmeasured_session = (
             self.session_ceiling is not None and self.session_spent is None
         )
+        self.session_ratio()  # the history read, outside the lock
         if unmeasured_session or (self._reserved and needed > self._reserved):
             with self._admission():
                 preflight(
                     needed,
-                    self.effective_ceiling(),
+                    self.admission_ceiling(),
                     paradigm=self.paradigm,
                     confirmed=self.confirmed,
                 )
+                self._note_calibrated_admission(needed)
                 self._reserve_to(needed)
         else:
             preflight(
                 needed,
-                self.effective_ceiling(),
+                self.admission_ceiling(),
                 paradigm=self.paradigm,
                 confirmed=self.confirmed,
             )
+            self._note_calibrated_admission(needed)
         self._estimated = needed
 
     def try_charge(self, estimate: float) -> bool:
@@ -1374,6 +1475,28 @@ class CostGate:
             *unserialized_ledger_warning(
                 self.paradigm, self.session_ceiling, self.serialized
             ),
+            *self._calibrated_admission_warning(),
+        ]
+
+    def _calibrated_admission_warning(self) -> list[str]:
+        """Say so when a command fit the day's ceiling only once calibrated (#324).
+
+        Its raw estimate was above what remains of ``budget.session_ceiling``, and
+        it was admitted because this connector's worst observed ratio puts its
+        likely bill under that remainder. The warehouse cap still binds at the
+        real remainder, which is the part a reader must not lose.
+        """
+
+        calibration = self._session_calibration
+        if not self._admitted_on_calibration or calibration is None:
+            return []
+        return [
+            "admitted against the cumulative ceiling on a calibrated estimate: "
+            "its raw estimate exceeds what remains of budget.session_ceiling "
+            f"today, but the last {calibration.samples} settled {self.connector} "
+            f"commands billed at most {calibration.high:.0%} of estimate, which "
+            "puts it under the remainder. The warehouse is still capped at the "
+            "real remainder, so the day cannot overspend"
         ]
 
     def record_billed(
