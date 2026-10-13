@@ -86,7 +86,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `status: error`. It is now caught per model: that model's grain is reported
   as unmeasured in `notes`, with the server's own words, and every other
   model's grain and every other finding class still run.
-  
+
 - **Nested MetricFlow schema errors identify the offending entity or measure**
   ([#537](https://github.com/exmergo/dex/issues/537),
   [#553](https://github.com/exmergo/dex/pull/553)). An invalid property previously
