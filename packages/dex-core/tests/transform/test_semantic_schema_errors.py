@@ -32,7 +32,12 @@ def nested_validator():
     ("document", "expected_location"),
     [
         (
-            {"entities": [{"name": "seller"}, {"name": "customer", "description": "invalid"}]},
+            {
+                "entities": [
+                    {"name": "seller"},
+                    {"name": "customer", "description": "invalid"},
+                ],
+            },
             "entities[1] ('customer')",
         ),
         (
@@ -56,7 +61,10 @@ def test_nested_schema_errors_identify_named_element(
 def test_model_level_schema_error_stays_unchanged(nested_validator):
     with pytest.raises(EditValidationError) as exc_info:
         _validate_with(
-            nested_validator, {"unexpected": True}, "models/orders.yml", "semantic model 'orders'"
+            nested_validator,
+            {"unexpected": True},
+            "models/orders.yml",
+            "semantic model 'orders'",
         )
 
     assert str(exc_info.value) == (
