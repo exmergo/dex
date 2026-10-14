@@ -950,7 +950,7 @@ def test_the_equivalence_check_is_priced_into_the_one_batch_estimate(
         transform_commands.test_mutations(engine, "fct", check_equivalence=True)
 
     lines = raised.value.request.data["per_table_bytes"]
-    verified = connector in {"bigquery", "snowflake"}
+    verified = connector in {"bigquery", "snowflake", "postgres"}
     assert ("(equivalence self-check)" in lines) is verified
     assert ("(equivalence checks, if every mutant survives)" in lines) is verified
     assert raised.value.request.data["estimated_bytes"] == sum(lines.values())
