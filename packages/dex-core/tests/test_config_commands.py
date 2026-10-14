@@ -69,6 +69,21 @@ def test_validate_fails_on_an_unknown_key_so_it_can_gate_ci(tmp_path, capsys):
     assert problem["fatal"] is False
 
 
+def test_validate_names_a_dbt_project_dir_that_holds_no_project(tmp_path, capsys):
+    _repo(tmp_path, "connector: duckdb\ndbt_project_dir: no_such_dir\n")
+    rc, envelope = _run(capsys, tmp_path, "config", "validate")
+    assert rc == 1
+    (problem,) = envelope["data"]["problems"]
+    assert problem == {
+        "kind": "project_not_found",
+        "key": "dbt_project_dir",
+        "line": 2,
+        "message": "names no_such_dir, which holds no dbt_project.yml",
+        "suggestion": None,
+        "fatal": False,
+    }
+
+
 def test_validate_marks_a_problem_that_stops_every_command(tmp_path, capsys):
     _repo(tmp_path, "query:\n  max_rows: lots\n")
     rc, envelope = _run(capsys, tmp_path, "config", "validate")

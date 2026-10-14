@@ -11,6 +11,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`dex config validate` reports a `dbt_project_dir` that holds no dbt
+  project** ([#590]). A pin to a directory that does not exist, or to one with
+  no `dbt_project.yml`, passed validation, and the mistake surfaced later from
+  whichever command first needed the project, not always as a message about the
+  pin. It is now a non-fatal `project_not_found` problem on the pin's line, so
+  `explore map` and `explore query` still run and every command carries it in
+  `warnings`, the same as an `unknown_key`.
+
 - **`Budget.paradigm` is removed; it validated and did nothing** ([#557]). A
   command's cost paradigm comes from its connector (`connect.paradigm_for`),
   never from the budget, so the field was accepted, type-checked against the

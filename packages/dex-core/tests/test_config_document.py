@@ -730,6 +730,39 @@ def test_a_credential_like_key_is_flagged_and_its_value_never_repeated():
     assert "hunter2" not in problem.describe()
 
 
+def _pinned(root: Path, text: str) -> list[tuple]:
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(text, encoding="utf-8")
+    document = ConfigDocument.read(root / ".dex" / "config.yml")
+    return [(p.kind, p.key, p.line, p.fatal, p.describe()) for p in document.problems()]
+
+
+def test_a_pin_to_a_missing_directory_is_reported_on_its_line(tmp_path: Path):
+    assert _pinned(tmp_path, "connector: duckdb\ndbt_project_dir: no_such_dir\n") == [
+        (
+            "project_not_found",
+            "dbt_project_dir",
+            2,
+            False,
+            "line 2: dbt_project_dir names no_such_dir, which holds no dbt_project.yml",
+        )
+    ]
+
+
+def test_a_pin_to_a_directory_without_dbt_project_yml_is_reported(tmp_path: Path):
+    (tmp_path / "transform").mkdir()
+    (problem,) = _pinned(tmp_path, "dbt_project_dir: transform\n")
+    assert problem[:4] == ("project_not_found", "dbt_project_dir", 1, False)
+
+
+def test_a_pin_to_a_real_project_or_no_pin_is_not_a_problem(tmp_path: Path):
+    (tmp_path / "transform").mkdir()
+    (tmp_path / "transform" / "dbt_project.yml").write_text("name: things\n")
+    assert _pinned(tmp_path, "dbt_project_dir: transform\n") == []
+    (tmp_path / ".dex" / "config.yml").write_text("connector: duckdb\n")
+    assert ConfigDocument.read(tmp_path / ".dex" / "config.yml").problems() == []
+
+
 def test_config_refuses_a_fatal_problem_by_setting_and_line():
     document = ConfigDocument("connector: duckdb\nquery:\n  max_rows: lots\n")
     with pytest.raises(InvalidConfigError) as raised:

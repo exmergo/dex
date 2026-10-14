@@ -57,9 +57,9 @@ ABSENT: Any = object()
 class ConfigProblem:
     """One thing wrong with the file, located by setting and line.
 
-    ``kind`` is ``syntax``, ``invalid``, ``unknown_key``, ``duplicate_key`` or
-    ``secret_like_key``. ``(kind, key, message)`` identifies a problem across
-    edits, because an edit shifts every line below it.
+    ``kind`` is ``syntax``, ``invalid``, ``unknown_key``, ``duplicate_key``,
+    ``secret_like_key`` or ``project_not_found``. ``(kind, key, message)``
+    identifies a problem across edits, because an edit shifts every line below it.
     """
 
     kind: str
@@ -292,12 +292,21 @@ class ConfigDocument:
     Immutable: an edit returns a new document built from the new text, so a
     document always describes exactly the bytes it holds. ``edit_warnings``
     carries what an edit could not keep (comments inside a list it replaced) for
-    the caller to show beside the diff.
+    the caller to show beside the diff. ``repo_root`` is the directory that holds
+    ``.dex/``; without it, a ``dbt_project_dir`` pin is not checked against the
+    filesystem.
     """
 
-    def __init__(self, text: str, *, edit_warnings: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        text: str,
+        *,
+        edit_warnings: list[str] | None = None,
+        repo_root: Path | None = None,
+    ) -> None:
         self.text = text
         self.edit_warnings = list(edit_warnings or [])
+        self.repo_root = repo_root
         self._syntax: ConfigProblem | None = None
         self._root: yaml.Node | None = None
         self._loaded: Any = None
@@ -327,7 +336,7 @@ class ConfigDocument:
     def read(cls, path: Path) -> ConfigDocument:
         # Bytes, not `read_text`: universal newlines would turn a CRLF file into
         # LF, and every edit would then rewrite every line ending in the file.
-        return cls(path.read_bytes().decode("utf-8"))
+        return cls(path.read_bytes().decode("utf-8"), repo_root=path.parent.parent)
 
     def write(self, path: Path) -> None:
         """Replace the file atomically, keeping its permissions.
@@ -634,6 +643,7 @@ class ConfigDocument:
         found = list(self._duplicates)
         self._unknown_keys(self._mapping(), DexConfig, "", found)
         self._credential_keys(self._mapping(), "", found)
+        self._project_pin(self._mapping(), found)
         try:
             DexConfig.model_validate(self._mapping())
         except ValidationError as exc:
@@ -695,6 +705,22 @@ class ConfigDocument:
                 self._credential_keys(
                     entry, f"{prefix.rstrip('.')}[{position}].", found
                 )
+
+    def _project_pin(self, mapping: dict[str, Any], found: list[ConfigProblem]) -> None:
+        # Not fatal, like an unknown key: commands that never open the dbt
+        # project still work, and every command carries the warning.
+        pin = mapping.get("dbt_project_dir")
+        if self.repo_root is None or not isinstance(pin, str) or not pin:
+            return
+        if not (self.repo_root / pin / "dbt_project.yml").is_file():
+            found.append(
+                ConfigProblem(
+                    "project_not_found",
+                    "dbt_project_dir",
+                    f"names {pin}, which holds no dbt_project.yml",
+                    line=self._line_of("dbt_project_dir"),
+                )
+            )
 
     def _invalid(self, error: Any) -> ConfigProblem:
         key = _dotted(error["loc"])
@@ -806,7 +832,11 @@ class ConfigDocument:
                 f"dex could not change {key} in {CONFIG_RELPATH} without guessing "
                 "at the file's layout, so nothing was changed; edit it by hand"
             )
-        return ConfigDocument(text, edit_warnings=[*self.edit_warnings, *warnings])
+        return ConfigDocument(
+            text,
+            edit_warnings=[*self.edit_warnings, *warnings],
+            repo_root=self.repo_root,
+        )
 
     @functools.cached_property
     def _newline(self) -> str:
