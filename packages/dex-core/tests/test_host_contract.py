@@ -119,6 +119,22 @@ def test_each_plan_vector_still_verifies_the_way_it_says(vector):
             )
 
 
+def test_plan_digest_reads_every_form_verify_plan_document_reads():
+    vector = next(v for v in vectors_for("portable-plan") if v["name"] == "plan-valid")
+    document = vector["payload"]
+    forms = {
+        "PortablePlan": host.verify_plan_document(document),
+        "dict": document,
+        "str": json.dumps(document),
+        "bytes": json.dumps(document).encode("utf-8"),
+    }
+    for label, form in forms.items():
+        assert host.plan_digest(form) == vector["expect"]["digest"], label
+
+    with pytest.raises(host.PlanDocumentError):
+        host.plan_digest({"not": "a plan"})
+
+
 def test_the_same_source_state_exports_the_same_digest_from_either_checkout():
     one = next(v for v in vectors_for("portable-plan") if v["name"] == "plan-valid")
     two = next(

@@ -11,6 +11,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`host.plan_digest` reads a plan document as a dict, JSON string or bytes**
+  ([#580]). It accepted only a `PortablePlan`, so the dict that
+  `DexEngine.export_plan(...).plan` returns failed with a builtin
+  `AttributeError`. It now takes the same four forms as `verify_plan_document`,
+  returns the same digest for each, and raises `PlanDocumentError` for input
+  that is not a readable plan. It still runs none of the other checks, so a
+  caller can digest a document it has not verified yet.
+
 - **`Budget.paradigm` is removed; it validated and did nothing** ([#557]). A
   command's cost paradigm comes from its connector (`connect.paradigm_for`),
   never from the budget, so the field was accepted, type-checked against the
