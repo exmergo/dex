@@ -106,7 +106,7 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_INTEGRATION_SA }}
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (bigquery + duckdb + dev extras)
@@ -151,7 +151,7 @@ jobs:
             const token = await core.getIDToken('snowflakecomputing.com')
             core.setSecret(token)
             core.exportVariable('SNOWFLAKE_TOKEN', token)
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (snowflake + duckdb + dev extras)
@@ -253,7 +253,7 @@ jobs:
             const token = (await response.json()).access_token
             core.setSecret(token)
             core.exportVariable('DATABRICKS_TOKEN', token)
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (databricks + duckdb + dev extras)
@@ -292,7 +292,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.DEX_TEST_REDSHIFT_ROLE_ARN }}
           aws-region: ${{ vars.DEX_TEST_REDSHIFT_REGION }}
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (redshift + duckdb + dev extras)
@@ -372,7 +372,7 @@ jobs:
             -c "CREATE DATABASE dex_dogfood"
           PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
             -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (postgres + duckdb + dev extras)
@@ -402,7 +402,7 @@ jobs:
       - name: Start and seed ClickHouse
         working-directory: .
         run: scripts/setup_clickhouse_dev.sh
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (clickhouse + duckdb + dev extras)
@@ -487,7 +487,7 @@ jobs:
         id: preflight
         working-directory: .
         run: scripts/clickhouse_cloud/preflight.sh
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Sync (clickhouse + duckdb + dev extras)

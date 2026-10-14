@@ -20,7 +20,7 @@ jobs:
         working-directory: packages/dex-core
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       # The cloud extras stay in the gate: their safety families importorskip
       # on the client libraries, and a release gate that silently skips
       # safety-critical assertions is a hole, not a speedup.
@@ -78,7 +78,7 @@ jobs:
           # hatch-vcs derives the version from the tag; it needs full history
           # and the tags, which the default shallow checkout omits.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Build sdist + wheel
         run: uv build
       - name: Assert built version matches the tag
@@ -137,7 +137,7 @@ jobs:
         working-directory: ${{ matrix.path }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Reserve the name on PyPI (once; no-op if it already exists)
         env:
           PROJECT: ${{ matrix.project }}
