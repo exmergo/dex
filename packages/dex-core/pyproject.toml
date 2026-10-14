@@ -131,6 +131,28 @@ semantic-api = ["httpx>=0.27"]
 # and never to a silent pass. 4.26 is upstream Ossie's own declared floor for
 # its validator, so dex validates against what upstream validates against.
 ossie = ["jsonschema>=4.26"]
+# SLayer semantic models (`semantic.vendor: slayer`). Pinned to ONE exact release,
+# never a range: SLayer is beta (six releases between Sep 27 and Oct 12, 2026) and
+# its stored model format is versioned (15 at 1.2.0), so a range would let the
+# format dex reads and writes move under it on an ordinary reinstall. Moving the
+# pin is a deliberate act, and `exmergo_dex_core.slayer.dependency.SLAYER_VERSION`
+# has to move with it (a test holds the two equal).
+#
+# The distribution is `motley-slayer`; it imports as `slayer`. The `slayer` name
+# on PyPI is an unrelated project, so never "simplify" this line to it.
+#
+# It self-references [sql], and that adds a ceiling rather than a package: SLayer
+# already depends on sqlglot (>=30.17), and dex's guards cap it (<31). Only
+# 30.17 to 30.x satisfies both, so this extra is the place an install is forced
+# to land inside that overlap instead of pairing dex's guards with a sqlglot they
+# were never run against. The `slayer-sqlglot` CI job resolves the two together,
+# so a bump on either side fails CI rather than a user's install.
+#
+# Heavy on purpose and therefore never in a base install: a base SLayer brings
+# FastAPI, uvicorn, mcp, duckdb, jafgen and tantivy. Nothing outside
+# `exmergo_dex_core.slayer` may import `slayer`, and that module imports it only
+# behind `ensure_available`; a packaging test holds both true.
+slayer = ["motley-slayer==1.2.0", "exmergo-dex-core[sql]"]
 # k-means clustering (`explore cluster`). scikit-learn pulls numpy and scipy, so
 # it is deliberately NOT a base dependency: the light default and the [duckdb]
 # on-ramp stay lean, and this extra is installed only when clustering is actually
@@ -188,7 +210,7 @@ semantic-conformance = ["pytest>=8"]
 # This is the heaviest install there is (seven dbt adapters, MetricFlow, and
 # scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
 all = [
-  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,ossie,postgres,redshift,semantic,semantic-api,snowflake,sql]",
+  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,ossie,postgres,redshift,semantic,semantic-api,slayer,snowflake,sql]",
 ]
 # Contributor tooling, plus the optional libraries the suite exercises directly
 # (the clustering tests need scikit-learn, the firewall tests need the dialect

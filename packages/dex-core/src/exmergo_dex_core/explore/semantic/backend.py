@@ -240,6 +240,15 @@ def resolve_semantic_layer(
         deployment = canonical_semantic_deployment(configured or "local")
 
     build = _BACKENDS.get((vendor, deployment))
+    if build is None and deployment in SEMANTIC_DEPLOYMENTS[vendor]:
+        # A deployment the vendor has, with no runtime dex can drive yet. Said
+        # as that, rather than as a deployment that does not exist, which would
+        # send the reader to change a setting that is already right.
+        raise SemanticBackendError(
+            f"dex has no `explore semantic` backend for semantic vendor "
+            f"'{vendor}' yet; the {vendor} layer is configured, and this command "
+            "cannot read it"
+        )
     if build is None:
         raise SemanticBackendError(
             f"vendor '{vendor}' has no deployment '{deployment}'; use one of "

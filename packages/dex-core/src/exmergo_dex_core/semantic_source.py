@@ -34,7 +34,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from .errors import ConfigurationError
+from .errors import ConfigurationError, DexError
 
 if TYPE_CHECKING:
     from .maintain.snapshot import SemanticLayerSnapshot
@@ -196,9 +196,12 @@ def construct_semantic_source(
 
     try:
         source = factory(context)
-    except ConfigurationError:
-        # The source refused its own coordinates and said why. Re-wrapping would
-        # bury the specific message under a generic one.
+    except DexError:
+        # The source refused in dex's own terms and said why: its coordinates
+        # (a ConfigurationError), or an extra it needs that is not installed (a
+        # prerequisite the caller fixes by installing it). Re-wrapping would bury
+        # the specific message under a generic one, and turn the second into a
+        # configuration problem nobody can fix by editing configuration.
         raise
     except Exception as exc:
         raise ConfigurationError(

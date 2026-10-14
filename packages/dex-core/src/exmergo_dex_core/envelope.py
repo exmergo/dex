@@ -329,7 +329,9 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
 
     # Always safe: no imports of their own (`errors.py`) or explicitly
     # designed to import without the dialect engine (`guards/dialect.py` is
-    # the module that checks whether sqlglot is even installed).
+    # the module that checks whether sqlglot is even installed, and
+    # `slayer/dependency.py` reads distribution metadata rather than importing
+    # SLayer).
     from .demo.warehouse import (
         DemoDependencyError,
         DemoPathError,
@@ -344,12 +346,14 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         WarehouseQueryError,
     )
     from .guards.dialect import DialectDependencyError
+    from .slayer.dependency import SlayerDependencyError
 
     overrides: list[tuple[type[BaseException], Reason]] = [
         (DemoTargetExistsError, Reason.GUARD),
         (DemoDependencyError, Reason.PREREQUISITE),
         (DemoPathError, Reason.REQUEST),
         (DialectDependencyError, Reason.PREREQUISITE),
+        (SlayerDependencyError, Reason.PREREQUISITE),
         (PrerequisiteError, Reason.PREREQUISITE),  # CacheRequiredError, NoBaselineError
         (ConnectorError, Reason.CONNECTION),  # every *ConnectionError subclass
         (ConfigurationError, Reason.CONFIGURATION),
@@ -398,6 +402,7 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         (SemanticQueryRefusedError, Reason.GUARD),  # policy, not backend failure
         (ClusterDependencyError, Reason.PREREQUISITE),  # install the extra, retry
         (DialectDependencyError, Reason.PREREQUISITE),
+        (SlayerDependencyError, Reason.PREREQUISITE),
         (PrerequisiteError, Reason.PREREQUISITE),
         (CostGuardError, Reason.GUARD),  # OverCeilingError, CeilingRequiredError
         (BudgetExhaustedError, Reason.GUARD),

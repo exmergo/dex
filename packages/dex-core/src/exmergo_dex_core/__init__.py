@@ -108,6 +108,7 @@ _EXPORTS = {
     "ScaffoldError": "transform.scaffold",
     "ScaffoldPrerequisiteError": "transform.scaffold",
     "ScopeError": "connect",
+    "SlayerDependencyError": "slayer.dependency",
     "SemanticBackendError": "explore.semantic",
     "SemanticLayerError": "explore.semantic",
     "SemanticQueryRefusedError": "explore.semantic",
@@ -190,6 +191,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         Result,
         to_envelope,
     )
+    from .slayer.dependency import SlayerDependencyError
     from .storage import (
         CacheUnreadableError,
         Document,
@@ -283,6 +285,7 @@ __all__ = [
     "SemanticQueryRefusedError",
     "SemanticSource",
     "SessionCeilingDecisionRequiredError",
+    "SlayerDependencyError",
     "Snapshot",
     "SourcesFileError",
     "SpendHistory",

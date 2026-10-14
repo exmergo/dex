@@ -368,7 +368,7 @@ def test_cached_authoring_validation_runs_no_warehouse_query(
     write, which is a different command than the one the caller ran.
     """
 
-    from exmergo_dex_core.transform.native_semantic import semantic_ossie
+    from exmergo_dex_core.transform.native_semantic import semantic_native
     from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 
     content = (tmp_path / "layer.ossie.yaml").read_text(encoding="utf-8")
@@ -380,6 +380,6 @@ def test_cached_authoring_validation_runs_no_warehouse_query(
 
     with ossie_bq() as engine:
         fake_bq_client.query_calls.clear()
-        semantic_ossie(engine, "revise the layer", [edit], mode="plan")
+        semantic_native(engine, "ossie", "revise the layer", [edit], mode="plan")
 
     assert fake_bq_client.query_calls == []

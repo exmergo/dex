@@ -26,6 +26,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
+from ..edits import SemanticEditValidation
 from ..errors import ConfigurationError, ProjectError, RepoRootRequiredError
 from . import catalog as catalog_mod
 from .loader import DOCUMENT_SUFFIXES, LoadResult, OssieDependencyError, load_documents
@@ -211,6 +212,21 @@ class OssieSemanticLayer:
         from .authoring import write_edits
 
         return write_edits(self, edits, confirmed=confirmed)
+
+    def validate_semantic_edits(
+        self, edits: Any, mode: str, *, cache: Any = None
+    ) -> SemanticEditValidation:
+        """Validate the prospective configured documents as Ossie."""
+
+        from .authoring import validate_plan
+
+        classification, notes, warnings = validate_plan(self, edits, mode, cache=cache)
+        return SemanticEditValidation(
+            defined=classification["defined"],
+            updated=classification["updated"],
+            notes=notes,
+            warnings=warnings,
+        )
 
     def _load(self) -> LoadResult:
         if self._loaded is None:

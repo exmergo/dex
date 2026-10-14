@@ -159,9 +159,32 @@ def _canonical(plan: PortablePlan) -> str:
     )
 
 
-def plan_digest(plan: PortablePlan) -> str:
-    """``sha256:<hex>`` over the plan's canonical form."""
+def _read_document(
+    document: PortablePlan | dict[str, Any] | str | bytes,
+) -> PortablePlan:
+    """The document as a fresh :class:`PortablePlan`, its shape the only check."""
 
+    if isinstance(document, PortablePlan):
+        return document.model_copy(deep=True)
+    try:
+        return (
+            PortablePlan.model_validate_json(document)
+            if isinstance(document, (str, bytes))
+            else PortablePlan.model_validate(document)
+        )
+    except Exception as exc:
+        raise PlanDocumentError(f"not a readable plan document: {exc}") from exc
+
+
+def plan_digest(plan: PortablePlan | dict[str, Any] | str | bytes) -> str:
+    """``sha256:<hex>`` over the plan's canonical form.
+
+    Takes the same four forms as :func:`verify_plan_document` and runs none of its
+    checks, so a caller can digest a document it has not verified yet.
+    """
+
+    if not isinstance(plan, PortablePlan):
+        plan = _read_document(plan)
     return "sha256:" + hashlib.sha256(_canonical(plan).encode("utf-8")).hexdigest()
 
 
@@ -233,17 +256,7 @@ def verify_plan_document(
     Pydantic is the only parser reached here. No YAML, no jinja, no SQL, no dbt.
     """
 
-    if isinstance(document, PortablePlan):
-        plan = document.model_copy(deep=True)
-    else:
-        try:
-            plan = (
-                PortablePlan.model_validate_json(document)
-                if isinstance(document, (str, bytes))
-                else PortablePlan.model_validate(document)
-            )
-        except Exception as exc:
-            raise PlanDocumentError(f"not a readable plan document: {exc}") from exc
+    plan = _read_document(document)
 
     if plan.schema_version != PLAN_DOCUMENT_SCHEMA_VERSION:
         raise PlanDocumentError(

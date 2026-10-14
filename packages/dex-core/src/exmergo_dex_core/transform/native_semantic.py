@@ -38,46 +38,43 @@ if TYPE_CHECKING:
 MODES = ("define", "update", "plan")
 
 
-def semantic_ossie(
-    engine: DexEngine, intent: str, edits: list[PlanEdit], *, mode: str
+def semantic_native(
+    engine: DexEngine, vendor: str, intent: str, edits: list[PlanEdit], *, mode: str
 ) -> PlanResult:
-    """Author configured native Ossie documents without involving dbt."""
+    """Author the configured vendor's native documents without involving dbt.
+
+    ``vendor`` is the one the caller named, as ``semantic <vendor>`` spells it,
+    and it has to be the configured one. Validation belongs to the layer, so
+    nothing here knows what any vendor's documents look like.
+    """
 
     if mode not in MODES:
-        raise ValueError(f"unknown semantic ossie mode '{mode}'")
+        raise ValueError(f"unknown semantic {vendor} mode '{mode}'")
+    require_configured_vendor(engine, vendor)
     if not edits:
         raise ValueError(
-            f"semantic ossie {mode} needs content: pass --edits-file <path|-> "
-            "with whole configured Ossie documents"
+            f"semantic {vendor} {mode} needs content: pass --edits-file <path|-> "
+            "with whole configured documents"
         )
     wrong = [e.path for e in edits if e.kind is not EditKind.SEMANTIC_DOCUMENT]
     if wrong:
         raise ValueError(
-            f"semantic ossie {mode} takes only semantic_document edits; got "
+            f"semantic {vendor} {mode} takes only semantic_document edits; got "
             "other kinds for: " + ", ".join(wrong)
         )
     deleted = [e.path for e in edits if e.op is EditOp.DELETE]
     if deleted:
         raise ValueError(
-            f"semantic ossie {mode} authors content and does not delete: "
+            f"semantic {vendor} {mode} authors content and does not delete: "
             + ", ".join(deleted)
         )
 
     layer = engine.semantic_catalog_source()
     if not isinstance(layer, SemanticEditTarget):
-        # The vendor, not the class: the caller configured a vendor name and that
-        # is the line they would edit. A class name would send someone reading
-        # this into the engine looking for a setting that is not there.
-        named = getattr(engine.config.semantic, "vendor", None) or "dbt"
-        raise ValueError(
-            f"the configured '{named}' semantic layer does not support native "
-            "semantic-document authoring; configure `semantic.vendor: ossie`"
-        )
+        raise ValueError(_unsupported(vendor))
 
-    from ..ossie.authoring import validate_plan
-
-    classification, validation_notes, validation_warnings = validate_plan(
-        layer, edits, mode, cache=readable_cache(engine.store)
+    validation = layer.validate_semantic_edits(
+        edits, mode, cache=readable_cache(engine.store)
     )
     repo_root = engine.require_repo_root("storing a native semantic plan")
     stored, diffs, plan_warnings = plans_mod.plan(
@@ -96,17 +93,69 @@ def semantic_ossie(
             stored.plan_id
         ),
         diffs=diffs,
-        notes=validation_notes,
-        warnings=[*plan_warnings, *validation_warnings],
-        defined=classification["defined"],
-        updated=classification["updated"],
+        notes=validation.notes,
+        warnings=[*plan_warnings, *validation.warnings],
+        defined=validation.defined,
+        updated=validation.updated,
     )
 
 
-def cmd_semantic_ossie(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+def require_configured_vendor(engine: DexEngine, vendor: str) -> None:
+    """Refuse ``semantic <vendor>`` unless ``vendor`` is the configured one.
+
+    Read off the configuration alone, so the refusal comes before the edits
+    payload or any semantic document is read: a repository has one semantic
+    layer, and authoring another vendor's documents into it is a mistake to name
+    rather than a plan to validate.
+    """
+
+    configured = configured_vendor(engine)
+    if vendor == configured:
+        return
+    if configured in _authoring_vendors():
+        raise ValueError(
+            f"`semantic {vendor}` authors a {vendor} semantic layer, and this "
+            f"repository's `semantic.vendor` is '{configured}': use "
+            f"`semantic {configured}`, or configure `semantic.vendor: {vendor}` "
+            "if the layer has moved"
+        )
+    raise ValueError(
+        f"`semantic {vendor}` authors a {vendor} semantic layer, and "
+        + _unsupported(configured)
+    )
+
+
+def configured_vendor(engine: DexEngine) -> str:
+    # The vendor, not the source's class: the caller configured a vendor name
+    # and that is the line they would edit. Already defaulted and lowercased by
+    # `SemanticConfig`, so nothing here restates which vendor is the default.
+    return engine.config.semantic.vendor
+
+
+def _authoring_vendors() -> tuple[str, ...]:
+    # Read per call rather than imported by value, so the table is the one
+    # source of the list a refusal names.
+    from .. import config
+
+    return config.SEMANTIC_DOCUMENT_AUTHORING
+
+
+def _unsupported(vendor: str) -> str:
+    supported = ", ".join(_authoring_vendors()) or "none"
+    return (
+        f"the configured '{vendor}' semantic layer does not support native "
+        "semantic-document authoring; `semantic.vendor` values that do: " + supported
+    )
+
+
+def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    vendor = args.subcommand
     try:
-        result = semantic_ossie(
+        # Before the payload, so a mismatch is refused without reading a file.
+        require_configured_vendor(engine, vendor)
+        result = semantic_native(
             engine,
+            vendor,
             getattr(args, "argument", None) or "",
             edits_from_payload(
                 getattr(args, "edits_file", None),

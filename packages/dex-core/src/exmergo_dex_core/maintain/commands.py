@@ -202,6 +202,10 @@ def _semantic_layer(
         source = engine.semantic_catalog_source()
         if isinstance(source, SemanticSnapshotSource):
             return source.semantic_layer()
+        # Declined, and the configured vendor is still the one semantic layer:
+        # falling through to the project would fingerprint the MetricFlow layer
+        # the vendor replaced, and report its drift as this one's.
+        return None
     if project is None:
         return None
     return project.semantic_layer()

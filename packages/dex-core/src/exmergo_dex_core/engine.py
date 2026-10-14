@@ -1491,14 +1491,25 @@ class DexEngine:
             self, intent, edits, definitions=definitions, no_parse=no_parse
         )
 
-    def semantic_ossie(
-        self, mode: str, intent: str, edits: list[PlanEdit]
+    def semantic_native(
+        self, vendor: str, mode: str, intent: str, edits: list[PlanEdit]
     ) -> PlanResult:
-        """Plan native semantic-document edits on the semantic-layer axis."""
+        """Plan native semantic-document edits on the semantic-layer axis.
+
+        ``vendor`` must be the configured ``semantic.vendor``, and its layer
+        validates the edits in its own format.
+        """
 
         from .transform import native_semantic
 
-        return native_semantic.semantic_ossie(self, intent, edits, mode=mode)
+        return native_semantic.semantic_native(self, vendor, intent, edits, mode=mode)
+
+    def semantic_ossie(
+        self, mode: str, intent: str, edits: list[PlanEdit]
+    ) -> PlanResult:
+        """`semantic ossie`: :meth:`semantic_native` for a native Ossie layer."""
+
+        return self.semantic_native("ossie", mode, intent, edits)
 
     # --- lifecycle ------------------------------------------------------------
 

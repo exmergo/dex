@@ -51,9 +51,15 @@ for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
 `[postgres]`, `[redshift]`, `[clickhouse]`, or `[all]` for every optional capability at once.
 Capabilities that are not a warehouse carry their own extras: `[semantic]` and
 `[semantic-api]` for the local and hosted dbt semantic-layer query backends,
-`[ossie]` for reading native Apache Ossie documents out of the repository, and
-`[cluster]` for `explore cluster`. `[ossie]` needs no connector and no warehouse,
-because a native semantic layer is files in the repository. The shipped wrapper pins
+`[ossie]` for reading native Apache Ossie documents out of the repository,
+`[slayer]` for `semantic.vendor: slayer` (SLayer model files in the repository,
+pinned to one exact SLayer release because its model format moves between
+releases), and `[cluster]` for `explore cluster`. `[ossie]` needs no connector and
+no warehouse, because a native semantic layer is files in the repository. The
+shipped wrapper takes `[slayer]` for `semantic slayer`, and for a `maintain`
+command only where `semantic.vendor` is `slayer`, since it is the heaviest extra
+there is; without it a SLayer-configured command refuses with
+`reason: prerequisite`, naming the install. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
 connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
 found by walking up from the run directory to the git root, then DuckDB), so a

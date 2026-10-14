@@ -37,8 +37,9 @@ exmergo-dex-core[all]          # every optional capability at once
 Some capabilities sit behind their own extras rather than a connector's:
 `[semantic]` and `[semantic-api]` for the local and hosted semantic-layer query
 backends, `[ossie]` for reading native Apache Ossie semantic documents out of the
-repository, and `[cluster]` for `explore cluster`. `[all]` covers all of these
-too.
+repository, `[slayer]` for SLayer semantic models (`semantic.vendor: slayer`,
+pinned to exactly one SLayer release), and `[cluster]` for `explore cluster`.
+`[all]` covers all of these too.
 
 Two of them stand alone, and for different reasons. `[semantic-api]` needs no
 connector, no dbt-core, and no SQL parser, because dbt Cloud owns the warehouse

@@ -154,6 +154,82 @@ def test_the_extras_are_the_connector_plus_whatever_the_command_needs(
     ]
 
 
+# SLayer is too heavy to install on a guess, so it is the one extra that follows
+# the config: `semantic slayer` always, and a `maintain` command only where
+# `semantic.vendor` is `slayer` (#596).
+@pytest.mark.parametrize(
+    ("argv", "vendor", "expected"),
+    [
+        (["semantic", "slayer", "define", "--edits-file", "e.json"], None, ["slayer"]),
+        (["semantic", "slayer", "plan"], "dbt", ["slayer"]),
+        (["maintain", "check"], "slayer", ["ossie", "slayer"]),
+        (["maintain", "snapshot"], "slayer", ["ossie", "slayer"]),
+        (["maintain", "semantic"], "slayer", ["ossie", "slayer"]),
+        (["maintain", "grain"], "slayer", ["slayer"]),
+        (["maintain", "reconcile"], "slayer", ["slayer"]),
+        (["--connector", "bigquery", "maintain", "schema"], "slayer", ["slayer"]),
+        # Never on a guess: no vendor, or another one, installs no SLayer.
+        (["maintain", "check"], None, ["ossie"]),
+        (["maintain", "check"], "ossie", ["ossie"]),
+        (["maintain", "check"], "dbt", ["ossie"]),
+        # Outside `maintain`, the vendor alone installs nothing.
+        (["explore", "inventory"], "slayer", []),
+        (["transform", "plan", "x"], "slayer", []),
+    ],
+)
+def test_the_slayer_extra_follows_the_configured_vendor(
+    wrapper, argv, vendor, expected
+):
+    assert wrapper._feature_extras(argv, vendor) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("semantic:\n  vendor: slayer\n", "slayer"),
+        ("connector: duckdb\nsemantic:\n    vendor: 'SLayer'  # pinned\n", "slayer"),
+        (
+            "semantic:\n  slayer:\n    base_dir: s\n    vendor: nope\n"
+            "  vendor: slayer\n",
+            "slayer",
+        ),
+        ('semantic:  # the layer\n  vendor: "ossie"\n', "ossie"),
+        # A `vendor:` that is not semantic's own child is not semantic.vendor.
+        ("semantic:\n  slayer:\n    vendor: slayer\n", None),
+        ("duckdb:\n  vendor: slayer\nsemantic:\n  deployment: local\n", None),
+        ("vendor: slayer\n", None),
+        # Flow style is not read; the engine refuses by name instead.
+        ("semantic: {vendor: slayer}\n", None),
+        ("", None),
+    ],
+)
+def test_the_vendor_is_read_from_the_nested_block(wrapper, tmp_path, text, expected):
+    config = tmp_path / "config.yml"
+    config.write_text(text, encoding="utf-8")
+    assert wrapper._semantic_vendor_from_config(config) == expected
+
+
+def test_extras_read_the_vendor_from_the_walked_up_config(
+    wrapper, tmp_path, monkeypatch
+):
+    """The vendor comes from the same file the connector does, found the same
+    way, so a run from a subdirectory installs what the project needs."""
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: snowflake\nsemantic:\n  vendor: slayer\n"
+        "  slayer:\n    base_dir: s\n    models: [models/w/o.yaml]\n",
+        encoding="utf-8",
+    )
+    nested = tmp_path / "models" / "staging"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+
+    assert wrapper._extras(["maintain", "check"]) == ["snowflake", "ossie", "slayer"]
+    assert wrapper._extras(["explore", "inventory"]) == ["snowflake"]
+
+
 def test_a_flag_value_is_never_read_as_the_mode(wrapper):
     """The peek has to consume value-taking flags, or `--metric query` reads as
     `explore semantic query` and installs MetricFlow for a catalog read. Worse in

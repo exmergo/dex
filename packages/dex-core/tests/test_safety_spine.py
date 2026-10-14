@@ -7496,7 +7496,7 @@ def test_reading_an_ossie_layer_opens_no_warehouse_connection(
     warehouse staleness forward rather than laundering it into a measurement.
     """
 
-    from exmergo_dex_core.transform.native_semantic import semantic_ossie
+    from exmergo_dex_core.transform.native_semantic import semantic_native
     from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 
     _ossie_billed_repo(tmp_path, session_ceiling=float(1024 * 1024 * 1024))
@@ -7506,8 +7506,9 @@ def test_reading_an_ossie_layer_opens_no_warehouse_connection(
 
     with engine:
         assert engine.semantic_list().catalog.view.semantic_models
-        semantic_ossie(
+        semantic_native(
             engine,
+            "ossie",
             "revise the layer",
             [
                 PlanEdit(

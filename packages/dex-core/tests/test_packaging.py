@@ -342,7 +342,7 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
         "import duckdb, google.cloud.bigquery, snowflake.connector, psycopg;"
         "import redshift_connector, databricks.sql, sklearn, httpx, metricflow;"
         "import clickhouse_connect;"
-        "import sqlglot;"
+        "import sqlglot, slayer.core.models;"
         "import dbt.adapters.duckdb, dbt.adapters.bigquery, dbt.adapters.snowflake;"
         "import dbt.adapters.postgres, dbt.adapters.redshift, dbt.adapters.databricks;"
         "import dbt.adapters.clickhouse;"
@@ -1456,7 +1456,7 @@ def test_a_base_install_imports_no_reader_and_no_optional_dependency(wheel: str)
     done = _run_isolated(
         wheel,
         "import exmergo_dex_core, sys\n"
-        "watched = ('jsonschema', 'sqlglot', 'dbt', 'metricflow')\n"
+        "watched = ('jsonschema', 'sqlglot', 'dbt', 'metricflow', 'slayer')\n"
         "print(sorted({m.split('.')[0] for m in sys.modules "
         "if m.startswith(watched)}))\n"
         "assert 'exmergo_dex_core.ossie' not in sys.modules\n",
@@ -1636,3 +1636,95 @@ def test_the_semantic_source_contract_needs_only_a_test_runner(wheel: str):
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip() == "[]"
+
+
+# --- the SLayer install boundary, from an actual wheel -------------------------
+#
+# `[slayer]` is heavy (FastAPI, uvicorn, mcp, duckdb, jafgen, tantivy), so the
+# promise is two-sided: a base install never imports it and refuses by name when
+# the configuration asks for it, and the extra installs exactly the pinned
+# release beside a sqlglot dex's guards accept.
+
+SLAYER_CONFIG = """connector: duckdb
+semantic:
+  vendor: slayer
+  slayer:
+    base_dir: semantics/slayer
+    models:
+      - models/warehouse/orders.yaml
+"""
+
+
+def _slayer_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "slayer_repo"
+    (root / ".dex").mkdir(parents=True)
+    (root / ".dex" / "config.yml").write_text(SLAYER_CONFIG, encoding="utf-8")
+    return root
+
+
+def test_a_base_install_refuses_slayer_by_name_and_imports_none_of_it(
+    wheel: str, tmp_path: Path
+):
+    """`vendor: slayer` with no extra is a prerequisite naming the install, not
+    an ImportError, and getting there imports nothing of SLayer's."""
+
+    root = _slayer_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import sys\n"
+        "from exmergo_dex_core import DexEngine, SlayerDependencyError\n"
+        "from exmergo_dex_core.envelope import Reason, reason_for\n"
+        f"engine = DexEngine.from_repo({str(root)!r})\n"
+        "assert engine.config.semantic.slayer.models\n"
+        "try:\n"
+        "    engine.semantic_catalog_source()\n"
+        "except SlayerDependencyError as exc:\n"
+        "    assert 'exmergo-dex-core[slayer]' in str(exc), exc\n"
+        "    assert reason_for(exc) is Reason.PREREQUISITE\n"
+        "    print('refused')\n"
+        "assert not [m for m in sys.modules if m.split('.')[0] == 'slayer']\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "refused"
+
+
+def test_config_validate_reads_a_slayer_block_on_a_base_install(
+    wheel: str, tmp_path: Path
+):
+    root = _slayer_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'config', 'validate'], "
+        "capture_output=True, text=True).stdout\n"
+        "print(json.loads(out)['status'])\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
+def test_the_slayer_extra_installs_the_pinned_release_inside_the_dialect_bounds(
+    wheel: str, tmp_path: Path
+):
+    root = _slayer_repo(tmp_path)
+    floor = _declared_sqlglot_floor()
+    done = _run_isolated(
+        wheel,
+        "import sqlglot, slayer.core.models\n"
+        "from importlib.metadata import version\n"
+        "from exmergo_dex_core import DexEngine\n"
+        "from exmergo_dex_core.slayer import SLAYER_VERSION, ensure_available\n"
+        "ensure_available()\n"
+        "assert version('motley-slayer') == SLAYER_VERSION\n"
+        "v = tuple(int(p) for p in sqlglot.__version__.split('.')[:2])\n"
+        f"assert {tuple(int(p) for p in floor.split('.')[:2])!r} <= v < (31, 0), v\n"
+        f"source = DexEngine.from_repo({str(root)!r}).semantic_catalog_source()\n"
+        "print(type(source).__name__)\n",
+        extras=["slayer"],
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "SlayerSemanticLayer"

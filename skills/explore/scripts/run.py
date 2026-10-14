@@ -132,6 +132,41 @@ def _connector_from_config(config_path: Path) -> str | None:
     return None
 
 
+def _semantic_vendor_from_config(config_path: Path) -> str | None:
+    """Read `semantic.vendor` from .dex/config.yml, stdlib only.
+
+    The one nested key this bootstrap reads, because it is the one that decides an
+    extra too heavy to install on a guess (see `_SLAYER_COMMANDS`). Block style
+    only: the first-level child `vendor:` under an unindented `semantic:` line.
+    Anything else, a flow mapping included, reads as unset, which installs no
+    SLayer and lets the engine refuse by name with the install line.
+    """
+
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    inside = False
+    child_indent = None
+    for line in text.splitlines():
+        body = line.split("#", 1)[0].rstrip()
+        if not body.strip():
+            continue
+        indent = len(body) - len(body.lstrip(" "))
+        if indent == 0:
+            inside = body == "semantic:"
+            child_indent = None
+            continue
+        if not inside:
+            continue
+        if child_indent is None:
+            child_indent = indent
+        if indent == child_indent and body.lstrip().startswith("vendor:"):
+            value = body.split(":", 1)[1].strip().strip("'\"").lower()
+            return value or None
+    return None
+
+
 def _find_config(start: Path) -> Path | None:
     """Nearest ancestor `.dex/config.yml` at or above `start`, mirroring the
     engine's resolution: walk up to the enclosing git repo (the ceiling), and
@@ -170,6 +205,19 @@ def _resolve_connector(argv: list[str], cwd: Path) -> str:
         if config_path is not None:
             connector = _connector_from_config(config_path)
     return connector if connector in _KNOWN_CONNECTORS else _DEFAULT_CONNECTOR
+
+
+def _resolve_semantic_vendor(argv: list[str], cwd: Path) -> str | None:
+    """The configured `semantic.vendor`, from the same walked-up .dex/config.yml
+    the connector comes from, or None where nothing says."""
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--repo-root", default=".")
+    known, _ = parser.parse_known_args(argv)
+    config_path = _find_config(cwd / known.repo_root)
+    if config_path is None:
+        return None
+    return _semantic_vendor_from_config(config_path)
 
 
 # Every value-taking flag this peek has to consume, so a flag's *value* is never
@@ -217,6 +265,17 @@ _OSSIE_READING_COMMANDS = (
 )
 
 
+# SLayer is the opposite trade. Its extra brings FastAPI, uvicorn, mcp, duckdb,
+# jafgen and tantivy, far too much to install on every `maintain` run of every
+# repository, so it follows the config instead: `semantic slayer` always takes it,
+# and a `maintain` command takes it only where `semantic.vendor` is `slayer`
+# (read by `_semantic_vendor_from_config`). Where the read misses, the engine
+# refuses by name with the install line rather than failing on an import.
+_SLAYER_COMMANDS = (("semantic", "slayer"),)
+_SLAYER_BACKED_GROUPS = ("maintain",)
+_SLAYER_VENDOR = "slayer"
+
+
 def _positionals(argv: list[str]) -> list[str]:
     """The bare tokens of an invocation: group, subcommand, and whatever follows.
 
@@ -231,7 +290,7 @@ def _positionals(argv: list[str]) -> list[str]:
     return [tok for tok in remaining if not tok.startswith("-")]
 
 
-def _feature_extras(argv: list[str]) -> list[str]:
+def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     """The extras this invocation needs on top of the connector's.
 
     Two commands need more than a warehouse client, and both are resolved from the
@@ -252,6 +311,10 @@ def _feature_extras(argv: list[str]) -> list[str]:
     The same rule gives every command in `_OSSIE_READING_COMMANDS` the `ossie`
     extra: whether the layer is native Ossie is `semantic.vendor`, in that same
     nested block, so the extra follows the command rather than the config.
+
+    `slayer` is the exception that does read `vendor`, the configured
+    `semantic.vendor`, because it is too heavy to take on a guess (see
+    `_SLAYER_COMMANDS`).
     """
 
     positionals = _positionals(argv)
@@ -259,6 +322,11 @@ def _feature_extras(argv: list[str]) -> list[str]:
     if command == ("explore", "cluster"):
         return ["cluster"]
     extras = ["ossie"] if command in _OSSIE_READING_COMMANDS else []
+    group = command[0] if command else None
+    if command in _SLAYER_COMMANDS or (
+        vendor == _SLAYER_VENDOR and group in _SLAYER_BACKED_GROUPS
+    ):
+        extras.append("slayer")
     if command != ("explore", "semantic"):
         return extras
     mode = positionals[2] if len(positionals) > 2 else "list"
@@ -289,7 +357,11 @@ def _extras(argv: list[str]) -> list[str]:
     Warm-up and a real run both resolve here, on the same argv, which is what stops
     a warmed environment from disagreeing with the one the next command asks for."""
 
-    return [_resolve_connector(argv, Path.cwd()), *_feature_extras(argv)]
+    cwd = Path.cwd()
+    return [
+        _resolve_connector(argv, cwd),
+        *_feature_extras(argv, _resolve_semantic_vendor(argv, cwd)),
+    ]
 
 
 def _uv_run(engine_spec: list[str], tail: list[str]) -> list[str]:

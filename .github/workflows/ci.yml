@@ -99,6 +99,38 @@ jobs:
           uv run --no-sync python -c "import sqlglot; print('testing sqlglot', sqlglot.__version__)"
           uv run --no-sync pytest -q -m "not packaging"
 
+  # SLayer and dex's guards both bound sqlglot: the pinned SLayer release needs
+  # >=30.17 and the [sql] extra caps it <31, so only 30.17 to 30.x satisfies both.
+  # The [slayer] extra self-references [sql] so every install lands in that
+  # overlap, and this job is what notices when it stops existing: a SLayer pin
+  # bump that raises its floor, or a [sql] ceiling or floor that moves away from
+  # it. Either way the two no longer resolve together, and that has to fail here
+  # rather than on a user's `pip install`.
+  #
+  # Not advisory, unlike the canary above: both ranges are ones this repository
+  # declares, so a red run is something this change did, never an upstream
+  # surprise. The fresh resolve reads pyproject.toml rather than uv.lock, which is
+  # the point of it (a lock can only show that one pair once resolved); the locked
+  # sync then runs the SLayer tests that skip everywhere the extra is absent.
+  slayer-sqlglot:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - name: Resolve [sql,slayer] fresh from the declared ranges
+        run: |
+          uv run --isolated --no-project --with ".[sql,slayer]" python -c \
+            "import sqlglot, slayer.core.models; from importlib.metadata import version; print('sqlglot', sqlglot.__version__, 'motley-slayer', version('motley-slayer'))"
+      - name: Sync (sql + slayer + dev extras)
+        run: uv sync --locked --extra sql --extra slayer --extra dev
+      - name: SLayer tests with the extra installed
+        run: uv run --no-sync pytest -q tests/slayer_vendor
+
   # `explore diagram` emits Mermaid and dex never renders it, so nothing in
   # pyproject.toml pins the syntax dialect it has to stay compatible with: the
   # contract is with a parser living in whatever tool a reader opens the diagram
