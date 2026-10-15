@@ -210,7 +210,10 @@ def _refuse_surviving_reads(
     )
     index = ReferenceIndex(after, scan_packages=False)
     forms = _READING_FORMS.get(kind, _NODE_READING_FORMS)
-    hits, _limits = index.references_to(name, kind)
+    kinds = _FILE_NODES if kind in _FILE_NODES else (kind,)
+    hits = [
+        hit for candidate in kinds for hit in index.references_to(name, candidate)[0]
+    ]
     where = sorted(
         f"{hit.path}:{hit.line}"
         for hit in hits
@@ -513,6 +516,8 @@ class _Builder:
     # --- helpers -------------------------------------------------------------
 
     def _matches(self, name: str, kind: str) -> bool:
+        if kind == "model":
+            kind = self.index.node_kind(name) or "model"
         if kind != self.kind:
             return False
         if self.kind == "column":

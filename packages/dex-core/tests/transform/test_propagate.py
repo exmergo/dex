@@ -241,6 +241,74 @@ class TestNodeRename:
         sql = next(e for e in result.edits if e.path.endswith("stg_orders.sql"))
         assert "{{ source('landing', 'order_events') }}" in sql.new_content
 
+    def test_a_seed_rename_rewrites_refs_and_passes_the_delete_guard(
+        self, project: Path
+    ):
+        """Regression for #628: renaming a seed must rewrite the `ref()` calls
+        that read it so the plan's delete guard accepts the move."""
+
+        from exmergo_dex_core.engine import DexEngine
+
+        _write(project / "seeds/codes.csv", "code,label\nUS,United States\n")
+        _write(
+            project / "models/marts/uses_codes.sql",
+            "select code, label from {{ ref('codes') }}\n",
+        )
+
+        outcome = DexEngine(repo_root=project.parent).rename(
+            "seed", "codes", "country_codes"
+        )
+        assert outcome.plan_id
+        assert set(outcome.paths) == {
+            "seeds/codes.csv",
+            "seeds/country_codes.csv",
+            "models/marts/uses_codes.sql",
+        }
+        assert outcome.sites == {"definition": 1, "ref_call": 1}
+
+        result = _propagate(project, "seed", "codes", "country_codes")
+        referrer = next(
+            e for e in result.edits if e.path == "models/marts/uses_codes.sql"
+        )
+        assert "{{ ref('country_codes') }}" in referrer.new_content
+
+    def test_a_snapshot_rename_rewrites_refs_and_passes_the_delete_guard(
+        self, project: Path
+    ):
+        """Regression for #628: renaming a snapshot must rewrite the `ref()`
+        calls that read it so the plan's delete guard accepts the move."""
+
+        from exmergo_dex_core.engine import DexEngine
+
+        _write(
+            project / "snapshots/snap_orders.sql",
+            "{% snapshot snap_orders %}\n"
+            "{{ config(unique_key='order_id', strategy='check', check_cols='all') }}\n"
+            "select * from {{ source('raw', 'orders') }}\n"
+            "{% endsnapshot %}\n",
+        )
+        _write(
+            project / "models/marts/uses_snap.sql",
+            "select * from {{ ref('snap_orders') }}\n",
+        )
+
+        outcome = DexEngine(repo_root=project.parent).rename(
+            "snapshot", "snap_orders", "orders_snapshot"
+        )
+        assert outcome.plan_id
+        assert set(outcome.paths) == {
+            "snapshots/snap_orders.sql",
+            "snapshots/orders_snapshot.sql",
+            "models/marts/uses_snap.sql",
+        }
+        assert outcome.sites == {"definition": 1, "ref_call": 1}
+
+        result = _propagate(project, "snapshot", "snap_orders", "orders_snapshot")
+        referrer = next(
+            e for e in result.edits if e.path == "models/marts/uses_snap.sql"
+        )
+        assert "{{ ref('orders_snapshot') }}" in referrer.new_content
+
 
 class TestRemoval:
     def test_a_surviving_read_refuses_and_names_it(self, project: Path):
