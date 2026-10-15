@@ -60,6 +60,11 @@ class PlanResult(Result):
     # moved. Absent (not empty) when the edit cannot change a row population at
     # all, which is the common case and deserves no key.
     row_attribution: list[dict[str, Any]] | None = None
+    # Every assumption declared on the models this plan touches, read back from
+    # the post-change YAML (model, decision, chosen, evidence), so the agent can
+    # relay the decisions it made without reconstructing them. Empty is an
+    # answer (nothing declared); absent means no dbt project to read.
+    decisions: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -69,6 +74,8 @@ class PlanResult(Result):
             "paths": self.paths,
             "plan_path": self.plan_path,
         }
+        if self.decisions is not None:
+            payload["decisions"] = self.decisions
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:
@@ -205,15 +212,21 @@ class ApplyResult(Result):
     written: list[str] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
     conflicts_overridden: list[str] = Field(default_factory=list)
+    # The assumptions declared on the models this apply wrote, as the project
+    # now records them. See :attr:`PlanResult.decisions`.
+    decisions: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
         if self.pending_confirmation is not None:
             return {"plan_id": self.plan_id, "conflicts": self.conflicts}
-        return {
+        payload: dict[str, Any] = {
             "plan_id": self.plan_id,
             "written": self.written,
             "conflicts_overridden": self.conflicts_overridden,
         }
+        if self.decisions is not None:
+            payload["decisions"] = self.decisions
+        return payload
 
 
 class PlanExportResult(Result):
@@ -384,6 +397,9 @@ class BuildResult(Result):
     # Absent only when the command predates the concept; a run that declined to
     # verify still says so, because an omitted key would read as "clean".
     verification: dict[str, Any] | None = None
+    # The assumptions declared on the models this build ran, as the project
+    # records them. See :attr:`PlanResult.decisions`.
+    decisions: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
         payload = dict(self.summary)
@@ -395,4 +411,6 @@ class BuildResult(Result):
             }
         if self.verification is not None:
             payload["verification"] = self.verification
+        if self.decisions is not None:
+            payload["decisions"] = self.decisions
         return payload

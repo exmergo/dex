@@ -419,17 +419,15 @@ def _edit_path(
 
 
 def _schema_path(view: DbtProjectView, node: str) -> str | None:
-    """The YAML file that documents ``node``, if any documents it."""
+    """The YAML file that documents ``node``, if any documents it.
 
-    from .rewrite import yaml_blocks
+    The one lookup declarations and reconcile use too, so all three agree on
+    where a model is declared.
+    """
 
-    for path in sorted(view.files):
-        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
-            continue
-        for block in yaml_blocks(view.files[path].content):
-            if block.form == "yaml_model_entry" and block.name == node:
-                return path
-    return None
+    from .declarations import schema_path
+
+    return schema_path({path: f.content for path, f in view.files.items()}, node)
 
 
 def _per_target(

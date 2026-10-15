@@ -772,7 +772,15 @@ class DbtProject:
         )
 
     def edit_path(self, kind: EditKind, model: str) -> str | None:
-        """The scaffold convention, which is what reconcile hard-coded before.
+        """Where the project already keeps ``stg_<model>``, else the scaffold
+        convention.
+
+        Read from the project rather than assumed: a staging model declared in a
+        shared ``_staging.yml``, or kept in a subfolder, lives there, and the
+        lookup is the one declarations and `transform place` use, so all three
+        agree on where a model is declared. The convention
+        (``models/staging/stg_<model>.<suffix>``) answers only for a model the
+        project does not have yet, which is where the scaffold puts one.
 
         Both kinds resolve, because for dbt both artifacts are the source of
         truth. A kind reconcile does not propose today returns ``None`` rather
@@ -782,7 +790,23 @@ class DbtProject:
         from ..transform.plans import EditKind as _EditKind
 
         suffix = {_EditKind.MODEL_SQL: "sql", _EditKind.SCHEMA_YML: "yml"}.get(kind)
-        return None if suffix is None else f"models/staging/stg_{model}.{suffix}"
+        if suffix is None:
+            return None
+        convention = f"models/staging/stg_{model}.{suffix}"
+        try:
+            view = self.load()
+        except dbt_project.DbtProjectError:
+            return convention
+        from ..transform.declarations import model_sql_path, schema_path
+
+        files = {path: source.content for path, source in view.files.items()}
+        node = f"stg_{model}"
+        found = (
+            model_sql_path(files, view.model_paths, node)
+            if kind is _EditKind.MODEL_SQL
+            else schema_path(files, node)
+        )
+        return found or convention
 
     def editing_surface(self) -> list[str]:
         """Everything dbt's own writer accepts: every authored path family, and

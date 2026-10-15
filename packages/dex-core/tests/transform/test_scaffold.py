@@ -127,6 +127,9 @@ def _seed_cache(tmp_path: Path, duckdb_file: Path, capsys) -> None:
 def test_scaffold_builds_staging_skeletons_with_pii_meta(
     dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
 ):
+    # The fixture declares stg_customers in a shared schema.yml; a scaffold
+    # beside that would be a second entry dbt refuses (see the test below).
+    (dbt_project_dir / "models/staging/schema.yml").unlink()
     _seed_cache(tmp_path, duckdb_file, capsys)
     rc, envelope = _run(
         [
@@ -303,6 +306,7 @@ def test_a_scaffolded_duckdb_model_takes_config_meta_and_refuses_the_old_form(
     fix named instead of letting it reach `dbt parse`.
     """
 
+    (dbt_project_dir / "models/staging/schema.yml").unlink()
     _seed_cache(tmp_path, duckdb_file, capsys)
     rc, envelope = _run(
         [
@@ -348,6 +352,39 @@ def test_a_scaffolded_duckdb_model_takes_config_meta_and_refuses_the_old_form(
     assert envelope["status"] == "error"
     assert "both a top-level 'meta' and 'config.meta'" in envelope["errors"][0]
     assert "Move the keys" in envelope["errors"][0]
+
+
+def test_a_scaffold_never_writes_a_second_entry_for_a_declared_model(
+    dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
+):
+    """The fixture declares stg_customers in a shared models/staging/schema.yml.
+
+    A `stg_customers.yml` beside it would be a second entry for one model, which
+    dbt refuses (`DuplicatePatchPathError`). The scaffold's YAML is left out and
+    the warning says how to add what it carried to the entry that exists.
+    """
+
+    _seed_cache(tmp_path, duckdb_file, capsys)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold",
+            "--scaffold",
+            "customers",
+        ],
+        capsys,
+    )
+
+    assert rc == 0, envelope
+    assert "models/staging/stg_customers.yml" not in envelope["data"]["paths"]
+    assert "models/staging/stg_customers.sql" in envelope["data"]["paths"]
+    assert any(
+        "already declared in models/staging/schema.yml" in w and "declarations" in w
+        for w in envelope["warnings"]
+    )
 
 
 def test_scaffold_without_cache_is_a_clean_error(
