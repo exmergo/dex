@@ -141,6 +141,49 @@ def test_parse_failure_blocks_the_plan_and_stores_nothing(
     assert _plans_on_disk(tmp_path) == []
 
 
+def test_parse_failure_names_the_cause_behind_a_dbt_1_12_level_tagged_header(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Regression for #626: dbt-core 1.12 prefixes the generic error header
+    with `[ERROR]: `, which must still be recognized as a generic header so the
+    underlying compilation/parse cause on the following lines is preserved."""
+
+    _add_time_spine(dbt_project_dir)
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    line = json.dumps(
+        {
+            "info": {
+                "level": "error",
+                "name": "MainEncounteredError",
+                "msg": (
+                    "[ERROR]: Encountered an error:\n"
+                    "Compilation Error\n"
+                    "  Model 'model.analytics.mart_b' (models/marts/mart_b.sql) "
+                    "depends on a source named 'raw.no_such_table' which was not found"
+                ),
+            }
+        }
+    )
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            return subprocess.CompletedProcess(
+                args=argv, returncode=1, stdout=line, stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+    rc, envelope = _define(tmp_path, _payload_file(tmp_path, _SEMANTIC_YAML), capsys)
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt parse failed: [ERROR]: Encountered an error: Model "
+        "'model.analytics.mart_b' (models/marts/mart_b.sql) depends on a source "
+        "named 'raw.no_such_table' which was not found"
+    )
+    assert _plans_on_disk(tmp_path) == []
+
+
 def test_shadow_parse_never_touches_the_real_project(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):

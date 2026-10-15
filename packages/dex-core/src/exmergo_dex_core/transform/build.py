@@ -1250,7 +1250,7 @@ _RUN_RESULT_ERROR = "RunResultError"
 # whichever of these wrappers led; the #50 deprecation fix never caught it
 # because #50's own repro didn't spell one out in its test message (#76).
 _GENERIC_HEADER = re.compile(
-    r"^(?:Encountered an error:|"
+    r"^(?:\[[A-Z]+\]:\s*)?(?:Encountered an error:|"
     r"(?:Database|Runtime|Compilation|Validation|Internal) Error(?: in .+)?)$"
 )
 
