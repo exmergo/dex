@@ -1,0 +1,1 @@
+**Reference reports now flag malformed YAML as incomplete.** Model and column renames and removals refuse to proceed while a project YAML file cannot be parsed, rather than silently missing its references.

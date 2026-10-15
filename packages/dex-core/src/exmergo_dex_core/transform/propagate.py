@@ -237,6 +237,14 @@ def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
     than about whichever file dex happened to reach first.
     """
 
+    unread_yaml = [path for path in index.unread if path.endswith((".yml", ".yaml"))]
+    if unread_yaml:
+        raise PropagationRefusedError(
+            "dex cannot promise it found every use of "
+            f"'{name}': YAML could not be parsed in {', '.join(unread_yaml)}. "
+            "Resolve that first, because a partial rewrite can still compile"
+        )
+
     if index.limits:
         raise PropagationRefusedError(
             "dex cannot promise it found every use of "

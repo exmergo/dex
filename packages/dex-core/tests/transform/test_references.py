@@ -17,6 +17,7 @@ import pytest
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import load
 from exmergo_dex_core.references import ReferenceIndex, find_references
+from exmergo_dex_core.transform.propagate import PropagationRefusedError, propagate
 
 
 def _run(argv: list[str], capsys) -> tuple[int, dict]:
@@ -198,6 +199,22 @@ def test_the_report_states_whether_it_believes_itself_complete(project):
     variables = find_references(view, ["using_department"], kind="var")
     assert variables.completeness == "complete"
     assert variables.limits == []
+
+
+def test_unparseable_yaml_limits_references_and_refuses_rewrites(tmp_path):
+    root = tmp_path / "analytics"
+    _write(root / "dbt_project.yml", "name: analytics\nprofile: analytics\n")
+    _write(root / "models" / "stg_x.sql", "select 1 as id\n")
+    _write(root / "models" / "broken.yml", "models: [\n")
+    view = load(root)
+
+    report = find_references(view, ["stg_x"], kind="model")
+    assert report.completeness == "incomplete"
+    assert any("models/broken.yml" in limit for limit in report.limits)
+    with pytest.raises(PropagationRefusedError, match=r"models/broken\.yml"):
+        propagate(view, root, "model", "stg_x", "stg_y")
+    with pytest.raises(PropagationRefusedError, match=r"models/broken\.yml"):
+        propagate(view, root, "model", "stg_x")
 
 
 # --- resolution edges ------------------------------------------------------------
@@ -506,10 +523,8 @@ def test_a_python_model_in_a_package_is_declared_by_that_package(project):
     assert declared.path == "dbt_packages/utils/models/py_util.py"
 
 
-def test_a_yaml_file_that_does_not_parse_is_unread_not_a_limit(project):
-    """Every YAML reader skips a file that does not parse. Saying so here lets a
-    caller that must rule a definition out decline to, without turning the file
-    into a limit that the rename guards would refuse every change over."""
+def test_a_yaml_file_that_does_not_parse_is_unread_not_a_global_limit(project):
+    """Grounding uses unread files only when a definition may be missing."""
 
     _write(project / "models" / "broken.yml", "models: [unclosed\n")
     _write(project / "models" / "empty.yml", "")

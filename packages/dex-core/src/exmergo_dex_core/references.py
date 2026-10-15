@@ -155,10 +155,9 @@ class ReferenceIndex:
         #: because those queries are about editable sites: a rename cannot move a
         #: `.py` file, and a removal guard keyed by kind must keep matching.
         self._declared: dict[tuple[str, str], list[Reference]] = defaultdict(list)
-        #: Files and packages the scan could not read at all. A YAML file that
-        #: does not parse is skipped by every YAML reader in the engine without a
-        #: limit; listing it here lets a caller that has to rule a definition out
-        #: say why it cannot, without changing what the existing readers refuse on.
+        #: Files and packages the scan could not read at all. Grounding uses
+        #: this list to explain why it cannot rule out a missing definition;
+        #: references and rewrites treat skipped YAML as an incomplete index.
         self.unread: list[str] = []
 
         self._scan(view, package=None)
@@ -1282,6 +1281,11 @@ def find_references(
 
     index = index or ReferenceIndex(view)
     limits = list(index.limits)
+    limits.extend(
+        f"{path}: YAML could not be parsed"
+        for path in index.unread
+        if path.endswith((".yml", ".yaml"))
+    )
     notes: list[str] = []
     targets: list[dict[str, Any]] = []
     indeterminate: list[Reference] = []
