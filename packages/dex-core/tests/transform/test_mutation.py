@@ -472,7 +472,7 @@ def _as_sql(node: str) -> str:
     return re.sub(r"\{\{\s*ref\('([^']+)'\)\s*\}\}", r"\1", node.split("{{ config")[0])
 
 
-@pytest.mark.parametrize("dialect", ["duckdb", "bigquery", "snowflake"])
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery", "snowflake", "postgres"])
 def test_the_comparison_projects_four_counts_and_nothing_else(dialect):
     """The structural half of the no-row-value guarantee: whatever the model
     holds, the statement can only return the four aggregates it projects."""
@@ -488,9 +488,7 @@ def test_the_comparison_projects_four_counts_and_nothing_else(dialect):
         assert projection.find(sqlglot.exp.AggFunc) is not None
 
 
-@pytest.mark.parametrize(
-    "dialect", ["postgres", "redshift", "databricks", "clickhouse"]
-)
+@pytest.mark.parametrize("dialect", ["redshift", "databricks", "clickhouse"])
 def test_a_warehouse_without_a_verified_fingerprint_gets_no_comparison(dialect):
     """A fingerprint that silently skipped a column would label a mutant that
     changes it as equivalent, so an unverified one is never guessed at."""
