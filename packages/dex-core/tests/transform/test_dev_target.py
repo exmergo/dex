@@ -192,6 +192,118 @@ def test_duckdb_path_drift_is_refused(dbt_project_dir: Path, tmp_path: Path):
     assert "duckdb.path: /elsewhere.duckdb" in str(exc.value)
 
 
+def test_env_var_in_duckdb_path_matching_resolves_and_passes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    target_path = tmp_path / "dev.duckdb"
+    monkeypatch.setenv("THINGS_DUCKDB_PATH", str(target_path))
+    _write_profile(
+        dbt_project_dir,
+        "      type: duckdb\n      path: \"{{ env_var('THINGS_DUCKDB_PATH') }}\"\n",
+    )
+    config = DexConfig(
+        connector="duckdb",
+        duckdb=DuckDBTarget(path=str(target_path)),
+    )
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert all("disagree" not in w for w in warnings)
+
+
+def test_env_var_in_duckdb_path_mismatch_refuses_naming_resolved_value(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("THINGS_DUCKDB_PATH", str(tmp_path / "other.duckdb"))
+    _write_profile(
+        dbt_project_dir,
+        "      type: duckdb\n      path: \"{{ env_var('THINGS_DUCKDB_PATH') }}\"\n",
+    )
+    config = DexConfig(
+        connector="duckdb",
+        duckdb=DuckDBTarget(path=str(tmp_path / "dev.duckdb")),
+    )
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert f"duckdb.path: {tmp_path / 'dev.duckdb'}" in message
+    assert f"profiles.yml dev.path: {tmp_path / 'other.duckdb'}" in message
+    assert "{{" not in message
+
+
+def test_env_var_with_default_in_snowflake_database(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("DEV_DATABASE", raising=False)
+    _snowflake_profile(
+        dbt_project_dir, database="\"{{ env_var('DEV_DATABASE', 'DBT_DEV') }}\""
+    )
+    config = _snowflake_config(dev_database="DBT_DEV")
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert all("disagree" not in w for w in warnings)
+
+    # When env var is explicitly set, it overrides the default:
+    monkeypatch.setenv("DEV_DATABASE", "OVERRIDDEN_DB")
+    config2 = _snowflake_config(dev_database="OVERRIDDEN_DB")
+    warnings2 = dev_target.check(dbt_project_dir, "dev", config2, tmp_path)
+    assert all("disagree" not in w for w in warnings2)
+
+
+def test_env_var_in_snowflake_database_mismatch_refuses_naming_resolved_value(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("DEV_DATABASE", "OTHER_DB")
+    _snowflake_profile(dbt_project_dir, database="\"{{ env_var('DEV_DATABASE') }}\"")
+    config = _snowflake_config(dev_database="DBT_DEV")
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert "snowflake.dev_database: DBT_DEV" in message
+    assert "profiles.yml dev.database: OTHER_DB" in message
+    assert "{{" not in message
+
+
+def test_unresolvable_template_in_profile_only_warns_and_does_not_refuse(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("UNSET_DB_VAR", raising=False)
+    # Unset env_var with no default:
+    _snowflake_profile(dbt_project_dir, database="\"{{ env_var('UNSET_DB_VAR') }}\"")
+    config = _snowflake_config(dev_database="DBT_DEV")
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert any("could not resolve" in w and "database" in w for w in warnings)
+
+    # Non-env_var Jinja expression:
+    _snowflake_profile(dbt_project_dir, database='"{{ custom_macro() }}"')
+    warnings2 = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert any("could not resolve" in w and "database" in w for w in warnings2)
+
+
+def test_issue_577_reproduction_builds(tmp_path: Path, monkeypatch):
+    """The reproduction from #577: path templated through env_var builds cleanly
+    when the variable resolves to what config specifies."""
+    from exmergo_dex_core import DexEngine
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "dbt_project.yml").write_text(
+        'name: things\nversion: "1.0"\nprofile: things\n'
+    )
+    (repo / "models").mkdir()
+    (repo / "models" / "things.sql").write_text("select 1 as id\n")
+    (repo / "profiles.yml").write_text(
+        "things:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        "      path: \"{{ env_var('THINGS_DUCKDB_PATH') }}\"\n"
+    )
+    (repo / ".dex").mkdir()
+    target_db = repo / "dev.duckdb"
+    (repo / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {target_db}\n"
+    )
+    monkeypatch.setenv("THINGS_DUCKDB_PATH", str(target_db))
+
+    engine = DexEngine.from_repo(repo)
+    engine.build()
+
+
 # --- existence: snowflake, through the fake ------------------------------------------
 
 

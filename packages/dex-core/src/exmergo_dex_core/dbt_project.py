@@ -378,10 +378,10 @@ def target_identifiers(
 
     Where ``resolve_target`` answers "which adapter", this answers "which
     database, schema, warehouse". It exists so the engine can compare the
-    rendered profile against ``.dex/config.yml`` and refuse a build whose config
-    has silently drifted out of the profile that actually governs it. Missing
-    profile or target yields ``{}``: the caller degrades to no check rather than
-    erroring on a project it cannot read.
+    profile's target identifiers against ``.dex/config.yml`` and refuse a build
+    whose config has silently drifted out of the profile that actually governs
+    it. Missing profile or target yields ``{}``: the caller degrades to no check
+    rather than erroring on a project it cannot read.
     """
 
     project = Path(project_dir)
@@ -495,6 +495,15 @@ def duckdb_target_path(
     raw_path = output.get("path")
     if not raw_path or str(raw_path) == ":memory:":
         return None
+    if "{{" in str(raw_path):
+        import os
+
+        from .connect import _profile_scalar
+
+        resolved = _profile_scalar(raw_path, os.environ)
+        if not resolved:
+            return None
+        raw_path = resolved
     path = Path(str(raw_path))
     return path if path.is_absolute() else project / path
 

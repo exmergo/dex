@@ -31,6 +31,7 @@ legitimate thing to have, and dex proposes rather than imposes.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,6 +39,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from ..config import CONFIG_FILE, DexConfig
+from ..connect import _profile_scalar
 from ..dbt_project import (
     MANIFEST_PATH,
     PROFILES_FILE,
@@ -110,6 +112,7 @@ def check(
     *,
     store: ExploreStore | None = None,
     connection: ConnectionSource | None = None,
+    env: dict | os._Environ | None = None,
 ) -> list[str]:
     """Refuse a dev target that has drifted or does not exist. Returns warnings.
 
@@ -126,8 +129,11 @@ def check(
 
     project = Path(project_dir)
     profile = target_identifiers(project, target)
-    _assert_no_drift(project, target, config, profile, repo_root)
+    drift_warnings = _assert_no_drift(
+        project, target, config, profile, repo_root, env=env
+    )
     return [
+        *drift_warnings,
         *_assert_build_cap_reachable(project, target, config),
         *_assert_namespace_exists(
             project,
@@ -216,26 +222,32 @@ def _assert_no_drift(
     config: DexConfig,
     profile: dict[str, str],
     repo_root: Path | str,
-) -> None:
+    env: dict | os._Environ | None = None,
+) -> list[str]:
     if not profile:
-        return
+        return []
+    if env is None:
+        env = os.environ
     config_rel = f"{DEX_DIR}/{CONFIG_FILE}"
     profile_rel = _relative(project / PROFILES_FILE, repo_root)
 
     profile_type = profile.get("type")
-    if profile_type and profile_type != config.connector:
-        raise DevTargetError(
-            f"{config_rel} and {profile_rel} disagree about the connector: "
-            f"config.yml says connector: {config.connector}, {PROFILES_FILE} "
-            f"target '{target}' says type: {profile_type}; edit one to match the "
-            "other (dex never rewrites a profile you may have hand-edited)"
-        )
+    if profile_type:
+        profile_type_resolved = _profile_scalar(profile_type, env) or profile_type
+        if profile_type_resolved != config.connector:
+            raise DevTargetError(
+                f"{config_rel} and {profile_rel} disagree about the connector: "
+                f"config.yml says connector: {config.connector}, {PROFILES_FILE} "
+                f"target '{target}' says type: {profile_type}; edit one to match the "
+                "other (dex never rewrites a profile you may have hand-edited)"
+            )
 
     target_config = getattr(config, config.connector, None)
     if target_config is None:
-        return
+        return []
     fold = config.connector in _CASE_FOLDING
     divergent = []
+    warnings: list[str] = []
     # Config paths resolve against the repo root (committed target); profile
     # paths resolve against the dbt project dir (dbt's cwd).
     config_base = Path(repo_root)
@@ -246,9 +258,22 @@ def _assert_no_drift(
         if attribute not in target_config.model_fields_set:
             continue
         want = getattr(target_config, attribute, None)
-        got = profile.get(profile_key)
-        if want is None or got is None:
+        raw_got = profile.get(profile_key)
+        if want is None or raw_got is None:
             continue
+        if "{{" in str(raw_got):
+            resolved = _profile_scalar(raw_got, env)
+            if resolved is None:
+                warnings.append(
+                    f"could not resolve {PROFILES_FILE} target '{target}' "
+                    f"{profile_key} template: {raw_got}; "
+                    "skipping dev-target drift check for this field"
+                )
+                continue
+            got = resolved
+        else:
+            got = str(raw_got)
+
         if config.connector == "duckdb" and attribute == "path":
             want_resolved = _resolve_declared_path(str(want), config_base)
             got_resolved = _resolve_declared_path(str(got), profile_base)
@@ -272,6 +297,7 @@ def _assert_no_drift(
             + "\nedit one to match the other, then re-run (dex never rewrites a "
             "profile you may have hand-edited)"
         )
+    return warnings
 
 
 def _assert_namespace_exists(

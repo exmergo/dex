@@ -1,0 +1,1 @@
+**`transform build` resolves `{{ env_var() }}` in `profiles.yml` before checking for dev-target drift.** A templated database, schema or path is now compared using its resolved environment variable value (including any default fallback). Unresolvable templates produce a warning instead of a false-positive `DevTargetError`.

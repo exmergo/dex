@@ -2003,7 +2003,9 @@ def _redshift_host_compute(host: str | None) -> dict | None:
     return _redshift_compute(kind)
 
 
-_ENV_VAR_TEMPLATE = re.compile(r"\{\{\s*env_var\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}")
+_ENV_VAR_TEMPLATE = re.compile(
+    r"\{\{\s*env_var\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*['\"]([^'\"]*)['\"]\s*)?\)\s*\}\}"
+)
 
 
 def _profile_scalar(value, env: dict | os._Environ) -> str | None:
@@ -2020,7 +2022,12 @@ def _profile_scalar(value, env: dict | os._Environ) -> str | None:
         return text
     match = _ENV_VAR_TEMPLATE.fullmatch(text.strip())
     if match:
-        return env.get(match.group(1)) or None
+        var_name = match.group(1)
+        default_val = match.group(2)
+        val = env.get(var_name)
+        if val is not None:
+            return val
+        return default_val
     return None
 
 
