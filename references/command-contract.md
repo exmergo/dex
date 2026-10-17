@@ -358,7 +358,9 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      the compiled SQL through its CTE chain, naming the join and its
                                      key and stating both counts; a model with a filter, aggregate,
                                      de-duplication or set operation is never reported for loss, and an
-                                     incremental model is skipped. Free on metadata alone, and every
+                                     incremental model is skipped. A model generated in SQL with no parent
+                                     relation is named in notes. A real parent relation missing from the
+                                     warehouse is still a warning. Free on metadata alone, and every
                                      count made exact where counting bills nothing; a relation the
                                      warehouse keeps no count for (any view) is priced as one batched
                                      aggregate and returned as an offer beside findings already final.

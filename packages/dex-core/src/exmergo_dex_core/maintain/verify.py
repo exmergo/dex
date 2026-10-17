@@ -882,6 +882,8 @@ def grain_findings(
 
 # --- row population: a model against the relation it is built from -------------
 
+_GENERATED_SQL = "generated in SQL; no parent relation to compare against"
+
 
 @dataclass(frozen=True)
 class RowPopulationCheck:
@@ -1082,6 +1084,15 @@ def _driving_parent(tree, sql_shape):
             )
             current = inner
             continue
+        if isinstance(relation, exp.Values):
+            return (
+                None,
+                reducers,
+                found_joins,
+                multiplies,
+                _GENERATED_SQL,
+                cte_scopes,
+            )
         if not isinstance(relation, exp.Table):
             return (
                 None,
@@ -1092,6 +1103,13 @@ def _driving_parent(tree, sql_shape):
                 cte_scopes,
             )
         name = relation.name.lower()
+        if not name:
+            reason = (
+                _GENERATED_SQL
+                if isinstance(relation.this, exp.GenerateSeries)
+                else "it is a table function with no warehouse parent"
+            )
+            return None, reducers, found_joins, multiplies, reason, cte_scopes
         if name in cte_scopes:
             if name in visited:  # pragma: no cover - a cycle needs invalid SQL
                 return (
@@ -1113,7 +1131,7 @@ def row_population_plan(
     dialect: str,
     *,
     scope: set[str] | None = None,
-) -> tuple[list[RowPopulationCheck], list[str]]:
+) -> tuple[list[RowPopulationCheck], list[str], list[str]]:
     """Line every buildable model up against the relation it is built from.
 
     Free and connectionless: the compiled SQL and the relation names are both
@@ -1122,7 +1140,8 @@ def row_population_plan(
 
     A model this cannot line up is named in the notes rather than dropped. An
     unfollowable chain and a clean model are the same empty result otherwise,
-    and only one of them means the model was checked.
+    and only one of them means the model was checked. The third list is the
+    subset of those notes that name a model generated in SQL.
 
     ``scope`` narrows to a set of model unique ids, which is what a caller
     verifying one build rather than a whole project has: the notes narrow with
@@ -1145,6 +1164,7 @@ def row_population_plan(
                 "no compiled manifest found; run `dbt compile` or `dbt build` "
                 "for row-population findings"
             ],
+            [],
         )
 
     relations: dict[str, str] = {}
@@ -1172,7 +1192,9 @@ def row_population_plan(
 
     checks: list[RowPopulationCheck] = []
     notes: list[str] = []
+    informational: list[str] = []
     incremental: list[str] = []
+    generated: list[str] = []
     unfollowable: list[str] = []
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
@@ -1212,7 +1234,10 @@ def row_population_plan(
             tree, sql_shape
         )
         if table is None:
-            unfollowable.append(f"{name} ({reason})")
+            if reason == _GENERATED_SQL:
+                generated.append(name)
+            else:
+                unfollowable.append(f"{name} ({reason})")
             continue
 
         parent_relation, parent = name_of(_table_name(table))
@@ -1246,12 +1271,18 @@ def row_population_plan(
             "an incremental model holds what previous runs loaded into it, so its "
             "row count is not a function of its parent's"
         )
+    if generated:
+        generated_note = "row population was not compared for " + ", ".join(
+            f"{model} ({_GENERATED_SQL})" for model in sorted(generated)
+        )
+        notes.append(generated_note)
+        informational.append(generated_note)
     if unfollowable:
         notes.append(
             "no single driving parent could be identified for "
             + ", ".join(sorted(unfollowable))
         )
-    return checks, notes
+    return checks, notes, informational
 
 
 def row_population_findings(

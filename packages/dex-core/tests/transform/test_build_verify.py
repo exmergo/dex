@@ -413,6 +413,89 @@ def test_a_cost_refusal_is_not_downgraded_to_a_warning(tmp_path: Path):
         )
 
 
+def test_generated_sql_is_a_note_and_a_missing_parent_still_warns(tmp_path: Path):
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day "
+                    "from range(date '2020-01-01', date '2030-01-01', interval 1 day)"
+                ),
+            },
+            "model.shop.fct_orders": {
+                "name": "fct_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_orders"',
+                "compiled_code": 'select * from "warehouse"."raw"."orders"',
+            },
+        },
+        results=[{"unique_id": "model.shop.fct_orders", "status": "success"}],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_orders")],
+        counts={"warehouse.dbt_dev.fct_orders": 10},
+    )
+    result = _sweep(
+        tmp_path,
+        _summary(
+            [
+                _node("model.shop.metricflow_time_spine"),
+                _node("model.shop.fct_orders"),
+            ]
+        ),
+        adapter,
+    )
+    generated = (
+        "row population was not compared for metricflow_time_spine "
+        "(generated in SQL; no parent relation to compare against)"
+    )
+    assert result.notes == [generated]
+    assert generated not in result.warnings
+    assert any(
+        "fct_orders (nothing built at warehouse.raw.orders)" in warning
+        for warning in result.warnings
+    )
+    joined = " ".join(result.warnings)
+    assert "nothing built at )" not in joined
+    assert "nothing built at :" not in joined
+
+
+def test_a_time_spine_alone_is_a_note(tmp_path: Path):
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day "
+                    "from range(date '2020-01-01', date '2030-01-01', interval 1 day)"
+                ),
+            }
+        },
+        results=[
+            {"unique_id": "model.shop.metricflow_time_spine", "status": "success"}
+        ],
+    )
+    result = _sweep(
+        tmp_path,
+        _summary([_node("model.shop.metricflow_time_spine")]),
+        _StubAdapter([]),
+    )
+    generated = (
+        "row population was not compared for metricflow_time_spine "
+        "(generated in SQL; no parent relation to compare against)"
+    )
+    assert result.notes == [generated]
+    assert generated not in result.warnings
+    assert result.suppressed["row_population"] == generated
+
+
 # --- the payload --------------------------------------------------------------
 
 

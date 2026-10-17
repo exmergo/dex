@@ -72,6 +72,7 @@ class BuildVerification:
     findings: list[DriftFinding] = field(default_factory=list)
     scope: list[str] = field(default_factory=list)
     suppressed: dict[str, str] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     offer: ConfirmationRequest | None = None
 
@@ -135,7 +136,7 @@ def price_verification(
     if estimator is None:
         return 0.0, []
     try:
-        checks, _ = verify_mod.row_population_plan(
+        checks, _, _ = verify_mod.row_population_plan(
             project_dir, adapter.dialect, scope=scope
         )
         countable = _uncounted_by_materialization(project_dir, checks)
@@ -266,10 +267,11 @@ def _row_population(
     except DexError as exc:
         return f"warehouse unreachable: {exc}"
 
-    checks, plan_notes = verify_mod.row_population_plan(
+    checks, plan_notes, informational = verify_mod.row_population_plan(
         project_dir, adapter.dialect, scope=scope
     )
-    result.warnings.extend(plan_notes)
+    result.notes.extend(informational)
+    result.warnings.extend(note for note in plan_notes if note not in informational)
     if not checks:
         return (
             plan_notes[0]

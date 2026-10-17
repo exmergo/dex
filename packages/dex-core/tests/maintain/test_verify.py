@@ -1235,13 +1235,29 @@ def _plan(tmp_path: Path, nodes: dict, sources: dict | None = None):
     (target / "manifest.json").write_text(
         json.dumps({"nodes": nodes, "sources": sources or {}}), encoding="utf-8"
     )
-    return verify_mod.row_population_plan(tmp_path, "duckdb")
+    checks, notes, _informational = verify_mod.row_population_plan(tmp_path, "duckdb")
+    return checks, notes
 
 
 def _judge(checks, counts: dict[str, int], counted: set[str] | None = None):
     keyed = {f"{WAREHOUSE}.{name}": rows for name, rows in counts.items()}
     measured = set(keyed) if counted is None else {f"{WAREHOUSE}.{n}" for n in counted}
     return verify_mod.row_population_findings(checks, keyed, measured)
+
+
+def _population_text(checks, plan_notes, present: dict[str, int]) -> str:
+    """The sentences a reader sees, plan notes and the count pass together.
+
+    Relations the plan named that are not in ``present`` are absent, which is
+    what ``relation_counts`` reports for an object the warehouse does not have.
+    """
+
+    keyed = {f"{WAREHOUSE}.{name}": rows for name, rows in present.items()}
+    absent = {rel for check in checks for rel in check.relations} - set(keyed)
+    _findings, finding_notes = verify_mod.row_population_findings(
+        checks, keyed, set(keyed), absent
+    )
+    return " ".join([*plan_notes, *finding_notes])
 
 
 def test_an_inner_join_that_loses_a_fifth_of_the_rows_is_reported(tmp_path: Path):
@@ -1491,6 +1507,77 @@ def test_unparseable_compiled_sql_becomes_a_note_not_an_exception(tmp_path: Path
     assert "broken" in notes[0]
 
 
+def test_a_model_generated_in_sql_names_no_empty_parent(tmp_path: Path):
+    """#650: a MetricFlow time spine is ``select ... from range(...)``. That
+    generates its rows in SQL and has no parent relation, so the report must
+    not claim one was built at an empty name."""
+
+    checks, notes = _plan(
+        tmp_path,
+        {
+            "m.spine": _model(
+                "metricflow_time_spine",
+                "select cast(range as date) as date_day "
+                "from range(date '2020-01-01', date '2030-01-01', interval 1 day)",
+            )
+        },
+    )
+    text = _population_text(checks, notes, {"metricflow_time_spine": 3652})
+    assert text == (
+        "row population was not compared for metricflow_time_spine "
+        "(generated in SQL; no parent relation to compare against)"
+    )
+    assert checks == []
+
+
+def test_a_values_clause_is_generated_sql_with_no_parent(tmp_path: Path):
+    checks, notes = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "spine_values",
+                "with days as ("
+                "select * from (values (date '2020-01-01'), (date '2020-01-02')) "
+                "as t(date_day)) "
+                "select date_day from days",
+            )
+        },
+    )
+    text = _population_text(checks, notes, {"spine_values": 2})
+    assert checks == []
+    assert text == (
+        "row population was not compared for spine_values "
+        "(generated in SQL; no parent relation to compare against)"
+    )
+
+
+def test_a_table_function_with_no_parent_is_not_called_generated_sql(tmp_path: Path):
+    checks, notes = _plan(
+        tmp_path,
+        {"m.1": _model("loaded", "select * from read_csv_auto('data.csv')")},
+    )
+    text = _population_text(checks, notes, {"loaded": 3})
+    assert checks == []
+    assert "generated in SQL" not in text
+    assert "nothing built at )" not in text
+    assert "nothing built at :" not in text
+    assert "table function with no warehouse parent" in text
+
+
+def test_a_real_unbuilt_parent_keeps_its_wording(tmp_path: Path):
+    checks, notes = _plan(
+        tmp_path,
+        {"m.1": _model("fct", 'select * from "wh"."main"."stg_orders"')},
+    )
+    assert checks[0].parent_relation == "wh.main.stg_orders"
+    text = _population_text(checks, notes, {"fct": 10})
+    assert text == (
+        "row population was not compared for fct "
+        "(nothing built at wh.main.stg_orders): the driving relation has no "
+        "object in the warehouse"
+    )
+
+
 def test_a_parent_with_no_row_count_is_named_rather_than_dropped(tmp_path: Path):
     """#172's inertness requirement applied here: an absent finding must not be
     indistinguishable from a clean one."""
@@ -1591,6 +1678,51 @@ def test_verify_reports_row_loss_end_to_end(
     assert findings[0]["exact"] is True
     assert payload["cost"]["paradigm"] == "free_local"
     assert "row_population" not in payload["data"]["suppressed"]
+
+
+def test_verify_names_generated_sql_in_notes(
+    maintain_repo, _assume_the_project_compiles
+):
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT DATE '2020-01-01' AS date_day"
+    )
+    maintain_repo.sql("CREATE TABLE fct_built AS SELECT * FROM orders")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day "
+                    "from range(date '2020-01-01', date '2030-01-01', interval 1 day)"
+                ),
+            },
+            "model.maintain_test.fct_built": {
+                "name": "fct_built",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_built"',
+                "compiled_code": 'select * from "warehouse"."main"."missing_orders"',
+            },
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    generated = (
+        "row population was not compared for metricflow_time_spine "
+        "(generated in SQL; no parent relation to compare against)"
+    )
+    assert generated in payload["data"]["notes"]
+    assert generated not in payload["warnings"]
+    assert any(
+        "fct_built (nothing built at warehouse.main.missing_orders)" in warning
+        for warning in payload["warnings"]
+    )
+    joined = " ".join(payload["warnings"])
+    assert "nothing built at )" not in joined
+    assert "nothing built at :" not in joined
 
 
 def test_verify_says_so_when_no_model_can_be_lined_up(
@@ -2650,13 +2782,17 @@ def test_the_plan_can_be_scoped_to_one_build_s_models(tmp_path: Path):
         json.dumps({"nodes": nodes, "sources": {}}), encoding="utf-8"
     )
 
-    checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb", scope={"m.2"})
+    checks, notes, _informational = verify_mod.row_population_plan(
+        tmp_path, "duckdb", scope={"m.2"}
+    )
     assert [c.model for c in checks] == ["fct_orders"]
     # The incremental model is outside the scope, so its skip is not this
     # caller's business either.
     assert notes == []
 
-    everything, all_notes = verify_mod.row_population_plan(tmp_path, "duckdb")
+    everything, all_notes, _informational = verify_mod.row_population_plan(
+        tmp_path, "duckdb"
+    )
     assert {c.model for c in everything} == {"stg_orders", "fct_orders"}
     assert any("incremental_events" in n for n in all_notes)
 
@@ -2834,10 +2970,10 @@ def test_row_population_scopes_by_id_so_one_version_does_not_bring_the_other(
     }
     _plan(tmp_path, nodes)
 
-    checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb")
+    checks, notes, _informational = verify_mod.row_population_plan(tmp_path, "duckdb")
     assert sorted(c.model for c in checks) == ["dim_orders.v1", "dim_orders.v2"]
 
-    checks, notes = verify_mod.row_population_plan(
+    checks, notes, _informational = verify_mod.row_population_plan(
         tmp_path, "duckdb", scope={"model.maintain_test.dim_orders.v2"}
     )
     assert [c.model for c in checks] == ["dim_orders.v2"] and notes == []
@@ -2854,6 +2990,6 @@ def test_an_unfollowable_version_is_named_once_per_version(tmp_path: Path):
         ).items()
     }
     _plan(tmp_path, nodes)
-    _checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb")
+    _checks, notes, _informational = verify_mod.row_population_plan(tmp_path, "duckdb")
     assert len(notes) == 1
     assert "dim_orders.v1 (" in notes[0] and "dim_orders.v2 (" in notes[0]
