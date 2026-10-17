@@ -1319,8 +1319,11 @@ def _python_relation_calls(
 ) -> list[tuple[str, int, tuple[str | None, ...]]] | None:
     """``dbt.ref`` and ``dbt.source`` calls in one Python model.
 
-    Each argument is the string literal dex read, or ``None`` when the argument
-    is anything else. ``None`` for the whole list means the file did not parse,
+    Each positional argument is the string literal dex read, or ``None`` when
+    the argument is anything else. On ``dbt.ref``, ``v`` and ``version`` are
+    dbt's version selector and are ignored, so the model name stays the
+    positional argument. Any other keyword, including ``**kwargs``, leaves the
+    call unresolved. ``None`` for the whole list means the file did not parse,
     which is a different fact from a file that parses and names nothing.
     """
 
@@ -1340,7 +1343,10 @@ def _python_relation_calls(
             and func.attr in ("ref", "source")
         ):
             continue
-        if node.keywords:
+        versioned_ref = func.attr == "ref" and all(
+            keyword.arg in {"v", "version"} for keyword in node.keywords
+        )
+        if node.keywords and not versioned_ref:
             args: tuple[str | None, ...] = (None,)
         else:
             args = tuple(

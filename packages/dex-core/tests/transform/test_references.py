@@ -16,6 +16,7 @@ import pytest
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import load
+from exmergo_dex_core.edits import EditOp
 from exmergo_dex_core.references import ReferenceIndex, find_references
 from exmergo_dex_core.transform.propagate import PropagationRefusedError, propagate
 
@@ -651,6 +652,140 @@ def test_an_unresolved_python_ref_makes_model_queries_incomplete(tmp_path):
     report = find_references(load(root), ["stg_orders"], kind="model")
     assert report.completeness == "incomplete"
     assert any("could not be resolved" in limit for limit in report.limits)
+
+
+def test_a_versioned_python_ref_resolves_to_the_model(tmp_path):
+    """`dbt.ref("other_model", v=1)` and `version=` name the model.
+
+    A package-qualified call names the model too. The version keyword is not
+    an unread argument.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "other_model.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        '    pinned = dbt.ref("other_model", v=1)\n'
+        '    named = dbt.ref("other_model", version=1)\n'
+        '    packaged = dbt.ref("utils", "other_model", version=2)\n'
+        "    return pinned\n",
+    )
+    index = ReferenceIndex(load(root))
+
+    python_refs = [
+        hit
+        for hit in index.references_to("other_model", "model")[0]
+        if hit.form == "python_ref"
+    ]
+    assert [(hit.path, hit.line, hit.qualifier) for hit in python_refs] == [
+        ("models/py_orders.py", 2, None),
+        ("models/py_orders.py", 3, None),
+        ("models/py_orders.py", 4, "utils"),
+    ]
+    assert [
+        item
+        for item in index.indeterminate_for("model")
+        if item.path == "models/py_orders.py"
+    ] == []
+    assert index.parents_of("py_orders") == {"other_model"}
+
+
+def test_a_versioned_python_ref_does_not_block_an_unrelated_model(tmp_path):
+    """A version keyword does not make every model query incomplete.
+
+    Renaming a model the call does not name is the move of that model.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(root / "models" / "other_model.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        '    pinned = dbt.ref("other_model", v=1)\n'
+        '    named = dbt.ref("other_model", version=1)\n'
+        '    packaged = dbt.ref("utils", "other_model", version=2)\n'
+        "    return pinned\n",
+    )
+    view = load(root)
+
+    report = find_references(view, ["stg_orders"], kind="model")
+    assert report.completeness == "complete"
+    assert report.limits == []
+    result = propagate(view, root, "model", "stg_orders", "stg_bookings")
+    assert [(edit.op, edit.path) for edit in result.edits] == [
+        (EditOp.DELETE, "models/stg_orders.sql"),
+        (EditOp.UPSERT, "models/stg_bookings.sql"),
+    ]
+    moved = next(
+        edit for edit in result.edits if edit.path == "models/stg_bookings.sql"
+    )
+    assert moved.new_content == "select 1 as id\n"
+
+
+def test_an_unknown_python_ref_keyword_stays_unresolved(tmp_path):
+    """A keyword other than `v` or `version`, and `**kwargs`, stay unread."""
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        "    dbt.ref('other_model', where='active')\n"
+        "    return dbt.ref('other_model', **opts)\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+
+    unresolved = index.indeterminate_for("model")
+    assert [(hit.path, hit.line, hit.form, hit.name) for hit in unresolved] == [
+        ("models/py_orders.py", 2, "python_ref", None),
+        ("models/py_orders.py", 3, "python_ref", None),
+    ]
+    assert index.references_to("other_model", "model")[0] == []
+    report = find_references(view, ["stg_orders"], kind="model")
+    assert report.completeness == "incomplete"
+    with pytest.raises(PropagationRefusedError, match=r"models/py_orders\.py:2"):
+        propagate(view, root, "model", "stg_orders", "stg_bookings")
+
+
+def test_a_dynamic_python_ref_with_a_version_stays_unresolved(tmp_path):
+    """`dbt.ref(model_name, v=1)` still names nothing dex can read."""
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n    return dbt.ref(model_name, v=1)\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+
+    unresolved = index.indeterminate_for("model")
+    assert [(hit.path, hit.line, hit.form, hit.name) for hit in unresolved] == [
+        ("models/py_orders.py", 2, "python_ref", None)
+    ]
+    report = find_references(view, ["stg_orders"], kind="model")
+    assert report.completeness == "incomplete"
+    with pytest.raises(PropagationRefusedError, match=r"models/py_orders\.py:2"):
+        propagate(view, root, "model", "stg_orders", "stg_bookings")
 
 
 def test_an_unparsed_python_model_limits_relation_queries(tmp_path):
