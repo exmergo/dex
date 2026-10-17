@@ -98,19 +98,13 @@ INTERNAL_REFUSALS = {
     # every one is caught and rendered as the `reason` on a finding that reports
     # it could not attribute a change. A consumer reads that field, not this type.
     "UnattributableError",
-    # The transform surface. Every one of these needs a repo_root, so they sit
-    # outside "reachable from the public API without a repo_root". Worth
-    # revisiting as a family if a host ever drives transform programmatically.
+    # Most of the transform surface needs a repo_root, so these remain outside
+    # "reachable from the public API without a repo_root". Worth revisiting as
+    # a family if a host ever drives transform programmatically.
     # The scaffold refusals have already left, on their own (#514): a host
     # driving `transform plan --scaffold` has to tell "run `explore map`" from
     # "qualify the name" from "edit the sources file", and ScaffoldError goes
     # with its two subclasses so `except ScaffoldError` works from the root too.
-    "BuildFailedError",
-    "DbtParseError",
-    "DbtProjectError",
-    "DbtRunError",
-    "DevTargetError",
-    "EditValidationError",
     "InitError",
     "MutationError",
     "PlacementRefusedError",
