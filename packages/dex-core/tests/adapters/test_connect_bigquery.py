@@ -549,6 +549,34 @@ def test_billing_rounding_retries_once_within_the_confirmed_budget(fake_bq_clien
     assert second_cap == 160 * MB  # widened to exactly what BigQuery required
 
 
+def test_a_second_statement_is_charged_at_the_billing_floor_not_refused(
+    fake_bq_client,
+):
+    """#482. A command admitted on its first statement's floored estimate ran a
+    second statement whose dry run was 88 bytes. Charged raw, the booking grew by
+    88 bytes, so the second statement's server-side cap was the 88 bytes left
+    after the first billed BigQuery's 10 MB minimum, and the command refused
+    itself with a budget roughly 190 times its estimate. Each statement is now
+    charged at least the minimum it will bill."""
+
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 10 * MB
+    fake_bq_client.tables["test-proj.shop.events"].num_bytes = 88
+    adapter = make_adapter(
+        fake_bq_client, ceiling=2_000 * MB, session_ceiling=10_000 * MB
+    )
+    first = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    second = "SELECT COUNT(*) FROM `test-proj`.`shop`.`events`"
+    adapter.cost_gate.preflight_command(adapter.query_estimate(first))
+
+    adapter.run_query(first, max_rows=10, timeout_seconds=30)
+    adapter.run_query(second, max_rows=10, timeout_seconds=30)
+
+    billed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(billed) == 2
+    # A cap BigQuery will honour: never under its own per-query minimum.
+    assert billed[1].job_config.maximum_bytes_billed >= 10 * MB
+
+
 def test_billing_rounding_retry_still_refuses_past_the_confirmed_ceiling(
     fake_bq_client,
 ):

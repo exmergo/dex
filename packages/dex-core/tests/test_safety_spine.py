@@ -4221,7 +4221,10 @@ def test_bigquery_unconfirmed_scan_never_executes(fake_bq_client):
             max_rows=10,
             timeout_seconds=30,
         )
-    assert exc_info.value.cost.estimate == 5_000
+    # The estimate is what BigQuery will bill, never under its 10 MB per-query
+    # minimum, rather than the 5,000-byte raw dry run (#482): the figure an agent
+    # sizes --budget from has to be one the bill cannot exceed.
+    assert exc_info.value.cost.estimate == 10 * 1024 * 1024
     assert [c.dry_run for c in fake_bq_client.query_calls] == [True]
 
 

@@ -1210,11 +1210,34 @@ class BigQueryAdapter:
         timeout_seconds: float | None = None,
         max_results: int | None = None,
     ) -> tuple[Any, Any]:
-        """SELECT-only guard, free dry-run, gate charge, then the capped run."""
+        """SELECT-only guard, free dry-run, gate charge, then the capped run.
+
+        Charged at what BigQuery will bill, never less than its per-query
+        minimum: the same floor :meth:`query_estimate` prices the handshake at
+        and the dedicated probes charge. A raw dry-run of a few bytes booked
+        only those few bytes, so the next statement's server-side cap was
+        sized from a booking 10 MB short of what the statement before it
+        billed, and a command refused its own second statement (#482).
+        """
 
         assert_select_only(sql, dialect=self.dialect)
-        estimate = self._dry_run(sql)
-        self.cost_gate.charge(estimate)
+        dry_run = self._dry_run(sql)
+        floor = self._min_billed_floor(sql)
+        estimate = max(dry_run, floor)
+        try:
+            self.cost_gate.charge(estimate)
+        except OverCeilingError as exc:
+            if floor <= dry_run:
+                raise
+            # The minimum, not the scan, is what did not fit, and a refusal
+            # that quotes 10 MB against a statement the caller knows reads a
+            # few bytes has to say where the number came from.
+            raise OverCeilingError(
+                f"{exc}. BigQuery bills at least {_MIN_BILLED_BYTES:,} bytes per "
+                f"table a query reads, so this statement is priced at that "
+                f"minimum rather than its {dry_run:,.0f}-byte dry run",
+                cost=exc.cost,
+            ) from exc
         return self._run(
             sql, estimate, timeout_seconds=timeout_seconds, max_results=max_results
         )

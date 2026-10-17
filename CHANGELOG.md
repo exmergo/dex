@@ -467,6 +467,27 @@ pending fragments into a new section below. See
   `semantic model 'orders' > entities[1] ('customer')`. Validation rules and
   model-level error messages are unchanged.
 
+### Fixed
+
+- **A BigQuery command no longer refuses its own second statement** ([#482]).
+  A whole-project `maintain verify --confirm --budget 2000000000` returned
+  `error`: "the remaining budget (88 bytes) is below the 10,485,760-byte
+  minimum". The command was admitted on its first statement's estimate, floored
+  at BigQuery's 10 MB per-query minimum, and billed that minimum. Its second
+  statement went through the generic query path, which charged the raw dry run
+  (88 bytes), so the booking grew by only 88 bytes, and the second statement's
+  server-side cap was sized from that booking: 88 bytes, under the minimum,
+  refused. The advice to raise `--budget` could not help, because the budget was
+  about 190 times the estimate and was not the binding term.
+
+  - Every BigQuery statement is now charged at least the minimum it will bill,
+    the same floor its estimate is priced at, so the booking covers each
+    statement. A refusal the minimum causes says so.
+  - The cost guard's booking may still tighten a statement's cap, but no longer
+    refuses one by itself: where only the booking is short of the connector's
+    minimum and the confirmed budget still covers it, the statement is capped at
+    the minimum. A budget that is genuinely short still refuses, as before.
+
 ## [1.13.0] - 2026-10-12
 
 ### Changed
