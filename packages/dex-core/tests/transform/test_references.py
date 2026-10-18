@@ -578,6 +578,43 @@ def test_a_yaml_snapshot_relation_is_an_occurrence(tmp_path):
     ]
 
 
+def test_dynamic_yaml_snapshot_relations_limit_only_their_reference_kinds(tmp_path):
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "orders.sql", "select 1 as id\n")
+    _write(
+        root / "snapshots" / "snapshots.yml",
+        "snapshots:\n"
+        "  - name: dynamic_source\n"
+        "    relation: source('raw', var('table_name'))\n"
+        "  - name: dynamic_model\n"
+        "    relation: ref(var('model_name'))\n"
+        "  - name: literal_source\n"
+        "    relation: source('raw', 'orders')\n"
+        "  - name: literal_model\n"
+        "    relation: ref('orders')\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+    for kind, name, line in (("source", "raw.orders", 3), ("model", "orders", 5)):
+        report = find_references(view, [name], kind=kind, index=index)
+        assert report.completeness == "incomplete"
+        unresolved = [
+            (hit.path, hit.line, hit.kind, hit.name) for hit in report.indeterminate
+        ]
+        assert unresolved == [("snapshots/snapshots.yml", line, kind, None)]
+        assert any("could not be resolved" in limit for limit in report.limits)
+        assert any(
+            hit.form == "yaml_snapshot_relation"
+            for hit in index.references_to(name, kind)[0]
+        )
+    seed_report = find_references(view, ["orders"], kind="seed", index=index)
+    assert seed_report.completeness == "complete"
+
+
 def test_a_python_model_lists_its_ref_and_source_reads(tmp_path):
     """Literal `dbt.ref` and `dbt.source` calls are occurrences.
 

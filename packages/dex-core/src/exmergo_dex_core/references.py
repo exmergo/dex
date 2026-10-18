@@ -847,6 +847,22 @@ class ReferenceIndex:
         relation = entry.get("relation")
         target = _relation_from(relation)
         if target is None:
+            if isinstance(relation, str):
+                expression = relation if "{{" in relation else "{{ " + relation + " }}"
+                for call in jinja_calls(expression):
+                    if call.callee not in ("ref", "source"):
+                        continue
+                    self._record(
+                        Reference(
+                            path=path,
+                            line=lines.peek(relation),
+                            form="yaml_snapshot_relation",
+                            kind="source" if call.callee == "source" else "model",
+                            resolution=INDETERMINATE,
+                            package=package,
+                            note="snapshot relation could not be resolved statically",
+                        )
+                    )
             return
         self._record(
             Reference(

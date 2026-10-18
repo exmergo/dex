@@ -1,0 +1,1 @@
+**Dynamic YAML snapshot relations no longer disappear from reference reports.** `transform references` now marks model or source queries incomplete when a snapshot's `relation` uses a dynamic `ref()` or `source()` argument, and identifies the snapshot file so callers do not mistake an unresolved read for an unused relation.
