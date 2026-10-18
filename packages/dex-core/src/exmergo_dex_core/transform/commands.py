@@ -219,6 +219,7 @@ def init_project(
         project_dir=result.project_dir,
         connector=result.connector,
         connector_source=source,
+        warehouse_path=result.warehouse_path,
         created=result.created,
         diffs=result.diffs,
         warnings=preflight,
