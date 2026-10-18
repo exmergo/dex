@@ -26,6 +26,9 @@ class InitResult(Result):
     # warehouse because a config was picked up implicitly is the failure this
     # command exists to prevent.
     connector_source: str = ""
+    # The duckdb warehouse path as committed: relative when the warehouse is
+    # inside the repo, absolute when it is not (issue #642).
+    warehouse_path: str | None = None
     created: list[str] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
@@ -34,6 +37,7 @@ class InitResult(Result):
             "project_dir": self.project_dir,
             "connector": self.connector,
             "connector_source": self.connector_source,
+            "warehouse_path": self.warehouse_path,
             "created": self.created,
         }
 
