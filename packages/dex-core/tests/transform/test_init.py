@@ -87,15 +87,101 @@ def test_init_bootstraps_a_project_end_to_end(
     assert config["connector"] == "duckdb"
     assert config["dbt_project_dir"] == "analytics"
     assert config["dbt_target"] == "dev"
-    assert config["duckdb"]["path"] == str(duckdb_file)
+    # The fixture's warehouse sits inside the repo, so init commits it
+    # repo-relative rather than leaking the author's absolute path (#642).
+    assert config["duckdb"]["path"] == "warehouse.duckdb"
 
     profiles = yaml.safe_load((project / "profiles.yml").read_text(encoding="utf-8"))
     assert profiles["analytics"]["target"] == "dev"
     assert set(profiles["analytics"]["outputs"]) == {"dev"}
+    # Project-relative, because dbt resolves profile paths against its cwd.
     assert profiles["analytics"]["outputs"]["dev"] == {
         "type": "duckdb",
-        "path": str(duckdb_file),
+        "path": "../warehouse.duckdb",
     }
+
+
+# --- portable warehouse paths: nothing absolute leaks into committed files ----
+
+
+def test_init_writes_no_absolute_path_for_an_in_repo_warehouse(tmp_path: Path, capsys):
+    """The issue #642 repro, verbatim: a relative ``--path`` must not come back
+    as an absolute one, in either committed file."""
+
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "duckdb", "--path", "warehouse/x.duckdb"),
+        capsys,
+    )
+    assert rc == 0, envelope
+    project = tmp_path / "analytics"
+
+    config_text = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    profiles_text = (project / "profiles.yml").read_text(encoding="utf-8")
+    # Neither committed file may carry the author's absolute path.
+    assert str(tmp_path) not in config_text
+    assert str(tmp_path) not in profiles_text
+
+    config = yaml.safe_load(config_text)
+    assert config["duckdb"]["path"] == "warehouse/x.duckdb"
+    profiles = yaml.safe_load(profiles_text)
+    assert profiles["analytics"]["outputs"]["dev"] == {
+        "type": "duckdb",
+        "path": "../warehouse/x.duckdb",
+    }
+    # The envelope reports which form was chosen, so a caller never has to
+    # open the files to find out.
+    assert envelope["data"]["warehouse_path"] == "warehouse/x.duckdb"
+
+
+def test_init_keeps_an_absolute_path_for_a_warehouse_outside_the_repo(
+    tmp_path: Path, capsys
+):
+    """A warehouse outside the repo cannot be named relatively and still
+    resolve, so it stays absolute in both files."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "elsewhere" / "wh.duckdb"
+    rc, envelope = _run(
+        _init_argv(repo, "--connector", "duckdb", "--path", str(outside)),
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    config = yaml.safe_load((repo / ".dex" / "config.yml").read_text(encoding="utf-8"))
+    assert config["duckdb"]["path"] == str(outside)
+    profiles = yaml.safe_load(
+        (repo / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    assert profiles["analytics"]["outputs"]["dev"]["path"] == str(outside)
+    assert envelope["data"]["warehouse_path"] == str(outside)
+
+
+def test_init_passes_the_dev_target_check_with_relative_paths(tmp_path: Path, capsys):
+    """`transform build --target dev` runs the dev-target check right after
+    init: the config path resolves against the repo root, the profile path
+    against the project dir, and the two must land on the same file."""
+
+    warehouse = tmp_path / "warehouse" / "x.duckdb"
+    warehouse.parent.mkdir(parents=True)
+    # Existence is all the namespace check looks at; nothing opens the file.
+    warehouse.write_bytes(b"")
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "duckdb", "--path", "warehouse/x.duckdb"),
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    from exmergo_dex_core.config import load_config
+    from exmergo_dex_core.transform import dev_target
+
+    config = load_config(tmp_path)
+    assert config.connector == "duckdb"
+    # No store or connection, exactly how a free/local build wires it up.
+    warnings = dev_target.check(
+        tmp_path / "analytics", "dev", config, tmp_path, store=None, connection=None
+    )
+    assert warnings == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="mode bits are synthetic on Windows")
