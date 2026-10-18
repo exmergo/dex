@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from exmergo_dex_core import EditValidationError
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.transform.semantic import validate_semantic_yaml
 
 _VALID_SEMANTIC_YAML = """\
 semantic_models:
@@ -127,6 +131,35 @@ def test_semantic_define_rejects_invalid_metricflow_yaml(
     )
     assert rc == 1
     assert envelope["status"] == "error"
+
+
+@pytest.mark.parametrize("key", ["metrics", "semantic_models"])
+def test_semantic_sections_must_be_lists(key: str):
+    with pytest.raises(EditValidationError, match=key):
+        validate_semantic_yaml("models/semantic/customers.yml", {key: 3})
+
+
+@pytest.mark.parametrize("key", ["metrics", "semantic_models"])
+def test_semantic_plan_reports_non_list_sections_as_request_errors(
+    key: str, dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _payload_file(tmp_path, f"{key}: 3\n")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "plan",
+            "bad",
+            "--edits-file",
+            str(payload),
+            "--no-parse",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["reason"] == "request"
+    assert key in envelope["errors"][0]
 
 
 def test_semantic_define_requires_semantic_content(

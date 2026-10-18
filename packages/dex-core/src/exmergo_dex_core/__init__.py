@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 _EXPORTS = {
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
+    "BuildFailedError": "transform.commands",
     "CacheRequiredError": "explore.commands",
     "CacheUnreadableError": "storage.base",
     "CeilingRequiredError": "guards.cost_guard",
@@ -79,8 +80,13 @@ _EXPORTS = {
     "DexConfig": "config",
     "DexEngine": "engine",
     "DexError": "errors",
+    "DbtParseError": "transform.commands",
+    "DbtProjectError": "dbt_project",
+    "DbtRunError": "transform.build",
     "DialectDependencyError": "guards.dialect",
     "Document": "storage",
+    "EditValidationError": "transform.validate",
+    "DevTargetError": "transform.dev_target",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
     "InvalidConfigError": "config_document",
@@ -140,6 +146,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScopeError,
         SemanticSource,
     )
+    from .dbt_project import DbtProjectError
     from .demo import (
         DEMO_FILENAME,
         DemoDependencyError,
@@ -205,7 +212,9 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         StoreContext,
         StoreFactory,
     )
-    from .transform.build import MissingPackagesError
+    from .transform.build import DbtRunError, MissingPackagesError
+    from .transform.commands import BuildFailedError, DbtParseError
+    from .transform.dev_target import DevTargetError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -213,6 +222,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScaffoldPrerequisiteError,
         SourcesFileError,
     )
+    from .transform.validate import EditValidationError
 
 try:
     __version__ = version("exmergo-dex-core")
@@ -227,6 +237,7 @@ __all__ = [
     "DEMO_FILENAME",
     "BaselineUnreadableError",
     "BudgetExhaustedError",
+    "BuildFailedError",
     "CacheRequiredError",
     "CacheUnreadableError",
     "CeilingRequiredError",
@@ -243,6 +254,9 @@ __all__ = [
     "CostGuardError",
     "CredentialDiscoveryError",
     "Dataset",
+    "DbtParseError",
+    "DbtProjectError",
+    "DbtRunError",
     "DemoDependencyError",
     "DemoError",
     "DemoPathError",
@@ -251,8 +265,10 @@ __all__ = [
     "DexConfig",
     "DexEngine",
     "DexError",
+    "DevTargetError",
     "DialectDependencyError",
     "Document",
+    "EditValidationError",
     "ExploreStore",
     "FilesystemStore",
     "InvalidConfigError",

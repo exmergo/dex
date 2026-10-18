@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from exmergo_dex_core import DexEngine, MemoryStore, PlanNotFoundError
 from exmergo_dex_core.cli import main
 
 
@@ -122,6 +123,11 @@ def test_apply_without_plan_id_and_no_plans_is_a_clean_error(
     assert rc == 1
     assert envelope["status"] == "error"
     assert "no unapplied plan" in envelope["errors"][0]
+
+
+def test_engine_apply_without_plan_raises_a_typed_error():
+    with DexEngine(store=MemoryStore()) as engine, pytest.raises(PlanNotFoundError):
+        engine.apply()
 
 
 def test_apply_without_id_takes_the_latest_unapplied_plan(

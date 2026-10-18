@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import write_manifest, write_semantic_manifest
 
-from exmergo_dex_core import DexEngine
+from exmergo_dex_core import DexEngine, MemoryStore, PlanNotFoundError
 from exmergo_dex_core.edits import EditOp
 from exmergo_dex_core.transform.grounding import (
     config_digest,
@@ -45,6 +45,11 @@ def _model(path: str, content: str) -> PlanEdit:
     return PlanEdit(
         path=path, new_content=content, op=EditOp.UPSERT, kind=EditKind.MODEL_SQL
     )
+
+
+def test_engine_ground_without_plan_raises_a_typed_error():
+    with DexEngine(store=MemoryStore()) as engine, pytest.raises(PlanNotFoundError):
+        engine.ground()
 
 
 @pytest.fixture

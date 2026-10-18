@@ -41,11 +41,22 @@ from ..dbt_project import (
 from .validate import EditValidationError
 
 
+def _semantic_entries(path: str, parsed: dict[str, Any], key: str) -> list[Any]:
+    """Return one semantic section after checking its collection shape."""
+
+    value = parsed.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise EditValidationError(f"{path}: '{key}' must be a list")
+    return value
+
+
 def validate_semantic_yaml(path: str, parsed: dict[str, Any]) -> list[str]:
     """Validate one semantic YAML document. Returns warnings; raises on failure."""
 
-    semantic_models = parsed.get("semantic_models") or []
-    metrics = parsed.get("metrics") or []
+    semantic_models = _semantic_entries(path, parsed, "semantic_models")
+    metrics = _semantic_entries(path, parsed, "metrics")
     if not semantic_models and not metrics:
         raise EditValidationError(
             f"{path}: semantic YAML must declare semantic_models or metrics"
@@ -271,6 +282,11 @@ def check_mode(
             f"{', '.join(sorted(name for _kind, name in removed))}; use "
             "`semantic update` or `semantic plan` to remove one"
         )
+
+    for path, parsed in parsed_edits:
+        if isinstance(parsed, dict):
+            _semantic_entries(path, parsed, "semantic_models")
+            _semantic_entries(path, parsed, "metrics")
 
     existing = existing_semantic_names(view)
     on_disk = project_definitions(view)
