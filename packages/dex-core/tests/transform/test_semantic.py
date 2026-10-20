@@ -1420,3 +1420,96 @@ def test_the_removal_unit_reaches_the_engine_surface_too(
     assert result.removed == ["doubled"]
     assert result.updated == []
     assert len(result.diffs) == 1
+
+
+# --- indentless sequences (#728) -----------------------------------------------
+
+# `yaml.safe_dump` and many dbt projects write a top-level sequence with its
+# `- ` items at column 0, directly under the key. That is valid YAML, so the
+# definition editor has to splice into it rather than refuse the file.
+_INDENTLESS_YAML = "".join(
+    line[2:] if line.startswith("  ") else line
+    for line in _VALID_SEMANTIC_YAML.splitlines(keepends=True)
+)
+assert "metrics:\n- name: customer_count\n" in _INDENTLESS_YAML, "fixture must dedent"
+
+_NEW_METRIC = {
+    "kind": "metric",
+    "content": (
+        "name: doubled\n"
+        "label: Doubled\n"
+        "type: derived\n"
+        "type_params:\n"
+        "  expr: customer_count * 2\n"
+        "  metrics:\n"
+        "    - name: customer_count\n"
+    ),
+    "path": "models/semantic/customers.yml",
+}
+
+
+def test_definition_edit_adds_to_an_indentless_sequence(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _land_baseline(tmp_path, capsys, _INDENTLESS_YAML)
+    envelope, landed = _apply_definitions(tmp_path, capsys, [_NEW_METRIC], "add.json")
+    assert envelope["data"]["defined"] == ["doubled"]
+    assert landed == (
+        _INDENTLESS_YAML
+        + "\n- name: doubled\n"
+        + "  label: Doubled\n"
+        + "  type: derived\n"
+        + "  type_params:\n"
+        + "    expr: customer_count * 2\n"
+        + "    metrics:\n"
+        + "      - name: customer_count\n"
+    )
+
+
+def test_definition_edit_updates_an_indentless_sequence_item(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _land_baseline(tmp_path, capsys, _INDENTLESS_YAML)
+    envelope, landed = _apply_definitions(
+        tmp_path,
+        capsys,
+        [
+            {
+                "kind": "metric",
+                "content": (
+                    "name: customer_count\n"
+                    "label: Count of customers\n"
+                    "type: simple\n"
+                    "type_params:\n"
+                    "  measure: customer_count\n"
+                ),
+            }
+        ],
+        "update.json",
+    )
+    assert envelope["data"]["updated"] == ["customer_count"]
+    assert landed == _INDENTLESS_YAML.replace(
+        "label: Customer count", "label: Count of customers"
+    )
+
+
+def test_definition_edit_removes_from_an_indentless_sequence(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    with_two = _INDENTLESS_YAML + (
+        "- name: doubled\n"
+        "  label: Doubled\n"
+        "  type: derived\n"
+        "  type_params:\n"
+        "    expr: customer_count * 2\n"
+        "    metrics:\n"
+        "      - name: customer_count\n"
+    )
+    _land_baseline(tmp_path, capsys, with_two)
+    _envelope, landed = _apply_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "name": "doubled", "op": "delete"}],
+        "remove.json",
+    )
+    assert landed == _INDENTLESS_YAML
