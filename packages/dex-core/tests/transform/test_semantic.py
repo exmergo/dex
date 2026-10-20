@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.transform.semantic import _Block, _find_block
 
 _VALID_SEMANTIC_YAML = """\
 semantic_models:
@@ -1420,3 +1421,20 @@ def test_the_removal_unit_reaches_the_engine_surface_too(
     assert result.removed == ["doubled"]
     assert result.updated == []
     assert len(result.diffs) == 1
+
+
+def test_find_block_reads_an_indentless_sequence_to_its_last_item():
+    # YAML allows a sequence under a key to sit at the key's own column, as
+    # yaml.safe_dump writes it. The block runs to the end of the list, and its
+    # items keep the column they already use.
+    lines = [
+        "metrics:\n",
+        "- name: views\n",
+        "  type: simple\n",
+        "- name: clicks\n",
+        "  type: simple\n",
+    ]
+
+    block = _find_block("semantic.yml", lines, "metrics")
+
+    assert block == _Block(start=1, end=5, indent="")

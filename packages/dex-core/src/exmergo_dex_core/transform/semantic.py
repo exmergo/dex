@@ -836,13 +836,14 @@ def _find_block(path: str, lines: list[str], key: str) -> _Block | None:
     end = len(lines)
     for index in range(key_line + 1, len(lines)):
         line = lines[index]
-        if line.strip() and not line[:1].isspace():
+        # An indentless item (`- name:` at the key's column) is part of the block.
+        if line.strip() and not line[:1].isspace() and not line.startswith("- "):
             end = index
             break
 
     indent = None
     for index in range(key_line + 1, end):
-        match = re.match(r"^(\s+)-\s", lines[index])
+        match = re.match(r"^(\s*)-\s", lines[index])
         if match:
             indent = match.group(1)
             break
