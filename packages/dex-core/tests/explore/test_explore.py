@@ -1517,8 +1517,7 @@ def _orphan_repo(tmp_path: Path) -> tuple[Path, Path]:
     return db, repo
 
 
-def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
-    db, repo = _orphan_repo(tmp_path)
+def _map_orphan_repo(db: Path, repo: Path, capsys) -> tuple:
     _run(
         [
             "explore",
@@ -1536,8 +1535,68 @@ def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
         d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders")
     )
     backed = next(d for d in cache.datasets if d.identifier.endswith(".stg_orders"))
-    assert any("orphaned residue" in n for n in orphan.data_quality)
+    return orphan, backed
+
+
+_NOT_DECLARED = "no dbt source declares this relation yet"
+
+
+def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
+    """No baseline, so the leftover may just be a table the loader added (#735):
+    it is still downranked, but not called residue of a removal."""
+
+    db, repo = _orphan_repo(tmp_path)
+    orphan, backed = _map_orphan_repo(db, repo, capsys)
+    assert any(_NOT_DECLARED in n for n in orphan.data_quality)
+    assert not any("orphaned residue" in n for n in orphan.data_quality)
     assert orphan.rank_score < backed.rank_score
+
+
+def test_map_calls_orphan_residue_only_when_baseline_knew_it(tmp_path: Path, capsys):
+    db, repo = _orphan_repo(tmp_path)
+    legacy_model = repo / "models" / "stg_legacy_orders.sql"
+    legacy_model.write_text("select * from x", encoding="utf-8")
+    _run(
+        ["maintain", "snapshot", "--path", str(db), "--repo-root", str(repo)],
+        capsys,
+    )
+    legacy_model.unlink()
+    orphan, backed = _map_orphan_repo(db, repo, capsys)
+    assert any("orphaned residue" in n for n in orphan.data_quality)
+    assert not any(_NOT_DECLARED in n for n in orphan.data_quality)
+    assert orphan.rank_score < backed.rank_score
+
+
+def test_map_unreadable_snapshot_counts_as_no_baseline(tmp_path: Path, capsys):
+    db, repo = _orphan_repo(tmp_path)
+    (repo / ".dex").mkdir(exist_ok=True)
+    (repo / ".dex" / "snapshot.json").write_text("{not json", encoding="utf-8")
+    orphan, _backed = _map_orphan_repo(db, repo, capsys)
+    assert any(_NOT_DECLARED in n for n in orphan.data_quality)
+
+
+def test_map_orphan_note_on_an_explore_only_store(tmp_path: Path):
+    """An explore-tier store keeps no snapshot, so it counts as no baseline."""
+
+    from fakes.stores import TenantStore
+
+    from exmergo_dex_core import DexEngine
+
+    db, repo = _orphan_repo(tmp_path)
+    TenantStore.reset()
+    with DexEngine(
+        connector="duckdb",
+        path=str(db),
+        store=TenantStore("t"),
+        repo_root=str(repo),
+    ) as engine:
+        engine.map(use_project=True)
+    cache = TenantStore("t").load_cache()
+    TenantStore.reset()
+    orphan = next(
+        d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders")
+    )
+    assert any(_NOT_DECLARED in n for n in orphan.data_quality)
 
 
 def test_map_declared_grain_overrides_heuristic(tmp_path: Path, capsys):

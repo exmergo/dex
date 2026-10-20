@@ -79,7 +79,13 @@ from ..semantic_catalog import (
     derive_entity_type,
     entity_joins,
 )
-from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
+from ..storage import (
+    CacheUnreadableError,
+    Document,
+    ExploreStore,
+    MaintainStore,
+    readable_cache,
+)
 from ..values_free import (
     ResultMode,
     ValuesFreeCode,
@@ -2247,6 +2253,7 @@ def map(
 
     metas = inventory_mod.inventory(adapter)
     orphaned = _orphan_candidates(metas, defs)
+    baselined = _baselined_identifiers(store) if orphaned else set()
     # The schema/dataset namespaces this run's inventory actually saw, so
     # carry-forward can tell "out of this run's scope" from "gone from the
     # warehouse" (issue #149) -- an identifier whose own namespace is here but
@@ -2332,6 +2339,7 @@ def map(
         profiled,
         defs,
         orphaned=orphaned,
+        baselined=baselined,
         high_null_fraction=config.profile_high_null_fraction,
     )
     suppressed: list[rel_mod.SuppressedMatch] = []
@@ -4179,10 +4187,10 @@ def _orphan_candidates(
     metas: list[ObjectMeta], defs: dbt_project.ProjectDefinitions
 ) -> set[str]:
     """Identifiers no current model/source builds or sources, restricted to
-    schemas the project *does* build/source at least one other object into --
-    that schema-membership check stands in for maintain's baseline-vs-current
-    comparison, which explore has no snapshot to perform, so a raw, never
-    dbt-modeled schema is never miscast as full of orphans."""
+    schemas the project *does* build/source at least one other object into, so
+    a raw, never dbt-modeled schema is never miscast as full of orphans. A
+    candidate is not necessarily residue: a table the loader just added is one
+    too. :func:`_baselined_identifiers` tells the two apart for the note."""
 
     if not defs.present or not defs.built_relation_names:
         return set()
@@ -4204,6 +4212,22 @@ def _orphan_candidates(
     }
 
 
+def _baselined_identifiers(store: ExploreStore) -> set[str]:
+    """Lowercased identifiers the accepted baseline (``.dex/snapshot.json``)
+    knew. Empty when there is none, the store keeps none, or it cannot be read:
+    the note it selects is advisory, and `maintain` reports a corrupt one."""
+
+    if not isinstance(store, MaintainStore):
+        return set()
+    try:
+        snap = store.load_snapshot()
+    except ValueError:
+        return set()
+    if snap is None:
+        return set()
+    return {d.identifier.lower() for d in snap.warehouse.datasets}
+
+
 def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
     """User-configured ranking hints plus the models metric definitions ground
     in. User hints come first and are never displaced; metric-backed models are
@@ -4223,6 +4247,7 @@ def _annotate_grain(
     defs: dbt_project.ProjectDefinitions | None = None,
     *,
     orphaned: set[str] | None = None,
+    baselined: set[str] | None = None,
     high_null_fraction: float = 0.95,
 ) -> None:
     """Attach the interpretation layer to raw profiles: candidate keys, the likely
@@ -4242,7 +4267,9 @@ def _annotate_grain(
     proven single column, in which case the proven single wins and the
     composite is only noted. ``candidate_keys`` stays measurement-only: an
     unmeasured declared key is a claim, and the cache is a drift baseline.
-    ``orphaned`` (map only) badges a relation no current model/source builds.
+    ``orphaned`` (map only) badges a relation no current model/source builds:
+    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
+    and otherwise as a new relation no source declares yet.
     """
 
     declared_grain: dict[str, str] = {}
@@ -4285,11 +4312,17 @@ def _annotate_grain(
         ds.key_evidence = rel_mod.key_evidence(ds)
         ds.data_quality.extend(rel_mod.data_quality_notes(ds))
         if orphaned and ds.identifier in orphaned:
-            ds.data_quality.append(
-                "no current dbt model or source builds this relation, though "
-                "the project builds/sources others in this schema; likely "
-                "orphaned residue of a rename or removal"
-            )
+            if baselined and ds.identifier.lower() in baselined:
+                ds.data_quality.append(
+                    "no current dbt model or source builds this relation, though "
+                    "the project builds/sources others in this schema; likely "
+                    "orphaned residue of a rename or removal"
+                )
+            else:
+                ds.data_quality.append(
+                    "no dbt source declares this relation yet; add it to the "
+                    "sources file before modelling it"
+                )
 
         grain_column = declared_grain.get(ds.identifier.lower())
         if grain_column is not None:
