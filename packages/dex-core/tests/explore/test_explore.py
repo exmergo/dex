@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
+from exmergo_dex_core.adapters.base import ObjectMeta
 from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
@@ -136,6 +137,78 @@ def test_inventory_rank_states_its_basis(duckdb_file: Path, capsys):
     basis = " ".join(payload["data"]["notes"])
     assert "naming convention" in basis
     assert "connectivity" in basis
+
+
+def test_inventory_rank_note_without_row_counts(
+    duckdb_file: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.explore import commands
+
+    metas = [
+        ObjectMeta(
+            identifier="main.orders",
+            object_type="table",
+            schema="main",
+            name="orders",
+            row_count=None,
+            byte_size=None,
+            column_count=2,
+        ),
+        ObjectMeta(
+            identifier="main.customers",
+            object_type="table",
+            schema="main",
+            name="customers",
+            row_count=None,
+            byte_size=None,
+            column_count=2,
+        ),
+    ]
+    monkeypatch.setattr(commands.inventory_mod, "inventory", lambda adapter: metas)
+
+    payload = _run(
+        ["explore", "inventory", "--rank", "--path", str(duckdb_file)], capsys
+    )
+    basis = " ".join(payload["data"]["notes"])
+
+    assert "ranked by size" not in basis
+    assert "naming convention" in basis
+    assert "size did not contribute" in basis
+
+
+def test_inventory_rank_note_with_row_counts_keeps_size_signal(
+    duckdb_file: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.explore import commands
+
+    metas = [
+        ObjectMeta(
+            identifier="main.orders",
+            object_type="table",
+            schema="main",
+            name="orders",
+            row_count=100,
+            byte_size=None,
+            column_count=2,
+        ),
+        ObjectMeta(
+            identifier="main.customers",
+            object_type="table",
+            schema="main",
+            name="customers",
+            row_count=None,
+            byte_size=None,
+            column_count=2,
+        ),
+    ]
+    monkeypatch.setattr(commands.inventory_mod, "inventory", lambda adapter: metas)
+
+    payload = _run(
+        ["explore", "inventory", "--rank", "--path", str(duckdb_file)], capsys
+    )
+    basis = " ".join(payload["data"]["notes"])
+
+    assert "ranked by size (row count)" in basis
 
 
 def test_inventory_without_rank_reports_empty_notes(duckdb_file: Path, capsys):
