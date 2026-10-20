@@ -833,16 +833,19 @@ def _find_block(path: str, lines: list[str], key: str) -> _Block | None:
     if key_line is None:
         return None
 
+    # The block runs until the next top-level line. An item written at column 0
+    # (`- name: x` directly under the key, an "indentless" sequence) is still
+    # part of the block, not the next key.
     end = len(lines)
     for index in range(key_line + 1, len(lines)):
         line = lines[index]
-        if line.strip() and not line[:1].isspace():
+        if line.strip() and not line[:1].isspace() and not line.startswith("- "):
             end = index
             break
 
     indent = None
     for index in range(key_line + 1, end):
-        match = re.match(r"^(\s+)-\s", lines[index])
+        match = re.match(r"^(\s*)-\s", lines[index])
         if match:
             indent = match.group(1)
             break
