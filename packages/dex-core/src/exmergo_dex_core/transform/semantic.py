@@ -693,8 +693,14 @@ def parse_definition_payload(entries: Iterable[Any]) -> list[DefinitionEdit]:
     return parsed_entries
 
 
+_KIND_PLURAL = {"semantic_model": "semantic models", "metric": "metrics"}
+
+
 def splice_definitions(
-    definitions: Sequence[DefinitionEdit], view: DbtProjectView
+    definitions: Sequence[DefinitionEdit],
+    view: DbtProjectView,
+    *,
+    notes: list[str],
 ) -> list[tuple[str, str]]:
     """Lower per-definition edits into whole-file content, one entry per path.
 
@@ -712,6 +718,12 @@ def splice_definitions(
     span safely is reported with ``--edits-file`` named as the way to edit it,
     and the spliced result is re-parsed and compared against the incoming body
     so a splice that landed in the wrong place cannot reach the plan store.
+
+    A new definition with no path goes to the one file that declares every
+    existing definition of its kind or, when none of that kind exists yet, the
+    project's only semantic file, and ``notes`` is told where it went. With no
+    such file, or more than one, it is refused: there is nothing unambiguous to
+    pick.
     """
 
     on_disk = project_definitions(view)
@@ -734,6 +746,26 @@ def splice_definitions(
             continue
         if definition.path is None:
             if current is None:
+                homes = {
+                    p for (k, _n), (p, _b) in on_disk.items() if k == definition.kind
+                }
+                where = (
+                    "the project's only file that declares "
+                    + _KIND_PLURAL[definition.kind]
+                )
+                if not homes:
+                    # No definition of this kind yet: the first one goes to the
+                    # project's only semantic file, if there is exactly one.
+                    homes = {p for p, _b in on_disk.values()}
+                    where = "the project's only semantic file"
+                if len(homes) == 1:
+                    (home,) = homes
+                    notes.append(
+                        f"{definition.kind} '{definition.name}' placed in "
+                        f"{home}, {where}"
+                    )
+                    targets.append((home, definition))
+                    continue
                 raise EditValidationError(
                     f"{definition.kind} '{definition.name}' is not in the project, "
                     "so there is no file to rewrite: give it a path"

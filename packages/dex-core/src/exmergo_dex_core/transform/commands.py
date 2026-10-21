@@ -3680,13 +3680,16 @@ def _semantic_plan(
     # back out of it: a removal's effect is the absence of something, which the
     # content it produces cannot state.
     removed: list[semantic_mod.DefinitionEdit] = []
+    placement_notes: list[str] = []
     if definitions:
         # Lowered to the whole-file unit before anything else looks at them, so
         # the validation, classification, parse gate, and plan store below stay
         # on one code path regardless of how the caller expressed the change.
         edits = [
             PlanEdit(path=path, kind=EditKind.SEMANTIC_YML, new_content=content)
-            for path, content in _semantic().splice_definitions(definitions, view)
+            for path, content in _semantic().splice_definitions(
+                definitions, view, notes=placement_notes
+            )
         ]
         scope = {(d.kind, d.name) for d in definitions}
         removed = [d for d in definitions if d.op is EditOp.DELETE]
@@ -3774,6 +3777,7 @@ def _semantic_plan(
             "every definition in this payload is identical to the project's "
             "current content, so this plan changes nothing"
         )
+    result.warnings.extend(placement_notes)
     if spine_warning:
         result.warnings.append(spine_warning)
     if parse_warning:

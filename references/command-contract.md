@@ -905,9 +905,12 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   `{"definitions": [{"kind", "path", "content"}, ...]}`, `kind` being
   `semantic_model` or `metric`, `content` that definition's YAML body (a mapping,
   written without the leading `- `). The name is read from the content, so the
-  two cannot disagree. `path` is required for a name the project does not have
-  and optional for one it does, defaulting to the file that declares it; an
-  explicit path that would relocate an existing definition is refused, because
+  two cannot disagree. `path` is optional for a name the project has,
+  defaulting to the file that declares it. For a new name it defaults to the one
+  file that declares every existing definition of that kind or, when none of
+  that kind exists yet, the project's only semantic file, with a warning naming
+  the file, and is required when there is no such file or more than one.
+  An explicit path that would relocate an existing definition is refused, because
   writing it to a second file duplicates the name. The engine writes each
   definition in place and preserves every other byte, comments included, then
   re-parses the result and compares it against what was sent. A file whose

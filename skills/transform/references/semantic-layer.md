@@ -25,9 +25,13 @@ line is a chance to corrupt a definition. Send only what changes:
 `kind` is `semantic_model` or `metric`, and `content` is that definition's YAML
 body with no leading `- `. The name comes from the content, and `path` can be
 omitted for anything the project already declares (the engine rewrites it where
-it lives). Everything else in the file, comments included, is preserved byte for
-byte. Use `--edits-file` to create a file, move a definition between files, or
-empty one, and when the engine refuses a layout it will not splice into.
+it lives). A new definition can omit it too when every existing definition of
+its kind lives in one file or, when none of that kind exists yet, the project's
+only semantic file: it is added to that file, and the plan's `warnings` say so.
+With no such file, or more than one, give it a `path`. Everything else in the
+file, comments included, is preserved byte for byte. Use `--edits-file` to
+create a file, move a definition between files, or empty one, and when the
+engine refuses a layout it will not splice into.
 
 ### Removing a definition
 

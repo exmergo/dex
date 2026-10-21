@@ -889,6 +889,175 @@ def test_definition_edit_finds_the_file_that_already_declares_the_name(
     assert envelope["data"]["updated"] == ["doubled"]
 
 
+_TRIPLED = {
+    "kind": "metric",
+    "content": (
+        "name: tripled\n"
+        "label: Tripled\n"
+        "type: derived\n"
+        "type_params:\n"
+        "  expr: customer_count * 3\n"
+        "  metrics:\n"
+        "    - name: customer_count\n"
+    ),
+}
+_NO_PATH_REFUSAL = (
+    "metric 'tripled' is not in the project, so there is no file to rewrite: "
+    "give it a path"
+)
+
+
+def test_a_new_definition_defaults_to_the_only_file_of_its_kind(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#738: one file declares every metric and semantic model, so a new one
+    with no path has exactly one place to go, and the plan says it went there."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    orders = {
+        "kind": "semantic_model",
+        "content": (
+            "name: orders\n"
+            "model: ref('stg_customers')\n"
+            "entities:\n"
+            "  - name: customer_order\n"
+            "    type: primary\n"
+            "    expr: id\n"
+        ),
+    }
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED, orders], "new.json")
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
+    assert sorted(envelope["data"]["defined"]) == ["orders", "tripled"]
+    assert (
+        "metric 'tripled' placed in models/semantic/customers.yml, the project's "
+        "only file that declares metrics"
+    ) in envelope["warnings"]
+    assert (
+        "semantic_model 'orders' placed in models/semantic/customers.yml, the "
+        "project's only file that declares semantic models"
+    ) in envelope["warnings"]
+    assert "+  - name: tripled" in envelope["diffs"][0]["unified"]
+
+
+def test_a_new_definition_follows_its_own_kind_not_any_semantic_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Semantic models in one file and metrics in another: two semantic files,
+    but only one declares metrics, so a new metric still has one home."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    (dbt_project_dir / "models" / "semantic" / "more_models.yml").write_text(
+        "semantic_models:\n"
+        "  - name: accounts\n"
+        "    model: ref('stg_customers')\n"
+        "    entities:\n"
+        "      - name: account\n"
+        "        type: primary\n"
+        "        expr: id\n",
+        encoding="utf-8",
+    )
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED], "split.json")
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
+    assert envelope["data"]["defined"] == ["tripled"]
+    assert any(
+        w.startswith("metric 'tripled' placed in models/semantic/customers.yml")
+        for w in envelope["warnings"]
+    )
+
+
+def test_a_first_metric_defaults_to_the_only_semantic_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """No metric exists yet, but one file declares every semantic model, so the
+    project's first metric has one place to go."""
+
+    models_only = _VALID_SEMANTIC_YAML.split("\nmetrics:\n")[0] + "\n"
+    _land_baseline(tmp_path, capsys, models_only)
+    first = {
+        "kind": "metric",
+        "content": (
+            "name: customers_total\n"
+            "label: Customers total\n"
+            "type: simple\n"
+            "type_params:\n"
+            "  measure: customer_count\n"
+        ),
+    }
+    rc, envelope = _plan_definitions(tmp_path, capsys, [first], "first.json")
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
+    assert envelope["data"]["defined"] == ["customers_total"]
+    assert (
+        "metric 'customers_total' placed in models/semantic/customers.yml, the "
+        "project's only semantic file"
+    ) in envelope["warnings"]
+
+
+def test_a_first_metric_with_two_semantic_files_is_still_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """No metric exists yet and two files declare semantic models, so the first
+    metric has no single file to default to."""
+
+    models_only = _VALID_SEMANTIC_YAML.split("\nmetrics:\n")[0] + "\n"
+    _land_baseline(tmp_path, capsys, models_only)
+    (dbt_project_dir / "models" / "semantic" / "more_models.yml").write_text(
+        "semantic_models:\n"
+        "  - name: accounts\n"
+        "    model: ref('stg_customers')\n"
+        "    entities:\n"
+        "      - name: account\n"
+        "        type: primary\n"
+        "        expr: id\n",
+        encoding="utf-8",
+    )
+    first = {
+        "kind": "metric",
+        "content": (
+            "name: customers_total\n"
+            "label: Customers total\n"
+            "type: simple\n"
+            "type_params:\n"
+            "  measure: customer_count\n"
+        ),
+    }
+    rc, envelope = _plan_definitions(tmp_path, capsys, [first], "first.json")
+    assert rc == 1
+    assert envelope["errors"] == [
+        "metric 'customers_total' is not in the project, so there is no file to "
+        "rewrite: give it a path"
+    ]
+
+
+def test_a_new_definition_with_two_files_of_its_kind_is_still_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    (dbt_project_dir / "models" / "semantic" / "more_metrics.yml").write_text(
+        "metrics:\n"
+        "  - name: quadrupled\n"
+        "    type: derived\n"
+        "    type_params:\n"
+        "      expr: customer_count * 4\n"
+        "      metrics:\n"
+        "        - name: customer_count\n",
+        encoding="utf-8",
+    )
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED], "two.json")
+    assert rc == 1
+    assert envelope["errors"] == [_NO_PATH_REFUSAL]
+
+
+def test_a_new_definition_with_no_file_of_its_kind_is_still_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED], "none.json")
+    assert rc == 1
+    assert envelope["errors"] == [_NO_PATH_REFUSAL]
+
+
 def test_definition_edit_drops_a_note_about_a_line_it_removed(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
