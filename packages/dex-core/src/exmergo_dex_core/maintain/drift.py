@@ -159,6 +159,7 @@ def schema_drift(
     baseline = {d.identifier: d for d in snap.warehouse.datasets}
     now = {d.identifier: d for d in current}
     findings: list[DriftFinding] = []
+    built = _built_tables(current_transform)
 
     def scoped(identifier: str) -> bool:
         return scope is None or identifier in scope
@@ -172,7 +173,7 @@ def schema_drift(
             detail=f"{identifier} is new since the snapshot",
         )
         for identifier in sorted(now.keys() - baseline.keys())
-        if scoped(identifier)
+        if scoped(identifier) and not _built_by_project(identifier, built)
     )
     findings.extend(
         DriftFinding(
@@ -2219,6 +2220,53 @@ def _distinct_combination_stand_in(
     import sqlglot
 
     return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
+
+
+def _built_tables(transform: TransformLayer | None) -> set[str]:
+    """Table names (lowered) the live project builds: its models only.
+
+    Unlike :func:`_backed_tables` this leaves out declared ``source()`` tables,
+    so a new table a ``sources:`` block already names is still reported."""
+
+    if transform is None:
+        return set()
+    return {model.lower() for model in transform.models}
+
+
+def _built_by_project(identifier: str, built: set[str]) -> bool:
+    return identifier.rsplit(".", 1)[-1].lower() in built
+
+
+def built_relation_warnings(
+    current: list[Dataset],
+    snap: Snapshot,
+    scope: set[str] | None = None,
+    current_transform: TransformLayer | None = None,
+) -> list[str]:
+    """Name the new relations :func:`schema_drift` did not report as drift.
+
+    On DuckDB the dev target is the source file, so ``transform build --target
+    dev`` writes the project's own models into the warehouse dex reads. Those
+    are not new source tables. Skipping them silently would read as a clean
+    sweep, so the count is named."""
+
+    built = _built_tables(current_transform)
+    if not built:
+        return []
+    baseline_ids = {d.identifier for d in snap.warehouse.datasets}
+    skipped = sum(
+        1
+        for d in current
+        if d.identifier not in baseline_ids
+        and (scope is None or d.identifier in scope)
+        and _built_by_project(d.identifier, built)
+    )
+    if not skipped:
+        return []
+    return [
+        f"{skipped} relation(s) built by this project were not reported as "
+        "source drift (table_added)"
+    ]
 
 
 def _backed_tables(transform: TransformLayer | None) -> set[str]:
