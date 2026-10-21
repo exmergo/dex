@@ -1440,6 +1440,14 @@ class CostGate:
         floor = max(minimum, 1)
         remaining = self._remaining_for_statement(reserve)
         if remaining is not None and remaining < floor:
+            # The booking may tighten the cap but never refuse on its own (see
+            # `_remaining_for_statement`). Where only the booking is short of the
+            # connector's minimum and the confirmed ceiling still covers it, the
+            # statement gets the minimum: refusing would tell the caller to raise
+            # a budget that is not the binding term (#482).
+            ceiling = self.effective_ceiling()
+            if ceiling is not None and ceiling - self._billed >= floor:
+                return floor
             raise OverCeilingError(
                 _cap_shortfall(remaining, floor, unit, reserve),
                 cost=self._cost(self._estimated),
