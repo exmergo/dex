@@ -681,6 +681,9 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     # findings that says nothing about the warehouse moving (#543): named here,
     # beside the findings it accounts for, so the report carries both.
     warnings.extend(drift_mod.scope_mismatch_warnings(current, snap, scope))
+    warnings.extend(
+        drift_mod.built_relation_warnings(current, snap, scope, current_transform)
+    )
     # Not scoped by `objects`: a model's identifier is its project name, not a
     # warehouse identifier, and `scope` above is resolved against the latter.
     findings.extend(drift_mod.transform_drift(current_transform, snap))
@@ -1426,6 +1429,11 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     # Same as in schema_drift() (#543): a dataset only one side covers is named
     # beside the block of findings it accounts for.
     warnings.extend(drift_mod.scope_mismatch_warnings(current_datasets, snap, scope))
+    warnings.extend(
+        drift_mod.built_relation_warnings(
+            current_datasets, snap, scope, current_transform
+        )
+    )
     # Not scoped by `objects`, same reason as in schema_drift(): a model's
     # identifier is its project name, not a warehouse identifier.
     schema_findings.extend(drift_mod.transform_drift(current_transform, snap))
