@@ -1,0 +1,1 @@
+**`transform remove column` can remove a column from a scaffolded model.** It edits the named projection inside the `renamed` CTE even when the final query selects `*`, while refusing a removal if another expression still reads that column.

@@ -231,10 +231,13 @@ dex transform rename <kind>       -> every edit the rename needs, as one plan: t
 dex transform remove <kind> <name>   -> the definition removed, and every read verified gone. Same kinds
   [--edits-file <f>]                 as rename, same refusals. dex authors the removal of the
                                      definition and REFUSES while any read survives, naming each with
-                                     a file and a line; it never rewrites a read, because
-                                     `{% if var('flag') %}` can be dropped or unguarded and only the
-                                     caller knows which. Pass those read edits with --edits-file and
-                                     they are validated and stored in this same plan
+                                     a file and a line. For a scaffolded model ending in a
+                                     trailing `select * from <cte>`, a removed column's definition
+                                     is deleted from that CTE's projection (including its comma).
+                                     Other reads, such as filters or downstream projections, still
+                                     refuse: dex never guesses what those expressions should become.
+                                     Pass hand-authored read edits with --edits-file and they are
+                                     validated and stored in this same plan
 dex transform place <column>      -> where a derived column shared by several models belongs: the
   --targets <m,m> --expr "<sql>"     lowest model in the ref() graph that every target descends from
   [--explain]                        and that already projects the inputs the expression reads. The

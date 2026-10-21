@@ -436,7 +436,9 @@ class _Builder:
             if self.new is not None:
                 result = rename_column_in_sql(content, path, column, self.new)
             elif node == self.owner:
-                result = unproject_column_in_sql(content, path, column)
+                result = unproject_column_in_sql(
+                    content, path, column, through_ctes=True
+                )
             else:
                 # A downstream model reading a removed column is a read the caller
                 # has to decide about, not one dex removes. `_refuse_reads` names
