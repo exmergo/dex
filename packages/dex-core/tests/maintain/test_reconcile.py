@@ -842,6 +842,43 @@ def test_a_dropped_column_hand_written_logic_reads_is_advisory_and_unedited(
     assert "order_status" in dropped["action"]
 
 
+def test_reconcile_does_not_edit_a_staging_model_reading_another_source(maintain_repo):
+    _edit_sql(
+        maintain_repo,
+        "source('main', 'orders')",
+        "ref('something_else')",
+    )
+    payload = _reconcile_after(
+        maintain_repo,
+        "ALTER TABLE orders ADD COLUMN discount DOUBLE",
+        "ALTER TABLE orders DROP status",
+    )
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    assert payload["diffs"] == []
+    advisories = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] in {"column_added", "column_dropped"}
+    ]
+    assert len(advisories) == 2
+    assert all(p["kind"] == "advisory" for p in advisories)
+    assert all("does not read source" in p["action"] for p in advisories)
+
+
+def test_reconcile_accepts_case_insensitive_qualified_source_name(maintain_repo):
+    _edit_sql(
+        maintain_repo,
+        "source('main', 'orders')",
+        "source('RAW', 'ORDERS')",
+    )
+    payload = _reconcile_after(
+        maintain_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE"
+    )
+    assert payload["data"]["mechanical_count"] == 1
+    assert "discount" in _diff(payload, _STG_SQL)["unified"]
+
+
 def test_an_unedited_model_still_gets_a_mechanical_add_of_one_line(maintain_repo):
     payload = _reconcile_after(
         maintain_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE"

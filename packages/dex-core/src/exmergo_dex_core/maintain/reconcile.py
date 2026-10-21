@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from ..adapters.project import PlacingProject
 from ..cache import ColumnProfile, DexCache
 from ..config import PIIOverrideMatcher
-from ..dbt_project import DbtProjectView, ProjectDefinitions, node_name
+from ..dbt_project import DbtProjectView, ProjectDefinitions, jinja_calls, node_name
 from ..explore.profile import detect_pii
 from ..references import ReferenceIndex
 from ..transform.plans import EditKind, PlanEdit
@@ -212,6 +212,21 @@ def build(
                     ),
                 )
                 for finding in written
+            )
+            continue
+        if not any(
+            call.callee == "source"
+            and len(call.args) >= 2
+            and call.args[1] is not None
+            and call.args[1].casefold() == table.casefold()
+            for call in jinja_calls(view.files[model_path].content)
+        ):
+            reason = (
+                f"stg_{table} does not read source(..., '{table}'), "
+                "so dex did not edit it"
+            )
+            proposals.extend(
+                _schema_advisory(identifier, finding, reason) for finding in written
             )
             continue
         _splice_model(

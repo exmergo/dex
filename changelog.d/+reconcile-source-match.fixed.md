@@ -1,0 +1,1 @@
+**Reconcile checks a staging model's source before suggesting a mechanical edit.** A model named for a drifted table but reading a different source now receives advisories instead of an SQL or schema diff. Models reading the table through `source()` continue to receive the normal edits.
