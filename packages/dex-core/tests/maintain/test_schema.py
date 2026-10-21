@@ -470,3 +470,27 @@ def test_a_fresh_cache_makes_no_age_claim(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "schema")
     assert rc == 0
     assert not [w for w in payload["warnings"] if "freshness" in w]
+
+
+def test_relations_the_project_builds_are_not_reported_as_source_drift(maintain_repo):
+    """#754: on DuckDB the dev build writes the project's own models into the
+    warehouse dex reads. Those are not new source tables; one warning names
+    how many were left out, and a table no model builds is still reported."""
+
+    maintain_repo.snapshot()
+    (maintain_repo.root / "models" / "marts" / "fct_returns.sql").write_text(
+        "select * from {{ ref('stg_orders') }}\n", encoding="utf-8"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_returns AS SELECT * FROM orders",
+        "CREATE TABLE payments (id INTEGER, amount DOUBLE)",
+    )
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    added = {f["identifier"] for f in _by_code(payload).get("table_added", [])}
+    assert added == {"warehouse.main.payments"}
+    built = [w for w in payload["warnings"] if "built by this project" in w]
+    assert built == [
+        "1 relation(s) built by this project were not reported as source drift "
+        "(table_added)"
+    ]
