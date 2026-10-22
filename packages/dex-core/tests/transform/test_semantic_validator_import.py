@@ -77,7 +77,16 @@ def _install(name: str, validator) -> dict[str, types.ModuleType]:
 
 
 def _absent(monkeypatch, name: str) -> None:
-    """Make `import name` fail the way a missing package does."""
+    """Make every import of `name` fail the way a missing package does.
+
+    Blocking only the parent is not enough. The import under test names the
+    submodule (``name.parsing.schemas``), and a submodule already cached in
+    ``sys.modules`` resolves straight from the cache, so the blocked parent is
+    never consulted. That is what made these two tests pass in a sandbox
+    without MetricFlow and fail in CI with it installed.
+    """
+    for cached in [key for key in sys.modules if key.startswith(f"{name}.")]:
+        monkeypatch.setitem(sys.modules, cached, None)
     monkeypatch.setitem(sys.modules, name, None)
 
 
@@ -90,11 +99,9 @@ def test_the_package_metricflow_ships_today_is_the_first_choice(monkeypatch):
     validators = _metricflow_validators()
 
     assert validators is not None
-    assert validators[0] is fake["metricflow_semantic_interfaces.parsing.schemas"].metric_validator
-    assert (
-        validators[1]
-        is fake["metricflow_semantic_interfaces.parsing.schemas"].semantic_model_validator
-    )
+    schemas = fake["metricflow_semantic_interfaces.parsing.schemas"]
+    assert validators[0] is schemas.metric_validator
+    assert validators[1] is schemas.semantic_model_validator
 
 
 def test_the_older_package_name_is_the_fallback(monkeypatch):
@@ -107,14 +114,9 @@ def test_the_older_package_name_is_the_fallback(monkeypatch):
     validators = _metricflow_validators()
 
     assert validators is not None
-    assert (
-        validators[0]
-        is fake["dbt_semantic_interfaces.parsing.schemas"].metric_validator
-    )
-    assert (
-        validators[1]
-        is fake["dbt_semantic_interfaces.parsing.schemas"].semantic_model_validator
-    )
+    schemas = fake["dbt_semantic_interfaces.parsing.schemas"]
+    assert validators[0] is schemas.metric_validator
+    assert validators[1] is schemas.semantic_model_validator
 
 
 def test_neither_package_installed_is_none(monkeypatch):
