@@ -2,9 +2,12 @@
 
 ``define`` and ``update`` are plan producers into the same store as model SQL;
 ``transform apply`` writes them into the project. The engine validates the YAML
-the agent authored; MetricFlow's own schemas (via ``dbt-semantic-interfaces``,
-pulled in by dbt-duckdb) are the validator of record, with a structural fallback
-when that package is absent so validation degrades to a warning, never to silence.
+the agent authored; MetricFlow's own schemas are the validator of record, with a
+structural fallback when they are absent so validation degrades to a warning,
+never to silence. MetricFlow ships those schemas as
+``metricflow_semantic_interfaces``; the older ``dbt-semantic-interfaces`` package
+is the same schemas under the name dbt used before the split, and is still what
+older pins carry. Both are tried, newest first.
 
 A payload arrives in one of two units. A **whole file** is the original: the
 caller sends the complete new content for a path. A **definition** names one
@@ -41,6 +44,36 @@ from ..dbt_project import (
 from .validate import EditValidationError
 
 
+def _metricflow_validators() -> tuple[Any, Any] | None:
+    """The MetricFlow schema validators, or None where they are not installed.
+
+    MetricFlow ships its schemas as ``metricflow_semantic_interfaces``; the
+    older ``dbt-semantic-interfaces`` package is the same schemas under the name
+    dbt used before the split, and is still what an older pin carries. Both are
+    tried, newest first, because the package name alone used to decide whether
+    the validator ran at all: a pin that shipped the other name imported
+    nothing, the ``ImportError`` was caught, and the YAML was checked
+    structurally with a warning that read like routine news.
+
+    Returns None rather than raising, so the caller can degrade to the
+    structural check and say which package is missing.
+    """
+    try:
+        from metricflow_semantic_interfaces.parsing.schemas import (
+            metric_validator,
+            semantic_model_validator,
+        )
+    except ImportError:
+        try:
+            from dbt_semantic_interfaces.parsing.schemas import (
+                metric_validator,
+                semantic_model_validator,
+            )
+        except ImportError:
+            return None
+    return metric_validator, semantic_model_validator
+
+
 def validate_semantic_yaml(path: str, parsed: dict[str, Any]) -> list[str]:
     """Validate one semantic YAML document. Returns warnings; raises on failure."""
 
@@ -51,17 +84,16 @@ def validate_semantic_yaml(path: str, parsed: dict[str, Any]) -> list[str]:
             f"{path}: semantic YAML must declare semantic_models or metrics"
         )
 
-    try:
-        from dbt_semantic_interfaces.parsing.schemas import (
-            metric_validator,
-            semantic_model_validator,
-        )
-    except ImportError:
+    validators = _metricflow_validators()
+    if validators is None:
         _structural_check(path, semantic_models, metrics)
         return [
-            "dbt-semantic-interfaces is not installed; semantic YAML got a "
-            "structural check only"
+            "metricflow is not installed (neither metricflow_semantic_interfaces "
+            "nor dbt_semantic_interfaces could be imported); semantic YAML got a "
+            "structural check only. Install the 'semantic' extra "
+            "(exmergo-dex-core[semantic]) to validate against MetricFlow's schemas."
         ]
+    metric_validator, semantic_model_validator = validators
 
     for entry in semantic_models:
         if not isinstance(entry, dict) or not entry.get("name"):

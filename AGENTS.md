@@ -56,7 +56,11 @@ Capabilities that are not a warehouse carry their own extras: `[semantic]` and
 pinned to one exact SLayer release because its model format moves between
 releases), and `[cluster]` for `explore cluster`. `[ossie]` needs no connector and
 no warehouse, because a native semantic layer is files in the repository. The
-shipped wrapper takes `[slayer]` for `semantic slayer`, and for a command that
+shipped wrapper takes `[semantic]` for the dbt authoring commands
+(`semantic define|update|plan`), because authoring validates the YAML against
+MetricFlow's schemas and that validation degrades to a structural check where
+MetricFlow is absent. It
+takes `[slayer]` for `semantic slayer`, and for a command that
 reads the semantic layer (any `maintain` command, `explore semantic`,
 `transform apply`, or an `explore` command run with `--use-project`) only where `semantic.vendor` is
 `slayer`, since it is the heaviest extra there is; without it a SLayer-configured command refuses with

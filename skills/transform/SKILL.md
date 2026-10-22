@@ -200,6 +200,10 @@ a field, flag, or macro you need is not described here.
 - A project with no MetricFlow time spine cannot parse semantic models. Author
   one (a day-grain date model plus a `time_spine:` config) in the same or a
   separate plan.
+- Semantic YAML is validated against MetricFlow's schemas, so the wrapper
+  installs the `[semantic]` extra for `semantic define|update|plan`. A document
+  the schemas refuse is refused with the schema's own message; a refusal
+  naming a missing package is a refused install, not a bad document.
 - For native Ossie, edit only documents whose paths are listed in
   `semantic.ossie.files`, as whole documents. `maintain reconcile` never authors
   into Ossie; this command does.

@@ -270,6 +270,19 @@ _OSSIE_READING_COMMANDS = (
     ("maintain", "snapshot"),
 )
 
+# The commands that author the dbt semantic layer, as (group, subcommand).
+# Authoring validates the YAML against MetricFlow's schemas, so these take the
+# `semantic` extra even though they render nothing: without it the validation
+# degrades to a structural check and the command warns instead of refusing,
+# which is the failure #639 describes. The native document commands
+# (`semantic ossie ...`, `semantic slayer ...`) validate against their own
+# schemas and take their own extras, so they are not here.
+_SEMANTIC_AUTHORING_COMMANDS = (
+    ("semantic", "define"),
+    ("semantic", "update"),
+    ("semantic", "plan"),
+)
+
 
 # SLayer is the opposite trade. Its extra brings FastAPI, uvicorn, mcp, duckdb,
 # jafgen and tantivy, far too much to install on every `maintain` run of every
@@ -304,9 +317,18 @@ def _positionals(argv: list[str]) -> list[str]:
 def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     """The extras this invocation needs on top of the connector's.
 
-    Two commands need more than a warehouse client, and both are resolved from the
-    command rather than installed always, so a repo that never clusters and never
-    queries a semantic layer resolves neither scikit-learn nor MetricFlow.
+    Three commands need more than a warehouse client, and each is resolved from
+    the command rather than installed always, so a repo that never clusters,
+    never authors a semantic layer and never queries one resolves neither
+    scikit-learn nor MetricFlow.
+
+    `semantic define|update|plan` author the dbt semantic layer, and authoring
+    validates the YAML against MetricFlow's schemas. Where MetricFlow is absent
+    the validation degrades to a structural check, and the warning that says so
+    reads like routine news, so the authoring commands take the `semantic` extra
+    and the schemas actually run. The native document commands
+    (`semantic ossie ...`, `semantic slayer ...`) validate against their own
+    schemas and take their own extras.
 
     `explore semantic` needs the hosted client on any of its subcommands, which is
     an httpx and nothing heavier. It needs MetricFlow only where a statement might
@@ -343,6 +365,8 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     )
     if command in _SLAYER_COMMANDS or (vendor == _SLAYER_VENDOR and reads_layer):
         extras.append("slayer")
+    if command in _SEMANTIC_AUTHORING_COMMANDS:
+        extras.append("semantic")
     if command != ("explore", "semantic"):
         return extras
     mode = positionals[2] if len(positionals) > 2 else "list"
