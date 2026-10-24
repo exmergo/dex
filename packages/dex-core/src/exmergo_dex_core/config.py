@@ -8,9 +8,13 @@ Secrets (passwords, keys, tokens) are read at runtime from their own stores by
 
 from __future__ import annotations
 
+import difflib
 import fnmatch
+import functools
+import types
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Union, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -22,7 +26,121 @@ from .storage import DEX_DIR
 CONFIG_FILE = "config.yml"
 
 
-class Budget(BaseModel):
+class _ConfigModel(BaseModel):
+    """Base for every model in the ``DexConfig`` tree.
+
+    Records keys the schema does not know across both direct construction
+    (``DexConfig(...)``, ``SnowflakeTarget(...)``) and ``model_validate(...)``
+    so a programmatic caller never drops a misspelled setting in silence:
+    ``load_warnings`` carries the same unknown-key warnings and nearest-key
+    suggestions that ``ConfigDocument`` produces for ``.dex/config.yml``, and
+    :meth:`strict` (or ``model_validate(..., context={"strict": True})``)
+    refuses unknown keys outright with :class:`~.errors.ConfigurationError`.
+    """
+
+    _unknown_keys: list[str] = PrivateAttr(default_factory=list)
+    _key_order: list[str] = PrivateAttr(default_factory=list)
+    _load_warnings: list[str] = PrivateAttr(default_factory=list)
+
+    @property
+    def load_warnings(self) -> list[str]:
+        """Problems the config has that every command reports and none refuses."""
+
+        return list(self._load_warnings)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _record_unknown_keys(cls, data: Any, handler: Any) -> _ConfigModel:
+        if isinstance(data, Mapping):
+            fields = cls.model_fields
+            own_unknown = [str(key) for key in data if key not in fields]
+            key_order = [str(key) for key in data]
+        elif isinstance(data, _ConfigModel):
+            own_unknown = list(data._unknown_keys)
+            key_order = list(data._key_order)
+        else:
+            own_unknown = []
+            key_order = []
+
+        prior_warnings = list(data._load_warnings) if isinstance(data, cls) else []
+        prior_source = (
+            getattr(data, "_source_path", None) if isinstance(data, cls) else None
+        )
+        prior_cap = (
+            getattr(data, "_session_ceiling_cap", None)
+            if isinstance(data, cls)
+            else None
+        )
+        instance = handler(data)
+        instance._unknown_keys = own_unknown
+        instance._key_order = key_order
+        if prior_source is not None and hasattr(instance, "_source_path"):
+            instance._source_path = prior_source
+        if prior_cap is not None and hasattr(instance, "_session_ceiling_cap"):
+            instance._session_ceiling_cap = prior_cap
+        computed = _unknown_key_warnings(instance, "")
+        instance._load_warnings = (
+            computed if computed or not prior_warnings else prior_warnings
+        )
+        return instance
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Any:
+        strict_unknown = isinstance(context, Mapping) and bool(context.get("strict"))
+        if strict_unknown and (warnings := _input_unknown_key_warnings(obj, cls, "")):
+            raise ConfigurationError("; ".join(warnings))
+        kwargs: dict[str, Any] = {
+            "strict": strict,
+            "from_attributes": from_attributes,
+            "context": context,
+        }
+        if by_alias is not None:
+            kwargs["by_alias"] = by_alias
+        if by_name is not None:
+            kwargs["by_name"] = by_name
+        instance = super().model_validate(obj, **kwargs)
+        if strict_unknown and instance.load_warnings:
+            raise ConfigurationError("; ".join(instance.load_warnings))
+        return instance
+
+    @classmethod
+    def strict(
+        cls,
+        __data: Mapping[str, Any] | BaseModel | None = None,
+        /,
+        **kwargs: Any,
+    ) -> Any:
+        """Validate this config model and refuse any key dex does not read."""
+
+        if __data is not None and kwargs:
+            if not isinstance(__data, Mapping):
+                raise ConfigurationError(
+                    f"{cls.__name__}.strict() takes either a mapping or keyword "
+                    "arguments, not a model instance alongside keyword arguments"
+                )
+            payload: Any = {**dict(__data), **kwargs}
+        elif __data is not None:
+            payload = __data
+        else:
+            payload = kwargs
+        if warnings := _input_unknown_key_warnings(payload, cls, ""):
+            raise ConfigurationError("; ".join(warnings))
+        instance = cls.model_validate(payload) if __data is not None else cls(**kwargs)
+        if instance.load_warnings:
+            raise ConfigurationError("; ".join(instance.load_warnings))
+        return instance
+
+
+class Budget(_ConfigModel):
     """Cost ceilings for a connector paradigm. Magnitudes are paradigm-relative
     (bytes, credits, DBUs, load score); DuckDB is unbounded by cost and only
     resource-bounded.
@@ -48,12 +166,12 @@ class Budget(BaseModel):
     session_ceiling_declined: bool = False
 
 
-class DuckDBTarget(BaseModel):
+class DuckDBTarget(_ConfigModel):
     # A local DuckDB file, or a directory of Parquet/CSV. Opened read-only.
     path: str
 
 
-class BigQueryTarget(BaseModel):
+class BigQueryTarget(_ConfigModel):
     """Non-secret BigQuery connection target. Credentials are never here: auth
     is Application Default Credentials, discovered at runtime by connect.py.
 
@@ -74,7 +192,7 @@ class BigQueryTarget(BaseModel):
     max_full_profile_bytes: int | None = None
 
 
-class SnowflakeTarget(BaseModel):
+class SnowflakeTarget(_ConfigModel):
     """Non-secret Snowflake connection target. Credentials are never here: auth
     is discovered at runtime by connect.py (connections.toml, SNOWFLAKE_* env,
     or a dbt profile), and passwords or keys are never written or logged.
@@ -103,7 +221,7 @@ class SnowflakeTarget(BaseModel):
     credit_price_usd: float | None = None
 
 
-class DatabricksTarget(BaseModel):
+class DatabricksTarget(_ConfigModel):
     """Non-secret Databricks connection target. Credentials are never here: auth
     is discovered at runtime by connect.py through the SDK's unified chain (a
     ``~/.databrickscfg`` profile, ``DATABRICKS_*`` environment variables, or a
@@ -136,7 +254,7 @@ class DatabricksTarget(BaseModel):
     dbu_price_usd: float | None = None
 
 
-class PostgresTarget(BaseModel):
+class PostgresTarget(_ConfigModel):
     """Non-secret PostgreSQL connection target. Credentials are never here:
     auth is discovered at runtime by connect.py (a pg_service.conf entry,
     DATABASE_URL, PG* environment variables, or a dbt profile), and passwords
@@ -164,7 +282,7 @@ class PostgresTarget(BaseModel):
     max_full_profile_bytes: int | None = None
 
 
-class RedshiftTarget(BaseModel):
+class RedshiftTarget(_ConfigModel):
     """Non-secret Amazon Redshift connection target. Credentials are never
     here: auth is discovered at runtime by connect.py (the AWS default
     credential chain for IAM temporary database credentials, REDSHIFT_*
@@ -202,7 +320,7 @@ class RedshiftTarget(BaseModel):
     rpu_price_usd: float | None = None
 
 
-class ClickHouseTarget(BaseModel):
+class ClickHouseTarget(_ConfigModel):
     """Non-secret ClickHouse connection target. Credentials are never here:
     auth is discovered at runtime by connect.py (CLICKHOUSE_URL, the
     CLICKHOUSE_* environment, this committed target plus CLICKHOUSE_PASSWORD,
@@ -268,7 +386,7 @@ class ClickHouseTarget(BaseModel):
 GALAXY_HOST_SUFFIX = ".galaxy.starburst.io"
 
 
-class TrinoTarget(BaseModel):
+class TrinoTarget(_ConfigModel):
     """Non-secret Trino connection target. Credentials are never here: auth is
     discovered at runtime by connect.py (TRINO_URL, the TRINO_* environment,
     this committed target plus TRINO_PASSWORD or TRINO_JWT_TOKEN, or a dbt
@@ -341,7 +459,7 @@ class TrinoTarget(BaseModel):
         return self
 
 
-class QueryLimits(BaseModel):
+class QueryLimits(_ConfigModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
     The caps protect agent context from token blowups: an oversized result is
@@ -361,7 +479,7 @@ class QueryLimits(BaseModel):
     timeout_seconds: float = 30.0
 
 
-class ClusterLimits(BaseModel):
+class ClusterLimits(_ConfigModel):
     """Bounds on `explore cluster`, enforced in the engine.
 
     Clustering must never load a giant table into anything: only a bounded
@@ -393,7 +511,7 @@ class ClusterLimits(BaseModel):
     timeout_seconds: float = 60.0
 
 
-class MaintainConfig(BaseModel):
+class MaintainConfig(_ConfigModel):
     """Tuning for `maintain`'s detectors.
 
     ``grain_min_rows``: below this row count, a lost-uniqueness finding
@@ -409,7 +527,7 @@ class MaintainConfig(BaseModel):
     grain_min_rows: int = 100
 
 
-class PIIOverride(BaseModel):
+class PIIOverride(_ConfigModel):
     """One reviewed column, or a reviewed *class* of structurally identical
     columns, the team has decided is not PII.
 
@@ -499,7 +617,7 @@ def pii_override_paths(overrides: list[PIIOverride]) -> PIIOverrideMatcher:
     return PIIOverrideMatcher(overrides)
 
 
-class BlobOverride(BaseModel):
+class BlobOverride(_ConfigModel):
     """One reviewed blob-type column a human wants profiled despite the default
     exclusion (see ``adapters.base.is_blob_type``). ``column`` is fully
     qualified, same shape and rationale as :class:`PIIOverride`: a per-column
@@ -517,7 +635,7 @@ def blob_override_paths(overrides: list[BlobOverride]) -> set[str]:
     return {entry.column.strip().lower() for entry in overrides}
 
 
-class EntityAffixes(BaseModel):
+class EntityAffixes(_ConfigModel):
     """Table-name prefixes and suffixes entity matching strips as a
     lower-confidence fallback, tried only once an exact entity-name match
     fails (see ``explore.relationships._match_parent``).
@@ -549,7 +667,7 @@ class EntityAffixes(BaseModel):
     )
 
 
-class ConventionWarnings(BaseModel):
+class ConventionWarnings(_ConfigModel):
     """Which house conventions ``transform plan`` reads out of the project's own
     models, and warns when an authored model breaks.
 
@@ -646,7 +764,7 @@ def canonical_semantic_deployment(value: str) -> str:
     return _SEMANTIC_DEPLOYMENT_SPELLINGS.get(key, key)
 
 
-class OssieSemanticConfig(BaseModel):
+class OssieSemanticConfig(_ConfigModel):
     """The repository-confined native documents behind ``vendor: ossie``.
 
     The coordinates are validated here so a bad path is refused where it is
@@ -729,7 +847,7 @@ def _repository_relative(
     return path
 
 
-class SlayerSemanticConfig(BaseModel):
+class SlayerSemanticConfig(_ConfigModel):
     """The repository-confined SLayer model files behind ``vendor: slayer``.
 
     ``base_dir`` is SLayer's storage root inside the repository. SLayer keeps a
@@ -796,7 +914,7 @@ class SlayerSemanticConfig(BaseModel):
         return self
 
 
-class SemanticConfig(BaseModel):
+class SemanticConfig(_ConfigModel):
     """How ``explore semantic`` reaches the semantic layer, on two axes.
 
     ``vendor`` is which semantic-layer format answers: ``dbt``/MetricFlow,
@@ -963,7 +1081,7 @@ def _vendor_sections(semantic: SemanticConfig) -> list[tuple[str, Any]]:
     return pairs
 
 
-class CacheConfig(BaseModel):
+class CacheConfig(_ConfigModel):
     """Where dex keeps its scratch state, and how to reach it.
 
     Scratch state only: the exploration cache, the reconcile baseline, the last
@@ -999,7 +1117,7 @@ class CacheConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
-class ProjectConfig(BaseModel):
+class ProjectConfig(_ConfigModel):
     """Which format owns the source of truth, and how to reach it.
 
     The project is what declares intent: which models exist, at what grain, how
@@ -1037,7 +1155,7 @@ class ProjectConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
-class GuardConfig(BaseModel):
+class GuardConfig(_ConfigModel):
     """Opt-in tightening of what a guarded build may execute.
 
     Empty by default, and the emptiness is the design. ``approved_functions``
@@ -1056,7 +1174,7 @@ class GuardConfig(BaseModel):
     approved_functions: list[str] = Field(default_factory=list)
 
 
-class DexConfig(BaseModel):
+class DexConfig(_ConfigModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
 
@@ -1071,11 +1189,6 @@ class DexConfig(BaseModel):
     # settings are not the ones in play would record a decision about the wrong
     # project's budget. See `session_ceiling_undecided`.
     _source_path: Path | None = PrivateAttr(default=None)
-    # What the file says that does not stop a command (a key the schema does not
-    # know, a key written twice), phrased for an envelope. Stamped by
-    # `load_config` beside the path, since only a config read from a file can
-    # have said anything wrong.
-    _load_warnings: list[str] = PrivateAttr(default_factory=list)
     # A host's cap on the daily ceiling (#787), set by the engine from its
     # constructor or the environment and never parsed from the file. Private for
     # the reason `_source_path` is: it never joins a dump, so it can never be
@@ -1087,12 +1200,6 @@ class DexConfig(BaseModel):
         """The file this config was loaded from, or None if it was not loaded."""
 
         return self._source_path
-
-    @property
-    def load_warnings(self) -> list[str]:
-        """Problems the file has that every command reports and none refuses."""
-
-        return list(self._load_warnings)
 
     @property
     def session_ceiling_cap(self) -> SessionCeilingCap | None:
@@ -1323,3 +1430,119 @@ def save_config(config: DexConfig, repo_root: Path | str = ".") -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _unknown_key_warnings(node: _ConfigModel, prefix: str) -> list[str]:
+    fields = type(node).model_fields
+    unknown = set(node._unknown_keys)
+    ordered = list(node._key_order)
+    seen = set(ordered)
+    ordered.extend(name for name in fields if name not in seen)
+    warnings: list[str] = []
+    for name in ordered:
+        path = f"{prefix}{name}"
+        if name in unknown:
+            warnings.append(_format_unknown_key_warning(prefix, name, fields))
+            continue
+        if name not in fields:
+            continue
+        annotation = fields[name].annotation
+        section = _model_in(annotation)
+        if section is not None:
+            sub = getattr(node, name, None)
+            if isinstance(sub, _ConfigModel):
+                warnings.extend(_unknown_key_warnings(sub, f"{path}."))
+            continue
+        item = _item_model(annotation)
+        if item is not None:
+            sub = getattr(node, name, None)
+            if isinstance(sub, list):
+                for position, entry in enumerate(sub):
+                    if isinstance(entry, _ConfigModel):
+                        warnings.extend(
+                            _unknown_key_warnings(entry, f"{path}[{position}].")
+                        )
+    return warnings
+
+
+def _input_unknown_key_warnings(
+    value: Any, model: type[BaseModel], prefix: str
+) -> list[str]:
+    if isinstance(value, _ConfigModel):
+        return _unknown_key_warnings(value, prefix)
+    if not isinstance(value, Mapping):
+        return []
+    fields = model.model_fields
+    warnings: list[str] = []
+    for raw_name, sub in value.items():
+        name = str(raw_name)
+        path = f"{prefix}{name}"
+        if name not in fields:
+            warnings.append(_format_unknown_key_warning(prefix, name, fields))
+            continue
+        annotation = fields[name].annotation
+        section = _model_in(annotation)
+        if section is not None:
+            warnings.extend(_input_unknown_key_warnings(sub, section, f"{path}."))
+            continue
+        item = _item_model(annotation)
+        if item is not None and isinstance(sub, list):
+            for position, entry in enumerate(sub):
+                warnings.extend(
+                    _input_unknown_key_warnings(entry, item, f"{path}[{position}].")
+                )
+    return warnings
+
+
+def _format_unknown_key_warning(prefix: str, name: str, siblings: Any) -> str:
+    path = f"{prefix}{name}"
+    suggestion = _suggest(prefix.rstrip("."), name, siblings)
+    hint = f"; did you mean {suggestion}?" if suggestion else ""
+    return f"{path} is not a setting dex reads, so it is ignored{hint}"
+
+
+def _suggest(parent: str, name: str, siblings: Any) -> str | None:
+    """The key ``name`` was probably meant to be: a near sibling, or the one key
+    elsewhere in the schema with exactly that name (a setting written at the
+    wrong level)."""
+
+    close = difflib.get_close_matches(name, list(siblings), n=1, cutoff=0.6)
+    if close:
+        return f"{parent}.{close[0]}" if parent else close[0]
+    elsewhere = [key for key in _schema_keys() if key.rsplit(".", 1)[-1] == name]
+    return elsewhere[0] if len(elsewhere) == 1 else None
+
+
+@functools.cache
+def _schema_keys() -> tuple[str, ...]:
+    keys: list[str] = []
+
+    def walk(model: type[BaseModel], prefix: str) -> None:
+        for name, info in model.model_fields.items():
+            key = f"{prefix}{name}"
+            keys.append(key)
+            section = _model_in(info.annotation)
+            if section is not None:
+                walk(section, f"{key}.")
+
+    walk(DexConfig, "")
+    return tuple(keys)
+
+
+def _model_in(annotation: Any) -> type[BaseModel] | None:
+    """The model an annotation names, directly or as ``Model | None``."""
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    if get_origin(annotation) in (Union, types.UnionType):
+        models = [arg for arg in get_args(annotation) if _model_in(arg) is not None]
+        if len(models) == 1:
+            return models[0]
+    return None
+
+
+def _item_model(annotation: Any) -> type[BaseModel] | None:
+    if get_origin(annotation) is list:
+        (item,) = get_args(annotation) or (None,)
+        return _model_in(item)
+    return None
