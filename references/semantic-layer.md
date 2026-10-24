@@ -127,6 +127,13 @@ declared entity a drawable join. The top-level `type` is kept and is **derived**
 primary wherever any declaration is primary. Read `roles` for the join graph; read
 `type` for a summary.
 
+An entity's `description` is the exception: a dbt project cannot author one.
+dbt-semantic-interfaces' `entity_schema` has no `description` property and sets
+`additionalProperties: false`, so a `description:` key under an entity is refused at
+parse time. On `--local` the field is therefore structurally absent, not merely
+unset: the shape above lists it because the model type carries it and other
+backends can supply it, not because a dbt project can fill it.
+
 ### The physical link
 
 A semantic layer describes a warehouse the rest of `explore` also describes, and
@@ -1347,6 +1354,7 @@ in `tests/slayer_vendor/test_reader.py`, the catalog one against
 | Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse | the connector's, never in context; SLayer reads none |
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name | `ConnectionSource` (the connector's); a `SemanticSource` is refused by name, since the layer is files in this repository |
 | Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
+| Entity descriptions on `list` | no: not authorable from a dbt project (see above), so the field is structurally absent here | a description at most, never a label: the API supplies one where it has one | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
 | Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else | name, label, description and `relation`; no `model_ref` and no default time dimension | name, description, `relation` and default time dimension; no label, `model_ref` or primary entity |
 | Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads | yes, where the dataset source is one relation this connector can address | yes, where `sql_table` is fully qualified for the connector |
 | Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier | on a dimension only; none for an expression or a quoted identifier |
