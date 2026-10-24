@@ -1560,22 +1560,27 @@ def grain_drift(
     for dataset, columns, row_count in plan.null_checks or []:
         if not callable(aggregate_columns):
             continue
+
         if row_count == 0:
             findings.append(no_rows(dataset))
             continue
+
         probe = probes.get(dataset.identifier)
         aggregates = list(
             probe.aggregates
             if probe is not None and probe.aggregates is not None
             else aggregate_columns(dataset.identifier, columns)
         )
+
         if row_count is None:
-            # No free count before the scan; the scan's own COUNT(*) is the
-            # count, and adapters keep it for the rest of the command.
+            # The scan's COUNT(*) provides the count and the adapter
+            # retains it for the rest of the command.
             row_count = adapter.table_metadata(dataset.identifier)[0].row_count
+
             if row_count == 0:
                 findings.append(no_rows(dataset))
                 continue
+
         joins = [
             {
                 "from_dataset": relation.from_dataset,
@@ -1586,36 +1591,65 @@ def grain_drift(
             for _baseline, relation in plan.fanout_pairs
             if relation.from_dataset == dataset.identifier
         ]
+
         for aggregate in aggregates:
             fraction = aggregate.null_fraction
+
             if fraction is None or fraction < 0.95:
                 continue
+
             fully_null = fraction == 1.0
-            finding_data = {"null_fraction": fraction, "row_count": row_count}
+
+            severity, floor_data, floor_note = _grain_severity(
+                row_count,
+                min_rows,
+            )
+
+            finding_data = {
+                "null_fraction": fraction,
+                "row_count": row_count,
+            }
+
             if fully_null and joins:
-                # A right-side projection that is NULL for every result row is
-                # the observable form of a failed join.  Multiple joins remain
-                # explicit rather than guessing which one supplied the column.
                 finding_data["joins"] = joins
             findings.append(
                 DriftFinding(
                     axis="grain",
-                    code="fully_null_column" if fully_null else "mostly_null_column",
+                    code=("fully_null_column" if fully_null else "mostly_null_column"),
                     identifier=dataset.identifier,
                     column=aggregate.name,
-                    severity="high" if fully_null else "low",
+                    severity=(
+                        "high"
+                        if fully_null and row_count >= min_rows
+                        else severity
+                        if fully_null
+                        else "low"
+                    ),
                     detail=(
                         f"{aggregate.name} on {dataset.identifier} is "
                         + ("100% NULL" if fully_null else f"{fraction:.1%} NULL")
                         + (
                             "; its joined relation may have matched nothing"
-                            if fully_null and joins
+                            if fully_null and joins and row_count >= min_rows
+                            else ""
+                        )
+                        + (
+                            floor_note
+                            if fully_null and not (joins and row_count >= min_rows)
                             else ""
                         )
                     ),
-                    data=finding_data,
+                    data={
+                        **finding_data,
+                        **(
+                            floor_data
+                            if fully_null and not (joins and row_count >= min_rows)
+                            else {}
+                        ),
+                    },
                 )
             )
+
     return findings
 
 

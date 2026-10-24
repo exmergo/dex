@@ -291,6 +291,64 @@ def test_fully_null_join_side_columns_name_the_failed_join(maintain_repo):
     )
 
 
+def test_fully_null_computed_column_on_small_table_is_low_severity(maintain_repo):
+    """A fully NULL computed column on a small table should have low severity."""
+    maintain_repo.sql(
+        "CREATE TABLE small_null_values AS "
+        "SELECT i AS id, NULL::VARCHAR AS computed_value "
+        "FROM range(1, 10) t(i)"
+    )
+    rc, payload = maintain_repo.dex("explore", "map")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "grain", "small_null_values")
+    assert rc == 0 and payload["status"] == "ok", payload
+
+    findings = [
+        finding
+        for finding in payload["data"]["findings"]
+        if finding["code"] == "fully_null_column"
+        and finding["identifier"] == "warehouse.main.small_null_values"
+    ]
+
+    assert len(findings) == 1, payload["data"]["findings"]
+    assert findings[0]["column"] == "computed_value"
+    assert findings[0]["severity"] == "low"
+    assert findings[0]["data"]["severity_floor_applied"] is True
+    assert findings[0]["data"]["grain_min_rows"] == 100
+
+
+def test_fully_null_computed_column_with_unrelated_join_is_low_severity(
+    maintain_repo,
+):
+    """An unrelated outgoing relationship must not raise computed NULL severity."""
+    maintain_repo.sql(
+        "CREATE TABLE small_null_with_join AS "
+        "SELECT i AS id, NULL::VARCHAR AS computed_value, "
+        "(i % 40) + 1 AS customer_id "
+        "FROM range(1, 10) t(i)"
+    )
+
+    rc, payload = maintain_repo.dex("explore", "map", "--verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "grain", "small_null_with_join")
+    assert rc == 0 and payload["status"] == "ok", payload
+
+    findings = [
+        finding
+        for finding in payload["data"]["findings"]
+        if finding["code"] == "fully_null_column"
+        and finding["identifier"] == "warehouse.main.small_null_with_join"
+    ]
+
+    assert len(findings) == 1, payload["data"]["findings"]
+    assert findings[0]["column"] == "computed_value"
+    assert findings[0]["severity"] == "low"
+
+
 def test_mostly_null_column_is_a_low_severity_near_miss(maintain_repo):
     maintain_repo.sql(
         "CREATE TABLE optional_values AS "

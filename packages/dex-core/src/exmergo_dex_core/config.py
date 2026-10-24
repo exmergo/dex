@@ -397,13 +397,14 @@ class MaintainConfig(BaseModel):
     """Tuning for `maintain`'s detectors.
 
     ``grain_min_rows``: below this row count, a lost-uniqueness finding
-    (``key_lost_uniqueness`` / ``declared_grain_not_unique``) is damped to
-    ``low`` rather than reported at ``high`` (issue #280). A handful of rows
-    is exactly the shape where losing uniqueness means the least: a 4-row
-    table with a boolean column "loses" a uniqueness it never meaningfully
-    had once a fifth row repeats a value. The finding is never dropped, only
-    downgraded, and the damping is named in the finding's own `data` so
-    nothing about the run is silent.
+    (``key_lost_uniqueness`` / ``declared_grain_not_unique``) or a
+    ``fully_null_column`` finding is damped to ``low`` rather than reported
+    at ``high`` (issue #280 and issue #778). A handful of rows is exactly the
+    shape where losing uniqueness means the least: a 4-row table with a
+    boolean column "loses" a uniqueness it never meaningfully had once a
+    fifth row repeats a value. The finding is never dropped, only downgraded,
+    and the damping is named in the finding's own `data` so nothing about
+    the run is silent.
     """
 
     grain_min_rows: int = 100
