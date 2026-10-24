@@ -122,7 +122,7 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_INTEGRATION_SA }}
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -170,7 +170,7 @@ jobs:
             const token = await core.getIDToken('snowflakecomputing.com')
             core.setSecret(token)
             core.exportVariable('SNOWFLAKE_TOKEN', token)
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -282,7 +282,7 @@ jobs:
             const token = (await response.json()).access_token
             core.setSecret(token)
             core.exportVariable('DATABRICKS_TOKEN', token)
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -322,7 +322,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.DEX_TEST_REDSHIFT_ROLE_ARN }}
           aws-region: ${{ vars.DEX_TEST_REDSHIFT_REGION }}
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -405,7 +405,7 @@ jobs:
             -c "CREATE DATABASE dex_dogfood"
           PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
             -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -436,7 +436,7 @@ jobs:
       - name: Start and seed ClickHouse
         working-directory: .
         run: scripts/setup_clickhouse_dev.sh
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -467,7 +467,7 @@ jobs:
       - name: Start and seed Trino
         working-directory: .
         run: scripts/setup_trino_dev.sh
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -519,7 +519,7 @@ jobs:
       - name: Start and seed Trino with the Glue catalog
         working-directory: .
         run: scripts/setup_trino_dev.sh --aws
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
@@ -605,7 +605,7 @@ jobs:
         id: preflight
         working-directory: .
         run: scripts/clickhouse_cloud/preflight.sh
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           python-version: "3.14"
