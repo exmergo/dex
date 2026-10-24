@@ -120,7 +120,9 @@ is not described here.
 
 - Take `maintain snapshot` right after a known-good build, and tell the user to
   **commit `.dex/snapshot.json` like a lockfile**, so the whole team diffs
-  against one reference.
+  against one reference. See the README's "What to commit in `.dex/`" for
+  what else in `.dex/` is safe to commit and what must stay out on a
+  private-data repo.
 - Never snapshot a state that is already drifted: `check` would then mask the
   very drift that matters. To accept a change as the new normal, re-run
   `explore map` first, then `maintain snapshot`.

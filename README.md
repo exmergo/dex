@@ -196,6 +196,40 @@ checks a project as it stands, with no baseline needed.
 
 <img width="484" height="344" alt="Maintain" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
 
+### What to commit in `.dex/`
+
+Dex keeps its working state in `.dex/`. Most of it is safe to commit; the
+exception is any file that can carry data values. Commit the lockfile and the
+config, and keep the exploration cache out of a repo that must not publish
+data values:
+
+| File | Commit? | Can it contain data values? |
+| --- | --- | --- |
+| `.dex/config.yml` | Yes | No: connector targets, `pii_overrides` (column names, not values), budgets and limits. Credentials live in environment variables or dbt profiles, never in this file. |
+| `.dex/snapshot.json` | Yes, like a lockfile | Yes: when snapshotted from a cache it pins the cache's datasets wholesale, including each non-PII column's capped value domain and min/max. A metadata-only baseline (no cache) carries schema and volume only. PII-flagged columns never carry value domains. |
+| `.dex/cache.json` | Only if values may be public | Yes: column profiles with capped value domains (actual values with counts). Never for PII-flagged columns. |
+| `.dex/plans/*.json` | Optional, as an audit trail | No warehouse values: the proposed contents of project files. |
+| `.dex/queries.jsonl` | Optional, as a ledger | SQL text, which may hold literals. |
+| `.dex/drift.json` | No: regenerate with `maintain check` | Aggregates only: counts, names and schema metadata in drift findings. |
+
+For a repo that must not publish data values, ignore the rest:
+
+```gitignore
+# Dex state that can publish data values, or is local-only output.
+.dex/cache.json
+.dex/dex.db
+.dex/dex.db-journal
+.dex/queries.jsonl
+.dex/drift.json
+.dex/spend.jsonl
+.dex/spend.lock
+```
+
+`.dex/dex.db` is the SQLite backend's equivalent of `cache.json`, so it gets
+the same caution. `.dex/spend.jsonl` is the billed-command ledger: byte
+counts, job ids and statement hashes only, never SQL values or credentials,
+but it is local spend history, so there is no reason to commit it.
+
 ### What dex will never do
 
 - **Write to your data.** Warehouse access is read-only, and generated SQL is SELECT-only.
