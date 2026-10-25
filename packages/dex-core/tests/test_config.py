@@ -15,6 +15,7 @@ from exmergo_dex_core.config import (
     DexConfig,
     PIIOverride,
     SemanticConfig,
+    SnowflakeTarget,
     blob_override_paths,
     load_config,
     pii_override_paths,
@@ -381,3 +382,113 @@ def test_budget_paradigm_loads_and_is_carried_as_an_unknown_key_warning(
         ".dex/config.yml line 3: budget.paradigm is not a setting dex reads, so "
         "it is ignored"
     ]
+
+
+def test_a_config_built_in_code_with_unknown_keys_populates_load_warnings():
+    cfg = DexConfig.model_validate(
+        {
+            "connector": "snowflake",
+            "snowflake": {"wharehouse": "COMPUTE_WH", "dev_shcema": "dbt_dev"},
+            "session_ceiling": 10.0,
+        }
+    )
+    assert cfg.snowflake is not None
+    assert cfg.snowflake.warehouse is None
+    assert cfg.budget.session_ceiling is None
+    assert cfg.load_warnings == [
+        "snowflake.wharehouse is not a setting dex reads, so it is ignored; "
+        "did you mean snowflake.warehouse?",
+        "snowflake.dev_shcema is not a setting dex reads, so it is ignored; "
+        "did you mean snowflake.dev_schema?",
+        "session_ceiling is not a setting dex reads, so it is ignored; "
+        "did you mean budget.session_ceiling?",
+    ]
+
+
+def test_direct_constructor_and_nested_models_carry_unknown_key_warnings(
+    tmp_path: Path,
+):
+    cfg = DexConfig(
+        connector="snowflake",
+        snowflake=SnowflakeTarget(wharehouse="COMPUTE_WH"),  # type: ignore[call-arg]
+        pii_overrides=[
+            PIIOverride(column="MY_DB.PUBLIC.REGION.R_NAME", rationale="reviewed"),  # type: ignore[call-arg]
+        ],
+        session_ceiling=10.0,  # type: ignore[call-arg]
+    )
+    assert cfg.load_warnings == [
+        "snowflake.wharehouse is not a setting dex reads, so it is ignored; "
+        "did you mean snowflake.warehouse?",
+        "pii_overrides[0].rationale is not a setting dex reads, so it is ignored",
+        "session_ceiling is not a setting dex reads, so it is ignored; "
+        "did you mean budget.session_ceiling?",
+    ]
+    # Private tracking state never leaks into model_dump or save_config.
+    dumped = cfg.model_dump(exclude_unset=True)
+    assert "_unknown_keys" not in dumped
+    assert "_key_order" not in dumped
+    assert "_load_warnings" not in dumped
+    save_config(cfg, tmp_path)
+    raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    assert "wharehouse" not in raw
+    assert "rationale" not in raw
+
+
+def test_free_form_cache_and_project_options_do_not_warn_as_unknown_keys():
+    cfg = DexConfig.model_validate(
+        {
+            "cache": {"backend": "mypkg:store", "options": {"custom_opt": 1}},
+            "project": {"format": "mypkg:proj", "options": {"custom_flag": True}},
+        }
+    )
+    assert cfg.load_warnings == []
+    assert (
+        DexConfig.strict(
+            cache={"backend": "mypkg:store", "options": {"custom_opt": 1}},
+            project={"format": "mypkg:proj", "options": {"custom_flag": True}},
+        ).load_warnings
+        == []
+    )
+
+
+def test_strict_config_construction_refuses_unknown_keys():
+    with pytest.raises(ConfigurationError) as raised:
+        DexConfig.strict(
+            {
+                "connector": "snowflake",
+                "snowflake": {"wharehouse": "COMPUTE_WH", "dev_shcema": "dbt_dev"},
+                "session_ceiling": 10.0,
+            }
+        )
+    message = str(raised.value)
+    assert "snowflake.wharehouse" in message
+    assert "did you mean snowflake.warehouse?" in message
+    assert "snowflake.dev_shcema" in message
+    assert "did you mean snowflake.dev_schema?" in message
+    assert "session_ceiling" in message
+    assert "did you mean budget.session_ceiling?" in message
+
+    with pytest.raises(ConfigurationError, match=r"snowflake\.wharehouse"):
+        DexConfig.strict(
+            connector="snowflake",
+            snowflake=SnowflakeTarget(wharehouse="COMPUTE_WH"),  # type: ignore[call-arg]
+        )
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"pii_overrides\[0\]\.colum.*pii_overrides\[0\]\.column",
+    ):
+        DexConfig.strict(pii_overrides=[{"colum": "MY_DB.PUBLIC.REGION.R_NAME"}])
+
+    with pytest.raises(ConfigurationError, match=r"budget\.celing.*budget\.ceiling"):
+        DexConfig.model_validate({"budget": {"celing": 5.0}}, context={"strict": True})
+
+    clean = DexConfig.strict(
+        connector="snowflake",
+        snowflake={"warehouse": "COMPUTE_WH", "dev_schema": "dbt_dev"},
+        budget={"session_ceiling": 10.0},
+    )
+    assert clean.snowflake is not None
+    assert clean.snowflake.warehouse == "COMPUTE_WH"
+    assert clean.budget.session_ceiling == 10.0
+    assert clean.load_warnings == []
