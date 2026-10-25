@@ -86,7 +86,10 @@ complete composite, never one column at a time. Aggregates only.
   a column the baseline read as constant, reads `medium`: the rows were added
   along that column (a second tenant, region or repository), and
   `data.still_unique_as` names the combination. A real duplicate repeats that
-  combination too, so it stays `high`, and a lost grain always does.
+  combination too, so it stays `high`, and a lost grain always does. The same
+  finding says whether the dataset's grain still holds (`data.grain_holds`),
+  from the count the axis already takes; that alone never lowers the severity,
+  because a surrogate grain stays unique through a real duplicate.
 - Finding codes: `key_lost_uniqueness` (proven unique at baseline, not now),
   `declared_grain_not_unique` (declared, never held), and
   `join_cardinality_exceeded` (a join whose declared arity, SLayer's

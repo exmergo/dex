@@ -348,4 +348,6 @@ def test_the_widening_of_a_lost_key_rides_the_tables_one_statement():
     assert finding.column == "day"
     assert finding.severity == "medium"
     assert finding.data["still_unique_as"] == ["tenant", "day"]
+    # The grain's distinct count is a key the same statement already carried.
+    assert finding.data["grain_holds"] is True
     assert len(_executed(client)) == 1

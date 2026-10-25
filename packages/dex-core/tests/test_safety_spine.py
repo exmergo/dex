@@ -6895,6 +6895,7 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
     # not row-derived values, so they belong on this allowlist same as the rest.
     # `joins` (#779) names relations and columns, never their values, and so
     # does `still_unique_as` (#780): the combination a lost key still holds as.
+    # `grain_holds` (#780) is a boolean read off the grain's distinct count.
     assert grain and all(
         set(f["data"])
         <= {
@@ -6905,6 +6906,7 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
             "grain_min_rows",
             "joins",
             "still_unique_as",
+            "grain_holds",
         }
         or f["code"] != "key_lost_uniqueness"
         for f in grain

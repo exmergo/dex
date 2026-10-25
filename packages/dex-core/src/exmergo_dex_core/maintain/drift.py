@@ -1382,6 +1382,15 @@ def grain_drift(
     ``data.still_unique_as``. A real duplicate repeats that combination too, so
     it stays ``high``.
 
+    The same finding says whether the dataset's recorded grain still holds, in
+    ``data.grain_holds`` and its detail. :func:`grain_plan` always surveys the
+    grain, a single column among the keys and a composite among the composite
+    checks, so the count is read from what this run measures anyway; the two
+    surveys share a composite's count rather than taking it twice. It never
+    lowers the severity, because on a surrogate grain a real duplicate leaves
+    the grain unique too. Where the run cannot measure the grain (a composite
+    grain on a connector without combination counts), the field is absent.
+
     ``probes`` holds what :func:`run_batched_probes` already measured, one
     statement per table; run here from the plan when omitted. A table it covers
     is read from it and every other table is probed separately, so the findings
@@ -1395,9 +1404,38 @@ def grain_drift(
         dataset.identifier: combos
         for dataset, combos, _rows in plan.widening_checks or []
     }
+    measured: dict[tuple, dict[tuple[str, ...], int]] = {}
+
+    def composite_counts(
+        identifier: str, combos: list[list[str]]
+    ) -> dict[tuple[str, ...], int]:
+        # Measured once, whether a lost key's grain or the composite survey
+        # below asks first, so reading the grain adds no statement.
+        survey = (identifier, tuple(tuple(combo) for combo in combos))
+        if survey not in measured:
+            measured[survey] = _combination_counts(
+                probes, combo_counts, identifier, combos
+            )
+        return measured[survey]
+
+    def grain_count(dataset: Dataset, distinct: dict[str, int]) -> int | None:
+        # The grain's distinct count from what this run measures anyway, else
+        # None: the grain is reported for free or not at all.
+        grain = list(dataset.grain or [])
+        if len(grain) == 1:
+            return distinct.get(grain[0])
+        if not grain or combo_counts is None:
+            return None
+        for checked, combos, _rows in plan.composite_checks:
+            if checked.identifier == dataset.identifier and grain in combos:
+                return composite_counts(dataset.identifier, combos).get(tuple(grain))
+        return None
+
     findings: list[DriftFinding] = []
     for dataset, keys, row_count in plan.key_checks:
         widened: dict[tuple[str, ...], int] | None = None
+        grain_read = False
+        grain_distinct: int | None = None
         probe = probes.get(dataset.identifier)
         distinct = (
             probe.distinct
@@ -1463,6 +1501,22 @@ def grain_drift(
                 if still_unique_as is not None
                 else ""
             )
+            # Whether the grain held is read, never acted on: it does not
+            # lower the severity, since a real duplicate leaves a surrogate
+            # grain unique too.
+            grain_holds: bool | None = None
+            if not was_grain and dataset.grain:
+                if not grain_read:
+                    grain_distinct = grain_count(dataset, distinct)
+                    grain_read = True
+                if grain_distinct is not None:
+                    grain_holds = grain_distinct >= row_count
+            grain_clause = (
+                ""
+                if grain_holds is None
+                else f"; the grain ({', '.join(dataset.grain)}) "
+                + ("is still unique" if grain_holds else "is no longer unique either")
+            )
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -1475,6 +1529,7 @@ def grain_drift(
                         f"{count} distinct over {row_count} rows "
                         f"(~{duplicates} duplicate rows)"
                         + widened_clause
+                        + grain_clause
                         + "; "
                         + _fanout_clause(joins)
                         + floor_note
@@ -1488,6 +1543,11 @@ def grain_drift(
                             if still_unique_as is not None
                             else {}
                         ),
+                        **(
+                            {"grain_holds": grain_holds}
+                            if grain_holds is not None
+                            else {}
+                        ),
                         **floor_data,
                         **({"joins": joins} if joins else {}),
                     },
@@ -1497,7 +1557,7 @@ def grain_drift(
     for dataset, combos, row_count in plan.composite_checks:
         if combo_counts is None:
             break  # an adapter without combination probes cannot re-verify
-        counts = _combination_counts(probes, combo_counts, dataset.identifier, combos)
+        counts = composite_counts(dataset.identifier, combos)
         live_meta, _ = adapter.table_metadata(dataset.identifier)
         if live_meta.row_count is not None:
             row_count = live_meta.row_count

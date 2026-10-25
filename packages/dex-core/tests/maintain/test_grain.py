@@ -1511,6 +1511,7 @@ class _TenantAdapter:
         self.distinct = distinct
         self.combinations = combinations or {}
         self.combo_calls: list[list[list[str]]] = []
+        self.distinct_calls: list[list[str]] = []
 
     def list_objects(self, *, include_views: bool = True):
         meta, _ = self.table_metadata(_EVENTS)
@@ -1535,6 +1536,7 @@ class _TenantAdapter:
         ]
 
     def exact_distinct_counts(self, identifier, columns):
+        self.distinct_calls.append(list(columns))
         return {column: self.distinct[column] for column in columns}
 
     def distinct_combination_counts(self, identifier, combinations):
@@ -1598,10 +1600,12 @@ def test_a_key_that_only_narrowed_reads_medium_and_names_what_still_holds():
         "row_count": 300,
         "was_grain": False,
         "still_unique_as": ["tenant", "day"],
+        "grain_holds": True,
     }
     assert "but (tenant, day) still is: the rows were added along tenant" in (
         finding.detail
     )
+    assert "; the grain (id) is still unique; " in finding.detail
     assert finding.detail.endswith("no known join uses it")
     assert adapter.combo_calls == [[["tenant", "day"]]]
 
@@ -1619,6 +1623,98 @@ def test_a_real_duplicate_of_the_widened_combination_stays_high():
     assert finding.severity == "high"
     assert "still_unique_as" not in finding.data
     assert "still is" not in finding.detail
+    # The surrogate grain holds on a real duplicate too, which is why holding
+    # is reported and never earns the downgrade.
+    assert finding.data["grain_holds"] is True
+
+
+def test_a_lost_key_whose_grain_holds_says_so_with_nothing_widened():
+    """#780's third criterion: no column was constant at the baseline, so
+    nothing widens, and the finding still says the grain held, from the
+    distinct count it already took, at its full severity."""
+
+    from exmergo_dex_core.cache import ColumnProfile
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset = _events_dataset(
+        columns=[
+            ColumnProfile(name="id", data_type="INTEGER", distinct_count=150),
+            ColumnProfile(name="tenant", data_type="VARCHAR", distinct_count=2),
+            ColumnProfile(name="region", data_type="VARCHAR", distinct_count=3),
+            ColumnProfile(name="day", data_type="DATE", distinct_count=150),
+        ]
+    )
+    adapter = _TenantAdapter(rows=300, distinct={"day": 150, "id": 300})
+    plan = grain_plan(adapter, _events_snapshot(dataset))
+    assert plan.widening_checks == []
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.severity == "high"
+    assert finding.data["grain_holds"] is True
+    assert "still_unique_as" not in finding.data
+    assert "; the grain (id) is still unique; " in finding.detail
+    assert adapter.distinct_calls == [["day", "id"]]
+    assert adapter.combo_calls == []
+
+
+def test_a_lost_key_whose_grain_is_lost_too_says_so():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    adapter = _TenantAdapter(rows=300, distinct={"day": 150, "id": 290})
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset()))
+    by_column = {f.column: f for f in grain_drift(adapter, plan)}
+    assert by_column["day"].severity == "high"
+    assert by_column["day"].data["grain_holds"] is False
+    assert "; the grain (id) is no longer unique either; " in by_column["day"].detail
+    # The grain's own finding is the one that matters, and says nothing about
+    # itself.
+    assert by_column["id"].data["was_grain"] is True
+    assert "grain_holds" not in by_column["id"].data
+
+
+def test_a_composite_grain_is_read_from_the_survey_that_already_counts_it():
+    """A composite grain's count comes from the composite survey, measured once
+    for both readers, so reporting it adds no statement."""
+
+    from exmergo_dex_core.cache import ColumnProfile
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset = _events_dataset(
+        columns=[
+            ColumnProfile(name="id", data_type="INTEGER", distinct_count=150),
+            ColumnProfile(name="tenant", data_type="VARCHAR", distinct_count=2),
+            ColumnProfile(name="region", data_type="VARCHAR", distinct_count=3),
+            ColumnProfile(name="day", data_type="DATE", distinct_count=150),
+        ],
+        candidate_keys=[["region", "day"], ["id"]],
+        grain=["region", "day"],
+    )
+    adapter = _TenantAdapter(
+        rows=300, distinct={"id": 280}, combinations={("region", "day"): 300}
+    )
+    plan = grain_plan(adapter, _events_snapshot(dataset))
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.column == "id"
+    assert finding.data["was_grain"] is False
+    assert finding.data["grain_holds"] is True
+    assert "; the grain (region, day) is still unique; " in finding.detail
+    assert adapter.combo_calls == [[["region", "day"]]]
+
+
+def test_a_grain_this_run_cannot_measure_is_not_reported():
+    """A composite grain on a connector without combination counts: nothing
+    here counts it, so the finding says nothing about it rather than guess."""
+
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset = _events_dataset(candidate_keys=[["day"]], grain=["tenant", "id"])
+    adapter = _TenantAdapter(rows=300, distinct={"day": 150})
+    adapter.distinct_combination_counts = None  # shadow: adapter can't probe
+    plan = grain_plan(adapter, _events_snapshot(dataset))
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.column == "day"
+    assert "grain_holds" not in finding.data
+    assert "the grain" not in finding.detail
+    assert adapter.distinct_calls == [["day"]]
 
 
 def test_the_widening_is_counted_only_once_a_key_on_the_table_is_lost():
@@ -1665,6 +1761,7 @@ def test_the_grain_is_never_widened_whatever_the_plan_carries():
     assert finding.severity == "high"
     assert finding.data["was_grain"] is True
     assert "still_unique_as" not in finding.data
+    assert "grain_holds" not in finding.data
     assert adapter.combo_calls == []
 
 
@@ -1739,6 +1836,7 @@ def test_a_second_tenant_narrows_an_incidental_key_end_to_end(dex, tmp_path):
     assert finding["severity"] == "medium"
     assert finding["data"]["was_grain"] is False
     assert finding["data"]["still_unique_as"] == ["repository", "date"]
+    assert finding["data"]["grain_holds"] is True
 
 
 def test_a_real_duplicate_stays_high_end_to_end(dex, tmp_path):
@@ -1754,3 +1852,7 @@ def test_a_real_duplicate_stays_high_end_to_end(dex, tmp_path):
     assert finding["column"] == "date"
     assert finding["severity"] == "high"
     assert "still_unique_as" not in finding["data"]
+    # `id` is unique in this arm too: the grain holding is reported, and is
+    # not what decides the severity.
+    assert finding["data"]["grain_holds"] is True
+    assert "the grain (id) is still unique" in finding["detail"]
