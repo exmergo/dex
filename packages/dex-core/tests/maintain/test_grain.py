@@ -1458,3 +1458,299 @@ def test_a_false_declared_grain_names_its_joins_only_when_there_are_some(joined)
     else:
         assert finding.detail.endswith("no known join uses it")
         assert "joins" not in finding.data
+
+
+# --- a lost incidental key, widened by a column that only gained values (#780) ----
+
+
+_EVENTS = "db.s.events"
+
+
+def _events_dataset(**overrides):
+    """A per-tenant-per-day table baselined while it held one tenant: `id` is
+    the grain, `day` was unique only because `tenant` was constant, and
+    `region` already held three values."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+
+    fields = {
+        "identifier": _EVENTS,
+        "row_count": 150,
+        "columns": [
+            ColumnProfile(name="id", data_type="INTEGER", distinct_count=150),
+            ColumnProfile(name="tenant", data_type="VARCHAR", distinct_count=1),
+            ColumnProfile(name="region", data_type="VARCHAR", distinct_count=3),
+            ColumnProfile(name="day", data_type="DATE", distinct_count=150),
+        ],
+        "candidate_keys": [["id"], ["day"]],
+        "grain": ["id"],
+    }
+    fields.update(overrides)
+    return Dataset(**fields)
+
+
+def _events_snapshot(dataset):
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    return Snapshot.model_construct(
+        warehouse=WarehouseBaseline.model_construct(
+            datasets=[dataset], relationships=[]
+        )
+    )
+
+
+class _TenantAdapter:
+    """The events table after its baseline: answers the key distincts and the
+    combination counts it is given, and records every combination probe."""
+
+    name = "stub"
+    dialect = "duckdb"
+
+    def __init__(self, rows: int, distinct: dict[str, int], combinations=None):
+        self.rows = rows
+        self.distinct = distinct
+        self.combinations = combinations or {}
+        self.combo_calls: list[list[list[str]]] = []
+
+    def list_objects(self, *, include_views: bool = True):
+        meta, _ = self.table_metadata(_EVENTS)
+        return [meta]
+
+    def table_metadata(self, identifier):
+        from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+
+        names = ["id", "tenant", "region", "day"]
+        meta = ObjectMeta(
+            identifier=identifier,
+            object_type="table",
+            schema="s",
+            name="events",
+            row_count=self.rows,
+            byte_size=None,
+            column_count=len(names),
+        )
+        return meta, [
+            ColumnMeta(name=n, data_type="VARCHAR", nullable=True, ordinal=i)
+            for i, n in enumerate(names)
+        ]
+
+    def exact_distinct_counts(self, identifier, columns):
+        return {column: self.distinct[column] for column in columns}
+
+    def distinct_combination_counts(self, identifier, combinations):
+        self.combo_calls.append([list(c) for c in combinations])
+        return {tuple(c): self.combinations.get(tuple(c), 0) for c in combinations}
+
+
+def test_only_a_key_that_is_not_the_grain_is_widened_by_a_constant_column():
+    from exmergo_dex_core.maintain.drift import grain_plan
+
+    dataset = _events_dataset()
+    plan = grain_plan(_TenantAdapter(rows=300, distinct={}), _events_snapshot(dataset))
+    assert plan.key_checks == [(dataset, ["day", "id"], 300)]
+    # `id` is the grain, so only `day` is widened, and `region` already held
+    # three values at the baseline, so only `tenant` may widen it.
+    assert plan.widening_checks == [(dataset, [["tenant", "day"]], 300)]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"grain": None}, id="no-recorded-grain"),
+        pytest.param({"row_count": 1}, id="one-row-baseline"),
+        pytest.param({"row_count": None}, id="uncounted-baseline"),
+    ],
+)
+def test_nothing_is_widened_without_evidence_the_key_is_incidental(overrides):
+    from exmergo_dex_core.maintain.drift import grain_plan
+
+    snap = _events_snapshot(_events_dataset(**overrides))
+    plan = grain_plan(_TenantAdapter(rows=300, distinct={}), snap)
+    assert plan.key_checks, "the keys are still checked"
+    assert plan.widening_checks == []
+
+
+def test_a_connector_without_combination_counts_plans_no_widening():
+    from exmergo_dex_core.maintain.drift import grain_plan
+
+    adapter = _TenantAdapter(rows=300, distinct={})
+    adapter.distinct_combination_counts = None  # shadow: adapter can't probe
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset()))
+    assert plan.key_checks
+    assert plan.widening_checks == []
+
+
+def test_a_key_that_only_narrowed_reads_medium_and_names_what_still_holds():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    adapter = _TenantAdapter(
+        rows=300,
+        distinct={"day": 150, "id": 300},
+        combinations={("tenant", "day"): 300},
+    )
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset()))
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.code == "key_lost_uniqueness"
+    assert finding.column == "day"
+    assert finding.severity == "medium"
+    assert finding.data == {
+        "distinct_count": 150,
+        "row_count": 300,
+        "was_grain": False,
+        "still_unique_as": ["tenant", "day"],
+    }
+    assert "but (tenant, day) still is: the rows were added along tenant" in (
+        finding.detail
+    )
+    assert finding.detail.endswith("no known join uses it")
+    assert adapter.combo_calls == [[["tenant", "day"]]]
+
+
+def test_a_real_duplicate_of_the_widened_combination_stays_high():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    adapter = _TenantAdapter(
+        rows=170,
+        distinct={"day": 150, "id": 170},
+        combinations={("tenant", "day"): 150},
+    )
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset()))
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.severity == "high"
+    assert "still_unique_as" not in finding.data
+    assert "still is" not in finding.detail
+
+
+def test_the_widening_is_counted_only_once_a_key_on_the_table_is_lost():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    adapter = _TenantAdapter(rows=300, distinct={"day": 300, "id": 300})
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset()))
+    assert plan.widening_checks, "planned, so the estimate prices it"
+    assert grain_drift(adapter, plan) == []
+    assert adapter.combo_calls == []
+
+
+def test_a_widened_key_below_the_row_floor_stays_low():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    adapter = _TenantAdapter(
+        rows=60,
+        distinct={"day": 30, "id": 60},
+        combinations={("tenant", "day"): 60},
+    )
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset(row_count=30)))
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.severity == "low"
+    assert finding.data["still_unique_as"] == ["tenant", "day"]
+    assert finding.data["severity_floor_applied"] is True
+
+
+def test_the_grain_is_never_widened_whatever_the_plan_carries():
+    from exmergo_dex_core.maintain.drift import GrainPlan, grain_drift
+
+    dataset = _events_dataset()
+    plan = GrainPlan(
+        key_checks=[(dataset, ["id"], 300)],
+        fanout_pairs=[],
+        composite_checks=[],
+        declared_composite_checks=[],
+        notes=[],
+        widening_checks=[(dataset, [["tenant", "id"]], 300)],
+    )
+    adapter = _TenantAdapter(
+        rows=300, distinct={"id": 290}, combinations={("tenant", "id"): 300}
+    )
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.severity == "high"
+    assert finding.data["was_grain"] is True
+    assert "still_unique_as" not in finding.data
+    assert adapter.combo_calls == []
+
+
+def test_grain_estimate_prices_the_widening_as_if_it_runs():
+    from exmergo_dex_core.maintain.drift import grain_estimate, grain_plan
+
+    adapter = _TenantAdapter(rows=300, distinct={})
+    plan = grain_plan(adapter, _events_snapshot(_events_dataset()))
+    priced: list[str] = []
+    adapter.query_estimate = lambda sql: priced.append(sql) or 7.0
+    total, per_table = grain_estimate(adapter, plan)
+    # The key distincts and the widening combination, one statement each.
+    assert total == 14.0
+    assert per_table == {_EVENTS: 14.0}
+    assert len(priced) == 2
+    assert "SELECT DISTINCT" in priced[1]
+
+
+def _tenant_repo(dex, tmp_path, insert_sql: str):
+    """The #780 report on DuckDB: a table baselined with one repository, then
+    one insert, then both commands that read the grain axis."""
+
+    import duckdb
+
+    root = tmp_path / "tenants"
+    root.mkdir()
+    db_path = root / "warehouse.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE traffic AS SELECT i AS id, 'repo-a' AS repository, "
+        "DATE '2026-01-01' + i::INTEGER AS date, (i * 7) % 50 AS views "
+        "FROM range(150) t(i)"
+    )
+    conn.close()
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {db_path}\n", encoding="utf-8"
+    )
+    rc, _payload = dex("--repo-root", str(root), "explore", "map")
+    assert rc == 0
+    rc, _payload = dex("--repo-root", str(root), "maintain", "snapshot")
+    assert rc == 0
+    cache = json.loads((root / ".dex" / "cache.json").read_text(encoding="utf-8"))
+    (baseline,) = [d for d in cache["datasets"] if d["identifier"].endswith("traffic")]
+    assert baseline["grain"] == ["id"]
+    assert ["date"] in baseline["candidate_keys"]
+
+    conn = duckdb.connect(str(db_path))
+    conn.execute(insert_sql)
+    conn.close()
+
+    findings = {}
+    for command in ("grain", "check"):
+        rc, payload = dex("--repo-root", str(root), "maintain", command)
+        assert rc == 0 and payload["status"] == "ok"
+        (finding,) = [
+            f for f in payload["data"]["findings"] if f["code"] == "key_lost_uniqueness"
+        ]
+        findings[command] = finding
+    assert findings["grain"] == findings["check"]
+    return findings["check"]
+
+
+def test_a_second_tenant_narrows_an_incidental_key_end_to_end(dex, tmp_path):
+    finding = _tenant_repo(
+        dex,
+        tmp_path,
+        "INSERT INTO traffic SELECT 150 + i, 'repo-b', "
+        "DATE '2026-01-01' + i::INTEGER, (i * 3) % 50 FROM range(150) t(i)",
+    )
+    assert finding["column"] == "date"
+    assert finding["severity"] == "medium"
+    assert finding["data"]["was_grain"] is False
+    assert finding["data"]["still_unique_as"] == ["repository", "date"]
+
+
+def test_a_real_duplicate_stays_high_end_to_end(dex, tmp_path):
+    """The same repository and date twice. `(date, views)` is unique here by
+    chance, which is why a column that varied at the baseline never widens."""
+
+    finding = _tenant_repo(
+        dex,
+        tmp_path,
+        "INSERT INTO traffic SELECT 150 + i, 'repo-a', "
+        "DATE '2026-01-01' + i::INTEGER, 1 FROM range(20) t(i)",
+    )
+    assert finding["column"] == "date"
+    assert finding["severity"] == "high"
+    assert "still_unique_as" not in finding["data"]

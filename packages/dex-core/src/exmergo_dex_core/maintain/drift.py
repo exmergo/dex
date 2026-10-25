@@ -615,6 +615,13 @@ class GrainPlan(NamedTuple):
     # finding names the joins on its key rather than assuming there are some.
     # Free to collect and never scanned. Defaulted for the same reason as above.
     joins: list[Relationship] | None = None
+    # `[column, key]` for each single-column key that is not the dataset's grain
+    # and each column the baseline read as constant (#780): the combinations
+    # that show a lost key still unique once its rows are split by a dimension
+    # that only gained values. Planned with the rest so the estimate prices
+    # them; read only for a key that lost uniqueness. Defaulted for the same
+    # reason as above.
+    widening_checks: list[tuple[Dataset, list[list[str]], int | None]] | None = None
 
     def scans(self) -> bool:
         """Whether the plan holds any statement that scans, and so is priced.
@@ -698,6 +705,7 @@ def grain_plan(
     key_checks: list[tuple[Dataset, list[str], int | None]] = []
     composite_checks: list[tuple[Dataset, list[list[str]], int | None]] = []
     declared_checks: list[tuple[Dataset, list[list[str]], int | None]] = []
+    widening_checks: list[tuple[Dataset, list[list[str]], int | None]] = []
     for dataset in snap.warehouse.datasets:
         if scope is not None and dataset.identifier not in scope:
             continue
@@ -729,6 +737,9 @@ def grain_plan(
         live_composites = [c for c in composites if set(c) <= columns]
         if live_keys and row_count != 0:
             key_checks.append((dataset, live_keys, row_count))
+            widening = _widening_combinations(dataset, live_keys, columns)
+            if widening:
+                widening_checks.append((dataset, widening, row_count))
         if live_composites and row_count != 0:
             composite_checks.append((dataset, live_composites, row_count))
 
@@ -850,6 +861,10 @@ def grain_plan(
             + " was not verified"
         )
         cardinality_checks = []
+    if getattr(adapter, "distinct_combination_counts", None) is None:
+        # Nothing to note: without the widening a lost key reads exactly as it
+        # did before it existed.
+        widening_checks = []
 
     return GrainPlan(
         key_checks,
@@ -860,7 +875,39 @@ def grain_plan(
         null_checks,
         cardinality_checks,
         joins,
+        widening_checks,
     )
+
+
+def _widening_combinations(
+    dataset: Dataset, keys: list[str], columns: set[str]
+) -> list[list[str]]:
+    """The combinations that would show a lost key still unique once its rows
+    are split by a column the baseline read as constant (#780).
+
+    Only a key that is not the dataset's recorded grain is widened: losing the
+    grain is the finding that matters, and a dataset with no recorded grain
+    gives no way to tell an incidental key from the real one. Only a column with
+    one distinct value at the baseline may widen it. A looser bound lets measure
+    columns in, and a measure can make a real duplicate unique by chance. A
+    baseline of fewer than two rows reads every column as constant, so it
+    widens nothing.
+    """
+
+    if not dataset.grain or dataset.row_count is None or dataset.row_count < 2:
+        return []
+    constant = [
+        column.name
+        for column in dataset.columns
+        if column.distinct_count == 1 and column.name in columns
+    ]
+    return [
+        [name, key]
+        for key in keys
+        if key not in dataset.grain
+        for name in constant
+        if name != key
+    ]
 
 
 def _joins_on(
@@ -1118,7 +1165,9 @@ def batched_probes(
             add_distinct(dataset.identifier, keys)
     if getattr(adapter, "distinct_combination_counts", None) is not None:
         for dataset, combos, _rows in (
-            plan.composite_checks + plan.declared_composite_checks
+            plan.composite_checks
+            + plan.declared_composite_checks
+            + (plan.widening_checks or [])
         ):
             if combos:
                 add_combinations(dataset.identifier, combos)
@@ -1204,8 +1253,13 @@ def grain_estimate(
         per_table[dataset.identifier] = query_estimate(
             _distinct_count_sql(dataset.identifier, keys, adapter.dialect)
         )
+    # The widening combinations are priced as if they run. Unbatched, they run
+    # only for a table where a key lost uniqueness, so the settled spend can come
+    # in under this, never over it.
     for dataset, combos, _row_count in (
-        plan.composite_checks + plan.declared_composite_checks
+        plan.composite_checks
+        + plan.declared_composite_checks
+        + (plan.widening_checks or [])
     ):
         if dataset.identifier in batched:
             continue
@@ -1321,6 +1375,13 @@ def grain_drift(
     ``join_orphans_increased``, which already grades its own severity from the
     measured orphan fraction rather than asserting ``high`` unconditionally.
 
+    A lost single-column key that is not the grain is read against the plan's
+    ``widening_checks`` (#780). When the key is still unique together with a
+    column the baseline read as constant, the rows were added along that
+    column: the finding reads ``medium`` and names the combination in
+    ``data.still_unique_as``. A real duplicate repeats that combination too, so
+    it stays ``high``.
+
     ``probes`` holds what :func:`run_batched_probes` already measured, one
     statement per table; run here from the plan when omitted. A table it covers
     is read from it and every other table is probed separately, so the findings
@@ -1329,8 +1390,14 @@ def grain_drift(
 
     if probes is None:
         probes = run_batched_probes(adapter, batched_probes(adapter, plan))
+    combo_counts = getattr(adapter, "distinct_combination_counts", None)
+    widening = {
+        dataset.identifier: combos
+        for dataset, combos, _rows in plan.widening_checks or []
+    }
     findings: list[DriftFinding] = []
     for dataset, keys, row_count in plan.key_checks:
+        widened: dict[tuple[str, ...], int] | None = None
         probe = probes.get(dataset.identifier)
         distinct = (
             probe.distinct
@@ -1354,6 +1421,48 @@ def grain_drift(
             duplicates = row_count - count
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             joins = _joins_on(plan, dataset.identifier, [key])
+            was_grain = bool(dataset.grain and key in dataset.grain)
+            # Losing the grain is the finding that matters, so it is never
+            # widened, whatever a plan carries.
+            candidates = (
+                []
+                if was_grain
+                else [
+                    combo
+                    for combo in widening.get(dataset.identifier, [])
+                    if combo[-1] == key
+                ]
+            )
+            still_unique_as: list[str] | None = None
+            if candidates and combo_counts is not None:
+                # Counted once per table, and only once a key on it is lost; a
+                # batched table already carries the counts in its statement.
+                if widened is None:
+                    widened = _combination_counts(
+                        probes,
+                        combo_counts,
+                        dataset.identifier,
+                        widening[dataset.identifier],
+                    )
+                still_unique_as = next(
+                    (
+                        combo
+                        for combo in candidates
+                        if widened.get(tuple(combo), 0) >= row_count
+                    ),
+                    None,
+                )
+            # A key that only narrowed is still worth reading, so it drops to
+            # medium rather than out; the row floor's low is never raised.
+            if still_unique_as is not None and severity == "high":
+                severity = "medium"
+            widened_clause = (
+                f", but ({', '.join(still_unique_as)}) still is: the rows were "
+                f"added along {still_unique_as[0]}, which held one value at the "
+                "baseline"
+                if still_unique_as is not None
+                else ""
+            )
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -1364,21 +1473,27 @@ def grain_drift(
                     detail=(
                         f"{key} on {dataset.identifier} is no longer unique: "
                         f"{count} distinct over {row_count} rows "
-                        f"(~{duplicates} duplicate rows); "
+                        f"(~{duplicates} duplicate rows)"
+                        + widened_clause
+                        + "; "
                         + _fanout_clause(joins)
                         + floor_note
                     ),
                     data={
                         "distinct_count": count,
                         "row_count": row_count,
-                        "was_grain": bool(dataset.grain and key in dataset.grain),
+                        "was_grain": was_grain,
+                        **(
+                            {"still_unique_as": list(still_unique_as)}
+                            if still_unique_as is not None
+                            else {}
+                        ),
                         **floor_data,
                         **({"joins": joins} if joins else {}),
                     },
                 )
             )
 
-    combo_counts = getattr(adapter, "distinct_combination_counts", None)
     for dataset, combos, row_count in plan.composite_checks:
         if combo_counts is None:
             break  # an adapter without combination probes cannot re-verify

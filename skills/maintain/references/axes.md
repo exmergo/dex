@@ -82,6 +82,11 @@ complete composite, never one column at a time. Aggregates only.
 - Below `maintain.grain_min_rows` rows (default 100), a uniqueness-regression
   finding is damped to `low`, and the damping is named in the finding's `data`
   (`severity_floor_applied`, `grain_min_rows`).
+- A single-column key that is not the grain, and is still unique together with
+  a column the baseline read as constant, reads `medium`: the rows were added
+  along that column (a second tenant, region or repository), and
+  `data.still_unique_as` names the combination. A real duplicate repeats that
+  combination too, so it stays `high`, and a lost grain always does.
 - Finding codes: `key_lost_uniqueness` (proven unique at baseline, not now),
   `declared_grain_not_unique` (declared, never held), and
   `join_cardinality_exceeded` (a join whose declared arity, SLayer's
