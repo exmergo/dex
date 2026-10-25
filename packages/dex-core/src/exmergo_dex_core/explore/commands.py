@@ -4456,10 +4456,12 @@ def _relationship_notes(
             notes.append("no declared relationships resolved against this connection")
         elif defs is not None and not defs.present and defs.project_dir:
             notes.append("no declared relationships (dbt project present but unused)")
-        else:
+        elif defs is not None and defs.present and not defs.foreign_keys:
             notes.append(
-                "no declared relationships (no dbt project or no declared foreign keys)"
+                "no declared relationships (dbt project declares no foreign keys)"
             )
+        else:
+            notes.append("no declared relationships (no dbt project)")
     if fk_columns and not inferred:
         notes.append(
             "no id-shaped column matched a parent table by name; joins may exist "

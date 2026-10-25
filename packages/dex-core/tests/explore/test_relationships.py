@@ -2090,6 +2090,36 @@ def test_relationships_envelope_unresolved_declared_is_a_signal(tmp_path: Path, 
     assert any("not in this connection's inventory" in n for n in notes)
 
 
+def test_dbt_with_no_relationship(tmp_path: Path, capsys):
+    db, repo = _declared_join_repo(tmp_path, with_manifest=False)
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: payment_id\n"
+        "        tests:\n",
+        encoding="utf-8",
+    )
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["declared_count"] == 0
+    notes = data["notes"]
+    assert any("no declared relationships" in n for n in notes)
+    assert any("no foreign keys" in n for n in notes)
+
+
 # ---- the semantic layer's declared entity graph (#361) -----------------------
 #
 # A shared entity is a join the layer states, with the key named per model. These
