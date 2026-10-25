@@ -1439,17 +1439,23 @@ def _warnings(
                 f"'{model}' declares no assumptions, so no decision it rests on is "
                 "recorded"
             )
-    measures = sorted(
-        {
-            entry.split(".")[1]
-            for entry in missing
-            if entry.startswith("columns.") and not entry.endswith(".role")
-        }
-    )
-    if measures:
+    measure_fields: dict[str, set[str]] = {}
+    for entry in missing:
+        if entry.startswith("columns.") and not entry.endswith(".role"):
+            _, column, field = entry.split(".", 2)
+            measure_fields.setdefault(column, set()).add(field)
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for column, fields in sorted(measure_fields.items()):
+        absent = tuple(
+            field for field in ("aggregation", "additivity", "unit") if field in fields
+        )
+        groups.setdefault(absent, []).append(column)
+    for fields, columns in groups.items():
+        plural = len(columns) > 1
         out.append(
-            f"'{model}' declares measure(s) {', '.join(measures)} without their "
-            "aggregation, additivity or unit"
+            f"'{model}' declares {'measures' if plural else 'measure'} "
+            f"{', '.join(columns)} without {'their' if plural else 'its'} "
+            f"{', '.join(fields)}"
         )
     unprofiled = [i["relation"] for i in drafted.get("inputs", []) if not i["profiled"]]
     if unprofiled:

@@ -420,8 +420,11 @@ the models the command touched. The plan envelope also carries
 `data.declarations.<model>` for every model the plan creates, edits or declares:
 `drafted` (facts the `.dex/` cache and the SQL support, each with its evidence),
 `declared` (what the post-change YAML says) and `missing` (intent fields nobody
-supplied, each also a warning). `drafted.precedent` says what the project's other
-models do with each column the model filters, branches on or aggregates, and a
+supplied, each also a warning). For measures, warnings name only the missing
+`aggregation`, `additivity`, or `unit` fields and group columns with the same
+missing fields; the `missing` list keeps its per-column paths unchanged.
+`drafted.precedent` says what the project's other models do with each column
+that the model filters, branches on or aggregates, and a
 literal compared to a column whose complete cached domain does not hold it is a
 warning. On a model that already exists, `contradictions` lists each declared rule
 (population filter, grain, declared column, an upstream column's additivity) that

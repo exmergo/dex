@@ -459,11 +459,46 @@ def test_declared_is_read_from_the_yaml_and_missing_names_the_rest():
         "columns.amount.unit",
     ]
     assert "'fct' declares no population rule; its SQL filters on status" in warnings
-    assert any("measure(s) amount" in w for w in warnings)
+    assert "'fct' declares measure amount without its additivity, unit" in warnings
     # The YAML says customer_id, the SQL and the cache say order_id.
     assert any(
         "declares grain [customer_id] and dex drafted [order_id]" in w for w in warnings
     )
+
+
+def test_measure_warnings_group_only_columns_with_the_same_missing_fields():
+    yml = """version: 2
+models:
+  - name: fct
+    columns:
+      - name: amount
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, unit: USD}
+      - name: discount_rate
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, unit: fraction}
+      - name: margin_pct
+        config:
+          meta:
+            dex: {role: measure}
+"""
+    entry, warnings = _draft(
+        "select amount, discount_rate, margin_pct from {{ ref('stg_orders') }}\n",
+        yml=yml,
+    )
+    assert entry["missing"][-5:] == [
+        "columns.amount.additivity",
+        "columns.discount_rate.additivity",
+        "columns.margin_pct.aggregation",
+        "columns.margin_pct.additivity",
+        "columns.margin_pct.unit",
+    ]
+    assert [w for w in warnings if "declares measure" in w] == [
+        "'fct' declares measures amount, discount_rate without their additivity",
+        "'fct' declares measure margin_pct without its aggregation, additivity, unit",
+    ]
 
 
 def test_a_model_with_nothing_declared_misses_every_intent_field():

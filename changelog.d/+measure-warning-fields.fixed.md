@@ -1,0 +1,1 @@
+**Measure warnings identify the fields still missing.** `transform plan` now names only the absent aggregation, additivity, or unit for each measure and groups measures missing the same fields. The per-column `data.declarations.<model>.missing` paths are unchanged.
