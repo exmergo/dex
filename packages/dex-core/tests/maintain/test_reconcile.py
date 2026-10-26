@@ -417,6 +417,27 @@ def test_grain_drift_is_advisory_with_a_visibility_test(maintain_repo):
     assert "unique" in yml_diff["unified"]
 
 
+def test_staging_grain_drift_uses_existing_unique_test(maintain_repo):
+    """A drift on stg_orders must resolve its existing declaration."""
+    maintain_repo.dex("explore", "map", "--verify")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "INSERT INTO stg_orders SELECT * FROM stg_orders WHERE order_id <= 10"
+    )
+    rc, grain = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and any(
+        finding["code"] == "key_lost_uniqueness"
+        and finding["identifier"].endswith(".stg_orders")
+        for finding in grain["data"]["findings"]
+    ), grain
+
+    rc, payload = maintain_repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert payload["diffs"] == []
+    assert not any("stg_stg_orders" in warning for warning in payload["warnings"])
+    assert not any("add a `unique` test" in warning for warning in payload["warnings"])
+
+
 def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
     # The fixture's stg_orders.yml already tests order_id for uniqueness, so a
     # broken key already fails builds; reconcile does not add a redundant test.
@@ -440,9 +461,8 @@ def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
 # two the way dbt's semantics imply discards it and the plan applies having
 # changed nothing.
 #
-# Drift is induced on `orders` rather than on `stg_orders`, because the test edit
-# lands in the *staging model's* declaration: a finding on `stg_orders` resolves to
-# `stg_stg_orders.yml` and never reaches the check under test.
+# Drift is induced on `orders` here so the test edit is proposed on a different
+# model. Drift on `stg_orders` is separately covered by the regression above.
 
 _COMPOSITE_GRAIN = (
     "    tests:\n"
@@ -739,6 +759,9 @@ def test_the_no_format_fallback_answers_exactly_what_dbt_answers():
     staged = "models/staging/stg_orders"
     assert _placed(None, EditKind.MODEL_SQL, "orders") == f"{staged}.sql"
     assert _placed(None, EditKind.SCHEMA_YML, "orders") == f"{staged}.yml"
+    for kind, suffix in ((EditKind.MODEL_SQL, "sql"), (EditKind.SCHEMA_YML, "yml")):
+        assert _placed(None, kind, "stg_orders") == f"{staged}.{suffix}"
+        assert DbtProject().edit_path(kind, "stg_orders") == f"{staged}.{suffix}"
     # `None` is a complete answer, not a gap: reconcile proposes staging models
     # and their schema.yml, and a kind it does not propose gets no path this
     # class would be inventing.

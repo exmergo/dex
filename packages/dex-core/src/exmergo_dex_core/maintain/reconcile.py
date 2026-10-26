@@ -86,7 +86,8 @@ def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str
         # callers holding no format, so answering a path where it answers `None`
         # would make the shim and the format disagree about the same input.
         suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
-        return None if suffix is None else f"models/staging/stg_{table}.{suffix}"
+        model = table if table.startswith("stg_") else f"stg_{table}"
+        return None if suffix is None else f"models/staging/{model}.{suffix}"
     return placement.edit_path(kind, table)
 
 

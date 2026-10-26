@@ -435,9 +435,11 @@ rather than offered.
 `_staging.yml` included) and the folder that already holds its SQL, using the same
 lookup `transform place` and model declarations use. The
 `models/staging/stg_<table>.<suffix>` convention answers only for a model the project
-does not have yet. Reconcile and declarations therefore agree on where a model lives,
-and a re-scaffold that would land beside a model the project keeps elsewhere is
-refused as misplaced rather than written as a second copy.
+does not have yet. A drift finding for a table already named `stg_orders` resolves
+`stg_orders.yml`, not `stg_stg_orders.yml`; reconcile can therefore see an existing
+`unique` test instead of advising the user to add it again. Reconcile and declarations
+agree on where a model lives, and a re-scaffold that would land beside a model the
+project keeps elsewhere is refused as misplaced rather than written as a second copy.
 
 ## Declaring what a model means
 

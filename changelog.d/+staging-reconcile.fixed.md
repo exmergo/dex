@@ -1,0 +1,1 @@
+**Reconcile finds tests on staging models whose names already start with `stg_`.** Grain drift on `stg_orders` previously looked for `stg_stg_orders.yml` and incorrectly advised adding a `unique` test. It now reads the existing staging declaration and leaves an already-failing uniqueness test unchanged.
