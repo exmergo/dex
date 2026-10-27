@@ -51,7 +51,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
-    distinct_combination_sql,
+    distinct_combination_parts,
     is_blob_type,
     is_integer_type,
     is_string_type,
@@ -956,6 +956,12 @@ class PostgresAdapter:
         can afford (they arrive best-ranked first) and says so, rather than
         giving up the grain wholesale. A metered adapter never self-escalates
         past its ceiling.
+
+        COUNT(*) rides along as one more scalar subquery in the same
+        statement, mirroring :meth:`exact_distinct_counts`: the grain
+        check reads the row count only after the scan ran, so a composite
+        grain on an unanalyzed table or a view is measured against the
+        exact total, never against the planner's estimate (#849).
         """
 
         if not combinations:
@@ -971,12 +977,20 @@ class PostgresAdapter:
             self._note(identifier, note)
         if not probed:
             return {}
+        # The only interpolation is the quoted+escaped identifier (never a
+        # value); the statement is parsed and refused if not a read-only
+        # SELECT.
+        parts = [
+            f"(SELECT COUNT(*) FROM {self._quote(identifier)}) AS n_total",  # noqa: S608
+            *distinct_combination_parts(self._quote(identifier), probed, _quote_ident),
+        ]
         sql = assert_select_only(
-            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
+            f"SELECT {', '.join(parts)}",
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
+        self._exact_rows[identifier] = int(values["n_total"])
         return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(

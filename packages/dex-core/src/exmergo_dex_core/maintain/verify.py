@@ -607,14 +607,17 @@ def _declared_grain_findings(
     identifier: str,
     candidates: list[GrainCandidate],
     min_rows: int,
-) -> tuple[list[DriftFinding], bool, list[str]]:
+) -> tuple[list[DriftFinding], str | None, list[str]]:
     """Check every declared candidate for one model. Returns ``(findings,
-    unchecked, unresolved)``: ``unchecked`` is True when a candidate could
-    not be measured at all (a metered adapter declining an unaffordable scan,
-    per :meth:`Adapter.distinct_combination_counts`'s own contract), which is
-    a caveat for the caller's notes, not a clean bill of health; ``unresolved``
-    names every declared column the live relation does not have, which is
-    skipped rather than sent to the warehouse to fail there.
+    unchecked_reason, unresolved)``: ``unchecked_reason`` is None when every
+    candidate was measured, ``"scan"`` when a candidate could not be measured
+    at all (a metered adapter declining an unaffordable scan, per
+    :meth:`Adapter.distinct_combination_counts`'s own contract), and
+    ``"no_count"`` when the scans ran but no exact row count was available
+    to compare them against. Either non-None value is a caveat for the
+    caller's notes, not a clean bill of health; ``unresolved`` names every
+    declared column the live relation does not have, which is skipped
+    rather than sent to the warehouse to fail there.
 
     Each declared column is resolved against the relation's own columns
     case-insensitively before it reaches the adapter (#483). ``schema.yml``
@@ -633,12 +636,8 @@ def _declared_grain_findings(
     """
 
     meta, columns = adapter.table_metadata(identifier)
-    row_count = meta.row_count
-    if row_count is None:
-        return [], True, []
 
     findings: list[DriftFinding] = []
-    unchecked = False
     unresolved: list[str] = []
 
     # Declared spelling -> the relation's spelling. With no column metadata to
@@ -663,36 +662,51 @@ def _declared_grain_findings(
     singles = [
         (c, names) for c, names in resolved if names is not None and len(names) == 1
     ]
+    # Collect every distinct count first, compare second. The count the
+    # verdicts compare against must not be read before the scans ran: on
+    # an adapter whose catalog holds only an estimate (Postgres reltuples)
+    # or nothing at all (an unanalyzed table, reltuples -1, or a view),
+    # the scan itself is what supplies the exact total -- the distinct
+    # count statement rides COUNT(*) along -- so reading it up front
+    # would either compare against a stale estimate or bail out before
+    # the scan that would have measured the grain (#849).
+    single_counts: dict[str, int] = {}
+    scan_failed = False
     if singles:
         counts = adapter.exact_distinct_counts(
             identifier, [names[0] for _, names in singles]
         )
-        for c, names in singles:
+        for _, names in singles:
             distinct = counts.get(names[0])
             if distinct is None:
-                unchecked = True
+                scan_failed = True
                 continue
-            if distinct >= row_count:
-                continue
-            findings.append(
-                _grain_broken_finding(
-                    model,
-                    c.columns,
-                    row_count,
-                    distinct,
-                    exact=True,
-                    source=c.source,
-                    min_rows=min_rows,
-                )
-            )
+            single_counts[names[0]] = distinct
 
-    for c, names in resolved:
+    combo_counts: dict[tuple[str, ...], int] = {}
+    for _, names in resolved:
         if names is None or len(names) == 1:
             continue
         result = adapter.distinct_combination_counts(identifier, [names])
         distinct = result.get(tuple(names))
         if distinct is None:
-            unchecked = True
+            scan_failed = True
+            continue
+        combo_counts[tuple(names)] = distinct
+
+    # A scan that ran may have upgraded the catalog count to the exact
+    # total; only fall back to the pre-scan count when it did not.
+    row_count = adapter.table_metadata(identifier)[0].row_count
+    if row_count is None:
+        row_count = meta.row_count
+    if row_count is None:
+        if single_counts or combo_counts:
+            return [], "no_count", unresolved
+        return [], "scan", unresolved
+
+    for c, names in singles:
+        distinct = single_counts.get(names[0])
+        if distinct is None:
             continue
         if distinct >= row_count:
             continue
@@ -708,7 +722,27 @@ def _declared_grain_findings(
             )
         )
 
-    return findings, unchecked, unresolved
+    for c, names in resolved:
+        if names is None or len(names) == 1:
+            continue
+        distinct = combo_counts.get(tuple(names))
+        if distinct is None:
+            continue
+        if distinct >= row_count:
+            continue
+        findings.append(
+            _grain_broken_finding(
+                model,
+                c.columns,
+                row_count,
+                distinct,
+                exact=True,
+                source=c.source,
+                min_rows=min_rows,
+            )
+        )
+
+    return findings, ("scan" if scan_failed else None), unresolved
 
 
 def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
@@ -728,11 +762,12 @@ def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
 
     Returns ``(finding_or_None, reason)`` where ``reason`` is ``None`` (clean
     or a finding was produced), ``"unknown"`` (no column even looked like a
-    key), or ``"unsupported"`` (the adapter cannot run the check this needs).
+    key), ``"unsupported"`` (the adapter cannot run the check this needs), or
+    ``"no_count"`` (the aggregates ran but no exact row count was available
+    to compare them against).
     """
 
     meta, columns = adapter.table_metadata(identifier)
-    row_count = meta.row_count
     entity = entity_of(identifier.rsplit(".", 1)[-1])
     named = (f"{entity}_id", f"{entity}id", "id")
     candidate = next((c for c in columns if c.name.lower() in named), None)
@@ -740,8 +775,6 @@ def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
         candidate = next((c for c in columns if is_id_shaped(c.name)), None)
     if candidate is None:
         return None, "unknown"
-    if row_count is None:
-        return None, "unsupported"
 
     aggregates_fn = getattr(adapter, "column_aggregates", None)
     if aggregates_fn is None:
@@ -753,6 +786,15 @@ def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
     if agg.null_fraction not in (0.0, None):
         # A key candidate with nulls is not a key: disqualified, not proven.
         return None, "unknown"
+
+    # As with the declared path, the count is read only after the scan
+    # ran: the aggregate statement itself is what supplies the exact total
+    # on an adapter whose catalog holds only an estimate or nothing (#849).
+    row_count = adapter.table_metadata(identifier)[0].row_count
+    if row_count is None:
+        row_count = meta.row_count
+    if row_count is None:
+        return None, "no_count"
 
     non_null = round((1 - (agg.null_fraction or 0.0)) * row_count)
     if non_null and agg.distinct_count >= NEAR_UNIQUE_RATIO * non_null:
@@ -823,6 +865,7 @@ def grain_findings(
     findings: list[DriftFinding] = []
     ambiguous: list[str] = []
     unchecked: list[str] = []
+    no_count: list[str] = []
     unknown: list[str] = []
     unresolved: dict[str, list[str]] = {}
     refused: dict[str, str] = {}
@@ -846,12 +889,14 @@ def grain_findings(
         try:
             candidates = declared.get(model)
             if candidates:
-                model_findings, was_unchecked, missing = _declared_grain_findings(
+                model_findings, unchecked_reason, missing = _declared_grain_findings(
                     adapter, model, identifier, candidates, min_rows
                 )
                 findings.extend(model_findings)
-                if was_unchecked:
+                if unchecked_reason == "scan":
                     unchecked.append(model)
+                elif unchecked_reason == "no_count":
+                    no_count.append(model)
                 if missing:
                     unresolved[model] = missing
                 continue
@@ -866,6 +911,8 @@ def grain_findings(
             unknown.append(model)
         elif reason == "unsupported":
             unchecked.append(model)
+        elif reason == "no_count":
+            no_count.append(model)
 
     notes: list[str] = []
     if ambiguous:
@@ -879,6 +926,12 @@ def grain_findings(
             "the grain could not be measured for "
             + ", ".join(sorted(unchecked))
             + ": the connector could not run the distinct-count scan this needs"
+        )
+    if no_count:
+        notes.append(
+            "the grain could not be measured for "
+            + ", ".join(sorted(no_count))
+            + ": no exact row count was available"
         )
     if unknown:
         notes.append(

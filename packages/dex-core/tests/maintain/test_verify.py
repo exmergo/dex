@@ -736,6 +736,176 @@ def test_a_refused_heuristic_escalation_is_a_note_too():
     assert "refused the distinct-count statement" in notes[0]
 
 
+# --- grain without a catalog count (#849) --------------------------------------
+
+
+class _RideAlongGrainAdapter(_GrainAdapter):
+    """Simulates the Postgres adapter: the catalog count is None (an
+    unanalyzed table, reltuples -1, or a view) until a distinct-count scan
+    runs, which rides COUNT(*) along and upgrades it to the exact total."""
+
+    def __init__(self, *, exact_totals, **kwargs):
+        super().__init__(**kwargs)
+        self._exact_totals = exact_totals
+        self._scanned: set[str] = set()
+
+    def table_metadata(self, identifier):
+        meta, cols = super().table_metadata(identifier)
+        if identifier in self._scanned:
+            meta = types.SimpleNamespace(
+                identifier=identifier, row_count=self._exact_totals[identifier]
+            )
+        return meta, cols
+
+    def exact_distinct_counts(self, identifier, columns):
+        result = super().exact_distinct_counts(identifier, columns)
+        if result:
+            self._scanned.add(identifier)
+        return result
+
+    def distinct_combination_counts(self, identifier, combinations):
+        result = super().distinct_combination_counts(identifier, combinations)
+        if result:
+            self._scanned.add(identifier)
+        return result
+
+    def column_aggregates(self, identifier, columns):
+        result = super().column_aggregates(identifier, columns)
+        if result:
+            self._scanned.add(identifier)
+        return result
+
+
+def test_declared_grain_is_measured_when_the_scan_supplies_the_count():
+    # A never-analyzed table (or a view, dbt's default materialization):
+    # the catalog has no count, so the old code reported the grain
+    # unmeasured without ever running the scan that would have supplied it.
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].code == "grain_broken"
+    assert findings[0].exact is True
+    assert findings[0].data["duplicate_count"] == 1
+
+
+def test_declared_composite_is_measured_when_the_scan_supplies_the_count():
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["order_id", "line_no"]},
+        combos={"db.main.a": {("order_id", "line_no"): 198}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [
+                verify_mod.GrainCandidate(
+                    columns=["order_id", "line_no"], source="unique_test_composite"
+                )
+            ]
+        },
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].data["duplicate_count"] == 2
+
+
+def test_declared_grain_compares_against_the_scans_exact_count_not_the_estimate():
+    # A stale planner estimate (210) must not stand in for the exact total
+    # (200) once the scan has run: the verdict is 1 duplicate, not 11.
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": 210},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].data["duplicate_count"] == 1
+
+
+def test_declared_grain_without_any_count_says_so_instead_of_blaming_the_connector():
+    # The scan ran fine; what is missing is the count. The note must say
+    # that, not that the connector could not run the scan.
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == [
+        "the grain could not be measured for a: no exact row count was available"
+    ]
+
+
+def test_declared_grain_with_a_declined_scan_keeps_the_connector_note():
+    # The scan itself was declined (a metered adapter out of budget), so
+    # the connector note is the accurate one and must survive the split.
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["id"]},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == [
+        "the grain could not be measured for a: the connector could not run "
+        "the distinct-count scan this needs"
+    ]
+
+
+def test_heuristic_grain_is_measured_when_the_aggregates_supply_the_count():
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["order_id"]},
+        approx={"db.main.a": {"order_id": (199, 0.0)}},
+        exact={"db.main.a": {"order_id": 199}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].exact is True
+    assert findings[0].data["duplicate_count"] == 1
+    assert findings[0].data["source"] == "heuristic"
+
+
 # --- compile_check: wraps shadow_parse -------------------------------------------
 
 
