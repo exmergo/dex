@@ -1,0 +1,1 @@
+**`maintain verify` reads correctly when additivity is suppressed.** The reason no longer says "there is no an entity to order it by", and models dropped for the same reason are named once in a single entry, as in "no declaration could be checked (8 models: a, b, ...)", instead of the reason being repeated for each model.

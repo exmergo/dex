@@ -555,12 +555,12 @@ def _cumulative_candidate(model: DeclaredModel, resolve, live):
         ]
     if not temporals or not entities:
         missing = " and ".join(
-            what
-            for what, found in (("an entity", entities), ("a time column", temporals))
+            f"no {what}"
+            for what, found in (("entity", entities), ("time column", temporals))
             if not found
         )
         return None, (
-            f"there is no {missing} to order it by; declare a `time` role and a "
+            f"there is {missing} to order it by; declare a `time` role and a "
             "`foreign_key` role, or a composite grain naming both"
         )
     entity, time = resolve(entities[0])[0], resolve(temporals[0])[0]
@@ -789,10 +789,37 @@ def findings(
             reasons = prepared.dropped.get(finding_class) or [
                 "no declared column could be measured"
             ]
-            result.suppressed[finding_class] = (
-                "no declaration could be checked: " + "; ".join(reasons)
-            )
+            result.suppressed[finding_class] = _suppression_reason(reasons)
     return result
+
+
+def _suppression_reason(reasons: list[str]) -> str:
+    """One class's suppression line, with models that share a reason named once.
+
+    Each reason reads ``model: why``. When every model is dropped for the same
+    ``why``, repeating it per model buries the fact that the whole axis is off
+    for the project, so equal reasons collapse into one entry that lists the
+    models it applies to.
+    """
+    grouped: dict[str, list[str]] = {}
+    for reason in reasons:
+        model, separator, why = reason.partition(": ")
+        if not separator:
+            model, why = "", reason
+        names = grouped.setdefault(why, [])
+        if model and model not in names:
+            names.append(model)
+    if len(grouped) == 1:
+        ((why, names),) = grouped.items()
+        if len(names) > 1:
+            return (
+                f"no declaration could be checked ({len(names)} models: "
+                f"{', '.join(names)}): {why}"
+            )
+    return "no declaration could be checked: " + "; ".join(
+        f"{', '.join(names)}: {why}" if names else why
+        for why, names in grouped.items()
+    )
 
 
 def _refusal(exc: Exception) -> str:

@@ -587,6 +587,65 @@ def test_no_entity_or_time_to_order_by_is_named(tmp_path: Path):
     assert "to order it by" in result.suppressed["additivity"]
 
 
+def test_the_missing_ordering_columns_read_without_a_stray_article(tmp_path: Path):
+    both = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns=_additive("amount"))},
+        "CREATE TABLE t AS SELECT i * 1.0 AS amount FROM range(50) t(i)",
+    )
+    assert "there is no entity and no time column to order it by" in (
+        both.suppressed["additivity"]
+    )
+    assert "no an " not in both.suppressed["additivity"]
+
+
+def test_a_missing_entity_alone_is_named_without_an_article(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {
+            "model.p.t": _model(
+                "t", columns=_additive("amount", placed_at={"role": "time"})
+            )
+        },
+        "CREATE TABLE t AS SELECT i * 1.0 AS amount, "
+        "TIMESTAMP '2026-01-01' + to_days(i) AS placed_at FROM range(50) t(i)",
+    )
+    reason = result.suppressed["additivity"]
+    assert "there is no entity to order it by" in reason
+    assert "no an " not in reason
+
+
+def test_models_sharing_a_suppression_reason_are_listed_once(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {
+            "model.p.a": _model("a", columns=_additive("amount")),
+            "model.p.b": _model("b", columns=_additive("amount")),
+        },
+        "CREATE TABLE a AS SELECT i * 1.0 AS amount FROM range(50) t(i)",
+        "CREATE TABLE b AS SELECT i * 1.0 AS amount FROM range(50) t(i)",
+    )
+    reason = result.suppressed["additivity"]
+    assert reason.startswith("no declaration could be checked (2 models: ")
+    assert "a" in reason.split("):")[0] and "b" in reason.split("):")[0]
+    assert reason.count("to order it by") == 1
+
+
+def test_suppression_reasons_that_differ_stay_separate():
+    reason = facts_mod._suppression_reason(["a: x", "b: y", "c: x"])
+    assert reason == "no declaration could be checked: a, c: x; b: y"
+
+
+def test_a_single_models_suppression_reason_reads_as_before():
+    assert (
+        facts_mod._suppression_reason(["a: x"])
+        == "no declaration could be checked: a: x"
+    )
+    assert facts_mod._suppression_reason(
+        ["no declared column could be measured"]
+    ) == ("no declaration could be checked: no declared column could be measured")
+
+
 # --- the build path's grain, and nothing declared at all --------------------------
 
 
