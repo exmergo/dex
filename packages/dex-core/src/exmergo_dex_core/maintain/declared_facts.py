@@ -817,8 +817,7 @@ def _suppression_reason(reasons: list[str]) -> str:
                 f"{', '.join(names)}): {why}"
             )
     return "no declaration could be checked: " + "; ".join(
-        f"{', '.join(names)}: {why}" if names else why
-        for why, names in grouped.items()
+        f"{', '.join(names)}: {why}" if names else why for why, names in grouped.items()
     )
 
 

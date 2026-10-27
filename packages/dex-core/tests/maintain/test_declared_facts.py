@@ -593,10 +593,9 @@ def test_the_missing_ordering_columns_read_without_a_stray_article(tmp_path: Pat
         {"model.p.t": _model("t", columns=_additive("amount"))},
         "CREATE TABLE t AS SELECT i * 1.0 AS amount FROM range(50) t(i)",
     )
-    assert "there is no entity and no time column to order it by" in (
-        both.suppressed["additivity"]
-    )
-    assert "no an " not in both.suppressed["additivity"]
+    reason = both.suppressed["additivity"]
+    assert "there is no entity and no time column to order it by" in reason
+    assert "no an " not in reason
 
 
 def test_a_missing_entity_alone_is_named_without_an_article(tmp_path: Path):
@@ -641,9 +640,9 @@ def test_a_single_models_suppression_reason_reads_as_before():
         facts_mod._suppression_reason(["a: x"])
         == "no declaration could be checked: a: x"
     )
-    assert facts_mod._suppression_reason(
-        ["no declared column could be measured"]
-    ) == ("no declaration could be checked: no declared column could be measured")
+    assert facts_mod._suppression_reason(["no declared column could be measured"]) == (
+        "no declaration could be checked: no declared column could be measured"
+    )
 
 
 # --- the build path's grain, and nothing declared at all --------------------------
