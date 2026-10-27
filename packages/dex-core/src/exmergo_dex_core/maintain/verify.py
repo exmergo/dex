@@ -762,9 +762,10 @@ def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
 
     Returns ``(finding_or_None, reason)`` where ``reason`` is ``None`` (clean
     or a finding was produced), ``"unknown"`` (no column even looked like a
-    key), ``"unsupported"`` (the adapter cannot run the check this needs), or
-    ``"no_count"`` (the aggregates ran but no exact row count was available
-    to compare them against).
+    key), ``"unsupported"`` (the adapter cannot run the check this needs,
+    including a priced scan the cost gate refuses: an unconfirmed run with
+    no ceiling, or a spent budget), or ``"no_count"`` (the aggregates ran
+    but no exact row count was available to compare them against).
     """
 
     meta, columns = adapter.table_metadata(identifier)
@@ -776,10 +777,19 @@ def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
     if candidate is None:
         return None, "unknown"
 
+    from ..guards.cost_guard import CostGuardError
+
     aggregates_fn = getattr(adapter, "column_aggregates", None)
     if aggregates_fn is None:
         return None, "unsupported"
-    aggregates = aggregates_fn(identifier, [candidate])
+    try:
+        aggregates = aggregates_fn(identifier, [candidate])
+    except CostGuardError:
+        # A priced scan the cost gate refuses is this model's grain going
+        # unmeasured, not the command failing: the declared path declines
+        # the same way via try_charge, and grain_findings already treats a
+        # refused statement as a note rather than a failure (#483).
+        return None, "unsupported"
     agg = next((a for a in aggregates if a.name == candidate.name), None)
     if agg is None or agg.distinct_count is None:
         return None, "unsupported"

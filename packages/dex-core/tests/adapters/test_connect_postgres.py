@@ -572,13 +572,17 @@ def test_distinct_combination_counts_batch_into_one_guarded_statement(
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     fake_pg_connection.row_resolver = lambda sql: FakeResult(
-        rows=[{"d_0": 97, "d_1": 100}], seconds=0.5
+        rows=[{"n_total": 137, "d_0": 97, "d_1": 100}], seconds=0.5
     )
     adapter = make_adapter(fake_pg_connection)
     counts = adapter.distinct_combination_counts(
         "dexdb.shop.customers", [["id", "email"], ["email", "id"]]
     )
     assert counts == {("id", "email"): 97, ("email", "id"): 100}
+    # The combination statement rides COUNT(*) along (#849), so the scan
+    # supplies the exact total the same way the aggregate scan does.
+    meta, _ = adapter.table_metadata("dexdb.shop.customers")
+    assert meta.row_count == 137
     stmts = fake_pg_connection.data_statements
     assert len(stmts) == 1
     sql = stmts[0].sql
