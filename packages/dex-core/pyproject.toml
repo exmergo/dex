@@ -329,7 +329,7 @@ all = [
 # runs the whole suite without also picking a connector. towncrier is the version
 # scripts/prepare_release.sh runs, so the changelog tests exercise it offline;
 # tests/test_changelog.py fails if the two pins part.
-dev = ["ruff==0.17.1", "towncrier==26.9.0", "scikit-learn>=1.4", "exmergo-dex-core[ossie,sql,storage-conformance]"]
+dev = ["ruff==0.17.2", "towncrier==26.9.0", "scikit-learn>=1.4", "exmergo-dex-core[ossie,sql,storage-conformance]"]
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"
