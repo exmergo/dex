@@ -322,6 +322,29 @@ def _advisory(finding: DriftFinding) -> Proposal:
                 f"drop_orphan_relations --args '{operation_args}'"
             ),
         )
+    if finding.code == "dimension_cardinality_changed":
+        before = finding.data.get("distinct_before")
+        after = finding.data.get("distinct_after")
+        investigation = "check whether the dimension's population changed"
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            if after < before:
+                investigation = "check for missing categories or upstream filters"
+            elif after > before:
+                investigation = (
+                    "check for additional categories or upstream population changes"
+                )
+        if not finding.exact:
+            investigation += (
+                "; the distinct counts are approximate, not proof of changed values"
+            )
+        return Proposal(
+            axis=finding.axis,
+            kind="advisory",
+            finding_code=finding.code,
+            identifier=finding.identifier,
+            column=finding.column,
+            action=investigation,
+        )
     actions = {
         "table_added": (
             "a new table appeared; scaffold a staging model with "
@@ -361,10 +384,6 @@ def _advisory(finding: DriftFinding) -> Proposal:
         "join_orphans_increased": (
             "investigate the upstream load; a dbt `relationships` test would "
             "make the orphaned keys visible in builds"
-        ),
-        "dimension_cardinality_changed": (
-            "decide whether the new categorical value belongs in the impacted "
-            "metric definitions; a firewalled `explore query` can name it"
         ),
         "dangling_reference": (
             "update the semantic definition with `semantic update`, or restore "

@@ -1,0 +1,1 @@
+**`maintain reconcile` no longer assumes cardinality drift introduces a new value.** Dimension-cardinality advisories now distinguish contraction from expansion, avoid claiming that a particular category changed, and warn when the counts are approximate.

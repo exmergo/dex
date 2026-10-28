@@ -11,6 +11,60 @@ def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+def test_cardinality_contraction_advice_does_not_invent_a_new_value():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison.page",
+        detail="dimension 'page' narrowed: ~80 -> 77 distinct values",
+        exact=False,
+        data={"distinct_before": 80, "distinct_after": 77},
+    )
+
+    action = _advisory(finding).action
+    assert "missing categories" in action
+    assert "new categorical value" not in action
+    assert "approximate" in action
+
+
+def test_cardinality_expansion_advice_does_not_claim_a_specific_new_value():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison.page",
+        detail="dimension 'page' expanded: 77 -> 80 distinct values",
+        data={"distinct_before": 77, "distinct_after": 80},
+    )
+
+    action = _advisory(finding).action
+    assert "additional categories" in action
+    assert "new categorical value" not in action
+    assert "approximate" not in action
+
+
+def test_cardinality_advice_without_counts_stays_neutral():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        detail="cardinality changed",
+        data={},
+    )
+
+    action = _advisory(finding).action
+    assert "population changed" in action
+    assert "missing categories" not in action
+    assert "additional categories" not in action
+
+
 _INTENDED_CHURN = (
     "definition or model changes since the baseline are recorded but "
     "not reconciled: if the current project state is intended, run "
