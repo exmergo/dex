@@ -513,6 +513,73 @@ def test_missing_stats_notes_analyze(fake_pg_connection):
     assert any("ANALYZE" in note for note in adapter.table_notes("dexdb.shop.events"))
 
 
+def _events_rows(sql):
+    if "COUNT(DISTINCT" in sql:
+        return FakeResult(rows=[{"n_total": 50, "d_0": 50}], seconds=0.5)
+    return FakeResult(rows=[{"n_total": 50, "nn_0": 50, "nn_1": 50}], seconds=0.5)
+
+
+def test_missing_stats_measured_note_replaces_analyze_note(fake_pg_connection):
+    # Issue #896: once an exact scan measures the columns the catalog had
+    # none for, the ANALYZE note must not still claim they are unavailable.
+    fake_pg_connection.row_resolver = _events_rows
+    adapter = make_adapter(fake_pg_connection, ceiling=5000.0)
+    _meta, columns = adapter.table_metadata("dexdb.shop.events")
+    adapter.column_aggregates("dexdb.shop.events", columns)
+    assert adapter.exact_distinct_counts("dexdb.shop.events", ["id"]) == {"id": 50}
+    notes = adapter.table_notes("dexdb.shop.events")
+    assert not any("ANALYZE" in note for note in notes)
+    assert any("id" in note and "measured with an exact scan" in note for note in notes)
+
+
+def test_missing_stats_partial_measurement_keeps_analyze_note(fake_pg_connection):
+    # Only the measured column leaves the unavailable note; the rest keep it.
+    from fakes.postgres import FakePostgresConnection
+
+    connection = FakePostgresConnection(
+        tables=[
+            FakePostgresTable(
+                schema="shop",
+                name="plain",
+                columns=[("id", "bigint", True), ("code", "text", True)],
+                reltuples=-1.0,
+                total_bytes=1000,
+            )
+        ],
+        database="dexdb",
+    )
+
+    def _plain_rows(sql):
+        if "COUNT(DISTINCT" in sql:
+            return FakeResult(rows=[{"n_total": 40, "d_0": 40}], seconds=0.5)
+        return FakeResult(rows=[{"n_total": 40, "nn_0": 40, "nn_1": 40}], seconds=0.5)
+
+    connection.row_resolver = _plain_rows
+    adapter = make_adapter(connection, ceiling=5000.0)
+    _meta, columns = adapter.table_metadata("dexdb.shop.plain")
+    adapter.column_aggregates("dexdb.shop.plain", columns)
+    assert adapter.exact_distinct_counts("dexdb.shop.plain", ["id"]) == {"id": 40}
+    notes = adapter.table_notes("dexdb.shop.plain")
+    assert any("1 column(s)" in note and "ANALYZE" in note for note in notes)
+    assert any("id" in note and "measured with an exact scan" in note for note in notes)
+
+
+def test_exact_distinct_counts_skips_degraded(fake_pg_connection):
+    # The engine also sends catalog-blind columns, and a degraded column
+    # (jsonb here) among them must not fail the whole statement: Postgres
+    # cannot COUNT(DISTINCT) every degraded type.
+    fake_pg_connection.row_resolver = _events_rows
+    adapter = make_adapter(fake_pg_connection, ceiling=5000.0)
+    assert adapter.exact_distinct_counts("dexdb.shop.events", ["id", "payload"]) == {
+        "id": 50
+    }
+    exact_statements = [
+        s.sql for s in fake_pg_connection.data_statements if "COUNT(DISTINCT" in s.sql
+    ]
+    assert exact_statements
+    assert all("payload" not in sql for sql in exact_statements)
+
+
 def test_exact_count_from_scan_supersedes_reltuples(fake_pg_connection):
     fake_pg_connection.row_resolver = lambda sql: FakeResult(
         rows=[{"n_total": 137, "nn_0": 137, "nn_1": 137, "nn_2": 1, "nn_3": 1}],

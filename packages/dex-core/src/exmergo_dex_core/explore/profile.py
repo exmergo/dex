@@ -1110,9 +1110,18 @@ def _escalate_near_unique(
     unique within approximation noise, so uniqueness verdicts (and the grain and
     data-quality notes derived from them) rest on proof, not on HLL error.
 
-    Bounded: at most ``_EXACT_DISTINCT_CAP`` columns per table (the smallest
-    approx-to-non-null gaps win), all in one batched adapter call. An adapter
-    without ``exact_distinct_counts`` degrades to the approximate signals.
+    A second pass covers columns the catalog says nothing about at all
+    (Postgres views and tables nobody has analyzed report no planner
+    statistics, so their distinct counts arrive as None): a null-free column
+    with no count is exactly a column that could prove as a single-column
+    key, and leaving it unmeasured is what used to leave the grain unknown
+    and the candidate keys empty. Those columns have no approximation to
+    rank by, so id-shaped names go first and the rest follow scan order.
+
+    Bounded: at most ``_EXACT_DISTINCT_CAP`` columns per table across both
+    passes (the near-unique pass wins the slots first), all in one batched
+    adapter call. An adapter without ``exact_distinct_counts`` degrades to
+    the approximate signals.
     """
 
     if not row_count:
@@ -1121,25 +1130,46 @@ def _escalate_near_unique(
     if exact_counts is None:
         return aggregates
 
-    candidates: list[tuple[int, str, int]] = []
-    for agg in aggregates.values():
-        if agg.distinct_count is None or agg.distinct_count_exact:
-            continue
-        non_null = (
+    def _non_null(agg: ColumnAggregate) -> int:
+        return (
             round((1 - agg.null_fraction) * row_count)
             if agg.null_fraction is not None
             else row_count
         )
+
+    candidates: list[tuple[int, str, int]] = []
+    catalog_blind: list[str] = []
+    for agg in aggregates.values():
+        if agg.distinct_count_exact:
+            continue
+        if agg.distinct_count is None:
+            if agg.null_fraction in (0.0, None):
+                catalog_blind.append(agg.name)
+            continue
+        non_null = _non_null(agg)
         if non_null <= 0:
             continue
         if agg.distinct_count >= NEAR_UNIQUE_RATIO * non_null:
             gap = abs(non_null - agg.distinct_count)
             candidates.append((gap, agg.name, non_null))
-    if not candidates:
+    if not candidates and not catalog_blind:
         return aggregates
 
     candidates.sort(key=lambda c: c[0])
     chosen = candidates[:_EXACT_DISTINCT_CAP]
+    if len(chosen) < _EXACT_DISTINCT_CAP and catalog_blind:
+        # Imported here: relationships imports NEAR_UNIQUE_RATIO from this
+        # module, so a module-level import would be circular.
+        from .relationships import is_id_shaped
+
+        blind_ranked = sorted(
+            catalog_blind,
+            key=lambda name: (not is_id_shaped(name), list(aggregates).index(name)),
+        )
+        for name in blind_ranked[: _EXACT_DISTINCT_CAP - len(chosen)]:
+            chosen.append((0, name, _non_null(aggregates[name])))
+    if not chosen:
+        return aggregates
     exact = exact_counts(identifier, [name for _gap, name, _nn in chosen])
 
     escalated = dict(aggregates)

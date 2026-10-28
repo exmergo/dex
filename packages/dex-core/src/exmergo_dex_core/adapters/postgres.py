@@ -205,6 +205,12 @@ class PostgresAdapter:
         self.forget_metadata()
         self._database: str | None = None
         self._notes: dict[str, list[str]] = {}
+        # Columns the catalog had no planner statistics for, and columns an
+        # exact scan has since measured: `table_notes` reconciles the two so
+        # a measured column is never still reported as unavailable. Both
+        # survive `forget_metadata` like the notes themselves do.
+        self._missing_stats: dict[str, set[str]] = {}
+        self._exact_measured: dict[str, set[str]] = {}
         self._session_prepared = False
 
     # --- capabilities (free) ---------------------------------------------------
@@ -266,9 +272,31 @@ class PostgresAdapter:
     def table_notes(self, identifier: str) -> list[str]:
         """Data-quality notes the profiling run accumulated for one object
         (sampling degradation, skipped escalations, missing planner stats).
-        Merged into the dataset's ``data_quality`` by the profile engine."""
+        Merged into the dataset's ``data_quality`` by the profile engine.
 
-        return list(self._notes.get(identifier, []))
+        The missing-stats note is composed here, not at scan time: an exact
+        scan after the aggregate scan may have measured columns the catalog
+        had none for, and a note claiming those counts are unavailable until
+        ANALYZE runs would then be wrong. Columns still unmeasured keep
+        the unavailable note; measured ones get a note saying so.
+        """
+
+        notes = list(self._notes.get(identifier, []))
+        missing = self._missing_stats.get(identifier, set())
+        measured = self._exact_measured.get(identifier, set()) & missing
+        unmeasured = missing - measured
+        if unmeasured:
+            notes.append(
+                f"no planner statistics for {len(unmeasured)} column(s); distinct "
+                "counts are unavailable until ANALYZE runs on this table",
+            )
+        if measured:
+            notes.append(
+                "distinct counts for "
+                f"{', '.join(sorted(measured))} measured with an exact scan "
+                "because the catalog had none",
+            )
+        return notes
 
     def _load_inventory(self) -> None:
         if self._inventory_loaded:
@@ -721,7 +749,7 @@ class PostgresAdapter:
                     sampled=sample_percent is not None,
                 )
             )
-        self._note_missing_stats(identifier, columns, stats)
+        self._record_missing_stats(identifier, columns, stats)
         return results
 
     def _distinct_row_basis(self, identifier: str, meta: ObjectMeta) -> int | None:
@@ -897,20 +925,20 @@ class PostgresAdapter:
             )
         return aggregates
 
-    def _note_missing_stats(
+    def _record_missing_stats(
         self, identifier: str, columns: list[ColumnMeta], stats: dict[str, float]
     ) -> None:
-        missing = [
+        # Recorded, not noted: `table_notes` composes the note after any
+        # exact scan has had its chance to measure these columns, so a
+        # measured column is never reported as unavailable. A fresh
+        # aggregate scan starts a fresh measurement epoch: exact counts
+        # from an earlier run must not speak for this one.
+        self._exact_measured[identifier] = set()
+        self._missing_stats[identifier] = {
             col.name
             for col in columns
             if not self._is_degraded(col.data_type) and col.name not in stats
-        ]
-        if missing:
-            self._note(
-                identifier,
-                f"no planner statistics for {len(missing)} column(s); distinct "
-                "counts are unavailable until ANALYZE runs on this table",
-            )
+        }
 
     def exact_distinct_counts(
         self, identifier: str, columns: list[str]
@@ -919,11 +947,27 @@ class PostgresAdapter:
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let uniqueness verdicts stay
         approximate. A metered adapter never self-escalates past its ceiling.
+
+        Columns the adapter degrades (json, xml and friends, which the
+        aggregate scan itself refuses to count) are skipped, not counted:
+        the engine also sends columns the catalog had no statistics for,
+        and a degraded column among them would fail the whole statement.
+        A column the inventory does not know is kept, since its type cannot
+        be proven degraded. Measured columns are recorded so `table_notes`
+        can say they were measured because the catalog had none.
         """
 
         if not columns:
             return {}
-        meta, _ = self.table_metadata(identifier)
+        meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        measurable = [
+            name
+            for name in columns
+            if name not in types or not self._is_degraded(types[name])
+        ]
+        if not measurable:
+            return {}
         estimate = self._scan_seconds(meta.byte_size)
         if not self.cost_gate.try_charge(estimate):
             self._note(
@@ -936,7 +980,7 @@ class PostgresAdapter:
         # row estimate to an exact count (grain verdicts compare against it).
         select_parts = ["COUNT(*) AS n_total"] + [
             f"COUNT(DISTINCT {_quote_ident(name)}) AS d_{i}"
-            for i, name in enumerate(columns)
+            for i, name in enumerate(measurable)
         ]
         sql = assert_select_only(
             f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}",  # noqa: S608
@@ -945,7 +989,8 @@ class PostgresAdapter:
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
         self._exact_rows[identifier] = int(values["n_total"])
-        return {name: int(values[f"d_{i}"]) for i, name in enumerate(columns)}
+        self._exact_measured.setdefault(identifier, set()).update(measurable)
+        return {name: int(values[f"d_{i}"]) for i, name in enumerate(measurable)}
 
     def distinct_combination_counts(
         self, identifier: str, combinations: list[list[str]]

@@ -2196,6 +2196,157 @@ def test_adapter_without_exact_counts_degrades_gracefully():
     assert not any("not unique" in n for n in datasets[0].data_quality)
 
 
+# --- catalog-blind escalation (issue #896) --------------------------------------
+#
+# A Postgres view or a table nobody has analyzed reports no planner
+# statistics, so distinct counts arrive as None and the near-unique pass
+# has nothing to escalate. The null-free columns among them are exactly the
+# columns that could prove as single-column keys, so they escalate too.
+
+
+class _CatalogBlindStubAdapter:
+    """Fake adapter whose distinct counts are None where the catalog has
+    none, with exact counts supplied per column like a real scan would."""
+
+    def __init__(self, rows, approx, exact, nulls=None):
+        from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+
+        self._meta_cls = ObjectMeta
+        self._col_cls = ColumnMeta
+        self.rows = rows
+        self.approx = approx
+        self.exact = exact
+        self.nulls = nulls or {}
+        self.calls = []
+
+    def table_metadata(self, identifier):
+        columns = [
+            self._col_cls(name=n, data_type="BIGINT", nullable=True, ordinal=i)
+            for i, n in enumerate(self.approx)
+        ]
+        return (
+            self._meta_cls(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name=identifier.rsplit(".", 1)[-1],
+                row_count=self.rows,
+                byte_size=None,
+                column_count=len(self.approx),
+            ),
+            columns,
+        )
+
+    def column_aggregates(
+        self,
+        identifier,
+        columns,
+        *,
+        safe_min_max=None,
+        shape_stats=None,
+        type_stats=None,
+        key_shape_stats=None,
+        temporal_stats=None,
+    ):
+        from exmergo_dex_core.adapters.base import ColumnAggregate
+
+        return [
+            ColumnAggregate(
+                name=c.name,
+                null_fraction=self.nulls.get(c.name, 0.0),
+                distinct_count=self.approx[c.name],
+                is_unique=False,
+                min_value=None,
+                max_value=None,
+            )
+            for c in columns
+        ]
+
+    def exact_distinct_counts(self, identifier, columns):
+        self.calls.append(list(columns))
+        return {n: self.exact[n] for n in columns if n in self.exact}
+
+    def distinct_combination_counts(self, identifier, combinations):
+        return {}
+
+    def value_domain_counts(self, identifier, columns, *, limit):
+        return {}
+
+
+def test_catalog_blind_column_escalates_to_exact_and_proves_key():
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _CatalogBlindStubAdapter(
+        rows=100,
+        approx={"id": None, "val": None},
+        exact={"id": 100, "val": 60},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+
+    assert len(adapter.calls) == 1, "both passes batch into one adapter call"
+    cols = {c.name: c for c in datasets[0].columns}
+    assert cols["id"].distinct_count == 100
+    assert cols["id"].distinct_count_exact is True
+    assert cols["id"].is_unique is True
+    assert cols["val"].distinct_count == 60
+    assert cols["val"].distinct_count_exact is True
+    assert cols["val"].is_unique is False
+    assert rel_mod.candidate_keys(datasets[0]) == [["id"]]
+
+
+def test_catalog_blind_columns_share_cap_with_near_unique():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _CatalogBlindStubAdapter(
+        rows=1000,
+        approx={f"near_{i}": 990 + i for i in range(5)}
+        | {f"blind_{i}": None for i in range(5)},
+        exact={f"blind_{i}": 500 for i in range(5)}
+        | {f"near_{i}": 990 + i for i in range(5)},
+    )
+    profile_mod.profile(adapter, ["db.s.t"])
+
+    assert len(adapter.calls) == 1
+    chosen = adapter.calls[0]
+    assert len(chosen) == 8, "the cap binds across both passes"
+    assert all(f"near_{i}" in chosen for i in range(5))
+    assert chosen[5:] == ["blind_0", "blind_1", "blind_2"]
+
+
+def test_catalog_blind_column_with_nulls_not_escalated():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _CatalogBlindStubAdapter(
+        rows=100,
+        approx={"id": None},
+        exact={"id": 100},
+        nulls={"id": 0.5},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+
+    assert adapter.calls == [], "a nullable column can never prove as a key"
+    assert datasets[0].columns[0].distinct_count is None
+    assert datasets[0].columns[0].is_unique is False
+
+
+def test_id_shaped_catalog_blind_columns_rank_first():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    names = [f"f{i}" for i in range(9)] + ["customer_id"]
+    adapter = _CatalogBlindStubAdapter(
+        rows=100,
+        approx=dict.fromkeys(names),
+        exact=dict.fromkeys(names, 50),
+    )
+    profile_mod.profile(adapter, ["db.s.t"])
+
+    chosen = adapter.calls[0]
+    assert len(chosen) == 8
+    assert "customer_id" in chosen, "the key-shaped column must win a slot"
+    assert "f7" not in chosen and "f8" not in chosen
+
+
 # --- composite-key probing ------------------------------------------------------
 
 
