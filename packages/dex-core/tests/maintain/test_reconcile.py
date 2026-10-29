@@ -1091,3 +1091,129 @@ def test_a_declaration_spelled_in_another_case_is_still_the_column(maintain_repo
 
     assert payload["data"]["mechanical_count"] == 1
     assert "-      - name: STATUS" in _diff(payload, _STG_YML)["unified"]
+
+
+def test_dimension_cardinality_contraction_advisory_exact():
+    """A dimension contraction advises investigating missing categories or filters,
+    never claiming a new categorical value appeared (#890)."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison",
+        column="page",
+        detail="dimension 'page' narrowed: 80 -> 77 distinct values",
+        exact=True,
+        data={"distinct_before": 80, "distinct_after": 77},
+    )
+    proposal = _advisory(finding)
+    assert proposal.kind == "advisory"
+    assert proposal.finding_code == "dimension_cardinality_changed"
+    assert proposal.action == (
+        "the dimension narrowed; investigate missing categories, "
+        "filters, upstream coverage, or expected population changes"
+    )
+    assert "new categorical value" not in proposal.action
+
+
+def test_dimension_cardinality_contraction_advisory_approximate():
+    """An approximate dimension contraction preserves sketch uncertainty (#890)."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison",
+        column="page",
+        detail="dimension 'page' narrowed: ~80 -> 77 distinct values",
+        exact=False,
+        data={"distinct_before": 80, "distinct_after": 77},
+    )
+    proposal = _advisory(finding)
+    assert proposal.action == (
+        "the dimension narrowed approximately; investigate missing "
+        "categories, filters, upstream coverage, expected population "
+        "changes, or sketch variance"
+    )
+    assert "new categorical value" not in proposal.action
+
+
+def test_dimension_cardinality_expansion_advisory_exact():
+    """An exact dimension expansion advises investigating additional categories
+    without claiming a single new value (#890)."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison",
+        column="page",
+        detail="dimension 'page' widened: 77 -> 80 distinct values",
+        exact=True,
+        data={"distinct_before": 77, "distinct_after": 80},
+    )
+    proposal = _advisory(finding)
+    assert proposal.action == (
+        "the dimension widened; investigate additional categories "
+        "and decide whether they belong in impacted metric definitions"
+    )
+    assert "new categorical value" not in proposal.action
+
+
+def test_dimension_cardinality_expansion_advisory_approximate():
+    """An approximate dimension expansion notes sketch variance (#890)."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison",
+        column="page",
+        detail="dimension 'page' widened: ~77 -> 80 distinct values",
+        exact=False,
+        data={"distinct_before": 77, "distinct_after": 80},
+    )
+    proposal = _advisory(finding)
+    assert proposal.action == (
+        "the dimension widened approximately; investigate additional "
+        "categories or sketch variance before updating "
+        "metric definitions"
+    )
+    assert "new categorical value" not in proposal.action
+
+
+def test_dimension_cardinality_neutral_advisory_fallback():
+    """Fallback when counts are equal or missing remains neutral (#890)."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    # Equal counts, exact
+    exact_finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        exact=True,
+        detail="dimension cardinality changed",
+        data={"distinct_before": 50, "distinct_after": 50},
+    )
+    assert _advisory(exact_finding).action == (
+        "investigate the changed distinct count and whether it reflects an "
+        "expected population change"
+    )
+
+    # Missing counts, approximate
+    approx_finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        exact=False,
+        detail="dimension cardinality changed",
+        data={},
+    )
+    assert _advisory(approx_finding).action == (
+        "investigate the approximate distinct count change and whether sketch "
+        "variance or an expected population change accounts for it"
+    )

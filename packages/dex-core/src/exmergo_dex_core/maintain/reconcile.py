@@ -302,6 +302,48 @@ def _run_operation_args(identifiers: list[str]) -> str:
     return f"{{relations: [{relations}], dry_run: false}}"
 
 
+def _dimension_cardinality_action(finding: DriftFinding) -> str:
+    before = finding.data.get("distinct_before")
+    after = finding.data.get("distinct_after")
+    if before is not None and after is not None:
+        try:
+            b_val = float(before)
+            a_val = float(after)
+            if a_val < b_val:
+                if not finding.exact:
+                    return (
+                        "the dimension narrowed approximately; investigate missing "
+                        "categories, filters, upstream coverage, expected population "
+                        "changes, or sketch variance"
+                    )
+                return (
+                    "the dimension narrowed; investigate missing categories, "
+                    "filters, upstream coverage, or expected population changes"
+                )
+            if a_val > b_val:
+                if not finding.exact:
+                    return (
+                        "the dimension widened approximately; investigate additional "
+                        "categories or sketch variance before updating "
+                        "metric definitions"
+                    )
+                return (
+                    "the dimension widened; investigate additional categories "
+                    "and decide whether they belong in impacted metric definitions"
+                )
+        except (ValueError, TypeError):
+            pass
+    if not finding.exact:
+        return (
+            "investigate the approximate distinct count change and whether sketch "
+            "variance or an expected population change accounts for it"
+        )
+    return (
+        "investigate the changed distinct count and whether it reflects an "
+        "expected population change"
+    )
+
+
 def _advisory(finding: DriftFinding) -> Proposal:
     if finding.code == "orphan_relation":
         operation_args = _run_operation_args(
@@ -321,6 +363,15 @@ def _advisory(finding: DriftFinding) -> Proposal:
                 "project does not have it yet, then run dbt run-operation "
                 f"drop_orphan_relations --args '{operation_args}'"
             ),
+        )
+    if finding.code == "dimension_cardinality_changed":
+        return Proposal(
+            axis=finding.axis,
+            kind="advisory",
+            finding_code=finding.code,
+            identifier=finding.identifier,
+            column=finding.column,
+            action=_dimension_cardinality_action(finding),
         )
     actions = {
         "table_added": (
@@ -361,10 +412,6 @@ def _advisory(finding: DriftFinding) -> Proposal:
         "join_orphans_increased": (
             "investigate the upstream load; a dbt `relationships` test would "
             "make the orphaned keys visible in builds"
-        ),
-        "dimension_cardinality_changed": (
-            "decide whether the new categorical value belongs in the impacted "
-            "metric definitions; a firewalled `explore query` can name it"
         ),
         "dangling_reference": (
             "update the semantic definition with `semantic update`, or restore "

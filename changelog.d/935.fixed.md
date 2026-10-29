@@ -1,0 +1,1 @@
+**`maintain reconcile` provides directional advice for dimension cardinality drift.** Reconcile proposals now distinguish dimension contractions from expansions and note sketch variance when the baseline is approximate, avoiding false claims that a new categorical value appeared.
