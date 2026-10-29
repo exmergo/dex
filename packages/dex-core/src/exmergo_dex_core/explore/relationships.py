@@ -846,6 +846,81 @@ def orphan_findings(
     return findings
 
 
+def missing_column_findings(
+    relationships: list[Relationship],
+    datasets: list[Dataset],
+) -> list[tuple[Relationship, str]]:
+    """A join that names a column its dataset's profile does not have, paired
+    with the finding text a caller needs: the relation, named, plus the column
+    that is missing and the relation it is missing from.
+
+    A probe measures a join with real SQL, so a column that no longer exists
+    cannot be referenced: the statement fails to bind and takes the whole
+    ``--verify`` command down with it (issue #924). Checking the columns
+    against the profiled datasets up front keeps that failure off the wire --
+    the broken edge is reported as a finding instead, it is never marked
+    verified, and everything sound is still measured. Only the joins
+    :func:`probe_candidates` would select are considered, so a finding here
+    always means "this edge would have failed the probe", never "this edge
+    was not probed for another reason".
+
+    A dataset absent from ``datasets`` is skipped, not reported: an unprofiled
+    parent (out of scope this run) may still exist in the warehouse, and only
+    a profiled column set is evidence that a column is really gone.
+
+    Kind-specific wording mirrors :func:`orphan_findings`: a declared join is
+    the project asserting a foreign key the warehouse no longer has, while an
+    inferred one is dex's own name match pointing at a ghost column.
+    """
+
+    by_identifier = {d.identifier.lower(): d for d in datasets}
+    findings: list[tuple[Relationship, str]] = []
+    for rel in relationships:
+        if not rel.from_columns or len(rel.from_columns) != len(rel.to_columns):
+            continue  # never probed, so it cannot fail a probe (issue #924)
+        parts: list[str] = []
+        for dataset_id, columns in (
+            (rel.from_dataset, rel.from_columns),
+            (rel.to_dataset, rel.to_columns),
+        ):
+            dataset = by_identifier.get(dataset_id.lower())
+            if dataset is None:
+                continue
+            known = {c.name.lower() for c in dataset.columns}
+            missing = [c for c in columns if c.lower() not in known]
+            if missing:
+                quoted = ", ".join(f'"{c}"' for c in missing)
+                if len(missing) == 1:
+                    parts.append(f"column {quoted} does not exist on {dataset_id}")
+                else:
+                    parts.append(f"columns {quoted} do not exist on {dataset_id}")
+        if not parts:
+            continue
+        edge = (
+            f"{rel.from_dataset}.{rel.from_columns[0]} -> "
+            f"{rel.to_dataset}.{rel.to_columns[0]}"
+        )
+        description = " and ".join(parts)
+        if rel.kind is RelationshipKind.DECLARED:
+            text = (
+                f"{edge} is declared as a foreign key but {description}; "
+                "the project and the warehouse disagree"
+            )
+        elif rel.kind is RelationshipKind.OVERLAP_INFERRED:
+            text = (
+                f"{edge} was proposed from measured value overlap but "
+                f"{description}; the containment that proposed this edge no "
+                "longer holds"
+            )
+        else:
+            text = (
+                f"{edge} shares a column name but {description}; the shared "
+                "name is not evidence of a shared key"
+            )
+        findings.append((rel, text))
+    return findings
+
+
 def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
     """The joins an overlap probe would measure, declared and inferred alike.
 

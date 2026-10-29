@@ -1057,8 +1057,19 @@ def relationships(
     # joins a cooperative project cares most about. Merging first also means no
     # measurement can be lost to the "declared wins over the same inferred edge"
     # rule: at merge time nothing has been measured yet.
+    # A join that names a column its dataset's profile no longer has can never
+    # be probed: the batch SQL would fail to bind and take the whole command
+    # down (issue #924). Check the columns against the profiled datasets first
+    # so the failure stays off the wire -- the edge becomes a finding (surfaced
+    # below beside orphan findings) and everything sound is still measured. The
+    # estimate and the run share the filtered pool, so the priced set and the
+    # run set stay the same set.
+    missing_column_findings = []
     if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, rels)
+        missing_column_findings = rel_mod.missing_column_findings(rels, datasets)
+        missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
+        verify_pool = [rel for rel in rels if id(rel) not in missing_column_ids]
+        probe_cost, candidates, objects = _verify_estimate(adapter, verify_pool)
         verify_pending = command_args.verify_handshake(
             "explore relationships",
             adapter,
@@ -1067,12 +1078,12 @@ def relationships(
             object_count=objects,
         )
         if verify_pending is None:
-            probed = rel_mod.probe_candidates(rels)
+            probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
                 rel_mod.verify_relationships(
                     adapter,
-                    rels,
+                    verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
                 )
@@ -1185,6 +1196,15 @@ def relationships(
     notes.extend(text for _rel, text in orphan_findings)
     datasets_by_id = {d.identifier: d for d in datasets}
     for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join naming a column the warehouse does not have is the same shape of
+    # drift as a catastrophic orphan rate: surfaced in notes and mirrored onto
+    # the child dataset's data_quality so it survives into the cache (issue
+    # #924). Only `--verify` computes it, because only a probe would fail.
+    notes.extend(text for _rel, text in missing_column_findings)
+    for rel, text in missing_column_findings:
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
@@ -2442,8 +2462,21 @@ def map(
 
     # Verify the merged set: declared joins are probe candidates (issue #163)
     # and only exist from the merge above. Same ordering as `relationships`.
+    # A join naming a column its profile no longer has cannot be probed -- the
+    # batch SQL would fail to bind and take the whole command down (issue
+    # #924) -- so it is checked against the profiled/selected datasets first,
+    # reported as a finding below, and excluded from the verify pool; the
+    # estimate and the run share the filtered pool so they stay the same set.
+    missing_column_findings = []
     if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, relationship_set)
+        missing_column_findings = rel_mod.missing_column_findings(
+            relationship_set, all_selected
+        )
+        missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
+        verify_pool = [
+            rel for rel in relationship_set if id(rel) not in missing_column_ids
+        ]
+        probe_cost, candidates, objects = _verify_estimate(adapter, verify_pool)
         verify_pending = command_args.verify_handshake(
             "explore map",
             adapter,
@@ -2452,12 +2485,12 @@ def map(
             object_count=objects,
         )
         if verify_pending is None:
-            probed = rel_mod.probe_candidates(relationship_set)
+            probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
                 rel_mod.verify_relationships(
                     adapter,
-                    relationship_set,
+                    verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
                 )
@@ -2561,6 +2594,14 @@ def map(
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
+    # A join naming a column the warehouse does not have is the same shape of
+    # drift as a catastrophic orphan rate: surfaced in notes and mirrored onto
+    # the child dataset's data_quality so it survives into the cache (issue
+    # #924). Only `--verify` computes it, because only a probe would fail.
+    for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
 
     # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
     # composed set rather than this run's profiles: the link is derived from the
@@ -2601,6 +2642,7 @@ def map(
         )
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
+    notes.extend(text for _rel, text in missing_column_findings)
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared joins; kept as declared"

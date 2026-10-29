@@ -1604,6 +1604,138 @@ def test_map_verify_also_reports_orphan_findings(tmp_path: Path, capsys):
     assert any("not evidence of a shared key" in n for n in orders.data_quality)
 
 
+def test_missing_column_findings_names_the_relation_and_column():
+    """A declared edge referencing a column its dataset's profile does not
+    have carries a finding naming the relation and the missing column; a
+    sound edge and an edge whose parent was not profiled do not."""
+
+    from exmergo_dex_core.explore.relationships import missing_column_findings
+
+    orders = _ds("db.main.orders", [_col("id"), _col("customer_id")])
+    customers = _ds("db.main.customers", [_col("id")])
+
+    good = _rel(
+        from_dataset="db.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="db.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    broken = _rel(
+        from_dataset="db.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="db.main.customers",
+        to_columns=["region_code"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    unprofiled_parent = _rel(
+        from_dataset="db.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="db.main.archived_orders",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+
+    findings = missing_column_findings(
+        [good, broken, unprofiled_parent], [orders, customers]
+    )
+    assert len(findings) == 1
+    found_rel, text = findings[0]
+    assert found_rel is broken
+    assert "db.main.orders.customer_id -> db.main.customers.region_code" in text
+    assert '"region_code"' in text
+    assert "does not exist on db.main.customers" in text
+    assert "declared as a foreign key" in text
+    assert "the project and the warehouse disagree" in text
+
+
+def test_verify_survives_a_declared_join_naming_a_missing_column(
+    tmp_path: Path, capsys
+):
+    """Issue #924 end to end: one declared join is measurable, the other names
+    a column the warehouse does not have. `--verify` still succeeds: the good
+    edge is verified, the broken one is reported as a finding (relation and
+    missing column named) rather than failing the whole command, and the same
+    text lands in the child dataset's persisted data_quality."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, region_code VARCHAR)"
+    )
+    conn.execute("INSERT INTO orders VALUES (1, 1, 'EU'), (2, 2, 'US'), (3, 1, 'APAC')")
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: customer_id\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('customers')\n"
+        "              field: id\n"
+        "      - name: region_code\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('customers')\n"
+        "              field: region_code\n",
+        encoding="utf-8",
+    )
+
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--verify",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    by_fk = {tuple(r["from_columns"]): r for r in data["relationships"]}
+    good = by_fk[("customer_id",)]
+    assert good["verified"] is True
+    assert good["orphan_fraction"] == 0.0
+    broken = by_fk[("region_code",)]
+    assert broken["kind"] == "declared"
+    assert broken["verified"] is False
+    # A declaration is not demoted: only the verification verdict is withheld.
+    assert broken["confidence"] == 1.0
+
+    notes = " ".join(data["notes"])
+    assert "wh.main.orders.region_code -> wh.main.customers.region_code" in notes
+    assert '"region_code"' in notes
+    assert "does not exist on wh.main.customers" in notes
+    assert "declared as a foreign key" in notes
+    assert "the project and the warehouse disagree" in notes
+    # The probe never ran against the ghost column, so no raw warehouse error
+    # text leaks into the envelope.
+    assert "Binder" not in notes
+    assert "Error" not in notes
+
+    cache = FilesystemStore(repo).load_cache()
+    orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
+    assert any("does not exist on wh.main.customers" in n for n in orders.data_quality)
+
+
 def test_relationships_persists_datasets_and_relationships(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
