@@ -48,7 +48,7 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from ..adapters import normalize_relation
+from ..adapters import fold_identifier, normalize_relation
 from ..project_definitions import (
     DeclaredCompositeKey,
     DeclaredForeignKey,
@@ -139,7 +139,7 @@ def semantic_catalog(
         tokens: list[str] = []
         computed: list[str] = []
         for col in model.columns:
-            gate_column = physical_column(col)
+            gate_column = physical_column(col, connector)
             column = gate_column if relation else None
             if gate_relation and gate_column is None:
                 computed.append(col.name)
@@ -236,7 +236,7 @@ def _metric(
     )
 
 
-def physical_column(col: Any) -> str | None:
+def physical_column(col: Any, connector: str | None = None) -> str | None:
     """The single physical column behind a SLayer column, or ``None``.
 
     The catalog's one rule (:func:`~..semantic_catalog.column_reference`): no
@@ -246,11 +246,16 @@ def physical_column(col: Any) -> str | None:
     are one column is the warehouse's folding rule, and dex cannot tell which the
     author meant.
 
+    A bare identifier is the column the warehouse folded it to, so it is folded
+    the way ``connector`` resolves it (``CUSTOMER_ID`` on Snowflake); a quoted
+    identifier resolves to nothing and is left alone.
+
     A column carrying a ``filter`` keeps its column. Its values are a subset of
     that column's, so the PII gate screening that column screens the right one.
     """
 
-    return column_reference(col.sql, col.name)
+    resolved = column_reference(col.sql, col.name)
+    return fold_identifier(connector, resolved) if resolved else None
 
 
 def _relation(model: Any, connector: str | None) -> tuple[str | None, str | None]:
@@ -430,7 +435,7 @@ def definitions(
     for entry in loaded:
         model = entry.model
         relation = relations.get(model.name)
-        for columns in declared_key_columns(model):
+        for columns in declared_key_columns(model, connector):
             if len(columns) == 1:
                 keys.append(
                     DeclaredKey(
@@ -451,7 +456,9 @@ def definitions(
                     )
                 )
         for join in model.joins:
-            declared, note = declared_relationship(model, join, by_name, relations)
+            declared, note = declared_relationship(
+                model, join, by_name, relations, connector
+            )
             if note:
                 found.append(note)
             if declared is None:
@@ -481,7 +488,7 @@ def definitions(
     )
 
 
-def declared_key_columns(model: Any) -> list[list[str]]:
+def declared_key_columns(model: Any, connector: str | None = None) -> list[list[str]]:
     """Every column combination the model declares unique, as physical columns.
 
     The primary key is one declaration, however many columns it has: a sole
@@ -496,13 +503,13 @@ def declared_key_columns(model: Any) -> list[list[str]]:
     """
 
     declared: list[list[str]] = []
-    primary = [physical_column(c) for c in model.columns if c.primary_key]
+    primary = [physical_column(c, connector) for c in model.columns if c.primary_key]
     if primary and all(primary):
         declared.append([str(c) for c in primary])
     for col in model.columns:
         if not col.unique:
             continue
-        column = physical_column(col)
+        column = physical_column(col, connector)
         if column and [column] not in declared:
             declared.append([column])
     return declared
@@ -513,6 +520,7 @@ def declared_relationship(
     join: Any,
     by_name: dict[str, Any],
     relations: dict[str, str],
+    connector: str | None = None,
 ) -> tuple[DeclaredRelationship | None, str | None]:
     """One SLayer join with every ordered pair, as physical columns.
 
@@ -528,8 +536,8 @@ def declared_relationship(
         return None, None
     pairs: list[tuple[str, str]] = []
     for source_key, target_key in join.join_pairs:
-        frm = _column_named(model, source_key)
-        to = _column_named(target, target_key)
+        frm = _column_named(model, source_key, connector)
+        to = _column_named(target, target_key, connector)
         if frm is None or to is None:
             return None, (
                 f"join {model.name} -> {target.name} keys on a column with no "
@@ -584,6 +592,6 @@ def _cardinality(join: Any) -> str | None:
     return None if value is None else str(getattr(value, "value", value))
 
 
-def _column_named(model: Any, name: str) -> str | None:
+def _column_named(model: Any, name: str, connector: str | None = None) -> str | None:
     col = model.get_column(name)
-    return physical_column(col) if col is not None else None
+    return physical_column(col, connector) if col is not None else None

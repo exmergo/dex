@@ -29,7 +29,7 @@ import re
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from ..adapters import normalize_relation
+from ..adapters import fold_identifier, normalize_relation
 from ..project_definitions import (
     DeclaredCompositeKey,
     DeclaredForeignKey,
@@ -194,7 +194,12 @@ def _dimension(
     # the owning model's `relation` to form an address, so carrying one half of
     # an address that has no other half claims a link that does not exist. That
     # keeps `column` meaning exactly one thing everywhere in the catalog.
-    resolved = column_reference(expression, None) if expression else None
+    #
+    # A bare identifier is the column the warehouse folded it to, so it is
+    # folded the way `connector` resolves it; a quoted identifier resolves to
+    # nothing and is left alone.
+    bare = column_reference(expression, None) if expression else None
+    resolved = fold_identifier(connector, bare) if bare else None
     column = resolved if relation else None
 
     # The note names the *actual* reason a field did not link, and there are
@@ -439,16 +444,16 @@ def definitions(
                 relation = _relation(dataset.get("source"), connector)
                 if relation:
                     relations[qualified] = relation
-                _keys(dataset, qualified, relation, keys, composite)
+                _keys(dataset, qualified, relation, keys, composite, connector)
 
             for rel in model.get("relationships") or []:
-                declaration, note = _join(rel, by_name, relations)
+                declaration, note = _join(rel, by_name, relations, connector)
                 if declaration is not None:
                     joins.append(declaration)
                 if note:
                     found.append(note)
                 relationship, relationship_note = _declared_relationship(
-                    rel, by_name, relations
+                    rel, by_name, relations, connector
                 )
                 if relationship is not None:
                     declared_relationships.append(relationship)
@@ -487,6 +492,7 @@ def _keys(
     relation: str | None,
     keys: list[DeclaredKey],
     composite: list[DeclaredCompositeKey],
+    connector: str | None = None,
 ) -> None:
     """A dataset's key declarations, split by arity.
 
@@ -495,18 +501,22 @@ def _keys(
     The two say very different things: "this combination is unique" is a grain,
     while "each of these is unique on its own" is a much stronger claim that the
     document does not make and that reconcile would act on.
+
+    A declared key names the column the way the author wrote it, so it is folded
+    the way `connector` resolves it, like every other physical column.
     """
 
     for declared in (dataset.get("primary_key"), *(dataset.get("unique_keys") or [])):
         columns = [c for c in (declared or []) if isinstance(c, str) and c]
         if not columns:
             continue
-        if len(columns) == 1:
+        folded = [fold_identifier(connector, c) for c in columns]
+        if len(folded) == 1:
             keys.append(
                 DeclaredKey(
                     model=qualified,
                     relation=relation,
-                    column=columns[0],
+                    column=folded[0],
                     unique=True,
                     source=DECLARATION_SOURCE,
                 )
@@ -516,7 +526,7 @@ def _keys(
                 DeclaredCompositeKey(
                     model=qualified,
                     relation=relation,
-                    columns=columns,
+                    columns=folded,
                     source=DECLARATION_SOURCE,
                 )
             )
@@ -526,6 +536,7 @@ def _join(
     rel: dict[str, Any],
     by_name: dict[str, str],
     relations: dict[str, str],
+    connector: str | None = None,
 ) -> tuple[DeclaredForeignKey | None, str | None]:
     """One relationship as a declared join, or a note saying why not.
 
@@ -560,10 +571,10 @@ def _join(
         DeclaredForeignKey(
             model=child,
             relation=relations.get(child),
-            column=from_columns[0],
+            column=fold_identifier(connector, from_columns[0]),
             to_model=parent,
             to_relation=relations.get(parent),
-            to_column=to_columns[0],
+            to_column=fold_identifier(connector, to_columns[0]),
             source=DECLARATION_SOURCE,
         ),
         None,
@@ -571,7 +582,10 @@ def _join(
 
 
 def _declared_relationship(
-    rel: dict[str, Any], by_name: dict[str, str], relations: dict[str, str]
+    rel: dict[str, Any],
+    by_name: dict[str, str],
+    relations: dict[str, str],
+    connector: str | None = None,
 ) -> tuple[DeclaredRelationship | None, str | None]:
     """Preserve an Ossie relationship's full ordered pairs.
 
@@ -597,7 +611,10 @@ def _declared_relationship(
             relation=relations.get(child),
             to_model=parent,
             to_relation=relations.get(parent),
-            column_pairs=list(zip(from_columns, to_columns, strict=True)),
+            column_pairs=[
+                (fold_identifier(connector, a), fold_identifier(connector, b))
+                for a, b in zip(from_columns, to_columns, strict=True)
+            ],
             source=DECLARATION_SOURCE,
             name=str(name) if name else None,
         ),

@@ -206,6 +206,57 @@ def test_a_source_is_normalized_the_way_the_connector_folds_it(tmp_path: Path):
         assert catalog.semantic_models[0].relation == expected
 
 
+def test_snowflake_columns_keys_and_joins_are_folded_the_way_snowflake_resolves_them(
+    tmp_path: Path,
+):
+    """An unquoted column is the column the warehouse folded it to: reading it
+    as written made every Ossie column look gone from a Snowflake table (#923)."""
+
+    write(
+        tmp_path,
+        "case.ossie.yaml",
+        document(
+            model(
+                "m",
+                dataset(
+                    "orders",
+                    "demo.main.orders",
+                    field("order_id"),
+                    field("nick", '"Nick"'),
+                    primary_key=["order_id"],
+                ),
+                dataset(
+                    "customers",
+                    "demo.main.customers",
+                    field("customer_key"),
+                    primary_key=["customer_key"],
+                ),
+                relationships=[
+                    {
+                        "name": "orders_to_customers",
+                        "from": "orders",
+                        "to": "customers",
+                        "from_columns": ["customer_id"],
+                        "to_columns": ["customer_key"],
+                    }
+                ],
+            )
+        ),
+    )
+
+    layer = build(tmp_path, "case.ossie.yaml", connector="snowflake")
+    rows = {d.name: d for d in layer.semantic_catalog().dimensions}
+    assert rows["orders__order_id"].column == "ORDER_ID"
+    assert rows["orders__nick"].column is None
+
+    declared = layer.declared_definitions()
+    assert {k.column for k in declared.declared_keys} == {"ORDER_ID", "CUSTOMER_KEY"}
+    (join,) = declared.foreign_keys
+    assert (join.column, join.to_column) == ("CUSTOMER_ID", "CUSTOMER_KEY")
+    (relationship,) = declared.declared_relationships
+    assert relationship.column_pairs == [("CUSTOMER_ID", "CUSTOMER_KEY")]
+
+
 # --- dimensions ------------------------------------------------------------
 
 
