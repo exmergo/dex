@@ -38,7 +38,11 @@ def dataset(name: str, source: str, *fields: dict[str, Any], **extra: Any):
 
 
 def document(*models: dict[str, Any], version: str = VERSION) -> dict[str, Any]:
-    return {"version": version, "semantic_model": list(models)}
+    """One Ossie document: one model, flat at the root."""
+
+    if len(models) != 1:
+        raise TypeError("an Ossie document is exactly one semantic model")
+    return {"version": version, **models[0]}
 
 
 def model(name: str, *datasets: dict[str, Any], **extra: Any) -> dict[str, Any]:

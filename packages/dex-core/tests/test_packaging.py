@@ -1434,23 +1434,22 @@ def test_selecting_ossie_without_its_extra_refuses_by_name(wheel: str):
 # import probe cannot see it.
 
 OSSIE_DOCUMENT = """version: "0.2.0.dev0"
-semantic_model:
-  - name: shop
-    datasets:
-      - name: orders
-        source: demo.main.orders
-        primary_key: [order_id]
-        fields:
-          - name: order_id
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_id
-          - name: net_total
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_total - discount
+name: shop
+datasets:
+  - name: orders
+    source: demo.main.orders
+    primary_key: [order_id]
+    fields:
+      - name: order_id
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_id
+      - name: net_total
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_total - discount
 """
 
 OSSIE_CONFIG = """connector: duckdb

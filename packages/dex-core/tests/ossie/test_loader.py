@@ -62,7 +62,7 @@ def test_the_schema_ships_beside_a_provenance_record():
     ).read_text(encoding="utf-8")
 
     assert SCHEMA_SHA256 in provenance
-    assert "b5da5d66f0da4a0cd3388d52201dbf5523221a77" in provenance
+    assert "7a8de20f850dad3934e307a1ac7425b09e9ca89f" in provenance
     assert "Apache License" in provenance
 
 
@@ -77,7 +77,9 @@ def test_a_document_outside_the_repository_is_refused(tmp_path: Path):
     """
 
     outside = tmp_path.parent / "escape.ossie.yaml"
-    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    outside.write_text(
+        "version: '0.2.0.dev0'\nname: outside\ndatasets: []\n", encoding="utf-8"
+    )
 
     result = load(tmp_path, "../escape.ossie.yaml")
 
@@ -89,7 +91,9 @@ def test_a_symlink_leaving_the_repository_is_refused(tmp_path: Path, symlinks: N
     """Confinement is checked on the resolved path, so a symlink cannot cheat."""
 
     outside = tmp_path.parent / "linked.ossie.yaml"
-    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    outside.write_text(
+        "version: '0.2.0.dev0'\nname: outside\ndatasets: []\n", encoding="utf-8"
+    )
     (tmp_path / "inside.ossie.yaml").symlink_to(outside)
 
     assert rules(load(tmp_path, "inside.ossie.yaml")) == ["confinement"]
@@ -155,11 +159,64 @@ def test_a_document_that_is_not_a_mapping_is_refused(tmp_path: Path):
 
 
 def test_a_wrong_version_is_refused_by_name(tmp_path: Path):
-    write(tmp_path, "old.ossie.yaml", document(version="0.1.0"))
+    write(tmp_path, "old.ossie.yaml", document(model("shop"), version="0.1.0"))
 
     result = load(tmp_path, "old.ossie.yaml")
 
     assert "version" in rules(result)
+
+
+def test_a_wrapped_document_is_refused_with_the_migration_named(tmp_path: Path):
+    """The earlier `semantic_model` list is a known shape with a known fix.
+
+    Reported as an unknown key it would send the reader looking for a typo, so it
+    has its own rule, the only one the document gets, and the message carries the
+    migration upstream's specification describes.
+    """
+
+    write(
+        tmp_path,
+        "wrapped.ossie.yaml",
+        {
+            "version": "0.2.0.dev0",
+            "semantic_model": [model("shop", dataset("o", "a.b.c"))],
+        },
+    )
+
+    result = load(tmp_path, "wrapped.ossie.yaml")
+
+    assert rules(result) == ["wrapped_document"]
+    message = result.diagnostics[0].message
+    assert "remove `semantic_model`" in message
+    assert "one document per model" in message
+    assert not result.documents
+
+
+def test_a_key_naming_no_declared_field_is_refused(tmp_path: Path):
+    """Keys name fields (upstream's Name Resolution), never source columns."""
+
+    write(
+        tmp_path,
+        "keys.ossie.yaml",
+        document(
+            model(
+                "shop",
+                dataset(
+                    "orders",
+                    "demo.main.orders",
+                    field("order_id", "o_orderkey"),
+                    primary_key=["o_orderkey"],
+                    unique_keys=[["ORDER_ID"]],
+                ),
+            )
+        ),
+    )
+
+    result = load(tmp_path, "keys.ossie.yaml")
+
+    # The unique key names the field in another case, which upstream accepts.
+    assert rules(result) == ["undeclared_key_field"]
+    assert result.diagnostics[0].path == "datasets -> 0 -> primary_key"
 
 
 def test_an_unknown_structural_key_reports_incompatibility_not_a_cause(
@@ -174,7 +231,7 @@ def test_an_unknown_structural_key_reports_incompatibility_not_a_cause(
     """
 
     doc = reference_document()
-    doc["semantic_model"][0]["datasets"][0]["grain"] = ["order_id"]
+    doc["datasets"][0]["grain"] = ["order_id"]
     write(tmp_path, "future.ossie.yaml", doc)
 
     result = load(tmp_path, "future.ossie.yaml")
@@ -208,25 +265,23 @@ def test_a_nested_malformed_shape_collects_rather_than_raising(tmp_path: Path):
     ("mutate", "rule"),
     [
         (
-            lambda d: d["semantic_model"][0]["datasets"].append(
+            lambda d: d["datasets"].append(
                 dataset("orders", "demo.main.other", field("x"))
             ),
             "duplicate_dataset",
         ),
         (
-            lambda d: d["semantic_model"][0]["datasets"][0]["fields"].append(
-                field("order_id")
-            ),
+            lambda d: d["datasets"][0]["fields"].append(field("order_id")),
             "duplicate_field",
         ),
         (
-            lambda d: d["semantic_model"][0]["metrics"].append(
+            lambda d: d["metrics"].append(
                 {"name": "revenue", "expression": expression(ANSI_SQL="1")}
             ),
             "duplicate_metric",
         ),
         (
-            lambda d: d["semantic_model"][0]["relationships"].append(
+            lambda d: d["relationships"].append(
                 {
                     "name": "orders_to_customers",
                     "from": "orders",
@@ -249,7 +304,7 @@ def test_a_duplicate_name_is_refused_at_each_scope(tmp_path: Path, mutate, rule)
 
 def test_a_relationship_naming_an_undeclared_dataset_is_refused(tmp_path: Path):
     doc = reference_document()
-    doc["semantic_model"][0]["relationships"][0]["to"] = "suppliers"
+    doc["relationships"][0]["to"] = "suppliers"
     write(tmp_path, "dangling.ossie.yaml", doc)
 
     result = load(tmp_path, "dangling.ossie.yaml")
@@ -266,7 +321,7 @@ def test_unequal_key_arity_is_refused(tmp_path: Path):
     """
 
     doc = reference_document()
-    doc["semantic_model"][0]["relationships"][0]["to_columns"] = [
+    doc["relationships"][0]["to_columns"] = [
         "customer_id",
         "country_code",
     ]
@@ -285,7 +340,7 @@ def test_insufficient_target_key_coverage_warns_rather_than_refusing(
     """
 
     doc = reference_document()
-    doc["semantic_model"][0]["relationships"][0]["to_columns"] = ["country_code"]
+    doc["relationships"][0]["to_columns"] = ["country_code"]
     write(tmp_path, "coverage.ossie.yaml", doc)
 
     result = load(tmp_path, "coverage.ossie.yaml")
@@ -298,11 +353,11 @@ def test_target_key_coverage_accepts_a_superset_in_any_order(tmp_path: Path):
     """A superset of a key still guarantees the many-to-one join."""
 
     doc = reference_document()
-    doc["semantic_model"][0]["relationships"][0]["from_columns"] = [
+    doc["relationships"][0]["from_columns"] = [
         "customer_id",
         "region",
     ]
-    doc["semantic_model"][0]["relationships"][0]["to_columns"] = [
+    doc["relationships"][0]["to_columns"] = [
         "country_code",
         "customer_id",
     ]
@@ -315,7 +370,7 @@ def test_a_target_declaring_no_key_is_skipped_rather_than_failed(tmp_path: Path)
     """Absent keys are not evidence of anything: the fields are optional."""
 
     doc = reference_document()
-    del doc["semantic_model"][0]["datasets"][1]["primary_key"]
+    del doc["datasets"][1]["primary_key"]
     write(tmp_path, "keyless.ossie.yaml", doc)
 
     assert "key_coverage" not in rules(load(tmp_path, "keyless.ossie.yaml"))
@@ -346,9 +401,7 @@ def test_one_semantic_model_name_across_the_configured_set(tmp_path: Path):
 
 def test_invalid_sql_is_refused_with_the_dialect_named(tmp_path: Path):
     doc = reference_document()
-    doc["semantic_model"][0]["metrics"][0]["expression"] = expression(
-        ANSI_SQL="SUM(FROM WHERE"
-    )
+    doc["metrics"][0]["expression"] = expression(ANSI_SQL="SUM(FROM WHERE")
     write(tmp_path, "sql.ossie.yaml", doc)
 
     result = load(tmp_path, "sql.ossie.yaml")
@@ -399,9 +452,7 @@ def test_absent_sql_support_is_a_named_skip_and_never_a_pass(
         return real(name, *args, **kwargs)
 
     doc = reference_document()
-    doc["semantic_model"][0]["metrics"][0]["expression"] = expression(
-        ANSI_SQL="SUM(FROM WHERE"
-    )
+    doc["metrics"][0]["expression"] = expression(ANSI_SQL="SUM(FROM WHERE")
     write(tmp_path, "noglot.ossie.yaml", doc)
     monkeypatch.setattr(builtins, "__import__", refuse)
 
@@ -439,7 +490,7 @@ def test_a_diagnostic_names_the_file_and_the_document_path(tmp_path: Path):
     """An error a reader cannot locate is an error they cannot fix."""
 
     doc = reference_document()
-    doc["semantic_model"][0]["datasets"][0]["fields"].append(field("order_id"))
+    doc["datasets"][0]["fields"].append(field("order_id"))
     write(tmp_path, "where.ossie.yaml", doc)
 
     found = next(
@@ -449,5 +500,5 @@ def test_a_diagnostic_names_the_file_and_the_document_path(tmp_path: Path):
     )
 
     assert found.file == "where.ossie.yaml"
-    assert found.path == "semantic_model -> 0 -> datasets -> 0 -> fields"
-    assert found.render().startswith("where.ossie.yaml: semantic_model -> 0")
+    assert found.path == "datasets -> 0 -> fields"
+    assert found.render().startswith("where.ossie.yaml: datasets -> 0")

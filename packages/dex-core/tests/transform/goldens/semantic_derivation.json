@@ -643,9 +643,64 @@
   },
   "vendor_ossie": {
     "semantic_files": {},
-    "semantic_proposal": null,
-    "warnings": [
-      "no semantic model was derived for fct_orders: semantic.vendor is 'ossie', and the ossie layer does not carry declarations yet (it does not implement the derivation hook, SemanticDerivationSource), so the declared population, grain and measures reach no semantic definition"
-    ]
+    "semantic_proposal": {
+      "definitions": {
+        "edits": [
+          {
+            "content": "version: 0.2.0.dev0\nname: fct_orders\ndatasets:\n  - name: fct_orders\n    source: fct_orders\n    primary_key:\n      - order_id\n    description: One row per order.\n    fields:\n      - name: order_id\n        expression:\n          sql: order_id\n      - name: customer_id\n        expression:\n          sql: customer_id\n      - name: status\n        expression:\n          sql: status\n        description: Lifecycle status.\n      - name: ordered_at\n        expression:\n          sql: ordered_at\n        datatype: Date\n        dimension:\n          is_time: true\n      - name: order_total\n        expression:\n          sql: order_total\n        ai_context:\n          dex:\n            additivity: additive\n      - name: balance\n        expression:\n          sql: balance\n        ai_context:\n          dex:\n            additivity: semi_additive\n    metrics:\n      - name: order_total_sum\n        expression:\n          sql: SUM(order_total)\n",
+            "kind": "semantic_document",
+            "path": "semantic/fct_orders.ossie.yaml"
+          }
+        ]
+      },
+      "mode": "proposed",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.additivity"
+          ],
+          "content": "version: 0.2.0.dev0\nname: fct_orders\ndatasets:\n  - name: fct_orders\n    source: fct_orders\n    primary_key:\n      - order_id\n    description: One row per order.\n    fields:\n      - name: order_id\n        expression:\n          sql: order_id\n      - name: customer_id\n        expression:\n          sql: customer_id\n      - name: status\n        expression:\n          sql: status\n        description: Lifecycle status.\n      - name: ordered_at\n        expression:\n          sql: ordered_at\n        datatype: Date\n        dimension:\n          is_time: true\n      - name: order_total\n        expression:\n          sql: order_total\n        ai_context:\n          dex:\n            additivity: additive\n      - name: balance\n        expression:\n          sql: balance\n        ai_context:\n          dex:\n            additivity: semi_additive\n    metrics:\n      - name: order_total_sum\n        expression:\n          sql: SUM(order_total)\n",
+          "dataset": "fct_orders",
+          "limitations": [
+            "source is the bare table name 'fct_orders': no dataset sits on another of this project's models and there is no compiled manifest, so the source is not one relation dex can address, and none of its fields links a physical column. Qualify it before relying on it",
+            "balance: semi_additive, and an Ossie metric has no way to sum across entities but not across time; which expression stands for it is the author's call, so no metric is derived"
+          ],
+          "next": "semantic/fct_orders.ossie.yaml is not under semantic.ossie.files, the documents dex may write: run `dex config set semantic.ossie.files '[semantic/orders.ossie.yaml, semantic/fct_orders.ossie.yaml]'`, then pass data.semantic_proposal.definitions as the edits file to `semantic ossie define`",
+          "not_carried": {
+            "columns.balance.aggregation": "semi_additive, and an Ossie metric has no way to sum across entities but not across time; which expression stands for it is the author's call",
+            "columns.customer_id.references": "the dataset is proposed as a document of its own, and a relationship joins datasets of one model only"
+          },
+          "notes": [
+            "no configured Ossie document could be read to hold it, so it is proposed as a document of its own",
+            "metrics beyond declared measures are not derived: a dataset metric is what a column's declared aggregation states, anything more is a business definition, and that stays the author's"
+          ],
+          "path": "semantic/fct_orders.ossie.yaml",
+          "status": "proposed",
+          "validation": {
+            "catalog": {
+              "result": "passed"
+            },
+            "ossie": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "next": "semantic/fct_orders.ossie.yaml is not under semantic.ossie.files, the documents dex may write: run `dex config set semantic.ossie.files '[semantic/orders.ossie.yaml, semantic/fct_orders.ossie.yaml]'`, then pass data.semantic_proposal.definitions as the edits file to `semantic ossie define`",
+      "notes": [],
+      "vendor": "ossie"
+    },
+    "warnings": []
   }
 }

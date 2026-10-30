@@ -4700,7 +4700,11 @@ def _store_companion(
             derived.vendor,
             f"{intent} (derived {derived.vendor} models)",
             derived.companion,
-            mode="define",
+            # `plan`, not `define`: a layer that keeps several definitions in
+            # one document (Ossie) adds a derived one to a model it already
+            # defines. Each derivation has already refused to overwrite or
+            # rename an authored definition, which is what `define` guards.
+            mode="plan",
         )
     except (DexError, ValueError) as exc:
         for name in included:

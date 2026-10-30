@@ -33,6 +33,7 @@ from exmergo_dex_core.semantic_source import SemanticSourceContext
 FIXTURES = Path(__file__).parent / "fixtures"
 DOCUMENTS = FIXTURES / "documents"
 MANIFEST = FIXTURES / "cases.yaml"
+UPSTREAM = FIXTURES / "upstream"
 
 
 def _manifest() -> dict[str, Any]:
@@ -212,6 +213,68 @@ def test_the_declared_relationships_keep_every_ordered_pair(
     )
 
     assert seen == expected, f"{case['id']}: relationships {seen} != {expected}"
+
+
+@declaring("metrics")
+def test_the_catalog_carries_the_metrics_and_lineage_a_case_declares(
+    case: dict[str, Any], tmp_path: Path
+) -> None:
+    metrics = _source(case, tmp_path).semantic_catalog().metrics
+    seen = {m.name: sorted(m.semantic_models or []) for m in metrics}
+    expected = {name: sorted(lineage) for name, lineage in case["metrics"].items()}
+
+    assert seen == expected, f"{case['id']}: metrics {seen} != {expected}"
+
+
+@declaring("notes_contain")
+def test_the_declarations_channel_says_what_a_case_expects(
+    case: dict[str, Any], tmp_path: Path
+) -> None:
+    """A declaration dex declines to emit is named, never silently absent."""
+
+    notes = " ".join(_source(case, tmp_path).declared_definitions().notes)
+
+    missing = [text for text in case["notes_contain"] if text not in notes]
+    assert not missing, f"{case['id']}: notes lack {missing}: {notes}"
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(str(p.relative_to(UPSTREAM)) for p in UPSTREAM.rglob("*.ossie.yaml")),
+)
+def test_every_upstream_example_at_the_pin_loads_clean(name: str) -> None:
+    """Upstream's own examples and compliance documents, at the pinned commit.
+
+    The pin is only worth something if a document upstream ships as valid is a
+    document dex reads, with nothing to say about it.
+    """
+
+    loaded = load_documents(UPSTREAM, [name], connector="duckdb")
+
+    assert [d.render() for d in loaded.diagnostics if d.severity != "note"] == []
+    assert len(loaded.documents) == 1
+
+
+def test_upstream_renamed_fields_resolve_keys_and_joins_to_columns() -> None:
+    """Upstream's own Name Resolution example, read the way the spec reads it."""
+
+    source = OssieSemanticLayer(
+        UPSTREAM, ["examples/renamed_fields.ossie.yaml"], connector="duckdb"
+    )
+    declared = source.declared_definitions()
+
+    keys = {(k.model, k.column) for k in declared.declared_keys}
+    assert ("renamed_fields.orders", "o_orderkey") in keys
+    assert ("renamed_fields.customers", "c_custkey") in keys
+    pairs = {
+        (r.model, r.to_model, tuple(r.column_pairs))
+        for r in declared.declared_relationships
+    }
+    assert (
+        "renamed_fields.orders",
+        "renamed_fields.customers",
+        (("o_custkey", "c_custkey"),),
+    ) in pairs
 
 
 def test_a_warning_retains_the_document_it_warns_about() -> None:

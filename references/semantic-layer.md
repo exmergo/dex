@@ -671,6 +671,43 @@ before storing the plan. `define` refuses an existing semantic-model name;
 `update` refuses a new one; `plan` accepts and reports both. These commands do
 not remove models or files.
 
+Each document is one semantic model, flat at its root (`version`, `name`,
+`datasets`, `relationships`, `metrics`), as upstream's current schema requires. A
+document in the earlier wrapped shape, a `semantic_model` list of models, is
+refused by its own rule, `wrapped_document`, whose message names the migration:
+move the model's properties to the root, remove `semantic_model`, drop any
+root-level `dialects` and `vendors`, and split a file holding several models into
+one document per model, each listed in `semantic.ossie.files`.
+
+#### Declarations on a dataset
+
+The payload may also carry `declarations`, beside or instead of `edits`. Each
+names a dataset the payload or the layer already defines and is rendered into it
+field by field: the grain becomes `primary_key` on the fields exposing the grain
+columns (refused by name where no field exposes one, since a key names fields),
+descriptions are native, a declared aggregation becomes a dataset-scoped metric
+`<field>_<agg>`, a foreign key becomes a relationship to the parent dataset's
+field, population and assumptions go to the dataset's `ai_context` (the population
+sentence as `instructions`, the declaration under a structured `dex` key), and
+unit, NULL rule and additivity go to the field's `ai_context.dex`. Only that
+dataset's list item is rewritten and a relationship is appended, so every other
+byte of the document is kept; the result passes the same validation as an
+authored document. `custom_extensions` is never written, because its `data` is an
+opaque string and a declaration inside one could not be reviewed in a diff. The
+full mapping is in [Apache Ossie compatibility](ossie-compatibility.md#declarations).
+
+#### Derived from a declared dbt mart
+
+In a repository with a dbt project beside the Ossie layer, `transform plan` (and
+`transform declare`) on a declared mart derives an Ossie dataset for it under
+`data.semantic_proposal`, on the same mapping. It is appended to the configured
+document holding the datasets its foreign keys reference (or the only configured
+document, where it references none) and stored as a plan of its own on the Ossie
+layer, named by `data.semantic_proposal.plan_id`; apply both. Where the parents
+span documents or no document can hold it, it is proposed as a document of its
+own, validated the same way, with the `dex config set semantic.ossie.files` that
+adopts it.
+
 The preservation contract is exact and predictable: Dex does not parse and
 re-serialize accepted content. Apply writes the authored bytes byte-for-byte,
 including comments, quoting, ordering, and whitespace; configured files absent
@@ -787,21 +824,27 @@ that any consumer can execute it.
 
 ### Which expression dex reads
 
-An Ossie field or metric may declare an expression per dialect, and the enum mixes
-SQL with languages that are not SQL. dex partitions it once: `ANSI_SQL`,
-`SNOWFLAKE`, `DATABRICKS` and `BIGQUERY` are read; `MDX`, `TABLEAU` and `MAQL` are
-preserved verbatim, never parsed, and never a source of a physical column claim.
-Upstream's own validator maintains the same partition.
+An Ossie field or metric states a portable top-level `sql` (written in
+`OSSIE_SQL_2026`, the one dialect the specification defines), an expression per
+dialect under `dialects`, or both. `Dialect` is an open string, so any token is
+valid. dex partitions it once: `OSSIE_SQL_2026`, `ANSI_SQL`, `SNOWFLAKE`,
+`DATABRICKS` and `BIGQUERY` are read; every other token (`MDX`, `TABLEAU`,
+`MAQL`, `DAX`, `THOUGHTSPOT`, or one no registry names) is preserved verbatim,
+never parsed, and never a source of a physical column claim. Upstream's own
+validator maintains the same partition.
 
 Selection is deterministic given a document and a connector:
 
 1. the active connector's own Ossie dialect, where it has one;
-2. the portable dialect, `ANSI_SQL`;
-3. the first declared SQL dialect, in the document's own order.
+2. `OSSIE_SQL_2026`, the top-level `sql` first, since upstream makes it
+   authoritative over an `OSSIE_SQL_2026` dialect entry;
+3. `ANSI_SQL`;
+4. the first other declared SQL dialect, in the document's own order.
 
 It never falls through to a non-SQL language. DuckDB, Postgres, Redshift,
-ClickHouse and Trino have no token in Ossie's enum, so they fall to the portable
-dialect, which is correct and is stated here rather than left to be inferred. Every
+ClickHouse and Trino have no Ossie dialect of their own, so they fall to the
+portable forms, which is correct and is stated here rather than left to be
+inferred. Every
 declared dialect is preserved on the element's `vendor_params`, along with the
 datatype, the AI context, and any custom extensions, so nothing the document says
 is dropped and nothing is smuggled into an unrelated field.
@@ -819,7 +862,7 @@ says which of them applies:
 | a computed expression | a column guessed out of an expression makes the PII gate screen the wrong column and report it as evidence |
 | a quoted identifier | an unquoted identifier is folded the way the warehouse folds it while a quoted one is exact, so the two need not name the same column and dex cannot tell which was meant |
 | a query-backed source | Ossie documents a source as `database.schema.table` **or a query** with no portable discriminator, and a query read as a relation would reach the PII gate as physical evidence that does not exist |
-| a field declaring only non-SQL dialects | dex does not read MDX, Tableau or MAQL, so it has nothing to resolve |
+| a field declaring only non-SQL dialects | dex does not read MDX, Tableau, DAX or any other non-SQL token, so it has nothing to resolve |
 
 The relation rule is the connector's own, so the same document links on DuckDB and
 does not on ClickHouse, whose relations are two parts rather than three.
@@ -840,7 +883,10 @@ absence from a field the author left blank:
 - **no metric-to-dataset reference.** Lineage comes only from qualified
   `dataset.field` references that resolve, and **when nothing resolves it is
   empty**: naming every dataset in the semantic model would be the maximal claim
-  dressed as a conservative one.
+  dressed as a conservative one. A dataset-scoped metric (`datasets[].metrics`) is
+  the exception the format itself makes: it belongs to one dataset, is listed as
+  `dataset.metric`, and its lineage is that dataset whenever it names one of the
+  dataset's fields.
 - **no grain vocabulary.** A categorical dimension states `queryable_granularities:
   []`, which is a fact. A time dimension leaves it unset, because Ossie was never
   asked and an empty list there would positively state that no grain is queryable.
@@ -852,7 +898,11 @@ absence from a field the author left blank:
 
 Ossie satisfies none of the project tiers and never becomes the transformation
 project, so this is the only route its declarations have into exploration. An
-Ossie-only repository still contributes all of it:
+Ossie-only repository still contributes all of it. A key and a relationship's
+`from_columns` and `to_columns` name **fields** (upstream's Name Resolution), so
+each member reaches the warehouse through its field's own physical link; a key or
+relationship any of whose fields links no column is opaque as a whole, named in a
+note, and never verified or probed:
 
 - a single-column `primary_key` or `unique_keys` entry becomes a declared unique
   key;

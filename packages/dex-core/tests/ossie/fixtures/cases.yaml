@@ -30,8 +30,8 @@
 schema:
   # Pinned here as well as in the loader and PROVENANCE.md, so a hash bumped in
   # one place and not the others fails rather than drifting quietly.
-  sha256: 27aab111647b1e8d2229a2413e4682e459f43edc62e0eaadd497317754089e42
-  upstream_commit: b5da5d66f0da4a0cd3388d52201dbf5523221a77
+  sha256: 2cf11e3c555b767b2612a4e479545e55485d81af62c3bf465a03f33a861aae4c
+  upstream_commit: 7a8de20f850dad3934e307a1ac7425b09e9ca89f
   declared_version: 0.2.0.dev0
 
 cases:
@@ -129,7 +129,7 @@ cases:
     documents: [unequal_arity.ossie.yaml]
     connector: duckdb
     diagnostics:
-      - {rule: key_arity, severity: error, origin: dex}
+      - {rule: key_arity, severity: error, origin: integrity}
 
   - id: target_key_coverage_warns
     documents: [weak_target_key.ossie.yaml]
@@ -173,12 +173,41 @@ cases:
     physical_columns:
       orders__mixed: [demo.main.orders, order_id]
 
-  - id: post_pin_thoughtspot_is_refused
-    documents: [post_pin_dialect.ossie.yaml]
+  # Was `post_pin_thoughtspot_is_refused` under the b5da5d6 pin, whose closed
+  # enum had no THOUGHTSPOT. `Dialect` is an open string now.
+  - id: opaque_dialects_are_metadata
+    documents: [opaque_dialects.ossie.yaml]
     connector: duckdb
     diagnostics:
-      - {rule: enum, severity: error, origin: schema}
+      - {rule: non_sql_dialect, severity: note, origin: dex}
+    semantic_models: [opaque.orders]
+    physical_columns:
+      orders__status: [demo.main.orders, status]
+
+  - id: wrapped_document_refused
+    documents: [wrapped.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: wrapped_document, severity: error, origin: dex}
     semantic_models: []
+
+  - id: ossie_sql_2026_top_level_sql_links
+    documents: [top_level_sql.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    physical_columns:
+      orders__order_id: [demo.main.orders, order_id]
+      orders__amount: [demo.main.orders, order_total]
+      orders__status: [demo.main.orders, status]
+
+  - id: dataset_metrics_read
+    documents: [dataset_metrics.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    metrics:
+      orders.total_net_amount: [sales.orders]
+      orders.order_count: [sales.orders]
+      revenue: [sales.orders]
 
   - id: physical_linkage_is_direct_only
     documents: [linkage.ossie.yaml]
@@ -207,6 +236,39 @@ cases:
       - model: grain.allocations
         to_model: grain.orders
         pairs: [[order_id, order_id]]
+
+  - id: renamed_field_keys
+    documents: [renamed_fields.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    # Keys and relationship columns name fields; each resolves to the column
+    # its field exposes, which is what a probe reads.
+    single_keys:
+      - {model: renamed.orders, column: o_orderkey}
+      - {model: renamed.customers, column: c_custkey}
+    relationships:
+      - model: renamed.orders
+        to_model: renamed.customers
+        pairs: [[o_custkey, c_custkey]]
+
+  - id: computed_field_key_is_opaque
+    documents: [computed_key.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    single_keys: []
+    composite_keys: []
+    relationships: []
+    notes_contain:
+      - "declares a primary key on order_ref, and order_ref links no physical column"
+      - "relationship 'orders_to_customers' joins on customers.customer_key"
+
+  - id: key_names_source_column_refused
+    documents: [key_names_column.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: undeclared_key_field, severity: error, origin: integrity}
+      - {rule: undeclared_relationship_field, severity: error, origin: integrity}
+    semantic_models: []
 
   - id: adversarial_composite
     documents: [adversarial_composite.ossie.yaml]

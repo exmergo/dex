@@ -56,202 +56,201 @@ would be.
 
 ```yaml
 version: "0.2.0.dev0"
-semantic_model:
-  - name: commerce
-    description: Orders, the customers who place them, and the products they buy.
-    ai_context:
-      instructions: >-
-        Revenue is gross and excludes returns. Do not present it as net.
-      synonyms: [sales, retail]
-    datasets:
-      - name: orders
-        source: dex_demo.main.orders
-        description: One row per placed order.
-        primary_key: [order_id]
-        fields:
-          - name: order_id
-            datatype: Integer
-            label: Order ID
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_id
-          - name: customer_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: customer_id
-          - name: status
-            datatype: String
-            description: Order lifecycle state.
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: status
-                - dialect: SNOWFLAKE
-                  expression: status
-                - dialect: MDX
-                  expression: "[Order].[Status]"
-          - name: order_total_eur
-            datatype: Decimal
-            description: Order total converted at a fixed rate.
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_total * 0.92
-          - name: quoted_status
-            datatype: String
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: '"status"'
-
-      - name: customers
-        source: dex_demo.main.customers
-        description: One row per registered customer.
-        primary_key: [customer_id]
-        ai_context: Contains personal data; treat email and full_name carefully.
-        fields:
-          - name: customer_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: customer_id
-          - name: email
-            datatype: String
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: email
-          - name: country_code
-            datatype: String
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: country_code
-          - name: signup_date
-            datatype: Date
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: signup_date
-
-      - name: order_items
-        source: dex_demo.main.order_items
-        description: One row per line on an order.
-        primary_key: [order_id, product_id]
-        fields:
-          - name: order_item_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_item_id
-          - name: order_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_id
-          - name: product_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: product_id
-          - name: quantity
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: quantity
-
-      - name: returns
-        source: dex_demo.main.returns
-        description: One row per returned order line.
-        primary_key: [return_id]
-        fields:
-          - name: return_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: return_id
-          - name: order_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_id
-
-      - name: web_events
-        source: dex_demo.main.web_events
-        description: One row per page view.
-        fields:
-          - name: customer_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: customer_id
-          - name: page_path
-            datatype: String
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: page_path
-
-      - name: recent_orders
-        source: "SELECT * FROM dex_demo.main.orders WHERE status = 'paid'"
-        description: A rolling window, expressed as a query rather than a table.
-        fields:
-          - name: order_id
-            datatype: Integer
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_id
-
-    relationships:
-      - name: orders_to_customers
-        from: orders
-        to: customers
-        from_columns: [customer_id]
-        to_columns: [customer_id]
-      - name: web_events_to_customers
-        from: web_events
-        to: customers
-        from_columns: [customer_id]
-        to_columns: [customer_id]
-      - name: returns_to_order_items
-        from: returns
-        to: order_items
-        from_columns: [order_id, return_id]
-        to_columns: [order_id, order_item_id]
-
-    metrics:
-      - name: revenue
-        datatype: Decimal
-        description: Sum of gross order totals.
-        ai_context:
-          instructions: Gross of returns. Pair with order_count for an average.
-        expression:
-          dialects:
-            - dialect: ANSI_SQL
-              expression: SUM(orders.order_total_eur)
-            - dialect: SNOWFLAKE
-              expression: SUM(orders.order_total_eur)::NUMBER(38,2)
-            - dialect: MAQL
-              expression: "SELECT SUM({fact/order_total})"
-      - name: order_count
+name: commerce
+description: Orders, the customers who place them, and the products they buy.
+ai_context:
+  instructions: >-
+    Revenue is gross and excludes returns. Do not present it as net.
+  synonyms: [sales, retail]
+datasets:
+  - name: orders
+    source: dex_demo.main.orders
+    description: One row per placed order.
+    primary_key: [order_id]
+    fields:
+      - name: order_id
         datatype: Integer
-        description: How many orders were placed.
+        label: Order ID
         expression:
           dialects:
             - dialect: ANSI_SQL
-              expression: COUNT(*)
+              expression: order_id
+      - name: customer_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: customer_id
+      - name: status
+        datatype: String
+        description: Order lifecycle state.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: status
+            - dialect: SNOWFLAKE
+              expression: status
+            - dialect: MDX
+              expression: "[Order].[Status]"
+      - name: order_total_eur
+        datatype: Decimal
+        description: Order total converted at a fixed rate.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_total * 0.92
+      - name: quoted_status
+        datatype: String
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: '"status"'
+
+  - name: customers
+    source: dex_demo.main.customers
+    description: One row per registered customer.
+    primary_key: [customer_id]
+    ai_context: Contains personal data; treat email and full_name carefully.
+    fields:
+      - name: customer_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: customer_id
+      - name: email
+        datatype: String
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: email
+      - name: country_code
+        datatype: String
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: country_code
+      - name: signup_date
+        datatype: Date
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: signup_date
+
+  - name: order_items
+    source: dex_demo.main.order_items
+    description: One row per line on an order.
+    primary_key: [order_id, product_id]
+    fields:
+      - name: order_item_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_item_id
+      - name: order_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_id
+      - name: product_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: product_id
+      - name: quantity
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: quantity
+
+  - name: returns
+    source: dex_demo.main.returns
+    description: One row per returned order line.
+    primary_key: [return_id]
+    fields:
+      - name: return_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: return_id
+      - name: order_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_id
+
+  - name: web_events
+    source: dex_demo.main.web_events
+    description: One row per page view.
+    fields:
+      - name: customer_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: customer_id
+      - name: page_path
+        datatype: String
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: page_path
+
+  - name: recent_orders
+    source: "SELECT * FROM dex_demo.main.orders WHERE status = 'paid'"
+    description: A rolling window, expressed as a query rather than a table.
+    fields:
+      - name: order_id
+        datatype: Integer
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_id
+
+relationships:
+  - name: orders_to_customers
+    from: orders
+    to: customers
+    from_columns: [customer_id]
+    to_columns: [customer_id]
+  - name: web_events_to_customers
+    from: web_events
+    to: customers
+    from_columns: [customer_id]
+    to_columns: [customer_id]
+  - name: returns_to_order_items
+    from: returns
+    to: order_items
+    from_columns: [order_id, return_id]
+    to_columns: [order_id, order_item_id]
+
+metrics:
+  - name: revenue
+    datatype: Decimal
+    description: Sum of gross order totals.
+    ai_context:
+      instructions: Gross of returns. Pair with order_count for an average.
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: SUM(orders.order_total_eur)
+        - dialect: SNOWFLAKE
+          expression: SUM(orders.order_total_eur)::NUMBER(38,2)
+        - dialect: MAQL
+          expression: "SELECT SUM({fact/order_total})"
+  - name: order_count
+    datatype: Integer
+    description: How many orders were placed.
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: COUNT(*)
 ```
 
 What each part is there to demonstrate:
@@ -266,6 +265,16 @@ What each part is there to demonstrate:
 | `returns_to_order_items` | a composite relationship, two ordered column pairs |
 | `web_events_to_customers` | a declaration the warehouse will contradict |
 | `revenue` and `order_count` | metric lineage that resolves, and lineage that does not |
+
+The document is one semantic model, flat at its root: `version`, `name`, then the
+model's own `datasets`, `relationships` and `metrics`. A configured file holds one
+such document; a layer of several models is several files. The keys and the
+relationships' `from_columns` and `to_columns` name **fields** of their datasets,
+not warehouse columns: here every field is named after the column it exposes, so
+the two read the same, but a field `customer_ref` defined as `customer_id` would be
+named `customer_ref` in a key and still reach the column `customer_id` when dex
+verifies it. An expression may also be written as a top-level `sql:` (Ossie's
+portable `OSSIE_SQL_2026`) instead of, or beside, its `dialects`.
 
 ## 3. Configuring it
 

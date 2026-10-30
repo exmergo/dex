@@ -6,8 +6,10 @@ snapshots, or writeback, and this class implements none of the project tiers.
 What it implements is the two source capabilities in :mod:`..semantic_source`,
 :class:`~..semantic_source.SemanticCatalogSource` for the read catalog and
 :class:`~..semantic_source.SemanticSnapshotSource` for the drift fingerprint
-``maintain snapshot`` and ``maintain check`` compare against, plus
-:class:`~..edits.SemanticEditTarget` for authoring.
+``maintain snapshot`` and ``maintain check`` compare against,
+:class:`~..edits.SemanticEditTarget` for authoring, and
+:class:`~..semantic_source.SemanticDerivationSource` for carrying model
+declarations into the layer.
 
 Ossie is configured through ``semantic.vendor: ossie`` and
 ``semantic.ossie.files``, whether or not the repository also has a dbt project.
@@ -227,6 +229,21 @@ class OssieSemanticLayer:
             notes=notes,
             warnings=warnings,
         )
+
+    # --- the derivation channel (#927, #500) ---------------------------------
+
+    def derive_semantic(self, request: Any) -> Any:
+        """Declared marts as Ossie datasets; see :mod:`.derivation`.
+
+        Reads only the request and the configured documents, and validates with
+        the checks authoring runs, so no warehouse connection is opened.
+        """
+
+        from .derivation import derive
+        from .loader import ensure_available
+
+        ensure_available()
+        return derive(self, request)
 
     def _load(self) -> LoadResult:
         if self._loaded is None:

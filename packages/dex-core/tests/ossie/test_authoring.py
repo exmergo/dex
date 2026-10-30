@@ -474,7 +474,7 @@ def test_relation_absent_from_a_complete_cached_namespace_refuses_the_plan(
                     ),
                 )
             ),
-            "primary_key names column 'missing_key'",
+            "declares a key on 'missing_key', which is not a declared field",
         ),
         (
             document(
@@ -502,10 +502,25 @@ def test_relation_absent_from_a_complete_cached_namespace_refuses_the_plan(
                     ],
                 )
             ),
-            "relationship 'orders_to_customers' from_columns names column 'missing_fk'",
+            "names 'missing_fk' in `from_columns`, which is not a declared field",
+        ),
+        (
+            # A key names a field; the field's column is what the cache refutes.
+            document(
+                model(
+                    "commerce",
+                    dataset(
+                        "orders",
+                        "demo.main.orders",
+                        field("order_key", "missing_column"),
+                        primary_key=["order_key"],
+                    ),
+                )
+            ),
+            "field 'order_key' names column 'missing_column'",
         ),
     ],
-    ids=["field", "key", "relationship-endpoint"],
+    ids=["field", "key", "relationship-endpoint", "key-through-renamed-field"],
 )
 def test_columns_known_missing_from_cached_profiles_refuse_the_plan(
     tmp_path: Path, capsys, authored, expected

@@ -47,8 +47,8 @@ jobs:
       # does not override it, so a plain checkout rewrites every text file
       # with CRLF. Three tests hash the bundled Ossie schema's bytes and the
       # loader records that hash as provenance, so a CRLF checkout reads as
-      # "the bundled schema moved" (its sha256 becomes bea4565d... instead of
-      # the recorded 27aab111...). The wheel ships LF, so the job checks out
+      # "the bundled schema moved" (its sha256 becomes 70aec8d9... instead of
+      # the recorded 2cf11e3c...). The wheel ships LF, so the job checks out
       # what the wheel ships. Before checkout, because that is when the
       # conversion happens.
       - name: Check out with the bytes the repository holds

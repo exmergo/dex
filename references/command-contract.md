@@ -508,13 +508,19 @@ beside the configured files (`primary_key` on the grain dimensions, other roles 
 dimensions, declared aggregations as measures named after the column,
 `many_to_one` joins from foreign keys), validated by `semantic cube`'s own checks
 and read back through its catalog, and included or proposed on the same terms
-against `semantic.cube.files`. Under `ossie`, whose layer does not implement the
-hook yet, nothing is derived and a warning says so. In every layer a population is carried
-as metadata (`config.meta.dex` or `meta.dex`, and one sentence in the description)
+against `semantic.cube.files`. Under `ossie` it is a dataset (a field per declared
+column, `primary_key` on every grain field, declared aggregations as dataset-scoped
+metrics `<column>_<agg>`, a relationship from each foreign key to the parent's
+field) appended to the configured document holding the datasets its foreign keys
+reference, every other byte kept, and stored as a second plan (`plan_id`); where
+no configured document can hold it, it is proposed as a document of its own. In
+every layer a population is carried as metadata (`config.meta.dex`, `meta.dex`, or
+Ossie's `ai_context`, and one sentence in the description)
 and never as a filter, since the mart's SQL already enforces it; per model,
 `carried` and `not_carried` account for every declared field.
-`semantic slayer define|update|plan` and `semantic cube define|update|plan` take
-`declarations` too, annotating a model or cube the payload or the layer defines; `semantic ossie` refuses them by name. A command that takes no declarations refuses a payload
+`semantic slayer define|update|plan`, `semantic cube define|update|plan` and
+`semantic ossie define|update|plan` take `declarations` too, annotating a model,
+cube or dataset the payload or the layer defines. A command that takes no declarations refuses a payload
 carrying them rather than dropping them. `transform declare [<model>...]` takes the
 same payload for models that already exist: it proposes only the measured facts
 each selected model does not yet declare, lays the supplied `declarations` over
@@ -1165,7 +1171,9 @@ default, or a filter or operator after it is refused. A key naming a location
   Its namespace guard is the semantic-model namespace across every configured
   document: `define` rejects existing names, `update` rejects missing names,
   and `plan` reports a mixed change under `defined` and `updated`. Each edit is
-  a complete configured `.ossie.yaml`, `.ossie.yml`, or `.ossie.json` document;
+  a complete configured `.ossie.yaml`, `.ossie.yml`, or `.ossie.json` document,
+  one semantic model flat at its root (the earlier wrapped `semantic_model` list
+  is refused with the migration named);
   Dex overlays all edits in memory and validates the prospective configured set
   before storing anything. It writes the accepted content byte-for-byte, with
   no YAML/JSON reformatting, and never changes a configured document absent from
@@ -1274,7 +1282,11 @@ way" would be a claim about the layer where the truth is that this backend was
 never told. The documents are named in `semantic.ossie.files`, including for an
 Ossie-only repository. They are confined to the repository, and selecting Ossie
 without the `[ossie]` extra refuses and names it. dex pins the Ossie schema by
-content hash rather than by the version string the document carries. See
+content hash rather than by the version string the document carries, and records
+that hash as the layer's `format_version` in a snapshot, so a moved pin is one
+`semantic_format_changed` finding rather than a layer of changed definitions. Keys
+and relationship columns name fields and reach the warehouse through each
+field's expression. A dataset-scoped metric is listed as `dataset.metric`. See
 `references/semantic-layer.md`, and `references/ossie-compatibility.md` for what
 dex accepts, checks, links, and declines to claim under that pin.
 

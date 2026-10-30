@@ -7772,30 +7772,29 @@ def _ossie_repo(root, document_text: str) -> None:
 
 _OSSIE_DOCUMENT = """
 version: "0.2.0.dev0"
-semantic_model:
-  - name: people
-    datasets:
-      - name: customers
-        source: demo.main.customers
-        fields:
-          - name: email
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: email
-          - name: masked_email
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: "LOWER(email)"
-      - name: leaked
-        source: "SELECT email FROM demo.main.customers"
-        fields:
-          - name: email
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: email
+name: people
+datasets:
+  - name: customers
+    source: demo.main.customers
+    fields:
+      - name: email
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: email
+      - name: masked_email
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "LOWER(email)"
+  - name: leaked
+    source: "SELECT email FROM demo.main.customers"
+    fields:
+      - name: email
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: email
 """
 
 
@@ -7990,7 +7989,9 @@ def test_ossie_reads_are_confined_to_the_repository(tmp_path):
     from exmergo_dex_core.ossie import OssieSemanticLayer
 
     outside = tmp_path.parent / "escape.ossie.yaml"
-    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    outside.write_text(
+        "version: '0.2.0.dev0'\nname: outside\ndatasets: []\n", encoding="utf-8"
+    )
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -8049,34 +8050,33 @@ def _ossie_billed_repo(root, *, session_ceiling: float | None = None) -> None:
     (root / "billed.ossie.yaml").write_text(
         """
 version: "0.2.0.dev0"
-semantic_model:
-  - name: shop
-    datasets:
-      - name: orders
-        source: test-proj.shop.customers
-        primary_key: [id]
-        fields:
-          - name: id
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: id}]
-      - name: events
-        source: test-proj.shop.events
-        primary_key: [id]
-        fields:
-          - name: id
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: id}]
-    relationships:
-      - name: events_to_orders
-        from: events
-        to: orders
-        from_columns: [id]
-        to_columns: [id]
-      - name: orders_to_orders
-        from: orders
-        to: orders
-        from_columns: [id]
-        to_columns: [id]
+name: shop
+datasets:
+  - name: orders
+    source: test-proj.shop.customers
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: id}]
+  - name: events
+    source: test-proj.shop.events
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: id}]
+relationships:
+  - name: events_to_orders
+    from: events
+    to: orders
+    from_columns: [id]
+    to_columns: [id]
+  - name: orders_to_orders
+    from: orders
+    to: orders
+    from_columns: [id]
+    to_columns: [id]
 """,
         encoding="utf-8",
     )
@@ -8250,7 +8250,9 @@ def test_a_post_plan_symlink_cannot_move_an_ossie_write_out_of_the_repository(
 
     _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
     outside = tmp_path.parent / "escaped.ossie.yaml"
-    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    outside.write_text(
+        "version: '0.2.0.dev0'\nname: outside\ndatasets: []\n", encoding="utf-8"
+    )
     before = outside.read_bytes()
 
     edits = tmp_path / "symlink-edits.json"

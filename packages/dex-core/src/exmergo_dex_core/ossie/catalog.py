@@ -8,6 +8,14 @@ project two different questions and the answers are shaped differently:
 - :func:`definitions` builds the declarations channel, which carries
   declared keys and joins and nothing else.
 
+**Names resolve the way upstream's Name Resolution says.** A field's expression
+names a column of its dataset's source; a key, a relationship's `from_columns`
+and `to_columns`, and a metric name **fields**. So a key or a join reaches the
+warehouse only through the field it names: that field's expression, linked to a
+physical column by the same rule every field follows (a bare identifier on an
+addressable source). A key or relationship with any member that links no column
+is opaque as a whole and named in a note, never probed on a partial tuple.
+
 **The rule running through both is that dex claims less than it could.** Ossie
 is an interchange format for a specification still under revision, and every
 place the document is silent is a place where a plausible inference would be
@@ -48,7 +56,7 @@ from ..semantic_catalog import (
 from .dialects import select_expression
 from .loader import LoadedDocument
 
-__all__ = ["DECLARATION_SOURCE", "definitions", "semantic_catalog"]
+__all__ = ["DECLARATION_SOURCE", "definitions", "field_columns", "semantic_catalog"]
 
 #: What `ProjectDefinitions` records as the channel a declaration came from.
 #: One value, because Ossie states its declarations in one place, unlike dbt
@@ -71,6 +79,11 @@ _IDENTIFIER_PAIR = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9
 # and dex cannot tell which the author meant.
 _QUOTED = re.compile(r"""["`\[].*""")
 
+# A bare identifier token, for a dataset metric's unqualified field references.
+# Matched against declared field names only, so a function name or keyword the
+# scan also finds resolves to nothing.
+_BARE_IDENTIFIER = re.compile(r"(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)(?![\w.])")
+
 
 def semantic_catalog(
     documents: Sequence[LoadedDocument],
@@ -87,55 +100,70 @@ def semantic_catalog(
     found: list[str] = list(notes)
 
     for document in documents:
-        for model in document.data.get("semantic_model") or []:
-            model_name = model.get("name")
-            datasets = model.get("datasets") or []
-            declared_fields: dict[str, set[str]] = {}
+        # One document is one semantic model, flat at its root.
+        model = document.data
+        model_name = model.get("name")
+        datasets = model.get("datasets") or []
+        declared_fields: dict[str, set[str]] = {}
+        dataset_metrics: list[tuple[str, str, dict[str, Any]]] = []
 
-            for dataset in datasets:
-                dataset_name = dataset.get("name")
-                # Namespaced by the containing semantic model, so two documents
-                # may each declare an ordinary `orders` without colliding. This
-                # is also why one semantic-model name across the configured set
-                # is a loader-level error.
-                qualified = f"{model_name}.{dataset_name}"
-                source = dataset.get("source")
-                relation = _relation(source, connector)
-                if relation is None:
-                    found.append(
-                        f"dataset '{qualified}' has a source dex cannot read as "
-                        f"one relation on {connector or 'this connector'}, so it "
-                        "carries no physical link. Ossie documents a source as a "
-                        "table reference or a query without a portable way to "
-                        "tell them apart, and a query read as a relation would "
-                        "reach the PII gate as false evidence"
-                    )
-                models.append(
-                    SemanticModelInfo(
-                        name=qualified,
-                        label=dataset_name,
-                        description=dataset.get("description"),
-                        relation=relation,
-                    )
+        for dataset in datasets:
+            dataset_name = dataset.get("name")
+            # Namespaced by the containing semantic model, so two documents
+            # may each declare an ordinary `orders` without colliding. This
+            # is also why one semantic-model name across the configured set
+            # is a loader-level error.
+            qualified = f"{model_name}.{dataset_name}"
+            source = dataset.get("source")
+            relation = _relation(source, connector)
+            if relation is None:
+                found.append(
+                    f"dataset '{qualified}' has a source dex cannot read as "
+                    f"one relation on {connector or 'this connector'}, so it "
+                    "carries no physical link. Ossie documents a source as a "
+                    "table reference or a query without a portable way to "
+                    "tell them apart, and a query read as a relation would "
+                    "reach the PII gate as false evidence"
                 )
-                names: set[str] = set()
-                for field_ in dataset.get("fields") or []:
-                    dimension, note = _dimension(
-                        field_, dataset_name, qualified, connector, relation
-                    )
-                    dimensions.append(dimension)
-                    names.add(dimension.definition or "")
-                    if note:
-                        found.append(note)
-                    if dimension.column and relation:
-                        physical[dimension.name] = (relation, dimension.column)
-                declared_fields[str(dataset_name)] = names
-
-            for metric in model.get("metrics") or []:
-                info, note = _metric(metric, model_name, declared_fields, connector)
-                metrics.append(info)
+            models.append(
+                SemanticModelInfo(
+                    name=qualified,
+                    label=dataset_name,
+                    description=dataset.get("description"),
+                    relation=relation,
+                )
+            )
+            names: set[str] = set()
+            for field_ in dataset.get("fields") or []:
+                dimension, note = _dimension(
+                    field_, dataset_name, qualified, connector, relation
+                )
+                dimensions.append(dimension)
+                names.add(dimension.definition or "")
                 if note:
                     found.append(note)
+                if dimension.column and relation:
+                    physical[dimension.name] = (relation, dimension.column)
+            declared_fields[str(dataset_name)] = names
+            dataset_metrics.extend(
+                (str(dataset_name), qualified, metric)
+                for metric in dataset.get("metrics") or []
+                if isinstance(metric, dict)
+            )
+
+        for dataset_name, qualified, metric in dataset_metrics:
+            info, note = _dataset_metric(
+                metric, dataset_name, qualified, declared_fields, connector
+            )
+            metrics.append(info)
+            if note:
+                found.append(note)
+
+        for metric in model.get("metrics") or []:
+            info, note = _metric(metric, model_name, declared_fields, connector)
+            metrics.append(info)
+            if note:
+                found.append(note)
 
     return SemanticCatalogView(
         semantic_models=models,
@@ -181,9 +209,7 @@ def _dimension(
     """
 
     field_name = str(field_.get("name"))
-    expression, dialect, declared = select_expression(
-        field_.get("expression"), connector
-    )
+    expression, dialect, declared, resolved, column = _link(field_, connector, relation)
     # `column_reference` resolves a bare identifier and refuses an expression.
     # Ossie always requires an expression, so its "no expression means the
     # element's own name" branch is unreachable here and a field is linked only
@@ -197,10 +223,8 @@ def _dimension(
     #
     # A bare identifier is the column the warehouse folded it to, so it is
     # folded the way `connector` resolves it; a quoted identifier resolves to
-    # nothing and is left alone.
-    bare = column_reference(expression, None) if expression else None
-    resolved = fold_identifier(connector, bare) if bare else None
-    column = resolved if relation else None
+    # nothing and is left alone. :func:`_link` is that rule, shared with keys
+    # and relationships, which reach a column only through a field.
 
     # The note names the *actual* reason a field did not link, and there are
     # three different ones. Misattributing them is worse than saying nothing: a
@@ -243,6 +267,57 @@ def _dimension(
         ),
         note,
     )
+
+
+def _link(
+    field_: dict[str, Any], connector: str | None, relation: str | None
+) -> tuple[str | None, str | None, dict[str, str], str | None, str | None]:
+    """A field's selected expression and the physical column it links to.
+
+    Returns ``(expression, dialect, declared, resolved, column)``: ``resolved``
+    is the folded bare identifier, ``column`` the same only where the dataset's
+    source is an addressable relation.
+    """
+
+    expression, dialect, declared = select_expression(
+        field_.get("expression"), connector
+    )
+    bare = column_reference(expression, None) if expression else None
+    resolved = fold_identifier(connector, bare) if bare else None
+    return expression, dialect, declared, resolved, (resolved if relation else None)
+
+
+def field_columns(
+    dataset: dict[str, Any], names: Sequence[Any], connector: str | None = None
+) -> list[tuple[str, str | None]]:
+    """Each name as ``(field, physical column or None)``, per Name Resolution.
+
+    A key or relationship member names a field of the dataset, compared
+    case-insensitively as upstream compares it, and reaches the warehouse only
+    through that field's own link. A name that is no declared field (which the
+    loader refuses) and a field that links no column both resolve to ``None``.
+    """
+
+    relation = _relation(dataset.get("source"), connector)
+    by_name = {
+        f["name"].casefold(): f
+        for f in dataset.get("fields") or []
+        if isinstance(f, dict) and isinstance(f.get("name"), str)
+    }
+    resolved: list[tuple[str, str | None]] = []
+    for name in names:
+        if not isinstance(name, str) or not name:
+            continue
+        field_ = by_name.get(name.casefold())
+        if field_ is None:
+            resolved.append((name, None))
+            continue
+        resolved.append((str(field_["name"]), _link(field_, connector, relation)[4]))
+    return resolved
+
+
+def _opaque(fields: Sequence[tuple[str, str | None]]) -> list[str]:
+    return [name for name, column in fields if column is None]
 
 
 def _linkage_note(
@@ -353,6 +428,56 @@ def _metric(
     )
 
 
+def _dataset_metric(
+    metric: dict[str, Any],
+    dataset_name: str,
+    qualified: str,
+    declared_fields: dict[str, set[str]],
+    connector: str | None,
+) -> tuple[MetricInfo, str | None]:
+    """A dataset-scoped metric (`datasets[].metrics`), named `dataset.metric`.
+
+    Upstream's Metric Scoping: it aggregates its own dataset's declared fields,
+    written unqualified, so its lineage is that one dataset whenever any bare
+    identifier in it names one of those fields. As conservative as a model
+    metric: an expression naming none of them carries no lineage and says so.
+    The integrity rules upstream adds for these (a shared field and metric
+    namespace, no reference to another dataset) are not checked here yet.
+    """
+
+    name = f"{dataset_name}.{metric.get('name')}"
+    expression, dialect, declared = select_expression(
+        metric.get("expression"), connector
+    )
+    fields = {f.casefold() for f in declared_fields.get(dataset_name, ())}
+    named = {token.casefold() for token in _BARE_IDENTIFIER.findall(expression or "")}
+    lineage = [qualified] if named & fields else []
+    note = None
+    if expression and not lineage:
+        note = (
+            f"dataset metric '{name}' names no declared field of dataset "
+            f"'{dataset_name}', so its lineage is empty"
+        )
+    return (
+        MetricInfo(
+            name=name,
+            type="expression",
+            description=metric.get("description"),
+            dimensions=[],
+            semantic_models=lineage or None,
+            vendor_params=_vendor_params(
+                datatype=metric.get("datatype"),
+                expression=expression,
+                dialect=dialect,
+                declared=declared,
+                ai_context=metric.get("ai_context"),
+                extensions=metric.get("custom_extensions"),
+            ),
+        ),
+        note,
+    )
+
+
 def _qualified_references(expression: str | None) -> Iterable[tuple[str, str]]:
     """Every `dataset.field` pair a SQL expression mentions.
 
@@ -435,30 +560,33 @@ def definitions(
     found: list[str] = list(notes)
 
     for document in documents:
-        for model in document.data.get("semantic_model") or []:
-            model_name = model.get("name")
-            by_name: dict[str, str] = {}
-            for dataset in model.get("datasets") or []:
-                qualified = f"{model_name}.{dataset.get('name')}"
-                by_name[str(dataset.get("name"))] = qualified
-                relation = _relation(dataset.get("source"), connector)
-                if relation:
-                    relations[qualified] = relation
-                _keys(dataset, qualified, relation, keys, composite, connector)
+        model = document.data
+        model_name = model.get("name")
+        by_name: dict[str, str] = {}
+        datasets: dict[str, dict[str, Any]] = {}
+        for dataset in model.get("datasets") or []:
+            qualified = f"{model_name}.{dataset.get('name')}"
+            by_name[str(dataset.get("name"))] = qualified
+            datasets[str(dataset.get("name"))] = dataset
+            relation = _relation(dataset.get("source"), connector)
+            if relation:
+                relations[qualified] = relation
+            _keys(dataset, qualified, relation, keys, composite, found, connector)
 
-            for rel in model.get("relationships") or []:
-                declaration, note = _join(rel, by_name, relations, connector)
-                if declaration is not None:
-                    joins.append(declaration)
-                if note:
-                    found.append(note)
-                relationship, relationship_note = _declared_relationship(
-                    rel, by_name, relations, connector
-                )
-                if relationship is not None:
-                    declared_relationships.append(relationship)
-                if relationship_note:
-                    found.append(relationship_note)
+        for rel in model.get("relationships") or []:
+            pairs, note = _resolved_pairs(rel, datasets, connector)
+            if note:
+                found.append(note)
+            if pairs is None:
+                continue
+            declaration, note = _join(rel, by_name, relations, pairs)
+            if declaration is not None:
+                joins.append(declaration)
+            if note:
+                found.append(note)
+            relationship = _declared_relationship(rel, by_name, relations, pairs)
+            if relationship is not None:
+                declared_relationships.append(relationship)
 
     if documents:
         # Ossie declares relations and builds none, so the field explore reads to
@@ -492,6 +620,7 @@ def _keys(
     relation: str | None,
     keys: list[DeclaredKey],
     composite: list[DeclaredCompositeKey],
+    notes: list[str],
     connector: str | None = None,
 ) -> None:
     """A dataset's key declarations, split by arity.
@@ -502,21 +631,36 @@ def _keys(
     while "each of these is unique on its own" is a much stronger claim that the
     document does not make and that reconcile would act on.
 
-    A declared key names the column the way the author wrote it, so it is folded
-    the way `connector` resolves it, like every other physical column.
+    A key names fields, so each member reaches its physical column through the
+    field it names (:func:`field_columns`). A key with any member that links no
+    column stays declared in the document and is emitted nowhere: it is named
+    in a note, and nothing probes a partial tuple of it.
     """
 
-    for declared in (dataset.get("primary_key"), *(dataset.get("unique_keys") or [])):
-        columns = [c for c in (declared or []) if isinstance(c, str) and c]
-        if not columns:
+    for label, declared in (
+        ("primary key", dataset.get("primary_key")),
+        *(("unique key", key) for key in dataset.get("unique_keys") or []),
+    ):
+        fields = field_columns(dataset, declared or [], connector)
+        if not fields:
             continue
-        folded = [fold_identifier(connector, c) for c in columns]
-        if len(folded) == 1:
+        opaque = _opaque(fields)
+        if opaque:
+            notes.append(
+                f"dataset '{qualified}' declares a {label} on "
+                f"{', '.join(name for name, _ in fields)}, and "
+                f"{', '.join(opaque)} links no physical column, so the key is "
+                "declared but not verified: nothing probes it, and a composite "
+                "is never checked on part of its tuple"
+            )
+            continue
+        columns = [column for _, column in fields if column]
+        if len(columns) == 1:
             keys.append(
                 DeclaredKey(
                     model=qualified,
                     relation=relation,
-                    column=folded[0],
+                    column=columns[0],
                     unique=True,
                     source=DECLARATION_SOURCE,
                 )
@@ -526,22 +670,66 @@ def _keys(
                 DeclaredCompositeKey(
                     model=qualified,
                     relation=relation,
-                    columns=folded,
+                    columns=columns,
                     source=DECLARATION_SOURCE,
                 )
             )
+
+
+def _resolved_pairs(
+    rel: dict[str, Any],
+    datasets: dict[str, dict[str, Any]],
+    connector: str | None,
+) -> tuple[list[tuple[str, str]] | None, str | None]:
+    """A relationship's ordered column pairs, through the fields it names.
+
+    ``(None, note)`` when the relationship is opaque: an endpoint is missing,
+    the arity differs, or any member's field links no column. Opaque as a
+    whole, because a composite join probed on part of its tuple is a join the
+    author never declared.
+    """
+
+    name = rel.get("name")
+    child = datasets.get(str(rel.get("from")))
+    parent = datasets.get(str(rel.get("to")))
+    from_columns = [c for c in (rel.get("from_columns") or []) if isinstance(c, str)]
+    to_columns = [c for c in (rel.get("to_columns") or []) if isinstance(c, str)]
+    if child is None or parent is None or not from_columns or not to_columns:
+        return None, None
+    if len(from_columns) != len(to_columns):
+        return None, (
+            f"relationship '{name}' has {len(from_columns)} child fields and "
+            f"{len(to_columns)} parent fields; it is opaque rather than paired"
+        )
+    child_fields = field_columns(child, from_columns, connector)
+    parent_fields = field_columns(parent, to_columns, connector)
+    opaque = [f"{rel.get('from')}.{n}" for n in _opaque(child_fields)] + [
+        f"{rel.get('to')}.{n}" for n in _opaque(parent_fields)
+    ]
+    if opaque:
+        return None, (
+            f"relationship '{name}' joins on {', '.join(opaque)}, which "
+            f"{'links' if len(opaque) == 1 else 'link'} no physical column, so "
+            "the relationship is declared but not verified: nothing probes it, "
+            "and a composite is never checked on part of its tuple"
+        )
+    return [
+        (str(a), str(b))
+        for (_, a), (_, b) in zip(child_fields, parent_fields, strict=True)
+    ], None
 
 
 def _join(
     rel: dict[str, Any],
     by_name: dict[str, str],
     relations: dict[str, str],
-    connector: str | None = None,
+    pairs: list[tuple[str, str]],
 ) -> tuple[DeclaredForeignKey | None, str | None]:
     """One relationship as a declared join, or a note saying why not.
 
     Ossie writes `from` as the many side and `to` as the one side, which is the
     direction `DeclaredForeignKey` already uses, so no side-swapping is needed.
+    ``pairs`` are the physical columns its fields resolve to.
 
     **A composite relationship becomes a note here rather than a partial
     edge.** ``DeclaredForeignKey`` carries one column per side, so half of a
@@ -555,14 +743,12 @@ def _join(
     name = rel.get("name")
     child = by_name.get(str(rel.get("from")))
     parent = by_name.get(str(rel.get("to")))
-    from_columns = [c for c in (rel.get("from_columns") or []) if isinstance(c, str)]
-    to_columns = [c for c in (rel.get("to_columns") or []) if isinstance(c, str)]
-    if child is None or parent is None or not from_columns or not to_columns:
+    if child is None or parent is None or not pairs:
         return None, None
-    if len(from_columns) != 1 or len(to_columns) != 1:
+    if len(pairs) != 1:
         return None, (
-            f"relationship '{name}' joins {len(from_columns)} columns to "
-            f"{len(to_columns)}, and a declared join carries one column per "
+            f"relationship '{name}' joins {len(pairs)} columns to "
+            f"{len(pairs)}, and a declared join carries one column per "
             "side, so it is recorded here as a note rather than as half of "
             "itself. The composite edge reaches the diagram through the "
             "semantic catalog"
@@ -571,10 +757,10 @@ def _join(
         DeclaredForeignKey(
             model=child,
             relation=relations.get(child),
-            column=fold_identifier(connector, from_columns[0]),
+            column=pairs[0][0],
             to_model=parent,
             to_relation=relations.get(parent),
-            to_column=fold_identifier(connector, to_columns[0]),
+            to_column=pairs[0][1],
             source=DECLARATION_SOURCE,
         ),
         None,
@@ -585,8 +771,8 @@ def _declared_relationship(
     rel: dict[str, Any],
     by_name: dict[str, str],
     relations: dict[str, str],
-    connector: str | None = None,
-) -> tuple[DeclaredRelationship | None, str | None]:
+    pairs: list[tuple[str, str]],
+) -> DeclaredRelationship | None:
     """Preserve an Ossie relationship's full ordered pairs.
 
     The neutral shape a composite join survives in: every pair, in declared
@@ -596,27 +782,14 @@ def _declared_relationship(
     name = rel.get("name")
     child = by_name.get(str(rel.get("from")))
     parent = by_name.get(str(rel.get("to")))
-    from_columns = [c for c in (rel.get("from_columns") or []) if isinstance(c, str)]
-    to_columns = [c for c in (rel.get("to_columns") or []) if isinstance(c, str)]
-    if child is None or parent is None or not from_columns or not to_columns:
-        return None, None
-    if len(from_columns) != len(to_columns):
-        return None, (
-            f"relationship '{name}' has {len(from_columns)} child columns and "
-            f"{len(to_columns)} parent columns; it is opaque rather than paired"
-        )
-    return (
-        DeclaredRelationship(
-            model=child,
-            relation=relations.get(child),
-            to_model=parent,
-            to_relation=relations.get(parent),
-            column_pairs=[
-                (fold_identifier(connector, a), fold_identifier(connector, b))
-                for a, b in zip(from_columns, to_columns, strict=True)
-            ],
-            source=DECLARATION_SOURCE,
-            name=str(name) if name else None,
-        ),
-        None,
+    if child is None or parent is None or not pairs:
+        return None
+    return DeclaredRelationship(
+        model=child,
+        relation=relations.get(child),
+        to_model=parent,
+        to_relation=relations.get(parent),
+        column_pairs=list(pairs),
+        source=DECLARATION_SOURCE,
+        name=str(name) if name else None,
     )

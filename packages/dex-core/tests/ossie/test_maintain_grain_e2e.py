@@ -46,23 +46,19 @@ def _repo(tmp_path: Path, *, duplicate_line_no: bool) -> Path:
 
     doc = {
         "version": "0.2.0.dev0",
-        "semantic_model": [
+        "name": "commerce",
+        "datasets": [
             {
-                "name": "commerce",
-                "datasets": [
-                    {
-                        "name": "order_items",
-                        "source": "demo.main.order_items",
-                        "fields": [
-                            _field("order_id"),
-                            _field("line_no"),
-                            _field("sku"),
-                        ],
-                        # An array of arrays, per the issue's own wording: one
-                        # independent unique-key declaration, itself composite.
-                        "unique_keys": [["order_id", "line_no"]],
-                    }
+                "name": "order_items",
+                "source": "demo.main.order_items",
+                "fields": [
+                    _field("order_id"),
+                    _field("line_no"),
+                    _field("sku"),
                 ],
+                # An array of arrays, per the issue's own wording: one
+                # independent unique-key declaration, itself composite.
+                "unique_keys": [["order_id", "line_no"]],
             }
         ],
     }

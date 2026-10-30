@@ -32,37 +32,36 @@ MB = 1024 * 1024
 #: shared dimension pays the scan once per edge that joins it.
 DOCUMENT = """
 version: "0.2.0.dev0"
-semantic_model:
-  - name: shop
-    datasets:
-      - name: orders
-        source: test-proj.shop.customers
-        primary_key: [id]
-        fields:
-          - name: id
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: id}]
-          - name: email
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: email}]
-      - name: events
-        source: test-proj.shop.events
-        primary_key: [id]
-        fields:
-          - name: id
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: id}]
-    relationships:
-      - name: events_to_orders
-        from: events
-        to: orders
-        from_columns: [id]
-        to_columns: [id]
-      - name: orders_to_orders
-        from: orders
-        to: orders
-        from_columns: [id]
-        to_columns: [id]
+name: shop
+datasets:
+  - name: orders
+    source: test-proj.shop.customers
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: id}]
+      - name: email
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: email}]
+  - name: events
+    source: test-proj.shop.events
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: id}]
+relationships:
+  - name: events_to_orders
+    from: events
+    to: orders
+    from_columns: [id]
+    to_columns: [id]
+  - name: orders_to_orders
+    from: orders
+    to: orders
+    from_columns: [id]
+    to_columns: [id]
 """
 
 

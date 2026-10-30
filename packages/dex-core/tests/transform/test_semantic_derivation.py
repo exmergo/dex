@@ -758,9 +758,12 @@ def test_marts_paths_in_config_move_where_a_mart_is(
     )
 
 
-def test_a_non_dbt_semantic_vendor_gets_a_note_and_no_derivation(
+def test_a_non_dbt_semantic_vendor_gets_its_own_derivation_and_no_metricflow(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """Under `vendor: ossie` the Ossie hook answers (#500): nothing
+    MetricFlow-shaped is derived and dbt never parses a semantic file."""
+
     calls = _fake_parse(monkeypatch)
     (tmp_path / ".dex").mkdir(exist_ok=True)
     (tmp_path / ".dex" / "config.yml").write_text(
@@ -775,8 +778,9 @@ def test_a_non_dbt_semantic_vendor_gets_a_note_and_no_derivation(
     rc, envelope = _plan(tmp_path, capsys)
 
     assert rc == 0, envelope
-    assert "semantic_proposal" not in envelope["data"]
-    assert any("semantic.vendor is 'ossie'" in w for w in envelope["warnings"])
+    proposal = envelope["data"]["semantic_proposal"]
+    assert proposal["vendor"] == "ossie"
+    assert "semantic_models" not in json.dumps(proposal)
     assert not any(any("semantic" in p for p in c) for c in calls)
 
 

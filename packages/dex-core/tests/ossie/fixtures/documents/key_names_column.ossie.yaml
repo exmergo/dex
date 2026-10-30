@@ -1,0 +1,30 @@
+# A key and a relationship naming source columns rather than fields. Since
+# upstream's Name Resolution they name fields, and a name that is no declared
+# field is an integrity error: "metrics and relationships do not reach through
+# a dataset to its source columns".
+version: "0.2.0.dev0"
+name: columns
+datasets:
+  - name: orders
+    source: demo.main.orders
+    primary_key: [o_orderkey]
+    fields:
+      - name: order_id
+        expression:
+          sql: o_orderkey
+      - name: customer_id
+        expression:
+          sql: o_custkey
+  - name: customers
+    source: demo.main.customers
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          sql: c_custkey
+relationships:
+  - name: orders_to_customers
+    from: orders
+    to: customers
+    from_columns: [o_custkey]
+    to_columns: [id]

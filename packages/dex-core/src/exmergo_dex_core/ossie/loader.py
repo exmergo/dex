@@ -8,7 +8,8 @@ the canonical model and config parsing:
 1. **Structure**, by JSON Schema against the bundled draft. Needs a schema
    validator, which is what the `[ossie]` extra carries.
 2. **Integrity**, in pure Python: name uniqueness, relationship endpoint
-   existence, key-array arity, target-key coverage. No dependency.
+   existence, keys and relationship columns naming declared fields, key-array
+   arity, target-key coverage. No dependency.
 3. **Expression syntax**, through sqlglot behind the existing `[sql]` extra.
    Absent, it degrades to a named skip and never to a silent pass, following the
    posture `guards.dialect` already sets.
@@ -17,7 +18,12 @@ Layer 2 ports the judgment in upstream's `validation/validate.py` rather than
 reinventing it. That script is Apache-2.0 and is a script rather than a package,
 so porting creates no runtime dependency and, more importantly, no divergence
 about what a valid Ossie document is. Two rules here are dex's own and are
-marked as such below; both are findings worth carrying back upstream.
+marked as such below: the cross-file model-name rule, and the refusal of the
+earlier wrapped document shape by name rather than as an unknown key.
+
+**One document is one model.** Since upstream's flat document shape, a
+document's root *is* its semantic model (`version`, `name`, `datasets`, ...),
+and the `semantic_model` array of earlier drafts is gone.
 
 **The assurance boundary, stated rather than implied.** There is no external
 validator here the way `dbt parse` is for dbt: neither `apache-ossie` nor
@@ -40,7 +46,7 @@ from typing import Any
 import yaml
 
 from ..errors import DexError
-from .dialects import NON_SQL_DIALECTS, SQL_DIALECTS, sqlglot_dialect
+from .dialects import SQL_DIALECTS, sqlglot_dialect
 
 __all__ = [
     "DOCUMENT_SUFFIXES",
@@ -57,7 +63,7 @@ __all__ = [
 #: The sha256 of the bundled upstream schema. Asserted by a test, so a
 #: regeneration is a reviewed diff rather than a quiet update. See
 #: `schema/PROVENANCE.md` for the upstream commit and the upgrade procedure.
-SCHEMA_SHA256 = "27aab111647b1e8d2229a2413e4682e459f43edc62e0eaadd497317754089e42"
+SCHEMA_SHA256 = "2cf11e3c555b767b2612a4e479545e55485d81af62c3bf465a03f33a861aae4c"
 
 #: The file extensions a native Ossie document may carry. JSON and YAML are the
 #: two serializations of one document shape, so both parse to the same mapping
@@ -91,7 +97,7 @@ class Diagnostic:
     """One thing wrong with, or unchecked in, a document.
 
     ``path`` is the document path the problem sits at, rendered the way upstream
-    renders it (`semantic_model -> 0 -> datasets -> 1 -> name`), or `(root)`.
+    renders it (`datasets -> 1 -> name`), or `(root)`.
     ``layer`` and ``rule`` say which check spoke, so a caller can act on a class
     of finding without matching on prose.
     """
@@ -365,8 +371,9 @@ def _parse_text(text: str, name: str) -> tuple[dict[str, Any] | None, list[Diagn
     if not isinstance(raw, dict):
         return refusal(
             "root",
-            "an Ossie document is a mapping with `version` and `semantic_model` "
-            f"at its root, and this parsed as {type(raw).__name__}",
+            "an Ossie document is one semantic model, a mapping with `version`, "
+            f"`name` and `datasets` at its root, and this parsed as "
+            f"{type(raw).__name__}",
         )
     return raw, []
 
@@ -390,6 +397,32 @@ def _validate_structure(document: dict[str, Any], name: str) -> Iterable[Diagnos
 
     schema = json.loads(schema_bytes())
     pinned = schema.get("properties", {}).get("version", {}).get("const", "unknown")
+    if "semantic_model" in document:
+        # dex's own rule, ahead of the schema: the schema would report the
+        # wrapper as an unknown key plus missing `name` and `datasets`, which
+        # sends the reader looking for a typo. This shape has a name and a
+        # mechanical migration, so the refusal says both.
+        yield Diagnostic(
+            file=name,
+            path="semantic_model",
+            layer="structure",
+            rule="wrapped_document",
+            severity=ERROR,
+            message=(
+                "this document uses the earlier wrapped shape, a `semantic_model` "
+                "list of models. The Ossie schema dex pins (spec version "
+                f"{pinned}) reads one model per document, flat at the root. To "
+                "migrate, as upstream's specification describes it: move the "
+                "model's properties (`name`, `description`, `ai_context`, "
+                "`datasets`, `relationships`, `metrics`, `custom_extensions`) to "
+                "the root and remove `semantic_model`; remove any root-level "
+                "`dialects` and `vendors`; keep per-expression dialects and "
+                "`custom_extensions` as they are. A file holding several models "
+                "becomes one document per model, each listed in "
+                "`semantic.ossie.files`"
+            ),
+        )
+        return
     validator = Draft202012Validator(schema)
     for error in validator.iter_errors(document):
         path = _render_path(error.absolute_path)
@@ -444,95 +477,163 @@ def _validate_integrity(document: dict[str, Any], name: str) -> Iterable[Diagnos
     declaration dex rewrites is a declaration its author no longer controls.
     """
 
-    for index, model in enumerate(document.get("semantic_model") or []):
-        base = f"semantic_model -> {index}"
-        model_name = model.get("name", "<unnamed>")
-        datasets = model.get("datasets") or []
-        by_name = {d["name"]: d for d in datasets if d.get("name")}
+    model = document
+    model_name = model.get("name", "<unnamed>")
+    datasets = model.get("datasets") or []
+    by_name = {d["name"]: d for d in datasets if d.get("name")}
 
+    yield from _duplicates(
+        [d.get("name") for d in datasets],
+        file=name,
+        path="datasets",
+        rule="duplicate_dataset",
+        what="dataset",
+        where=f"semantic model '{model_name}'",
+    )
+    for position, dataset in enumerate(datasets):
+        dataset_name = dataset.get("name", "<unnamed>")
         yield from _duplicates(
-            [d.get("name") for d in datasets],
+            [f.get("name") for f in dataset.get("fields") or []],
             file=name,
-            path=f"{base} -> datasets",
-            rule="duplicate_dataset",
-            what="dataset",
-            where=f"semantic model '{model_name}'",
+            path=f"datasets -> {position} -> fields",
+            rule="duplicate_field",
+            what="field",
+            where=f"dataset '{dataset_name}'",
         )
-        for position, dataset in enumerate(datasets):
-            yield from _duplicates(
-                [f.get("name") for f in dataset.get("fields") or []],
-                file=name,
-                path=f"{base} -> datasets -> {position} -> fields",
-                rule="duplicate_field",
-                what="field",
-                where=f"dataset '{dataset.get('name', '<unnamed>')}'",
-            )
-        yield from _duplicates(
-            [m.get("name") for m in model.get("metrics") or []],
-            file=name,
-            path=f"{base} -> metrics",
-            rule="duplicate_metric",
-            what="metric",
-            where=f"semantic model '{model_name}'",
+        fields = field_names(dataset)
+        keys = [("primary_key", dataset.get("primary_key"))]
+        keys.extend(
+            (f"unique_keys -> {offset}", key)
+            for offset, key in enumerate(dataset.get("unique_keys") or [])
         )
-        yield from _duplicates(
-            [r.get("name") for r in model.get("relationships") or []],
-            file=name,
-            path=f"{base} -> relationships",
-            rule="duplicate_relationship",
-            what="relationship",
-            where=f"semantic model '{model_name}'",
-        )
-
-        for position, rel in enumerate(model.get("relationships") or []):
-            path = f"{base} -> relationships -> {position}"
-            rel_name = rel.get("name", "<unnamed>")
-            for side in ("from", "to"):
-                referenced = rel.get(side)
-                if referenced not in by_name:
-                    yield Diagnostic(
-                        file=name,
-                        path=f"{path} -> {side}",
-                        layer="integrity",
-                        rule="unknown_dataset",
-                        severity=ERROR,
-                        message=(
-                            f"relationship '{rel_name}' names dataset "
-                            f"'{referenced}', which semantic model "
-                            f"'{model_name}' does not declare"
-                        ),
-                    )
-            from_columns = rel.get("from_columns") or []
-            to_columns = rel.get("to_columns") or []
-            # dex's own rule, not upstream's. The schema constrains both arrays
-            # to be non-empty and says nothing about their lengths, but a join
-            # pairs them positionally, so unequal arity is a relationship no
-            # consumer can resolve. Reported, never repaired, and carried
-            # upstream as a consumer finding.
-            if len(from_columns) != len(to_columns):
+        for where, key in keys:
+            missing = _undeclared(key, fields)
+            if missing:
                 yield Diagnostic(
                     file=name,
-                    path=path,
+                    path=f"datasets -> {position} -> {where}",
                     layer="integrity",
-                    rule="key_arity",
+                    rule="undeclared_key_field",
                     severity=ERROR,
                     message=(
-                        f"relationship '{rel_name}' pairs "
-                        f"{len(from_columns)} from_columns with "
-                        f"{len(to_columns)} to_columns. A join matches them in "
-                        "order, so the two arrays have to be the same length"
+                        f"dataset '{dataset_name}' declares a key on "
+                        f"{_listed(missing)}, which {_not_fields(missing)} "
+                        "of the dataset. A key names the dataset's fields, not "
+                        "columns of its source; declare a field for each key "
+                        "member, or name the field that exposes the column"
                     ),
                 )
-            target = by_name.get(rel.get("to"))
-            if target is not None and to_columns:
-                yield from _coverage(
-                    target,
-                    to_columns,
+    yield from _duplicates(
+        [m.get("name") for m in model.get("metrics") or []],
+        file=name,
+        path="metrics",
+        rule="duplicate_metric",
+        what="metric",
+        where=f"semantic model '{model_name}'",
+    )
+    yield from _duplicates(
+        [r.get("name") for r in model.get("relationships") or []],
+        file=name,
+        path="relationships",
+        rule="duplicate_relationship",
+        what="relationship",
+        where=f"semantic model '{model_name}'",
+    )
+
+    for position, rel in enumerate(model.get("relationships") or []):
+        path = f"relationships -> {position}"
+        rel_name = rel.get("name", "<unnamed>")
+        for side in ("from", "to"):
+            referenced = rel.get(side)
+            if referenced not in by_name:
+                yield Diagnostic(
                     file=name,
-                    path=path,
-                    rel_name=rel_name,
-                    model_name=model_name,
+                    path=f"{path} -> {side}",
+                    layer="integrity",
+                    rule="unknown_dataset",
+                    severity=ERROR,
+                    message=(
+                        f"relationship '{rel_name}' names dataset "
+                        f"'{referenced}', which semantic model "
+                        f"'{model_name}' does not declare"
+                    ),
                 )
+                continue
+            columns_key = f"{side}_columns"
+            missing = _undeclared(
+                rel.get(columns_key), field_names(by_name[referenced])
+            )
+            if missing:
+                yield Diagnostic(
+                    file=name,
+                    path=f"{path} -> {columns_key}",
+                    layer="integrity",
+                    rule="undeclared_relationship_field",
+                    severity=ERROR,
+                    message=(
+                        f"relationship '{rel_name}' names {_listed(missing)} in "
+                        f"`{columns_key}`, which {_not_fields(missing)} "
+                        f"of dataset '{referenced}'. A relationship names the "
+                        "datasets' fields, never columns of their sources"
+                    ),
+                )
+        from_columns = rel.get("from_columns") or []
+        to_columns = rel.get("to_columns") or []
+        # A join pairs the two arrays positionally, so unequal arity is a
+        # relationship no consumer can resolve. Upstream's validator has since
+        # adopted the same rule; reported, never repaired.
+        if len(from_columns) != len(to_columns):
+            yield Diagnostic(
+                file=name,
+                path=path,
+                layer="integrity",
+                rule="key_arity",
+                severity=ERROR,
+                message=(
+                    f"relationship '{rel_name}' pairs "
+                    f"{len(from_columns)} from_columns with "
+                    f"{len(to_columns)} to_columns. A join matches them in "
+                    "order, so the two arrays have to be the same length"
+                ),
+            )
+        target = by_name.get(rel.get("to"))
+        if target is not None and to_columns:
+            yield from _coverage(
+                target,
+                to_columns,
+                file=name,
+                path=path,
+                rel_name=rel_name,
+                model_name=model_name,
+            )
+
+
+def field_names(dataset: Mapping[str, Any]) -> dict[str, str]:
+    """A dataset's declared field names, casefolded to the name as written.
+
+    Keys and relationship columns name fields (upstream's Name Resolution), and
+    upstream compares them case-insensitively, so the lookup does too.
+    """
+
+    found: dict[str, str] = {}
+    for field_ in dataset.get("fields") or []:
+        if isinstance(field_, Mapping) and isinstance(field_.get("name"), str):
+            found.setdefault(field_["name"].casefold(), field_["name"])
+    return found
+
+
+def _undeclared(names: Any, fields: Mapping[str, str]) -> list[str]:
+    if not isinstance(names, list):
+        return []
+    return [n for n in names if isinstance(n, str) and n.casefold() not in fields]
+
+
+def _not_fields(names: Sequence[str]) -> str:
+    return "is not a declared field" if len(names) == 1 else "are not declared fields"
+
+
+def _listed(names: Sequence[str]) -> str:
+    return ", ".join(f"'{n}'" for n in names)
 
 
 def _coverage(
@@ -559,8 +660,9 @@ def _coverage(
     declared = [k for k in candidates if isinstance(k, list) and k]
     if not declared:
         return
-    wanted = set(to_columns)
-    if any(set(key) <= wanted for key in declared):
+    wanted = {c.casefold() for c in to_columns if isinstance(c, str)}
+    keys = [{c.casefold() for c in key if isinstance(c, str)} for key in declared]
+    if any(key <= wanted for key in keys):
         return
     yield Diagnostic(
         file=file,
@@ -582,10 +684,12 @@ def _validate_expressions(
 ) -> Iterable[Diagnostic]:
     """Layer 3: does each SQL expression parse.
 
-    Only the SQL dialects are parsed. `MDX`, `TABLEAU` and `MAQL` are preserved
-    verbatim, never handed to a SQL parser, and never reported as validated: a
-    skipped check that reads as a passed one is the failure mode this whole
-    module is shaped to avoid, so their skip is stated as a note.
+    Only the SQL dialects are parsed, the top-level `sql` among them as
+    `OSSIE_SQL_2026`. Every other token (`MDX`, `DAX`, `THOUGHTSPOT`, or one no
+    registry names, since `Dialect` is an open string) is preserved verbatim,
+    never handed to a SQL parser, and never reported as validated: a skipped
+    check that reads as a passed one is the failure mode this whole module is
+    shaped to avoid, so their skip is stated as a note.
     """
 
     try:
@@ -627,22 +731,28 @@ def _validate_expressions(
 
     skipped: set[str] = set()
     for path, label, expression in _expressions(document):
-        dialects = (expression or {}).get("dialects") or []
-        for position, entry in enumerate(dialects):
+        expression = expression if isinstance(expression, dict) else {}
+        located: list[tuple[str, str, str]] = []
+        if isinstance(expression.get("sql"), str) and expression["sql"]:
+            located.append(
+                (f"{path} -> expression -> sql", "OSSIE_SQL_2026", expression["sql"])
+            )
+        for position, entry in enumerate(expression.get("dialects") or []):
             dialect = entry.get("dialect")
             text = entry.get("expression")
-            if not text:
-                continue
-            if dialect in NON_SQL_DIALECTS:
-                skipped.add(dialect)
-                continue
+            if isinstance(dialect, str) and isinstance(text, str) and text:
+                located.append(
+                    (f"{path} -> expression -> dialects -> {position}", dialect, text)
+                )
+        for where, dialect, text in located:
             if dialect not in SQL_DIALECTS:
+                skipped.add(dialect)
                 continue
             failure = parses(text, dialect)
             if failure is not None:
                 yield Diagnostic(
                     file=name,
-                    path=f"{path} -> expression -> dialects -> {position}",
+                    path=where,
                     layer="expressions",
                     rule="sql_syntax",
                     severity=ERROR,
@@ -658,8 +768,9 @@ def _validate_expressions(
             severity=NOTE,
             message=(
                 f"{listed} expressions are preserved as written and were not "
-                "checked: they are not SQL, so dex neither parses them nor reads "
-                "a physical column out of one"
+                "checked: dex reads only the SQL dialects (OSSIE_SQL_2026, "
+                "ANSI_SQL, SNOWFLAKE, DATABRICKS, BIGQUERY), so it neither parses "
+                "these nor reads a physical column out of one"
             ),
         )
 
@@ -669,35 +780,37 @@ def _expressions(
 ) -> Iterable[tuple[str, str, dict[str, Any]]]:
     """Every expression in the document, as ``(path, label, expression)``."""
 
-    for index, model in enumerate(document.get("semantic_model") or []):
-        base = f"semantic_model -> {index}"
-        model_name = model.get("name", "<unnamed>")
-        for position, dataset in enumerate(model.get("datasets") or []):
-            dataset_name = dataset.get("name", "<unnamed>")
-            for offset, field_ in enumerate(dataset.get("fields") or []):
-                yield (
-                    f"{base} -> datasets -> {position} -> fields -> {offset}",
-                    f"field '{dataset_name}.{field_.get('name', '<unnamed>')}' "
-                    f"in semantic model '{model_name}'",
-                    field_.get("expression") or {},
-                )
-        for offset, metric in enumerate(model.get("metrics") or []):
+    model_name = document.get("name", "<unnamed>")
+    for position, dataset in enumerate(document.get("datasets") or []):
+        dataset_name = dataset.get("name", "<unnamed>")
+        for offset, field_ in enumerate(dataset.get("fields") or []):
             yield (
-                f"{base} -> metrics -> {offset}",
-                f"metric '{metric.get('name', '<unnamed>')}' in semantic model "
-                f"'{model_name}'",
+                f"datasets -> {position} -> fields -> {offset}",
+                f"field '{dataset_name}.{field_.get('name', '<unnamed>')}' "
+                f"in semantic model '{model_name}'",
+                field_.get("expression") or {},
+            )
+        for offset, metric in enumerate(dataset.get("metrics") or []):
+            yield (
+                f"datasets -> {position} -> metrics -> {offset}",
+                f"metric '{dataset_name}.{metric.get('name', '<unnamed>')}' "
+                f"in semantic model '{model_name}'",
                 metric.get("expression") or {},
             )
+    for offset, metric in enumerate(document.get("metrics") or []):
+        yield (
+            f"metrics -> {offset}",
+            f"metric '{metric.get('name', '<unnamed>')}' in semantic model "
+            f"'{model_name}'",
+            metric.get("expression") or {},
+        )
 
 
 def _model_names(document: LoadedDocument) -> set[str]:
-    """Every semantic-model name one document declares."""
+    """The semantic-model name one document declares: its root `name`."""
 
-    return {
-        model["name"]
-        for model in document.data.get("semantic_model") or []
-        if isinstance(model.get("name"), str)
-    }
+    name = document.data.get("name")
+    return {name} if isinstance(name, str) else set()
 
 
 def _validate_across_documents(
@@ -722,7 +835,7 @@ def _validate_across_documents(
     found = [
         Diagnostic(
             file=declared_in[name][1],
-            path="semantic_model",
+            path="name",
             layer="integrity",
             rule="duplicate_semantic_model_across_files",
             severity=ERROR,

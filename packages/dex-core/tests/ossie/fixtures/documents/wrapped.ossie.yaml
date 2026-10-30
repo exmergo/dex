@@ -1,0 +1,14 @@
+# The earlier wrapped shape: a `semantic_model` list of models. Upstream's
+# current schema reads one model per document, flat at the root, so this is
+# refused, by its own rule and with the migration named rather than as an
+# unknown key.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          - name: order_id
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: order_id}]

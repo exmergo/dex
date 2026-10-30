@@ -1,0 +1,34 @@
+# `Dialect` is an open string upstream: any non-empty token is valid, and only
+# OSSIE_SQL_2026 has semantics the specification defines. THOUGHTSPOT and DAX are
+# registered non-SQL languages; MY_ENGINE is a token no registry names. All three
+# are accepted, preserved verbatim, never parsed, and never a physical column.
+# (Under the previous pin THOUGHTSPOT was outside a closed enum and refused.)
+version: "0.2.0.dev0"
+name: opaque
+datasets:
+  - name: orders
+    source: demo.main.orders
+    fields:
+      - name: order_id
+        expression:
+          dialects:
+            - dialect: THOUGHTSPOT
+              expression: order_id
+      - name: revenue
+        expression:
+          dialects:
+            - dialect: DAX
+              expression: SUM(orders[amount])
+      - name: region
+        expression:
+          dialects:
+            - dialect: MY_ENGINE
+              expression: region
+      # An opaque token beside a SQL one: the SQL one is what dex reads.
+      - name: status
+        expression:
+          dialects:
+            - dialect: DAX
+              expression: orders[status]
+            - dialect: ANSI_SQL
+              expression: status

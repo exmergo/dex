@@ -1,0 +1,28 @@
+# The top-level `sql` form: OSSIE_SQL_2026, and authoritative over an
+# OSSIE_SQL_2026 entry in `dialects` when both are present. A field stating only
+# `sql:` is a field like any other, and links when it is a bare identifier.
+version: "0.2.0.dev0"
+name: portable
+datasets:
+  - name: orders
+    source: demo.main.orders
+    fields:
+      - name: order_id
+        expression:
+          sql: order_id
+      # `sql` outranks the OSSIE_SQL_2026 dialect entry beside it.
+      - name: amount
+        expression:
+          sql: order_total
+          dialects:
+            - dialect: OSSIE_SQL_2026
+              expression: legacy_total
+      # The OSSIE_SQL_2026 dialect token on its own is SQL too.
+      - name: status
+        expression:
+          dialects:
+            - dialect: OSSIE_SQL_2026
+              expression: status
+      - name: net
+        expression:
+          sql: order_total - discount

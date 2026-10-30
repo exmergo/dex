@@ -35,7 +35,7 @@ from ..maintain.snapshot import (
 )
 from ..project_definitions import DeclaredRelationship
 from . import catalog as catalog_mod
-from .loader import LoadResult
+from .loader import SCHEMA_SHA256, LoadResult
 
 
 def _content_hash(text: str) -> str:
@@ -56,7 +56,9 @@ def semantic_layer(
     """Fingerprint the semantic layer from the validated documents."""
 
     if not loaded.documents:
-        return SemanticLayerSnapshot(vendor="ossie", notes=loaded.notes())
+        return SemanticLayerSnapshot(
+            vendor="ossie", format_version=SCHEMA_SHA256, notes=loaded.notes()
+        )
 
     semantic_models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
@@ -64,43 +66,49 @@ def semantic_layer(
     notes: list[str] = list(loaded.notes())
 
     for document in loaded.documents:
-        for model in document.data.get("semantic_model") or []:
-            model_name = model.get("name")
-            by_name: dict[str, str] = {}
-            relations: dict[str, str] = {}
-            for dataset in model.get("datasets") or []:
-                dataset_name = dataset.get("name")
-                qualified = f"{model_name}.{dataset_name}"
-                by_name[str(dataset_name)] = qualified
-                sm_def, sm_notes = _semantic_model_def(
-                    dataset, qualified, document.file, connector
-                )
-                # A dataset with no fields and no keys has nothing semantic
-                # declared about it yet: a bare relation reference is a
-                # schema-axis fact, not a semantic-model definition, and
-                # recording one here would make an unadorned dataset
-                # indistinguishable from a real, populated one for the
-                # generic added/removed/changed diff.
-                if sm_def.dimensions or sm_def.keys:
-                    semantic_models.append(sm_def)
-                    notes.extend(sm_notes)
-                if sm_def.relation:
-                    relations[qualified] = sm_def.relation
-
-            for rel in model.get("relationships") or []:
-                declared, note = catalog_mod._declared_relationship(
-                    rel, by_name, relations
-                )
-                if note:
-                    notes.append(note)
-                if declared is not None:
-                    relationships.append(_relationship_def(declared, document.file))
-
-            metrics.extend(
-                _metric_def(metric, document.file)
-                for metric in model.get("metrics") or []
-                if isinstance(metric, dict) and isinstance(metric.get("name"), str)
+        # One document is one semantic model, flat at its root.
+        model = document.data
+        model_name = model.get("name")
+        by_name: dict[str, str] = {}
+        datasets: dict[str, dict[str, Any]] = {}
+        relations: dict[str, str] = {}
+        for dataset in model.get("datasets") or []:
+            dataset_name = dataset.get("name")
+            qualified = f"{model_name}.{dataset_name}"
+            by_name[str(dataset_name)] = qualified
+            datasets[str(dataset_name)] = dataset
+            sm_def, sm_notes = _semantic_model_def(
+                dataset, qualified, document.file, connector
             )
+            # A dataset with no fields and no keys has nothing semantic
+            # declared about it yet: a bare relation reference is a
+            # schema-axis fact, not a semantic-model definition, and
+            # recording one here would make an unadorned dataset
+            # indistinguishable from a real, populated one for the
+            # generic added/removed/changed diff.
+            if sm_def.dimensions or sm_def.keys:
+                semantic_models.append(sm_def)
+                notes.extend(sm_notes)
+            if sm_def.relation:
+                relations[qualified] = sm_def.relation
+
+        for rel in model.get("relationships") or []:
+            pairs, note = catalog_mod._resolved_pairs(rel, datasets, connector)
+            if note:
+                notes.append(note)
+            if pairs is None:
+                continue
+            declared = catalog_mod._declared_relationship(
+                rel, by_name, relations, pairs
+            )
+            if declared is not None:
+                relationships.append(_relationship_def(declared, rel, document.file))
+
+        metrics.extend(
+            _metric_def(metric, document.file)
+            for metric in model.get("metrics") or []
+            if isinstance(metric, dict) and isinstance(metric.get("name"), str)
+        )
 
     return SemanticLayerSnapshot(
         semantic_models=semantic_models,
@@ -108,6 +116,7 @@ def semantic_layer(
         relationships=relationships,
         relationships_and_keys_captured=True,
         vendor="ossie",
+        format_version=SCHEMA_SHA256,
         notes=notes,
     )
 
@@ -131,11 +140,16 @@ def _semantic_model_def(
         if note:
             notes.append(note)
 
+    # A key names fields; what drift compares against the warehouse is the
+    # physical column each one resolves to. A key with a member that links no
+    # column is left out (the catalog's note says so); a rename of a key field
+    # still moves the dataset's content hash, which covers the raw dataset.
     keys: list[list[str]] = []
     for declared in (dataset.get("primary_key"), *(dataset.get("unique_keys") or [])):
-        columns = [c for c in (declared or []) if isinstance(c, str) and c]
-        if columns:
-            keys.append(columns)
+        resolved = catalog_mod.field_columns(dataset, declared or [], connector)
+        columns = [column for _, column in resolved]
+        if columns and all(columns):
+            keys.append([str(c) for c in columns])
 
     return (
         SemanticModelDef(
@@ -150,15 +164,25 @@ def _semantic_model_def(
     )
 
 
-def _relationship_def(declared: DeclaredRelationship, path: str) -> RelationshipDef:
+def _relationship_def(
+    declared: DeclaredRelationship, rel: dict[str, Any], path: str
+) -> RelationshipDef:
     name = declared.name or (
         f"{declared.model}->{declared.to_model}:"
         + ",".join(f"{frm}={to}" for frm, to in declared.column_pairs)
     )
+    # The hash covers the fields the relationship names as well as the columns
+    # they resolve to, so renaming either one is drift.
     entry = {
         "model": declared.model,
         "to_model": declared.to_model,
         "column_pairs": [list(pair) for pair in declared.column_pairs],
+        "field_pairs": [
+            [str(a), str(b)]
+            for a, b in zip(
+                rel.get("from_columns") or [], rel.get("to_columns") or [], strict=False
+            )
+        ],
     }
     return RelationshipDef(
         name=name,

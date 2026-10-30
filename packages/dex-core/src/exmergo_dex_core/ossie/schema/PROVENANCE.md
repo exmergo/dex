@@ -8,9 +8,9 @@ them.
 | | |
 |---|---|
 | Upstream | <https://github.com/apache/ossie> |
-| Commit | `b5da5d66f0da4a0cd3388d52201dbf5523221a77` |
+| Commit | `7a8de20f850dad3934e307a1ac7425b09e9ca89f` |
 | Path | `core-spec/ossie-schema.json` |
-| SHA-256 | `27aab111647b1e8d2229a2413e4682e459f43edc62e0eaadd497317754089e42` |
+| SHA-256 | `2cf11e3c555b767b2612a4e479545e55485d81af62c3bf465a03f33a861aae4c` |
 | Declared spec version | `0.2.0.dev0` |
 | License | Apache License 2.0 |
 

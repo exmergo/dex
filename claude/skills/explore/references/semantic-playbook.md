@@ -161,7 +161,14 @@ format rather than a missing feature:
 - **A metric with no `semantic_models` is a metric whose lineage did not resolve**,
   not one that reads nothing. Ossie carries no metric-to-dataset reference, so Dex
   reports only what a qualified reference in the expression proved, and reports
-  nothing when none did.
+  nothing when none did. A metric named `dataset.metric` is dataset-scoped
+  (`datasets[].metrics`): it aggregates that one dataset's fields, and its lineage
+  is that dataset.
+
+A declared key or join names **fields**, and dex follows each field to the column
+its expression names, so `explore relationships --use-project --verify` probes
+the columns even where a field is named differently. A key or join on a field
+with no column (computed, quoted, non-SQL) is named in a note and never probed.
 
 An element with no `column` is also normal here and the notes say which of four
 reasons applies: a computed expression, a quoted identifier, a query-backed
