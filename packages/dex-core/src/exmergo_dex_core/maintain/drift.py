@@ -992,18 +992,21 @@ def grain_plan(
         # A composite grain contributes nothing to the single-column set: its
         # members are not individually unique, and checking them one at a time
         # would fabricate key_lost_uniqueness findings on every run.
+        # The baseline's grain can be the project's claim rather than a
+        # measurement (a declared primary key is reported as the grain whether
+        # or not it held). One measurement already refuted never lost anything:
+        # it is left to the declared survey below, as a declaration to fix.
+        refuted = {c.name for c in dataset.columns if c.is_unique is False}
         keys = sorted(
             {key[0] for key in dataset.candidate_keys if len(key) == 1}
             | (
-                set(dataset.grain)
+                set(dataset.grain) - refuted
                 if dataset.grain and len(dataset.grain) == 1
                 else set()
             )
         )
         composites: list[list[str]] = []
-        for combo in [k for k in dataset.candidate_keys if len(k) > 1] + (
-            [dataset.grain] if dataset.grain and len(dataset.grain) > 1 else []
-        ):
+        for combo in [k for k in dataset.candidate_keys if len(k) > 1]:
             if list(combo) not in composites:
                 composites.append(list(combo))
         if not keys and not composites:

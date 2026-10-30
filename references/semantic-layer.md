@@ -916,10 +916,13 @@ note, and never verified or probed:
 `explore map --use-project` marks each source relation with the Ossie semantic
 models sitting on it, and rewrites that mark on every read, so a dataset dropped
 from the layer clears rather than leaving a stale claim. `explore profile
---use-project` lets a declared key override the heuristic grain, noting the
-disagreement rather than replacing it silently, and
-`explore relationships --verify` measures a declared composite as one complete
-tuple. A measurement never revises a declared join's confidence: it stays at the
+--use-project` reports a declared `primary_key` as the grain at either arity,
+noting any disagreement with measurement rather than replacing it silently, and
+never reports a `unique_keys` entry as the grain. It also carries `declaration`,
+read from `ai_context.dex`, with no dbt project needed; SLayer and Cube do the same
+from `meta.dex`. Where a dbt model declares the same relation its declaration is
+reported, and `notes` says so. `explore relationships --verify` measures a declared
+composite as one complete tuple. A measurement never revises a declared join's confidence: it stays at the
 1.0 the document asserts, and a probe that finds the parent largely missing is
 reported as a finding instead.
 
@@ -1062,7 +1065,9 @@ already defines. Nothing opens SLayer storage, a datasource, or a warehouse.
   parent: the joining model is the child, except where `cardinality` is
   `one_to_many`. A single-pair join is also a foreign key, except where
   `cardinality` is `many_to_many`, which says the far side is not a key;
-- `explore map --use-project` marks each relation with the SLayer models on it.
+- `explore map --use-project` marks each relation with the SLayer models on it,
+  and `explore profile|map --use-project` report the primary key as the grain and
+  `meta.dex` as `declaration`.
 
 ### Governed `query` and `values`
 

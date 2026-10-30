@@ -187,6 +187,11 @@ class LocalMetricFlowBackend:
 
         return [], []
 
+    def declared_models(self) -> tuple[dict[str, Any], list[str]]:
+        """dbt's declarations reach exploration through ``definitions()`` too."""
+
+        return {}, []
+
     def _semantic_view(self):
         """The project's semantic catalog, read once per command.
 

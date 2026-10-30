@@ -259,7 +259,7 @@ layers implement. Two routes:
 | `measure` with `aggregation` | a dataset-scoped metric `<column>_<agg>` (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, `COUNT(DISTINCT ...)`) |
 | descriptions | the native `description` of the dataset and each field |
 | `population`, `assumptions` | the dataset's `ai_context`: `instructions` carries the population sentence, and a structured `dex` key carries the declaration; the sentence also closes the description |
-| `unit`, `null_rule`, `additivity` | the field's `ai_context.dex` |
+| `unit`, `null_rule`, `additivity`, `role`, `references` | the field's `ai_context.dex`, beside the native construct a role or a reference also renders |
 
 Decisions behind the mapping:
 
@@ -267,6 +267,15 @@ Decisions behind the mapping:
   The grain is the dataset's row identity, upstream's `primary_key` takes a list,
   and the SLayer and Cube derivations put every grain column on the primary key
   too. `unique_keys` stays for further, independent keys.
+- **The `primary_key` is what exploration reports as the grain, at either arity.**
+  `explore profile|map --use-project` report it with `declaration.grain_status`,
+  ahead of a measured key. A `unique_keys` entry is measured by `maintain grain`
+  and is never the grain. A declared key that never held is
+  `declared_grain_not_unique`, not `key_lost_uniqueness`.
+- **`ai_context.dex` is read back, as untrusted text.** It reaches `declaration`
+  on the dataset's relation, and a malformed part is left out and named in
+  `notes`. Fields are reported under the physical column they link, and a field
+  linking none is named instead.
 - **`ai_context`, never `custom_extensions`.** `custom_extensions.data` is an
   opaque string, and a declaration encoded into a string inside YAML cannot be
   reviewed in a diff. `ai_context` takes an object with any further keys, so the

@@ -188,6 +188,28 @@ class SemanticDeclarationContract:
             "arrives without it is read as an ordinary column"
         )
 
+    def test_a_primary_key_is_the_declared_grain(self) -> None:
+        """A key flagged primary is a grain claim (#976), so the declaration of
+        that model has to state the same columns, whatever their arity."""
+
+        source, _model, _column = self.a_source_declaring_a_unique_key()
+        declarations = self.declarations_of(source)
+        primary = {k.model: [k.column] for k in declarations.declared_keys if k.primary}
+        primary.update(
+            {
+                k.model: list(k.columns)
+                for k in declarations.declared_composite_keys
+                if k.claim == "primary"
+            }
+        )
+
+        for model, columns in primary.items():
+            declared = declarations.model_declarations.get(model)
+            assert declared is not None and declared.grain == columns, (
+                f"{model} flags {columns} as its primary key, but its declaration "
+                f"states {declared.grain if declared else None}"
+            )
+
     def test_a_declared_join_carries_both_sides(self) -> None:
         """Both ends, because a half-read join is worse than an unread one.
 

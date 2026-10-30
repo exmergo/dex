@@ -160,7 +160,7 @@ def test_the_physical_link_is_exactly_what_a_case_declares(
     )
 
 
-@declaring("composite_keys", "single_keys")
+@declaring("composite_keys", "single_keys", "grains")
 def test_the_declared_keys_are_exactly_what_a_case_declares(
     case: dict[str, Any], tmp_path: Path
 ) -> None:
@@ -183,6 +183,12 @@ def test_the_declared_keys_are_exactly_what_a_case_declares(
             for entry in case["composite_keys"]
         )
         assert seen == expected, f"{case['id']}: composite keys {seen} != {expected}"
+
+    if "grains" in case:
+        assert {
+            model: declaration.grain
+            for model, declaration in declarations.model_declarations.items()
+        } == case["grains"], case["id"]
 
     if "single_keys" in case:
         seen = sorted(

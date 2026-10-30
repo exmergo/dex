@@ -36,7 +36,8 @@ MetricFlow, and SLayer is shaped differently:
 and ``distinct_count``: values and cardinalities SLayer cached from the
 warehouse. Data values reach agent context only through `explore query`'s
 firewall, so none of them is carried into the catalog, the declarations, or the
-fingerprint. ``meta`` is free-form and is not carried either.
+fingerprint. ``meta`` is free-form and is not carried into the catalog; the
+declaration channel reads only its ``dex`` key, as untrusted text (#977).
 
 Nothing here imports SLayer. The models arrive already validated, and only
 their attributes are read.
@@ -54,6 +55,7 @@ from ..project_definitions import (
     DeclaredForeignKey,
     DeclaredKey,
     DeclaredRelationship,
+    ModelDeclaration,
     ProjectDefinitions,
 )
 from ..semantic_catalog import (
@@ -65,6 +67,7 @@ from ..semantic_catalog import (
     SemanticModelInfo,
     column_reference,
 )
+from ..semantic_declarations import read_native_declaration
 
 if TYPE_CHECKING:
     from .loader import LoadedModel
@@ -424,6 +427,8 @@ def definitions(
     joins: list[DeclaredForeignKey] = []
     relationships: list[DeclaredRelationship] = []
     relations: dict[str, str] = {}
+    declarations: dict[str, ModelDeclaration] = {}
+    unread: list[str] = []
     found: list[str] = list(notes)
     by_name = {entry.model.name: entry.model for entry in loaded}
 
@@ -435,6 +440,7 @@ def definitions(
     for entry in loaded:
         model = entry.model
         relation = relations.get(model.name)
+        primary = _primary_key_columns(model, connector)
         for columns in declared_key_columns(model, connector):
             if len(columns) == 1:
                 keys.append(
@@ -443,6 +449,7 @@ def definitions(
                         relation=relation,
                         column=columns[0],
                         unique=True,
+                        primary=columns == primary,
                         source=DECLARATION_SOURCE,
                     )
                 )
@@ -452,9 +459,21 @@ def definitions(
                         model=model.name,
                         relation=relation,
                         columns=columns,
+                        claim="primary",
                         source=DECLARATION_SOURCE,
                     )
                 )
+        declaration, declaration_notes = read_native_declaration(
+            model.name,
+            relation,
+            primary,
+            model.meta,
+            [(c.name, physical_column(c, connector), c.meta) for c in model.columns],
+            source=DECLARATION_SOURCE,
+        )
+        unread.extend(declaration_notes)
+        if declaration is not None:
+            declarations[model.name] = declaration
         for join in model.joins:
             declared, note = declared_relationship(
                 model, join, by_name, relations, connector
@@ -484,8 +503,17 @@ def definitions(
         declared_keys=keys,
         declared_composite_keys=composite,
         source_relations=relations,
+        model_declarations=declarations,
+        declaration_notes=unread,
         notes=found,
     )
+
+
+def _primary_key_columns(model: Any, connector: str | None) -> list[str] | None:
+    """The model's primary key as physical columns, or None if any has none."""
+
+    primary = [physical_column(c, connector) for c in model.columns if c.primary_key]
+    return [str(c) for c in primary] if primary and all(primary) else None
 
 
 def declared_key_columns(model: Any, connector: str | None = None) -> list[list[str]]:
@@ -503,9 +531,9 @@ def declared_key_columns(model: Any, connector: str | None = None) -> list[list[
     """
 
     declared: list[list[str]] = []
-    primary = [physical_column(c, connector) for c in model.columns if c.primary_key]
-    if primary and all(primary):
-        declared.append([str(c) for c in primary])
+    primary = _primary_key_columns(model, connector)
+    if primary:
+        declared.append(primary)
     for col in model.columns:
         if not col.unique:
             continue

@@ -59,6 +59,7 @@ from ..semantic_declarations import (
     account,
     column_metadata,
     model_metadata,
+    native_column_metadata,
     placed_table,
     sibling_prefix,
     table_name,
@@ -335,9 +336,7 @@ def _carried_member(
 def _describe(member: dict[str, Any], fields: Mapping[str, Any]) -> None:
     if isinstance(fields.get("description"), str) and fields["description"]:
         member["description"] = fields["description"]
-    meta = column_metadata(fields)
-    if fields.get("additivity") in ("semi_additive", "non_additive"):
-        meta["additivity"] = fields["additivity"]
+    meta = native_column_metadata(fields)
     if meta:
         member["meta"] = {DEX_META_KEY: meta}
 
@@ -930,9 +929,7 @@ def _annotated(
                 carried.append(f"columns.{name}.aggregation")
         if isinstance(fields.get("description"), str) and fields["description"]:
             member["description"] = fields["description"]
-        column_meta = column_metadata(fields)
-        if fields.get("additivity") in ("semi_additive", "non_additive"):
-            column_meta["additivity"] = fields["additivity"]
+        column_meta = native_column_metadata(fields)
         if column_meta:
             _merge_meta(member, column_meta)
         carried.extend(_carried_member(name, fields, with_role=bool(role)))

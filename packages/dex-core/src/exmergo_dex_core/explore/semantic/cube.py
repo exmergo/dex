@@ -145,6 +145,12 @@ class LocalCubeLayer:
         defs = self._source.declared_definitions()
         return defs.declared_keys, defs.declared_composite_keys
 
+    def declared_models(self) -> tuple[dict[str, Any], list[str]]:
+        """Each definition's declaration (#977), with what could not be read."""
+
+        defs = self._source.declared_definitions()
+        return defs.model_declarations, defs.declaration_notes
+
     def _catalog_view(self):
         if self._view is None:
             try:

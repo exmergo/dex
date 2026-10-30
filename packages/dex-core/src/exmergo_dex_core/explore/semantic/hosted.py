@@ -246,6 +246,11 @@ class HostedDbtCloudBackend:
 
         return [], []
 
+    def declared_models(self) -> tuple[dict[str, Any], list[str]]:
+        """dbt's declarations reach exploration through ``definitions()`` too."""
+
+        return {}, []
+
     # ---- query -------------------------------------------------------------
 
     def filter_refs(self, clauses: list[str]) -> list[str] | None:

@@ -53,8 +53,8 @@ import yaml
 from ..semantic_declarations import (
     DEX_META_KEY,
     account,
-    column_metadata,
     model_metadata,
+    native_column_metadata,
     placed_table,
     population_sentence,
     sibling_prefix,
@@ -443,17 +443,10 @@ def _field(
         field_["dimension"] = {"is_time": True}
     if isinstance(column.get("description"), str) and column["description"]:
         field_["description"] = column["description"]
-    meta = _column_meta(column)
+    meta = native_column_metadata(column)
     if meta:
         field_["ai_context"] = {DEX_META_KEY: meta}
     return field_
-
-
-def _column_meta(column: Mapping[str, Any]) -> dict[str, Any]:
-    meta = column_metadata(column)
-    if column.get("additivity"):
-        meta["additivity"] = column["additivity"]
-    return meta
 
 
 def _carried_member(
@@ -1036,7 +1029,7 @@ def _annotated(
                 **(dimension if isinstance(dimension, dict) else {}),
                 "is_time": True,
             }
-        column_meta = _column_meta(column)
+        column_meta = native_column_metadata(column)
         if column_meta:
             context = field_.get("ai_context")
             context = (

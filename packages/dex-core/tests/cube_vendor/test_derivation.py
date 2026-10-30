@@ -182,6 +182,7 @@ def test_the_derived_cube_states_what_the_declaration_says(
         # The SQL selects a bare literal, so nothing free states its type.
         "type": "string",
         "primary_key": True,
+        "meta": {"dex": {"role": "key"}},
     }
     assert dimensions["ordered_at"]["type"] == "time"
     assert dimensions["status"]["description"] == "Lifecycle status."
@@ -193,7 +194,13 @@ def test_the_derived_cube_states_what_the_declaration_says(
             "sql": "{CUBE}.order_total",
             "type": "sum",
             "description": "Order value.",
-            "meta": {"dex": {"unit": "currency:EUR"}},
+            "meta": {
+                "dex": {
+                    "unit": "currency:EUR",
+                    "additivity": "additive",
+                    "role": "measure",
+                }
+            },
         }
     ]
     assert body["joins"] == [

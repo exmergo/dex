@@ -43,6 +43,7 @@ from ..project_definitions import (
     DeclaredForeignKey,
     DeclaredKey,
     DeclaredRelationship,
+    ModelDeclaration,
     ProjectDefinitions,
 )
 from ..semantic_catalog import (
@@ -53,6 +54,7 @@ from ..semantic_catalog import (
     SemanticModelInfo,
     column_reference,
 )
+from ..semantic_declarations import read_native_declaration
 from .dialects import select_expression
 from .loader import LoadedDocument
 
@@ -557,6 +559,8 @@ def definitions(
     joins: list[DeclaredForeignKey] = []
     declared_relationships: list[DeclaredRelationship] = []
     relations: dict[str, str] = {}
+    declarations: dict[str, ModelDeclaration] = {}
+    unread: list[str] = []
     found: list[str] = list(notes)
 
     for document in documents:
@@ -572,6 +576,12 @@ def definitions(
             if relation:
                 relations[qualified] = relation
             _keys(dataset, qualified, relation, keys, composite, found, connector)
+            declaration, declaration_notes = _declaration(
+                dataset, qualified, relation, connector
+            )
+            unread.extend(declaration_notes)
+            if declaration is not None:
+                declarations[qualified] = declaration
 
         for rel in model.get("relationships") or []:
             pairs, note = _resolved_pairs(rel, datasets, connector)
@@ -610,7 +620,39 @@ def definitions(
         # Every dataset is a relation the document reads, never one it builds,
         # so none of them is a model a build could have failed to produce.
         source_relations=relations,
+        model_declarations=declarations,
+        declaration_notes=unread,
         notes=found,
+    )
+
+
+def _declaration(
+    dataset: dict[str, Any],
+    qualified: str,
+    relation: str | None,
+    connector: str | None,
+) -> tuple[ModelDeclaration | None, list[str]]:
+    """The dataset's declaration: its ``primary_key`` is the grain (#976), and the
+    rest is read from ``ai_context.dex`` on the dataset and its fields (#977)."""
+
+    key = field_columns(dataset, dataset.get("primary_key") or [], connector)
+    grain = [str(c) for _, c in key] if key and not _opaque(key) else None
+    members = [
+        (
+            f["name"],
+            field_columns(dataset, [f["name"]], connector)[0][1],
+            f.get("ai_context"),
+        )
+        for f in dataset.get("fields") or []
+        if isinstance(f, dict) and isinstance(f.get("name"), str)
+    ]
+    return read_native_declaration(
+        qualified,
+        relation,
+        grain,
+        dataset.get("ai_context"),
+        members,
+        source=DECLARATION_SOURCE,
     )
 
 
@@ -662,6 +704,7 @@ def _keys(
                     relation=relation,
                     column=columns[0],
                     unique=True,
+                    primary=label == "primary key",
                     source=DECLARATION_SOURCE,
                 )
             )
@@ -671,6 +714,7 @@ def _keys(
                     model=qualified,
                     relation=relation,
                     columns=columns,
+                    claim="primary" if label == "primary key" else "unique",
                     source=DECLARATION_SOURCE,
                 )
             )

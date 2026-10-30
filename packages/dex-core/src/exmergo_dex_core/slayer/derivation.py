@@ -48,8 +48,8 @@ import yaml
 from ..semantic_declarations import (
     DEX_META_KEY,
     account,
-    column_metadata,
     model_metadata,
+    native_column_metadata,
     placed_table,
     sibling_prefix,
     with_population,
@@ -233,9 +233,7 @@ def _build(
             column["primary_key"] = True
         if isinstance(fields.get("description"), str) and fields["description"]:
             column["description"] = fields["description"]
-        meta = column_metadata(fields)
-        if fields.get("additivity") in ("semi_additive", "non_additive"):
-            meta["additivity"] = fields["additivity"]
+        meta = native_column_metadata(fields)
         if meta:
             column["meta"] = {DEX_META_KEY: meta}
         columns.append(column)
@@ -882,9 +880,7 @@ def _annotated(
         if isinstance(fields.get("description"), str) and fields["description"]:
             column["description"] = fields["description"]
             carried.append(f"columns.{name}.description")
-        column_meta = column_metadata(fields)
-        if fields.get("additivity") in ("semi_additive", "non_additive"):
-            column_meta["additivity"] = fields["additivity"]
+        column_meta = native_column_metadata(fields)
         if column_meta:
             column.setdefault("meta", {})
             if not isinstance(column["meta"], dict):

@@ -31,6 +31,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .errors import DexError
+from .project_definitions import (
+    DeclaredColumnMeaning,
+    ModelDeclaration,
+    read_population,
+)
 
 # --- the declaration model (#491) ----------------------------------------------------
 
@@ -267,6 +272,138 @@ def column_metadata(fields: Mapping[str, Any] | None) -> dict[str, Any]:
         if value not in (None, ""):
             out[key] = value
     return out
+
+
+def native_column_metadata(fields: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The column-level facts a native layer's own metadata carries (#977).
+
+    More than :func:`column_metadata`, because a native layer has no model YAML
+    behind it: this metadata is the only place ``explore --use-project`` can read
+    a column's role and its reference back from. A native construct (a time
+    dimension, a saved measure, a join) renders a role and does not state it.
+    """
+
+    out = column_metadata(fields)
+    for key in ("additivity", "role", "references"):
+        value = (fields or {}).get(key)
+        if value not in (None, ""):
+            out[key] = value
+    return out
+
+
+def read_native_declaration(
+    model: str,
+    relation: str | None,
+    grain: list[str] | None,
+    model_metadata_block: Any,
+    columns: Iterable[tuple[str, str | None, Any]],
+    *,
+    source: str,
+) -> tuple[ModelDeclaration | None, list[str]]:
+    """A native definition's declaration as the neutral read model, with notes.
+
+    ``grain`` is the definition's own primary key as physical columns, the native
+    field being the authority, so a definition with no ``dex`` metadata still
+    states what one row is. ``model_metadata_block`` is the definition's metadata
+    (``meta`` or ``ai_context``), and ``columns`` is ``(member, physical column or
+    None, member metadata)``.
+
+    The metadata is untrusted repository text: anything of the wrong shape, or
+    outside the declaration's vocabulary, is left out and named in a note. Never
+    raised on, and a note never repeats the value, since the value is what is not
+    trusted.
+    """
+
+    notes: list[str] = []
+    dex = _dex_block(model_metadata_block, model, notes)
+    if "grain" in dex:
+        notes.append(
+            f"{model}: the `grain` in its dex metadata is ignored; the definition's "
+            "own primary key states the grain"
+        )
+    population = _read_native_population(dex.get("population"), model, notes)
+
+    meanings: dict[str, DeclaredColumnMeaning] = {}
+    for member, column, metadata in columns:
+        where = f"{model}.{member}"
+        stated = _read_native_meaning(_dex_block(metadata, where, notes), where, notes)
+        if not stated:
+            continue
+        if column is None:
+            notes.append(
+                f"{where}: links no physical column, so its dex metadata is not "
+                "reported"
+            )
+            continue
+        meanings[column] = DeclaredColumnMeaning(**stated)
+
+    if not (grain or population or meanings):
+        return None, notes
+    return (
+        ModelDeclaration(
+            model=model,
+            relation=relation,
+            grain=list(grain) if grain else None,
+            population=population,
+            columns=meanings,
+            source=source,
+        ),
+        notes,
+    )
+
+
+def _dex_block(metadata: Any, where: str, notes: list[str]) -> Mapping[str, Any]:
+    if not isinstance(metadata, Mapping):
+        return {}
+    dex = metadata.get(DEX_META_KEY)
+    if dex is None:
+        return {}
+    if not isinstance(dex, Mapping):
+        notes.append(f"{where}: its dex metadata is not a mapping, so it is not read")
+        return {}
+    return dex
+
+
+def _read_native_population(raw: Any, where: str, notes: list[str]) -> Any:
+    if raw is None:
+        return None
+    population = read_population(raw)
+    stated = raw.get("filters") if isinstance(raw, dict) else None
+    read = len(population.filters) if population is not None else 0
+    malformed = (
+        population is None
+        or (isinstance(stated, list) and read < len(stated))
+        or (bool(stated) and not isinstance(stated, list))
+    )
+    if malformed:
+        notes.append(
+            f"{where}: part of the population in its dex metadata is malformed and "
+            "is not reported"
+        )
+    return population
+
+
+def _read_native_meaning(
+    dex: Mapping[str, Any], where: str, notes: list[str]
+) -> dict[str, str]:
+    allowed = {
+        "role": {item.value for item in Role},
+        "additivity": {item.value for item in Additivity},
+    }
+    stated: dict[str, str] = {}
+    for key in ("role", "unit", "additivity", "references"):
+        value = dex.get(key)
+        if value is None:
+            continue
+        text = value.strip() if isinstance(value, str) else ""
+        if not text or (key in allowed and text not in allowed[key]):
+            notes.append(
+                f"{where}: the `{key}` in its dex metadata is malformed and is not "
+                "reported"
+            )
+            continue
+        stated[key] = text
+    return stated
 
 
 def declared_fields(declared: Mapping[str, Any]) -> list[str]:

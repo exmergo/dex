@@ -49,6 +49,7 @@ from ..project_definitions import (
     DeclaredForeignKey,
     DeclaredKey,
     DeclaredRelationship,
+    ModelDeclaration,
     ProjectDefinitions,
 )
 from ..semantic_catalog import (
@@ -60,6 +61,7 @@ from ..semantic_catalog import (
     SemanticCatalogView,
     SemanticModelInfo,
 )
+from ..semantic_declarations import read_native_declaration
 from .model import MEASURE, Cube, Member, View
 from .references import resolve, scan
 from .validator import PREDEFINED_GRANULARITIES
@@ -690,6 +692,8 @@ def definitions(
     composite: list[DeclaredCompositeKey] = []
     foreign: list[DeclaredForeignKey] = []
     relationships: list[DeclaredRelationship] = []
+    declarations: dict[str, ModelDeclaration] = {}
+    unread: list[str] = []
     found: list[str] = list(notes)
     relations = {
         cube.name: relation
@@ -706,6 +710,7 @@ def definitions(
                     relation=relations.get(cube.name),
                     column=columns[0],
                     unique=True,
+                    primary=True,
                     source=DECLARATION_SOURCE,
                 )
             )
@@ -715,9 +720,24 @@ def definitions(
                     model=cube.name,
                     relation=relations.get(cube.name),
                     columns=columns,
+                    claim="primary",
                     source=DECLARATION_SOURCE,
                 )
             )
+        declaration, declaration_notes = read_native_declaration(
+            cube.name,
+            relations.get(cube.name),
+            columns,
+            cube.raw.get("meta"),
+            [
+                (m.name, resolved.columns.get((cube.name, m.name)), m.raw.get("meta"))
+                for m in [*cube.dimensions, *cube.measures]
+            ],
+            source=DECLARATION_SOURCE,
+        )
+        unread.extend(declaration_notes)
+        if declaration is not None:
+            declarations[cube.name] = declaration
         for join in cube.joins:
             declared, note = declared_relationship(cube, join, resolved, relations)
             if note:
@@ -754,6 +774,8 @@ def definitions(
         declared_keys=keys,
         declared_composite_keys=composite,
         source_relations=relations,
+        model_declarations=declarations,
+        declaration_notes=unread,
         notes=found,
     )
 

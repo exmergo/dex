@@ -204,7 +204,9 @@ def test_the_derived_model_states_what_the_declaration_says(
     columns = {c["name"]: c for c in body["columns"]}
     assert columns["order_id"]["primary_key"] is True
     assert columns["ordered_at"]["type"] == "DATE"
-    assert columns["order_total"]["meta"] == {"dex": {"unit": "currency:EUR"}}
+    assert columns["order_total"]["meta"] == {
+        "dex": {"unit": "currency:EUR", "additivity": "additive", "role": "measure"}
+    }
     assert body["joins"] == [
         {
             "target_model": "customers",

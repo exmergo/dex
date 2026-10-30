@@ -457,7 +457,10 @@ dex explore relationships --use-project --verify
 dex explore diagram
 ```
 
-Three things arrive from the document.
+Three things arrive from the document, and a fourth with `explore profile
+--use-project` or the map's objects: a `declaration` on each dataset's relation,
+with its `primary_key` as the grain, `grain_status` comparing it with what
+profiling measured, and anything annotated under `ai_context.dex`.
 
 **Source annotations.** Each relation is marked with the semantic models sitting
 on it, and empty is an answer: `dex_demo.main.products` and

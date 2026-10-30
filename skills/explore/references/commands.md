@@ -93,6 +93,14 @@ column named `window`, which DuckDB reserves and dbt must quote).
   is annotated too. Declared columns are capped at 12 unless `--columns all`.
   Population values and the rule are withheld in values-free mode and for a
   filter on a PII-flagged column, named in `withheld_fields`.
+- A native semantic layer (Ossie, SLayer, Cube) answers `--use-project` the same
+  way, with no dbt project in the repository. Its `primary_key` is the declared
+  grain at either arity, overriding a measured key; a `unique_keys` entry or a
+  `unique` flag is measured and never reported as the grain. The rest comes from
+  its `dex` metadata (`ai_context.dex`, `meta.dex`), which is untrusted text: a
+  malformed part is left out and named in `notes`, never raised. Where a dbt
+  model and a layer declare one relation, the dbt declaration is reported whole,
+  and `notes` names both and any grain they disagree on.
 - `--target dev` also reads the dev namespace for this one command, as
   `maintain verify --target dev` does. Use it when a model's only build is the
   dev one and the source allowlist does not reach the namespace dbt writes into:

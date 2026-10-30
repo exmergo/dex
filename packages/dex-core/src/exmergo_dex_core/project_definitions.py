@@ -26,6 +26,8 @@ same downstream and only one of them is true.
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
 __all__ = [
@@ -38,6 +40,7 @@ __all__ = [
     "DeclaredRelationship",
     "ModelDeclaration",
     "ProjectDefinitions",
+    "read_population",
 ]
 
 
@@ -75,13 +78,20 @@ class DeclaredRelationship(BaseModel):
 
 
 class DeclaredKey(BaseModel):
-    """A column declared unique and/or not null on one model."""
+    """A column declared unique and/or not null on one model.
+
+    ``primary`` says the column is the model's row identity, a native layer's
+    ``primary_key``, as opposed to one more column that happens to be unique (a
+    dbt ``unique`` test, an Ossie ``unique_keys`` entry). Only the first is a
+    grain claim (#976).
+    """
 
     model: str
     relation: str | None = None
     column: str
     unique: bool = False
     not_null: bool = False
+    primary: bool = False
     source: str
 
 
@@ -94,11 +104,19 @@ class DeclaredCompositeKey(BaseModel):
     (it is the model's own claim about several columns together, not one
     column's own test), so overloading ``column`` to sometimes hold a list would
     blur two different concepts into one field.
+
+    ``claim`` says what the combination is (#976): ``primary`` is a native
+    layer's ``primary_key``, the row identity; ``combination`` is a model-level
+    test (dbt's ``unique_combination_of_columns``), which exploration takes as
+    the grain unless measurement proved a single column; and ``unique`` is one
+    further key (an Ossie ``unique_keys`` entry), which is measured for drift
+    and never reported as the grain.
     """
 
     model: str
     relation: str | None = None
     columns: list[str]
+    claim: Literal["primary", "combination", "unique"] = "combination"
     source: str
 
 
@@ -130,6 +148,44 @@ class DeclaredPopulation(BaseModel):
 
     rule: str | None = None
     filters: list[DeclaredPopulationFilter] = Field(default_factory=list)
+
+
+def read_population(raw: Any) -> DeclaredPopulation | None:
+    """A declared population from repository text, or None.
+
+    Lenient by design: this reads what a human or a tool wrote, so a field of the
+    wrong shape is left out rather than raised on. Every format's declaration
+    reader shares it, which is why it lives in this leaf.
+    """
+
+    if not isinstance(raw, dict):
+        return None
+    rule = raw.get("rule") if isinstance(raw.get("rule"), str) else None
+    filters: list[DeclaredPopulationFilter] = []
+    entries = raw.get("filters")
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("column"), str):
+            continue
+        includes = _scalar_values(entry.get("includes"))
+        excludes = _scalar_values(entry.get("excludes"))
+        if includes or excludes:
+            filters.append(
+                DeclaredPopulationFilter(
+                    column=entry["column"], includes=includes, excludes=excludes
+                )
+            )
+    if not (rule and rule.strip()) and not filters:
+        return None
+    return DeclaredPopulation(
+        rule=rule if rule and rule.strip() else None, filters=filters
+    )
+
+
+def _scalar_values(raw: Any) -> list[str | int | float | bool] | None:
+    if not isinstance(raw, list):
+        return None
+    kept = [value for value in raw if isinstance(value, str | int | float | bool)]
+    return kept or None
 
 
 class ModelDeclaration(BaseModel):
@@ -198,6 +254,8 @@ class ProjectDefinitions(BaseModel):
     primary_entities: dict[str, str] = Field(default_factory=dict)
     declared_grains: dict[str, list[str]] = Field(default_factory=dict)
     model_declarations: dict[str, ModelDeclaration] = Field(default_factory=dict)
+    #: What a native layer's ``dex`` metadata held that could not be read (#977).
+    declaration_notes: list[str] = Field(default_factory=list)
     metric_models: list[str] = Field(default_factory=list)
     built_relation_names: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)

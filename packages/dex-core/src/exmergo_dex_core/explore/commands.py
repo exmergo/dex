@@ -900,6 +900,7 @@ def profile(
         else:
             for dataset in datasets:
                 dataset.semantic_models = []
+        notes.extend(defs.declaration_notes)
         datasets, declaration_notes = _apply_declarations(
             datasets,
             defs,
@@ -3975,18 +3976,28 @@ def _fold_semantic_layer_keys(
     try:
         from .semantic import resolve_semantic_layer
 
-        keys, composite_keys = resolve_semantic_layer(
-            engine, local=True
-        ).declared_keys()
+        layer = resolve_semantic_layer(engine, local=True)
+        keys, composite_keys = layer.declared_keys()
+        declarations, declaration_notes = layer.declared_models()
     except (DexError, ValueError, OSError):
         return defs
-    if not keys and not composite_keys:
+    if not keys and not composite_keys and not declarations:
+        if declaration_notes:
+            return defs.model_copy(
+                update={
+                    "notes": [*defs.notes, *declaration_notes],
+                    "declaration_notes": declaration_notes,
+                }
+            )
         return defs
     return defs.model_copy(
         update={
             "present": True,
             "declared_keys": [*defs.declared_keys, *keys],
             "declared_composite_keys": [*defs.declared_composite_keys, *composite_keys],
+            "model_declarations": {**declarations, **defs.model_declarations},
+            "notes": [*defs.notes, *declaration_notes],
+            "declaration_notes": declaration_notes,
         }
     )
 
@@ -4168,12 +4179,21 @@ def _apply_declarations(
         return datasets, []
     identifiers = [d.identifier for d in datasets]
     by_identifier: dict[str, Any] = {}
-    for model, declaration in sorted(defs.model_declarations.items()):
+    precedence: list[str] = []
+    # dbt first: a native layer's declaration of a dbt model was derived from the
+    # model's YAML, so the YAML is the source and the layer the copy.
+    for model, declaration in sorted(
+        defs.model_declarations.items(),
+        key=lambda item: (item[1].source in _DECLARING_LAYER, item[0]),
+    ):
         ident, _ambiguous = rel_mod.resolve_declared(
             declaration.relation, model, identifiers
         )
-        if ident is not None:
-            by_identifier.setdefault(ident.lower(), declaration)
+        if ident is None:
+            continue
+        kept = by_identifier.setdefault(ident.lower(), declaration)
+        if kept is not declaration:
+            precedence.append(_declaration_precedence_note(ident, kept, declaration))
 
     out: list[Dataset] = []
     applied = 0
@@ -4198,7 +4218,32 @@ def _apply_declarations(
             "(see declaration on each); a declared grain is reported as grain, with "
             "candidate_keys still measured and grain_status comparing the two"
         )
+    notes.extend(precedence)
     return out, notes
+
+
+def _declaration_precedence_note(ident: str, kept: Any, dropped: Any) -> str:
+    """Which of two declarations of one relation is reported, and why."""
+
+    def layer(declaration: Any) -> str:
+        return _DECLARING_LAYER.get(declaration.source, "the dbt project")
+
+    note = (
+        f"{ident} is declared twice: {kept.model} from {layer(kept)} is reported "
+        f"over {dropped.model} from {layer(dropped)}"
+    )
+    if kept.source not in _DECLARING_LAYER:
+        note += ", since a layer's declaration is derived from the dbt model's"
+    if (
+        kept.grain
+        and dropped.grain
+        and {c.lower() for c in kept.grain} != {c.lower() for c in dropped.grain}
+    ):
+        note += (
+            f"; their grains disagree ({', '.join(kept.grain)} against "
+            f"{', '.join(dropped.grain)})"
+        )
+    return note
 
 
 def _declared_column_cap_notes(datasets: list[Dataset], lift: str) -> list[str]:
@@ -4294,11 +4339,12 @@ def _apply_declared_grain(
     else:
         status = "unmeasured"
     if [c.lower() for c in dataset.grain or []] != [c.lower() for c in resolved]:
-        origin = (
-            f"measured grain was {', '.join(dataset.grain)}"
-            if dataset.grain
-            else "measurement found no key of its own"
-        )
+        if not dataset.grain:
+            origin = "measurement found no key of its own"
+        elif dataset.grain in dataset.candidate_keys:
+            origin = f"measured grain was {', '.join(dataset.grain)}"
+        else:
+            origin = f"another declaration states {', '.join(dataset.grain)}"
         dataset.data_quality.append(
             f"grain {', '.join(resolved)} comes from the model's declaration ({origin})"
         )
@@ -4754,6 +4800,7 @@ def _is_declared_profile_note(text: str) -> bool:
         "declared primary entity" in text
         or "declared unique" in text
         or "declared composite" in text
+        or "declared primary key" in text
         or "composite keys are declared" in text
         or "also declared for this table" in text
     )
@@ -4784,6 +4831,7 @@ def _apply_declared_profile(
     # contradiction note names where the claim lives.
     declared_unique: dict[str, dict[str, str]] = {}
     declared_composite: dict[str, list[list[str]]] = {}
+    declared_primary: dict[str, list[str]] = {}
     if defs is not None and (
         defs.primary_entities or defs.declared_keys or defs.declared_composite_keys
     ):
@@ -4804,11 +4852,16 @@ def _apply_declared_profile(
                 declared_unique.setdefault(ident.lower(), {}).setdefault(
                     key.column.lower(), key.source
                 )
+                if key.primary:
+                    declared_primary.setdefault(ident.lower(), [key.column])
         for composite in defs.declared_composite_keys:
             ident, _ambiguous = rel_mod.resolve_declared(
                 composite.relation, composite.model, identifiers
             )
-            if ident is None:
+            if ident is None or composite.claim == "unique":
+                continue
+            if composite.claim == "primary":
+                declared_primary.setdefault(ident.lower(), list(composite.columns))
                 continue
             bucket = declared_composite.setdefault(ident.lower(), [])
             normalized = {c.lower() for c in composite.columns}
@@ -4856,8 +4909,34 @@ def _apply_declared_profile(
                     "profiling found duplicates"
                 )
 
+        primary = declared_primary.get(ds.identifier.lower())
+        if primary:
+            live = {c.name.lower(): c.name for c in ds.columns}
+            resolved = [live.get(c.lower()) for c in primary]
+            if all(resolved):
+                chosen = [str(c) for c in resolved]
+                if ds.grain != chosen:
+                    origin = (
+                        f"heuristic suggested {', '.join(ds.grain)}"
+                        if ds.grain
+                        else "measurement found no key of its own"
+                    )
+                    ds.data_quality.append(
+                        f"grain {', '.join(chosen)} comes from the project's "
+                        f"declared primary key ({origin})"
+                    )
+                ds.grain = chosen
+            else:
+                missing = [
+                    c for c, r in zip(primary, resolved, strict=True) if r is None
+                ]
+                ds.data_quality.append(
+                    f"declared primary key ({', '.join(primary)}) names column(s) "
+                    f"not in this profile ({', '.join(missing)}); not applied"
+                )
+
         composite_candidates = declared_composite.get(ds.identifier.lower())
-        if composite_candidates:
+        if composite_candidates and not primary:
             live = {c.name.lower(): c.name for c in ds.columns}
             valid: list[list[str]] = []
             for cols in composite_candidates:

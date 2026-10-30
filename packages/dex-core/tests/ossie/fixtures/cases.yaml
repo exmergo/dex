@@ -229,6 +229,11 @@ cases:
       - {model: grain.customers, column: customer_id}
       - {model: grain.customers, column: email}
       - {model: grain.orders, column: order_id}
+    # What one row is: the primary key of either arity, and never a unique key.
+    grains:
+      grain.allocations: [order_id, line_no, warehouse_id]
+      grain.customers: [customer_id]
+      grain.orders: [order_id]
     relationships:
       - model: grain.orders
         to_model: grain.customers

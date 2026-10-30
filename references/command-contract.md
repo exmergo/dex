@@ -1442,6 +1442,18 @@ resolved, so output without `--use-project` is unchanged.
   fresh one, and a removed declaration clears on the next run. Over a stale
   manifest the YAML is read instead, since a declaration is plain YAML a human
   edits.
+- A native semantic layer is a declaration source too, with no dbt project needed.
+  Its `primary_key` is the declared grain at either arity, reported ahead of a
+  measured key; an Ossie `unique_keys` entry, a SLayer `unique` flag and a dbt
+  `unique` test are measured and never reported as the grain. Population, role,
+  unit, additivity and `references` come from `dex` metadata (`ai_context.dex` on
+  Ossie, `meta.dex` on SLayer and Cube), and a document annotated before these
+  were stored reports no role until it is annotated again. The metadata is
+  untrusted text: a part of the wrong shape, or outside the vocabulary, is left
+  out and named in `notes`, and the note never repeats the value.
+- Where a dbt model and a native layer declare one relation, the dbt declaration
+  is reported whole, since a layer's is derived from it, and `notes` names both
+  and any grain they disagree on.
 - Declared columns are capped at 12 per object (`explore profile --columns all`
   lifts the cap there; `explore map` binds it in every mode), with the cut
   counted in `elided_column_count` and in `notes`.

@@ -51,10 +51,9 @@ from .project_definitions import (
     DeclaredCompositeKey,
     DeclaredForeignKey,
     DeclaredKey,
-    DeclaredPopulation,
-    DeclaredPopulationFilter,
     ModelDeclaration,
     ProjectDefinitions,
+    read_population,
 )
 from .semantic_catalog import (
     DIMENSIONS_PER_DECLARATION,
@@ -1380,7 +1379,7 @@ def declared_meaning(
 
     dex = entry_meta(entry).get("dex")
     dex = dex if isinstance(dex, dict) else {}
-    population = _declared_population(dex.get("population"))
+    population = read_population(dex.get("population"))
 
     columns: dict[str, DeclaredColumnMeaning] = {}
     raw = entry.get("columns") if isinstance(entry, dict) else None
@@ -1419,37 +1418,6 @@ def declared_meaning(
         columns=columns,
         source=source,
     )
-
-
-def _declared_population(raw: Any) -> DeclaredPopulation | None:
-    if not isinstance(raw, dict):
-        return None
-    rule = raw.get("rule") if isinstance(raw.get("rule"), str) else None
-    filters: list[DeclaredPopulationFilter] = []
-    entries = raw.get("filters")
-    for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict) or not isinstance(entry.get("column"), str):
-            continue
-        includes = _scalar_values(entry.get("includes"))
-        excludes = _scalar_values(entry.get("excludes"))
-        if includes or excludes:
-            filters.append(
-                DeclaredPopulationFilter(
-                    column=entry["column"], includes=includes, excludes=excludes
-                )
-            )
-    if not (rule and rule.strip()) and not filters:
-        return None
-    return DeclaredPopulation(
-        rule=rule if rule and rule.strip() else None, filters=filters
-    )
-
-
-def _scalar_values(raw: Any) -> list[str | int | float | bool] | None:
-    if not isinstance(raw, list):
-        return None
-    kept = [value for value in raw if isinstance(value, str | int | float | bool)]
-    return kept or None
 
 
 def _parse_relation_ref(value: Any) -> str | None:

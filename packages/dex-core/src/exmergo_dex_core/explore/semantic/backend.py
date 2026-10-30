@@ -93,6 +93,15 @@ class SemanticLayer(Protocol):
         """
         ...
 
+    def declared_models(self) -> tuple[dict[str, Any], list[str]]:
+        """Declarations this layer states itself, by model, and notes (#977).
+
+        Empty on the same terms as :meth:`declared_keys`. The notes say what the
+        layer's metadata held that could not be read, since that metadata is
+        untrusted text and a malformed block must never raise.
+        """
+        ...
+
 
 def descriptor_from_backend(backend: Any) -> BackendDescriptor:
     """Read a descriptor, including compatibility for narrow test doubles."""

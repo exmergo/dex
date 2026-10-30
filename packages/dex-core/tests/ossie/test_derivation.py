@@ -205,7 +205,7 @@ def test_the_derived_dataset_states_what_the_declaration_says(
     assert fields["ordered_at"]["datatype"] == "Date"
     assert fields["status"]["description"] == "Lifecycle status."
     assert fields["order_total"]["ai_context"] == {
-        "dex": {"unit": "currency:EUR", "additivity": "additive"}
+        "dex": {"unit": "currency:EUR", "additivity": "additive", "role": "measure"}
     }
     # A measure is a field, and its declared aggregation a dataset metric.
     assert body["metrics"] == [
@@ -518,7 +518,7 @@ def test_declarations_annotate_one_dataset_through_its_fields(
         {"name": "amount_sum", "expression": {"sql": "SUM(amount)"}}
     ]
     amount = next(f for f in orders["fields"] if f["name"] == "amount")
-    assert amount["ai_context"] == {"dex": {"unit": "currency:EUR"}}
+    assert amount["ai_context"] == {"dex": {"unit": "currency:EUR", "role": "measure"}}
     assert document["relationships"] == [
         {
             "name": "orders_to_customers",
