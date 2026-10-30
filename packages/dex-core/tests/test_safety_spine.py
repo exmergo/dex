@@ -5140,6 +5140,74 @@ def test_a_dev_profile_never_clears_an_ordinary_query(monkeypatch, fake_sf_conne
     assert [d.identifier for d in cached.datasets] == ["SHOP.DBT_DEV.STG_ORDERS"]
 
 
+@pytest.mark.parametrize(
+    ("connector", "target", "scopes", "held_back"),
+    [
+        # A `--scope` that narrows past the dev namespace holds its profiles
+        # back, though the committed allowlist reaches it.
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            ["SHOP.PUBLIC"],
+            ["SHOP.DBT_DEV.STG_ORDERS"],
+        ),
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            None,
+            [],
+        ),
+        # A bare BigQuery dev dataset is the configured project's; the same
+        # dataset name in another allowlisted project is a source.
+        (
+            "bigquery",
+            {
+                "project": "shop",
+                "datasets": ["other.dbt_dev"],
+                "dev_dataset": "dbt_dev",
+            },
+            None,
+            ["shop.dbt_dev.stg_orders"],
+        ),
+    ],
+)
+def test_dev_profiles_are_held_back_from_the_scope_a_query_reads(
+    connector, target, scopes, held_back
+):
+    # Family 2 (#893): the cache a query adjudicates on reads what this
+    # command's scope reads, and `--scope` only ever narrows it.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.explore.commands import _without_dev_profiles
+    from exmergo_dex_core.storage import MemoryStore
+
+    dev = (
+        "SHOP.DBT_DEV.STG_ORDERS"
+        if connector == "snowflake"
+        else ("shop.dbt_dev.stg_orders")
+    )
+    source = (
+        "SHOP.PUBLIC.ORDERS" if connector == "snowflake" else ("other.dbt_dev.orders")
+    )
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier=name, columns=[ColumnProfile(name="id", data_type="INT")]
+            )
+            for name in (dev, source)
+        ]
+    )
+    engine = DexEngine(
+        config=DexConfig.model_validate({"connector": connector, connector: target}),
+        store=MemoryStore(),
+        scopes=scopes,
+    )
+    kept = [d.identifier for d in _without_dev_profiles(engine, cache).datasets]
+    assert sorted({dev, source} - set(kept)) == held_back
+    assert source in kept
+
+
 def test_profile_refuses_a_prod_target(monkeypatch, fake_sf_connection):
     from exmergo_dex_core.explore.commands import profile
     from exmergo_dex_core.transform.build import ProdTargetRefusedError

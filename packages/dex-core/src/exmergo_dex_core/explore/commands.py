@@ -501,10 +501,11 @@ def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
     `explore profile --target dev` caches what it profiles (#893), so drafting
     can read a dev-only build. A command that runs SQL through the ordinary
     adapter must not clear a relation on those entries: the firewall would admit
-    a relation the committed allowlist does not reach, and the adapter would run
-    it without ever having agreed to read that namespace. Only the dev namespace
-    outside the allowlist is held back; one the allowlist reaches is a source
-    like any other. A copy, so the entries stay in the cache for drafting.
+    a relation the source scope does not reach, and the adapter would run it
+    without ever having agreed to read that namespace. Only the dev namespace
+    outside the scope this command reads (the allowlist, or the ``--scope``
+    narrowing it) is held back; one that scope reaches is a source like any
+    other. A copy, so the entries stay in the cache for drafting.
     """
 
     from ..connect import dev_namespace_outside_allowlist
@@ -512,16 +513,21 @@ def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
     connector = engine.connector or engine.config.connector
     if not connector:
         return cache
-    dev = dev_namespace_outside_allowlist(
-        connector, getattr(engine.config, connector, None)
-    )
+    target = getattr(engine.config, connector, None)
+    dev = dev_namespace_outside_allowlist(connector, target, engine.scopes)
     if dev is None:
         return cache
     dev = dev.lower()
+    # A bare BigQuery dev dataset lives in the configured project, as the
+    # adapter reads it; a dataset of that name in another project is not it.
+    project = engine.project or getattr(target, "project", None)
+    exact = connector == "bigquery" and ("." in dev or bool(project))
+    if exact and "." not in dev:
+        dev = f"{project}.{dev}".lower()
 
     def in_dev(identifier: str) -> bool:
         namespace = identifier.rsplit(".", 1)[0].lower()
-        return namespace == dev or namespace.endswith(f".{dev}")
+        return namespace == dev or (not exact and namespace.endswith(f".{dev}"))
 
     kept = [d for d in cache.datasets if not in_dev(d.identifier)]
     if len(kept) == len(cache.datasets):
