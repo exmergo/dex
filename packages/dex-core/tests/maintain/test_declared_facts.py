@@ -215,6 +215,28 @@ def test_a_model_without_a_declaration_keeps_the_existing_order():
     assert plan["other"][0].source == "declaration"
 
 
+def test_a_declared_grain_that_holds_is_recorded_as_proven(tmp_path: Path):
+    """#841: the count that would have reported a broken grain also proves an
+    intact one, which is what lets a fan-out on that model rank as intended."""
+
+    result = _run(
+        tmp_path,
+        {
+            "model.shop.held": _model("held", dex={"grain": ["a", "b"]}),
+            "model.shop.broke": _model("broke", dex={"grain": ["a"]}),
+        },
+        "CREATE TABLE held AS SELECT i AS a, i % 2 AS b FROM range(0, 10) t(i)",
+        "CREATE TABLE broke AS SELECT i % 3 AS a FROM range(0, 10) t(i)",
+        check_grain=True,
+    )
+    assert result.proven_grains == {
+        "held": {"columns": ["a", "b"], "source": "declaration"}
+    }
+    assert [f.identifier for f in result.findings if f.code == "grain_broken"] == [
+        "broke"
+    ]
+
+
 def test_a_composite_grain_is_checked_with_no_dbt_utils_test(
     maintain_repo, monkeypatch
 ):

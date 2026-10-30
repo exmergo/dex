@@ -658,7 +658,22 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
             for dataset in (cache.datasets if cache is not None else [])
         },
         "cache_note": note,
+        "dev_namespace": _dev_namespace(engine),
     }
+
+
+def _dev_namespace(engine: DexEngine) -> str | None:
+    """The dev namespace a plain `explore profile` cannot read (#893), read from
+    the config alone so drafting still opens nothing."""
+
+    from ..connect import dev_namespace_outside_allowlist
+
+    connector = engine.connector or engine.config.connector
+    if not connector:
+        return None
+    return dev_namespace_outside_allowlist(
+        connector, getattr(engine.config, connector, None)
+    )
 
 
 def _post_change_index(view: Any, edits: list[PlanEdit]) -> Any:

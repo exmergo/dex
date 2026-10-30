@@ -970,3 +970,71 @@ def test_declared_facts_that_do_not_fit_come_back_as_an_offer():
     assert offer.data["per_table_bytes"] == {"(declared facts)": 50_000.0}
     assert offer.data["statement_count"] == 2
     assert "--verify --confirm --budget" in offer.data["hint"]
+
+
+# --- #841: a build's own passing uniqueness test speaks for its fan-out ------------
+
+
+def _fanned_project(project: Path, test_status: str) -> tuple[dict, _StubAdapter]:
+    nodes = {
+        "model.shop.fct_lines": {
+            "name": "fct_lines",
+            "resource_type": "model",
+            "relation_name": '"warehouse"."dbt_dev"."fct_lines"',
+            "compiled_code": (
+                'select o.id, i.sku from "warehouse"."raw"."orders" o '
+                'inner join "warehouse"."raw"."items" i on o.id = i.order_id'
+            ),
+            "config": {"materialized": "table"},
+        },
+        "test.shop.unique_fct_lines_line_id.1a2b": {
+            "resource_type": "test",
+            "attached_node": "model.shop.fct_lines",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": "line_id"}},
+        },
+    }
+    _artifacts(
+        project,
+        nodes=nodes,
+        results=[
+            {"unique_id": "model.shop.fct_lines", "status": "success"},
+            {
+                "unique_id": "test.shop.unique_fct_lines_line_id.1a2b",
+                "status": test_status,
+            },
+        ],
+    )
+    summary = _summary(
+        [
+            _node("model.shop.fct_lines"),
+            _node("test.shop.unique_fct_lines_line_id.1a2b", status=test_status),
+        ]
+    )
+    adapter = _StubAdapter(
+        [
+            _Meta("warehouse.raw.orders"),
+            _Meta("warehouse.raw.items"),
+            _Meta("warehouse.dbt_dev.fct_lines"),
+        ],
+        counts={"warehouse.dbt_dev.fct_lines": 500, "warehouse.raw.orders": 100},
+    )
+    return summary, adapter
+
+
+def test_a_passing_unique_test_caps_the_build_s_fanout_at_low(tmp_path: Path):
+    summary, adapter = _fanned_project(tmp_path, "pass")
+    result = _sweep(tmp_path, summary, adapter)
+    (finding,) = [f for f in result.findings if f.code == "row_fanout"]
+    assert finding.severity == "low"
+    assert finding.data["grain_proven"] == {
+        "columns": ["line_id"],
+        "source": "unique_test",
+    }
+
+
+def test_a_failing_unique_test_proves_nothing(tmp_path: Path):
+    summary, adapter = _fanned_project(tmp_path, "fail")
+    result = _sweep(tmp_path, summary, adapter)
+    (finding,) = [f for f in result.findings if f.code == "row_fanout"]
+    assert finding.severity == "high"
+    assert "grain_proven" not in finding.data

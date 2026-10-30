@@ -3114,3 +3114,24 @@ def test_row_count_refreshes_after_the_aggregate_scan():
     assert id_col.distinct_count == 1000
     assert id_col.distinct_count_exact is True
     assert id_col.is_unique is True
+
+
+def test_profile_target_dev_is_a_named_no_op_on_duckdb(duckdb_file: Path, capsys):
+    """#893: DuckDB's dev target is the file the connection already reads, so
+    `--target dev` widens nothing and says so rather than staying silent."""
+
+    payload = _run(
+        ["explore", "profile", "orders", "--target", "dev", "--path", str(duckdb_file)],
+        capsys,
+    )
+    notes = payload["data"]["notes"]
+    assert any("--target dev widened nothing" in note for note in notes), notes
+
+
+def test_profile_refuses_a_prod_target_before_reading(duckdb_file: Path, capsys):
+    rc = main(
+        ["explore", "profile", "orders", "--target", "prod", "--path", str(duckdb_file)]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc != 0 and payload["status"] == "error", payload
+    assert "looks like production" in payload["errors"][0]

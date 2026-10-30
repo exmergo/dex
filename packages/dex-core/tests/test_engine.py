@@ -1188,3 +1188,41 @@ def test_importing_the_package_pulls_in_no_connector_library():
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
     assert out.stdout.strip() == "[]", out.stdout
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "expected"),
+    [
+        (
+            "snowflake",
+            {
+                "databases": ["SHOP.PUBLIC"],
+                "dev_database": "SHOP",
+                "dev_schema": "DBT_DEV",
+            },
+            "SHOP.DBT_DEV",
+        ),
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            None,
+        ),
+        ("snowflake", {"dev_database": "SHOP", "dev_schema": "DBT_DEV"}, None),
+        ("postgres", {"schemas": ["public"], "dev_schema": "dbt_dev"}, "dbt_dev"),
+        ("postgres", {"schemas": ["public"]}, None),
+        ("duckdb", {"path": "x.duckdb"}, None),
+    ],
+)
+def test_the_dev_namespace_a_plain_read_cannot_reach(connector, target, expected):
+    """#893: the namespace a drafting hint must name `--target dev` for is the
+    dev one the committed allowlist does not reach; an empty allowlist reads
+    everything, and DuckDB has no namespace to be outside of."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.connect import dev_namespace_outside_allowlist
+
+    config = DexConfig.model_validate({"connector": connector, connector: target})
+    assert (
+        dev_namespace_outside_allowlist(connector, getattr(config, connector))
+        == expected
+    )

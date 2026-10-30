@@ -283,7 +283,7 @@ paths the payload stated). `data.skipped` lists every other selected model:
 | `python_model` | a Python model; dex drafts from SQL only |
 | `versioned` | a model with `versions:`; declare each version by hand |
 | `sql_unreadable` | the SQL could not be read statically (`detail` says why) |
-| `unprofiled_inputs` | the cache has not profiled what it reads; `commands` holds the `explore profile` call for each. Nothing is scanned |
+| `unprofiled_inputs` | the cache has not profiled what it reads; `commands` holds an `explore profile` call that can reach each one: `explore profile <dev namespace>.<model> --target dev` for a project model whose dev namespace the source allowlist does not reach, and none (the reason says why) for a name that matches several profiled relations, which no profile run settles. Nothing is scanned |
 | `nothing_drafted` | the cache proves no key, verified join or running total for it |
 | `complete` | it already declares every fact dex can draft |
 | `not_writable` | its YAML cannot be spliced predictably (a flow-style entry), or a drafted fact does not fit the SELECT list; the rest of the batch still plans |

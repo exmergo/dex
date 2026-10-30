@@ -941,6 +941,17 @@ def _build_parser() -> argparse.ArgumentParser:
                             "(billed)"
                         ),
                     )
+                    # A model whose only build is the dev one lives where dex
+                    # does not read (#893); this reads it for one command, as
+                    # `maintain verify --target dev` does.
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "also read this dbt dev target's namespace; "
+                            "prod-looking targets are refused"
+                        ),
+                    )
                     # Default summarizes each dataset's columns to the ones that
                     # carry a finding (#288); --columns all restores the full list.
                     sp.add_argument(

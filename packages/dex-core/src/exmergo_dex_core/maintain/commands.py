@@ -1180,6 +1180,7 @@ def verify(
                 if project_dir is not None
                 else ([], [])
             )
+            proven_grains: dict[str, dict] = {}
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1187,6 +1188,7 @@ def verify(
                 live,
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
+                proven=proven_grains,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1258,6 +1260,11 @@ def verify(
                 )
                 findings.extend(facts.findings)
                 warnings.extend(facts_plan_notes + facts.notes)
+                # Every grain is judged by now, so a fan-out on a model whose
+                # declared grain held is ranked as the expansion it is (#841).
+                findings = verify_mod.damp_fanout(
+                    findings, {**proven_grains, **facts.proven_grains}
+                )
                 # No manifest is the more specific reason than "nothing declared".
                 for finding_class, reason in facts.suppressed.items():
                     suppressed[finding_class] = (
@@ -1334,6 +1341,7 @@ def _grain_contract(
     *,
     scope=None,
     counted_elsewhere: set[str] | None = None,
+    proven: dict[str, dict] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1371,6 +1379,7 @@ def _grain_contract(
         model_relations,
         [o.identifier for o in live],
         scoped_models,
+        proven=proven,
     )
     return findings, notes, None
 

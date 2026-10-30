@@ -674,6 +674,8 @@ class DeclaredFactsResult:
     notes: list[str] = field(default_factory=list)
     suppressed: dict[str, str] = field(default_factory=dict)
     offer: object | None = None
+    # The declared grains the statement counted unique, per model (#841).
+    proven_grains: dict[str, dict] = field(default_factory=dict)
 
 
 def nothing_declared(finding_class: str, where: str) -> str:
@@ -909,6 +911,11 @@ def _judge_aggregate(
 
     if probe.grain is not None:
         distinct = row.get("dex_grain")
+        if distinct is not None and int(distinct) >= rows:
+            result.proven_grains[model] = {
+                "columns": list(probe.grain),
+                "source": "declaration",
+            }
         if distinct is not None and int(distinct) < rows:
             from .verify import _grain_broken_finding
 

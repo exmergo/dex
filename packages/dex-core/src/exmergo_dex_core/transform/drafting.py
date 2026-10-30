@@ -140,6 +140,7 @@ def draft(
     domain_cap: int = 25,
     cumulative: Mapping[str, set[str]] | None = None,
     cache_note: str | None = None,
+    dev_namespace: str | None = None,
     index: Callable[[], ReferenceIndex] | None = None,
     prior: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -148,7 +149,10 @@ def draft(
     ``files`` is the project as it reads once the plan lands. ``cache`` has had
     any ``pii_overrides`` applied already. ``cumulative`` maps a cache identifier
     to the columns the cumulative detector flagged there. ``cache_note`` says
-    why the cache is absent, where it is. ``index`` builds the reference index
+    why the cache is absent, where it is. ``dev_namespace`` is the namespace dbt
+    dev builds write into when the source allowlist does not reach it, so the
+    command an unprofiled project model is named with is one that can find its
+    dev build (#893). ``index`` builds the reference index
     of that same project state, called at most once and only when a model uses
     a column precedent can be read for; without it no precedent is drafted.
     ``prior`` is the project as it reads before the plan; with it, a model that
@@ -184,6 +188,7 @@ def draft(
             domain_cap=domain_cap,
             cumulative=cumulative,
             cache_note=cache_note,
+            dev_namespace=dev_namespace,
         )
         if reading.usages and (found := reference_index()) is not None:
             precedent = _precedent(
@@ -1155,6 +1160,7 @@ def _drafted(
     cumulative: Mapping[str, set[str]],
     cache_note: str | None,
     model: str | None = None,
+    dev_namespace: str | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1205,13 +1211,31 @@ def _drafted(
                 else []
             )
             if len(ambiguous) > 1:
+                # Profiling again cannot help: every candidate is profiled
+                # already, and a bare name matches all of them (#893).
                 entry["reason"] = (
                     f"it matches {len(ambiguous)} relations in the cache "
-                    f"({', '.join(ambiguous)})"
+                    f"({', '.join(ambiguous)}), and a ref() is read by name, so "
+                    "no profile run can settle which one it means"
+                )
+            elif (
+                dev_namespace is not None
+                and model_sql_path(files, model_paths, relation) is not None
+            ):
+                # A project model's dev build is outside the allowlist, so only
+                # a read of the dev namespace finds it; qualified, so a prod
+                # copy the allowlist does reach cannot make it ambiguous.
+                built = _alias_of_model(files, model_paths, relation) or relation
+                entry["reason"] = cache_note or (
+                    "the cache has not profiled it, and its dev build in "
+                    f"{dev_namespace} is outside the source allowlist"
+                )
+                entry["command"] = (
+                    f"explore profile {dev_namespace}.{built} --target dev"
                 )
             else:
                 entry["reason"] = cache_note or "the cache has not profiled it"
-            entry["command"] = f"explore profile {relation}"
+                entry["command"] = f"explore profile {relation}"
         inputs.append(entry)
     if inputs:
         drafted["inputs"] = inputs
@@ -1859,15 +1883,16 @@ def _warnings(
             f"{', '.join(fields)}"
         )
     unprofiled = [
-        i["relation"]
-        for i in drafted.get("inputs", [])
-        if not i["profiled"] and i["relation"]
+        i for i in drafted.get("inputs", []) if not i["profiled"] and i["relation"]
     ]
     if unprofiled:
+        runnable = [i["command"] for i in unprofiled if i.get("command")]
+        stuck = [i for i in unprofiled if not i.get("command")]
         out.append(
-            f"'{model}' reads {', '.join(unprofiled)}, which the cache has not "
-            "profiled, so nothing was drafted from it; run "
-            + ", ".join(f"`explore profile {r}`" for r in unprofiled)
+            f"'{model}' reads {', '.join(i['relation'] for i in unprofiled)}, "
+            "which the cache has not profiled, so nothing was drafted from it"
+            + ("; run " + ", ".join(f"`{c}`" for c in runnable) if runnable else "")
+            + "".join(f"; {i['relation']}: {i['reason']}" for i in stuck)
         )
     elif reading.generated_sql:
         out.append(f"'{model}' is generated in SQL; nothing to draft from")

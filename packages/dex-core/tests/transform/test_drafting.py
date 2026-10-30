@@ -723,6 +723,93 @@ def test_an_unprofiled_input_is_named_with_the_command_that_profiles_it():
     assert any("`explore profile stg_refunds`" in w for w in warnings)
 
 
+def _dev_draft(cache: DexCache, *, alias: str | None = None):
+    """A mart over a project staging model whose dev build is outside the
+    allowlist (#893): the drafter names the dev namespace it must read."""
+
+    staging = "select 1 as id\n"
+    if alias is not None:
+        staging = f"{{{{ config(alias='{alias}') }}}}\n" + staging
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('stg_refunds') }}\n",
+        "models/staging/stg_refunds.sql": staging,
+    }
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        cache,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+    )
+    return drafts["fct"], warnings
+
+
+def test_a_dev_only_model_is_named_with_a_command_that_reads_the_dev_target():
+    """#893: a plain `explore profile stg_refunds` cannot find a model whose
+    only build is in a dev namespace the allowlist does not reach."""
+
+    entry, warnings = _dev_draft(CACHE)
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input == {
+        "relation": "stg_refunds",
+        "profiled": False,
+        "reason": (
+            "the cache has not profiled it, and its dev build in SHOP.DBT_DEV is "
+            "outside the source allowlist"
+        ),
+        "command": "explore profile SHOP.DBT_DEV.stg_refunds --target dev",
+    }
+    assert any(
+        "`explore profile SHOP.DBT_DEV.stg_refunds --target dev`" in w for w in warnings
+    )
+
+
+def test_the_dev_command_names_the_relation_a_literal_alias_builds():
+    entry, _ = _dev_draft(CACHE, alias="refunds")
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["command"] == (
+        "explore profile SHOP.DBT_DEV.refunds --target dev"
+    )
+
+
+def test_a_source_is_never_sent_to_the_dev_target():
+    """Only a project model is built into the dev namespace; a source lives
+    where the allowlist already reads."""
+
+    drafts, _ = draft(
+        ["fct"],
+        {"models/marts/fct.sql": "select id from {{ source('raw', 'refunds') }}\n"},
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input["command"] == "explore profile refunds"
+
+
+def test_an_ambiguous_input_names_no_command_and_says_why():
+    """#893: when the name matches several profiled relations, profiling again
+    settles nothing, so no command is offered rather than one that fails."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    entry, warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n", cache=cache
+    )
+    [missing_input] = entry["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["reason"] == (
+        "it matches 2 relations in the cache (warehouse.dbt_dev.stg_orders, "
+        "warehouse.main.stg_orders), and a ref() is read by name, so no profile "
+        "run can settle which one it means"
+    )
+    [warning] = [w for w in warnings if "stg_orders" in w and "profiled" in w]
+    assert "explore profile" not in warning
+    assert "no profile run can settle" in warning
+
+
 def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
     """#832: MetricFlow's time spine is ``select ... from range(...)``. sqlglot
     reads that table function as a table with no name, and the draft must not

@@ -1103,6 +1103,7 @@ class DexEngine:
         check_cumulative: bool = False,
         show_all_columns: bool = False,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> ProfileResult:
         from .explore import commands as explore
 
@@ -1117,6 +1118,7 @@ class DexEngine:
             use_project=use_project,
             check_cumulative=check_cumulative,
             result_mode=mode,
+            target=target,
         )
 
     def relationships(

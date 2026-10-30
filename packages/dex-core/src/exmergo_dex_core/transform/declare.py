@@ -434,16 +434,21 @@ def _why_nothing(
         reasons = list(
             dict.fromkeys(i.get("reason") or _NOT_PROFILED for i in unprofiled)
         )
+        # An input no command can profile (#893) is stated with its reason and
+        # left out of the commands, rather than named with one that fails.
+        commands = [i["command"] for i in unprofiled if i.get("command")]
         out["detail"] = (
             "nothing was drafted from "
             + ", ".join(i["relation"] for i in unprofiled)
             + ": "
             + "; ".join(reasons)
-            + ". Run "
-            + ", ".join(f"`{i['command']}`" for i in unprofiled)
-            + " and declare again"
+            + (
+                ". Run " + ", ".join(f"`{c}`" for c in commands) + " and declare again"
+                if commands
+                else ""
+            )
         )
-        out["commands"] = [i["command"] for i in unprofiled]
+        out["commands"] = commands
     elif drafted.get("incomplete"):
         out["reason"] = "sql_unreadable"
         out["detail"] = "; ".join(drafted["incomplete"])

@@ -1621,6 +1621,195 @@ def test_a_model_that_fans_out_is_reported_with_its_join_key(tmp_path: Path):
     assert findings[0].data["join_keys"] == ["o.order_id = i.order_id"]
 
 
+# --- #841: fan-out that is the model's purpose -----------------------------------
+
+_ANCHORED = (
+    "with anchors as (select date_day as anchor_date "
+    'from "wh"."main"."metricflow_time_spine"), '
+    'daily as (select * from "wh"."main"."fct_daily") '
+    "select anchors.anchor_date, daily.page from anchors inner join daily "
+    "on daily.data_date >= anchors.anchor_date - 14 "
+    "and daily.data_date < anchors.anchor_date"
+)
+
+
+def test_a_join_with_no_readable_key_caps_its_fanout_at_medium(tmp_path: Path):
+    """#841: a range join expands on purpose as often as by mistake, and with
+    no key there is nothing to call wrong, so size alone never ranks it high."""
+
+    checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
+    findings, _ = _judge(
+        checks,
+        {"metricflow_time_spine": 2557, "fct_daily": 900, "fct_comparison": 19096},
+    )
+    assert [f.code for f in findings] == ["row_fanout"]
+    finding = findings[0]
+    assert finding.severity == "medium"
+    assert finding.data["join_key_read"] is False
+    assert finding.data["severity_cap_applied"] == "join_key_unread"
+    assert "dex could not read the join key" in finding.detail
+    assert "severity capped at medium" in finding.detail
+
+
+def test_a_fanout_inside_the_medium_band_with_no_key_says_no_cap(tmp_path: Path):
+    checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
+    findings, _ = _judge(
+        checks,
+        {"metricflow_time_spine": 100, "fct_daily": 900, "fct_comparison": 150},
+    )
+    assert findings[0].severity == "medium"
+    assert findings[0].data["join_key_read"] is False
+    assert "severity_cap_applied" not in findings[0].data
+
+
+def test_each_join_is_shown_beside_its_own_keys(tmp_path: Path):
+    """A key read off the second join was shown next to the first join's label
+    (#841): each join now carries the keys its own ON clause holds."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "fct",
+                'select o.id from "wh"."main"."stg_orders" o '
+                'inner join "wh"."main"."spine" s on o.ordered_at >= s.day '
+                'left join "wh"."main"."stg_items" i on o.id = i.order_id',
+            )
+        },
+    )
+    assert checks[0].keys_by_join == ((), ("o.id = i.order_id",))
+    findings, _ = _judge(
+        checks, {"stg_orders": 100, "spine": 10, "stg_items": 300, "fct": 400}
+    )
+    detail = findings[0].detail
+    assert (
+        "inner join to 'wh.main.spine' (dex could not read the join key) or the "
+        "left join to 'wh.main.stg_items' on o.id = i.order_id"
+    ) in detail
+    # One join's key is readable, so the size of the expansion still ranks it.
+    assert findings[0].severity == "high"
+    assert "join_key_read" not in findings[0].data
+
+
+def _fanout(severity: str = "high", code: str = "row_fanout", model: str = "fct"):
+    from exmergo_dex_core.maintain.drift import DriftFinding
+
+    return DriftFinding(
+        axis="row_population",
+        code=code,
+        identifier=model,
+        severity=severity,
+        detail=f"'{model}' has 400 rows against its driving parent",
+        data={"row_count": 400},
+    )
+
+
+def test_a_proven_declared_grain_caps_a_fanout_at_low():
+    """#841: the extra rows are the grain the model declares, proven unique on
+    this run, so the finding stays listed but stops ranking with a wrong key."""
+
+    proven = {"fct": {"columns": ["comparison_key"], "source": "declaration"}}
+    (finding,) = verify_mod.damp_fanout([_fanout()], proven)
+    assert finding.severity == "low"
+    assert finding.data["grain_proven"] == {
+        "columns": ["comparison_key"],
+        "source": "declaration",
+    }
+    assert finding.data["severity_cap_applied"] == "grain_proven"
+    assert finding.data["row_count"] == 400
+    assert "[comparison_key] is proven unique" in finding.detail
+
+
+def test_damping_leaves_other_models_and_other_codes_alone():
+    proven = {"fct": {"columns": ["id"], "source": "unique_test"}}
+    findings = [
+        _fanout(model="other"),
+        _fanout(code="row_loss"),
+        _fanout(severity="low"),
+    ]
+    assert verify_mod.damp_fanout(findings, proven) == findings
+
+
+def test_a_declared_grain_that_holds_is_recorded_as_proven():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200, "db.main.b": 200},
+        columns={"db.main.a": ["id"], "db.main.b": ["id"]},
+        exact={"db.main.a": {"id": 200}, "db.main.b": {"id": 199}},
+    )
+    proven: dict = {}
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+            "b": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+        },
+        {"a": "db.main.a", "b": "db.main.b"},
+        ["db.main.a", "db.main.b"],
+        {"a", "b"},
+        proven=proven,
+    )
+    assert proven == {"a": {"columns": ["id"], "source": "unique_test"}}
+    assert [f.identifier for f in findings] == ["b"]
+
+
+def test_a_naming_guess_is_never_recorded_as_proven():
+    """Only a declaration says what one row is; an id-shaped column that
+    happens to be unique says nothing about the model's intent."""
+
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 200}},
+        approx={"db.main.a": {"id": (200, 0.0)}},
+    )
+    proven: dict = {}
+    verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}, proven=proven
+    )
+    assert proven == {}
+
+
+def test_a_passing_uniqueness_test_proves_its_model_s_grain(tmp_path: Path):
+    """A build's own passing `unique` test proved the grain on the relation
+    that build wrote; a failing one proved nothing."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.a": {"name": "a", "resource_type": "model"},
+            "model.p.b": {"name": "b", "resource_type": "model"},
+            "model.p.c": {"name": "c", "resource_type": "model"},
+            "test.p.unique_a_id.1": {
+                "resource_type": "test",
+                "attached_node": "model.p.a",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.unique_b_id.2": {
+                "resource_type": "test",
+                "attached_node": "model.p.b",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.combo_c.3": {
+                "resource_type": "test",
+                "attached_node": "model.p.c",
+                "test_metadata": {
+                    "name": "unique_combination_of_columns",
+                    "kwargs": {"combination_of_columns": ["day", "page"]},
+                },
+            },
+        },
+        results=[
+            {"unique_id": "test.p.unique_a_id.1", "status": "pass"},
+            {"unique_id": "test.p.unique_b_id.2", "status": "fail"},
+            {"unique_id": "test.p.combo_c.3", "status": "pass"},
+        ],
+    )
+    assert verify_mod.passed_grain_tests(tmp_path) == {
+        "a": {"columns": ["id"], "source": "unique_test"},
+        "c": {"columns": ["day", "page"], "source": "unique_test_composite"},
+    }
+
+
 def test_a_union_is_not_mistaken_for_fanout(tmp_path: Path):
     """A set operation has more rows than either side by construction, and no
     single driving parent to compare against, so it is declared rather than
@@ -1912,6 +2101,111 @@ def test_verify_reports_row_loss_end_to_end(
     assert findings[0]["exact"] is True
     assert payload["cost"]["paradigm"] == "free_local"
     assert "row_population" not in payload["data"]["suppressed"]
+
+
+def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
+    """#841's shape on a real warehouse: Monday anchors off a date spine,
+    range-joined to a daily fact, one row per anchor x day x page."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 100) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_daily AS SELECT DATE '2024-01-01' + i::INTEGER AS "
+        "data_date, p AS page FROM range(0, 100) t(i), (VALUES ('a'), ('b')) v(p)"
+    )
+    sql = (
+        "with anchors as (select date_day as anchor_date from "
+        '"warehouse"."main"."metricflow_time_spine" where dayofweek(date_day) = 1), '
+        'daily as (select * from "warehouse"."main"."fct_daily") '
+        "select anchors.anchor_date || '|' || daily.data_date || '|' || daily.page "
+        "as comparison_key, anchors.anchor_date, daily.data_date, daily.page "
+        "from anchors inner join daily "
+        "on daily.data_date >= anchors.anchor_date - 14 "
+        "and daily.data_date < anchors.anchor_date"
+    )
+    built = f"{sql} union all ({sql} limit 5)" if duplicate else sql
+    maintain_repo.sql(f"CREATE TABLE fct_comparison AS {built}")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.fct_comparison": {
+                "name": "fct_comparison",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_comparison"',
+                "compiled_code": sql,
+                "config": {"meta": {"dex": {"grain": ["comparison_key"]}}},
+            },
+            "model.maintain_test.fct_order_lines": {
+                "name": "fct_order_lines",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_order_lines"',
+                "compiled_code": (
+                    'select o.order_id from "warehouse"."main"."orders" o '
+                    'inner join "warehouse"."main"."orders" p '
+                    "on o.customer_id = p.customer_id"
+                ),
+            },
+        },
+        results=[],
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_order_lines AS SELECT o.order_id FROM orders o "
+        "JOIN orders p ON o.customer_id = p.customer_id"
+    )
+
+
+def test_verify_ranks_an_intended_expansion_low_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#841 end to end: the anchored comparison's declared grain is counted
+    unique, so its fan-out stays listed at low; a fan-out on a wrong key in the
+    same sweep, with no grain to speak for it, still ranks high."""
+
+    _anchored_comparison(maintain_repo)
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    fanouts = {
+        f["identifier"]: f
+        for f in payload["data"]["findings"]
+        if f["code"] == "row_fanout"
+    }
+    comparison = fanouts["fct_comparison"]
+    assert comparison["severity"] == "low"
+    assert comparison["data"]["grain_proven"] == {
+        "columns": ["comparison_key"],
+        "source": "declaration",
+    }
+    assert comparison["data"]["join_key_read"] is False
+    # One finding states one cap: the grain's replaces the unread key's.
+    assert comparison["detail"].count("severity capped") == 1
+    assert "severity capped at low" in comparison["detail"]
+    assert (
+        comparison["data"]["driving_parent"] == "warehouse.main.metricflow_time_spine"
+    )
+    assert fanouts["fct_order_lines"]["severity"] == "high"
+    assert not [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_comparison"
+    ]
+
+
+def test_verify_leaves_a_fanout_undamped_when_its_grain_broke(
+    maintain_repo, _assume_the_project_compiles
+):
+    _anchored_comparison(maintain_repo, duplicate=True)
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    by_code = {
+        f["code"]: f
+        for f in payload["data"]["findings"]
+        if f["identifier"] == "fct_comparison"
+    }
+    assert by_code["grain_broken"]["data"]["duplicate_count"] == 5
+    assert by_code["row_fanout"]["severity"] == "medium"
+    assert "grain_proven" not in by_code["row_fanout"]["data"]
 
 
 def test_verify_names_generated_sql_in_notes(

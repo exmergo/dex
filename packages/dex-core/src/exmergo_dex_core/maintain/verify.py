@@ -74,6 +74,13 @@ _ROW_LOSS_HIGH_FRACTION = 0.50
 # few extra matches; the key it joins on is wrong.
 _ROW_FANOUT_HIGH_FACTOR = 2.0
 
+# Said once when a fan-out with no readable key is capped, and dropped again
+# when a proven grain caps it further: one finding states one cap.
+_UNREAD_KEY_CAP = (
+    " (severity capped at medium: with no join key to read, dex cannot tell an "
+    "intended expansion from a wrong key)"
+)
+
 # Materializations whose row count is not a function of this run's parent, so
 # comparing the two says nothing. An incremental model holds whatever previous
 # runs loaded into it, which is the point of the materialization.
@@ -685,11 +692,14 @@ def _declared_grain_findings(
     identifier: str,
     candidates: list[GrainCandidate],
     min_rows: int,
+    proven: dict[str, dict] | None = None,
 ) -> tuple[list[DriftFinding], str | None, list[str]]:
     """Check every declared candidate for one model. Returns ``(findings,
-    unchecked_reason, unresolved)``: ``unchecked_reason`` is None when every
-    candidate was measured, ``"scan"`` when a candidate could not be measured
-    at all (a metered adapter declining an unaffordable scan, per
+    unchecked_reason, unresolved)``, and records in ``proven`` the first
+    candidate the scans showed unique (see :func:`damp_fanout`).
+    ``unchecked_reason`` is None when every candidate was measured, ``"scan"``
+    when a candidate could not be measured at all (a metered adapter declining
+    an unaffordable scan, per
     :meth:`Adapter.distinct_combination_counts`'s own contract), and
     ``"no_count"`` when the scans ran but no exact row count was available
     to compare them against. Either non-None value is a caveat for the
@@ -788,6 +798,7 @@ def _declared_grain_findings(
         if distinct is None:
             continue
         if distinct >= row_count:
+            _record_proven(proven, model, c)
             continue
         findings.append(
             _grain_broken_finding(
@@ -806,6 +817,7 @@ def _declared_grain_findings(
         if distinct is None:
             continue
         if distinct >= row_count:
+            _record_proven(proven, model, c)
             continue
         findings.append(
             _grain_broken_finding(
@@ -820,6 +832,15 @@ def _declared_grain_findings(
         )
 
     return findings, ("scan" if scan_failed else None), unresolved
+
+
+def _record_proven(
+    proven: dict[str, dict] | None, model: str, candidate: GrainCandidate
+) -> None:
+    if proven is not None:
+        proven.setdefault(
+            model, {"columns": list(candidate.columns), "source": candidate.source}
+        )
 
 
 def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
@@ -928,9 +949,14 @@ def grain_findings(
     all_models: set[str],
     *,
     min_rows: int = 100,
+    proven: dict[str, dict] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """A built relation's grain against what the project declares (or, absent
     any declaration, a free naming guess), for every selected model (#229).
+
+    ``proven`` collects, per model, the declared grain the scans showed unique
+    (#841). Only a declaration counts: the naming guess is never recorded,
+    because a guess proven unique says nothing about what the model intends.
 
     A declared source (unique test, composite, or primary entity) is checked
     directly with an exact scan: the declaration itself is the justification
@@ -977,7 +1003,7 @@ def grain_findings(
             candidates = declared.get(model)
             if candidates:
                 model_findings, unchecked_reason, missing = _declared_grain_findings(
-                    adapter, model, identifier, candidates, min_rows
+                    adapter, model, identifier, candidates, min_rows, proven
                 )
                 findings.extend(model_findings)
                 if unchecked_reason == "scan":
@@ -1062,7 +1088,7 @@ class RowPopulationCheck:
     parent: str
     parent_relation: str
     joins: tuple[str, ...] = ()
-    join_keys: tuple[str, ...] = ()
+    keys_by_join: tuple[tuple[str, ...], ...] = ()
     reducers: tuple[str, ...] = ()
     multiplies: bool = False
 
@@ -1071,6 +1097,27 @@ class RowPopulationCheck:
         """Both sides, as the keys a caller's count map must carry."""
 
         return (self.relation.lower(), self.parent_relation.lower())
+
+    @property
+    def join_keys(self) -> tuple[str, ...]:
+        """Every join's equality keys, in join order."""
+
+        return tuple(key for keys in self.keys_by_join for key in keys)
+
+    def describe_joins(self) -> str:
+        """Each join beside its own keys: a key read off one join is never
+        shown next to another join's label (#841)."""
+
+        return " or the ".join(
+            f"{label} on {', '.join(keys)}"
+            if keys
+            else f"{label} (dex could not read the join key)"
+            for label, keys in zip(
+                self.joins,
+                self.keys_by_join or ((),) * len(self.joins),
+                strict=True,
+            )
+        )
 
 
 def _manifest_sources(project_dir: Path) -> dict[str, dict]:
@@ -1441,10 +1488,8 @@ def row_population_plan(
                     )
                     for join in found_joins
                 ),
-                join_keys=tuple(
-                    key
-                    for join in found_joins
-                    for key in sql_shape.equality_columns(join.on)
+                keys_by_join=tuple(
+                    tuple(sql_shape.equality_columns(join.on)) for join in found_joins
                 ),
                 reducers=tuple(dict.fromkeys(reducers)),
                 multiplies=multiplies,
@@ -1569,24 +1614,27 @@ def row_population_findings(
 
         if check.multiplies or not check.joins:
             continue
-        key = (
-            f" on {', '.join(check.join_keys)}"
-            if check.join_keys
-            else " (dex could not read the join key)"
-        )
+        severity = "high" if rows >= parent_rows * _ROW_FANOUT_HIGH_FACTOR else "medium"
+        cap = ""
+        # A join with no key dex can read is usually a range or inequality join,
+        # and those expand on purpose as often as by mistake (#841). Without a
+        # key there is nothing to call wrong, so the size of the expansion alone
+        # never ranks it with a wrong key.
+        if not check.join_keys:
+            data["join_key_read"] = False
+            if severity == "high":
+                severity = "medium"
+                data["severity_cap_applied"] = "join_key_unread"
+                cap = _UNREAD_KEY_CAP
         findings.append(
             DriftFinding(
                 axis="row_population",
                 code="row_fanout",
                 identifier=check.model,
-                severity=(
-                    "high"
-                    if rows >= parent_rows * _ROW_FANOUT_HIGH_FACTOR
-                    else "medium"
-                ),
+                severity=severity,
                 detail=(
-                    f"'{check.model}' has {against}: the {check.joins[0]}{key} "
-                    "matches more than one row per parent row"
+                    f"'{check.model}' has {against}: the {check.describe_joins()} "
+                    f"matches more than one row per parent row{cap}"
                 ),
                 exact=exact,
                 data=data,
@@ -1608,6 +1656,99 @@ def row_population_findings(
             "counting it was not free)"
         )
     return findings, notes
+
+
+def damp_fanout(
+    findings: list[DriftFinding], proven: dict[str, dict]
+) -> list[DriftFinding]:
+    """Cap a ``row_fanout`` at low on a model whose declared grain this run
+    proved unique (#841).
+
+    A model that holds more rows than its driving parent and is still unique on
+    the grain it declares is holding the rows it says it holds: the expansion
+    is what the model is for (anchors times windows, a date spine times
+    entities), not a key matching twice. Only a declaration counts, never the
+    naming guess, and the finding stays listed rather than dropped, the way
+    ``grain_min_rows`` damps a grain finding, so a reader still sees the counts
+    and a gate on high or medium no longer needs an allowlist where a later,
+    real fan-out could hide. A fan-out on a model whose grain broke is left
+    alone: the ``grain_broken`` beside it is the duplicate it explains.
+    """
+
+    damped: list[DriftFinding] = []
+    for finding in findings:
+        grain = proven.get(finding.identifier or "")
+        if finding.code != "row_fanout" or grain is None or finding.severity == "low":
+            damped.append(finding)
+            continue
+        columns = ", ".join(grain["columns"])
+        damped.append(
+            finding.model_copy(
+                update={
+                    "severity": "low",
+                    "detail": (
+                        f"{finding.detail.replace(_UNREAD_KEY_CAP, '')} "
+                        "(severity capped at low: the declared "
+                        f"grain [{columns}] is proven unique, so the extra rows are "
+                        "the grain the model declares rather than duplicates)"
+                    ),
+                    "data": {
+                        **finding.data,
+                        "grain_proven": {
+                            "columns": list(grain["columns"]),
+                            "source": grain["source"],
+                        },
+                        "severity_cap_applied": "grain_proven",
+                    },
+                }
+            )
+        )
+    return damped
+
+
+def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
+    """The grains the last run's own uniqueness tests proved, per model label.
+
+    A ``unique`` or ``unique_combination_of_columns`` test that passed in
+    ``run_results.json`` proved its columns unique on the relation that run
+    built, which is the relation a build's verification judges. Read only by a
+    build, whose run results are this run's; a standalone sweep measures the
+    grain itself, since the last run may be older than the relation.
+    """
+
+    from ..dbt_project import manifest_node_label
+
+    nodes = _manifest_nodes(project_dir) or {}
+    results = _run_results(project_dir) or []
+    passed = {
+        str(r.get("unique_id")) for r in results if str(r.get("status")) == "pass"
+    }
+    proven: dict[str, dict] = {}
+    for unique_id in sorted(passed):
+        node = nodes.get(unique_id)
+        if not isinstance(node, dict) or node.get("resource_type") != "test":
+            continue
+        meta = node.get("test_metadata")
+        attached = node.get("attached_node")
+        if not isinstance(meta, dict) or not isinstance(attached, str):
+            continue
+        raw_kwargs = meta.get("kwargs")
+        kwargs = raw_kwargs if isinstance(raw_kwargs, dict) else {}
+        if meta.get("name") == "unique" and isinstance(kwargs.get("column_name"), str):
+            columns, source = [kwargs["column_name"]], "unique_test"
+        elif meta.get("name") == "unique_combination_of_columns" and isinstance(
+            kwargs.get("combination_of_columns"), list
+        ):
+            columns = [str(c) for c in kwargs["combination_of_columns"]]
+            source = "unique_test_composite"
+        else:
+            continue
+        parent = nodes.get(attached)
+        model = manifest_node_label(
+            attached, parent if isinstance(parent, dict) else None
+        )
+        proven.setdefault(model, {"columns": columns, "source": source})
+    return proven
 
 
 # --- join contract: a model's own joins against measured value overlap ---------

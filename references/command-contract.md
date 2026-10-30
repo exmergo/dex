@@ -138,6 +138,13 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
                                      profile_value_domain_cap values (.dex/config.yml, default 25)
                                      with the rest counted in its elided. Both reduce the payload
                                      only, never the cached profile
+  [--target dev]                     also reads the dev namespace for this one command (#893), as
+                                     maintain verify --target dev does: a model whose only build is
+                                     the dev one becomes profileable without widening the committed
+                                     allowlist. --scope still only narrows, nothing is written back,
+                                     the cost guard prices the scan; prod-looking targets refused.
+                                     DuckDB: its dev target is the file already read, so the flag
+                                     widens nothing and a note says so
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)
@@ -275,8 +282,10 @@ dex transform declare [<model>]   -> declarations for models that already exist,
                                      missing unless the payload's declarations supply it (they win
                                      field by field; edits are refused). Every model not proposed is
                                      in data.skipped with a reason (not_a_model, python_model,
-                                     versioned, sql_unreadable, unprofiled_inputs + the profile
-                                     command, nothing_drafted, complete, not_writable). Capped at 25
+                                     versioned, sql_unreadable, unprofiled_inputs + a profile
+                                     command that can reach the input, --target dev for a
+                                     dev-only build outside the allowlist, none with the reason
+                                     for a name matching several profiled relations, nothing_drafted, complete, not_writable). Capped at 25
                                      proposals (--limit only narrows); skipped models do not count,
                                      the rest are data.elided_count and a note. Nothing to propose
                                      stores no plan (plan_id null). Rendered, parse-gated and stored as
@@ -421,8 +430,13 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      through transitively skipped parents), nodes that warned rather
                                      than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
-                                     the compiled SQL through its CTE chain, naming the join and its
-                                     key and stating both counts; a model with a filter, aggregate,
+                                     the compiled SQL through its CTE chain, naming each join beside
+                                     its own key and stating both counts; a fan-out on a model whose
+                                     declared grain (declaration, unique or composite test, primary
+                                     entity; never the naming guess) the same run proved unique is
+                                     capped at low (data.grain_proven), and one through joins with no
+                                     readable key (a range or inequality join) at medium
+                                     (data.join_key_read: false) (#841); a model with a filter, aggregate,
                                      de-duplication or set operation is never reported for loss, and an
                                      incremental model is skipped. A model generated in SQL with no parent
                                      relation is named in notes. A real parent relation missing from the
@@ -1056,6 +1070,14 @@ default, or a filter or operator after it is refused. A key naming a location
   worth most; row population and the declared facts are suppressed there,
   because a half-built dev target is a mix of this run's output and the last
   one's.
+
+  **An intended expansion ranks low.** A `row_fanout` on a model whose grain
+  this build proved, by its own passing `unique` or
+  `unique_combination_of_columns` test or by the declared-fact count, is capped
+  at `low`, with `data.grain_proven` and `data.severity_cap_applied:
+  grain_proven` (#841). The finding stays listed, so a gate on `high` needs no
+  allowlist for a model that fans out by design, and a later fan-out on a wrong
+  key elsewhere still ranks on its counts.
 
   **Declared facts.** The sweep checks what each built model's declaration
   says (#496): `unit_out_of_range`, `additivity_contradicted` and

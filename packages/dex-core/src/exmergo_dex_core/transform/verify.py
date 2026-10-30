@@ -218,7 +218,12 @@ def verify_build(
     if reason is not None:
         result.suppressed["row_population"] = reason
 
-    _declared_facts(engine, project_dir, summary, scope, adapter_once, result)
+    proven = _declared_facts(engine, project_dir, summary, scope, adapter_once, result)
+    # A grain this build proved, by its own passing uniqueness test or by the
+    # declared-fact count, ranks a fan-out on that model as intended (#841).
+    if summary.get("success"):
+        proven = {**verify_mod.passed_grain_tests(project_dir), **proven}
+    result.findings = verify_mod.damp_fanout(result.findings, proven)
 
     result.findings = drift_mod.rank_findings(findings + result.findings)
     if len(result.findings) > MAX_FINDINGS:
@@ -343,15 +348,16 @@ def _declared_facts(
     scope: set[str],
     resolve_adapter: Callable[[], Adapter],
     result: BuildVerification,
-) -> None:
+) -> dict[str, dict]:
     """What the built models' declarations say, checked against what dbt wrote
     (#496): unit, additivity, population, and a declared grain no ``unique``
     test in this build covers.
 
     Writes findings, warnings, suppressions and any deferred offer onto
-    ``result``. The statements are gated as a phase of the build, like the row
-    counts, so a caller who confirmed the build's estimate (which priced these
-    upfront, see :func:`price_declared_facts`) is not asked again.
+    ``result``, and returns the declared grains the count proved unique. The
+    statements are gated as a phase of the build, like the row counts, so a
+    caller who confirmed the build's estimate (which priced these upfront, see
+    :func:`price_declared_facts`) is not asked again.
     """
 
     from ..errors import DexError
@@ -370,16 +376,16 @@ def _declared_facts(
             "run's output and the last one's; a declaration checked against "
             "that says nothing"
         )
-        return
+        return {}
     if not scope:
         suppress("this build ran no models")
-        return
+        return {}
 
     models, plan_notes = facts_mod.plan(project_dir, scope=scope)
     result.warnings.extend(plan_notes)
     if plan_notes:
         suppress(plan_notes[0])
-        return
+        return {}
     grain_models = [m for m in models if facts_mod.grain_untested(m)]
     if not grain_models:
         result.suppressed["grain"] = (
@@ -391,7 +397,7 @@ def _declared_facts(
             result.suppressed[finding_class] = facts_mod.nothing_declared(
                 finding_class, "this build ran"
             )
-        return
+        return {}
 
     try:
         adapter = resolve_adapter()
@@ -399,7 +405,7 @@ def _declared_facts(
         raise
     except DexError as exc:
         suppress(f"warehouse unreachable: {exc}")
-        return
+        return {}
     try:
         live = adapter.list_objects()
     except CostGuardError:
@@ -413,7 +419,7 @@ def _declared_facts(
                 f"({type(exc).__name__}: {exc})"
             )
         )
-        return
+        return {}
 
     try:
         prepared = facts_mod.prepare(
@@ -438,7 +444,7 @@ def _declared_facts(
                 f"the declared facts could not be checked ({type(exc).__name__}: {exc})"
             )
         )
-        return
+        return {}
 
     result.findings.extend(facts.findings)
     result.warnings.extend(facts.notes)
@@ -448,6 +454,7 @@ def _declared_facts(
         result.suppressed["grain"] = "checking it is a scan, offered above"
     if facts.offer is not None and result.offer is None:
         result.offer = facts.offer
+    return facts.proven_grains
 
 
 def _pii_overrides(engine: DexEngine):

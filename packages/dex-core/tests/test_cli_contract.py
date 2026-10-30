@@ -593,6 +593,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "refresh": "refresh",
             "use_project": "use_project",
             "check_cumulative": "check_cumulative",
+            "target": "target",
             # --columns takes the literal "all" (argparse `choices=["all"]"),
             # translated to the engine's boolean `show_all_columns`.
             "columns": _TRANSLATED,

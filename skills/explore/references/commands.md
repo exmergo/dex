@@ -93,6 +93,14 @@ column named `window`, which DuckDB reserves and dbt must quote).
   is annotated too. Declared columns are capped at 12 unless `--columns all`.
   Population values and the rule are withheld in values-free mode and for a
   filter on a PII-flagged column, named in `withheld_fields`.
+- `--target dev` also reads the dev namespace for this one command, as
+  `maintain verify --target dev` does. Use it when a model's only build is the
+  dev one and the source allowlist does not reach the namespace dbt writes into:
+  `transform declare` and `transform plan` name exactly this command for such an
+  input (`explore profile <dev namespace>.<model> --target dev`). `--scope` still
+  only narrows, nothing is written to `.dex/config.yml`, and the scan is priced
+  as usual. On DuckDB the dev target is the file already read, so the flag
+  widens nothing and a note says so.
 - A requested object whose cached profile is still fresh (same connector, schema
   unchanged, within `profile_freshness_hours`, default 24) is served from the
   cache (`cache_hit_count`) instead of re-scanned. `--refresh` forces a re-scan
