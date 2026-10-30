@@ -1,0 +1,1 @@
+Under ``semantic.vendor: ossie``, ``slayer``, or ``cube``, explore with the project definitions flag no longer folds MetricFlow ``primary_entities`` or metric lineage into the exploration beside the native vendor layer.

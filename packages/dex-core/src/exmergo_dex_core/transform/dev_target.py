@@ -422,6 +422,59 @@ def preflight_opener(
     return open_probe
 
 
+def seed_relation_columns(
+    project: Path,
+    target: str,
+    repo_root: Path | str,
+    config: DexConfig,
+    connection: ConnectionSource | None = None,
+) -> Callable[[list[str]], dict[str, list[str]]] | None:
+    """A reader of relations' columns in the DuckDB file the dev target writes,
+    or ``None`` when that file does not exist yet.
+
+    It backs the build's seed check, which compares each seed's CSV header with
+    the table dbt would reload it into. A missing file holds no seed table, so
+    there is nothing to compare and no reason to ask dbt anything. The file is
+    the one the profile names, which a project may keep beside ``profiles.yml``
+    rather than in the run directory. Each read opens it read-only and closes it
+    before returning, because DuckDB lets one process write a file and dbt is
+    about to be that process. A failure raises, and the build reports it as a
+    warning rather than letting the check go quiet. DuckDB only: on a billed
+    connector the refresh the check leads to would spend outside what the build
+    settles.
+    """
+
+    from ..cache import match_identifier
+    from ..connect import open_adapter
+    from ..dbt_project import strip_relation_quoting
+
+    database = duckdb_target_path(project, target)
+    if database is None or not database.is_file():
+        return None
+
+    def read(relations: list[str]) -> dict[str, list[str]]:
+        columns: dict[str, list[str]] = {}
+        adapter = open_adapter(
+            connector="duckdb",
+            path=str(database),
+            repo_root=repo_root,
+            config=config,
+            connection=connection,
+        )
+        try:
+            live = [meta.identifier for meta in adapter.list_objects()]
+            for relation in relations:
+                matched = match_identifier(strip_relation_quoting(relation), live)
+                if len(matched) == 1:
+                    _meta, found = adapter.table_metadata(matched[0])
+                    columns[relation] = [column.name for column in found]
+        finally:
+            adapter.close()
+        return columns
+
+    return read
+
+
 def _duckdb_namespace(project: Path, target: str) -> list[str]:
     """A duckdb target whose file does not exist yet is legitimate when the
     project builds everything from models, but a project reading from ``sources:``

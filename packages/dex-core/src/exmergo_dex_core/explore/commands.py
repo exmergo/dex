@@ -1091,6 +1091,7 @@ def relationships(
     # estimate and the run share the filtered pool, so the priced set and the
     # run set stay the same set.
     missing_column_findings = []
+    probe_refused = []
     if verify:
         rel_mod.adopt_profiled_spelling(rels, datasets)
         missing_column_findings = rel_mod.missing_column_findings(rels, datasets)
@@ -1108,7 +1109,7 @@ def relationships(
             probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
                     verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
@@ -1232,6 +1233,14 @@ def relationships(
     # #924). Only `--verify` computes it, because only a probe would fail.
     notes.extend(text for _rel, text in missing_column_findings)
     for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: surfaced in notes and mirrored onto the child
+    # dataset's data_quality so it survives into the cache (issue #933).
+    notes.extend(text for _rel, text in probe_refused)
+    for rel, text in probe_refused:
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
@@ -2504,6 +2513,7 @@ def map(
     # reported as a finding below, and excluded from the verify pool; the
     # estimate and the run share the filtered pool so they stay the same set.
     missing_column_findings = []
+    probe_refused = []
     if verify:
         rel_mod.adopt_profiled_spelling(relationship_set, all_selected)
         missing_column_findings = rel_mod.missing_column_findings(
@@ -2525,7 +2535,7 @@ def map(
             probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
                     verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
@@ -2639,6 +2649,13 @@ def map(
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: mirrored onto the child dataset's data_quality so it
+    # survives into the cache, and surfaced in notes further down (issue #933).
+    for rel, text in probe_refused:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
 
     # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
     # composed set rather than this run's profiles: the link is derived from the
@@ -2680,6 +2697,7 @@ def map(
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
     notes.extend(text for _rel, text in missing_column_findings)
+    notes.extend(text for _rel, text in probe_refused)
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared joins; kept as declared"
@@ -3778,6 +3796,39 @@ _DECLARING_LAYER = {
 }
 
 
+def _drop_metricflow_under_native_vendor(
+    engine: DexEngine, defs: dbt_project.ProjectDefinitions
+) -> dbt_project.ProjectDefinitions:
+    """Drop MetricFlow grain and metric lineage when a native vendor owns the layer.
+
+    Under ``semantic.vendor: ossie|slayer|cube`` the vendor layer is the
+    repository's one semantic layer (#922). ``explore`` still reads the dbt
+    project for transformation declarations (``config.meta.dex``, unique and
+    relationships tests), but MetricFlow-derived ``primary_entities`` and
+    ``metric_models`` must not fold into exploration beside that vendor. Under
+    ``vendor: dbt`` (or an unset vendor) the definitions are unchanged.
+    """
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor not in SEMANTIC_SOURCE_FACTORIES:
+        return defs
+    if (
+        not defs.primary_entities
+        and not defs.metric_models
+        and not defs.semantic_source
+    ):
+        return defs
+    return defs.model_copy(
+        update={
+            "primary_entities": {},
+            "metric_models": [],
+            "semantic_source": None,
+        }
+    )
+
+
 def _project_definitions(
     engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
@@ -3820,6 +3871,7 @@ def _project_definitions(
     # explore path, and `definitions()` is the channel declared keys and joins
     # reach dex through at all. Whichever format configuration named answers here.
     defs = engine.project_format().definitions()
+    defs = _drop_metricflow_under_native_vendor(engine, defs)
     return _fold_semantic_layer_keys(engine, defs)
 
 

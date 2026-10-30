@@ -489,10 +489,52 @@ def test_check_cumulative_run_twice_does_not_duplicate_the_note(tmp_path: Path, 
     cumulative_notes = [n for n in dataset["data_quality"] if "looks cumulative" in n]
     assert len(cumulative_notes) == 1
 
-    # And the duplicate-free state is what actually persisted.
     data = _run(
         ["explore", "profile", "account_activity", "--path", str(path)], capsys
     )["data"]
     [dataset] = data["datasets"]
     cumulative_notes = [n for n in dataset["data_quality"] if "looks cumulative" in n]
     assert len(cumulative_notes) == 1
+
+
+def test_sparse_daily_counts_with_ties_not_flagged_as_cumulative(tmp_path: Path):
+    """Sparse daily counts (e.g. 0s and 1s) with flat ties between occasional
+    bumps are not misread as a running total merely because consecutive zeros
+    do not decrease (#945)."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "sparse.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE search_stats ("
+        "site_id INTEGER, stat_date DATE, clicks INTEGER, running_clicks INTEGER)"
+    )
+    # 200 daily rows: clicks is sparse (mostly 0s and occasional 1s),
+    # running_clicks is a genuine cumulative sum with flat days between events.
+    rows = []
+    c = 0
+    for day in range(200):
+        stat_date = date(2026, 1, 1) + timedelta(days=day)
+        daily = 1 if day % 5 == 0 else 0
+        c += daily
+        rows.append((1, stat_date, daily, c))
+    conn.executemany("INSERT INTO search_stats VALUES (?, ?, ?, ?)", rows)
+    conn.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as run_profile
+
+    adapter = DuckDBAdapter(db_path)
+    try:
+        identifiers = [m.identifier for m in adapter.list_objects()]
+        [dataset] = run_profile(adapter, identifiers)
+        candidate, _ = find_candidate(dataset)
+        assert candidate is not None
+        assert set(candidate.measures) == {"clicks", "running_clicks"}
+
+        fractions = measure_fractions(adapter, dataset.identifier, candidate)
+        measure_notes = cumulative_measure_notes(candidate, fractions)
+    finally:
+        adapter.close()
+
+    assert any(n.startswith("running_clicks ") for n in measure_notes)
+    assert not any(n.startswith("clicks ") for n in measure_notes)
