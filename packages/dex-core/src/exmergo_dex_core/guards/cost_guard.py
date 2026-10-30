@@ -54,6 +54,8 @@ from ..errors import DexError
 from ..results import ConfirmationRequest
 from ..session_cap import SessionCeilingCap
 
+_UNSET_CONFIGURED_SESSION_CEILING = object()
+
 
 class CostGuardError(DexError):
     """Base for every cost-guard refusal.
@@ -816,6 +818,9 @@ class CostGate:
         paradigm: Paradigm,
         ceiling: float | None,
         session_ceiling: float | None,
+        configured_session_ceiling: float | object | None = (
+            _UNSET_CONFIGURED_SESSION_CEILING
+        ),
         session_spent: float | Callable[[], float],
         confirmed: bool,
         connector: str,
@@ -830,6 +835,11 @@ class CostGate:
         self.paradigm = paradigm
         self.ceiling = ceiling
         self.session_ceiling = session_ceiling
+        self.configured_session_ceiling = (
+            session_ceiling
+            if configured_session_ceiling is _UNSET_CONFIGURED_SESSION_CEILING
+            else configured_session_ceiling
+        )
         # The host's cap (#787), already folded into `session_ceiling` by
         # whoever built the gate. Held only so a refusal it causes can name it:
         # "raise the session budget in .dex/config.yml" is wrong advice when
