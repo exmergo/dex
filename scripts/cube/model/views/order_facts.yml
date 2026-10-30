@@ -1,0 +1,8 @@
+views:
+  - name: order_facts
+    cubes:
+      - join_path: orders
+        includes: [status, ordered_at, revenue, count]
+      - join_path: orders.customers
+        prefix: true
+        includes: [city]

@@ -525,6 +525,19 @@ class DuckDBAdapter:
             )
         return columns
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        # dex-built session statement, a constant; allowed on a read-only
+        # connection, since it changes the session and not the database.
+        self._conn.execute("SET TimeZone = 'UTC'")
+
     def run_query(
         self,
         sql: str,

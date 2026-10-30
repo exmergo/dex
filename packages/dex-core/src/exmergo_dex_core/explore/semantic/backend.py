@@ -157,11 +157,22 @@ def values_gap(backend: Any) -> str:
     )
 
 
+# Which deployment an execution override selects, for the vendors where the two
+# are one axis: dbt's local artifact is the only thing dex can execute, and dbt
+# Cloud the only thing that executes for itself.
 _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
     "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"},
     "ossie": {EXECUTION_DEX: "local"},
     "slayer": {EXECUTION_DEX: "local"},
-    "cube": {EXECUTION_DEX: "local"},
+}
+
+# The vendors whose deployment (where the layer runs) and execution (who runs
+# the SQL) are independent axes, and the executions each offers in this release.
+# Every Cube deployment serves the same REST API, so `--local` and `--api` choose
+# who executes and leave the configured deployment alone: Cube renders over
+# `/v1/sql` and dex executes, or Cube executes over `/v1/load` (#914).
+_INDEPENDENT_EXECUTIONS: dict[str, tuple[str, ...]] = {
+    "cube": (EXECUTION_DEX,),
 }
 
 
@@ -264,7 +275,20 @@ def resolve_semantic_layer(
             f"{', '.join(sorted(SEMANTIC_DEPLOYMENTS))}"
         )
 
-    if api or local:
+    configured = getattr(semantic, "deployment", None) or getattr(
+        semantic, "backend", None
+    )
+    if (api or local) and vendor in _INDEPENDENT_EXECUTIONS:
+        execution = EXECUTION_VENDOR if api else EXECUTION_DEX
+        if execution not in _INDEPENDENT_EXECUTIONS[vendor]:
+            raise SemanticBackendError(
+                f"semantic vendor '{vendor}' has no hosted execution (--api) in "
+                "this release: dex asks a Cube server to render SQL over /v1/sql "
+                "and executes it itself under the cost guard, and does not yet "
+                "have Cube execute a query over /v1/load. Drop --api"
+            )
+        deployment = canonical_semantic_deployment(configured or "local")
+    elif api or local:
         execution = EXECUTION_VENDOR if api else EXECUTION_DEX
         try:
             deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
@@ -274,9 +298,6 @@ def resolve_semantic_layer(
                 f"{'hosted' if api else 'local'} execution override"
             ) from exc
     else:
-        configured = getattr(semantic, "deployment", None) or getattr(
-            semantic, "backend", None
-        )
         deployment = canonical_semantic_deployment(configured or "local")
 
     build = _BACKENDS.get((vendor, deployment))

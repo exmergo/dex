@@ -31,9 +31,11 @@ cube changed.
 | `config validate`, `config get` on a `semantic.cube` block | none | always available |
 | reading the layer: `explore semantic list`, `--use-project`, `maintain` | `[cube]` (the dialect engine, which every connector extra already carries) | refused by name, `reason: prerequisite` |
 | authoring: `semantic cube define\|update\|plan`, and a derived cube | `[cube]`, the same extra | refused by name, `reason: prerequisite` |
+| querying: `explore semantic query\|values` | `[cube]` and `[semantic-api]` (httpx, to ask a Cube server to render) | refused by name, `reason: prerequisite` |
 
-No Cube package is installed for any of it: no Node, no Cube server, no
-`cube_dbt`, no `apache-ossie-cube`.
+No Cube package is installed for any of it: no Node, no `cube_dbt`, no
+`apache-ossie-cube`. Only querying needs a running Cube server, and it uses that
+server as a renderer: see below.
 
 ## Plain YAML is read; nothing else is guessed
 
@@ -257,15 +259,94 @@ measure, the rest in `meta.dex`. Only that cube's entry in its file is rewritten
 Every other cube, view and comment keeps its bytes, and the author's key spelling
 is kept. A declaration naming no cube, or naming a view, is refused.
 
-## `query` and `values` are not available yet
+## Querying: Cube renders, Dex executes
 
 Cube has no Python SQL renderer: its planner ships only inside a Cube server.
-`explore semantic query` refuses by name and points at `explore query` over the
-relations the catalog names. `explore semantic values` resolves the token first,
-so a misspelling is refused by name. It then runs the values PII gate, so a
-personal dimension is refused as PII (`reason: guard`), and only then refuses
-for want of a renderer. The governed path, where Cube renders and Dex executes
-under the cost guard, comes next.
+Every Cube server, Core or Cloud, answers `POST /cubejs-api/v1/sql` with the SQL
+a query would run, without running it. Dex uses that the way it uses MetricFlow's
+`explain()` and SLayer's dry run: Cube renders, Dex checks the statement and
+executes it through its own connector, under the PII gate and the cost guard.
+`execution` is `dex` on every result. Dex calls `/v1/meta` and `/v1/sql` and
+nothing else: never `/v1/load`, and it never hands Cube a warehouse credential.
+The server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
+
+### The order
+
+1. **Connector.** DuckDB, Postgres, BigQuery, Snowflake and Redshift, each held
+   to a golden of what Cube Core renders for it. Databricks, ClickHouse and
+   Trino are refused by name.
+2. **PII gate**, before anything is sent: every grouped member, the time
+   dimension a grain buckets, and every member a `--where` filter names,
+   resolved to the column behind it through the static catalog and screened on
+   its profile, with the name heuristic as the floor.
+3. **Grain**, against the time dimension's built-in and custom granularities.
+4. **Translation** to Cube's query JSON, and the data-source check: every cube
+   the query reaches must sit on `semantic.cube.data_source`.
+5. **Stale renderer.** Every member the query names is compared with the
+   server's `/v1/meta?extended=true`: present, the same kind, the same
+   aggregation or type, the same SQL and filters, the same custom
+   granularities, and, for a view member, the same cube member behind it. A
+   Cube server outside dev mode does not reload an edited model file, so a
+   server still serving yesterday's files is the normal state after an edit,
+   and it is refused naming the member.
+6. **Render** over `/v1/sql`, and the plan checks: one statement (a
+   `compareDateRange` plans several), no pre-aggregation (Cube matches a
+   rollup even one it never built, and the SQL then reads its table), no
+   external store, no lambda query, the configured data source, and no relation
+   that no cube in the repository's files sits on (which is also how a server
+   whose `sql_table` differs from the repository's is caught, since `/v1/meta`
+   does not carry `sql_table`).
+7. **Binding.** Cube returns `[sql, params]`, every parameter a string. Each
+   placeholder (`$n` on Postgres and Redshift, `?` elsewhere) becomes a literal
+   of the connector's dialect, quoted by that dialect's rules. A placeholder
+   style or identifier quote that belongs to another warehouse is refused: run
+   the Cube server with `CUBEJS_DB_TYPE` set to Dex's connector.
+8. **The governed spine**: SELECT-only, the relation pre-check against the
+   connection's inventory, the cost handshake (`needs_confirmation` on a
+   metered connector before any spend), Dex's connector in a UTC session (the
+   setting Cube's own drivers use, so a timestamp with no zone buckets the way
+   Cube means), and the columnar cap.
+
+### The CLI dialect
+
+| | |
+|---|---|
+| metrics and dimensions | `cube.member` or `view.member`, as `explore semantic list` names them |
+| a time grouping | `--group-by orders.ordered_at__month` (any built-in or custom granularity), or `--group-by orders.ordered_at --grain month`. Cube has no `metric_time`, so `--grain` alone is refused |
+| `--where` | Cube's JSON filter: `'{"member": "orders.status", "operator": "equals", "values": ["paid"]}'`, a list of them (ANDed), or `{"and": [...]}` / `{"or": [...]}` groups. A filter on a measure is a `HAVING`. A top-level `inDateRange` on the grouped time dimension is sent as its `dateRange`, which is what bounds a rolling window |
+| `--order-by` | the query's own metrics and grouped members only, `-` for descending (`--order-by=-orders.revenue`) |
+| `--limit` | sent to Cube; without one Dex sends `query.max_rows + 1`, since Cube adds `LIMIT 10000` silently |
+
+A filter Dex cannot read (an unknown operator or key, a value that is not a
+string, number or boolean, an empty group) is refused rather than screened by
+half. Result columns carry the tokens the caller wrote.
+
+`explore semantic values` is a dimension-only query rooted at the dimension's
+own cube (`scoped_to` empty); `--metric` adds that measure and names it in
+`scoped_to`. A PII dimension is refused before Cube is asked.
+
+### The server and its secret
+
+`semantic.cube.url` names the API base (`http://localhost:4000/cubejs-api` when
+unset). The token is an HS256 JWT Dex mints per request from `CUBEJS_API_SECRET`,
+read from the environment only, valid for 60 seconds, and never written to an
+envelope or an error. A loopback host is admitted; any other host only by exact
+name in `DEX_CUBE_ALLOWED_HOSTS`, over https, because the URL comes from a
+committed file and the secret is yours. The token claims `dex_scopes: [meta,
+sql]`; Cube enforces API scopes only through the deployment's own
+`contextToApiScopes`, so on a default server the claim restricts nothing, and
+what binds is that Dex calls nothing else.
+
+### What this release does not do
+
+- `--api` (Cube executes over `/v1/load`) and Cube Cloud are #914.
+- One data source per query.
+- Segments, `ungrouped`, `compareDateRange` and pre-aggregations are not sent or
+  not accepted.
+- Two warehouses that share a placeholder style and quoting (Postgres and
+  Redshift; DuckDB and Snowflake) cannot be told apart from a statement with no
+  parameters, so a server rendering for the wrong one of a pair is caught only
+  once the query carries a filter. Set `CUBEJS_DB_TYPE` to match.
 
 ## What `maintain` makes of the layer
 

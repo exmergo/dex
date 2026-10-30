@@ -396,6 +396,7 @@ markers = [
   "clickhouse_cloud: narrow ClickHouse Cloud integration tests (protected credentials required)",
   "trino: Trino-specific integration tests (the keyless local container)",
   "trino_iceberg: narrow Trino integration tests against the Glue and S3 Iceberg catalog (protected credentials required)",
+  "cube: governed Cube queries against a live render-only Cube Core (scripts/setup_cube_dev.sh)",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]
 

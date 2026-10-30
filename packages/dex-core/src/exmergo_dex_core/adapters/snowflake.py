@@ -1837,6 +1837,17 @@ class SnowflakeAdapter:
 
     # --- execution (the single billed door) --------------------------------------
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def run_query(
         self,
         sql: str,
@@ -1919,6 +1930,9 @@ class SnowflakeAdapter:
             cursor.execute(f"USE WAREHOUSE {_quote_ident(info['name'])}")
             cursor.execute("ALTER SESSION SET QUERY_TAG = 'dex'")
             self._session_prepared = True
+        if getattr(self, "_utc_session", False):
+            # dex-built session statement, a constant.
+            cursor.execute("ALTER SESSION SET TIMEZONE = 'UTC'")
         if remaining is not None:
             cursor.execute(
                 "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = "

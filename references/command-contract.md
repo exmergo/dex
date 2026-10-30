@@ -1301,8 +1301,14 @@ measure is a `ratio` or `derived` metric over the measures it references. A
 metric is groupable by its cube's dimensions and those its declared joins reach,
 so `--for-dimension` answers. Entities are declared `unavailable`: `primary_key`
 and joins reach `explore` through the declaration channel instead, at confidence
-1.0. `query` refuses by name, since Cube renders a query only inside a Cube
-server, and `values` refuses the same way after its PII gate has run. `maintain`
+1.0. `query` and `values` are governed: Cube has no SQL renderer outside a Cube
+server, so dex asks the server at `semantic.cube.url` to render over `/v1/sql`
+(planning, never executing), holds every member the query names to the server's
+`/v1/meta` first, refuses a plan from a pre-aggregation, of more than one
+statement, or rendered for another warehouse, binds Cube's parameters as literals
+of dex's dialect, and runs the statement through the governed spine in a UTC
+session, `execution: dex` (see
+[Querying: Cube renders, Dex executes](cube-compatibility.md#querying-cube-renders-dex-executes)). `maintain`
 runs every axis on the layer without starting a Cube server: the baseline records
 `vendor: cube` and each compiled-only definition by its content (a change is
 `compiled_only_changed`, never compared structurally, and a warning says so on

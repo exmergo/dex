@@ -1248,15 +1248,16 @@ semantic:
       - model/cubes/customers.yml
       - model/views/sales.yml
     data_source: default         # the Cube data source dex is connected to
-    url: https://cube.example.com/cubejs-api   # not read yet; never a credential
+    url: http://localhost:4000/cubejs-api   # the Cube server that renders queries; never a credential
 ```
 
 `files` is an exact allowlist, like `semantic.ossie.files`: no globs, no absolute
 paths, no `..`, no duplicates. `.yml`, `.yaml` and `.js` are accepted;
 `globals.py`, `cube.py` and `cube.js` configure a Cube deployment rather than
 declare a model, and are refused by name. `url` may carry no user, password,
-query string or fragment, since the file is committed. Querying through a Cube
-server (which reads `url`) is not in this release. The `[cube]` extra is the
+query string or fragment, since the file is committed. `url` is read only by
+`explore semantic query|values`, which ask a Cube server to render SQL (see the
+query bullet below); it defaults to `http://localhost:4000/cubejs-api`. The `[cube]` extra is the
 dialect engine (`exmergo-dex-core[sql]`), which every connector extra already
 carries; selecting the vendor without it refuses by name with
 `reason: prerequisite`.
@@ -1273,8 +1274,18 @@ In short:
   or `derived` metrics, and `primary_key` and joins reach `explore` through the
   declaration channel at confidence 1.0. Cube has no entities, declared in
   `unavailable`.
-- **`query` and `values` refuse in this release**, `values` after its PII gate,
-  because Cube renders a query only inside a Cube server.
+- **`query` and `values`: Cube renders, Dex executes.** Dex asks the Cube server
+  at `url` to render the query over `/v1/sql` and runs the SQL through its own
+  connector under the PII gate and the cost guard, `execution: dex`. Before
+  rendering it holds every member the query names to the server's `/v1/meta`,
+  and refuses a server serving a different model, a plan read from a
+  pre-aggregation, more than one statement, or SQL rendered for another
+  warehouse. Members are `cube.member`; a time grouping names its dimension with
+  the grain suffix (`orders.ordered_at__month`); `--where` is Cube's JSON filter.
+  The token is minted from `CUBEJS_API_SECRET` (environment only); a host other
+  than loopback needs `DEX_CUBE_ALLOWED_HOSTS`. DuckDB, Postgres, BigQuery,
+  Snowflake and Redshift; needs `[cube]` and `[semantic-api]`. In full:
+  [Querying: Cube renders, Dex executes](cube-compatibility.md#querying-cube-renders-dex-executes).
 - **`semantic cube define|update|plan` authors the files** through plan/apply,
   whole plain-YAML files written byte-for-byte, validated as one prospective set
   by the same rules the reader runs, with a key Cube does not declare refused in
@@ -1463,14 +1474,14 @@ in `tests/slayer_vendor/test_reader.py`, the catalog one against
 | | Local (`--local`) | Hosted (`--api`) | Native Ossie (`vendor: ossie`) | SLayer (`vendor: slayer`) | Cube (`vendor: cube`) |
 |---|---|---|---|---|---|
 | `execution` reported | `dex` | `vendor` | `dex` | `dex` | `dex` |
-| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime | SLayer, as a dry run over the model files dex validated, in the connector's dialect | nothing yet: Cube renders only inside a Cube server, which this release does not call |
-| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse | dex, through the active connector | nothing executes yet: `query` refuses, and `values` refuses after its PII gate |
+| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime | SLayer, as a dry run over the model files dex validated, in the connector's dialect | a Cube server, over `/v1/sql`, which plans without executing; Dex holds every named member to its `/v1/meta` first |
+| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse | dex, through the active connector | dex, through the active connector, in a UTC session |
 | Needs a local dbt project | yes | no | no, and it never reads one | no, and it never reads one | no, and it never reads one |
-| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing | the full handshake, ceiling enforced by dex | not applicable: reading the layer spends nothing |
-| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none | `.dex/` cache flags on the column behind each grouped and filtered dimension, joined filter columns included, name heuristic as the floor | `values` screens the token against `.dex/` cache flags on the column behind it, view members through their cube's column, name heuristic as the floor |
-| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies | disclosed on the result, naming the unprofiled relations | not applicable: nothing returns values yet |
-| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing | refused before spend, against the connection's own inventory, naming the model's `sql_table` | a `sql_table` that is not fully qualified for the connector links nothing, and a note says so |
-| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse | the connector's, never in context; SLayer reads none | none: no Cube server and no warehouse connection is opened |
+| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing | the full handshake, ceiling enforced by dex | the full handshake, ceiling enforced by dex |
+| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none | `.dex/` cache flags on the column behind each grouped and filtered dimension, joined filter columns included, name heuristic as the floor | `.dex/` cache flags on the column behind each grouped and filtered member, view members through their cube's column, name heuristic as the floor |
+| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the unprofiled relations |
+| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing | refused before spend, against the connection's own inventory, naming the model's `sql_table` | refused before spend, against the connection's own inventory; a relation no cube in the repository sits on is refused first |
+| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse | the connector's, never in context; SLayer reads none | the connector's, never in context and never handed to Cube; a JWT minted per request from `CUBEJS_API_SECRET`, never in context |
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name | `ConnectionSource` (the connector's); a `SemanticSource` is refused by name, since the layer is files in this repository | none: the layer is files in this repository; a `SemanticSource` is refused by name |
 | Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
 | Entity descriptions on `list` | no: not authorable from a dbt project (see above), so the field is structurally absent here | a description at most, never a label: the API supplies one where it has one | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
@@ -1479,11 +1490,11 @@ in `tests/slayer_vendor/test_reader.py`, the catalog one against
 | Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier | on a dimension only; none for an expression or a quoted identifier | on dimensions and measures, traced through `{references}` and a `sql` cube's projection; none for an expression or a quoted identifier |
 | A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none | no measures at all, declared in `unavailable` | no measures at all, declared in `unavailable` | resolved from the authored `sql`, so `sum` over `{CUBE}.amount` carries `amount`, and a `count` with no `sql` carries none |
 | `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved | `declarations`, always: the format states no join graph to resolve through | `declarations`, always: a metric groups by its own model's columns | `declarations`, always: a metric groups by its cube's dimensions and those its joins reach |
-| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks | by SLayer at render time, for a filter's dotted columns only; a group-by stays on the root model | walked in declared direction for a metric's groupable list; not planned, since nothing renders |
-| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary | SLayer's built-in grains, applied to the model's `default_time_dimension` | not applicable: `query` refuses |
-| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead | SLayer's dimension-only query, no measure, executed here under the full handshake | refused after the values PII gate: no renderer in this release |
-| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason | not applicable: a dimension is a column of its own model; `--metric` scopes it to a metric's model | not applicable: refused |
+| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks | by SLayer at render time, for a filter's dotted columns only; a group-by stays on the root model | walked in declared direction for a metric's groupable list; planned by the Cube server at render time |
+| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary | SLayer's built-in grains, applied to the model's `default_time_dimension` | each time dimension's built-in and custom granularities, applied to the time dimension the query groups by |
+| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead | SLayer's dimension-only query, no measure, executed here under the full handshake | Cube's dimension-only query over `/v1/sql`, executed here under the full handshake |
+| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason | not applicable: a dimension is a column of its own model; `--metric` scopes it to a metric's model | Cube plans the join from the dimension's cube; `--metric` adds that measure and names it in `scoped_to` |
 | Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent | every configured document in full, whether or not a metric reads it | every configured model file in full, with a refused file named in `notes` | every configured plain-YAML file in full; compiled-only files and elements named in `compiled_only` |
 | Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip | the configured documents in this repository, through the semantic-source seam | the configured model files in this repository, through the semantic-source seam | the configured model files in this repository, through the semantic-source seam |
-| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax | `[slayer]`, pinned to one SLayer release | `[cube]` (the dialect engine; no Cube package) |
+| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax | `[slayer]`, pinned to one SLayer release | `[cube]` (the dialect engine; no Cube package), plus `[semantic-api]` to query |
 | Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts | yes, both runtime contracts, against a SLayer rendering of the reference layer | yes, both runtime contracts and the four semantic-source contracts, against a Cube rendering of the reference layer |

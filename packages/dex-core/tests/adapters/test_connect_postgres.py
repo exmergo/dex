@@ -1098,3 +1098,17 @@ def test_a_host_cap_inside_the_estimate_lets_the_statement_run_capped(
     # from the higher per-command ceiling.
     assert statement.session_timeout_ms is not None
     assert statement.session_timeout_ms <= 120_000
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_pg_connection):
+    """Cube's rendered SQL reads a zone-less timestamp through the session time
+    zone its own driver sets to UTC, so the governed Cube path asks for one."""
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(rows=[{"n": 1}])
+    adapter = make_adapter(fake_pg_connection)
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert "timezone" not in fake_pg_connection.session_parameters
+
+    adapter.pin_utc_session()
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert fake_pg_connection.session_parameters["timezone"] == "UTC"

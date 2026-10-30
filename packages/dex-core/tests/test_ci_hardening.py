@@ -43,6 +43,7 @@ LOOPBACK = ROOT / "scripts" / "check_loopback_ports.sh"
 DOGFOOD_SETUPS = (
     ROOT / "scripts" / "setup_postgres_dev.sh",
     ROOT / "scripts" / "setup_clickhouse_dev.sh",
+    ROOT / "scripts" / "setup_cube_dev.sh",
 )
 WORKFLOW = ROOT / ".github" / "workflows" / "integration.yml"
 

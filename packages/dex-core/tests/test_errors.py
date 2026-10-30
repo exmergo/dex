@@ -75,6 +75,13 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # CacheRequiredError and NoBaselineError stayed unreachable long enough for
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
+    # Wrapped before a caller sees it: the Cube layer turns each into
+    # SemanticBackendError, or SemanticQueryRefusedError for a refusal.
+    "CubeFilterError",
+    "CubeQueryError",
+    "CubeRefusalError",
+    "CubeTransportError",
+    "StaleRendererError",
     # Connector-specific connection failures. A host catches the ConnectorError
     # family instead of importing eight names, one per warehouse it does not use.
     "BigQueryConnectionError",

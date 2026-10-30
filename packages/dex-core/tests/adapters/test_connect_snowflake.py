@@ -1903,3 +1903,14 @@ def test_a_host_cap_binds_over_a_higher_committed_session_ceiling(fake_sf_connec
             timeout_seconds=30,
         )
     assert data_statements(fake_sf_connection) == []
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_sf_connection):
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(rows=[{"n": 1}])
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)
+    assert "TIMEZONE" not in fake_sf_connection.session_parameters
+
+    adapter.pin_utc_session()
+    _one_query(adapter)
+    assert fake_sf_connection.session_parameters["TIMEZONE"] == "UTC"

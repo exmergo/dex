@@ -95,6 +95,7 @@ class GovernedSql:
         result_type,
         extra_notes: list[str] | None = None,
         column_names: Mapping[str, str] | None = None,
+        utc_session: bool = False,
         **fields,
     ):
         """Take rendered SQL to a stamped result, in the order the module states.
@@ -104,6 +105,10 @@ class GovernedSql:
         payload. ``column_names`` renames a column the warehouse returned under
         the name the statement had to emit to the name the layer reports it by,
         for a layer that encodes its result names to suit a dialect.
+        ``utc_session`` runs the statement in a UTC session, for a layer whose
+        rendered SQL assumes its own driver's (Cube's): an adapter whose
+        sessions carry no time zone (BigQuery, whose ``TIMESTAMP`` is UTC) has
+        nothing to pin.
         """
 
         from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
@@ -120,6 +125,8 @@ class GovernedSql:
         # connection, and `_adapter` rebuilds the cost gate on every call, so
         # asking twice would settle and rebuild a gate for nothing.
         adapter = self._dex._adapter(command)
+        if utc_session and (pin := getattr(adapter, "pin_utc_session", None)):
+            pin()
         refusal, unprofiled = self.relation_precheck(
             sql,
             cache,

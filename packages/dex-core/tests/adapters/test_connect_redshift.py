@@ -1673,3 +1673,14 @@ def test_a_committed_entry_that_names_nothing_is_still_refused(
     adapter.read_dev_target("dbt_dev")
     with pytest.raises(RedshiftConnectionError, match=r"redshift\.schemas"):
         adapter.list_objects()
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_redshift_connection):
+    fake_redshift_connection.row_resolver = lambda sql: FakeResult(rows=[{"n": 1}])
+    adapter = make_adapter(fake_redshift_connection)
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert "timezone" not in fake_redshift_connection.session_parameters
+
+    adapter.pin_utc_session()
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert fake_redshift_connection.session_parameters["timezone"] == "UTC"

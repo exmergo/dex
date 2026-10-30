@@ -1263,6 +1263,17 @@ class RedshiftAdapter:
         types = [self._description_type(d) for d in cursor.description]
         return rows, labels, types
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def _billed_cursor(self, timeout_seconds: float | None = None) -> tuple[Any, bool]:
         """A cursor prepared for spend: the session prepared once, and the
         server-side statement timeout wound down to what remains of the
@@ -1273,6 +1284,9 @@ class RedshiftAdapter:
         remaining = self.cost_gate.statement_cap(unit="compute-second")
         self._ensure_session()
         cursor = self._conn.cursor()
+        if getattr(self, "_utc_session", False):
+            # dex-built session statement, a constant.
+            cursor.execute("SET timezone = 'UTC'")
         timeout_ms: int | None = None
         budget_bound = False
         if remaining is not None:

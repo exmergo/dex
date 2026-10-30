@@ -623,9 +623,10 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # repository, and a server is a second copy of them that nobody reviews in a
     # pull request. `local` is those files and nothing else.
     "slayer": ("local",),
-    # Cube's YAML model files committed here. Cube Cloud is a deployment of the
-    # same files (#914), and a Cube Core server renders queries over them
-    # (#913); neither is read yet, so `local` is the files and nothing else.
+    # Cube's YAML model files committed here, rendered for a governed query by
+    # the Cube server at `semantic.cube.url` (a Cube Core on this machine by
+    # default) and executed by dex. Cube Cloud is a deployment of the same files
+    # (#914), not read yet.
     "cube": ("local",),
 }
 
@@ -864,9 +865,10 @@ class CubeSemanticConfig(BaseModel):
     ``cube.py``/``cube.js`` are deployment configuration, not models, and are
     refused by name.
 
-    ``url`` is the non-secret base of a Cube REST API, for the commands that ask
-    a Cube server to render a query (not read by this release). It may name no
-    credential: a token in a committed URL is a token in git, and the secret a
+    ``url`` is the non-secret base of a Cube REST API, read by ``explore
+    semantic query|values``, which ask a Cube server to render SQL and execute
+    it themselves (``http://localhost:4000/cubejs-api`` when unset). It may name
+    no credential: a token in a committed URL is a token in git, and the secret a
     Cube server needs is read from the environment. ``data_source`` is the Cube
     data source dex treats as the warehouse it is connected to (Cube's own
     default is ``default``); a cube on another one is named in the catalog.

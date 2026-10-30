@@ -16,6 +16,10 @@ screen the wrong column and call it evidence:
   and a single-table one with a filter keeps its table for the PII gate alone.
 - **Which columns a join pairs.** An equality between a column of each side, or
   a conjunction of them. Anything else is a join with no declared pairs.
+
+It also writes the one thing dex puts into Cube's SQL: a parameter as a string
+literal of the connector's dialect (:func:`string_literal`), quoted by that
+dialect's own escaping rules.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ __all__ = [
     "cube_relation",
     "join_pairs",
     "member_column",
+    "string_literal",
 ]
 
 # Placeholders substituted for the two sides' references before parsing. Not
@@ -426,3 +431,14 @@ def _equality(term: exp.Expression) -> tuple[str, str] | None:
     if set(sides) != {_SELF, _OTHER}:
         return None
     return sides[_SELF], sides[_OTHER]
+
+
+def string_literal(value: str, connector: str) -> str:
+    """``value`` as a string literal of ``connector``'s dialect.
+
+    The dialect decides the escaping: a doubled quote on Postgres and DuckDB, a
+    backslash on BigQuery, Snowflake and Redshift, which also escape the
+    backslash itself. Hand-rolled quoting would get one of them wrong.
+    """
+
+    return exp.Literal.string(value).sql(dialect=_dialect(connector))

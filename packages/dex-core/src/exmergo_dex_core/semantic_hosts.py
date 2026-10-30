@@ -1,4 +1,4 @@
-"""Which hosts may receive the hosted dbt Cloud Semantic Layer token.
+"""Which hosts may receive a semantic layer's token: dbt Cloud's, and a Cube server's.
 
 The host and the token come from different places. The token is the user's,
 from ``DBT_SL_TOKEN``, ``~/.dbt/dbt_cloud.yml``, or a host-supplied
@@ -13,6 +13,10 @@ A private-link or single-tenant host outside those domains is admitted only by
 exact name, and only from somewhere the repository cannot write: the
 ``DEX_SL_ALLOWED_HOSTS`` environment variable, or ``SemanticSource.allowed_hosts``
 from an embedding host. Never from ``.dex/config.yml``.
+
+A Cube server is bound the same way for the same reason (:func:`check_cube_url`):
+the JWT dex mints from ``CUBEJS_API_SECRET`` goes to a server on this machine, or
+to a host named exactly in ``DEX_CUBE_ALLOWED_HOSTS`` over https.
 
 Imports nothing from the package but the error base, so the resolver, the
 backend, and the transport can all hold the same rule without a cycle.
@@ -89,3 +93,76 @@ def check_semantic_layer_host(host: object, *, extra_hosts: Iterable[str] = ()) 
         f"single-tenant host, name it exactly in {ALLOWED_HOSTS_ENV} in your own "
         "environment; .dex/config.yml cannot widen this list"
     )
+
+
+# --- Cube --------------------------------------------------------------------------
+
+#: Exact extra Cube hosts, comma-separated. Environment only, for the reason
+#: ``DEX_SL_ALLOWED_HOSTS`` is: ``semantic.cube.url`` is committed, and the
+#: token minted from ``CUBEJS_API_SECRET`` is the user's.
+CUBE_ALLOWED_HOSTS_ENV = "DEX_CUBE_ALLOWED_HOSTS"
+
+#: The hosts a ``deployment: local`` Cube server is admitted on without asking:
+#: the machine dex runs on, and nothing a repository could point elsewhere.
+LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
+
+
+def env_cube_allowed_hosts(env: Mapping[str, str] | os._Environ) -> tuple[str, ...]:
+    """The exact hosts ``DEX_CUBE_ALLOWED_HOSTS`` names, normalized."""
+
+    raw = env.get(CUBE_ALLOWED_HOSTS_ENV) or ""
+    return tuple(h for h in (normalize_host(part) for part in raw.split(",")) if h)
+
+
+def check_cube_url(url: object, *, extra_hosts: Iterable[str] = ()) -> str:
+    """Return the Cube API base ``url`` if a token may be sent to it; else raise.
+
+    Called before ``CUBEJS_API_SECRET`` is read. A loopback host is admitted,
+    over http or https, because a local Cube Core is a process on this machine.
+    Any other host needs an exact entry in ``DEX_CUBE_ALLOWED_HOSTS`` and https,
+    since the token would otherwise cross a network in the clear. A URL carrying
+    userinfo, a query or a fragment is refused rather than parsed around: the
+    request paths are appended to it, and those would change what they mean.
+    """
+
+    from urllib.parse import urlsplit
+
+    shown = str(url)[:200]
+    try:
+        parts = urlsplit(str(url or ""))
+        parts.port  # noqa: B018  (raises on a malformed port)
+    except ValueError as exc:
+        raise SemanticHostRefusedError(
+            f"semantic.cube.url {shown!r} is not a URL: {exc}"
+        ) from exc
+    host = normalize_host(parts.hostname or "")
+    if (
+        parts.scheme not in {"http", "https"}
+        or not host
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+    ):
+        raise SemanticHostRefusedError(
+            f"semantic.cube.url {shown!r} is not a plain Cube API base such as "
+            "http://localhost:4000/cubejs-api: a scheme, a host, an optional port "
+            "and path, and no credentials, query or fragment"
+        )
+    if host in LOOPBACK_HOSTS:
+        return str(url).rstrip("/")
+    if host not in {normalize_host(h) for h in extra_hosts}:
+        raise SemanticHostRefusedError(
+            f"refusing to send a Cube API token to {host!r}: only a Cube server on "
+            "this machine (localhost, 127.0.0.1, ::1) is admitted by default. The "
+            "URL can come from .dex/config.yml, which the repository controls, and "
+            "the token is minted from your CUBEJS_API_SECRET. To use a Cube server "
+            f"elsewhere, name its host exactly in {CUBE_ALLOWED_HOSTS_ENV} in your "
+            "own environment; .dex/config.yml cannot widen this list"
+        )
+    if parts.scheme != "https":
+        raise SemanticHostRefusedError(
+            f"refusing to send a Cube API token to {host!r} over http: a host other "
+            "than this machine is reached over https only"
+        )
+    return str(url).rstrip("/")
