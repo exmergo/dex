@@ -14,6 +14,228 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.16.6] - 2026-10-30
+
+### Added
+
+- **Declarations reach native Ossie layers.** The Ossie layer implements the
+  derivation hook the other semantic layers do. In a repository that pairs a dbt
+  project with an Ossie layer, `transform plan` and `transform declare` on a
+  declared mart derive an Ossie dataset for it: a field per declared column with
+  its `datatype`, `primary_key` on every grain field, declared aggregations as
+  dataset-scoped metrics `<column>_<agg>`, a relationship from each foreign key to
+  the parent's field, descriptions native, and population, assumptions, unit, NULL
+  rule and additivity in `ai_context` (prose `instructions` plus a structured `dex`
+  key; never `custom_extensions`, and never a filter). It is appended to the
+  configured document holding the datasets its foreign keys reference, every other
+  byte kept, and stored as a plan of its own beside the mart's; otherwise it is
+  proposed as a document of its own with the `dex config set` that adopts it.
+  `semantic ossie define|update|plan` take a `declarations` payload too, annotating
+  a dataset field by field.
+- **Every `maintain` axis runs on a Cube layer.** Under `semantic.vendor: cube`,
+  beside a dbt project or with none, and without a Cube server or Node:
+
+  - **Compiled-only definitions are recorded by their content.** A JS model, a
+    Jinja-templated file or an `extends` cube lands in the baseline under
+    `opaque_definitions`. A change is `compiled_only_changed`, and every
+    `maintain semantic` and `maintain check` warns that these were never compared
+    structurally, so a layer holding one never reads clean.
+  - **The schema axis holds cubes and views to Dex's warehouse metadata.**
+    - `declared_relation_missing`: a cube's table is gone since the baseline. A
+      table the connection was never scoped to is a note, not a finding.
+    - `declared_column_missing`: a member's `sql`, a measure filter or a segment
+      reads a dropped column.
+    - `declared_type_conflict`: a `time` dimension on a non-temporal column, or a
+      `number` dimension or summing measure on text.
+    - `declared_dependency_dropped`: a member, join or view include that reads
+      something that goes.
+
+    An expression Dex cannot read is named as unchecked.
+  - **The grain axis measures each join's `relationship`.** A join that fans out
+    is `join_cardinality_exceeded`, beside the `primary_key` checks already there.
+  - **`maintain reconcile` plans the removals through `semantic cube update`.** It
+    cuts only the entries that go, keeps every other byte, and stores the edit
+    under `data.semantic_plan_id`, even in a repository with no dbt project. A
+    cube whose table is gone, and a view source that walks a removed join, stay
+    advisory.
+- **Snowflake commands can stop paying the warehouse's idle tail.** A short
+  command on a warehouse at Snowflake's default 600-second `AUTO_SUSPEND` used to
+  cost about 600 warehouse-seconds for a second or two of work. With
+  `snowflake.suspend_after_command: true` and `OPERATE` granted on the pinned
+  warehouse, Dex suspends it at the end of a command that woke it and left it
+  idle, so the command bills its statement time floored at Snowflake's 60-second
+  resume minimum. Dex never suspends a warehouse that was already running, that
+  other queries are using, that has `AUTO_RESUME` off, or that is not the pinned
+  one, and the statement comes
+  from one typed method the query firewall never sees. Without the grant the
+  command completes, names the grant to add, and settles the tail as before.
+  `connect test` reports `budget.warehouse.suspend_after_command` and, when
+  `AUTO_SUSPEND` is longer than 60 seconds with no suspend in place, recommends a
+  60-second `AUTO_SUSPEND` or the setting; Dex never changes `AUTO_SUSPEND`
+  itself.
+
+  Every warning about the idle tail now prints the two commands that stop it:
+  `dex config set snowflake.suspend_after_command true`, and the `GRANT OPERATE`
+  with the warehouse and the session's own role filled in.
+- **`explore semantic query` and `values` answer on a Cube layer: Cube renders,
+  Dex executes.** Under `semantic.vendor: cube`, Dex asks the Cube server at
+  `semantic.cube.url` (a local Cube Core by default) to render the query over
+  `/v1/sql`, which plans without executing, and runs the SQL through its own
+  connector under the PII gate and the cost guard (`execution: dex`). It works on
+  DuckDB, Postgres, BigQuery, Snowflake and Redshift.
+
+  - **Before anything is sent**, the PII gate screens every grouped and filtered
+    member against the profiled columns behind it.
+  - **Before anything is rendered**, every member the query names is held to the
+    server's `/v1/meta`: its kind, aggregation, SQL, filters and custom
+    granularities. A server still serving a model the repository has since
+    changed is refused, naming the member. Cube outside dev mode never reloads an
+    edited file, so this is the normal state after an edit until the server
+    restarts.
+  - **Before anything runs**, Dex refuses a plan Cube would answer from a
+    pre-aggregation (Cube matches a rollup it never built, and the SQL reads that
+    table), a plan of more than one statement, an external store, another data
+    source, a relation no cube in the repository sits on, and SQL rendered for
+    another warehouse. Cube's parameters are written in as literals of the
+    connector's dialect, and the statement runs in a UTC session, the setting
+    Cube's own drivers use.
+  - **The dialect is Cube's.** Members are `cube.member`; a time grouping is
+    `--group-by orders.ordered_at__month` (custom granularities included);
+    `--where` takes Cube's JSON filter, and a date range on the grouped time
+    dimension bounds a rolling window.
+  - **The server is a renderer, nothing more.** Dex calls `/v1/meta` and `/v1/sql`
+    only, never `/v1/load`, and gives Cube no warehouse credential. It signs each
+    request with a minute-long token minted from `CUBEJS_API_SECRET`, read from
+    the environment only and never shown. A Cube server other than one on this
+    machine must be named in `DEX_CUBE_ALLOWED_HOSTS`.
+  - **Needs `[cube]` and `[semantic-api]`**, which the skill wrappers already
+    select. `scripts/setup_cube_dev.sh` starts a hardened, render-only Cube Core
+    for local use.
+- **`semantic cube define|update|plan` authors Cube model files, and a declared
+  mart derives a cube.** Whole plain-YAML files listed in `semantic.cube.files`
+  are validated as one prospective set by Dex's port of Cube's model rules, with
+  a key Cube does not declare refused in a file the plan writes and a `fan_out`
+  warning for a summing cube with no `primary_key` on the one side of a join.
+  JavaScript models, `globals.py`, `cube.py`/`cube.js` and compiled-only files are
+  refused by name, and each cube and view is reported `defined`, `updated` or
+  `unchanged`. `transform apply` writes the authored bytes, all files or none.
+  Under `semantic.vendor: cube`, a declared dbt mart now gets a cube of its own in
+  `data.semantic_proposal` (grain as `primary_key`, foreign keys as `many_to_one`
+  joins, declared aggregations as measures, the population as `meta.dex` and never
+  a filter), and `semantic cube` takes `declarations` that annotate one cube
+  without touching the rest of its file. No Node, no Cube server and no warehouse
+  connection is opened.
+
+### Changed
+
+- **Native Ossie documents follow upstream's current schema: one flat model per
+  document, open dialects, and `OSSIE_SQL_2026`.** dex now pins Apache Ossie at
+  `7a8de20`, whose schema changed under the same `0.2.0.dev0` version string, so
+  dex read no current upstream document and upstream refused every one dex wrote.
+
+  - **A document is one semantic model, flat at its root** (`version`, `name`,
+    `datasets`, `relationships`, `metrics`). A document in the earlier wrapped
+    `semantic_model: [...]` shape is refused by a rule of its own,
+    `wrapped_document`, whose message names the migration: lift the model to the
+    root, drop root-level `dialects` and `vendors`, one document per model. Catalog
+    names stay `<model>.<dataset>`, so a migrated document reads under the names it
+    had.
+  - **`Dialect` is an open string.** `OSSIE_SQL_2026` is read and parsed as SQL,
+    and an expression's top-level `sql` is read as it, ahead of `ANSI_SQL` and over
+    an `OSSIE_SQL_2026` dialect entry. Any other token (`DAX`, `THOUGHTSPOT`, or
+    one no registry names) is accepted, kept verbatim, never parsed or linked, and
+    named in the `non_sql_dialect` note.
+  - **Dataset-scoped metrics** (`datasets[].metrics`) are listed by
+    `explore semantic list` as `dataset.metric`, with lineage to their dataset.
+  - **`maintain snapshot` records the pinned schema's hash** as the layer's
+    `format_version`, so a baseline taken under another pin reports
+    `semantic_format_changed` rather than a layer of changed definitions.
+  - Every upstream example and portability-compliance document at the pin loads
+    with no error and no warning, and the corpus records the verdicts that moved:
+    `post_pin_thoughtspot_is_refused` is now `opaque_dialects_are_metadata`
+    (accepted, with a note), and unequal relationship arity is now upstream's rule
+    as well as dex's.
+
+### Fixed
+
+- **`maintain reconcile` no longer assumes cardinality drift introduces a new value.** Dimension-cardinality advisories now distinguish contraction from expansion, avoid claiming that a particular category changed, and warn when the counts are approximate. ([#898](https://github.com/exmergo/dex/pull/898))
+- **`explore relationships --verify` and `explore map --verify` no longer fail when the warehouse refuses one probed join.** A refused batch is retried edge by edge, so the joins the warehouse accepts are still measured; on ClickHouse, a join refused for lack of a common key type (signed against unsigned, for example Int32 against UInt64) is retried with both key sides compared as Int128. An edge that still refuses is reported in notes instead of failing the command. ([#950](https://github.com/exmergo/dex/pull/950))
+- **On DuckDB, `transform build` finishes a seed change that adds, drops or
+  reorders a column.** dbt loads a seed into the table it already built, so a CSV
+  that gained or lost a column failed to load, every model reading the seed was
+  skipped, and the only way out was a `dbt seed --full-refresh` run outside Dex.
+  A CSV that only reordered its columns loaded each value under the wrong name.
+  `transform build` now compares each seed's header with the columns of its
+  relation in the dev target and rebuilds a seed that differs with
+  `dbt seed --full-refresh` before the build, only when the build selects it.
+  The envelope names the rebuilt seeds under `data.full_refresh` and says why in
+  `warnings`. ([#952](https://github.com/exmergo/dex/pull/952))
+- **`additivity_contradicted` ignores ties when detecting running totals.**
+  Consecutive observations whose values do not change no longer count as evidence
+  that an additive measure is a running total or snapshot, avoiding false
+  contradictions on sparse daily counts. ([#953](https://github.com/exmergo/dex/pull/953))
+- **A Snowflake `--verify` estimate includes the warehouse's uptime again.** With
+  every profile cached, `explore relationships --verify` and `explore map
+  --verify` quoted the probes alone (about a second) and then billed the resume
+  minimum and idle tail, or returned `ok` with nothing verified when the budget
+  could not cover them. The uptime is now added once per command by whichever
+  handshake shows the caller an estimate, as its own `(warehouse uptime)` line,
+  so the quote matches what settles and a budget too small for it returns
+  `needs_confirmation` with the real figure.
+- **A Snowflake database scope no longer inventories `INFORMATION_SCHEMA`.** With
+  `snowflake.databases` naming a whole database, `SHOW ... IN DATABASE` listed that
+  database's `INFORMATION_SCHEMA` views beside its own objects, so `explore` and
+  `maintain` profiled Snowflake's catalog as data (findings on
+  `INFORMATION_SCHEMA.COLUMNS`) and a probe could fail on a view such as
+  `CORTEX_SEARCH_SERVICES`. Those rows are now skipped, as the scope resolver
+  already skipped the schema.
+- **Ossie keys and relationships resolve through the fields they name.** Under
+  upstream's Name Resolution, `primary_key`, `unique_keys` and a relationship's
+  `from_columns` and `to_columns` name a dataset's **fields**, not its source
+  columns. dex read them as columns, so a field `customer_id` defined as
+  `o_custkey` sent `explore relationships --verify`, `explore profile
+  --use-project`, `maintain grain` and `maintain semantic` to a column that does not
+  exist, or to a different one of that name. Each member now reaches its column
+  through its field's expression; a key or relationship naming no declared field is
+  refused (`undeclared_key_field`, `undeclared_relationship_field`); and one with a
+  member whose field links no column (a computed field, for instance) is named in a
+  note and never verified or probed, so a composite is never checked on part of its
+  tuple. The snapshot fingerprints a relationship's fields as well as its columns,
+  so renaming either is drift.
+- **Snowflake commands run back to back no longer each pay a full idle tail.**
+  Each command now records its claim on the warehouse's resume cycle in
+  `.dex/spend.jsonl` (a zero-amount settlement row carrying `warehouse_claim`),
+  and a command that finds the warehouse still running in the same cycle is
+  quoted and charged only the gap since the previous command plus its own span.
+  Ten commands half a minute apart settle about one tail, as Snowflake bills
+  them, instead of ten. The charge never exceeds statement time plus one tail, so
+  a warehouse other users keep running cannot make Dex claim their uptime.
+- **`--verify` measures a declared join on Snowflake whatever case the project
+  wrote it in.** A dbt `relationships` test or a declaration's `references` names
+  `customer_id` where Snowflake stores `CUSTOMER_ID`, and the overlap probe quoted
+  the name as written, so `explore relationships --verify` and `explore map
+  --verify` failed with an invalid identifier. A declared join now takes the
+  spelling its profiled dataset records before it is probed, where exactly one
+  column matches.
+- **`maintain` no longer passes checks it could not run.**
+
+  - **Categorical dimensions are re-counted on SLayer and Cube models.** The
+    dimension-cardinality check found a model's table only through a dbt model,
+    so a layer whose models name their table directly (`sql_table`) was never
+    checked. A `definition_changed` on such a model now names its table too.
+  - **A declared join is checked where the warehouse keeps no free row count.**
+    On Postgres before `ANALYZE`, Trino's memory tables and any view, the join
+    arity check was dropped without a word. It now runs, and the scan supplies
+    the count.
+  - **An unjudged check is named.** Where nothing counts a table's rows (no free
+    count, and a scan that does not count), the key and join checks it needed
+    appear in `warnings` instead of reading as passed.
+  - **A semantic-only repository can reconcile.** `maintain reconcile` no longer
+    refuses outright when there is no dbt project. A semantic layer's own schema
+    findings are planned through their own route, and the rest stay advisory.
+- Under ``semantic.vendor: ossie``, ``slayer``, or ``cube``, explore with the project definitions flag no longer folds MetricFlow ``primary_entities`` or metric lineage into the exploration beside the native vendor layer.
+
+
 ## [1.16.5] - 2026-10-29
 
 ### Added

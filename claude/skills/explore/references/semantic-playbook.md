@@ -195,9 +195,26 @@ statically with no Cube server. `list` reads the same shape as anywhere else:
 - **`compiled_only` lists what Dex did not read**: a JS model, a templated
   (Jinja) YAML file, or a cube using `extends`. Those definitions exist; do not
   report them as missing, and do not guess at their contents.
-- **`query` and `values` refuse in this release.** Cube renders a query only
-  inside a Cube server. Use `explore profile` and `explore query` on the
-  relations the catalog names instead.
+- **`query` and `values` need a Cube server, as a renderer.** Dex asks the
+  server at `semantic.cube.url` for the SQL and runs it itself, so
+  `CUBEJS_API_SECRET` must be exported (never put it in config), and a host
+  other than this machine must be named in `DEX_CUBE_ALLOWED_HOSTS`. No Cube
+  server running, or the wrong secret, is an error naming the fix; with none
+  available, use `explore profile` and `explore query` on the relations the
+  catalog names instead.
+- **Speak Cube's dialect.** Metrics and dimensions are `cube.member` (or
+  `view.member`). Cube has no `metric_time`: group by the time dimension with
+  its grain, `--group-by orders.ordered_at__month` (custom granularities work
+  the same way). `--where` takes Cube's JSON filter, one object, a list, or
+  `and`/`or` groups; a date range on the grouped time dimension
+  (`inDateRange`) also bounds a rolling window. `--order-by` names only the
+  query's own members, `--order-by=-orders.revenue` for descending.
+- **A stale-renderer refusal means restart Cube, not fix the query.** Cube
+  outside dev mode never reloads an edited model file, so after a
+  `semantic cube update` the server serves the old model until restarted, and
+  Dex refuses rather than run SQL from a model nobody reviewed. A refusal naming
+  a pre-aggregation means Cube would answer from a rollup table; query members
+  it does not cover.
 
 ## When the layer is SLayer models
 

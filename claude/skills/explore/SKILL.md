@@ -161,7 +161,11 @@ fetches the engine's dependencies from PyPI or your configured index.
    physical route instead (`explore profile`, then `explore query` on the
    relation): take it. On a SLayer layer both run locally: metrics and
    dimensions are named `model.measure` and `model.column`, `--where` is
-   SLayer's filter syntax rather than Jinja, and `--api` is refused.
+   SLayer's filter syntax rather than Jinja, and `--api` is refused. On a Cube
+   layer both run locally too, rendered by the Cube server at
+   `semantic.cube.url`: members are `cube.member`, a time grouping is
+   `--group-by orders.ordered_at__month`, `--where` is Cube's JSON filter, and a
+   stale-renderer refusal means the Cube server needs a restart, not a new query.
 
 Per-command fields, caps, and backend detail are in
 `${CLAUDE_SKILL_DIR}/references/commands.md`. Read it when a field or flag you
@@ -230,6 +234,14 @@ need is not described here.
   reserve decides whether a higher budget buys work or only headroom.
 - When an estimate is larger than the work deserves, narrow with `--scope`
   instead of raising the budget.
+- On Snowflake, when `connect test` or an estimate's note says the warehouse's
+  `AUTO_SUSPEND` tail costs more than the work, put the choice to the person
+  before the first billed command, with the commands it names: lower
+  `AUTO_SUSPEND` to 60 on a dedicated warehouse, or turn on
+  `snowflake.suspend_after_command` and run the `GRANT OPERATE` it prints. Either
+  cuts a short command from about 600 warehouse-seconds to about 60. Never run
+  the grant or change the warehouse yourself, and never turn the setting on
+  without the person's yes, since it acts on a warehouse others may share.
 - `--api` (a hosted dbt Cloud layer) runs where no cost guard can reach. Relay
   the warning every such result carries.
 
