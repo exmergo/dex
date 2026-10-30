@@ -175,8 +175,8 @@ pending fragments into a new section below. See
   that an additive measure is a running total or snapshot, avoiding false
   contradictions on sparse daily counts. ([#953](https://github.com/exmergo/dex/pull/953))
 - **A Snowflake `--verify` estimate includes the warehouse's uptime again.** With
-  every profile cached, `explore relationships --verify` and `explore map
-  --verify` quoted the probes alone (about a second) and then billed the resume
+  every profile cached, `explore relationships --verify` and
+  `explore map --verify` quoted the probes alone (about a second) and then billed the resume
   minimum and idle tail, or returned `ok` with nothing verified when the budget
   could not cover them. The uptime is now added once per command by whichever
   handshake shows the caller an estimate, as its own `(warehouse uptime)` line,
@@ -193,8 +193,8 @@ pending fragments into a new section below. See
   upstream's Name Resolution, `primary_key`, `unique_keys` and a relationship's
   `from_columns` and `to_columns` name a dataset's **fields**, not its source
   columns. dex read them as columns, so a field `customer_id` defined as
-  `o_custkey` sent `explore relationships --verify`, `explore profile
-  --use-project`, `maintain grain` and `maintain semantic` to a column that does not
+  `o_custkey` sent `explore relationships --verify`,
+  `explore profile --use-project`, `maintain grain` and `maintain semantic` to a column that does not
   exist, or to a different one of that name. Each member now reaches its column
   through its field's expression; a key or relationship naming no declared field is
   refused (`undeclared_key_field`, `undeclared_relationship_field`); and one with a
@@ -213,8 +213,8 @@ pending fragments into a new section below. See
 - **`--verify` measures a declared join on Snowflake whatever case the project
   wrote it in.** A dbt `relationships` test or a declaration's `references` names
   `customer_id` where Snowflake stores `CUSTOMER_ID`, and the overlap probe quoted
-  the name as written, so `explore relationships --verify` and `explore map
-  --verify` failed with an invalid identifier. A declared join now takes the
+  the name as written, so `explore relationships --verify` and
+  `explore map --verify` failed with an invalid identifier. A declared join now takes the
   spelling its profiled dataset records before it is probed, where exactly one
   column matches.
 - **`maintain` no longer passes checks it could not run.**
