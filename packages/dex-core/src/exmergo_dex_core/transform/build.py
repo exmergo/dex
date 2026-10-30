@@ -17,6 +17,7 @@ named a runtime or an artifact directory.
 from __future__ import annotations
 
 import contextlib
+import csv
 import json
 import os
 import re
@@ -40,6 +41,7 @@ from ..dbt_project import (
     contained_path,
     manifest_node_label,
     profiles_dir,
+    strip_relation_quoting,
 )
 from ..dbt_project import load as load_project
 from ..envelope import Cost, EstimateQuality, Paradigm, redact
@@ -133,6 +135,7 @@ def build(
     approved_functions: frozenset[str] | None = None,
     runtime_key: str | None = None,
     artifact_directory: Path | str | None = None,
+    relation_columns: Callable[[list[str]], dict[str, list[str]]] | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -162,6 +165,13 @@ def build(
     ``--target-path``, so a ``target-path`` already set in the project is left
     alone. The summary names ``artifact_directory`` only when one of those
     arguments was passed.
+
+    ``relation_columns`` reads the dev target: it takes seed relation names and
+    returns the columns of each one that exists. With it, a seed whose CSV header
+    no longer matches its relation (see :func:`stale_seeds`) is rebuilt with
+    ``dbt seed --full-refresh`` right before the build, and the summary says so
+    under ``full_refresh``. Injected like ``dev_target_check``, and for the same
+    reason; without it the build runs as it always has.
     """
 
     assert_dev_target(target, configured_target)
@@ -212,9 +222,7 @@ def build(
                 "deps": {"ran": True, "success": False},
             }, cost
 
-    argv = [
-        _dbt_executable(),
-        "build",
+    flags = [
         "--target",
         target,
         "--project-dir",
@@ -224,6 +232,7 @@ def build(
         "--log-format",
         "json",
     ]
+    argv = [_dbt_executable(), "build", *flags]
     if select:
         argv += ["--select", select]
 
@@ -238,6 +247,7 @@ def build(
         artifacts = project / "target"
     if named_artifacts:
         argv += ["--target-path", str(artifacts)]
+        flags += ["--target-path", str(artifacts)]
 
     # A hard compile-time/parse-time failure (a Jinja context error, for
     # instance) dies before dbt ever reaches node execution, so it never
@@ -256,6 +266,21 @@ def build(
     run = runner or _default_runner(
         timeout, project, env=_build_env(connector, paradigm, ceiling)
     )
+    stale: list[dict[str, Any]] = []
+    if relation_columns is not None:
+        try:
+            stale = _seeds_to_refresh(
+                project, artifacts, flags, select, run, relation_columns
+            )
+        except Exception as exc:
+            # Reported, never raised: a check that cannot read the dev target
+            # must not break a build dbt could run, nor go quiet about it.
+            target_warnings = [
+                *target_warnings,
+                "could not compare seed headers with the dev target "
+                f"({type(exc).__name__}: {exc}); a seed whose columns changed "
+                "fails as dbt reports it",
+            ]
     if approved_functions:
         from ..adapters import get_dialect
 
@@ -270,6 +295,28 @@ def build(
         # resolved directory, so an isolated run does not keep a previous
         # invocation's results there.
         clear_run_results(artifacts)
+    # After every gate above, so a refused build has dropped nothing.
+    refreshed: list[str] = []
+    if stale:
+        seed_argv = [_dbt_executable(), "seed", "--full-refresh", *flags]
+        seed_argv += ["--select", " ".join(_exact_seed(node) for node in stale)]
+        clear_run_results(artifacts)
+        seeded = _summarize(
+            project,
+            target,
+            run(seed_argv),
+            artifact_directory=artifacts if named_artifacts else None,
+        )
+        refreshed = [node["name"] for node in seeded["nodes"]]
+        if not seeded["success"]:
+            seeded["full_refresh"] = {
+                "seeds": refreshed or [str(node["name"]) for node in stale],
+                "success": False,
+            }
+            return seeded, cost
+        # The build that follows reloads these seeds and tests them, so its own
+        # results are the evidence; the refresh's are not.
+        clear_run_results(artifacts)
     completed = run(argv)
 
     summary = _summarize(
@@ -280,11 +327,119 @@ def build(
     )
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
+    if refreshed:
+        summary["full_refresh"] = {"seeds": refreshed, "success": True}
+        target_warnings = [
+            *target_warnings,
+            f"rebuilt {', '.join(refreshed)} with dbt seed --full-refresh before "
+            "the build: its CSV header no longer matched the columns of its "
+            "relation in the dev target, and a changed header either fails to "
+            "load into the table dbt already built or loads values into the "
+            "wrong columns",
+        ]
     if target_warnings:
         # Notes, not failure causes: kept out of `messages`, whose first entry
         # is promoted to the envelope's error line on failure.
         summary["notes"] = list(target_warnings)
     return summary, cost
+
+
+def stale_seeds(
+    manifest_path: Path,
+    project: Path,
+    relation_columns: Callable[[list[str]], dict[str, list[str]]],
+) -> dict[str, dict[str, Any]]:
+    """The seeds whose CSV header no longer matches the relation they load into,
+    as ``unique_id`` to manifest node.
+
+    dbt reloads a seed into the table it already built unless told to rebuild
+    it, so a header that gained or lost a column fails to load (issue #943), and
+    on dbt-duckdb, which loads by position, one that reordered its columns loads
+    each value under the wrong name. Only ``--full-refresh`` recreates the
+    table. Names compare case-insensitively, since a warehouse may fold them,
+    and in order. A seed whose relation does not exist yet is not stale: dbt
+    creates it.
+    """
+
+    nodes: dict[str, Any] = {}
+    with contextlib.suppress(OSError, json.JSONDecodeError, AttributeError):
+        nodes = json.loads(manifest_path.read_text(encoding="utf-8")).get("nodes") or {}
+    seeds = {
+        strip_relation_quoting(node["relation_name"]): (unique_id, node)
+        for unique_id, node in nodes.items()
+        if isinstance(node, dict)
+        and node.get("resource_type") == "seed"
+        and node.get("fqn")
+        and node.get("relation_name")
+        and node.get("original_file_path")
+    }
+    if not seeds:
+        return {}
+    live = relation_columns(list(seeds))
+    stale: dict[str, dict[str, Any]] = {}
+    for relation, (unique_id, node) in seeds.items():
+        columns = live.get(relation)
+        if not columns:
+            continue
+        delimiter = (node.get("config") or {}).get("delimiter") or ","
+        csv_file = Path(node.get("root_path") or project) / node["original_file_path"]
+        try:
+            with csv_file.open(encoding="utf-8-sig", newline="") as handle:
+                header = next(csv.reader(handle, delimiter=delimiter), [])
+        except OSError:
+            continue
+        if [c.lower() for c in columns] != [h.lower() for h in header]:
+            stale[unique_id] = node
+    return stale
+
+
+def _seeds_to_refresh(
+    project: Path,
+    artifacts: Path,
+    flags: list[str],
+    select: str | None,
+    run: Runner,
+    relation_columns: Callable[[list[str]], dict[str, list[str]]],
+) -> list[dict[str, Any]]:
+    """The manifest node of each stale seed this build selects.
+
+    A full refresh drops the table, so a seed the build would not select is left
+    alone. dex does not evaluate dbt's selector language, which includes a
+    project's default selector, so ``dbt ls`` answers which seeds the build
+    selects. It parses afresh for this target, so neither a cleaned target
+    directory nor a manifest another target left behind decides which table a
+    seed loads into.
+    """
+
+    argv = [_dbt_executable(), "ls", "--quiet", "--resource-type", "seed"]
+    argv += ["--output", "json", "--output-keys", "unique_id", *flags]
+    if select:
+        argv += ["--select", select]
+    listed: set[str] = set()
+    for line in (run(argv).stdout or "").splitlines():
+        # Under --log-format json each printed node is a PrintEvent whose
+        # message is that node's own JSON.
+        with contextlib.suppress(ValueError, TypeError, KeyError, AttributeError):
+            event = json.loads(line)
+            if event["info"]["name"] == "PrintEvent":
+                listed.add(json.loads(event["data"]["msg"])["unique_id"])
+    if not listed:
+        return []
+    stale = stale_seeds(artifact_paths(artifacts).manifest, project, relation_columns)
+    return [stale[unique_id] for unique_id in sorted(stale) if unique_id in listed]
+
+
+def _exact_seed(node: dict[str, Any]) -> str:
+    """A dbt selection matching this one seed and nothing else.
+
+    dbt's fqn method also matches an fqn without its package and as a prefix,
+    which reaches a same-named seed in another package or the seeds in a
+    directory of the same name, so the package and the file name pin it.
+    """
+
+    fqn = [str(part) for part in node["fqn"]]
+    name = Path(node["original_file_path"]).name
+    return f"package:{fqn[0]},fqn:{'.'.join(fqn)},file:{name}"
 
 
 @contextlib.contextmanager

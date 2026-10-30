@@ -3286,6 +3286,9 @@ def build(
             dev_target_check=dev_check,
             dependencies=dependencies,
             approved_functions=frozenset(config.guards.approved_functions),
+            relation_columns=dev_target.seed_relation_columns(
+                project, target, repo_root, effective, engine.connection
+            ),
         )
         # Before the shaping on both paths, so the two read the same way; here
         # there is no gate to outlive, on the billed path below there is.
@@ -4371,11 +4374,14 @@ def _shape_build_result(
     # Agents triage from `errors` first, so the first real dbt message rides there;
     # the rest stay in warnings.
     deps_info = summary.get("deps")
-    prefix = (
-        "dbt deps failed"
-        if deps_info and not deps_info.get("success", True)
-        else "dbt build failed"
-    )
+    refresh_info = summary.get("full_refresh")
+    if deps_info and not deps_info.get("success", True):
+        prefix = "dbt deps failed"
+    elif refresh_info and not refresh_info.get("success", True):
+        prefix = "dbt seed --full-refresh failed"
+    else:
+        prefix = "dbt build failed"
+
     failed = BuildResult(
         success=False,
         summary=summary,

@@ -1002,6 +1002,25 @@ default, or a filter or operator after it is refused. A key naming a location
   declaration dex cannot check by name (a git URL names a repository, and dbt
   installs under the package's own name) is reported separately rather than named
   on a guess.
+- **`transform build` rebuilds a seed whose CSV header changed.** dbt loads a
+  seed into the table it already built, so a header that gained or lost a
+  column fails to load and every model reading the seed is skipped behind it,
+  and one that reordered its columns loads each value under the wrong name
+  (dbt-duckdb loads by position). On DuckDB, before the build, dex asks
+  `dbt ls` which seeds the build selects (dex does not evaluate the selector,
+  and a default selector in `selectors.yml` counts), compares each one's header
+  with the columns of its table in the DuckDB file the dev target writes, and
+  runs `dbt seed --full-refresh` for each seed that differs. `dbt ls` parses
+  afresh for the target, so neither a cleaned target directory nor a manifest
+  left by another target decides which table a seed loads into; it adds one dbt
+  invocation to every DuckDB build whose dev database file already exists (a
+  file that does not exist yet holds no seed table to compare).
+  `data.full_refresh` names the rebuilt seeds (`seeds`, `success`) and a line
+  in `warnings` says why; a refresh that fails stops the build, with
+  `dbt seed --full-refresh failed: ...` as `errors[0]`. A dev target dex cannot
+  read is named in `warnings` and the build runs as it did before the check
+  existed. Billed connectors do not run the check: the refresh would spend
+  warehouse time outside the spend the build settles.
 - `transform build --verify` runs the `maintain verify` sweep over the nodes
   this build touched and reports it under `data.verification`, in one envelope
   with the build result. Opt-in on every connector, free ones included.
