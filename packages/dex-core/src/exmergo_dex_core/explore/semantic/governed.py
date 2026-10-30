@@ -223,6 +223,10 @@ class GovernedSql:
             # cannot speak leaves the name heuristic in charge.
             matches = set(match_identifier(relation, known))
             cleared: set[str] = set()
+            # Strongest sub-threshold flag among clearing matches; carried
+            # beside clearance so the envelope can warn the way explore query
+            # does (semantic SQL never reaches query_firewall).
+            sub: dict[str, object] | None = None
             for dataset in datasets:
                 if dataset.identifier not in matches:
                     continue
@@ -232,10 +236,20 @@ class GovernedSql:
                     flag = column.pii
                     if flag is not None and flag.confidence >= PII_BLOCK_CONFIDENCE:
                         return {"pii": True, "category": flag.category.value}
+                    if flag is not None and (
+                        sub is None or flag.confidence > float(sub["confidence"])
+                    ):
+                        sub = {
+                            "category": flag.category.value,
+                            "confidence": flag.confidence,
+                        }
                     cleared.add(dataset.identifier)
             if matches and cleared == matches:
                 # Profiled and cleared (or a human override): authoritative,
-                # so say so rather than leaving it to the name heuristic.
+                # so say so rather than leaving it to the name heuristic. A
+                # sub-threshold flag rides along so the result can disclose it.
+                if sub is not None:
+                    return {"pii": False, **sub}
                 return {"pii": False}
             return None
 
@@ -263,6 +277,24 @@ class GovernedSql:
             if all(found is not None for found in verdicts):
                 # Every column it reads was profiled and cleared, which includes
                 # an expression that reads none: a constant carries no data.
+                # Carry the strongest sub-threshold flag so the envelope warns.
+                sub = None
+                for found in verdicts:
+                    if (
+                        isinstance(found, dict)
+                        and found.get("category") is not None
+                        and found.get("confidence") is not None
+                        and (
+                            sub is None
+                            or float(found["confidence"]) > float(sub["confidence"])
+                        )
+                    ):
+                        sub = {
+                            "category": found["category"],
+                            "confidence": found["confidence"],
+                        }
+                if sub is not None:
+                    return {"pii": False, READS: reads, **sub}
                 return {"pii": False, READS: reads}
             return {READS: reads}
 

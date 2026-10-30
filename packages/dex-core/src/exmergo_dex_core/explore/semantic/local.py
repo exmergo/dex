@@ -47,7 +47,7 @@ from . import (
 from .governed import GovernedSql
 from .governed import unprofiled_note as _unprofiled_note  # noqa: F401  (re-export)
 from .local_runtime import metricflow_engine
-from .policy import name_only_note
+from .policy import name_only_note, sub_threshold_note
 
 # Said only when the join graph could not be resolved, which is an install that
 # picked no extras. A list that names a metric's single-hop dimensions and reads
@@ -271,9 +271,12 @@ class LocalMetricFlowBackend:
             backend=self,
             command="explore semantic query",
             result_type=SemanticQueryResult,
-            extra_notes=name_only_note(
-                unadjudicated_refs(refs, meta_lookup=lookup, aliases=aliases)
-            ),
+            extra_notes=[
+                *name_only_note(
+                    unadjudicated_refs(refs, meta_lookup=lookup, aliases=aliases)
+                ),
+                *sub_threshold_note(refs, meta_lookup=lookup, aliases=aliases),
+            ],
         )
 
     def time_axis_refs(self, metrics: list[str]) -> list[str] | None:

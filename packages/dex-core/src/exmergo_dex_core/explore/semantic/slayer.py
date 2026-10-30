@@ -62,6 +62,7 @@ from .policy import (
     resolve_values_request,
     screen_dimension_refs,
     screen_values_request,
+    sub_threshold_note,
     unadjudicated_refs,
     validate_grain,
 )
@@ -242,7 +243,10 @@ class LocalSlayerLayer:
             backend=self,
             command="explore semantic query",
             result_type=SemanticQueryResult,
-            extra_notes=name_only_note(unadjudicated_refs(refs, meta_lookup=lookup)),
+            extra_notes=[
+                *name_only_note(unadjudicated_refs(refs, meta_lookup=lookup)),
+                *sub_threshold_note(refs, meta_lookup=lookup),
+            ],
             column_names=rendered.result_keys,
         )
 

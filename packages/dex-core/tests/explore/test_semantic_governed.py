@@ -25,6 +25,8 @@ from exmergo_dex_core.cache import (
 from exmergo_dex_core.config import DexConfig, QueryLimits
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.explore.semantic.governed import GovernedSql, unprofiled_note
+from exmergo_dex_core.explore.semantic.policy import sub_threshold_note
+from exmergo_dex_core.guards import PII_BLOCK_CONFIDENCE
 from exmergo_dex_core.storage import MemoryStore
 
 SEMANTIC = Path(exmergo_dex_core.__file__).parent / "explore" / "semantic"
@@ -201,3 +203,58 @@ def test_an_unprofiled_relation_is_disclosed_once_and_in_order():
     assert len(note) == 1
     assert "wh.main.a, wh.main.b" in note[0]
     assert unprofiled_note([]) == []
+
+
+def _sub_threshold_cache() -> DexCache:
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.customers",
+                columns=[
+                    ColumnProfile(
+                        name="city",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.ADDRESS, confidence=0.4),
+                    ),
+                    ColumnProfile(name="status", data_type="VARCHAR"),
+                ],
+            )
+        ]
+    )
+
+
+def test_sub_threshold_flag_clears_with_category_and_confidence():
+    """A flag below the block threshold is clearance, but the envelope must see it."""
+
+    lookup = _spine({"customers__city": ("wh.main.customers", "city")}).pii_lookup(
+        _sub_threshold_cache()
+    )
+
+    assert lookup("customers__city") == {
+        "pii": False,
+        "category": "address",
+        "confidence": 0.4,
+    }
+
+
+def test_sub_threshold_note_names_the_cleared_flag():
+    lookup = _spine({"customers__city": ("wh.main.customers", "city")}).pii_lookup(
+        _sub_threshold_cache()
+    )
+
+    notes = sub_threshold_note(["customers__city"], meta_lookup=lookup)
+    assert len(notes) == 1
+    assert "customers__city is PII-flagged at confidence 0.4" in notes[0]
+    assert f"below the {PII_BLOCK_CONFIDENCE:g} block threshold" in notes[0]
+
+
+def test_sub_threshold_note_stays_quiet_for_bare_clearance():
+    lookup = _spine(
+        {
+            "order__contact": ("wh.main.orders", "contact_col"),
+            "order__status": ("main.orders", "STATUS"),
+        }
+    ).pii_lookup(_flagged_cache())
+
+    assert lookup("order__status") == {"pii": False}
+    assert sub_threshold_note(["order__status"], meta_lookup=lookup) == []
