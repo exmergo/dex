@@ -1091,6 +1091,7 @@ def relationships(
     # estimate and the run share the filtered pool, so the priced set and the
     # run set stay the same set.
     missing_column_findings = []
+    probe_refused = []
     if verify:
         rel_mod.adopt_profiled_spelling(rels, datasets)
         missing_column_findings = rel_mod.missing_column_findings(rels, datasets)
@@ -1108,7 +1109,7 @@ def relationships(
             probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
                     verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
@@ -1232,6 +1233,14 @@ def relationships(
     # #924). Only `--verify` computes it, because only a probe would fail.
     notes.extend(text for _rel, text in missing_column_findings)
     for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: surfaced in notes and mirrored onto the child
+    # dataset's data_quality so it survives into the cache (issue #933).
+    notes.extend(text for _rel, text in probe_refused)
+    for rel, text in probe_refused:
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
@@ -2504,6 +2513,7 @@ def map(
     # reported as a finding below, and excluded from the verify pool; the
     # estimate and the run share the filtered pool so they stay the same set.
     missing_column_findings = []
+    probe_refused = []
     if verify:
         rel_mod.adopt_profiled_spelling(relationship_set, all_selected)
         missing_column_findings = rel_mod.missing_column_findings(
@@ -2525,7 +2535,7 @@ def map(
             probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
                     verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
@@ -2639,6 +2649,13 @@ def map(
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: mirrored onto the child dataset's data_quality so it
+    # survives into the cache, and surfaced in notes further down (issue #933).
+    for rel, text in probe_refused:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
 
     # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
     # composed set rather than this run's profiles: the link is derived from the
@@ -2680,6 +2697,7 @@ def map(
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
     notes.extend(text for _rel, text in missing_column_findings)
+    notes.extend(text for _rel, text in probe_refused)
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared joins; kept as declared"

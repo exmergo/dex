@@ -34,6 +34,7 @@ from ..cache import (
 )
 from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
+from ..errors import WarehouseQueryError
 from ..progress import ProgressReporter
 from ..semantic_catalog import EntityJoin
 from .profile import (
@@ -1070,12 +1071,30 @@ def verify_relationships(
     An optional ``progress`` reporter emits a throttled stderr line per probed
     join, so its counts match a ``total`` taken from :func:`probe_candidates`;
     ``None`` (the default) keeps existing callers silent and unchanged.
+
+    Returns the edges that could not be probed at all, paired with the finding
+    text a caller needs: a batch the warehouse refuses is retried edge by edge
+    (issue #933), so one unprobeable edge no longer takes the whole command
+    down, and an edge that still refuses after its retries is reported here
+    instead of raising. Only a warehouse refusal
+    (:class:`~exmergo_dex_core.errors.WarehouseQueryError`) is retried this
+    way; a budget, timeout, or connection failure still raises, exactly as
+    before, so the cost gate keeps its veto over the extra retry statements.
     """
 
+    refused: list[tuple[Relationship, str]] = []
     for batch in probe_batches(probe_candidates(relationships)):
-        for rel, nonnull, orphans in _run_probe_batch(
-            adapter, batch, timeout_seconds=timeout_seconds
-        ):
+        try:
+            results = _run_probe_batch(adapter, batch, timeout_seconds=timeout_seconds)
+        except WarehouseQueryError:
+            results, batch_refused = _probe_batch_with_fallback(
+                adapter, batch, timeout_seconds=timeout_seconds
+            )
+            refused.extend(batch_refused)
+            if progress is not None:
+                for _rel, _text in batch_refused:
+                    progress.advance()
+        for rel, nonnull, orphans in results:
             rel.verified = True
             if nonnull == 0:
                 rel.orphan_fraction = None
@@ -1102,11 +1121,18 @@ def verify_relationships(
             if progress is not None:
                 progress.advance()
 
+    return refused
+
 
 def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`verify_relationships` will run, one statement per
     batch of probed joins, in the adapter's dialect. Exists so a billed caller
-    can dry-run the probes for a cost estimate before confirming the spend."""
+    can dry-run the probes for a cost estimate before confirming the spend.
+
+    These are the planned statements: a batch the warehouse refuses is retried
+    edge by edge inside :func:`verify_relationships` (issue #933), so a refusal
+    can add retry statements this list did not price, bounded by the same cost
+    gate that priced these."""
 
     return [
         _transpile_probe(_batched_probe_sql(batch), dialect)
@@ -1114,7 +1140,9 @@ def probe_statements(relationships: list[Relationship], dialect: str) -> list[st
     ]
 
 
-def _batched_probe_sql(batch: list[Relationship]) -> str:
+def _batched_probe_sql(
+    batch: list[Relationship], *, key_cast: str | None = None
+) -> str:
     """One statement measuring every edge in ``batch``, returning a single row.
 
     Aggregate-only by construction: two counts per edge, no value in the
@@ -1138,7 +1166,18 @@ def _batched_probe_sql(batch: list[Relationship]) -> str:
     BigQuery lacks and sqlglot does not rewrite), and a join rather than a
     projected NOT EXISTS, which Redshift refuses outright (XX000: correlated
     subquery pattern not supported).
+
+    ``key_cast`` compares both sides of every join predicate in one type
+    instead of the raw columns: the fallback for a warehouse that refuses the
+    plain join for lack of a common key type (issue #933). The null check
+    stays on the raw child column, since a cast preserves nullness and the
+    count is about values present, not values convertible.
     """
+
+    def _cast_key(expr: str) -> str:
+        if key_cast is None:
+            return expr
+        return f"CAST({expr} AS {key_cast})"
 
     by_child: dict[str, list[tuple[int, Relationship]]] = {}
     for index, rel in enumerate(batch):
@@ -1153,10 +1192,12 @@ def _batched_probe_sql(batch: list[Relationship]) -> str:
             parent = _quote_identifier(rel.to_dataset)
             nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
             parent_keys = ", ".join(
-                f"{key} AS pk{pair_index}" for pair_index, key in enumerate(keys)
+                f"{_cast_key(key)} AS pk{pair_index}"
+                for pair_index, key in enumerate(keys)
             )
             predicate = " AND ".join(
-                f"d{index}.pk{pair_index} = c.{fk}" for pair_index, fk in enumerate(fks)
+                f"d{index}.pk{pair_index} = {_cast_key(f'c.{fk}')}"
+                for pair_index, fk in enumerate(fks)
             )
             counts.append(
                 f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS nonnull_fk_{index}, "
@@ -1183,6 +1224,7 @@ def _run_probe_batch(
     batch: list[Relationship],
     *,
     timeout_seconds: float,
+    key_cast: str | None = None,
 ) -> list[tuple[Relationship, int, int]]:
     """Issue one batched probe and return ``(edge, nonnull_fk, orphans)`` per
     edge, in the batch's own order.
@@ -1192,7 +1234,9 @@ def _run_probe_batch(
     command's overall time bound. Reads the row by alias, never by position.
     """
 
-    sql = _transpile_probe(_batched_probe_sql(batch), adapter.dialect)
+    sql = _transpile_probe(
+        _batched_probe_sql(batch, key_cast=key_cast), adapter.dialect
+    )
     result = adapter.run_query(
         sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
     )
@@ -1205,6 +1249,82 @@ def _run_probe_batch(
         )
         for index, rel in enumerate(batch)
     ]
+
+
+# ClickHouse refuses a join whose keys have no common supertype (code 386):
+# a signed key against an unsigned one, for example Int32 against UInt64.
+# Int128 holds every UInt64 and Int64 value, so comparing in that type
+# measures the join without changing what counts as a match (issue #933).
+_CLICKHOUSE_INT128 = "Int128"
+
+
+def _is_clickhouse_supertype_refusal(adapter: Adapter, exc: Exception) -> bool:
+    """Whether this refusal is the signed/unsigned key-type refusal a cast
+    retry can fix: ClickHouse only, and only the no-supertype message. Any
+    other refusal (a missing column, a missing table) would fail the cast
+    retry identically, so it is reported rather than retried."""
+
+    return adapter.dialect == "clickhouse" and "no supertype" in str(exc).lower()
+
+
+def _refusal_text(rel: Relationship, exc: Exception) -> str:
+    edge = (
+        f"{rel.from_dataset}.{rel.from_columns[0]} -> "
+        f"{rel.to_dataset}.{rel.to_columns[0]}"
+    )
+    return (
+        f"{edge} could not be probed: the warehouse refused the probe "
+        f"statement ({exc}); the edge stays unverified"
+    )
+
+
+def _probe_batch_with_fallback(
+    adapter: Adapter,
+    batch: list[Relationship],
+    *,
+    timeout_seconds: float,
+) -> tuple[list[tuple[Relationship, int, int]], list[tuple[Relationship, str]]]:
+    """Retry a refused batch edge by edge, keeping what measures.
+
+    A batch is one statement, so one edge the warehouse refuses refuses the
+    whole statement and, before this fallback, the whole command (issue #933:
+    a single signed/unsigned join pair took down ``--verify`` with no edge
+    measured). Each edge is therefore re-probed on its own: edges the
+    warehouse accepts are measured exactly as the batch would have measured
+    them, and an edge that still refuses is reported rather than raised. A
+    ClickHouse no-supertype refusal gets one more retry with both key sides
+    cast to Int128 before it is reported, since that refusal names a key-type
+    mismatch the cast removes rather than a broken edge.
+
+    Only warehouse refusals enter this path: the caller lets budget, timeout,
+    and connection failures raise, so a retry never spends past the confirmed
+    budget or masks an outage as an unprobeable edge.
+    """
+
+    results: list[tuple[Relationship, int, int]] = []
+    refused: list[tuple[Relationship, str]] = []
+    for rel in batch:
+        try:
+            results.extend(
+                _run_probe_batch(adapter, [rel], timeout_seconds=timeout_seconds)
+            )
+            continue
+        except WarehouseQueryError as exc:
+            if not _is_clickhouse_supertype_refusal(adapter, exc):
+                refused.append((rel, _refusal_text(rel, exc)))
+                continue
+            try:
+                results.extend(
+                    _run_probe_batch(
+                        adapter,
+                        [rel],
+                        timeout_seconds=timeout_seconds,
+                        key_cast=_CLICKHOUSE_INT128,
+                    )
+                )
+            except WarehouseQueryError as cast_exc:
+                refused.append((rel, _refusal_text(rel, cast_exc)))
+    return results, refused
 
 
 def _transpile_probe(sql: str, dialect: str) -> str:

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import write_manifest
 
+from exmergo_dex_core.adapters.base import QueryResult
 from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
@@ -23,6 +24,7 @@ from exmergo_dex_core.cache import (
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
+from exmergo_dex_core.errors import WarehouseQueryError
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
     _declared_relationship_conflicts,
@@ -1781,6 +1783,134 @@ def test_verify_survives_a_declared_join_naming_a_missing_column(
     cache = FilesystemStore(repo).load_cache()
     orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
     assert any("does not exist on wh.main.customers" in n for n in orders.data_quality)
+
+
+class _RefusingProbeAdapter:
+    """A probe-only adapter stand-in: ``run_query`` answers from a rule over
+    the statement, so a refused batch, a ClickHouse supertype refusal, and a
+    permanently refused edge are reproducible without a warehouse."""
+
+    def __init__(self, dialect: str, rule):
+        self.dialect = dialect
+        self.statements: list[str] = []
+        self._rule = rule
+
+    def run_query(self, sql, *, max_rows, timeout_seconds):
+        self.statements.append(sql)
+        return self._rule(sql)
+
+
+def _probe_counts(nonnull: int, orphans: int) -> QueryResult:
+    return QueryResult(
+        columns=["nonnull_fk_0", "orphans_0"],
+        types=["INTEGER", "INTEGER"],
+        cells=[[nonnull, orphans]],
+        truncated=False,
+    )
+
+
+def test_verify_retries_a_refused_batch_edge_by_edge():
+    """Issue #933: one edge the warehouse refuses must not take the batch
+    down. The batched statement fails, each edge is re-probed on its own, and
+    both are measured."""
+
+    def _rule(sql):
+        if "nonnull_fk_1" in sql:
+            raise WarehouseQueryError("the warehouse refused the statement")
+        return _probe_counts(10, 2)
+
+    adapter = _RefusingProbeAdapter("duckdb", _rule)
+    rels = [
+        _probe_rel("orders", "customer_id", "customers", "id"),
+        _probe_rel("returns", "customer_id", "customers", "id"),
+    ]
+    refused = verify_relationships(adapter, rels)
+    assert refused == []
+    assert [(r.verified, r.orphan_fraction) for r in rels] == [
+        (True, 0.2),
+        (True, 0.2),
+    ]
+    assert len(adapter.statements) == 3  # one batch, then one per edge
+
+
+def test_verify_reports_an_edge_that_refuses_even_alone():
+    """Issue #933: an edge that refuses its own single-edge probe is reported
+    and left unverified while the rest of the batch is still measured."""
+
+    def _rule(sql):
+        if "ghost" in sql:
+            raise WarehouseQueryError("table does not exist")
+        return _probe_counts(10, 0)
+
+    adapter = _RefusingProbeAdapter("duckdb", _rule)
+    good = _probe_rel("orders", "customer_id", "customers", "id")
+    broken = _probe_rel("ghost_orders", "customer_id", "customers", "id")
+    refused = verify_relationships(adapter, [good, broken])
+    assert good.verified is True
+    assert good.orphan_fraction == 0.0
+    assert broken.verified is False
+    assert broken.orphan_fraction is None
+    assert len(refused) == 1
+    assert refused[0][0] is broken
+    assert "wh.main.ghost_orders.customer_id" in refused[0][1]
+    assert "could not be probed" in refused[0][1]
+    assert "stays unverified" in refused[0][1]
+
+
+def test_verify_retries_a_clickhouse_supertype_refusal_with_int128():
+    """Issue #933, first acceptance bullet: a ClickHouse join between a
+    UInt64 key and an Int32 key is refused for lack of a supertype, then
+    measured when both sides are compared as Int128."""
+
+    def _rule(sql):
+        if "CAST" in sql.upper() and "INT128" in sql.upper():
+            return _probe_counts(10, 1)
+        raise WarehouseQueryError(
+            "Code: 386. DB::Exception: There is no supertype for types "
+            "UInt64, Int32 because some of them are signed integers and "
+            "some are unsigned integers [386]"
+        )
+
+    adapter = _RefusingProbeAdapter("clickhouse", _rule)
+    rel = _probe_rel("orders", "customer_id", "customers", "id")
+    refused = verify_relationships(adapter, [rel])
+    assert refused == []
+    assert rel.verified is True
+    assert rel.orphan_fraction == 0.1
+    assert any(
+        "CAST" in stmt.upper() and "INT128" in stmt.upper()
+        for stmt in adapter.statements
+    )
+
+
+def test_verify_does_not_cast_retry_a_non_supertype_refusal():
+    """The Int128 retry is for the ClickHouse no-supertype refusal only: any
+    other refusal is reported after the single-edge retry, with no cast
+    statement issued."""
+
+    def _rule(sql):
+        raise WarehouseQueryError("table does not exist")
+
+    adapter = _RefusingProbeAdapter("clickhouse", _rule)
+    rel = _probe_rel("orders", "customer_id", "customers", "id")
+    refused = verify_relationships(adapter, [rel])
+    assert len(refused) == 1
+    assert rel.verified is False
+    assert not any("CAST" in stmt.upper() for stmt in adapter.statements)
+
+
+def test_verify_still_raises_a_non_warehouse_failure():
+    """The fallback swallows warehouse refusals only: a budget, timeout, or
+    connection failure still aborts the verify pass as before."""
+
+    def _rule(sql):
+        raise ValueError("boom")
+
+    adapter = _RefusingProbeAdapter("duckdb", _rule)
+    with pytest.raises(ValueError, match="boom"):
+        verify_relationships(
+            adapter, [_probe_rel("orders", "customer_id", "customers", "id")]
+        )
 
 
 def test_relationships_persists_datasets_and_relationships(
