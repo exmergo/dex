@@ -495,6 +495,40 @@ class _ObjectGap:
         )
 
 
+def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
+    """The cache as a command reading only the source allowlist may adjudicate on.
+
+    `explore profile --target dev` caches what it profiles (#893), so drafting
+    can read a dev-only build. A command that runs SQL through the ordinary
+    adapter must not clear a relation on those entries: the firewall would admit
+    a relation the committed allowlist does not reach, and the adapter would run
+    it without ever having agreed to read that namespace. Only the dev namespace
+    outside the allowlist is held back; one the allowlist reaches is a source
+    like any other. A copy, so the entries stay in the cache for drafting.
+    """
+
+    from ..connect import dev_namespace_outside_allowlist
+
+    connector = engine.connector or engine.config.connector
+    if not connector:
+        return cache
+    dev = dev_namespace_outside_allowlist(
+        connector, getattr(engine.config, connector, None)
+    )
+    if dev is None:
+        return cache
+    dev = dev.lower()
+
+    def in_dev(identifier: str) -> bool:
+        namespace = identifier.rsplit(".", 1)[0].lower()
+        return namespace == dev or namespace.endswith(f".{dev}")
+
+    kept = [d for d in cache.datasets if not in_dev(d.identifier)]
+    if len(kept) == len(cache.datasets):
+        return cache
+    return cache.model_copy(update={"datasets": kept})
+
+
 def _object_gap(
     adapter: Adapter, prior: DexCache | None, named: list[str]
 ) -> _ObjectGap:
@@ -1649,7 +1683,11 @@ def _run_statements(
                 # unreachable. Only a refusal now returns without it.
                 shared.adapter = None
         if shared.adapter is not None:
-            gap = _object_gap(shared.adapter, cache, named)
+            gap = _object_gap(
+                shared.adapter,
+                None if cache is None else _without_dev_profiles(engine, cache),
+                named,
+            )
             if gap.absent:
                 # Only the statements that named a missing object are refused; a
                 # neighbor that reads a table this connection has is unaffected by
@@ -1700,7 +1738,10 @@ def _run_statements(
         # After the cache write, never before: mask_overridden edits the datasets
         # in place, and masking first would persist an in-memory override onto
         # objects this run never re-profiled.
-        cache = mask_overridden(cache, pii_override_paths(config.pii_overrides))
+        cache = mask_overridden(
+            _without_dev_profiles(engine, cache),
+            pii_override_paths(config.pii_overrides),
+        )
     for statement in batch:
         if not statement.live:
             continue
@@ -2978,7 +3019,11 @@ def cluster(
             # the opener at the bottom of this function, and raises there.
             adapter = None
     if adapter is not None:
-        gap = _object_gap(adapter, cache, [obj])
+        gap = _object_gap(
+            adapter,
+            None if cache is None else _without_dev_profiles(engine, cache),
+            [obj],
+        )
         if gap.absent:
             raise RequestError(gap.refusal())
         if gap.to_profile:
@@ -3021,6 +3066,7 @@ def cluster(
         )
 
     limits = config.cluster
+    cache = _without_dev_profiles(engine, cache)
     known = [d.identifier for d in cache.datasets if d.columns]
     matches = match_identifier(obj, known)
     if not matches:

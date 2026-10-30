@@ -1226,3 +1226,27 @@ def test_the_dev_namespace_a_plain_read_cannot_reach(connector, target, expected
         dev_namespace_outside_allowlist(connector, getattr(config, connector))
         == expected
     )
+
+
+def test_a_narrowing_scope_hides_the_dev_namespace_the_allowlist_reaches():
+    """A `--scope` that narrows past the dev namespace leaves a plain profile
+    unable to find a dev-only build, so the hint must name `--target dev`."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.connect import dev_namespace_outside_allowlist
+
+    config = DexConfig.model_validate(
+        {
+            "connector": "snowflake",
+            "snowflake": {
+                "databases": ["SHOP"],
+                "dev_database": "SHOP",
+                "dev_schema": "DBT_DEV",
+            },
+        }
+    )
+    assert dev_namespace_outside_allowlist("snowflake", config.snowflake) is None
+    assert (
+        dev_namespace_outside_allowlist("snowflake", config.snowflake, ["SHOP.PUBLIC"])
+        == "SHOP.DBT_DEV"
+    )

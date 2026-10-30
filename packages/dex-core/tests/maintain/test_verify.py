@@ -1730,6 +1730,16 @@ def test_damping_leaves_other_models_and_other_codes_alone():
     assert verify_mod.damp_fanout(findings, proven) == findings
 
 
+def test_damping_skips_a_model_whose_other_grain_broke():
+    """One declared grain held and another broke: the duplicate the broken one
+    found is what the fan-out explains, so it keeps its rank."""
+
+    proven = {"fct": {"columns": ["id"], "source": "unique_test"}}
+    broken = _fanout(code="grain_broken")
+    findings = [_fanout(), broken]
+    assert verify_mod.damp_fanout(findings, proven) == findings
+
+
 def test_a_declared_grain_that_holds_is_recorded_as_proven():
     adapter = _GrainAdapter(
         row_counts={"db.main.a": 200, "db.main.b": 200},

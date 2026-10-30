@@ -1672,13 +1672,20 @@ def damp_fanout(
     ``grain_min_rows`` damps a grain finding, so a reader still sees the counts
     and a gate on high or medium no longer needs an allowlist where a later,
     real fan-out could hide. A fan-out on a model whose grain broke is left
-    alone: the ``grain_broken`` beside it is the duplicate it explains.
+    alone, even where another of its declared grains held: the
+    ``grain_broken`` beside it is the duplicate it explains.
     """
 
+    broken = {f.identifier for f in findings if f.code == "grain_broken"}
     damped: list[DriftFinding] = []
     for finding in findings:
         grain = proven.get(finding.identifier or "")
-        if finding.code != "row_fanout" or grain is None or finding.severity == "low":
+        if (
+            finding.code != "row_fanout"
+            or grain is None
+            or finding.identifier in broken
+            or finding.severity == "low"
+        ):
             damped.append(finding)
             continue
         columns = ", ".join(grain["columns"])
@@ -1714,23 +1721,32 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
     built, which is the relation a build's verification judges. Read only by a
     build, whose run results are this run's; a standalone sweep measures the
     grain itself, since the last run may be older than the relation.
+
+    A test scoped by a ``where`` or ``limit`` config checked a subset of the
+    rows and proves nothing about the relation, so it is not read; and a model
+    one of whose uniqueness tests failed or warned has no proven grain, whatever
+    its others say, since that result is the duplicate a fan-out explains.
     """
 
     from ..dbt_project import manifest_node_label
 
     nodes = _manifest_nodes(project_dir) or {}
     results = _run_results(project_dir) or []
-    passed = {
-        str(r.get("unique_id")) for r in results if str(r.get("status")) == "pass"
-    }
+    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
     proven: dict[str, dict] = {}
-    for unique_id in sorted(passed):
+    unproven: set[str] = set()
+    for unique_id in sorted(status):
         node = nodes.get(unique_id)
         if not isinstance(node, dict) or node.get("resource_type") != "test":
             continue
         meta = node.get("test_metadata")
         attached = node.get("attached_node")
         if not isinstance(meta, dict) or not isinstance(attached, str):
+            continue
+        test_config = node.get("config")
+        if isinstance(test_config, dict) and (
+            test_config.get("where") or test_config.get("limit") is not None
+        ):
             continue
         raw_kwargs = meta.get("kwargs")
         kwargs = raw_kwargs if isinstance(raw_kwargs, dict) else {}
@@ -1747,8 +1763,11 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
         model = manifest_node_label(
             attached, parent if isinstance(parent, dict) else None
         )
-        proven.setdefault(model, {"columns": columns, "source": source})
-    return proven
+        if status[unique_id] in _FAILURE_STATUSES | _WARNING_STATUSES:
+            unproven.add(model)
+        elif status[unique_id] == "pass":
+            proven.setdefault(model, {"columns": columns, "source": source})
+    return {model: grain for model, grain in proven.items() if model not in unproven}
 
 
 # --- join contract: a model's own joins against measured value overlap ---------

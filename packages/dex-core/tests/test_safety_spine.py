@@ -5112,6 +5112,34 @@ def test_profile_reaches_a_dev_only_build_for_one_command(
         profile(engine, ["DBT_DEV.STG_ORDERS"])
 
 
+def test_a_dev_profile_never_clears_an_ordinary_query(monkeypatch, fake_sf_connection):
+    # Family 2 (#893): `explore profile --target dev` caches what it profiled so
+    # drafting can read it, but `explore query` reads the committed allowlist,
+    # and a cached dev profile must not clear a relation that allowlist does not
+    # reach. Nothing runs against the dev namespace.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.errors import DexError
+    from exmergo_dex_core.explore.commands import query
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    engine.store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier="SHOP.DBT_DEV.STG_ORDERS",
+                    columns=[ColumnProfile(name="ID", data_type="NUMBER")],
+                )
+            ]
+        )
+    )
+    with pytest.raises(DexError):
+        query(engine, "SELECT ID FROM SHOP.DBT_DEV.STG_ORDERS")
+    assert fake_sf_connection.data_statements == []
+    cached = engine.store.load_cache()
+    assert cached is not None
+    assert [d.identifier for d in cached.datasets] == ["SHOP.DBT_DEV.STG_ORDERS"]
+
+
 def test_profile_refuses_a_prod_target(monkeypatch, fake_sf_connection):
     from exmergo_dex_core.explore.commands import profile
     from exmergo_dex_core.transform.build import ProdTargetRefusedError

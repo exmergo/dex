@@ -672,7 +672,7 @@ def _dev_namespace(engine: DexEngine) -> str | None:
     if not connector:
         return None
     return dev_namespace_outside_allowlist(
-        connector, getattr(engine.config, connector, None)
+        connector, getattr(engine.config, connector, None), engine.scopes
     )
 
 

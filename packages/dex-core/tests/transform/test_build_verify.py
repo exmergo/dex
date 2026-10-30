@@ -1038,3 +1038,43 @@ def test_a_failing_unique_test_proves_nothing(tmp_path: Path):
     (finding,) = [f for f in result.findings if f.code == "row_fanout"]
     assert finding.severity == "high"
     assert "grain_proven" not in finding.data
+
+
+def _uniqueness_artifacts(project: Path, tests: dict[str, tuple[str, dict]]) -> None:
+    nodes: dict = {"model.shop.fct": {"name": "fct", "resource_type": "model"}}
+    for column, (_status, config) in tests.items():
+        nodes[f"test.shop.unique_fct_{column}"] = {
+            "resource_type": "test",
+            "attached_node": "model.shop.fct",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": column}},
+            "config": config,
+        }
+    _artifacts(
+        project,
+        nodes=nodes,
+        results=[
+            {"unique_id": f"test.shop.unique_fct_{column}", "status": status}
+            for column, (status, _config) in tests.items()
+        ],
+    )
+
+
+@pytest.mark.parametrize("config", [{"where": "is_current"}, {"limit": 10}])
+def test_a_scoped_unique_test_proves_no_grain(tmp_path: Path, config: dict):
+    from exmergo_dex_core.maintain.verify import passed_grain_tests
+
+    _uniqueness_artifacts(tmp_path, {"id": ("pass", config)})
+    assert passed_grain_tests(tmp_path) == {}
+
+
+def test_a_failing_unique_test_unproves_a_passing_one(tmp_path: Path):
+    from exmergo_dex_core.maintain.verify import passed_grain_tests
+
+    _uniqueness_artifacts(
+        tmp_path, {"id": ("pass", {}), "line_id": ("warn", {"where": None})}
+    )
+    assert passed_grain_tests(tmp_path) == {}
+    _uniqueness_artifacts(tmp_path, {"id": ("pass", {}), "line_id": ("skipped", {})})
+    assert passed_grain_tests(tmp_path) == {
+        "fct": {"columns": ["id"], "source": "unique_test"}
+    }

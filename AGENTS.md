@@ -262,10 +262,10 @@ PII and NULL facts, running totals, unit shapes and filtered value domains the
 project by a plan; `transform declare` writes part of it, when asked), `declared` (what the post-change YAML says) and `missing` (the intent
 fields still owed, each also a warning). Drafting reads the cache and the
 repository only, so it is free on every connector; an unprofiled input is named
-with an `explore profile` command that can reach it (`explore profile
-<dev namespace>.<model> --target dev` for a project model whose dev namespace
-the source allowlist does not reach, since a plain profile cannot find a
-dev-only build; none, with the reason, for a name matching several profiled
+with an `explore profile` command that can reach it
+(`explore profile <dev namespace>.<model> --target dev` for a project model
+whose dev namespace the source allowlist does not reach, since a plain profile
+cannot find a dev-only build; none, with the reason, for a name matching several profiled
 relations, which no profile run settles), and a PII-flagged
 column's domain is never drafted. `drafted.precedent` lists what the project's
 other models do with each column the model filters, branches on or aggregates,

@@ -714,20 +714,26 @@ def scope_origin(connector: str, flag: str | None) -> str:
     return flag or f"{connector}.{_SCOPE_FIELDS[connector]} in .dex/config.yml"
 
 
-def dev_namespace_outside_allowlist(connector: str, target) -> str | None:
-    """The dev namespace when the committed allowlist does not reach it, else None.
+def dev_namespace_outside_allowlist(
+    connector: str, target, scopes: list[str] | None = None
+) -> str | None:
+    """The dev namespace when the source scope does not reach it, else None.
 
     Where it does not, a model whose only build is the dev one is invisible to
     every read but the commands that take ``--target dev`` (#893), so a hint
     naming a plain read of it would name a command that cannot find it. An
     empty allowlist reads everything visible, the dev namespace included, and
-    DuckDB has no namespace to be outside of.
+    DuckDB has no namespace to be outside of. ``scopes`` is a ``--scope`` that
+    narrowed the committed allowlist for this command, and replaces it when
+    given, since a narrowed read can miss a namespace the allowlist reaches.
     """
 
     dev = dev_target_scope(connector, target)
     if dev is None or connector not in _SCOPE_FIELDS:
         return None
     committed = [str(entry) for entry in getattr(target, _SCOPE_FIELDS[connector])]
+    if scopes:
+        committed = [str(entry) for entry in scopes]
     if not committed or scope_within(dev, committed):
         return None
     return dev
