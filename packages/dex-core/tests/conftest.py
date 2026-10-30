@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import ci_groups
 import pytest
 
 _importorskip = pytest.importorskip
@@ -40,6 +42,74 @@ def _importorskip_absent_only(modname: str, *args, **kwargs):
 
 
 pytest.importorskip = _importorskip_absent_only
+
+
+# --- CI groups (tests/ci_groups.py) -------------------------------------------
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("ci groups")
+    group.addoption(
+        "--ci-group",
+        choices=sorted(ci_groups.GROUPS),
+        help="run only the test files tests/ci_groups.py assigns to this group",
+    )
+    group.addoption(
+        "--ci-group-report",
+        metavar="PATH",
+        help=(
+            "write what was collected, selected and run as JSON, for "
+            "scripts/check_test_groups.py to prove the groups cover the suite"
+        ),
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    group = config.getoption("--ci-group")
+    config.stash[_COLLECTED] = [item.nodeid for item in items]
+    if group is None:
+        return
+    root = config.rootpath
+    keep, drop = [], []
+    for item in items:
+        path = item.path.relative_to(root).as_posix()
+        (keep if ci_groups.group_of(path) == group else drop).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+    items[:] = keep
+    config.stash[_SELECTED] = [item.nodeid for item in keep]
+
+
+def pytest_runtest_logfinish(nodeid: str) -> None:
+    _RAN.append(nodeid)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    config = session.config
+    report = config.getoption("--ci-group-report")
+    if not report:
+        return
+    collected = config.stash.get(_COLLECTED, [])
+    Path(report).write_text(
+        json.dumps(
+            {
+                "group": config.getoption("--ci-group"),
+                "python": "{}.{}".format(*sys.version_info[:2]),
+                "collected": collected,
+                "selected": config.stash.get(_SELECTED, collected),
+                "ran": _RAN,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+_COLLECTED = pytest.StashKey[list[str]]()
+_SELECTED = pytest.StashKey[list[str]]()
+_RAN: list[str] = []
 
 
 @pytest.fixture
