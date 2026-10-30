@@ -879,6 +879,25 @@ def test_an_exhausted_budget_refuses_at_the_gate_rather_than_at_each_adapter():
         == 12 * 1024 * 1024
     )
 
+    # A booking short of the minimum is not a shortfall when the confirmed
+    # ceiling still covers one minimum-billed statement (#482): the booking may
+    # tighten the cap, never refuse on its own, so the cap is the minimum.
+    floor = 10 * 1024 * 1024
+    booked = CostGate(
+        paradigm=Paradigm.BYTES_SCANNED,
+        connector="bigquery",
+        command="maintain verify",
+        ceiling=2_000_000_000.0,
+        confirmed=True,
+        session_ceiling=10_000_000_000.0,
+        session_spent=0.0,
+    )
+    booked.preflight_command(float(floor))
+    booked.charge(float(floor))
+    booked.record_billed(float(floor), job_id=None, statement="first")
+    booked.charge(88.0)  # a statement charged below the minimum it will bill
+    assert booked.statement_cap(unit="byte", minimum=floor) == floor
+
     # `None` is the only other answer, and it means no ceiling bounds the
     # statement at all rather than "spend nothing": distinct from every integer,
     # so no adapter has to recognise a magnitude to tell them apart.
