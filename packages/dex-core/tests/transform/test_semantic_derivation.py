@@ -865,3 +865,53 @@ def test_dbt_parses_the_metadata_a_derivation_carries(
     model = envelope["data"]["semantic_proposal"]["models"]["fct_orders"]
     assert model["status"] == "included", model
     assert model["validation"]["parse"]["result"] == "passed"
+
+
+def test_the_local_catalog_omits_the_population_sentence_a_build_compiles(
+    dbt_project_dir: Path, tmp_path: Path, capsys, real_dbt
+):
+    """#1005: the compiled manifest keeps the generated sentence and the structured
+    population; the local catalog reads both and shows neither value."""
+
+    _add_time_spine(dbt_project_dir)
+    _add_layer(dbt_project_dir)
+    (dbt_project_dir / "models" / "semantic" / "metrics.yml").write_text(
+        "metrics:\n"
+        "  - name: order_revenue\n"
+        "    type: simple\n"
+        "    label: Order revenue\n"
+        "    type_params:\n"
+        "      measure: order_total\n",
+        encoding="utf-8",
+    )
+    rc, planned = _plan(tmp_path, capsys, declaration=POPULATED)
+    assert rc == 0, planned
+    root = ["--repo-root", str(tmp_path)]
+    rc, applied = _run([*root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+    rc, built = _run([*root, "transform", "build", "--target", "dev"], capsys)
+    assert rc == 0, built
+
+    compiled = json.loads(
+        (dbt_project_dir / "target" / "semantic_manifest.json").read_text("utf-8")
+    )
+    (entry,) = [m for m in compiled["semantic_models"] if m["name"] == "fct_orders"]
+    assert "Population: Paid and shipped orders" in entry["description"]
+    assert entry["config"]["meta"]["dex"]["population"] == POPULATED["population"]
+
+    for mode, flags in (("full", []), ("values_free", ["--values-free"])):
+        listing = [*root, "explore", "semantic", "list", "--local", *flags]
+        rc, listed = _run(listing, capsys)
+        assert rc == 0, listed
+        assert listed["data"].get("result_mode", "full") == mode
+        models = {m["name"]: m for m in listed["data"]["semantic_models"]}
+        assert models["fct_orders"]["description"] == "One row per order."
+        assert "Paid and shipped" not in json.dumps(listed)
+        assert "'shipped'" not in json.dumps(listed)
+
+    rc, searched = _run(
+        [*root, "explore", "semantic", "list", "--local", "--search", "shipped"],
+        capsys,
+    )
+    assert rc == 0, searched
+    assert searched["data"]["metrics"] == []

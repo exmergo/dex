@@ -1556,13 +1556,17 @@ in `tests/slayer_vendor/test_reader.py`, the catalog one against
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax | `[slayer]`, pinned to one SLayer release | `[cube]` (the dialect engine; no Cube package), plus `[semantic-api]` to query |
 | Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts | yes, both runtime contracts, against a SLayer rendering of the reference layer | yes, both runtime contracts and the four semantic-source contracts, against a Cube rendering of the reference layer |
 
-## Population prose in native catalogs
+## Population prose in local catalogs
 
-Ossie, SLayer and Cube catalogs omit Dex-generated population sentences in every
-result mode, including sentences in existing files. Catalog reads are
+Ossie, SLayer and Cube catalogs, and the local dbt catalog
+(`explore semantic list --local`, read from `target/semantic_manifest.json`),
+omit Dex-generated population sentences in every result mode, including sentences
+in existing files and compiled artifacts, with no rebuild. Catalog reads are
 connectionless and cannot establish that population values are safe. The authored
 description prefix is preserved when the generated suffix matches its structured
 `dex.population` metadata. A stale or malformed suffix causes the description to
 be withheld with a value-free note. This happens before catalog search. Files and
 drift fingerprints are unchanged. Use `explore profile|map --use-project` for the
-structured population, screened by the declaration withholding policy.
+structured population, screened by the declaration withholding policy. A
+description with no `dex.population` metadata is never edited, even when it says
+`Population:`. The hosted dbt Cloud catalog is not covered.

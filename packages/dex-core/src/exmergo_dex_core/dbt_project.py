@@ -71,6 +71,7 @@ from .semantic_catalog import (
     merge_element_fields,
     qualified_dimension,
 )
+from .semantic_declarations import catalog_description
 
 PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
@@ -1838,6 +1839,8 @@ def semantic_catalog(
     declares it rather than letting a short list read as the whole layer.
     """
 
+    from .guards.pii_meta import entry_meta
+
     read = _read_semantic_manifest(project)
     if read is None:
         raise DbtProjectError(
@@ -1874,6 +1877,7 @@ def semantic_catalog(
     # backends should not find one of them silent.
     words_by_definition: dict[tuple[str, str], dict[str, Any]] = {}
     custom_grains = _custom_granularities(manifest)
+    found: list[str] = []
 
     for entry in manifest.get("semantic_models") or []:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -2011,7 +2015,11 @@ def semantic_catalog(
             SemanticModelInfo(
                 name=model_name,
                 label=entry.get("label"),
-                description=entry.get("description"),
+                # Dex's generated population sentence is repository prose, not a
+                # screened result; the native catalogs omit it the same way.
+                description=catalog_description(
+                    entry.get("description"), entry_meta(entry), found
+                ),
                 model_ref=node_relation.get("alias")
                 or _parse_relation_ref(str(entry.get("model", ""))),
                 agg_time_dimension=agg_time,
@@ -2096,7 +2104,7 @@ def semantic_catalog(
         dimension_scope=(
             DIMENSIONS_PER_QUERYABLE_PATH if resolved else DIMENSIONS_PER_DECLARATION
         ),
-        notes=_catalog_notes(metrics),
+        notes=[*found, *_catalog_notes(metrics)],
         physical_columns=physical,
         # A token both maps resolve belongs to the column, which is the stronger
         # evidence: a bare name two models share can be a column on one of them.

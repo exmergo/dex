@@ -453,9 +453,10 @@ They require dbt and a dev profile. Compile-time `run_query`, statement blocks a
 `adapter.execute` SELECTs run through Dex's query firewall and existing cost
 controls; direct database handles and unsupported introspection refuse. Later
 queries share the command ceiling; a dynamically discovered estimate is partial.
-Native semantic catalogs omit Dex-generated population sentences in every mode,
-including from existing documents, preserving the authored description where the
-generated suffix can be identified. Structured population is reported by
+Native semantic catalogs and the local dbt catalog omit Dex-generated population
+sentences in every mode, including from existing documents and compiled
+artifacts, preserving the authored description where the generated suffix can be
+identified. Structured population is reported by
 `explore profile|map --use-project` under the withholding rules above.
 
 ### The envelope

@@ -48,6 +48,7 @@ from exmergo_dex_core.explore.semantic.local import (
     _unprofiled_note,
 )
 from exmergo_dex_core.results import to_envelope
+from exmergo_dex_core.semantic_declarations import with_population
 from exmergo_dex_core.storage import MemoryStore
 
 
@@ -956,6 +957,98 @@ def test_local_list_invents_no_words_for_metric_time(tmp_path: Path):
     )
     assert metric_time.type == "time"
     assert metric_time.label is None and metric_time.description is None
+
+
+POPULATION = {
+    "rule": "population_rule_sentinel_997",
+    "filters": [{"column": "id", "excludes": [123456]}],
+}
+
+
+def _populated_manifest(tmp_path: Path, description: str, meta: dict) -> Path:
+    project = tmp_path / "populated"
+    (project / "target").mkdir(parents=True)
+    manifest = {
+        "semantic_models": [
+            {
+                "name": "customers",
+                "description": description,
+                "entities": [{"name": "customer", "type": "primary", "expr": "id"}],
+                "measures": [{"name": "customer_count", "agg": "count", "expr": "id"}],
+                **meta,
+            }
+        ],
+        "metrics": [
+            {
+                "name": "customer_count",
+                "type": "simple",
+                "type_params": {"input_measures": [{"name": "customer_count"}]},
+            }
+        ],
+    }
+    (project / "target" / "semantic_manifest.json").write_text(json.dumps(manifest))
+    return project
+
+
+@pytest.mark.parametrize(
+    ("authored", "expected"),
+    [("Customer grain.", "Customer grain."), (None, None)],
+)
+@pytest.mark.parametrize("where", ["config", "top"])
+def test_local_list_omits_the_generated_population_sentence(
+    tmp_path: Path, authored, expected, where
+):
+    """#1005: the compiled description ends in the sentence Dex generated from
+    ``dex.population``; the catalog drops exactly that suffix, before search."""
+
+    dex = {"meta": {"dex": {"population": POPULATION}}}
+    meta = {"config": dex} if where == "config" else dex
+    description = with_population(authored, POPULATION)
+    assert "population_rule_sentinel_997" in description
+    backend = _local(_populated_manifest(tmp_path, description, meta))
+
+    catalog = backend.list_definitions()
+
+    assert catalog.semantic_models[0].description == expected
+    assert "population_rule_sentinel_997" not in repr(catalog)
+    assert "123456" not in repr(catalog)
+    matched, unmatched = catalog.matching(["sentinel_997"])
+    assert matched.metrics == [] and unmatched == ["sentinel_997"]
+
+
+@pytest.mark.parametrize(
+    "population",
+    [
+        {"rule": "a rule the description no longer states"},
+        {"filters": [{"column": "id", "excludes": "not a list"}]},
+        "not a mapping",
+    ],
+)
+def test_local_list_withholds_a_stale_or_malformed_population_sentence(
+    tmp_path: Path, population
+):
+    description = "Customer grain. Population: population_rule_sentinel_997."
+    meta = {"config": {"meta": {"dex": {"population": population}}}}
+    backend = _local(_populated_manifest(tmp_path, description, meta))
+
+    catalog = backend.list_definitions()
+
+    assert catalog.semantic_models[0].description is None
+    assert any("population sentence" in note for note in catalog.notes)
+    assert "sentinel_997" not in json.dumps(catalog.notes)
+
+
+def test_local_list_leaves_author_prose_naming_a_population_alone(tmp_path: Path):
+    """No ``dex.population`` metadata means no generated sentence to find, so an
+    author's own ``Population:`` stays exactly as written."""
+
+    description = "Customer grain. Population: everyone who ever signed up."
+    backend = _local(_populated_manifest(tmp_path, description, {}))
+
+    catalog = backend.list_definitions()
+
+    assert catalog.semantic_models[0].description == description
+    assert not any("population" in note for note in catalog.notes)
 
 
 def test_local_list_missing_manifest_errors(tmp_path: Path):
