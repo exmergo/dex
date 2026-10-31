@@ -327,6 +327,94 @@ def test_the_cli_returns_one_envelope_with_no_rows(project, tmp_path, capsys):
     assert "someone" not in out
 
 
+def test_an_accepted_type_change_still_compares_its_rows(project):
+    engine = _engine(project)
+    widened = _ORIGINAL.replace(
+        "coalesce(c.event_count, 0) as event_count",
+        "cast(coalesce(c.event_count, 0) as bigint) as event_count",
+    )
+    plan_id = _plan(engine, project, ("models/team_activity.sql", widened))
+    assert engine.compare(plan_id).reason_code == "schemas_differ"
+    result = engine.compare(plan_id, accepted_type_changes=["event_count"])
+    assert result.status == "equivalent", result.detail
+    assert [c["left"]["name"] for c in result.schema_diff["accepted_type_changes"]] == [
+        "event_count"
+    ]
+
+
+def test_an_accepted_type_change_does_not_hide_a_changed_value(project):
+    engine = _engine(project)
+    changed = _ORIGINAL.replace(
+        "coalesce(c.event_count, 0) as event_count",
+        "cast(coalesce(c.event_count, 0) + 1 as bigint) as event_count",
+    )
+    plan_id = _plan(engine, project, ("models/team_activity.sql", changed))
+    result = engine.compare(plan_id, accepted_type_changes=["event_count"])
+    assert result.status == "different"
+    assert result.reason_code == "rows_differ"
+
+
+def test_a_type_change_across_families_cannot_be_accepted(project):
+    engine = _engine(project)
+    changed = _ORIGINAL.replace(
+        "coalesce(c.event_count, 0) as event_count",
+        "cast(coalesce(c.event_count, 0) as double) as event_count",
+    )
+    plan_id = _plan(engine, project, ("models/team_activity.sql", changed))
+    result = engine.compare(plan_id, accepted_type_changes=["event_count"])
+    assert result.status == "not_checked"
+    assert result.reason_code == "invalid_type_acceptance"
+
+
+def _plan_with_macro(engine, path: str, body: str) -> str:
+    return engine.plan(
+        "macro",
+        edits=[
+            PlanEdit(
+                path=path,
+                new_content=body,
+                kind=EditKind.MACRO_SQL,
+            )
+        ],
+    ).plan_id
+
+
+def test_a_macro_edit_that_moves_an_untouched_parent_is_not_checked(project):
+    """The parent's dev relation holds the old rows, so #856's unsynchronized case."""
+
+    macros = project / "macros"
+    macros.mkdir()
+    (macros / "shift.sql").write_text(
+        "{% macro shift() %}1{% endmacro %}", encoding="utf-8"
+    )
+    (project / "models" / "event_counts.sql").write_text(
+        "select 10 as team_id, {{ shift() }} as event_count", encoding="utf-8"
+    )
+    _engine(project).build(target="dev")
+    engine = _engine(project)
+    plan_id = _plan_with_macro(
+        engine, "macros/shift.sql", "{% macro shift() %}2{% endmacro %}"
+    )
+    result = engine.compare(plan_id, model="team_activity")
+    assert result.status == "not_checked"
+    assert result.reason_code == "inputs_unsynchronized"
+    assert "event_counts" in result.detail
+
+
+def test_a_macro_edit_that_moves_no_parent_is_compared(project):
+    macros = project / "macros"
+    macros.mkdir()
+    (macros / "unused.sql").write_text(
+        "{% macro unused() %}1{% endmacro %}", encoding="utf-8"
+    )
+    engine = _engine(project)
+    plan_id = _plan_with_macro(
+        engine, "macros/unused.sql", "{% macro unused() %}2{% endmacro %}"
+    )
+    result = engine.compare(plan_id, model="team_activity")
+    assert result.status == "equivalent", result.detail
+
+
 @pytest.mark.parametrize(
     ("sql", "found"),
     [

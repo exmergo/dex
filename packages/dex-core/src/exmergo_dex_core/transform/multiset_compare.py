@@ -52,6 +52,45 @@ _UNGROUPABLE_TYPES: Mapping[str, frozenset[str]] = {
     "clickhouse": frozenset({"MAP", "JSON", "OBJECT", "AGGREGATEFUNCTION"}),
 }
 
+#: Type families a caller may accept a change within, because a warehouse widens
+#: inside one without changing a value. Float is apart from exact numerics, since
+#: a union of the two compares as floats and large integers would collapse. A
+#: blank-padded CHAR is in none, since casting it drops trailing blanks.
+_TYPE_FAMILIES: Mapping[str, frozenset[str]] = {
+    "text": frozenset({"VARCHAR", "TEXT", "STRING", "CHARACTER VARYING"}),
+    "exact_numeric": frozenset(
+        {
+            "TINYINT",
+            "SMALLINT",
+            "INT",
+            "INTEGER",
+            "BIGINT",
+            "HUGEINT",
+            "INT2",
+            "INT4",
+            "INT8",
+            "INT16",
+            "INT32",
+            "INT64",
+            "INT128",
+            "INT256",
+            "UINT8",
+            "UINT16",
+            "UINT32",
+            "UINT64",
+            "UINT128",
+            "UINT256",
+            "NUMBER",
+            "NUMERIC",
+            "DECIMAL",
+            "BIGNUMERIC",
+        }
+    ),
+    "float": frozenset(
+        {"REAL", "FLOAT", "FLOAT4", "FLOAT8", "FLOAT32", "FLOAT64", "DOUBLE"}
+    ),
+}
+
 #: The largest count a float carries exactly.
 _MAX_EXACT_FLOAT = 2**53
 
@@ -88,6 +127,7 @@ ReasonCode = Literal[
     "inputs_unsynchronized",
     "plan_applied",
     "plan_stale",
+    "invalid_type_acceptance",
 ]
 
 _VERDICT_CODES = frozenset(
@@ -119,6 +159,7 @@ _NOT_CHECKED_CODES = frozenset(
         "inputs_unsynchronized",
         "plan_applied",
         "plan_stale",
+        "invalid_type_acceptance",
     }
 )
 
@@ -175,6 +216,9 @@ class SchemaDiff:
     only_in_left: tuple[SchemaColumn, ...]
     only_in_right: tuple[SchemaColumn, ...]
     type_mismatches: tuple[TypeMismatch, ...]
+    #: Type changes the caller stated with ``accepted_type_changes``. Reported,
+    #: because accepted is not the same as absent, and their rows are compared.
+    accepted_type_changes: tuple[TypeMismatch, ...] = ()
 
     @property
     def compatible(self) -> bool:
@@ -296,6 +340,7 @@ class _MatchedColumn:
     left_name: str
     right_name: str
     type_name: str
+    right_type_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -405,6 +450,7 @@ def compare_refactors(
     column_mapping: Mapping[str, str] | None = None,
     key_columns: Sequence[str] | None = None,
     prepriced: bool = False,
+    accepted_type_changes: Sequence[str] | None = None,
 ) -> RefactorCompareResult:
     """Compare two compiled SELECTs on schema, multiset, and an optional key.
 
@@ -418,6 +464,12 @@ def compare_refactors(
     a statement the adapter cannot describe, a duplicate output name, a mapping
     key that is not a baseline output, or a declared key that is not an output
     column is ``not_checked``. An empty statement raises ``ValueError``.
+
+    ``accepted_type_changes`` names baseline columns whose type may differ, within
+    one family (text, exact numeric, float). Their rows are still compared
+    exactly, under the warehouse's common type for the two. A change across
+    families is ``not_checked`` with ``invalid_type_acceptance``, since a common
+    type there could make unequal values equal.
 
     ``prepriced`` says the caller already took this comparison through one
     handshake, as a command that had to profile the inputs first does. The
@@ -467,6 +519,7 @@ def compare_refactors(
             command,
             finish,
             prepriced=prepriced,
+            accepted=tuple(accepted_type_changes or ()),
         )
     except _NotCheckedError as exc:
         return finish(
@@ -490,6 +543,7 @@ def _compare(
     finish,
     *,
     prepriced: bool = False,
+    accepted: tuple[str, ...] = (),
 ):
     _assert_shapes(left, right, adapter)
     if not callable(getattr(adapter, "describe_query", None)):
@@ -517,7 +571,7 @@ def _compare(
         prepriced = True
 
     left_cols, right_cols = _describe_pair(left, right, adapter)
-    aligned = _align(left_cols, right_cols, mapping)
+    aligned = _align(left_cols, right_cols, mapping, accepted)
     schema = aligned.schema
     if not schema.compatible:
         return finish(status="different", reason_code="schemas_differ", schema=schema)
@@ -784,6 +838,7 @@ def _align(
     left_cols: Sequence[ColumnMeta],
     right_cols: Sequence[ColumnMeta],
     mapping: Mapping[str, str],
+    accepted: Sequence[str] = (),
 ) -> _Aligned:
     _reject_duplicate_names(left_cols, "baseline")
     _reject_duplicate_names(right_cols, "proposed")
@@ -799,6 +854,14 @@ def _align(
         _as_described(left, left_names): _as_described(right, right_names)
         for left, right in mapping.items()
     }
+    accepted_names = {_as_described(name, left_names) for name in accepted}
+    not_outputs = sorted(accepted_names - left_names)
+    if not_outputs:
+        shown = ", ".join(repr(name) for name in not_outputs)
+        raise _NotCheckedError(
+            "invalid_type_acceptance",
+            f"an accepted type change names a column that is not an output: {shown}",
+        )
     unknown = [name for name in mapping if name not in left_names]
     if unknown:
         shown = ", ".join(repr(name) for name in unknown)
@@ -817,6 +880,7 @@ def _align(
     unmatched_right = {column.name for column in right_cols}
     only_left: list[SchemaColumn] = []
     mismatches: list[TypeMismatch] = []
+    accepted_changes: list[TypeMismatch] = []
     matched: list[_MatchedColumn] = []
     for column, target in zip(left_cols, targets, strict=True):
         right = right_by_name.get(target)
@@ -827,9 +891,21 @@ def _align(
         unmatched_right.discard(target)
         right_schema = SchemaColumn(right.name, right.data_type)
         if _normal_type(column.data_type) != _normal_type(right.data_type):
-            mismatches.append(TypeMismatch(left=left_schema, right=right_schema))
-            continue
-        matched.append(_MatchedColumn(column.name, right.name, column.data_type))
+            change = TypeMismatch(left=left_schema, right=right_schema)
+            if column.name not in accepted_names:
+                mismatches.append(change)
+                continue
+            if not _same_family(column.data_type, right.data_type):
+                raise _NotCheckedError(
+                    "invalid_type_acceptance",
+                    f"{column.name} changes from {column.data_type} to "
+                    f"{right.data_type}, which is not one type family, so comparing "
+                    "their values under a common type would not be exact",
+                )
+            accepted_changes.append(change)
+        matched.append(
+            _MatchedColumn(column.name, right.name, column.data_type, right.data_type)
+        )
     only_right = tuple(
         SchemaColumn(column.name, column.data_type)
         for column in right_cols
@@ -840,6 +916,7 @@ def _align(
             only_in_left=tuple(only_left),
             only_in_right=only_right,
             type_mismatches=tuple(mismatches),
+            accepted_type_changes=tuple(accepted_changes),
         ),
         matched=tuple(matched),
     )
@@ -862,14 +939,23 @@ def _base_type(type_name: str) -> str:
         text = text.split("(", 1)[1].rstrip(") ")
 
 
+def _same_family(left: str, right: str) -> bool:
+    left_base, right_base = _base_type(left), _base_type(right)
+    return any(
+        left_base in members and right_base in members
+        for members in _TYPE_FAMILIES.values()
+    )
+
+
 def _unsupported_column(columns: Sequence[_MatchedColumn], dialect: str) -> str | None:
     refused = _UNGROUPABLE_TYPES.get(dialect, frozenset())
     for column in columns:
-        base = _base_type(column.type_name)
-        # A bare number is a type code the driver could not name, so nothing here
-        # can say it groups.
-        if base in refused or base.isdigit():
-            return f"{column.left_name} ({column.type_name})"
+        for type_name in (column.type_name, column.right_type_name or column.type_name):
+            base = _base_type(type_name)
+            # A bare number is a type code the driver could not name, so nothing
+            # here can say it groups.
+            if base in refused or base.isdigit():
+                return f"{column.left_name} ({type_name})"
     return None
 
 

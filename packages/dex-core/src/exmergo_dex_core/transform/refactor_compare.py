@@ -53,8 +53,8 @@ COMMAND = "transform compare"
 _UNSYNCHRONIZING_KINDS = frozenset({EditKind.SEED_CSV, EditKind.SNAPSHOT_SQL})
 
 #: Edits that can change how an untouched parent compiles. Its dev relation keeps
-#: what it was built with, so both sides still read one input, but it may not be
-#: the input the plan would produce.
+#: what it was built with, so both graphs are compiled through their ancestors and
+#: any parent that compiles differently makes the inputs unsynchronized.
 _GLOBAL_KINDS = frozenset(
     {EditKind.MACRO_SQL, EditKind.PROJECT_YML, EditKind.PACKAGES_YML}
 )
@@ -114,6 +114,9 @@ class _Side:
     sql: str
     digest: str
     grain: list[str] = field(default_factory=list)
+    #: Each upstream model read from the warehouse, by a digest of its compiled SQL.
+    #: Filled only when the plan can change how an untouched parent compiles.
+    parents: dict[str, str] = field(default_factory=dict)
 
 
 def compare(
@@ -124,6 +127,7 @@ def compare(
     column_mapping: Mapping[str, str] | None = None,
     key_columns: Sequence[str] | None = None,
     target: str | None = None,
+    accepted_type_changes: Sequence[str] | None = None,
 ) -> RefactorComparisonResult:
     """Compare one model before and after a stored, unapplied plan.
 
@@ -143,6 +147,7 @@ def compare(
             column_mapping=column_mapping,
             key_columns=key_columns,
             target=target,
+            accepted_type_changes=accepted_type_changes,
         )
     finally:
         if local:
@@ -157,6 +162,7 @@ def _compare(
     column_mapping: Mapping[str, str] | None,
     key_columns: Sequence[str] | None,
     target: str | None,
+    accepted_type_changes: Sequence[str] | None,
 ) -> RefactorComparisonResult:
     """The comparison itself.
 
@@ -215,12 +221,7 @@ def _compare(
             "this plan changes a seed or a snapshot, and the dev relation still "
             "holds what the last build wrote: " + ", ".join(unsynchronized),
         )
-    if any(edit.kind in _GLOBAL_KINDS for edit in stored.edits):
-        warnings.append(
-            "this plan changes a macro or project configuration, which can change "
-            "how untouched parents compile; those parents are read as built on "
-            "the dev target, so the comparison does not cover that effect"
-        )
+    through_ancestors = any(edit.kind in _GLOBAL_KINDS for edit in stored.edits)
 
     effective = config.model_copy(update={"connector": connector})
     warnings.extend(
@@ -235,13 +236,29 @@ def _compare(
     )
 
     try:
-        baseline = _compile_baseline(engine, stored, project, chosen, target, connector)
+        baseline = _compile_baseline(
+            engine, stored, project, chosen, target, connector, through_ancestors
+        )
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
     try:
-        proposed = _compile_proposed(engine, stored, project, chosen, target, connector)
+        proposed = _compile_proposed(
+            engine, stored, project, chosen, target, connector, through_ancestors
+        )
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
+
+    moved = sorted(
+        name
+        for name in baseline.parents.keys() & proposed.parents.keys()
+        if baseline.parents[name] != proposed.parents[name]
+    )
+    if moved:
+        return not_checked(
+            "inputs_unsynchronized",
+            "this plan changes how these untouched parents compile, and their dev "
+            "relations hold what the last build wrote: " + ", ".join(moved),
+        )
 
     dialect = get_dialect(connector)
     for side, sql in (("baseline", baseline.sql), ("proposed", proposed.sql)):
@@ -329,6 +346,7 @@ def _compare(
         column_mapping=column_mapping,
         key_columns=keys,
         prepriced=prepriced,
+        accepted_type_changes=accepted_type_changes,
     )
     result = _result(identity, verdict, warnings, profiled)
     return command_args.stamp_spend(result, adapter)
@@ -439,6 +457,7 @@ def _compile_baseline(
     model: str,
     target: str,
     connector: str,
+    through_ancestors: bool = False,
 ) -> _Side:
     view = load_project(project)
     try:
@@ -453,7 +472,9 @@ def _compile_baseline(
         if existing is not None:
             paths[edit.path] = existing.content
     with _shadow(engine, project, target, connector) as shadow:
-        return _compile_side(shadow, paths, model, "baseline_not_compilable")
+        return _compile_side(
+            shadow, paths, model, "baseline_not_compilable", through_ancestors
+        )
 
 
 def _compile_proposed(
@@ -463,6 +484,7 @@ def _compile_proposed(
     model: str,
     target: str,
     connector: str,
+    through_ancestors: bool = False,
 ) -> _Side:
     view = load_project(project)
     paths: dict[str, str] = {}
@@ -492,11 +514,17 @@ def _compile_proposed(
                     f"neither the project nor this plan defines '{model}'",
                 ) from exc
             paths[chosen_path] = view.files[chosen_path].content
-        return _compile_side(shadow, paths, model, "proposed_not_compilable")
+        return _compile_side(
+            shadow, paths, model, "proposed_not_compilable", through_ancestors
+        )
 
 
 def _compile_side(
-    shadow: ShadowRun, paths: Mapping[str, str], model: str, code: ReasonCode
+    shadow: ShadowRun,
+    paths: Mapping[str, str],
+    model: str,
+    code: ReasonCode,
+    through_ancestors: bool = False,
 ) -> _Side:
     """Inline the given models and compile ``model`` in this copy of the project."""
 
@@ -509,7 +537,7 @@ def _compile_side(
         shadow.write(path, content + "\n" + EPHEMERAL_HEADER + "\n")
         shadow.strip_semantic_models(Path(path).stem)
     try:
-        manifest = shadow.compile(model)
+        manifest = shadow.compile(f"+{model}" if through_ancestors else model)
     except DbtRunError as exc:
         raise _NotComparableError(code, _compile_detail(str(exc))) from exc
     matches = [
@@ -537,7 +565,33 @@ def _compile_side(
         sql=sql,
         digest=hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16],
         grain=[str(column) for column in grain] if isinstance(grain, list) else [],
+        parents=_built_parents(manifest, node) if through_ancestors else {},
     )
+
+
+def _built_parents(
+    manifest: Mapping[str, Any], node: Mapping[str, Any]
+) -> dict[str, str]:
+    """Every model upstream of ``node`` that is read as built, by compiled digest."""
+
+    nodes = manifest.get("nodes", {})
+    found: dict[str, str] = {}
+    pending = list((node.get("depends_on") or {}).get("nodes") or [])
+    seen: set[str] = set()
+    while pending:
+        unique_id = pending.pop()
+        if unique_id in seen or not unique_id.startswith("model."):
+            continue
+        seen.add(unique_id)
+        parent = nodes.get(unique_id) or {}
+        pending.extend((parent.get("depends_on") or {}).get("nodes") or [])
+        if (parent.get("config") or {}).get("materialized") == "ephemeral":
+            continue
+        compiled = (parent.get("compiled_code") or "").strip()
+        found[str(parent.get("name"))] = hashlib.sha256(
+            compiled.encode("utf-8")
+        ).hexdigest()[:16]
+    return found
 
 
 def _compile_detail(message: str) -> str:

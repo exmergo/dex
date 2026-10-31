@@ -114,6 +114,24 @@ CASES = [
         "schemas_differ",
     ),
     Case(
+        "accepted_widening_compares_the_rows",
+        "select 1 as id, cast(5 as int) as n",
+        "select 1 as id, cast(5 as bigint) as n",
+        "equivalent",
+        "equivalent_on_compared_inputs",
+        (1, 1, 0, 0),
+        kwargs={"accepted_type_changes": ["n"]},
+    ),
+    Case(
+        "accepted_widening_keeps_a_changed_value",
+        "select 1 as id, cast(5 as int) as n",
+        "select 1 as id, cast(6 as bigint) as n",
+        "different",
+        "rows_differ",
+        (1, 1, 1, 1),
+        kwargs={"accepted_type_changes": ["n"]},
+    ),
+    Case(
         "equivalent_refactor",
         "select id, sum(n) as n from (select 1 as id, 2 as n union all "
         "select 1 as id, 3 as n) s group by id",

@@ -212,7 +212,7 @@ test over the smaller result.
   A cold dev target that cannot be priced upfront is priced again after the
   build, against the reservation it already holds.
 
-## `transform compare [plan-id] [--model <m>] [--map old=new] [--key <column>] [--target dev]`
+## `transform compare [plan-id] [--model <m>] [--map old=new] [--key <column>] [--accept-type <column>] [--target dev]`
 
 Whether a stored plan keeps one model's results. Use it on a refactor, after
 `transform plan` and before `transform apply`: `data.refactor_comparison_offer` on
@@ -224,7 +224,11 @@ this, since a join rewrite can keep both and still change a measure.
   that when you report it. It is not a proof for future inputs.
 - `different` with `schemas_differ`: read `data.schema`. A rename is a difference
   until `--map old=new` states it. Types are compared exactly, so `INTEGER` to
-  `BIGINT` is a difference too, and the rows are then not compared.
+  `BIGINT` is a difference too, and the rows are then not compared. If the change
+  is intended, `--accept-type <column>` states it: within one family (text, exact
+  numeric, float) the rows are then compared and the change is reported under
+  `accepted_type_changes`. Across families it is `invalid_type_acceptance`, since a
+  common type could make unequal values equal. A blank-padded `CHAR` is in no family.
 - `different` with `rows_differ`: `data.multiset` counts excess rows on each side,
   so equal distinct rows with different duplicates still show. `data.keyed` adds
   keys missing, added and changed, when `--key` or the declared grain is unique on
@@ -235,12 +239,12 @@ this, since a join rewrite can keep both and still change a measure.
 |---|---|
 | `plan_applied`, `plan_stale` | plan the change again against the tree as it is |
 | `baseline_not_compilable`, `proposed_not_compilable` | the model does not compile on that side; `detail` quotes a compile error, and a connection failure says to run `dbt compile` |
-| `inputs_unsynchronized` | build the named parents on dev. A plan that changes a seed or snapshot cannot be compared, because dev holds the old rows |
+| `inputs_unsynchronized` | build the named parents on dev. A plan that changes a seed or snapshot, or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows: apply it on a branch, build, and compare from there |
 | `nondeterministic_expression` | the model calls a random, uuid or current-time function, or samples, so two runs can differ on their own |
 | `unsupported_type` | the named column cannot be grouped on this connector; `detail` names it and its type |
 | `firewall_refused`, `baseline_refused`, `proposed_refused` | a statement is not a single SELECT the firewall admits |
 | `baseline_not_executable`, `proposed_not_executable`, `comparison_unreadable` | the warehouse would not plan or run it; `detail` is an exception class, never its text |
-| `invalid_mapping`, `invalid_key`, `duplicate_output_name` | fix the flag, or give the model unique output names |
+| `invalid_mapping`, `invalid_key`, `invalid_type_acceptance`, `duplicate_output_name` | fix the flag, or give the model unique output names |
 | `awaiting_confirmation` | the priced ask, as on any metered command |
 | `comparison_unsupported_on_connector` | this connector has no `describe_query` |
 
@@ -260,9 +264,9 @@ The nondeterminism check knows built-in functions only. A nondeterministic UDF o
 an unordered `LIMIT` can show as `different` with no real change, so compare again
 if a `rows_differ` looks unexplained.
 
-A plan that changes a macro or project configuration carries a warning: untouched
-parents are read as built on dev, so the comparison does not cover how they would
-recompile. Refused in values-free mode.
+A plan that changes a macro or project configuration compiles both sides through
+their ancestors, and is compared when no untouched parent's SQL moved. Refused in
+values-free mode.
 
 ## `transform test --scaffold <model>`
 

@@ -1455,6 +1455,7 @@ class DexEngine:
         column_mapping: dict[str, str] | None = None,
         key_columns: list[str] | None = None,
         target: str | None = None,
+        accepted_type_changes: list[str] | None = None,
     ) -> RefactorComparisonResult:
         """One model before and after a stored plan, on the same dev inputs."""
 
@@ -1467,6 +1468,7 @@ class DexEngine:
             column_mapping=column_mapping,
             key_columns=key_columns,
             target=target,
+            accepted_type_changes=accepted_type_changes,
         )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:

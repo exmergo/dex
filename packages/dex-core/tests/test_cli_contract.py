@@ -774,6 +774,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "model": "model",
             "map": "column_mapping",
             "key": "key_columns",
+            "accept_type": "accepted_type_changes",
             "target": "target",
         },
     },

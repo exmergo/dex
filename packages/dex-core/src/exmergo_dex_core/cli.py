@@ -1329,6 +1329,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="baseline key column, repeatable; default: declared grain",
                     )
                     sp.add_argument(
+                        "--accept-type",
+                        action="append",
+                        default=None,
+                        metavar="COLUMN",
+                        help="baseline column whose type may change in its family",
+                    )
+                    sp.add_argument(
                         "--target",
                         default=None,
                         help="dbt dev target to read; prod-looking targets are refused",

@@ -2760,6 +2760,7 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 column_mapping=_column_map(getattr(args, "map", None)),
                 key_columns=getattr(args, "key", None),
                 target=getattr(args, "target", None),
+                accepted_type_changes=getattr(args, "accept_type", None),
             )
         )
     except ValueError as exc:

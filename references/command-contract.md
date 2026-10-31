@@ -367,7 +367,8 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      side compiled in its own project copy with every touched model
                                      inlined, then output names and types, then the exact row multiset,
                                      as counts and never rows. --model picks the model, --map old=new
-                                     states a rename, --key (or the declared grain) adds per-key counts.
+                                     states a rename, --accept-type states a type change within one family,
+                                     --key (or the declared grain) adds per-key counts.
                                      data.status is equivalent, different or not_checked with
                                      data.reason_code; equivalent holds for data.input_scope at
                                      data.compared_at only. Priced before spend on metered connectors
