@@ -373,7 +373,7 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # This package lives in a subdirectory; the repository .git is two levels up.
 root = "../.."
-fallback_version = "1.16.6"
+fallback_version = "1.17.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

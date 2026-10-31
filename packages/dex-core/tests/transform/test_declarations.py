@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
@@ -714,7 +715,7 @@ def test_build_reports_the_decisions_of_the_models_it_ran(
         capsys,
     )
 
-    run_results = dbt_project_dir / "target" / "run_results.json"
+    run_results = dex_target(dbt_project_dir) / "run_results.json"
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
 
     def fake(timeout: float, cwd, env=None):

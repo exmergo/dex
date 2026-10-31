@@ -137,7 +137,6 @@ _NOT_ENGINE_METHODS = {
     ("semantic", "define"),
     ("semantic", "update"),
     ("semantic", "plan"),
-    ("viz", "preview"),
     ("config", "get"),
     ("config", "validate"),
     ("config", "set"),

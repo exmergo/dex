@@ -68,7 +68,8 @@ def test_collision_isolates_per_runtime_without_deleting(tmp_path: Path):
     shared = tmp_path / "target"
     planted = _plant_directory_as_sql(shared)
     chosen = resolve_artifact_dir(shared, "dbt-1.10.11")
-    assert chosen == runtime_artifact_dir(tmp_path, "dbt-1.10.11")
+    assert chosen == runtime_artifact_dir(shared, "dbt-1.10.11")
+    assert chosen == shared / "dex" / "dbt-1.10.11"
     assert chosen.is_dir()
     assert planted.is_dir()
 

@@ -464,6 +464,33 @@ def test_the_cli_renderer_documents_every_kind_of_argument():
     assert gaps == []
 
 
+def test_cli_details_are_collapsed_without_hiding_command_anchors():
+    parser, shared = _parser()
+    pages, _ = site.render_cli_reference(parser, shared, group_order=["tool"])
+    body = pages["cli/tool"]
+    heading = body.index("## dex tool run")
+    details = body.index('<Accordion title="Usage and options for dex tool run">')
+    end = body.index("</Accordion>", details)
+    assert "[`dex tool run`](#dex-tool-run)" in body[:heading]
+    assert heading < details < body.index("| `--tag TAG` |") < end
+    assert "```" in body[details:end]
+    assert "[global options](/cli/overview#global-options)" in body[:heading]
+
+
+def test_getting_started_and_workflows_are_separate_from_reference(real_build):
+    builder, _ = real_build
+    docs, reference, _ = builder.config["navigation"]["tabs"]
+    docs_pages = site._navigation_pages(docs)
+    reference_pages = site._navigation_pages(reference)
+    assert docs_pages[:4] == ["index", "quickstart", "installation", "connect"]
+    assert {"guides/explore", "guides/transform", "guides/maintain"} <= set(docs_pages)
+    assert "reference/command-contract" in reference_pages
+    assert "connectors/duckdb" in reference_pages
+    assert "reference/command-contract" not in docs_pages
+    assert 'href="/dex/quickstart"' in builder.pages["index"].body
+    assert 'href="/dex/installation"' in builder.pages["index"].body
+
+
 def test_missing_help_is_a_gap_and_a_problem_when_required(tmp_path):
     parser, shared = _parser()
     run = parser._subparsers._group_actions[0].choices["tool"]

@@ -89,7 +89,7 @@ def metricflow_engine(
 
     from ... import dbt_project
 
-    manifest_path = project / dbt_project.SEMANTIC_MANIFEST_PATH
+    manifest_path = dbt_project.semantic_manifest_file(project)
     if not manifest_path.is_file():
         raise SemanticBackendError(
             "no compiled semantic manifest at target/semantic_manifest.json; "

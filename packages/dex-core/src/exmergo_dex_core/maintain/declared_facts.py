@@ -101,7 +101,7 @@ def plan(
     project_dir: Path, *, scope: set[str] | None = None
 ) -> tuple[list[DeclaredModel], list[str]]:
     """Every selected model's checkable declared facts. Free and connectionless:
-    read from ``target/manifest.json``, where dbt has already merged each
+    read from ``the compiled ``manifest.json``, where dbt has already merged each
     model's and column's ``config.meta`` into the node.
 
     ``scope`` holds model unique ids or lowered labels, the same convention

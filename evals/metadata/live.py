@@ -94,7 +94,7 @@ class Session:
     candidate_plugin_loaded: bool | None = None
 
 
-_GROUPS = "explore|transform|maintain|semantic|config|connect|demo|procedure|viz"
+_GROUPS = "explore|transform|maintain|semantic|config|connect|demo|procedure"
 # `dex <group>`, the engine module, or the skill wrapper, however its path is
 # spelled (`run.py`, or `--script $R` with the path in a shell variable).
 _DEX_CALL = re.compile(

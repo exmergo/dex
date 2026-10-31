@@ -1,30 +1,55 @@
-"""Artifact-producer provenance and per-runtime artifact isolation (#862).
+"""Where Dex's dbt runs write artifacts, and where readers look (#862, #1014).
 
 Dex's dbt runtime and a separately pinned project or CI runtime can share a
 ``target/`` directory. Incompatible dbt versions have left
 ``target/run/<project>/snapshots/<name>.sql`` as a directory that a later
 version then opens as a file (``IsADirectoryError``).
 
-The policy is runtime isolation, through :func:`resolve_artifact_dir` and
-:func:`runtime_artifact_dir`. A clean shared ``target/`` is reused, which is
-the same-runtime case and is unchanged. A collision isolates this runtime in a
-sibling directory, or refuses when isolation is off. Neither choice deletes
-caller-owned artifacts.
+The policy is one setting, ``transform.artifacts``:
 
-A caller that needs the artifacts at a chosen path passes that directory, or a
-runtime key that resolves one. :func:`artifact_paths` is the one naming of
-``run_results.json`` and ``manifest.json`` inside that directory, so the build
-and the evidence read use the same files. A reader that names an expected
+``isolated`` (the default)
+    Every dbt invocation Dex owns on the real project (the build, the compile
+    that prices it, the ``dbt ls`` that selects seeds, the settlement read after
+    a failed run) writes to :func:`isolated_artifact_dir`,
+    ``<target-path>/dex/<runtime-key>``. The runtime key is the installed
+    dbt-core version, so two Dex runs with the same runtime share partial-parse
+    state while a different runtime never reads or writes them. The directory sits
+    inside the project's own target path, so whatever ignores ``target/`` (git,
+    ``dbt clean``, the shadow copies Dex validates in) ignores it too. The
+    project's own ``target/`` is never written.
+
+``shared``
+    Dex writes the project's own target path, for a caller that needs the
+    artifacts where its other tooling looks. Before writing,
+    :func:`resolve_build_artifact_dir` refuses a directory another runtime left
+    incompatible: a snapshot path that is a directory where dbt expects a file,
+    or a manifest written by a different dbt minor version. The refusal names
+    the recovery. Nothing is deleted.
+
+Readers do not know which policy wrote last, and do not need to:
+:func:`readable_artifact` returns the newer of the file in Dex's directory and
+the file in the project's target path. After a Dex build that is Dex's; after
+the user's own ``dbt parse`` it is theirs.
+
+:func:`shared_target_dir` resolves the project's target path the way dbt does:
+``DBT_ENGINE_TARGET_PATH``, then ``DBT_TARGET_PATH``, then ``target-path`` in
+``dbt_project.yml``, then ``target``. A reader that names an expected
 invocation id refuses results from a different invocation. Missing artifacts
 stay missing. Neither case is a successful completion.
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import functools
+import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..errors import DexError
 
@@ -146,11 +171,21 @@ def find_snapshot_path_collisions(artifact_dir: Path | str) -> list[CollisionFin
     return found
 
 
-def runtime_artifact_dir(base: Path | str, runtime_key: str) -> Path:
-    """Per-runtime artifact directory under ``base`` (no deletion of siblings)."""
+#: The folder inside the project's target path that holds Dex's per-runtime
+#: artifact directories.
+DEX_ARTIFACT_FOLDER = "dex"
+
+
+def runtime_artifact_dir(shared: Path | str, runtime_key: str) -> Path:
+    """Per-runtime artifact directory inside ``shared`` (no deletion of siblings).
+
+    ``<shared>/dex/<key>``: dbt writes ``run/``, ``compiled/`` and its JSON
+    artifacts at the top of a target path, never under ``dex/``, so another
+    runtime using ``shared`` cannot collide with it.
+    """
 
     key = re.sub(r"[^A-Za-z0-9._-]+", "_", runtime_key.strip()) or "runtime"
-    return Path(base) / f"dex-runtime-{key}"
+    return Path(shared) / DEX_ARTIFACT_FOLDER / key
 
 
 class ArtifactCollisionError(DexError, ValueError):
@@ -166,7 +201,7 @@ def resolve_artifact_dir(
     """Choose a writable artifact directory for this runtime.
 
     Same-runtime reuse of ``shared`` is fine when no collision is present.
-    On collision, either return an isolated sibling directory (default) or
+    On collision, either return an isolated directory inside it (default) or
     refuse. Never recursively deletes caller-owned artifacts.
     """
 
@@ -182,7 +217,7 @@ def resolve_artifact_dir(
             f"(directory where file expected: {names}); "
             "use an isolated artifact directory per runtime"
         )
-    isolated = runtime_artifact_dir(shared_path.parent, runtime_key)
+    isolated = runtime_artifact_dir(shared_path, runtime_key)
     isolated.mkdir(parents=True, exist_ok=True)
     return isolated
 
@@ -198,16 +233,18 @@ class ArtifactPaths:
     directory: Path
     run_results: Path
     manifest: Path
+    semantic_manifest: Path
 
 
 def artifact_paths(artifact_dir: Path | str) -> ArtifactPaths:
-    """Name ``run_results.json`` and ``manifest.json`` inside ``artifact_dir``."""
+    """Name the JSON artifacts Dex reads inside ``artifact_dir``."""
 
     directory = Path(artifact_dir)
     return ArtifactPaths(
         directory=directory,
         run_results=directory / "run_results.json",
         manifest=directory / "manifest.json",
+        semantic_manifest=directory / "semantic_manifest.json",
     )
 
 
@@ -261,3 +298,217 @@ def assert_same_invocation(expected_id: str | None, actual_id: str | None) -> No
     raise ForeignInvocationError(
         f"run results belong to invocation '{actual_id}', not '{expected_id}'"
     )
+
+
+# --- the artifact policy (#1014) ---------------------------------------------
+
+ArtifactPolicy = Literal["isolated", "shared"]
+ARTIFACT_POLICIES: tuple[str, ...] = ("isolated", "shared")
+DEFAULT_ARTIFACT_POLICY: ArtifactPolicy = "isolated"
+
+
+@functools.lru_cache(maxsize=1)
+def dbt_runtime_key() -> str | None:
+    """``dbt-<version>`` of the dbt-core Dex runs, or ``None`` without one.
+
+    Read from the installed distribution's metadata, so nothing is imported and
+    no subprocess is spawned. The build runs the ``dbt`` beside this interpreter
+    (see ``build._dbt_executable``), which is this distribution.
+    """
+
+    try:
+        return f"dbt-{metadata.version('dbt-core')}"
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def shared_target_dir(project_root: Path | str) -> Path:
+    """The project's own target path, resolved the way dbt resolves it.
+
+    ``DBT_ENGINE_TARGET_PATH`` wins (dbt 1.12's spelling, read before the old
+    one), then ``DBT_TARGET_PATH``, then ``target-path`` in ``dbt_project.yml``,
+    then ``target``. A relative path is relative to the project, which is made
+    absolute first so a caller holding a relative project path gets a path it can
+    open as given. A value carrying Jinja cannot be rendered here and falls back
+    to ``target``; set ``DBT_TARGET_PATH`` to the rendered path to point Dex at it.
+    """
+
+    project = Path(project_root).absolute()
+    configured = (
+        os.environ.get("DBT_ENGINE_TARGET_PATH")
+        or os.environ.get("DBT_TARGET_PATH")
+        or _yml_target_path(project)
+    )
+    if not configured or "{{" in configured or "{%" in configured:
+        configured = "target"
+    path = Path(configured).expanduser()
+    return path if path.is_absolute() else project / path
+
+
+def _yml_target_path(project: Path) -> str | None:
+    import yaml
+
+    try:
+        document = yaml.safe_load(
+            (project / "dbt_project.yml").read_text(encoding="utf-8")
+        )
+    except (OSError, yaml.YAMLError):
+        return None
+    value = document.get("target-path") if isinstance(document, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def isolated_artifact_dir(
+    project_root: Path | str, runtime_key: str | None = None
+) -> Path | None:
+    """``<target-path>/dex/<runtime-key>``, or ``None`` with no dbt runtime."""
+
+    key = runtime_key or dbt_runtime_key()
+    if key is None:
+        return None
+    return runtime_artifact_dir(shared_target_dir(project_root), key)
+
+
+class IncompatibleArtifactsError(ArtifactCollisionError):
+    """The shared target path holds artifacts this runtime must not write over."""
+
+
+def resolve_build_artifact_dir(
+    project_root: Path | str,
+    policy: str = DEFAULT_ARTIFACT_POLICY,
+    *,
+    runtime_key: str | None = None,
+) -> Path:
+    """The directory every Dex-owned dbt invocation on this project writes to.
+
+    ``isolated``: :func:`isolated_artifact_dir`, created if missing. ``shared``:
+    the project's target path, after refusing one that holds a cross-runtime
+    collision or a manifest from a different dbt minor version. The refusal
+    names both ways out and deletes nothing.
+    """
+
+    if policy not in ARTIFACT_POLICIES:
+        raise ValueError(
+            f"transform.artifacts must be one of {', '.join(ARTIFACT_POLICIES)}, "
+            f"not '{policy}'"
+        )
+    key = runtime_key or dbt_runtime_key()
+    shared = shared_target_dir(project_root)
+    if policy == "isolated" and key is not None:
+        isolated = runtime_artifact_dir(shared, key)
+        isolated.mkdir(parents=True, exist_ok=True)
+        return isolated
+    collisions = find_snapshot_path_collisions(shared)
+    found = _foreign_manifest_version(shared, key)
+    if collisions or found:
+        label = sanitize_artifact_directory(shared, project_root=project_root)
+        why = (
+            f"a snapshot path another dbt runtime left as a directory "
+            f"({collisions[0].path.rsplit('/', 1)[-1]})"
+            if collisions
+            else f"a manifest written by dbt {found}"
+        )
+        raise IncompatibleArtifactsError(
+            f"transform.artifacts is 'shared', and {label}/ holds {why}, which "
+            f"this runtime ({key or 'dbt'}) cannot safely write over. Dex deletes "
+            f"nothing there. Either run `dbt clean` with the runtime that wrote "
+            "it, or unset transform.artifacts so Dex writes to its own "
+            f"{label}/{DEX_ARTIFACT_FOLDER}/ directory"
+        )
+    shared.mkdir(parents=True, exist_ok=True)
+    return shared
+
+
+def _foreign_manifest_version(shared: Path, runtime_key: str | None) -> str | None:
+    """The dbt version of a manifest in ``shared`` whose minor differs from ours."""
+
+    import json
+
+    if runtime_key is None:
+        return None
+    try:
+        document = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
+        written = str(document["metadata"]["dbt_version"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    ours = runtime_key.removeprefix("dbt-")
+    return None if _minor(written) == _minor(ours) else written
+
+
+def _minor(version: str) -> tuple[str, ...]:
+    return tuple(version.split(".")[:2])
+
+
+@dataclass(frozen=True)
+class PinnedArtifacts:
+    """The one directory, and the one invocation, a command's readers answer for."""
+
+    directory: Path
+    invocation_id: str | None
+
+
+_PINNED: contextvars.ContextVar[PinnedArtifacts | None] = contextvars.ContextVar(
+    "dex_pinned_artifacts", default=None
+)
+
+
+@contextlib.contextmanager
+def pinned_artifacts(
+    directory: Path | str, invocation_id: str | None = None
+) -> Iterator[PinnedArtifacts]:
+    """Bind every reader in this block to ``directory``.
+
+    A build knows where it wrote and which invocation it ran, so what it reads
+    back (the pricing pass, the ``--verify`` sweep, the decisions it reports)
+    reads exactly that directory instead of the newest one on disk, which
+    another dbt process could have rewritten meanwhile. ``invocation_id`` lets a
+    reader of ``run_results.json`` refuse results from any other invocation (see
+    :func:`pinned_invocation_id`). Standalone readers, outside any such block,
+    keep the newest-artifact choice.
+    """
+
+    token = _PINNED.set(PinnedArtifacts(Path(directory), invocation_id))
+    try:
+        yield _PINNED.get()  # type: ignore[misc]
+    finally:
+        _PINNED.reset(token)
+
+
+def pinned_invocation_id() -> str | None:
+    """The invocation a pinned block's run results must belong to, if any."""
+
+    pinned = _PINNED.get()
+    return pinned.invocation_id if pinned is not None else None
+
+
+def readable_artifact(project_root: Path | str, name: str) -> Path:
+    """The newer of ``name`` in Dex's directory and in the project's target path.
+
+    Readers cannot know which policy, or which tool, wrote last, so they read
+    whichever file was written last. With neither present the answer is the
+    project's own path, so a reader's "missing" message names the place a user
+    would look. Inside :func:`pinned_artifacts` the answer is always the pinned
+    directory.
+    """
+
+    pinned = _PINNED.get()
+    if pinned is not None:
+        return pinned.directory / name
+    shared = shared_target_dir(project_root) / name
+    isolated_dir = isolated_artifact_dir(project_root)
+    candidates = [shared] + ([isolated_dir / name] if isolated_dir else [])
+    present: list[tuple[float, Path]] = []
+    for path in candidates:
+        try:
+            present.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    if not present:
+        return shared
+    return max(present, key=lambda pair: pair[0])[1]
+
+
+def readable_artifact_dir(project_root: Path | str) -> Path:
+    """The directory holding the manifest :func:`readable_artifact` would pick."""
+
+    return readable_artifact(project_root, "manifest.json").parent

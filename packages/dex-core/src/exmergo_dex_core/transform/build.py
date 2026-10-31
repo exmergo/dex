@@ -48,10 +48,14 @@ from ..envelope import Cost, EstimateQuality, Paradigm, redact
 from ..errors import DexError, PrerequisiteError
 from ..guards.cost_guard import UPTIME_LINE, preflight
 from .artifact_runtime import (
+    DEFAULT_ARTIFACT_POLICY,
     artifact_paths,
     clear_run_results,
     prepare_artifact_dir,
+    readable_artifact_dir,
+    resolve_build_artifact_dir,
     sanitize_artifact_directory,
+    shared_target_dir,
 )
 
 # Names that mean production no matter what the config says. The build target
@@ -135,7 +139,9 @@ def build(
     approved_functions: frozenset[str] | None = None,
     runtime_key: str | None = None,
     artifact_directory: Path | str | None = None,
+    artifact_policy: str = DEFAULT_ARTIFACT_POLICY,
     relation_columns: Callable[[list[str]], dict[str, list[str]]] | None = None,
+    full_refresh: bool = False,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -157,14 +163,22 @@ def build(
     layer has already run the confirm handshake from the same estimate, and this
     re-check binds every caller of the engine regardless.
 
-    ``runtime_key`` chooses the artifact directory for this runtime. A clean
-    shared ``target/`` is reused. A cross-runtime path collision isolates the
-    run, and ``--target-path`` points dbt at that directory.
-    ``artifact_directory`` is that path outright and wins over ``runtime_key``.
-    With neither, the build writes ``<project>/target`` and does not pass
-    ``--target-path``, so a ``target-path`` already set in the project is left
-    alone. The summary names ``artifact_directory`` only when one of those
-    arguments was passed.
+    Where dbt writes is decided once, before anything runs, and every dbt
+    invocation below gets it as ``--target-path`` (issue #1014).
+    ``artifact_directory`` names it outright. ``runtime_key`` is the older
+    spelling from #883: reuse a clean shared target path, isolate on a
+    collision. Otherwise ``artifact_policy`` decides, through
+    :func:`~.artifact_runtime.resolve_build_artifact_dir`: ``isolated`` (the
+    default) is Dex's own ``<target-path>/dex/<runtime>``, and ``shared`` is the
+    project's target path, refused when another runtime left it incompatible.
+    The summary names the directory under ``artifact_directory``.
+
+    ``full_refresh`` passes ``--full-refresh`` to ``dbt build``, which rebuilds
+    each selected incremental model and seed from scratch (issue #1015). The
+    summary's ``full_refresh`` then names them, with any whose own
+    ``full_refresh: false`` config makes dbt ignore the flag. The stale-seed
+    pre-step is skipped, since the build itself now refreshes every seed it
+    selects.
 
     ``relation_columns`` reads the dev target: it takes seed relation names and
     returns the columns of each one that exists. With it, a seed whose CSV header
@@ -182,6 +196,22 @@ def build(
     # against the cwd we pin below: a relative project dir would otherwise
     # double (dbt would look for project/project and fail).
     project = Path(project_dir).resolve()
+
+    # Resolved ahead of every gate: it is free, and a shared directory another
+    # runtime left incompatible refuses here, before anyone weighs a budget.
+    if artifact_directory is not None:
+        artifacts = Path(artifact_directory)
+        if not artifacts.is_absolute():
+            artifacts = project / artifacts
+        artifacts.mkdir(parents=True, exist_ok=True)
+    elif runtime_key is not None:
+        artifacts = prepare_artifact_dir(
+            project,
+            runtime_key,
+            shared_relative=str(shared_target_dir(project)),
+        )
+    else:
+        artifacts = resolve_build_artifact_dir(project, artifact_policy)
 
     target_warnings = dev_target_check() if dev_target_check is not None else []
 
@@ -231,23 +261,14 @@ def build(
         str(profiles_dir(project).resolve()),
         "--log-format",
         "json",
+        "--target-path",
+        str(artifacts),
     ]
     argv = [_dbt_executable(), "build", *flags]
     if select:
         argv += ["--select", select]
-
-    named_artifacts = artifact_directory is not None or runtime_key is not None
-    if artifact_directory is not None:
-        artifacts = Path(artifact_directory)
-        if not artifacts.is_absolute():
-            artifacts = project / artifacts
-    elif runtime_key is not None:
-        artifacts = prepare_artifact_dir(project, runtime_key)
-    else:
-        artifacts = project / "target"
-    if named_artifacts:
-        argv += ["--target-path", str(artifacts)]
-        flags += ["--target-path", str(artifacts)]
+    if full_refresh:
+        argv.append("--full-refresh")
 
     # A hard compile-time/parse-time failure (a Jinja context error, for
     # instance) dies before dbt ever reaches node execution, so it never
@@ -267,7 +288,9 @@ def build(
         timeout, project, env=_build_env(connector, paradigm, ceiling)
     )
     stale: list[dict[str, Any]] = []
-    if relation_columns is not None:
+    # A requested full refresh rebuilds every seed the build selects, stale or
+    # not, so the pre-step would only drop the same tables twice.
+    if relation_columns is not None and not full_refresh:
         try:
             stale = _seeds_to_refresh(
                 project, artifacts, flags, select, run, relation_columns
@@ -284,16 +307,20 @@ def build(
     if approved_functions:
         from ..adapters import get_dialect
 
-        _compile_project(project, target=target, select=select, runner=run)
-        _assert_compiled_functions(
+        _compile_project(
             project,
+            target=target,
+            select=select,
+            runner=run,
+            artifacts=artifacts,
+            full_refresh=full_refresh,
+        )
+        _assert_compiled_functions(
+            artifacts,
             dialect=get_dialect(connector or "duckdb"),
             approved_functions=approved_functions,
         )
         # Compilation also writes run_results; it is not build evidence.
-        # Compile itself still uses the project target. This clear is the
-        # resolved directory, so an isolated run does not keep a previous
-        # invocation's results there.
         clear_run_results(artifacts)
     # After every gate above, so a refused build has dropped nothing.
     refreshed: list[str] = []
@@ -302,10 +329,7 @@ def build(
         seed_argv += ["--select", " ".join(_exact_seed(node) for node in stale)]
         clear_run_results(artifacts)
         seeded = _summarize(
-            project,
-            target,
-            run(seed_argv),
-            artifact_directory=artifacts if named_artifacts else None,
+            project, target, run(seed_argv), artifact_directory=artifacts
         )
         refreshed = [node["name"] for node in seeded["nodes"]]
         if not seeded["success"]:
@@ -319,15 +343,22 @@ def build(
         clear_run_results(artifacts)
     completed = run(argv)
 
-    summary = _summarize(
-        project,
-        target,
-        completed,
-        artifact_directory=artifacts if named_artifacts else None,
-    )
+    summary = _summarize(project, target, completed, artifact_directory=artifacts)
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
-    if refreshed:
+    if full_refresh:
+        rebuilt = full_refresh_nodes(artifacts)
+        summary["full_refresh"] = {
+            "requested": True,
+            **rebuilt,
+            "success": bool(summary["success"]),
+        }
+        if not select:
+            target_warnings = [
+                *target_warnings,
+                full_refresh_unselected_warning(rebuilt),
+            ]
+    elif refreshed:
         summary["full_refresh"] = {"seeds": refreshed, "success": True}
         target_warnings = [
             *target_warnings,
@@ -462,15 +493,27 @@ def shadow_project(
 
     project = Path(project_dir).resolve()
     view = load_project(project)
+    by_name = shutil.ignore_patterns(
+        "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
+    )
+    # A configured target-path holds artifacts as surely as `target/` does,
+    # Dex's own isolated ones included (issue #1014). It is skipped by its full
+    # path: `target-path: models/target` must not skip `models/`.
+    artifacts: Path | None = None
+    with contextlib.suppress(ValueError, OSError):
+        configured = shared_target_dir(project).resolve()
+        if configured != project and configured.is_relative_to(project):
+            artifacts = configured
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        skipped = set(by_name(directory, names))
+        if artifacts is not None and Path(directory).resolve() == artifacts.parent:
+            skipped.update(name for name in names if name == artifacts.name)
+        return skipped
+
     with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
         shadow = Path(tmp) / (project.name or "project")
-        shutil.copytree(
-            project,
-            shadow,
-            ignore=shutil.ignore_patterns(
-                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
-            ),
-        )
+        shutil.copytree(project, shadow, ignore=ignore)
         for edit in edits:
             edit_path = contained_path(shadow, edit.path, view)
             if edit.op is EditOp.DELETE:
@@ -633,6 +676,11 @@ def _child_environ(*, isolated: bool = False) -> dict[str, str]:
     withheld = set(_CHILD_ENV_WITHHELD)
     if isolated:
         withheld.update(_ISOLATED_ENV_SCRUBBED)
+        # dbt 1.12 reads each of these first as `DBT_ENGINE_<NAME>`, so the old
+        # name alone would leave the setting in place.
+        withheld.update(
+            name.replace("DBT_", "DBT_ENGINE_", 1) for name in _ISOLATED_ENV_SCRUBBED
+        )
     env = {key: value for key, value in os.environ.items() if key not in withheld}
     # dbt writes a `.user.yml` into the profiles directory when usage tracking
     # is on, and the profiles directory here is often the real project.
@@ -832,7 +880,12 @@ class ShadowRun:
         results = self._require_shadow() / "target" / "run_results.json"
         if not results.is_file():
             return None
-        return _summarize(self._require_shadow(), self.target, completed)
+        return _summarize(
+            self._require_shadow(),
+            self.target,
+            completed,
+            read_from=self._require_shadow() / "target",
+        )
 
     def show(
         self, select: str
@@ -856,7 +909,12 @@ class ShadowRun:
         summary = None
         if results.is_file():
             summary = {
-                **_summarize(self._require_shadow(), self.target, completed),
+                **_summarize(
+                    self._require_shadow(),
+                    self.target,
+                    completed,
+                    read_from=self._require_shadow() / "target",
+                ),
                 "messages": [],
             }
         if completed.returncode != 0:
@@ -1203,6 +1261,8 @@ def compile_estimate(
     timeout: float = _COMPILE_TIMEOUT_SECONDS,
     approved_functions: frozenset[str] | None = None,
     overhead: float = 0.0,
+    artifact_directory: Path | str | None = None,
+    full_refresh: bool = False,
 ) -> tuple[float, dict[str, float], list[str]]:
     """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
 
@@ -1231,12 +1291,25 @@ def compile_estimate(
     :data:`UPTIME_LINE`, so the breakdown says where it went and a build with
     nothing to scan still quotes it.
 
+    ``artifact_directory`` is where the compile writes and where its artifacts
+    are read back, the directory the build itself will write (issue #1014); by
+    default the one :func:`~.artifact_runtime.resolve_build_artifact_dir`
+    resolves for the isolated policy. ``full_refresh`` compiles with
+    ``--full-refresh``, so ``is_incremental()`` renders false and each
+    incremental node is priced as the full rebuild the build will run rather
+    than as a batch (issue #1015).
+
     Raises :class:`DbtRunError` when ``dbt compile`` itself fails: that same
     failure would sink the build, and the caller degrades to no-estimate so dbt's
     own error is what the user sees, not a masked one from here.
     """
 
     project = Path(project_dir).resolve()
+    artifacts = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else resolve_build_artifact_dir(project)
+    )
     estimator = getattr(adapter, "query_estimate", None)
     if estimator is None and not approved_functions:
         return (
@@ -1250,10 +1323,12 @@ def compile_estimate(
         target=target,
         select=select,
         runner=runner or _default_runner(timeout, project, env),
+        artifacts=artifacts,
+        full_refresh=full_refresh,
     )
     if approved_functions:
         _assert_compiled_functions(
-            project, dialect=adapter.dialect, approved_functions=approved_functions
+            artifacts, dialect=adapter.dialect, approved_functions=approved_functions
         )
     if estimator is None:
         return (
@@ -1262,7 +1337,7 @@ def compile_estimate(
             ["connector exposes no estimator; build cost not priced upfront"],
         )
 
-    compiled = _compiled_nodes(project)
+    compiled = _compiled_nodes(artifacts)
     total = 0.0
     per_node: dict[str, float] = {}
     skipped: list[str] = []
@@ -1287,13 +1362,82 @@ def compile_estimate(
         )
     if not per_node and not skipped and overhead <= 0:
         notes.append("no scanning build nodes to price; the estimate is zero")
+    if full_refresh:
+        rebuilt = full_refresh_nodes(artifacts)
+        if rebuilt["models"] or rebuilt["seeds"]:
+            notes.append(
+                "priced as a full refresh: "
+                f"{_count(len(rebuilt['models']), 'incremental model')} and "
+                f"{_count(len(rebuilt['seeds']), 'seed')} are priced as the full "
+                "rebuild they will run, not as an incremental batch"
+            )
+        if not select:
+            notes.append(full_refresh_unselected_warning(rebuilt))
     if overhead > 0:
         per_node[UPTIME_LINE] = overhead
         total += overhead
     return total, per_node, notes
 
 
-def compiled_model_ids(project: Path) -> set[str]:
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def full_refresh_nodes(artifact_directory: Path | str) -> dict[str, list[str]]:
+    """What a ``--full-refresh`` run over this selection rebuilds from scratch.
+
+    Read from the artifacts of the run (a build's, or the compile that priced
+    it, which selects the same nodes): ``models`` are the selected incremental
+    models and ``seeds`` the selected seeds. ``not_refreshed`` names the ones
+    whose own ``full_refresh: false`` config makes dbt ignore the flag, so a
+    caller does not read the rows they keep as rebuilt. A table or a view is
+    rebuilt by every build and is not listed; a snapshot ignores the flag.
+    """
+
+    paths = artifact_paths(artifact_directory)
+    found: dict[str, list[str]] = {"models": [], "seeds": [], "not_refreshed": []}
+    try:
+        results = json.loads(paths.run_results.read_text(encoding="utf-8"))["results"]
+        nodes = json.loads(paths.manifest.read_text(encoding="utf-8"))["nodes"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return found
+    for result in results if isinstance(results, list) else []:
+        unique_id = str((result or {}).get("unique_id", ""))
+        node = nodes.get(unique_id) if isinstance(nodes, dict) else None
+        if not isinstance(node, dict):
+            continue
+        config = node.get("config") or {}
+        kind = node.get("resource_type")
+        if kind == "seed":
+            bucket = "seeds"
+        elif kind == "model" and config.get("materialized") == "incremental":
+            bucket = "models"
+        else:
+            continue
+        label = manifest_node_label(unique_id, node)
+        if config.get("full_refresh") is False:
+            found["not_refreshed"].append(label)
+        else:
+            found[bucket].append(label)
+    return {key: sorted(set(names)) for key, names in found.items()}
+
+
+def full_refresh_unselected_warning(rebuilt: dict[str, list[str]]) -> str:
+    """The warning a ``--full-refresh`` with no ``--select`` carries."""
+
+    models = _count(len(rebuilt["models"]), "incremental model")
+    seeds = _count(len(rebuilt["seeds"]), "seed")
+    return (
+        "--full-refresh with no --select rebuilds every incremental model and "
+        "seed dbt's default selection reaches (the whole project, unless a "
+        f"default selector narrows it): {models} and {seeds}. Name the models "
+        "whose logic changed with --select to rebuild only those"
+    )
+
+
+def compiled_model_ids(
+    project: Path, artifact_directory: Path | str | None = None
+) -> set[str]:
     """The models dbt's last compile selected, by unique id.
 
     The same ``run_results.json`` the estimate is built from, which is what
@@ -1301,7 +1445,12 @@ def compiled_model_ids(project: Path) -> set[str]:
     ``--select`` narrows the compile, so it narrows this too.
     """
 
-    run_results = project / "target" / "run_results.json"
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else readable_artifact_dir(project)
+    )
+    run_results = artifact_paths(directory).run_results
     if not run_results.is_file():
         return set()
     try:
@@ -1316,11 +1465,18 @@ def compiled_model_ids(project: Path) -> set[str]:
 
 
 def _compile_project(
-    project: Path, *, target: str, select: str | None, runner: Runner
+    project: Path,
+    *,
+    target: str,
+    select: str | None,
+    runner: Runner,
+    artifacts: Path,
+    full_refresh: bool = False,
 ) -> None:
-    """Compile the selection afresh; never reuse a prior invocation's results."""
+    """Compile the selection afresh into ``artifacts``; never reuse a prior
+    invocation's results."""
 
-    (project / "target" / "run_results.json").unlink(missing_ok=True)
+    clear_run_results(artifacts)
     argv = [
         _dbt_executable(),
         "compile",
@@ -1332,9 +1488,13 @@ def _compile_project(
         str(profiles_dir(project).resolve()),
         "--log-format",
         "json",
+        "--target-path",
+        str(artifacts),
     ]
     if select:
         argv += ["--select", select]
+    if full_refresh:
+        argv.append("--full-refresh")
     completed = runner(argv)
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
@@ -1342,7 +1502,7 @@ def _compile_project(
 
 
 def _assert_compiled_functions(
-    project: Path, *, dialect: str, approved_functions: frozenset[str]
+    artifacts: Path, *, dialect: str, approved_functions: frozenset[str]
 ) -> None:
     """Adjudicate every selected SQL node before pricing or building it.
 
@@ -1354,8 +1514,9 @@ def _assert_compiled_functions(
     from ..guards.sql_guard import NotSelectOnlyError, RefusalReason
 
     try:
-        results = json.loads((project / "target/run_results.json").read_text())
-        manifest = json.loads((project / "target/manifest.json").read_text())
+        paths = artifact_paths(artifacts)
+        results = json.loads(paths.run_results.read_text())
+        manifest = json.loads(paths.manifest.read_text())
         selected = results["results"]
         nodes = manifest["nodes"]
         if not isinstance(selected, list) or not isinstance(nodes, dict):
@@ -1383,7 +1544,12 @@ def _assert_compiled_functions(
         raise DbtRunError(f"cannot enforce guards.approved_functions: {exc}") from exc
 
 
-def dynamic_bound_nodes(project_dir: Path | str, *, dialect: str) -> dict[str, str]:
+def dynamic_bound_nodes(
+    project_dir: Path | str,
+    *,
+    dialect: str,
+    artifact_directory: Path | str | None = None,
+) -> dict[str, str]:
     """The incremental nodes whose batch filter a dry run prices unpruned.
 
     An incremental model's batch filter is usually a watermark computed by a
@@ -1406,7 +1572,12 @@ def dynamic_bound_nodes(project_dir: Path | str, *, dialect: str) -> dict[str, s
     from sqlglot import expressions as exp
 
     bounded: dict[str, str] = {}
-    for label, node, code in _priced_manifest_nodes(Path(project_dir).resolve()):
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else readable_artifact_dir(Path(project_dir).resolve())
+    )
+    for label, node, code in _priced_manifest_nodes(directory):
         if (node.get("config") or {}).get("materialized") != "incremental":
             continue
         try:
@@ -1438,13 +1609,13 @@ def dynamic_bound_nodes(project_dir: Path | str, *, dialect: str) -> dict[str, s
     return bounded
 
 
-def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
+def _compiled_nodes(artifacts: Path) -> list[tuple[str, str]]:
     """The (label, compiled SQL) of each priced node dbt just compiled."""
 
-    return [(label, code) for label, _node, code in _priced_manifest_nodes(project)]
+    return [(label, code) for label, _node, code in _priced_manifest_nodes(artifacts)]
 
 
-def _priced_manifest_nodes(project: Path) -> list[tuple[str, dict[str, Any], str]]:
+def _priced_manifest_nodes(artifacts: Path) -> list[tuple[str, dict[str, Any], str]]:
     """The (label, manifest node, compiled SQL) of each priced node.
 
     The selected set comes from compile's ``run_results.json`` (which honors the
@@ -1453,8 +1624,8 @@ def _priced_manifest_nodes(project: Path) -> list[tuple[str, dict[str, Any], str
     without compiled SQL contribute no billed statement and are dropped here.
     """
 
-    run_results = project / "target" / "run_results.json"
-    manifest = project / "target" / "manifest.json"
+    paths = artifact_paths(artifacts)
+    run_results, manifest = paths.run_results, paths.manifest
     if not run_results.is_file() or not manifest.is_file():
         return []
     compiled_ids = [
@@ -1809,12 +1980,26 @@ def _show_preview(
     return None
 
 
+def _logged_invocation_id(completed: subprocess.CompletedProcess) -> str | None:
+    """The invocation id dbt's ``--log-format json`` stamps on its log lines."""
+
+    for line in (completed.stdout or "").splitlines():
+        if not line.startswith("{"):
+            continue
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            found = (json.loads(line).get("info") or {}).get("invocation_id")
+            if found:
+                return str(found)
+    return None
+
+
 def _summarize(
     project: Path,
     target: str,
     completed: subprocess.CompletedProcess,
     *,
     artifact_directory: Path | None = None,
+    read_from: Path | None = None,
 ) -> dict[str, Any]:
     """Reduce a dbt run to a sanitized summary; raw log text stays behind.
 
@@ -1824,8 +2009,17 @@ def _summarize(
     can be cross-referenced on); the name is what a reader scans.
 
     ``artifact_directory``, when passed, is the directory this build resolved.
-    The summary then carries that directory's publishable label. Callers that
-    omit it keep reading ``<project>/target`` and the summary shape they had.
+    The summary then carries that directory's publishable label. A caller that
+    omits it reads ``read_from`` when given (a shadow copy's own directory,
+    which no environment variable may redirect) and otherwise the newest
+    artifacts on disk (:func:`~.artifact_runtime.readable_artifact_dir`), and
+    gets no label.
+
+    Results another invocation wrote are never reported as this one's (issue
+    #1014). dbt's JSON log names the invocation on every line. When the
+    ``run_results.json`` on disk names a different one, its nodes are dropped
+    and the run is a failure that says so, rather than a success borrowed from
+    an earlier or a foreign run.
     """
 
     nodes: list[dict[str, Any]] = []
@@ -1833,11 +2027,19 @@ def _summarize(
     bytes_billed = 0.0
     saw_billing = False
     elapsed_seconds: float | None = None
-    paths = artifact_paths(artifact_directory or (project / "target"))
+    paths = artifact_paths(
+        artifact_directory or read_from or readable_artifact_dir(project)
+    )
     run_results = paths.run_results
+    foreign: str | None = None
     if run_results.is_file():
         document = json.loads(run_results.read_text(encoding="utf-8"))
         results = document.get("results", [])
+        written_by = (document.get("metadata") or {}).get("invocation_id")
+        logged = _logged_invocation_id(completed)
+        if written_by and logged and str(written_by) != logged:
+            foreign = str(written_by)
+            results = []
         # dbt writes this at the top of run_results, not inside `metadata`.
         if isinstance(elapsed := document.get("elapsed_time"), (int, float)):
             elapsed_seconds = float(elapsed)
@@ -1873,10 +2075,18 @@ def _summarize(
     messages: list[str] = []
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+    if foreign is not None:
+        label = sanitize_artifact_directory(paths.directory, project_root=project)
+        messages = [
+            f"the run results in {label} "
+            f"belong to another dbt invocation ({foreign}), not this run's; none "
+            "of its nodes are reported, and the build is not a success",
+            *messages,
+        ]
 
     summary = {
         "target": target,
-        "success": completed.returncode == 0,
+        "success": completed.returncode == 0 and foreign is None,
         "returncode": completed.returncode,
         "nodes": nodes,
         "counts": counts,
@@ -1897,4 +2107,10 @@ def _summarize(
         summary["artifact_directory"] = sanitize_artifact_directory(
             paths.directory, project_root=project
         )
+    # An internal hand-off like `bytes_billed`, popped by the command layer
+    # before shaping: the evidence read is held to the invocation this run
+    # logged, so a foreign run_results never yields evidence either.
+    logged_id = _logged_invocation_id(completed)
+    if artifact_directory is not None and logged_id is not None:
+        summary["logged_invocation_id"] = logged_id
     return summary

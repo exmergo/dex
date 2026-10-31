@@ -1,0 +1,88 @@
+---
+title: Maintain a project
+sidebarTitle: Maintain
+description: Check the project as it stands, capture a known-good baseline, and compare later changes against it. Review reconciliation plans and verify repairs on dev.
+---
+
+**Outcome:** a clear account of what changed, what is wrong now, and which edits
+would fix it. You need a connected project. Drift comparisons also need a saved
+baseline; correctness checks do not.
+
+## Choose the question
+
+| You want to know | Command | Needs a previous snapshot? |
+| --- | --- | --- |
+| Is the project correct now? | `dex maintain verify` | No |
+| What changed since the baseline? | `dex maintain check` | Yes |
+| What edits would reconcile the drift? | `dex maintain reconcile` | Yes |
+
+Ask your agent:
+
+```text
+Use Dex to check this project against its last snapshot. Separate measured
+problems from checks that did not run, and show me the proposed fixes.
+```
+
+## 1. Check the current project
+
+```bash
+dex maintain verify
+```
+
+For relations built only on dev, use `--target dev`. Review both findings and
+suppressed checks. A missing baseline does not prevent this check, but missing
+build evidence or unmeasured relations can limit what it proves.
+
+## 2. Save a baseline you trust
+
+After reviewing and fixing the current state:
+
+```bash
+dex maintain snapshot
+```
+
+A snapshot records the state future drift checks compare against. It is not a
+backup of your warehouse, and saving one does not establish correctness.
+
+## 3. Compare later changes
+
+```bash
+dex maintain check
+```
+
+Read schema, volume, grain, and semantic findings in context. On a metered
+connector, a free result may include an offer for additional measured checks.
+An offered check has not run; decide whether to approve it before drawing a
+conclusion from its absence.
+
+## 4. Review and verify a repair
+
+```bash
+dex maintain reconcile
+```
+
+Reconciliation proposes edits. It does not apply them. Review the mechanical
+changes and advisory findings, then apply the returned plan ID and build on dev:
+
+```bash
+dex transform apply PLAN_ID
+dex transform build --target dev --verify --for-plan PLAN_ID
+```
+
+Read `data.outcome` and `data.evidence.coverage`: only `validated` means the
+build ran every node the repair changed.
+
+Only refresh the baseline after the result is accepted. Taking a new snapshot
+before investigating drift makes the changed state the new comparison point.
+
+<Accordion title="Check repository changes without scanning the warehouse">
+
+`dex maintain snapshot --project-only` refreshes the project layers of the
+baseline without opening a warehouse connection. Use it when that is the state
+you intend to record. It does not prove row counts or data quality, and it is
+not a substitute for checking warehouse drift.
+
+</Accordion>
+
+See [`dex maintain`](/dex/cli/maintain) for individual drift commands and
+[cost controls](/dex/guardrails/cost-controls) for optional measurement offers.

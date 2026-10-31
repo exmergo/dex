@@ -11,7 +11,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -586,9 +586,18 @@ class TransformConfig(BaseModel):
     every metric. The default is the folder ``transform init`` scaffolds, so a
     project dex created needs nothing here; a house that keeps marts elsewhere
     names its own. A folder covers everything beneath it.
+
+    ``artifacts``: where the dbt invocations Dex runs on the project write
+    their artifacts (issue #1014). ``isolated``, the default, is a directory of
+    Dex's own per dbt runtime, ``<target-path>/dex/<runtime>``, so a project or
+    CI runtime of another dbt version never trips on what Dex's left behind.
+    ``shared`` writes the project's own target path for a caller whose other
+    tooling reads it there, and refuses one another runtime left incompatible
+    rather than writing over it.
     """
 
     marts_paths: list[str] = Field(default_factory=lambda: ["models/marts"])
+    artifacts: Literal["isolated", "shared"] = "isolated"
 
     @model_validator(mode="after")
     def _check_marts_paths(self) -> TransformConfig:

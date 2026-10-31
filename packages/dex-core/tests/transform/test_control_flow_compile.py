@@ -378,3 +378,84 @@ def test_explicit_warehouse_path_must_match_the_compilation_profile(
     )
     assert rc == 1, out
     assert "duckdb.path" in str(out)
+
+
+def _manager_like_bigquery():
+    """A connection manager whose close() reads the handle, as dbt-bigquery's
+    does, so closing a never-opened connection would resolve its lazy handle."""
+
+    import threading
+
+    class Lazy:
+        def resolve(self, connection):
+            raise AssertionError("resolved a handle only to close it")
+
+    class States:
+        CLOSED = "closed"
+
+    class Connection:
+        def __init__(self, handle):
+            self._handle = handle
+            self.state = "init"
+
+        @property
+        def handle(self):
+            if isinstance(self._handle, Lazy):
+                self._handle.resolve(self)
+            return self._handle
+
+    class Manager:
+        def __init__(self, connections):
+            self.lock = threading.Lock()
+            self.thread_connections = dict(enumerate(connections))
+
+        def get_if_exists(self):
+            return next(iter(self.thread_connections.values()), None)
+
+        @classmethod
+        def close(cls, connection):
+            connection.handle.close()
+            connection.state = States.CLOSED
+
+        def release(self):
+            conn = self.get_if_exists()
+            if conn is not None:
+                self.close(conn)
+
+        def cleanup_all(self):
+            for connection in self.thread_connections.values():
+                self.close(connection)
+            self.thread_connections.clear()
+
+    return Manager, Connection, Lazy, States
+
+
+def test_releasing_a_never_opened_connection_does_not_open_it():
+    """dbt-bigquery's close() read the handle and so refused every compile on
+    BigQuery before a model compiled (found dogfooding #1015)."""
+
+    from exmergo_dex_core.transform.compile_worker import guard_unopened_connections
+
+    manager, connection, lazy, states = _manager_like_bigquery()
+    guard_unopened_connections(manager, lazy, states)
+
+    unopened = connection(lazy())
+    manager([unopened]).release()
+    assert unopened.state == states.CLOSED
+
+    pool = manager([connection(lazy()), connection(lazy())])
+    pool.cleanup_all()
+    assert pool.thread_connections == {}
+
+
+def test_an_opened_connection_is_still_closed_normally():
+    from exmergo_dex_core.transform.compile_worker import guard_unopened_connections
+
+    manager, connection, lazy, states = _manager_like_bigquery()
+    guard_unopened_connections(manager, lazy, states)
+
+    closed: list[bool] = []
+    opened = connection(SimpleNamespace(close=lambda: closed.append(True)))
+    manager([opened]).release()
+    assert closed == [True]
+    assert opened.state == states.CLOSED
