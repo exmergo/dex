@@ -198,11 +198,7 @@ def test_reports_a_mismatched_ruff_pin(
 @pytest.mark.parametrize(
     "workflow",
     [
-        (
-            "steps:\n"
-            "  - run: uvx ruff@0.17.2 check .\n"
-            "  - run: uvx ruff format .\n"
-        ),
+        "steps:\n  - run: uvx ruff@0.17.2 check .\n  - run: uvx ruff format .\n",
         (
             "steps:\n"
             "  - run: |\n"
