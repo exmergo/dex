@@ -276,13 +276,14 @@ def test_declared_composite_grain_unmeasured_and_missing_columns():
     assert _declare(_dataset(), ["a"]).declaration.grain_status == "unprofiled"
 
 
-def test_population_values_on_a_pii_column_are_withheld_in_full_mode():
+@pytest.mark.parametrize("confidence", [0.2, 0.9])
+def test_population_values_on_a_pii_column_are_withheld_in_full_mode(confidence):
     ds = _dataset(id=True)
     ds.columns.append(
         ColumnProfile(
             name="email",
             data_type="VARCHAR",
-            pii=PIIFlag(category="email", confidence=0.9),
+            pii=PIIFlag(category="email", confidence=confidence),
         )
     )
     defs = ProjectDefinitions(
@@ -294,7 +295,7 @@ def test_population_values_on_a_pii_column_are_withheld_in_full_mode():
                     "population": {
                         "rule": "staff excluded",
                         "filters": [
-                            {"column": "email", "excludes": ["a@b.c"]},
+                            {"column": "EMAIL", "excludes": ["a@b.c"]},
                             {"column": "id", "includes": [1]},
                         ],
                     },
@@ -308,8 +309,11 @@ def test_population_values_on_a_pii_column_are_withheld_in_full_mode():
     email, ident = out.declaration.population.filters
     assert email.excludes is None and email.includes is None
     assert ident.includes == [1]
-    assert out.declaration.population.rule == "staff excluded"
-    assert out.declaration.withheld_fields == ["population.filters[].values"]
+    assert out.declaration.population.rule is None
+    assert out.declaration.withheld_fields == [
+        "population.rule",
+        "population.filters[].values",
+    ]
 
 
 # --- end to end -------------------------------------------------------------------

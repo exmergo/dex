@@ -54,7 +54,7 @@ from ..semantic_catalog import (
     SemanticModelInfo,
     column_reference,
 )
-from ..semantic_declarations import read_native_declaration
+from ..semantic_declarations import catalog_description, read_native_declaration
 from .dialects import select_expression
 from .loader import LoadedDocument
 
@@ -131,7 +131,9 @@ def semantic_catalog(
                 SemanticModelInfo(
                     name=qualified,
                     label=dataset_name,
-                    description=dataset.get("description"),
+                    description=catalog_description(
+                        dataset.get("description"), dataset.get("ai_context"), found
+                    ),
                     relation=relation,
                 )
             )

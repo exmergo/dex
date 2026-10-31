@@ -371,6 +371,7 @@ def plan(
                 project,
                 cache=cache if edit.kind is EditKind.SEED_CSV else None,
                 pii_overrides=overrides,
+                defer_compilation=True,
             )
         # Refuse an orphaning delete with a precise, dbt-independent message
         # before the subprocess runs (which would otherwise report the same
@@ -4446,6 +4447,38 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
     # and refuse with "no dbt project found" in a repository that has none.
     places = isinstance(editable, PlacingProject)
     gap = placement_gap(editable)
+    compiled_models = {}
+    compilation = None
+    compile_required = False
+    if _has_dbt_project(engine):
+        from .validate import needs_compilation
+
+        compile_required = any(
+            e.kind is EditKind.MODEL_SQL
+            and e.new_content is not None
+            and needs_compilation(e.new_content)
+            for e in edits
+        )
+    if compile_required:
+        from ..dbt_project import load as load_project
+        from .compile import compile_models
+        from .validate import assert_profiles_safe
+
+        project = engine.project_dir()
+        view = load_project(project)
+        assert_profiles_safe(view, edits)
+        overrides = pii_override_paths(engine.config.pii_overrides)
+        cache = readable_cache(engine.store) if _has_seed(edits) else None
+        for edit in edits:
+            plans_mod.admit_edit(
+                edit,
+                view,
+                project,
+                cache=cache,
+                pii_overrides=overrides,
+                defer_compilation=True,
+            )
+        compiled_models, compilation = compile_models(engine, edits)
     try:
         stored, diffs, warnings = plans_mod.plan(
             intent,
@@ -4470,6 +4503,7 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
             # surface the format admits to owning. A format declining the write
             # tier is `None` and validates against dbt's surface as before.
             project_format=editable,
+            compiled_models=compiled_models,
         )
     except DexError as exc:
         # A format with a placement gap fell back to dbt's project and dbt's
@@ -4480,7 +4514,10 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
         if gap is None:
             raise
         raise type(exc)(f"{exc}. {gap}") from exc
-    return PlanResult(
+    finally:
+        if compilation is not None:
+            compilation.settle()
+    result = PlanResult(
         plan_id=stored.plan_id,
         intent=stored.intent,
         paths=[e.path for e in stored.edits],
@@ -4490,6 +4527,10 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
         diffs=diffs,
         warnings=[*warnings, gap] if gap else warnings,
     )
+    if compilation is not None:
+        result.warnings.extend(compilation.warnings)
+        compilation.settle(result)
+    return result
 
 
 def _semantic_plan(

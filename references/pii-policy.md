@@ -35,6 +35,7 @@ confidence against the blocking threshold.
 | cluster feature selection | presence, any confidence | flagged columns are excluded; naming one is opt-in and mean only |
 | the query firewall | threshold | at or above, projection is refused; below, it runs with a warning |
 | the seed header gate | threshold | a seed column at or above the threshold is refused |
+| declaration population reporting | presence, any confidence | a flagged filter withholds its values and the entire free-text population rule |
 | the semantic request gate | presence, any confidence | a flagged dimension refuses the whole command |
 
 A weak flag therefore still suppresses min and max and still stamps `meta`,

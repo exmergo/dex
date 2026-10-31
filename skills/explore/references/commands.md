@@ -91,8 +91,9 @@ column named `window`, which DuckDB reserves and dbt must quote).
   `contradicted`, `unmeasured`, `missing_columns`, `unprofiled`) says how they
   compare. It is read from the repository each run, never cached, so a cache hit
   is annotated too. Declared columns are capped at 12 unless `--columns all`.
-  Population values and the rule are withheld in values-free mode and for a
-  filter on a PII-flagged column, named in `withheld_fields`.
+  Values-free mode withholds the rule and all population filter values. In full
+  mode, any PII-flagged filter withholds the entire rule and that filter's values,
+  at any confidence, named in `withheld_fields`.
 - A native semantic layer (Ossie, SLayer, Cube) answers `--use-project` the same
   way, with no dbt project in the repository. Its `primary_key` is the declared
   grain at either arity, overriding a measured key; a `unique_keys` entry or a

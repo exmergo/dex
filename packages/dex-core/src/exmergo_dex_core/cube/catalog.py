@@ -61,7 +61,7 @@ from ..semantic_catalog import (
     SemanticCatalogView,
     SemanticModelInfo,
 )
-from ..semantic_declarations import read_native_declaration
+from ..semantic_declarations import catalog_description, read_native_declaration
 from .model import MEASURE, Cube, Member, View
 from .references import resolve, scan
 from .validator import PREDEFINED_GRANULARITIES
@@ -247,7 +247,9 @@ def semantic_catalog(
             SemanticModelInfo(
                 name=cube.name,
                 label=cube.title,
-                description=cube.description,
+                description=catalog_description(
+                    cube.description, cube.raw.get("meta"), found
+                ),
                 agg_time_dimension=time,
                 relation=relation.relation,
             )
@@ -670,7 +672,7 @@ def _view(
     model = SemanticModelInfo(
         name=view.name,
         label=view.title,
-        description=view.description,
+        description=catalog_description(view.description, view.raw.get("meta"), notes),
         agg_time_dimension=times[0] if len(times) == 1 else None,
     )
     return metrics, dimensions, model

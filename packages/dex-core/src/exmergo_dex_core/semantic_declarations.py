@@ -14,7 +14,8 @@ declared rule and the SQL disagree, which is what declaration contradictions
 exist to catch. It is carried twice over instead: structured, under the
 vendor's metadata key ``dex`` (where a reviewer or a tool reads it exactly), and
 as one sentence at the end of the definition's description (where an agent
-reading the catalog meets it).
+reviewing the file meets it). Native catalogs omit that generated sentence: population
+values belong to the separately screened declaration surface.
 
 **Every declared field is accounted for.** :func:`declared_fields` lists each
 field the declaration states, as a path (``population``,
@@ -217,9 +218,8 @@ def population_sentence(population: Any) -> str | None:
     """One sentence stating which rows the model holds, or None.
 
     The rule in the author's words where there is one, then each filter as the
-    values it keeps or drops. A filter's values are already committed in the
-    model's YAML (and refused there for a column that looks like personal
-    data), so stating them again leaks nothing new.
+    values it keeps or drops. This is repository prose, not a screened result:
+    native catalogs remove it and profile/map screen the structured population.
     """
 
     if not isinstance(population, Mapping):
@@ -251,6 +251,39 @@ def with_population(description: Any, population: Any) -> str | None:
     if not text:
         return sentence
     return f"{text} {sentence}"
+
+
+def catalog_description(
+    description: Any, metadata: Any, notes: list[str]
+) -> str | None:
+    """Remove Dex's generated population prose, including from older documents.
+
+    Catalogs are connectionless and cannot prove a population's values safe.
+    Match the writer's exact suffix to preserve the authored prefix. A stale
+    sentence cannot be separated reliably; withhold it rather than repeating
+    values the structured declaration would hide. No file is rewritten.
+    """
+
+    if not isinstance(description, str):
+        return None
+    dex = metadata.get(DEX_META_KEY) if isinstance(metadata, Mapping) else None
+    if not isinstance(dex, Mapping) or "population" not in dex:
+        return description
+    if "Population: " not in description:
+        return description
+    try:
+        sentence = population_sentence(dex["population"])
+    except (TypeError, ValueError):
+        sentence = None
+    if sentence and description == sentence:
+        return None
+    if sentence and description.endswith(" " + sentence):
+        return description[: -len(sentence)].rstrip() or None
+    notes.append(
+        "a description with population metadata has a stale or unrecognized "
+        "population sentence; the description is withheld"
+    )
+    return None
 
 
 def model_metadata(declared: Mapping[str, Any]) -> dict[str, Any]:

@@ -559,6 +559,14 @@ which is why it sees the two-argument `ref('package', 'model')` form, why a seed
 data rows no longer count as source, and why a reference dex could not resolve
 statically *warns* rather than refusing: it may or may not name the deleted node,
 and no edit the caller could make would settle it.
+Control-flow model compilation requires dbt and a dev profile. Dex compiles a
+throwaway copy containing every proposed edit, validates fresh SQL, and keeps the
+original Jinja in the stored plan. Compile-time SELECTs are governed through
+Dex's query path; direct warehouse handles and unsupported adapter introspection
+refuse. Dynamic queries share the command ceiling, with partial estimates and
+completed spend disclosed. See [dbt projects](dbt-project.md#compiling-authored-control-flow)
+and [cost controls](cost-controls.md#queries-discovered-during-model-compilation).
+
 A rename is one plan: `delete` the old model, `create` the new, `update` the
 referrers, validated together. `transform rename` generates exactly that plan, and
 the rest of the rename's edits with it, so hand-assembling one is now the fallback
@@ -568,7 +576,8 @@ differently on purpose: a reference dex cannot resolve *warns* on a delete and
 so refusing would block a legitimate delete forever; the same reference in a
 rename's path is satisfiable, because the caller can resolve it by hand and
 re-run. The engine validates each edit
-(model SQL must be a single read-only SELECT once jinja is stripped; YAML must
+(model SQL must be a single read-only SELECT, checked on fresh dbt-compiled SQL
+for Jinja `for`/`if` control flow and with Jinja stripped otherwise; YAML must
 parse; semantic YAML must satisfy MetricFlow's schemas; a `packages_yml` edit
 must carry a `packages:` or `dependencies:` list and targets the project-root
 `packages.yml` or `dependencies.yml`; a `macro_sql` edit must hold only macro
@@ -1458,8 +1467,9 @@ resolved, so output without `--use-project` is unchanged.
   lifts the cap there; `explore map` binds it in every mode), with the cut
   counted in `elided_column_count` and in `notes`.
 - A population's values and its free-text rule are column values all the same:
-  in values-free mode, and for a filter on a column profiling flagged as
-  personal data, they are null and named in `withheld_fields`.
+  values-free mode withholds the rule and every filter value. In full mode,
+  any filter on a PII-flagged column withholds the entire rule and that filter's
+  values, at any confidence. The null fields are named in `withheld_fields`.
 
 `explore relationships` and `explore map` also accept the independent
 `--use-hosted-semantic-layer` opt-in. It permits a configured hosted layer read;

@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.row_attribution import (
@@ -429,6 +430,12 @@ def test_a_jinja_conditional_says_it_could_not_be_attributed(
     attributable_project, plan_edit, capsys
 ):
     repo, warehouse = attributable_project
+    # Control-flow validation now compiles against a coherent, existing dev
+    # target; the attribution itself remains static and reports its limitation.
+    profile_path = repo / "analytics" / "profiles.yml"
+    profiles = yaml.safe_load(profile_path.read_text())
+    profiles["shop"]["outputs"]["dev"]["path"] = str(warehouse)
+    profile_path.write_text(yaml.safe_dump(profiles))
     payload = plan_edit(
         PRIOR_MODEL.replace(
             "and total_revenue > 0",

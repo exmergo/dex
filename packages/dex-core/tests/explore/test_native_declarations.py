@@ -16,7 +16,11 @@ import pytest
 import yaml
 
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.semantic_declarations import read_native_declaration
+from exmergo_dex_core.semantic_declarations import (
+    catalog_description,
+    read_native_declaration,
+    with_population,
+)
 
 pytest.importorskip("sqlglot")
 duckdb = pytest.importorskip("duckdb")
@@ -382,7 +386,7 @@ def test_a_planned_declaration_is_read_back_with_no_dbt_project(
     layer, tmp_path, capsys
 ):
     vendor, model = layer(tmp_path)
-    declaration = {**DECLARATION, "model": model}
+    declaration = {**DECLARATION, "model": model, "description": "One row per order."}
 
     planned = _ok(
         tmp_path,
@@ -423,6 +427,17 @@ def test_a_planned_declaration_is_read_back_with_no_dbt_project(
     assert columns["amount"]["additivity"] == "additive"
     assert columns["status"]["role"] == "dimension"
 
+    catalog = _ok(tmp_path, capsys, "explore", "semantic", "list")["data"]
+    assert catalog["semantic_models"][0]["description"] == "One row per order."
+    assert "Orders that were placed" not in json.dumps(catalog)
+    assert "draft" not in json.dumps(catalog)
+    searched = _ok(
+        tmp_path, capsys, "explore", "semantic", "list", "--search", "draft"
+    )["data"]
+    assert searched["metrics"] == []
+    free_catalog = _ok(tmp_path, capsys, "explore", "semantic", "list", "--values-free")
+    assert "Orders that were placed" not in json.dumps(free_catalog)
+
     objects = _ok(tmp_path, capsys, "explore", "map", "--use-project")["data"][
         "objects"
     ]
@@ -456,6 +471,49 @@ def test_values_free_withholds_a_native_population(tmp_path, capsys):
 
 
 # --- untrusted metadata ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "population",
+    [
+        {"rule": "private-person@example.test"},
+        {"filters": [{"column": "email", "excludes": ["private-person@example.test"]}]},
+    ],
+)
+def test_catalog_omits_generated_population_and_preserves_author_prose(population):
+    description = with_population("Orders.", population)
+    notes = []
+    assert (
+        catalog_description(description, {"dex": {"population": population}}, notes)
+        == "Orders."
+    )
+    assert notes == []
+
+
+@pytest.mark.parametrize(
+    "population",
+    [
+        {"rule": "changed"},
+        {"filters": [{"column": "email", "includes": 42}]},
+    ],
+)
+def test_catalog_withholds_stale_or_malformed_population_description(population):
+    notes = []
+    assert (
+        catalog_description(
+            "Orders. Population: private-person@example.test.",
+            {"dex": {"population": population}},
+            notes,
+        )
+        is None
+    )
+    assert notes
+    assert "private-person" not in json.dumps(notes)
+
+
+def test_catalog_preserves_unrelated_author_prose():
+    description = "Population: the author's own description."
+    assert catalog_description(description, {}, []) == description
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,24 @@ confined to the repository and byte for byte. That surface shares this one's pla
 and apply spine and none of the path families below, which is why it is described
 in [`semantic-layer.md`](semantic-layer.md) rather than here.
 
+## Compiling authored control flow
+
+A model edit using Jinja `for` or `if` is checked against fresh dbt-compiled SQL
+in a throwaway copy containing the whole edit set. The compiled query must pass
+the SELECT-only guard; the stored edit keeps the authored Jinja. Compilation
+requires dbt and a dev profile that passes the usual build coherence and
+existence preflight, and never reuses a prior manifest as proof.
+Missing or failed compilation stores no plan.
+
+Compile-time `run_query`, statement blocks and `adapter.execute` SELECTs run
+through Dex's scoped read-only connector, query firewall, PII gate and result
+limits. `get_relation()` and `is_incremental()` use Dex's scoped, scan-free inventory.
+Direct database handles and other unsupported adapter introspection refuse;
+truncated macro results refuse too. The first discovered query is priced before
+spend and later queries share its command and daily ceilings. See
+[cost controls](cost-controls.md#queries-discovered-during-model-compilation).
+No model materialization runs during planning.
+
 ## What dex reads
 
 - `dbt_project.yml`: the project name, profile name, and the six authored path

@@ -1,0 +1,1 @@
+**Jinja control-flow models validate against dbt compilation.** `transform plan` accepts UNION loops and conditional SQL, checks the fresh compiled SELECT in a throwaway project, and governs compile-time queries through Dex's dev-target, PII, scope and cost controls.

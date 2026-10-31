@@ -10,6 +10,24 @@ Validates the edits and returns them as diffs with a plan id; nothing is applied
 plus per-model YAML with key tests and PII meta) from the `.dex/` cache, instead
 of or on top of hand-authored edits.
 
+Model SQL with Jinja `for`/`if` control flow is compiled by dbt in a throwaway
+copy containing all edits, then checked as a single read-only SELECT. dbt and a
+dev profile passing the usual build preflight are required; failed or missing
+compilation stores no plan. The
+authored Jinja remains the reviewable edit. Compile-time SELECTs from
+`run_query`, statement blocks and `adapter.execute` pass through Dex's query
+firewall, scoped read-only connector, PII screening, query limits and cost guard.
+`get_relation()` and `is_incremental()` use Dex's scoped inventory; direct
+database handles and other unsupported adapter introspection refuse. A truncated
+macro result refuses rather than producing an incomplete model.
+
+Compilation that reads no warehouse data needs no spend confirmation. For
+compile-time queries on billed connectors, the first discovered work is quoted
+through the existing `--confirm --budget` handshake. Its estimate is partial:
+subsequent queries share the command and daily ceilings. A stopped compilation
+stores no plan and reports any completed spend; re-running may repeat queries.
+See the cost-controls reference for the shared budget mechanism.
+
 - `data.row_attribution`: on a model that already exists, every predicate, join,
   source, and grain change is named and measured on its own against the prior
   model, alongside the whole-model net. Column expressions, aliases, and ordering

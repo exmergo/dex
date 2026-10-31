@@ -195,3 +195,14 @@ query count per run.
 - **Small counts.** A count of one identifies a row.
 - **An aggregate over one row is that row's value.** `select avg(salary) from t
   where id = 42` is accepted and returns a salary.
+
+## Population prose in native catalogs
+
+Ossie, SLayer and Cube catalogs omit Dex-generated population sentences in every
+result mode, including sentences in existing files. Catalog reads are
+connectionless and cannot establish that population values are safe. The authored
+description prefix is preserved when the generated suffix matches its structured
+`dex.population` metadata. A stale or malformed suffix causes the description to
+be withheld with a value-free note. This happens before catalog search. Files and
+drift fingerprints are unchanged. Use `explore profile|map --use-project` for the
+structured population, screened by the declaration withholding policy.

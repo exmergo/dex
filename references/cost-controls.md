@@ -47,6 +47,18 @@ populated `cost.estimate` on an `ok` still means settled preflight for work that
 ran, and `needs_confirmation` stays reserved for work the caller asked for and
 has not authorized.
 
+### Queries discovered during model compilation
+
+`transform plan` compiles Jinja control-flow models against the dev target in a
+throwaway project. Compile-time SELECTs use Dex's own read-only query path;
+compilation opens no direct dbt warehouse handle. The first discovered query and
+any required profiles are quoted before spending. Because a later macro query
+may depend on an earlier result, the estimate covers only work discovered so
+far and is marked approximate. Later queries extend the same reservation and
+share the command and daily ceilings. A refusal stores no plan and reports any
+completed spend. Re-running compilation may repeat its queries. DuckDB needs no
+spend handshake.
+
 ### Unattended sessions
 
 Spending authority comes from the person running a session, or from the limits

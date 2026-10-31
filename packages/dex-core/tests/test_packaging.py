@@ -476,6 +476,54 @@ def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Pa
     assert mapped["data"]["pii_column_count"] == 6
 
 
+def test_control_flow_compilation_runs_from_the_installed_wheel(
+    wheel: str, tmp_path: Path
+):
+    """The compiler child and its dbt/agate dependencies must ship in [duckdb]."""
+
+    done = _run_isolated(
+        wheel,
+        r'''
+import contextlib
+import io
+import json
+from pathlib import Path
+from exmergo_dex_core.cli import main
+
+def run(*args):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        rc = main(list(args))
+    envelope = json.loads(output.getvalue())
+    assert rc == 0, envelope
+    return envelope["data"]
+
+run("demo")
+run("explore", "map")
+run("transform", "init", "analytics")
+sql = """{% if execute %}
+{% set counts = run_query('select count(*) as n from orders') %}
+{% else %}{% set counts = none %}{% endif %}
+{% for i in [1, 2] %}
+select {{ i }} as id, {% if execute %}{{ counts.rows[0][0] }}{% else %}0{% endif %} as n
+{% if not loop.last %} union all {% endif %}
+{% endfor %}
+"""
+Path("edits.json").write_text(json.dumps({"edits": [{
+    "path": "models/control_flow.sql", "kind": "model_sql", "content": sql,
+}]}))
+planned = run("transform", "plan", "installed compiler", "--edits-file", "edits.json")
+run("transform", "apply", planned["plan_id"])
+assert Path("analytics/models/control_flow.sql").read_text() == sql
+built = run("transform", "build", "--target", "dev")
+assert built["outcome"] == "validated", built
+''',
+        extras=["duckdb"],
+        cwd=tmp_path,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
     """`dex` is a console script the wheel declares, and every agent wrapper
     invokes it expecting exactly one JSON envelope on stdout and nothing else.

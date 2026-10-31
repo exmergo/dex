@@ -278,6 +278,8 @@ def admit_edit(
     *,
     cache: Any = None,
     pii_overrides: Any = None,
+    compiled: Any = None,
+    defer_compilation: bool = False,
 ) -> list[str]:
     """Every check that can refuse one dbt-shaped edit, and the warnings it
     raises. Stores nothing, writes nothing, reads no subprocess.
@@ -329,7 +331,13 @@ def admit_edit(
         return []
     from .validate import validate_edit
 
-    return validate_edit(edit, cache=cache, pii_overrides=pii_overrides)
+    return validate_edit(
+        edit,
+        cache=cache,
+        pii_overrides=pii_overrides,
+        compiled=compiled,
+        defer_compilation=defer_compilation,
+    )
 
 
 def plan(
@@ -345,6 +353,7 @@ def plan(
     pii_overrides: Any = None,
     conventions: ConventionWarnings | None = None,
     dialect: str | None = None,
+    compiled_models: Any = None,
 ) -> tuple[TransformPlan, list[dict[str, Any]], list[str]]:
     """Validate agent-authored edits and store them as a plan. Writes no source file.
 
@@ -483,6 +492,7 @@ def plan(
                     project,
                     cache=seed_cache() if edit.kind is EditKind.SEED_CSV else None,
                     pii_overrides=pii_overrides,
+                    compiled=(compiled_models or {}).get(edit.path),
                 )
             )
         else:

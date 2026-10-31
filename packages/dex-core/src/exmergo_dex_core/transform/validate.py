@@ -1,14 +1,17 @@
 """Per-kind validation of agent-authored edits, before they become a plan.
 
-Model SQL must be a single read-only SELECT once its jinja is stripped (defense in
-depth: the same guard the adapters apply to generated SQL). YAML edits must parse
+Model SQL must be a single read-only SELECT, compiled by dbt for control flow
+and otherwise checked with Jinja stripped (defense in depth: the same guard the
+adapters apply to generated SQL). YAML edits must parse
 to a mapping. Semantic YAML gets a further MetricFlow-shape check in
 ``semantic.py``; this module owns the checks common to every plan producer.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import sqlglot
@@ -136,6 +139,44 @@ _JINJA_EXPR = re.compile(r"\{\{.*?\}\}", re.DOTALL)
 _JINJA_STMT = re.compile(r"\{%.*?%\}", re.DOTALL)
 _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _PLACEHOLDER = "__dex_jinja__"
+
+
+def needs_compilation(content: str) -> bool:
+    """Control flow cannot be reduced to SQL by deleting its delimiters."""
+
+    return any(
+        re.match(r"\{%\s*-?\s*(?:for|if)\b", block)
+        for block in _JINJA_STMT.findall(_JINJA_COMMENT.sub("", content))
+    )
+
+
+@dataclass(frozen=True)
+class CompiledModel:
+    """Fresh, internal evidence bound to the authored file and its SQL dialect."""
+
+    path: str
+    source_sha256: str
+    sql: str
+    target: str
+    dialect: str
+
+    def check(self, edit: PlanEdit) -> None:
+        if (
+            self.path != edit.path
+            or self.source_sha256
+            != hashlib.sha256(edit.new_content.encode()).hexdigest()
+            or not self.sql.strip()
+        ):
+            raise EditValidationError(
+                f"{edit.path}: compiled validation is stale or empty"
+            )
+        try:
+            assert_select_only(
+                self.sql, dialect=self.dialect, deny_external_reads=False
+            )
+        except Exception as exc:
+            raise EditValidationError(f"{edit.path}: compiled SQL: {exc}") from exc
+
 
 # Macro definition delimiters, tolerant of whitespace-control markers. A macro
 # file is jinja, not SQL, so its shape check is structural: definitions only,
@@ -294,7 +335,11 @@ def _assert_query_only(path: str, content: str, noun: str) -> list[str]:
         assert_select_only(stripped, deny_external_reads=False)
     except Exception as exc:
         raise EditValidationError(f"{path}: {exc}") from exc
-    called = _external_read(stripped)
+    return _external_read_warnings(path, stripped, noun)
+
+
+def _external_read_warnings(path: str, sql: str, noun: str) -> list[str]:
+    called = _external_read(sql)
     if called is not None:
         return [
             f"{path}: {noun} calls {called}, which reads a file, a URL, another "
@@ -672,6 +717,8 @@ def validate_edit(
     *,
     cache: object | None = None,
     pii_overrides: object | None = None,
+    compiled: CompiledModel | None = None,
+    defer_compilation: bool = False,
 ) -> list[str]:
     """Validate one edit for its kind. Returns warnings; raises on a hard failure.
 
@@ -745,7 +792,19 @@ def validate_edit(
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:
-        warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
+        if needs_compilation(edit.new_content):
+            if compiled is not None:
+                compiled.check(edit)
+                warnings.extend(
+                    _external_read_warnings(edit.path, compiled.sql, "compiled model")
+                )
+            elif not defer_compilation:
+                raise EditValidationError(
+                    f"{edit.path}: Jinja control flow requires dbt compilation; "
+                    "use transform plan with an installed dbt adapter and a dev profile"
+                )
+        else:
+            warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
     else:
         try:
             parsed = yaml.safe_load(edit.new_content)

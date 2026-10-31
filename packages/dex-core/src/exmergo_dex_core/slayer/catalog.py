@@ -67,7 +67,7 @@ from ..semantic_catalog import (
     SemanticModelInfo,
     column_reference,
 )
-from ..semantic_declarations import read_native_declaration
+from ..semantic_declarations import catalog_description, read_native_declaration
 
 if TYPE_CHECKING:
     from .loader import LoadedModel
@@ -133,7 +133,7 @@ def semantic_catalog(
         models.append(
             SemanticModelInfo(
                 name=model.name,
-                description=model.description,
+                description=catalog_description(model.description, model.meta, found),
                 agg_time_dimension=time_dimension,
                 relation=relation,
             )

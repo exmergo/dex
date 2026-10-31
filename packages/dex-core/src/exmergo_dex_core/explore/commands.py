@@ -1577,6 +1577,9 @@ def _run_statements(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode = ResultMode.FULL,
+    adapter: Adapter | None = None,
+    handshake: Callable[..., None] | None = None,
+    reads_dev_target: bool = False,
 ) -> tuple[list[_Statement], _Batch]:
     """Drive every statement of one call through the firewall and the warehouse.
 
@@ -1620,7 +1623,10 @@ def _run_statements(
 
     batch = [_Statement(i, sql, line) for i, (sql, line) in enumerate(statements)]
     size = len(batch)
-    shared = _Batch()
+    shared = _Batch(adapter=adapter)
+
+    def visible_cache(value: DexCache) -> DexCache:
+        return value if reads_dev_target else _without_dev_profiles(engine, value)
 
     def ledger(statement: _Statement, entry: dict) -> None:
         if values_free and "reason" in entry:
@@ -1673,7 +1679,7 @@ def _run_statements(
         named = list(dict.fromkeys(name for names in reads.values() for name in names))
         if named:
             try:
-                shared.adapter = engine._adapter("explore query")
+                shared.adapter = shared.adapter or engine._adapter("explore query")
             except DexError:
                 # No connection settles nothing, exactly as an unreadable column
                 # signature settles nothing inside `_object_gap`. That tolerance
@@ -1692,7 +1698,7 @@ def _run_statements(
         if shared.adapter is not None:
             gap = _object_gap(
                 shared.adapter,
-                None if cache is None else _without_dev_profiles(engine, cache),
+                None if cache is None else visible_cache(cache),
                 named,
             )
             if gap.absent:
@@ -1733,6 +1739,7 @@ def _run_statements(
                     at,
                     size,
                     withhold=values_free,
+                    handshake=handshake,
                 )
 
     if cache is None and any(statement.live for statement in batch):
@@ -1746,7 +1753,7 @@ def _run_statements(
         # in place, and masking first would persist an in-memory override onto
         # objects this run never re-profiled.
         cache = mask_overridden(
-            _without_dev_profiles(engine, cache),
+            visible_cache(cache),
             pii_override_paths(config.pii_overrides),
         )
     for statement in batch:
@@ -1788,7 +1795,7 @@ def _run_statements(
         # would release the profile's booking. Every statement still passes the
         # per-statement gate and the server-side cap on its way out.
         if not shared.profiled:
-            _price_statements(shared.adapter, live, size, ledger)
+            _price_statements(shared.adapter, live, size, ledger, handshake=handshake)
 
         _execute(
             engine,
@@ -1824,6 +1831,8 @@ def _price_statements(
     live: list[_Statement],
     size: int,
     ledger: Callable[[_Statement, dict], None],
+    *,
+    handshake: Callable[..., None] | None = None,
 ) -> None:
     """One handshake for the whole call, itemized per statement.
 
@@ -1842,7 +1851,7 @@ def _price_statements(
     }
     estimate = sum(per_statement.values())
     try:
-        command_args.billed_handshake(
+        (handshake or command_args.billed_handshake)(
             "explore query",
             adapter,
             estimate,
@@ -2069,6 +2078,7 @@ def _profile_for_statements(
     size: int,
     *,
     withhold: bool = False,
+    handshake: Callable[..., None] | None = None,
 ) -> tuple[DexCache, list[str], list[str]]:
     """Price and run the profiles a call needs, then hand back the new cache.
 
@@ -2099,7 +2109,7 @@ def _profile_for_statements(
     statement_estimate = sum(per_statement.values())
     subject = "this statement reads" if size == 1 else "these statements read"
     try:
-        command_args.billed_handshake(
+        (handshake or command_args.billed_handshake)(
             "explore query",
             adapter,
             profile_estimate + statement_estimate,
@@ -4274,7 +4284,10 @@ def _dataset_declaration(
     if declaration.population is not None:
         flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
         rule = declaration.population.rule
-        if rule is not None and values_free:
+        if rule is not None and (
+            values_free
+            or any(f.column.lower() in flagged for f in declaration.population.filters)
+        ):
             rule = None
             withheld.append("population.rule")
         filters: list[DeclaredFilter] = []
