@@ -42,6 +42,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
+from ..budget import effective_session_ceiling
 from ..config import SnowflakeTarget
 from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
@@ -818,9 +819,14 @@ class SnowflakeAdapter:
             ],
         }
         cost = self.cost_gate.cost()
+        ceiling_in_force, ceiling_source = effective_session_ceiling(
+            self.cost_gate.configured_session_ceiling
+        )
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
             "session_spent_today_seconds": self.cost_gate.session_spent_now(),
+            "session_ceiling_in_force": ceiling_in_force,
+            "session_ceiling_source": ceiling_source,
         }
         if self.target.warehouse:
             info = self._warehouse()

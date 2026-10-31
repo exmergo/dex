@@ -53,6 +53,7 @@ from typing import Any
 import sqlglot
 from sqlglot import expressions as exp
 
+from ..budget import effective_session_ceiling
 from ..config import TrinoTarget
 from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
@@ -363,6 +364,9 @@ class TrinoAdapter:
         # credential fails here instead of reporting a healthy connection.
         probe = self._catalog("SELECT version() AS server_version")[0]
         cost = self.cost_gate.cost()
+        ceiling_in_force, ceiling_source = effective_session_ceiling(
+            self.cost_gate.configured_session_ceiling
+        )
         caps: dict[str, object] = {
             "connector": self.name,
             "dialect": self.dialect,
@@ -388,6 +392,8 @@ class TrinoAdapter:
         caps["budget"] = {
             "ceiling_seconds": cost.ceiling,
             "session_spent_today_seconds": self.cost_gate.session_spent_now(),
+            "session_ceiling_in_force": ceiling_in_force,
+            "session_ceiling_source": ceiling_source,
         }
         return caps
 
