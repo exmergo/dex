@@ -571,6 +571,31 @@ def test_reconcile_never_removes_a_whole_cube(repo: Path, capsys):
     assert "semantic_plan_id" not in payload["data"]
 
 
+def test_reconcile_native_only_repository_whose_findings_the_layer_does_not_handle(
+    tmp_path: Path, capsys
+):
+    """#994: A native-only repository whose findings the layer doesn't handle
+    returns status: ok with advisory proposals and no stored plan."""
+    root = _layout(tmp_path, dbt=False)
+    _cli(root, capsys, "maintain", "snapshot")
+    _sql(root, "INSERT INTO orders VALUES (4, 2, 1.0, 'paid', '2026-01-05')")
+    _cli(root, capsys, "maintain", "grain")
+
+    payload = _cli(root, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload
+    assert payload["status"] == "ok"
+    proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_grain_not_unique"
+    ]
+    assert len(proposals) == 1
+    assert proposals[0]["kind"] == "advisory"
+    assert payload["data"].get("plan_id") is None
+    assert any("no transformation project to edit" in w for w in payload["warnings"])
+
+
 def test_a_join_no_view_walks_is_removed_with_the_gone_cube(tmp_path: Path, capsys):
     root = _layout(tmp_path, dbt=False)
     _write(

@@ -165,3 +165,75 @@ def test_reconcile_proposes_no_edit_for_a_failed_declared_grain(tmp_path: Path, 
     assert len(proposals) == 1
     assert proposals[0]["kind"] == "advisory"
     assert payload["data"].get("plan_id") is None
+
+def test_reconcile_native_only_repository_whose_findings_the_layer_does_not_handle(
+    tmp_path: Path, capsys
+):
+    """#994: A native-only repository whose findings the layer doesn't handle
+    returns status: ok with advisory proposals and no stored plan."""
+    repo = _repo(tmp_path, duplicate_line_no=True)
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+    _cli(repo, "maintain", "grain", capsys=capsys)
+
+    payload = _cli(repo, "maintain", "reconcile", capsys=capsys)
+
+    assert payload["_exit"] == 0, payload
+    assert payload["status"] == "ok"
+    proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_grain_not_unique"
+    ]
+    assert len(proposals) == 1
+    assert proposals[0]["kind"] == "advisory"
+    assert payload["data"].get("plan_id") is None
+    assert any("no transformation project to edit" in w for w in payload["warnings"])
+
+
+def test_reconcile_refuses_when_neither_project_nor_layer_is_configured(
+    tmp_path: Path, capsys
+):
+    """#994: The refusal stays for a repository with neither a project nor a layer."""
+    duckdb = pytest.importorskip("duckdb")
+    root = tmp_path
+    db_path = root / "demo.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE t (id INT)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.close()
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {db_path}\n", encoding="utf-8"
+    )
+    _cli(root, "maintain", "snapshot", capsys=capsys)
+    # Delete row to create volume drift finding
+    conn = duckdb.connect(str(db_path))
+    conn.execute("DELETE FROM t")
+    conn.close()
+    _cli(root, "maintain", "volume", capsys=capsys)
+    payload = _cli(root, "maintain", "reconcile", capsys=capsys)
+    assert payload["_exit"] != 0
+    assert payload["status"] == "error"
+    assert any(
+        "reconcile edits a project" in err for err in payload.get("errors", [])
+    )
+
+
+
+def test_reconcile_refuses_when_project_is_invalid_even_with_layer(
+    tmp_path: Path, capsys
+):
+    """#994: An invalid transformation project refuses rather than degrading."""
+    repo = _repo(tmp_path, duplicate_line_no=True)
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+    _cli(repo, "maintain", "grain", capsys=capsys)
+
+    # Introduce an invalid dbt_project.yml (broken YAML)
+    (repo / "dbt_project.yml").write_text("name: [unclosed list", encoding="utf-8")
+
+    payload = _cli(repo, "maintain", "reconcile", capsys=capsys)
+    assert payload["_exit"] != 0
+    assert payload["status"] == "error"
+    assert any(
+        "reconcile edits a project" in err for err in payload.get("errors", [])
+    )
