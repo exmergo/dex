@@ -307,6 +307,13 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
              [--for-plan <id>]       --verify sweeps the nodes this build ran for correctness and
              [--for-plan-file <f>]   reports the findings in the same envelope, under
              [--no-install-deps]     data.verification; findings never change the status
+             [--select <s>]          --full-refresh passes dbt's flag, for after an incremental
+             [--full-refresh]        model's logic changed: priced as the full rebuild, the
+                                     rebuilt nodes named under data.full_refresh, recorded in
+                                     data.evidence.invocation.full_refresh. Every dbt invocation
+                                     writes data.artifact_directory, which transform.artifacts
+                                     sets: isolated (default) <target-path>/dex/<dbt-version>,
+                                     or shared, refused when another runtime left it incompatible
                                      data.outcome says what the run established, which success cannot:
                                      success is dbt's exit code and an empty selection exits zero, so
                                      empty_selection, unrelated, partial, skipped, stale, failed and
@@ -971,7 +978,7 @@ default, or a filter or operator after it is refused. A key naming a location
   is, and what its edits actually contain. Both are repo-only and free. See
   `references/host-integration.md` for the whole seam, including the
   conformance vectors shipped for a consumer to assert its own reader against.
-- `transform build` accepts `--target`, `--select` and `--verify`. The target must be `dev`
+- `transform build` accepts `--target`, `--select`, `--full-refresh` and `--verify`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
   the refusal. On a billed connector the cost gate is priced upfront: dex runs a
@@ -1069,6 +1076,71 @@ default, or a filter or operator after it is refused. A key naming a location
   read is named in `warnings` and the build runs as it did before the check
   existed. Billed connectors do not run the check: the refresh would spend
   warehouse time outside the spend the build settles.
+- **`transform build --full-refresh` rebuilds an incremental model from
+  scratch** (#1015). An incremental run only adds or merges rows, so once an
+  incremental model's logic changes, the rows the old logic wrote stay in the
+  dev relation until it is rebuilt. The flag passes dbt's own `--full-refresh`
+  to `dbt build`, on the dev target only. It is for that case, not a routine
+  build, since a full rebuild scans the model's whole history.
+
+  The pricing compile runs with `--full-refresh` too, so `is_incremental()`
+  renders false and each selected incremental model is priced as the full
+  `SELECT` that runs rather than as its batch. On BigQuery there is then no
+  watermark filter, and no `data.upper_bounds` line. A note in the estimate
+  counts the incremental models and seeds priced that way.
+
+  `data.full_refresh` is `{requested: true, models, seeds, not_refreshed,
+  success}`, read from the build's own artifacts. `models` are the selected
+  incremental models and `seeds` the selected seeds. `not_refreshed` names any
+  whose own `full_refresh: false` config makes dbt ignore the flag, so their
+  rows are not read as rebuilt. Tables and views are rebuilt by every build and
+  are not listed. Snapshots ignore the flag. `data.evidence.invocation.full_refresh`
+  is `true`, and `false` on every other build. With no `--select`, a `warnings`
+  line counts the incremental models and seeds the whole project rebuilds. The
+  DuckDB stale-seed refresh above does not run, since the build already
+  rebuilds every seed it selects. A failed build keeps `dbt build failed` as
+  its `errors[0]` prefix. `--verify` is unchanged; its row-population checks
+  still skip incremental models.
+- **Every dbt invocation Dex runs on the project writes one artifact directory**
+  (#862, #1014). Dex's pinned dbt and a project's own runtime (a CI image, a
+  teammate's install, a benchmark grader) used to share `target/`. When their
+  versions differ, the second can fail before it evaluates anything. One
+  observed case: dbt 1.12 leaves `target/run/<project>/snapshots/<name>.sql` as
+  a directory, and dbt 1.10 raises `IsADirectoryError` opening it as a file.
+
+  The directory is resolved once per command, before any gate, from
+  `transform.artifacts` in `.dex/config.yml` (or `artifacts=` on
+  `DexEngine.build`). Every invocation receives it as `--target-path`: the
+  build, the compile that prices it, the seed `dbt ls`, and the settlement read
+  after a failed run.
+  - `isolated`, the default, is `<target-path>/dex/<dbt-version>/`. The runtime
+    key is the dbt-core version, so two Dex runs share partial-parse state while
+    another runtime never sees it. It sits inside the project's target path, so
+    git, `dbt clean` and Dex's own shadow copies ignore it as they ignore
+    `target/`. The project's own `target/` is never written.
+  - `shared` is the project's own target path, for tooling that must find the
+    artifacts there. Before anything runs, Dex refuses (`reason: guard`) a
+    directory that holds a snapshot path another runtime left as a directory,
+    or a `manifest.json` written by a different dbt minor version. The refusal
+    names both ways out: `dbt clean` with the runtime that wrote it, or unset
+    the setting. Nothing is deleted.
+
+  The target path resolves the way dbt resolves it: `DBT_TARGET_PATH`, then
+  `target-path` in `dbt_project.yml`, then `target`. A templated value falls
+  back to `target`. `data.artifact_directory` is the project-relative label of
+  the directory written.
+
+  Readers do not know which tool wrote last. Every manifest, semantic-manifest
+  and run-results reader (`maintain verify`, `--use-project`, local
+  `explore semantic`, `transform ground`, the dev-target preflight) reads the
+  newer of Dex's directory and the project's own. That is a Dex build right
+  after it, and the user's own `dbt parse` after that.
+
+  dbt's JSON log names the invocation on every line. A `run_results.json` that
+  names a different invocation (an earlier run, another tool) has its nodes
+  dropped, and the build is reported as a failure that says so. A missing one
+  is `not_run` or `empty_selection` in the evidence. Neither is ever a
+  successful completion.
 - `transform build --verify` runs the `maintain verify` sweep over the nodes
   this build touched and reports it under `data.verification`, in one envelope
   with the build result. Opt-in on every connector, free ones included.

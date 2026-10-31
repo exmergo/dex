@@ -1166,6 +1166,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="refuse missing dbt packages instead of installing them",
                     )
+                    # dbt's own flag, for the one case an incremental build
+                    # cannot handle: its logic changed, and the rows the old
+                    # logic wrote stay until the model is rebuilt (#1015).
+                    sp.add_argument(
+                        "--full-refresh",
+                        action="store_true",
+                        default=False,
+                        help="rebuild selected incremental models after their "
+                        "logic changed",
+                    )
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is
                     # each of these used", which is the shape of a rename. `--kind`

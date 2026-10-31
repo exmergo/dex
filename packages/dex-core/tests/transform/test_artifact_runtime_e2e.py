@@ -22,8 +22,14 @@ from tests.transform.test_build_evidence import (
 
 from exmergo_dex_core.transform.artifact_runtime import (
     ForeignInvocationError,
+    IncompatibleArtifactsError,
     assert_same_invocation,
+    dbt_runtime_key,
+    find_snapshot_path_collisions,
     prepare_artifact_dir,
+    readable_artifact_dir,
+    resolve_build_artifact_dir,
+    shared_target_dir,
 )
 from exmergo_dex_core.transform.build import build
 from exmergo_dex_core.transform.evidence import BuildOutcome, build_evidence
@@ -83,7 +89,7 @@ def test_cross_runtime_handoff_reads_the_isolated_directory(dbt_project_dir: Pat
     shared = dbt_project_dir / "target"
     planted = _plant_directory_as_sql(shared)
     isolated = prepare_artifact_dir(dbt_project_dir, _RUNTIME_B)
-    assert isolated == dbt_project_dir / f"dex-runtime-{_RUNTIME_B}"
+    assert isolated == shared / "dex" / _RUNTIME_B
     _write_success(isolated)
 
     evidence = build_evidence(
@@ -92,7 +98,7 @@ def test_cross_runtime_handoff_reads_the_isolated_directory(dbt_project_dir: Pat
 
     assert evidence.outcome is BuildOutcome.VALIDATED
     producer = evidence.invocation["artifact_producer"]
-    assert producer["artifact_directory"] == f"dex-runtime-{_RUNTIME_B}"
+    assert producer["artifact_directory"] == f"target/dex/{_RUNTIME_B}"
     assert producer["invocation_id"] == "abc-123"
     assert planted.is_dir()
     assert (planted / "nested.sql").is_file()
@@ -107,7 +113,7 @@ def test_same_runtime_reuses_a_clean_shared_target(tmp_path: Path):
     chosen = prepare_artifact_dir(project, _RUNTIME_B)
 
     assert chosen == shared
-    assert not (project / f"dex-runtime-{_RUNTIME_B}").exists()
+    assert not (shared / "dex").exists()
     assert (shared / "manifest.json").is_file()
 
 
@@ -181,8 +187,8 @@ def test_build_passes_isolated_target_path_when_the_shared_dir_collides(
         ),
         encoding="utf-8",
     )
-    isolated = dbt_project_dir / f"dex-runtime-{_RUNTIME_B}"
-    isolated.mkdir()
+    isolated = shared / "dex" / _RUNTIME_B
+    isolated.mkdir(parents=True)
     (isolated / "run_results.json").write_text(
         json.dumps(
             {
@@ -221,7 +227,7 @@ def test_build_passes_isolated_target_path_when_the_shared_dir_collides(
     assert summary["success"] is True
     assert summary["nodes"] == []
     assert "elapsed_seconds" not in summary
-    assert summary["artifact_directory"] == f"dex-runtime-{_RUNTIME_B}"
+    assert summary["artifact_directory"] == f"target/dex/{_RUNTIME_B}"
 
 
 def test_explicit_artifact_directory_is_passed_as_target_path(
@@ -248,7 +254,9 @@ def test_explicit_artifact_directory_is_passed_as_target_path(
     assert summary["nodes"] == []
 
 
-def test_default_build_does_not_override_target_path(dbt_project_dir: Path):
+def test_default_build_writes_the_isolated_runtime_directory(dbt_project_dir: Path):
+    """#1014: with no directory named, a build isolates by default."""
+
     seen: dict[str, list[str]] = {}
 
     def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -257,8 +265,165 @@ def test_default_build_does_not_override_target_path(dbt_project_dir: Path):
 
     summary, _cost = build(dbt_project_dir, target="dev", confirmed=True, runner=runner)
 
-    assert "--target-path" not in seen["argv"]
-    assert "artifact_directory" not in summary
+    key = dbt_runtime_key()
+    argv = seen["argv"]
+    written = Path(argv[argv.index("--target-path") + 1])
+    assert written == dbt_project_dir / "target" / "dex" / key
+    assert summary["artifact_directory"] == f"target/dex/{key}"
+
+
+def test_shared_policy_writes_the_project_target_path(dbt_project_dir: Path):
+    seen: dict[str, list[str]] = {}
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    summary, _cost = build(
+        dbt_project_dir,
+        target="dev",
+        confirmed=True,
+        runner=runner,
+        artifact_policy="shared",
+    )
+
+    argv = seen["argv"]
+    assert Path(argv[argv.index("--target-path") + 1]) == dbt_project_dir / "target"
+    assert summary["artifact_directory"] == "target"
+
+
+def test_shared_policy_refuses_a_collision_before_running(dbt_project_dir: Path):
+    planted = _plant_directory_as_sql(dbt_project_dir / "target")
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with pytest.raises(IncompatibleArtifactsError, match="dbt clean"):
+        build(
+            dbt_project_dir,
+            target="dev",
+            confirmed=True,
+            runner=runner,
+            artifact_policy="shared",
+        )
+    assert calls == []
+    assert (planted / "nested.sql").is_file()
+
+
+def test_shared_policy_refuses_a_manifest_from_another_dbt_minor(
+    dbt_project_dir: Path,
+):
+    shared = dbt_project_dir / "target"
+    shared.mkdir()
+    (shared / "manifest.json").write_text(
+        json.dumps({"metadata": {"dbt_version": "1.10.11"}}), encoding="utf-8"
+    )
+
+    with pytest.raises(IncompatibleArtifactsError, match=r"1\.10\.11"):
+        resolve_build_artifact_dir(dbt_project_dir, "shared", runtime_key="dbt-1.12.5")
+    # The same minor is the same runtime family and is reused.
+    assert (
+        resolve_build_artifact_dir(dbt_project_dir, "shared", runtime_key="dbt-1.10.2")
+        == shared
+    )
+    assert (shared / "manifest.json").is_file()
+
+
+def test_the_isolated_directory_never_collides_with_another_runtime(
+    dbt_project_dir: Path,
+):
+    """The #862 handoff: Dex's isolated build leaves the shared target alone,
+    so the other runtime finds no directory where it expects a file."""
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        out = Path(argv[argv.index("--target-path") + 1])
+        # What dbt 1.12 leaves behind for a snapshot.
+        (out / "run" / "dex_test" / "snapshots" / "check_row.sql").mkdir(parents=True)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    build(dbt_project_dir, target="dev", confirmed=True, runner=runner)
+
+    assert find_snapshot_path_collisions(dbt_project_dir / "target") == []
+    assert not (dbt_project_dir / "target" / "run").exists()
+
+
+def test_a_run_results_from_another_invocation_is_not_a_success(
+    dbt_project_dir: Path,
+):
+    """dbt's JSON log names this run; results naming another one are foreign."""
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        out = Path(argv[argv.index("--target-path") + 1])
+        _write_success(out, invocation_id="someone-else")
+        log = json.dumps({"info": {"invocation_id": "this-run", "name": "MainReport"}})
+        return subprocess.CompletedProcess(argv, 0, stdout=log + "\n", stderr="")
+
+    summary, _cost = build(dbt_project_dir, target="dev", confirmed=True, runner=runner)
+
+    assert summary["success"] is False
+    assert summary["nodes"] == []
+    assert "someone-else" in summary["messages"][0]
+
+
+def test_readers_take_the_newest_of_dex_and_the_project_target_path(
+    dbt_project_dir: Path, monkeypatch
+):
+    import os
+
+    from exmergo_dex_core.dbt_project import manifest_file
+
+    shared = dbt_project_dir / "target"
+    isolated = shared / "dex" / "dbt-9.9.9"
+    for directory in (shared, isolated):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "manifest.json").write_text("{}", encoding="utf-8")
+    os.utime(shared / "manifest.json", (1_000, 1_000))
+    monkeypatch.setattr(
+        "exmergo_dex_core.transform.artifact_runtime.dbt_runtime_key",
+        lambda: "dbt-9.9.9",
+    )
+
+    assert manifest_file(dbt_project_dir) == isolated / "manifest.json"
+    assert readable_artifact_dir(dbt_project_dir) == isolated
+
+    # The user's own `dbt parse` after Dex's build is the newer answer.
+    os.utime(shared / "manifest.json", None)
+    os.utime(isolated / "manifest.json", (1_000, 1_000))
+    assert manifest_file(dbt_project_dir) == shared / "manifest.json"
+
+
+def test_target_path_resolves_like_dbt(dbt_project_dir: Path, monkeypatch):
+    yml = dbt_project_dir / "dbt_project.yml"
+    yml.write_text(yml.read_text() + "\ntarget-path: build_out\n", encoding="utf-8")
+    assert shared_target_dir(dbt_project_dir) == dbt_project_dir / "build_out"
+
+    monkeypatch.setenv("DBT_TARGET_PATH", "from_env")
+    assert shared_target_dir(dbt_project_dir) == dbt_project_dir / "from_env"
+    monkeypatch.delenv("DBT_TARGET_PATH")
+
+    yml.write_text(
+        yml.read_text().replace("build_out", "\"{{ env_var('X') }}\""),
+        encoding="utf-8",
+    )
+    assert shared_target_dir(dbt_project_dir) == dbt_project_dir / "target"
+
+
+def test_a_configured_target_path_isolates_beneath_it(dbt_project_dir: Path):
+    yml = dbt_project_dir / "dbt_project.yml"
+    yml.write_text(yml.read_text() + "\ntarget-path: build_out\n", encoding="utf-8")
+    seen: dict[str, list[str]] = {}
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    build(dbt_project_dir, target="dev", confirmed=True, runner=runner)
+
+    argv = seen["argv"]
+    written = Path(argv[argv.index("--target-path") + 1])
+    assert written.parent.parent == dbt_project_dir / "build_out"
 
 
 def test_foreign_invocation_cannot_be_a_successful_completion(
@@ -289,3 +454,31 @@ def test_assert_same_invocation_allows_a_missing_side():
     assert_same_invocation("invocation-a", "invocation-a")
     with pytest.raises(ForeignInvocationError, match="invocation-b"):
         assert_same_invocation("invocation-a", "invocation-b")
+
+
+def test_the_shared_policy_refusal_is_a_guard(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Through the CLI: refused before dbt runs, as `reason: guard`."""
+
+    import yaml
+
+    from exmergo_dex_core.cli import main
+
+    _plant_directory_as_sql(dbt_project_dir / "target")
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        yaml.safe_dump(
+            {
+                "connector": "duckdb",
+                "duckdb": {"path": str(tmp_path / "dev.duckdb")},
+                "dbt_project_dir": dbt_project_dir.name,
+                "transform": {"artifacts": "shared"},
+            }
+        )
+    )
+    main(["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"])
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert envelope["reason"] == "guard"
+    assert "dbt clean" in envelope["errors"][0]
