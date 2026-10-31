@@ -40,9 +40,12 @@ stay missing. Neither case is a successful completion.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -436,15 +439,61 @@ def _minor(version: str) -> tuple[str, ...]:
     return tuple(version.split(".")[:2])
 
 
+@dataclass(frozen=True)
+class PinnedArtifacts:
+    """The one directory, and the one invocation, a command's readers answer for."""
+
+    directory: Path
+    invocation_id: str | None
+
+
+_PINNED: contextvars.ContextVar[PinnedArtifacts | None] = contextvars.ContextVar(
+    "dex_pinned_artifacts", default=None
+)
+
+
+@contextlib.contextmanager
+def pinned_artifacts(
+    directory: Path | str, invocation_id: str | None = None
+) -> Iterator[PinnedArtifacts]:
+    """Bind every reader in this block to ``directory``.
+
+    A build knows where it wrote and which invocation it ran, so what it reads
+    back (the pricing pass, the ``--verify`` sweep, the decisions it reports)
+    reads exactly that directory instead of the newest one on disk, which
+    another dbt process could have rewritten meanwhile. ``invocation_id`` lets a
+    reader of ``run_results.json`` refuse results from any other invocation (see
+    :func:`pinned_invocation_id`). Standalone readers, outside any such block,
+    keep the newest-artifact choice.
+    """
+
+    token = _PINNED.set(PinnedArtifacts(Path(directory), invocation_id))
+    try:
+        yield _PINNED.get()  # type: ignore[misc]
+    finally:
+        _PINNED.reset(token)
+
+
+def pinned_invocation_id() -> str | None:
+    """The invocation a pinned block's run results must belong to, if any."""
+
+    pinned = _PINNED.get()
+    return pinned.invocation_id if pinned is not None else None
+
+
 def readable_artifact(project_root: Path | str, name: str) -> Path:
     """The newer of ``name`` in Dex's directory and in the project's target path.
 
     Readers cannot know which policy, or which tool, wrote last, so they read
     whichever file was written last. With neither present the answer is the
     project's own path, so a reader's "missing" message names the place a user
-    would look.
+    would look. Inside :func:`pinned_artifacts` the answer is always the pinned
+    directory.
     """
 
+    pinned = _PINNED.get()
+    if pinned is not None:
+        return pinned.directory / name
     shared = shared_target_dir(project_root) / name
     isolated_dir = isolated_artifact_dir(project_root)
     candidates = [shared] + ([isolated_dir / name] if isolated_dir else [])

@@ -493,15 +493,27 @@ def shadow_project(
 
     project = Path(project_dir).resolve()
     view = load_project(project)
-    skipped = ["target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"]
+    by_name = shutil.ignore_patterns(
+        "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
+    )
     # A configured target-path holds artifacts as surely as `target/` does,
-    # Dex's own isolated ones included (issue #1014).
-    configured = shared_target_dir(project)
-    with contextlib.suppress(ValueError, IndexError):
-        skipped.append(configured.resolve().relative_to(project).parts[0])
+    # Dex's own isolated ones included (issue #1014). It is skipped by its full
+    # path: `target-path: models/target` must not skip `models/`.
+    artifacts: Path | None = None
+    with contextlib.suppress(ValueError, OSError):
+        configured = shared_target_dir(project).resolve()
+        if configured != project and configured.is_relative_to(project):
+            artifacts = configured
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        skipped = set(by_name(directory, names))
+        if artifacts is not None and Path(directory).resolve() == artifacts.parent:
+            skipped.update(name for name in names if name == artifacts.name)
+        return skipped
+
     with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
         shadow = Path(tmp) / (project.name or "project")
-        shutil.copytree(project, shadow, ignore=shutil.ignore_patterns(*skipped))
+        shutil.copytree(project, shadow, ignore=ignore)
         for edit in edits:
             edit_path = contained_path(shadow, edit.path, view)
             if edit.op is EditOp.DELETE:

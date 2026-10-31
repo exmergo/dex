@@ -1141,7 +1141,11 @@ default, or a filter or operator after it is refused. A key naming a location
   and run-results reader (`maintain verify`, `--use-project`, local
   `explore semantic`, `transform ground`, the dev-target preflight) reads the
   newer of Dex's directory and the project's own. That is a Dex build right
-  after it, and the user's own `dbt parse` after that.
+  after it, and the user's own `dbt parse` after that. A build's own reads (its
+  pricing pass, its `--verify` sweep) are the exception: they read the
+  directory the build wrote, and only that invocation's run results, so a dbt
+  process writing elsewhere meanwhile cannot hand the sweep another run's
+  manifest or another run's passing tests.
 
   dbt's JSON log names the invocation on every line. A `run_results.json` that
   names a different invocation (an earlier run, another tool) has its nodes

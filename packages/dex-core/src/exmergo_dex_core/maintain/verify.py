@@ -142,10 +142,19 @@ def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
 
 
 def _run_results(project_dir: Path) -> list[dict] | None:
+    from ..transform.artifact_runtime import pinned_invocation_id
+
     path = _artifact(project_dir, "run_results.json")
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8")).get("results", [])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    # A build's own sweep reads only its own invocation's results; another
+    # run's passing tests must not vouch for this build's rows.
+    expected = pinned_invocation_id()
+    written = (document.get("metadata") or {}).get("invocation_id")
+    if expected is not None and written is not None and str(written) != expected:
+        return None
+    return document.get("results", [])
 
 
 def read_manifest_target(project_dir: Path) -> str | None:

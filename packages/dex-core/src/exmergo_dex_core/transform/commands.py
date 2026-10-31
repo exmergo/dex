@@ -3390,7 +3390,14 @@ def build(
         logged_id = summary.pop("logged_invocation_id", None)
         # Before the shaping on both paths, so the two read the same way; here
         # there is no gate to outlive, on the billed path below there is.
-        verification = _verify_build(engine, project, summary, verify)
+        verification = _verify_build(
+            engine,
+            project,
+            summary,
+            verify,
+            artifact_directory=artifacts_dir,
+            invocation_id=logged_id,
+        )
         return _shape_build_result(
             summary,
             cost,
@@ -3516,7 +3523,15 @@ def build(
     # Between the run and the shaping, deliberately: `_shape_build_result`
     # settles the gate, and a statement issued after that is charged against a
     # reservation that has already been released.
-    verification = _verify_build(engine, project, summary, verify, adapter=adapter)
+    verification = _verify_build(
+        engine,
+        project,
+        summary,
+        verify,
+        adapter=adapter,
+        artifact_directory=artifacts_dir,
+        invocation_id=logged_id,
+    )
     decisions = _built_decisions(engine, summary)
     return _shape_build_result(
         summary,
@@ -3558,6 +3573,8 @@ def _verify_build(
     requested: bool,
     *,
     adapter=None,
+    artifact_directory: Path | None = None,
+    invocation_id: str | None = None,
 ) -> BuildVerification:
     """The sweep, or the statement that it did not run.
 
@@ -3571,8 +3588,14 @@ def _verify_build(
     rather than re-derived: opening again would settle the gate holding this
     command's reservation and rebuild it, and the counts would then be charged
     against nothing.
+
+    ``artifact_directory`` and ``invocation_id`` are this build's own. The sweep
+    reads that directory, not the newest one on disk, and only that
+    invocation's run results, so another dbt process writing meanwhile cannot
+    hand it a different run's manifest or a different run's passing tests.
     """
 
+    from .artifact_runtime import pinned_artifacts
     from .verify import BuildVerification, verify_build
 
     if not requested:
@@ -3584,7 +3607,10 @@ def _verify_build(
         if adapter is not None
         else (lambda: engine._adapter("transform build", reads_dev_target=True))
     )
-    return verify_build(engine, Path(project), summary, resolve_adapter=opener)
+    if artifact_directory is None:
+        return verify_build(engine, Path(project), summary, resolve_adapter=opener)
+    with pinned_artifacts(artifact_directory, invocation_id):
+        return verify_build(engine, Path(project), summary, resolve_adapter=opener)
 
 
 def _for_plan_document(args: argparse.Namespace) -> Any:
@@ -4270,18 +4296,29 @@ def _price_build(
             # The compile above wrote the manifest this reads, so the sweep's
             # scan can be priced here and confirmed with the build rather than
             # asked about again once the build has already spent.
+            from .artifact_runtime import pinned_artifacts
             from .build import compiled_model_ids
             from .verify import price_declared_facts, price_verification
 
             scope = compiled_model_ids(Path(project), artifact_directory)
-            scan, scan_notes = price_verification(adapter, Path(project), scope=scope)
+            # Priced off the manifest this compile just wrote, not whichever
+            # manifest on disk is newest.
+            pin = (
+                pinned_artifacts(artifact_directory)
+                if artifact_directory is not None
+                else contextlib.nullcontext()
+            )
+            with pin:
+                scan, scan_notes = price_verification(
+                    adapter, Path(project), scope=scope
+                )
+                facts, facts_notes = price_declared_facts(
+                    adapter, Path(project), scope=scope
+                )
             notes = [*notes, *scan_notes]
             if scan:
                 estimate += scan
                 per_node = {**per_node, "(row counts)": scan}
-            facts, facts_notes = price_declared_facts(
-                adapter, Path(project), scope=scope
-            )
             notes = [*notes, *facts_notes]
             if facts:
                 estimate += facts

@@ -569,3 +569,46 @@ def test_foreign_run_results_yield_no_evidence_through_the_cli(
     assert envelope["data"].get("outcome") != "validated"
     assert "evidence" not in envelope["data"] or envelope["data"]["evidence"] is None
     assert "logged_invocation_id" not in envelope["data"]
+
+
+def test_a_nested_target_path_is_skipped_without_its_parent(dbt_project_dir: Path):
+    """`target-path: models/target` skips that directory, never `models/`."""
+
+    from exmergo_dex_core.transform.build import shadow_project
+
+    yml = dbt_project_dir / "dbt_project.yml"
+    yml.write_text(yml.read_text() + "\ntarget-path: models/target\n")
+    artifacts = dbt_project_dir / "models" / "target"
+    artifacts.mkdir()
+    (artifacts / "manifest.json").write_text("{}", encoding="utf-8")
+
+    with shadow_project(dbt_project_dir) as shadow:
+        assert (shadow / "models" / "staging" / "stg_customers.sql").is_file()
+        assert not (shadow / "models" / "target").exists()
+
+
+def test_a_pinned_block_reads_the_build_directory_and_its_invocation_only(
+    dbt_project_dir: Path,
+):
+    """A build's own sweep reads where it wrote, not the newest manifest, and
+    refuses run results another invocation wrote there."""
+
+    from exmergo_dex_core.maintain.verify import _manifest_nodes, _run_results
+    from exmergo_dex_core.transform.artifact_runtime import pinned_artifacts
+
+    shared = dbt_project_dir / "target"
+    build_dir = shared / "dex" / "dbt-test"
+    _write_success(build_dir, invocation_id="this-build")
+    # Another dbt process writes the project's target/ afterwards: newer.
+    _write_success(shared, invocation_id="someone-else")
+    (shared / "manifest.json").write_text(json.dumps({"nodes": {}}), encoding="utf-8")
+
+    with pinned_artifacts(build_dir, "this-build"):
+        assert "model.dex_test.mart" in (_manifest_nodes(dbt_project_dir) or {})
+        assert _run_results(dbt_project_dir)
+
+    with pinned_artifacts(build_dir, "a-later-build"):
+        assert _run_results(dbt_project_dir) is None
+
+    # Outside a build, the newest on disk is still the answer.
+    assert _manifest_nodes(dbt_project_dir) == {}

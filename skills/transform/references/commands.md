@@ -243,6 +243,8 @@ covers the build, the compile that prices it, and the seed check.
   as `maintain verify`, local `explore semantic`, `transform ground` and
   `--use-project` take the newer of Dex's directory and the project's own, so
   they read a Dex build right after it, and your own `dbt parse` after that.
+  A build's own `--verify` sweep reads only the directory it wrote and only its
+  own invocation's run results.
 - If the `run_results.json` on disk names a different dbt invocation than the
   run's own log, its nodes are dropped and the build is reported as failed, not
   successful.
