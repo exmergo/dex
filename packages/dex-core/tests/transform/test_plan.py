@@ -63,6 +63,51 @@ def test_plan_from_edits_file(dbt_project_dir: Path, tmp_path: Path, capsys):
     assert not (dbt_project_dir / "models/staging/stg_orders.yml").exists()
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{{ config(materialized='view') }} select 1 as id\n",
+        "{{ config(materialized='view') }}\nselect 1 as id\n",
+    ],
+    ids=["inline", "separate-line"],
+)
+def test_plan_accepts_inline_and_separate_line_config_headers(
+    dbt_project_dir: Path, tmp_path: Path, capsys, content: str
+):
+    """#1003: Inline and separate-line config() headers both plan successfully."""
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/config_probe.sql",
+                "kind": "model_sql",
+                "content": content,
+            },
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "probe config",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["edit_count"] == 1
+    assert envelope["diffs"] and envelope["diffs"][0]["op"] == "create"
+    plan_id = envelope["data"]["plan_id"]
+    plan_file = tmp_path / ".dex" / "plans" / f"{plan_id}.json"
+    assert plan_file.is_file()
+    saved_plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert saved_plan["edits"][0]["new_content"] == content
+
+
 def test_plan_packages_yml_at_project_root(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

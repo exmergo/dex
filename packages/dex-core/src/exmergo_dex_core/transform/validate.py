@@ -208,6 +208,81 @@ _SNAPSHOT_BLOCK = re.compile(
     r"\{%-?\s*snapshot\s.*?\{%-?\s*endsnapshot\s*-?%\}", re.DOTALL
 )
 _CONFIG_CALL = re.compile(r"\{\{-?\s*config\s*\(", re.DOTALL)
+_CONFIG_CALL_CLOSE = re.compile(r"\s*-?\}\}")
+_LEADING_COMMENT_OR_WS = re.compile(r"\s+|--[^\r\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def _match_config_call(text: str, start: int) -> int | None:
+    """If text[start:] begins with a config(...) call closing with -?}},
+    return the end index in text, else None.
+
+    Handles single and double-quoted strings with escape characters so
+    parentheses inside string arguments do not close the call early (#1003).
+    """
+
+    m = _CONFIG_CALL.match(text, start)
+    if not m:
+        return None
+    pos = m.end()
+    depth = 1
+    in_quote = None
+    escape = False
+
+    while pos < len(text) and depth > 0:
+        ch = text[pos]
+        if in_quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_quote:
+                in_quote = None
+        else:
+            if ch in ("'", '"'):
+                in_quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+        pos += 1
+
+    if depth != 0:
+        return None
+
+    close_m = _CONFIG_CALL_CLOSE.match(text, pos)
+    if not close_m:
+        return None
+    return close_m.end()
+
+
+def _strip_leading_config_headers(sql: str) -> str:
+    """Blank out recognized leading config() headers before the SQL query starts
+    with spaces (#1003), preserving line and column coordinates for downstream
+    parsing.
+    """
+
+    pos = 0
+    chars = list(sql)
+
+    while pos < len(sql):
+        comment_match = _LEADING_COMMENT_OR_WS.match(sql, pos)
+        if comment_match:
+            pos = comment_match.end()
+            continue
+
+        config_end = _match_config_call(sql, pos)
+        if config_end is not None:
+            for i in range(pos, config_end):
+                if chars[i] not in ("\n", "\r"):
+                    chars[i] = " "
+            pos = config_end
+            continue
+
+        break
+
+    return "".join(chars)
+
+
 # The strategies dbt ships, and the field each one cannot work without: a
 # timestamp strategy compares an updated-at column, a check strategy compares a
 # named column list. Naming the required field in the refusal is the difference
@@ -219,18 +294,21 @@ def strip_jinja(sql: str) -> str:
     """Reduce a dbt model to plain SQL for the SELECT-only check.
 
     Inline expressions (``{{ ref(...) }}``) become an identifier placeholder;
-    statement and comment blocks are removed. Before the query starts, a
-    placeholder-only line is dropped at the top level (a ``{{ config(...) }}``
-    header). Once the first SQL ``SELECT`` or ``WITH`` token has started the
-    query, it is preserved as an identifier so a line-broken ``ref()`` remains
-    parseable. Inside parentheses it becomes a placeholder subquery, because
-    there it is a macro rendering a whole SELECT
+    statement and comment blocks are removed. Recognized leading
+    ``{{ config(...) }}`` headers are blanked out (#1003) before expression
+    replacement so queries following on the same or separate lines both parse
+    cleanly. Before the query starts, any remaining placeholder-only line is
+    dropped at the top level. Once the first SQL ``SELECT`` or ``WITH`` token
+    has started the query, it is preserved as an identifier so a line-broken
+    ``ref()`` remains parseable. Inside parentheses it becomes a placeholder
+    subquery, because there it is a macro rendering a whole SELECT
     (``from ( {{ unpivot_json_object(...) }} )``), and dropping it would leave
     unparseable SQL. Depth counting is naive about parens inside string literals;
     a miscount only ever refuses, never admits.
     """
 
     text = _JINJA_COMMENT.sub("", sql)
+    text = _strip_leading_config_headers(text)
     text = _JINJA_STMT.sub("", text)
     text = _JINJA_EXPR.sub(_PLACEHOLDER, text)
     # Token lines locate the query without mistaking keywords in comments or
