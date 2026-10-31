@@ -33,6 +33,18 @@ pending fragments into a new section below. See
 
 ### Fixed
 
+- **The local dbt catalog no longer repeats population values.**
+  `explore semantic list --local` copied each semantic model's compiled
+  description verbatim, so the population sentence Dex appends when it derives a
+  semantic model (the rule and every filter value) appeared in the catalog in both
+  full and values-free mode, and a search term found only in that sentence
+  selected the model's metrics. The catalog now omits that sentence, matched
+  exactly against the model's `config.meta.dex.population`, and keeps the authored
+  description before it. Any other description that mentions population,
+  whatever its separator or spelling, is withheld with a note that names no
+  value. Existing compiled artifacts are screened on read, with no rebuild, and a
+  description without Dex population metadata is left as written. The hosted dbt
+  Cloud catalog is unchanged. ([#1017](https://github.com/exmergo/dex/pull/1017))
 - **`transform plan` measures a model that builds rows from an inline `VALUES` list.** A comparison mart that forms its windows with `cross join (values (7), (28)) as windows (window_days)` had every change on it reported as `attributed: false` with "unsupported FROM source: Values", because the query firewall knew no such source. A named, literal-only `VALUES` list reads nothing from the warehouse, so the firewall now admits it beside tables, views and CTEs, and the model's predicate, join and `GROUP BY` changes get their measured `rows` and `delta`. Only plain literals are admitted in its rows (numbers, strings, `NULL` and booleans): a list whose rows hold an expression (a typed literal such as `DATE '2020-01-01'` counts as one), a column or a subquery, or whose columns are unnamed, is still refused. ([#954](https://github.com/exmergo/dex/pull/954))
 - **Semantic PII clearance discloses a sub-threshold flag.** `explore semantic query` now warns when a grouped or filtered dimension is profiled below the block threshold, matching `explore query`. ([#965](https://github.com/exmergo/dex/pull/965))
 - **Reconcile dangling-reference advice names the configured vendor's authoring command.** Under Ossie, SLayer or Cube the advisory now points at `semantic <vendor> update` instead of MetricFlow's `semantic update`. ([#979](https://github.com/exmergo/dex/pull/979))
