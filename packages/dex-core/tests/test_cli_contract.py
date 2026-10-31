@@ -859,6 +859,12 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "command a library caller drives through DexEngine"
         ),
     },
+    ("procedure", None): {
+        "reason": (
+            "package text, not an engine operation: a library caller reads "
+            "exmergo_dex_core.procedure.text() / .block() / .check() directly"
+        ),
+    },
     **{
         ("config", sub): {
             "reason": (

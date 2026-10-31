@@ -1,0 +1,28 @@
+version: 2
+models:
+  - name: team_season_record
+    description: Each team's record for each season, as of the latest week played.
+    config:
+      meta:
+        dex:
+          grain: [season, team_id]
+          population:
+            rule: Every team in every season, including a season still in progress.
+          assumptions:
+            - decision: How to turn running totals into a season record
+              chosen: max of the to-date columns
+              evidence: data
+              detail: wins_to_date and losses_to_date only grow within a season
+    columns:
+      - name: season
+        config: {meta: {dex: {role: time}}}
+      - name: team_id
+        config: {meta: {dex: {role: foreign_key, references: stg_teams.team_id}}}
+      - name: team_name
+        config: {meta: {dex: {role: attribute}}}
+      - name: wins
+        description: Wins this season so far.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+      - name: losses
+        description: Losses this season so far.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}

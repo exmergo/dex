@@ -2385,6 +2385,25 @@ def test_a_range_join_is_skipped_and_stated():
     assert "no conjunctive column-to-column equality" in skipped[0]
 
 
+def test_a_join_that_filters_beside_its_keys_says_so_rather_than_no_key():
+    """`left join orders o on o.customer_id = c.id and o.status <> 'x'` has a
+    key; the skip is right (a probe of the key alone would read the filtered
+    rows as orphans), and the reason must not claim there is no key."""
+
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select c.id from "wh"."main"."customers" c '
+            'left join "wh"."main"."orders" o '
+            "on o.customer_id = c.id and o.status <> 'cancelled'"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "filters as well as pairing keys" in skipped[0]
+    assert "no conjunctive" not in skipped[0]
+
+
 def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
     # o.customer_id = c.id OR o.backup_id = c.id matches on EITHER pair, not
     # both together: probing it as one composite key would demand a

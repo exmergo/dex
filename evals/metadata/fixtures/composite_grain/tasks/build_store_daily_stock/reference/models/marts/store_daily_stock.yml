@@ -1,0 +1,25 @@
+version: 2
+models:
+  - name: store_daily_stock
+    description: One row per store per day with the units it held and how many SKUs it had in stock.
+    config:
+      meta:
+        dex:
+          grain: [store_id, snapshot_date]
+          population:
+            rule: Every store on every snapshot day.
+          assumptions:
+            - decision: How units roll up over time
+              chosen: a balance; take the latest or average day, never sum days
+              evidence: default
+    columns:
+      - name: store_id
+        config: {meta: {dex: {role: foreign_key, references: stg_stores.store_id}}}
+      - name: snapshot_date
+        config: {meta: {dex: {role: time}}}
+      - name: units_on_hand
+        description: Units across all SKUs at the end of the day.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: semi_additive, unit: count}}}
+      - name: skus_in_stock
+        description: SKUs with at least one unit at the end of the day.
+        config: {meta: {dex: {role: measure, aggregation: count_distinct, additivity: non_additive, unit: count}}}

@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "team_season_record"
+  ],
+  "prompt": "The `wins` and `losses` in `team_season_record` are far too high: no team plays that many games in a season. Fix the model so each row shows the team's record for that season so far, and rebuild it on dev."
+}

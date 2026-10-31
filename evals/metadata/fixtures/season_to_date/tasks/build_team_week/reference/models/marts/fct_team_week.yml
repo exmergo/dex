@@ -1,0 +1,37 @@
+version: 2
+models:
+  - name: fct_team_week
+    description: One row per team per game week, with the season-to-date record the standings published.
+    config:
+      meta:
+        dex:
+          grain: [season, week, team_id]
+          population:
+            rule: Every published standings row, unfinished seasons included.
+          assumptions:
+            - decision: How the to-date columns roll up
+              chosen: with max over weeks, never sum
+              evidence: data
+              detail: the columns grow week on week within a season, as running totals do
+    columns:
+      - name: season
+        config: {meta: {dex: {role: time}}}
+      - name: week
+        config: {meta: {dex: {role: time}}}
+      - name: team_id
+        description: The team.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_teams')
+                field: team_id
+        config: {meta: {dex: {role: foreign_key, references: stg_teams.team_id, null_rule: never}}}
+      - name: team_name
+        config: {meta: {dex: {role: attribute}}}
+      - name: wins_to_date
+        description: Wins so far this season, as of this week.
+        config: {meta: {dex: {role: measure, aggregation: max, additivity: semi_additive, unit: count}}}
+      - name: losses_to_date
+        description: Losses so far this season, as of this week.
+        config: {meta: {dex: {role: measure, aggregation: max, additivity: semi_additive, unit: count}}}

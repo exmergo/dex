@@ -38,6 +38,14 @@ _REPO = Path(__file__).resolve().parents[1]
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["metadata"]:
+        # The metadata-quality eval (#492) needs DuckDB, PyYAML and dbt, so it is
+        # imported only when asked for and runs in the engine's environment; the
+        # skill evals below stay stdlib-only.
+        from .metadata.cli import main as metadata_main
+
+        return metadata_main(raw[1:])
     parser = argparse.ArgumentParser(prog="evals", description="Tier-2 skill evals")
     parser.add_argument(
         "skill", nargs="?", default=None, help="skill dir or path to evals.json"

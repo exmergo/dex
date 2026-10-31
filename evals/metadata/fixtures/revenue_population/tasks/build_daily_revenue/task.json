@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "daily_revenue"
+  ],
+  "prompt": "Build a mart model `daily_revenue` in models/marts with one row per order date and three columns: `order_date`, `order_count` (the number of orders that day) and `revenue` (their total amount). Build it on dev when you are done."
+}

@@ -1,0 +1,9 @@
+version: 2
+models:
+  - name: stg_teams
+    description: One row per team.
+    columns:
+      - name: team_id
+        data_tests: [unique, not_null]
+  - name: stg_standings
+    description: The league table after each game week of each season.

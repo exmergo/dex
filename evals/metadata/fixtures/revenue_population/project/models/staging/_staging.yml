@@ -1,0 +1,14 @@
+version: 2
+models:
+  - name: stg_customers
+    description: One row per customer.
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+  - name: stg_orders
+    description: One row per order, every status included.
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: status
+        description: placed, shipped, completed, cancelled or returned.

@@ -597,6 +597,18 @@ def test_the_wheel_ships_the_host_conformance_vectors(wheel: str):
     assert any(n.endswith("plan-valid.json") for n in vectors), sorted(vectors)[:10]
 
 
+def test_the_wheel_ships_the_agent_procedure(wheel: str):
+    """`dex procedure` reads its text from package data (#502). A wheel without
+    it would answer every agent with a FileNotFoundError, and the PyPI install
+    is exactly the surface that has no SKILL.md to fall back on."""
+
+    import zipfile
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    assert "exmergo_dex_core/procedure/procedure.md" in names
+
+
 def test_the_host_boundary_is_reachable_on_a_bare_install(wheel: str):
     """The offline half of the lifecycle runs where there is no connector extra.
 

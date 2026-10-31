@@ -895,6 +895,20 @@ class _Lineage:
                     self.reading.filtered.append(column.name.lower())
             for conjunct in _conjuncts(node.this):
                 self._fragment(select, conjunct, clause)
+        # A column compared to literals inside a join's ON decides which joined
+        # rows count, the way a WHERE does for the driving ones, and it is where a
+        # filter has to live under a LEFT JOIN that must keep every parent. The
+        # key equalities beside it compare two columns and are not usages.
+        for join in select.args.get("joins") or []:
+            on = join.args.get("on")
+            if on is None:
+                continue
+            for conjunct in _conjuncts(on):
+                if _compared_literals(conjunct) is None:
+                    continue
+                for column in conjunct.find_all(exp.Column):
+                    self._use(select, column, "join")
+                self._fragment(select, conjunct, "join")
         for case in select.find_all(exp.Case):
             for branch in case.args.get("ifs") or []:
                 for column in branch.this.find_all(exp.Column):
@@ -1903,9 +1917,37 @@ def _warnings(
     if (grain_declared := declared.get("grain")) and not grain_judged:
         grain = (drafted.get("grain") or {}).get("value")
         if grain and sorted(c.lower() for c in grain_declared) != sorted(grain):
-            out.append(
-                f"'{model}' declares grain [{', '.join(grain_declared)}] and dex "
-                f"drafted [{', '.join(grain)}] from the SQL and the cache; one of "
-                "them is wrong"
-            )
+            out.append(_grain_disagreement(model, grain_declared, grain))
     return out
+
+
+def _grain_disagreement(model: str, declared: list[str], drafted: list[str]) -> str:
+    """Say how a declared grain and the drafted one differ.
+
+    A declared grain narrower than the drafted one is often right: the SQL groups
+    by a key and an attribute the key determines (``group by customer_id,
+    country_code``), so the key alone is the grain. Calling one of them wrong
+    there would push an agent to declare the wider, weaker grain, so the
+    narrower case names the condition under which it holds instead.
+    """
+
+    shown, draft = ", ".join(declared), ", ".join(drafted)
+    narrower = {c.lower() for c in declared}
+    wider = {c.lower() for c in drafted}
+    if narrower < wider:
+        rest = ", ".join(c for c in drafted if c.lower() not in narrower)
+        return (
+            f"'{model}' declares grain [{shown}], narrower than the [{draft}] dex "
+            f"drafted from the SQL and the cache; it holds only if [{shown}] "
+            f"determines {rest}, which a uniqueness test on [{shown}] proves at build"
+        )
+    if wider < narrower:
+        return (
+            f"'{model}' declares grain [{shown}], wider than the [{draft}] dex "
+            f"drafted from the SQL and the cache; if [{draft}] is already unique, "
+            "it is the grain and the extra columns are attributes"
+        )
+    return (
+        f"'{model}' declares grain [{shown}] and dex drafted [{draft}] from the "
+        "SQL and the cache; one of them is wrong"
+    )

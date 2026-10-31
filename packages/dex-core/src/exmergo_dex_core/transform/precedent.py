@@ -57,7 +57,14 @@ MAX_MODELS = 5
 #: column, which for a population question means it keeps every value.
 NO_USE = "none"
 
-_FIRST_CLAUSE = {"where": 0, "having": 1, "qualify": 2, "case": 3, "aggregation": 4}
+_FIRST_CLAUSE = {
+    "where": 0,
+    "having": 1,
+    "qualify": 2,
+    "join": 3,
+    "case": 4,
+    "aggregation": 5,
+}
 
 
 def usage_of(

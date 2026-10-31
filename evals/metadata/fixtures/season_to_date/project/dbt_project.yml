@@ -1,0 +1,11 @@
+name: league
+version: "1.0.0"
+profile: league
+model-paths: ["models"]
+
+models:
+  league:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

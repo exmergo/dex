@@ -1,0 +1,45 @@
+{
+  "models": {
+    "account_ticket_summary": {
+      "grain": [
+        "account_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "ticket_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "account_id": {
+          "role": "key"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every account is present",
+      "expect": 40,
+      "sql": "select count(*) from main.account_ticket_summary"
+    },
+    {
+      "name": "only real accounts",
+      "expect": 0,
+      "sql": "select count(*) from main.account_ticket_summary where account_id not in (select account_id from raw.accounts)"
+    },
+    {
+      "name": "accounts with no tickets count zero, not NULL",
+      "expect": 15,
+      "sql": "select count(*) from main.account_ticket_summary where ticket_count = 0"
+    },
+    {
+      "name": "ticket counts match",
+      "expect": 0,
+      "sql": "select count(*) from main.account_ticket_summary s join (select a.account_id, count(t.ticket_id) as n from raw.accounts a left join raw.tickets t using (account_id) group by 1) e using (account_id) where s.ticket_count is distinct from e.n"
+    }
+  ]
+}

@@ -385,6 +385,15 @@ installed) with `python -m evals skills/<skill>`. If a future backend needs a
 real Python dependency, promote `evals/` to its own uv project at that point and
 not before. See `evals/README.md` for the rationale and full usage.
 
+The one exception is the metadata-quality eval in `evals/metadata/` (#492), which
+needs DuckDB, PyYAML and dbt and so runs in the engine's environment. It imports
+them only when run, so the core above stays stdlib-only:
+
+```
+uv run --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
+uv run --project packages/dex-core --extra duckdb python -m evals metadata --reference
+```
+
 ## Writing a storage backend
 
 `.dex/` state lives behind a `Store` protocol, and the contract is public so a

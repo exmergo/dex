@@ -1,0 +1,11 @@
+name: inventory
+version: "1.0.0"
+profile: inventory
+model-paths: ["models"]
+
+models:
+  inventory:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

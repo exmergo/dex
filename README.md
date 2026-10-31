@@ -74,6 +74,14 @@ not run in claude.ai chat.
 uv run --no-project --script skills/<skill>/scripts/run.py --warm
 ```
 
+> [!TIP]
+> **Give every agent in your repository the same procedure.** `dex procedure
+> --block` prints the procedure every Dex skill follows, ready to paste into your
+> `CLAUDE.md` or `AGENTS.md`, so an agent follows it even before it loads a skill.
+> Dex never writes the file; `dex procedure --check CLAUDE.md` tells you when an
+> upgrade has made your copy stale. See
+> [`dex procedure`](https://docs.exmergo.com/dex/cli/procedure).
+
 What you get:
 
 - **Explore** a warehouse you have never seen. Ranked inventory, column profiles built from aggregates, PII flags, verified joins, and an ER diagram.
