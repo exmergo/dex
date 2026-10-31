@@ -382,3 +382,48 @@ def test_billed_full_refresh_prices_without_upper_bounds(
     assert envelope["status"] == "needs_confirmation"
     assert priced["full_refresh"] is True
     assert "upper_bounds" not in envelope["data"]
+
+
+def test_a_model_that_keeps_its_batch_filter_is_still_an_upper_bound(
+    bigquery_project_dir: Path,  # noqa: F811 -- the fixture imported above
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    """`full_refresh: false` keeps the incremental branch under --full-refresh,
+    so that model's line is still priced unpruned and still named."""
+
+    from tests.transform.test_build import _write_incremental_artifacts
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    adapter = _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"stg_events": 6_000_000_000.0, "dim_customers": 1_000_000_000.0},
+        confirmed=False,
+        ceiling=10_000_000_000,
+    )
+    adapter.prunes_dynamic_bounds_at_run_time = True
+    # What the compile leaves for a node that kept its watermark filter.
+    _write_incremental_artifacts(bigquery_project_dir)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--full-refresh",
+            "--budget",
+            "10000000000",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert set(envelope["data"]["upper_bounds"]) == {"stg_events"}

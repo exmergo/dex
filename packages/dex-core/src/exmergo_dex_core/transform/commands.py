@@ -3387,6 +3387,7 @@ def build(
             artifact_directory=artifacts_dir,
             full_refresh=full_refresh,
         )
+        logged_id = summary.pop("logged_invocation_id", None)
         # Before the shaping on both paths, so the two read the same way; here
         # there is no gate to outlive, on the billed path below there is.
         verification = _verify_build(engine, project, summary, verify)
@@ -3407,6 +3408,7 @@ def build(
                 for_plan_document,
                 artifact_directory=artifacts_dir,
                 full_refresh=full_refresh,
+                expected_invocation_id=logged_id,
             ),
             decisions=_built_decisions(engine, summary),
             engine=engine,
@@ -3460,6 +3462,7 @@ def build(
             artifact_directory=artifacts_dir,
             full_refresh=full_refresh,
         )
+        logged_id = summary.pop("logged_invocation_id", None)
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
         # why the confirm ask carries no number. `billed_handshake` never ran on
@@ -3540,6 +3543,7 @@ def build(
             for_plan_document,
             artifact_directory=artifacts_dir,
             full_refresh=full_refresh,
+            expected_invocation_id=logged_id,
         ),
         decisions=decisions,
         uncapped=bool(dev_target.missing_cap_references(project, target, connector)),
@@ -4199,8 +4203,9 @@ def _price_build(
 
     ``artifact_directory`` is the build's own, so the compile writes, and every
     read below reads, where the build will. ``full_refresh`` prices each
-    incremental node as the full rebuild it will run, so there is no batch
-    filter left to call an upper bound.
+    incremental node as the full rebuild it will run, so a rebuilt node has no
+    batch filter left to call an upper bound; one whose own `full_refresh: false`
+    keeps its filter is still named.
     """
 
     from .build import _build_env, compile_estimate, needs_deps
@@ -4282,9 +4287,9 @@ def _price_build(
                 estimate += facts
                 per_node = {**per_node, "(declared facts)": facts}
         upper_bounds: dict[str, str] = {}
-        if not full_refresh and getattr(
-            adapter, "prunes_dynamic_bounds_at_run_time", False
-        ):
+        # Under a full refresh the rebuilt nodes compile without their batch
+        # filter, so only a model whose `full_refresh: false` keeps it is named.
+        if getattr(adapter, "prunes_dynamic_bounds_at_run_time", False):
             from .build import dynamic_bound_nodes
 
             upper_bounds = {
@@ -4335,6 +4340,7 @@ def _build_evidence(
     *,
     artifact_directory: Path | None = None,
     full_refresh: bool = False,
+    expected_invocation_id: str | None = None,
 ) -> BuildEvidence | None:
     """Read dbt's artifacts and say what the build established, or nothing.
 
@@ -4379,8 +4385,11 @@ def _build_evidence(
             source_digest=source_digest,
             artifact_directory=artifact_directory,
             full_refresh=full_refresh,
+            expected_invocation_id=expected_invocation_id,
         )
     except Exception:
+        # Includes ForeignInvocationError: results another invocation wrote
+        # yield no evidence rather than evidence about the wrong run.
         return None
 
 

@@ -482,3 +482,90 @@ def test_the_shared_policy_refusal_is_a_guard(
     assert envelope["status"] == "error"
     assert envelope["reason"] == "guard"
     assert "dbt clean" in envelope["errors"][0]
+
+
+def test_dbt_1_12_engine_spelling_of_the_target_path_wins(
+    dbt_project_dir: Path, monkeypatch
+):
+    """dbt 1.12 reads DBT_ENGINE_TARGET_PATH before DBT_TARGET_PATH."""
+
+    monkeypatch.setenv("DBT_TARGET_PATH", "old_name")
+    monkeypatch.setenv("DBT_ENGINE_TARGET_PATH", "engine_name")
+    assert shared_target_dir(dbt_project_dir) == dbt_project_dir / "engine_name"
+
+
+def test_a_relative_project_path_reads_its_semantic_manifest(
+    dbt_project_dir: Path, monkeypatch
+):
+    """The resolved path is absolute, so `project / path` cannot double it."""
+
+    import os
+
+    from exmergo_dex_core.dbt_project import _read_semantic_manifest
+
+    target = dbt_project_dir / "target"
+    target.mkdir()
+    (target / "semantic_manifest.json").write_text(
+        json.dumps({"semantic_models": [{"name": "orders"}]}), encoding="utf-8"
+    )
+    monkeypatch.chdir(dbt_project_dir.parent)
+    relative = Path(os.path.relpath(dbt_project_dir))
+    read = _read_semantic_manifest(relative)
+    assert read is not None
+    assert read[0]["semantic_models"][0]["name"] == "orders"
+
+
+def test_isolated_dbt_children_drop_the_engine_spelling_too(monkeypatch):
+    from exmergo_dex_core.transform.build import _child_environ
+
+    monkeypatch.setenv("DBT_ENGINE_FULL_REFRESH", "true")
+    monkeypatch.setenv("DBT_ENGINE_TARGET_PATH", "/elsewhere")
+    monkeypatch.setenv("DBT_FULL_REFRESH", "true")
+    env = _child_environ(isolated=True)
+    assert "DBT_ENGINE_FULL_REFRESH" not in env
+    assert "DBT_ENGINE_TARGET_PATH" not in env
+    assert "DBT_FULL_REFRESH" not in env
+
+
+def test_foreign_run_results_yield_no_evidence_through_the_cli(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The summary refuses foreign results, and the evidence must not then
+    report them as this build's `validated` outcome."""
+
+    import importlib
+
+    import yaml
+
+    from exmergo_dex_core.cli import main
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def fake(timeout, cwd, env=None):
+        def run(argv):
+            if argv[1] == "build":
+                out = Path(argv[argv.index("--target-path") + 1])
+                _write_success(out, invocation_id="someone-else")
+            log = json.dumps({"info": {"invocation_id": "this-run", "name": "Main"}})
+            return subprocess.CompletedProcess(argv, 0, stdout=log + "\n", stderr="")
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        yaml.safe_dump(
+            {
+                "connector": "duckdb",
+                "duckdb": {"path": str(tmp_path / "dev.duckdb")},
+                "dbt_project_dir": dbt_project_dir.name,
+            }
+        )
+    )
+    main(["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"])
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert envelope["data"]["success"] is False
+    assert envelope["data"].get("outcome") != "validated"
+    assert "evidence" not in envelope["data"] or envelope["data"]["evidence"] is None
+    assert "logged_invocation_id" not in envelope["data"]

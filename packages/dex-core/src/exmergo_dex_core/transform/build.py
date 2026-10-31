@@ -664,6 +664,11 @@ def _child_environ(*, isolated: bool = False) -> dict[str, str]:
     withheld = set(_CHILD_ENV_WITHHELD)
     if isolated:
         withheld.update(_ISOLATED_ENV_SCRUBBED)
+        # dbt 1.12 reads each of these first as `DBT_ENGINE_<NAME>`, so the old
+        # name alone would leave the setting in place.
+        withheld.update(
+            name.replace("DBT_", "DBT_ENGINE_", 1) for name in _ISOLATED_ENV_SCRUBBED
+        )
     env = {key: value for key, value in os.environ.items() if key not in withheld}
     # dbt writes a `.user.yml` into the profiles directory when usage tracking
     # is on, and the profiles directory here is often the real project.
@@ -1412,8 +1417,9 @@ def full_refresh_unselected_warning(rebuilt: dict[str, list[str]]) -> str:
     seeds = _count(len(rebuilt["seeds"]), "seed")
     return (
         "--full-refresh with no --select rebuilds every incremental model and "
-        f"seed in the project: {models} and {seeds}. Name the models whose "
-        "logic changed with --select to rebuild only those"
+        "seed dbt's default selection reaches (the whole project, unless a "
+        f"default selector narrows it): {models} and {seeds}. Name the models "
+        "whose logic changed with --select to rebuild only those"
     )
 
 
@@ -2089,4 +2095,10 @@ def _summarize(
         summary["artifact_directory"] = sanitize_artifact_directory(
             paths.directory, project_root=project
         )
+    # An internal hand-off like `bytes_billed`, popped by the command layer
+    # before shaping: the evidence read is held to the invocation this run
+    # logged, so a foreign run_results never yields evidence either.
+    logged_id = _logged_invocation_id(completed)
+    if artifact_directory is not None and logged_id is not None:
+        summary["logged_invocation_id"] = logged_id
     return summary

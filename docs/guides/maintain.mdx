@@ -66,8 +66,11 @@ changes and advisory findings, then apply the returned plan ID and build on dev:
 
 ```bash
 dex transform apply PLAN_ID
-dex transform build --target dev --verify
+dex transform build --target dev --verify --for-plan PLAN_ID
 ```
+
+Read `data.outcome` and `data.evidence.coverage`: only `validated` means the
+build ran every node the repair changed.
 
 Only refresh the baseline after the result is accepted. Taking a new snapshot
 before investigating drift makes the changed state the new comparison point.

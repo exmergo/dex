@@ -32,10 +32,10 @@ the file in the project's target path. After a Dex build that is Dex's; after
 the user's own ``dbt parse`` it is theirs.
 
 :func:`shared_target_dir` resolves the project's target path the way dbt does:
-``DBT_TARGET_PATH``, then ``target-path`` in ``dbt_project.yml``, then
-``target``. A reader that names an expected invocation id refuses results from
-a different invocation. Missing artifacts stay missing. Neither case is a
-successful completion.
+``DBT_ENGINE_TARGET_PATH``, then ``DBT_TARGET_PATH``, then ``target-path`` in
+``dbt_project.yml``, then ``target``. A reader that names an expected
+invocation id refuses results from a different invocation. Missing artifacts
+stay missing. Neither case is a successful completion.
 """
 
 from __future__ import annotations
@@ -322,14 +322,20 @@ def dbt_runtime_key() -> str | None:
 def shared_target_dir(project_root: Path | str) -> Path:
     """The project's own target path, resolved the way dbt resolves it.
 
-    ``DBT_TARGET_PATH`` wins, then ``target-path`` in ``dbt_project.yml``, then
-    ``target``. A relative path is relative to the project. A value carrying
-    Jinja cannot be rendered here and falls back to ``target``, which is what a
-    reader would have assumed before this function existed.
+    ``DBT_ENGINE_TARGET_PATH`` wins (dbt 1.12's spelling, read before the old
+    one), then ``DBT_TARGET_PATH``, then ``target-path`` in ``dbt_project.yml``,
+    then ``target``. A relative path is relative to the project, which is made
+    absolute first so a caller holding a relative project path gets a path it can
+    open as given. A value carrying Jinja cannot be rendered here and falls back
+    to ``target``; set ``DBT_TARGET_PATH`` to the rendered path to point Dex at it.
     """
 
-    project = Path(project_root)
-    configured = os.environ.get("DBT_TARGET_PATH") or _yml_target_path(project)
+    project = Path(project_root).absolute()
+    configured = (
+        os.environ.get("DBT_ENGINE_TARGET_PATH")
+        or os.environ.get("DBT_TARGET_PATH")
+        or _yml_target_path(project)
+    )
     if not configured or "{{" in configured or "{%" in configured:
         configured = "target"
     path = Path(configured).expanduser()

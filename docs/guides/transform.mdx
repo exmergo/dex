@@ -67,13 +67,15 @@ current content so the diff you review is the one you apply.
 ## 4. Build and verify on dev
 
 ```bash
-dex transform build --target dev --verify
+dex transform build --target dev --verify --for-plan PLAN_ID
 ```
 
 On a metered connector, review the estimate and follow the
 [cost confirmation flow](/dex/guardrails/cost-controls). A successful dbt build
-is only part of the result: read `data.verification.ran`, its findings, and
-`suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
+is only part of the result. `--for-plan` makes the build report whether it ran
+every node the plan changed: read `data.outcome` (only `validated` means it did)
+and `data.evidence.coverage`. Then read `data.verification.ran`, its findings,
+and `suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
 need investigation before the change is finished.
 
 <Accordion title="Rebuild an incremental model from its full history">
@@ -88,6 +90,13 @@ dex transform build --target dev --select fct_orders --full-refresh --verify
 A full refresh drops and rebuilds selected incremental relations on dev. It can
 scan substantially more data. Review the full-rebuild estimate before approving
 it; this flag is not a routine fix for a failed build.
+
+A model configured with `full_refresh: false` is not rebuilt: check
+`data.full_refresh.not_refreshed` before treating a selected relation as
+rebuilt. `--verify` does not run its row-population checks on incremental
+models, so a green verification does not show the rebuilt history is right.
+Check the rebuilt rows yourself before accepting the change, for example with
+`dex explore profile <relation> --target dev --refresh`.
 
 </Accordion>
 

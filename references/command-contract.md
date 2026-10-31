@@ -1084,10 +1084,13 @@ default, or a filter or operator after it is refused. A key naming a location
   build, since a full rebuild scans the model's whole history.
 
   The pricing compile runs with `--full-refresh` too, so `is_incremental()`
-  renders false and each selected incremental model is priced as the full
-  `SELECT` that runs rather than as its batch. On BigQuery there is then no
-  watermark filter, and no `data.upper_bounds` line. A note in the estimate
-  counts the incremental models and seeds priced that way.
+  renders false and each rebuilt incremental model is priced as the full
+  `SELECT` that runs rather than as its batch. On BigQuery its line then has no
+  watermark filter and is not an upper bound. A model whose own
+  `full_refresh: false` makes dbt ignore the flag keeps its incremental branch
+  and its watermark filter, so its line is still named under
+  `data.upper_bounds`. A note in the estimate counts the incremental models and
+  seeds priced as a full rebuild.
 
   `data.full_refresh` is `{requested: true, models, seeds, not_refreshed,
   success}`, read from the build's own artifacts. `models` are the selected
@@ -1096,7 +1099,8 @@ default, or a filter or operator after it is refused. A key naming a location
   rows are not read as rebuilt. Tables and views are rebuilt by every build and
   are not listed. Snapshots ignore the flag. `data.evidence.invocation.full_refresh`
   is `true`, and `false` on every other build. With no `--select`, a `warnings`
-  line counts the incremental models and seeds the whole project rebuilds. The
+  line counts the incremental models and seeds the build selected, which is the
+  whole project unless a default selector in `selectors.yml` narrows it. The
   DuckDB stale-seed refresh above does not run, since the build already
   rebuilds every seed it selects. A failed build keeps `dbt build failed` as
   its `errors[0]` prefix. `--verify` is unchanged; its row-population checks
@@ -1125,9 +1129,12 @@ default, or a filter or operator after it is refused. A key naming a location
     names both ways out: `dbt clean` with the runtime that wrote it, or unset
     the setting. Nothing is deleted.
 
-  The target path resolves the way dbt resolves it: `DBT_TARGET_PATH`, then
-  `target-path` in `dbt_project.yml`, then `target`. A templated value falls
-  back to `target`. `data.artifact_directory` is the project-relative label of
+  The target path resolves the way dbt resolves it: `DBT_ENGINE_TARGET_PATH`
+  (dbt 1.12's spelling, read first), then `DBT_TARGET_PATH`, then `target-path`
+  in `dbt_project.yml`, then `target`. A templated `target-path` cannot be
+  rendered here and falls back to `target`; setting `DBT_TARGET_PATH` to the
+  rendered path points readers and the `shared` policy at the directory dbt
+  uses. `data.artifact_directory` is the project-relative label of
   the directory written.
 
   Readers do not know which tool wrote last. Every manifest, semantic-manifest
@@ -1138,9 +1145,11 @@ default, or a filter or operator after it is refused. A key naming a location
 
   dbt's JSON log names the invocation on every line. A `run_results.json` that
   names a different invocation (an earlier run, another tool) has its nodes
-  dropped, and the build is reported as a failure that says so. A missing one
-  is `not_run` or `empty_selection` in the evidence. Neither is ever a
-  successful completion.
+  dropped, the build is reported as a failure that says so, and no evidence is
+  built from it. A missing `run_results.json` is `not_run` in the evidence, and
+  one that lists no nodes is `empty_selection`. `success` stays dbt's exit code,
+  so it can be `true` for either of those: read `data.outcome`, never `success`
+  alone, to learn whether the build established anything.
 - `transform build --verify` runs the `maintain verify` sweep over the nodes
   this build touched and reports it under `data.verification`, in one envelope
   with the build result. Opt-in on every connector, free ones included.

@@ -197,16 +197,22 @@ the rows the old logic wrote stay in the dev table until the model is rebuilt.
 It is not a routine build. A full rebuild scans the model's whole history.
 
 - Name the model with `--select`. With no `--select`, every incremental model
-  and seed in the project is rebuilt, and a warning gives the count.
-- The cost preflight compiles with `--full-refresh`, so each incremental model
-  is priced as the full rebuild that runs, not as a batch. On BigQuery that
-  means no `data.upper_bounds` line, because there is no watermark filter left.
+  and seed dbt's default selection reaches is rebuilt: the whole project, unless
+  the project defines a default selector, which narrows it. A warning gives the
+  count of what this build actually selected.
+- The cost preflight compiles with `--full-refresh`, so each rebuilt incremental
+  model is priced as the full rebuild that runs, not as a batch. On BigQuery its
+  line is therefore not an upper bound. A model whose `full_refresh: false` keeps
+  its incremental branch keeps its watermark filter too, and its line is still
+  named under `data.upper_bounds`.
 - `data.full_refresh` is `{requested, models, seeds, not_refreshed, success}`.
   `not_refreshed` names models whose own `full_refresh: false` config makes dbt
   ignore the flag, so their old rows stay.
 - `data.evidence.invocation.full_refresh` is `true`.
 - Dev target only, like every build. `--verify` works the same way afterwards.
-  Its row-population check still skips incremental models.
+  Its row-population check still skips incremental models, so a green
+  verification does not show the rebuilt rows are right: check them yourself,
+  for example with `explore profile <relation> --target dev --refresh`.
 - The DuckDB stale-seed rebuild above is skipped, because the build already
   rebuilds every seed it selects.
 
@@ -227,8 +233,12 @@ covers the build, the compile that prices it, and the seed check.
   a snapshot path another runtime left as a directory, or a `manifest.json` from
   a different dbt minor version. The refusal names the recovery (`dbt clean`
   with that runtime, or unset the setting). Dex deletes nothing.
-- The target path resolves the way dbt resolves it: `DBT_TARGET_PATH`, then
-  `target-path` in `dbt_project.yml`, then `target`.
+- The target path resolves the way dbt resolves it: `DBT_ENGINE_TARGET_PATH`
+  (dbt 1.12's spelling), then `DBT_TARGET_PATH`, then `target-path` in
+  `dbt_project.yml`, then `target`. Dex cannot render a `target-path` written
+  with Jinja and falls back to `target` for it; set `DBT_TARGET_PATH` to the
+  rendered path so readers, and the `shared` policy, use the directory dbt
+  does.
 - `data.artifact_directory` names the directory the build wrote. Readers such
   as `maintain verify`, local `explore semantic`, `transform ground` and
   `--use-project` take the newer of Dex's directory and the project's own, so
