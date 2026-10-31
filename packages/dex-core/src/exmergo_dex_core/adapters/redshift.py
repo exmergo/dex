@@ -141,6 +141,8 @@ _OID_TYPE_NAMES = {
     1700: "numeric",
     2950: "uuid",
     3802: "super",
+    # What SUPER reports on a live workgroup. The driver names no constant for it.
+    4000: "super",
 }
 
 _ESTIMATE_QUALITY_NOTE = (
@@ -1194,6 +1196,23 @@ class RedshiftAdapter:
         }
 
     # --- execution (the single billed door) --------------------------------------
+
+    #: A ``LIMIT 0`` still runs on the cluster, and on Serverless wakes it at its
+    #: 60-second minimum, so a comparison prices before it reads a schema here.
+    describe_query_free = False
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        _rows, labels, types = self._run_rows(
+            f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
+            fetch_rows=1,
+        )
+        return [
+            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
+            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+        ]
 
     def run_query(
         self,

@@ -112,6 +112,8 @@ INTERNAL_REFUSALS = {
     # Control flow inside multiset compare. Callers catch it and render
     # reason_code. It is not a boundary type.
     "_NotCheckedError",
+    # The same, one level up: `transform compare` reports it as a reason_code.
+    "_NotComparableError",
     # The transform surface. Every one of these needs a repo_root, so they sit
     # outside "reachable from the public API without a repo_root". Worth
     # revisiting as a family if a host ever drives transform programmatically.

@@ -1261,6 +1261,32 @@ class DatabricksAdapter:
 
     # --- execution (the single billed door) --------------------------------------
 
+    #: ``DESCRIBE QUERY`` runs on the SQL warehouse and can start a stopped one,
+    #: so a comparison prices before it reads a schema here.
+    describe_query_free = False
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from ``DESCRIBE QUERY``, which reads no
+        rows but needs the warehouse."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        cursor = self._billed_cursor()
+        started = self._clock()
+        statement = f"DESCRIBE QUERY {checked}"
+        try:
+            cursor.execute(statement)
+            rows = cursor.fetchall()
+        except Exception as exc:
+            self._record_elapsed(started, cursor, statement)
+            raise self._translate(exc, None) from exc
+        self._record_elapsed(started, cursor, statement)
+        return [
+            ColumnMeta(
+                name=str(row[0]), data_type=str(row[1]), nullable=True, ordinal=ordinal
+            )
+            for ordinal, row in enumerate(rows)
+        ]
+
     def run_query(
         self,
         sql: str,

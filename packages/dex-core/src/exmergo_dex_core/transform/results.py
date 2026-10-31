@@ -85,6 +85,10 @@ class PlanResult(Result):
     # layer, offered here where it does not. Absent when no declared mart was
     # touched.
     semantic_proposal: dict[str, Any] | None = None
+    # The free pointer to `transform compare` on a plan that rewrites a model
+    # that already exists (#856). Planning scans nothing for it. Absent when the
+    # plan rewrites none.
+    refactor_comparison_offer: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -94,6 +98,8 @@ class PlanResult(Result):
             "paths": self.paths,
             "plan_path": self.plan_path,
         }
+        if self.refactor_comparison_offer is not None:
+            payload["refactor_comparison_offer"] = self.refactor_comparison_offer
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.declarations is not None:
@@ -423,6 +429,60 @@ class DepsResult(Result):
         if not self.ran:
             return {"ran": False, "reason": self.reason}
         return {"ran": True, **self.summary}
+
+
+class RefactorComparisonResult(Result):
+    """Whether a stored plan keeps one model's results on the compared inputs.
+
+    ``status`` is ``equivalent``, ``different`` or ``not_checked``, and
+    ``reason_code`` says which of them and why. ``equivalent`` means the schema
+    and the row multiset matched on ``input_scope`` at ``compared_at``. It is not
+    a claim about a build, or about any input that was not compared. Every field
+    here is a count, a name or a type: no row comes back.
+
+    ``keyed`` is present only when a key was given or declared, and unique on both
+    sides. ``key_source`` says which, because a key the request named and one a
+    declaration stated are different evidence.
+    """
+
+    plan_id: str = ""
+    model: str = ""
+    target: str = ""
+    status: str = "not_checked"
+    reason_code: str = ""
+    detail: str | None = None
+    compared_at: str = ""
+    baseline_compiled: str | None = None
+    proposed_compiled: str | None = None
+    input_scope: list[str] = Field(default_factory=list)
+    schema_diff: dict[str, Any] | None = None
+    multiset: dict[str, Any] | None = None
+    key_columns: list[str] | None = None
+    key_source: str | None = None
+    keyed: dict[str, Any] | None = None
+    keyed_reason: str | None = None
+    profiled_on_demand: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "model": self.model,
+            "target": self.target,
+            "status": self.status,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "compared_at": self.compared_at,
+            "baseline_compiled": self.baseline_compiled,
+            "proposed_compiled": self.proposed_compiled,
+            "input_scope": self.input_scope,
+            "schema": self.schema_diff,
+            "multiset": self.multiset,
+            "key_columns": self.key_columns,
+            "key_source": self.key_source,
+            "keyed": self.keyed,
+            "keyed_reason": self.keyed_reason,
+            "profiled_on_demand": self.profiled_on_demand,
+        }
 
 
 class MutationCoverageResult(Result):

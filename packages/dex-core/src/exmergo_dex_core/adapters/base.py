@@ -1029,10 +1029,14 @@ class Adapter(Protocol):
       where the table cannot be probed in one statement; the caller then issues
       the separate probes exactly as it would without the pair.
     - ``describe_query(sql)``: output columns of one SELECT, in order, without
-      executing it. Returns a list of :class:`ColumnMeta`. Reading a query's
+      reading any row. Returns a list of :class:`ColumnMeta`. Reading a query's
       output schema is metadata, and ``DESCRIBE`` is not a SELECT
       ``run_query`` can re-assert, so it stays on the adapter. An adapter
-      without it leaves a refactor comparison unchecked.
+      without it reports a refactor comparison as
+      ``comparison_unsupported_on_connector``.
+    - ``describe_query_free``: ``False`` where ``describe_query`` runs on paid
+      compute (it can start a stopped warehouse), so a comparison prices first.
+      Absent reads as free.
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".

@@ -1089,6 +1089,19 @@ class PostgresAdapter:
 
     # --- execution (the single billed door) --------------------------------------
 
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        _rows, labels, types = self._run_rows(
+            f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
+            fetch_rows=1,
+        )
+        return [
+            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
+            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+        ]
+
     def run_query(
         self,
         sql: str,

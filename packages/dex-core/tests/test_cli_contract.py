@@ -767,6 +767,17 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "and is not a DexEngine method"
         ),
     },
+    ("transform", "compare"): {
+        "method": "compare",
+        "args": {
+            "plan_id": "plan_id",
+            "model": "model",
+            "map": "column_mapping",
+            "key": "key_columns",
+            "accept_type": "accepted_type_changes",
+            "target": "target",
+        },
+    },
     ("semantic", "define"): {
         "method": "semantic_define",
         "args": {
