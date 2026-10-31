@@ -892,9 +892,10 @@ def test_the_local_catalog_omits_the_population_sentence_a_build_compiles(
     rc, built = _run([*root, "transform", "build", "--target", "dev"], capsys)
     assert rc == 0, built
 
-    compiled = json.loads(
-        (dbt_project_dir / "target" / "semantic_manifest.json").read_text("utf-8")
-    )
+    # Where the build wrote it: Dex's isolated artifact directory (#1014).
+    from exmergo_dex_core.dbt_project import semantic_manifest_file
+
+    compiled = json.loads(semantic_manifest_file(dbt_project_dir).read_text("utf-8"))
     (entry,) = [m for m in compiled["semantic_models"] if m["name"] == "fct_orders"]
     assert "Population: Paid and shipped orders" in entry["description"]
     assert entry["config"]["meta"]["dex"]["population"] == POPULATED["population"]
