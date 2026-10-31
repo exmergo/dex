@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DbtProjectError, node_files
@@ -312,7 +313,7 @@ def test_a_dev_build_compiles_an_applied_analysis_and_materializes_nothing(
     names = {n["name"] for n in envelope["data"]["nodes"]}
     assert "email_skew" not in names
     manifest = json.loads(
-        (dbt_project_dir / "target" / "manifest.json").read_text(encoding="utf-8")
+        (dex_target(dbt_project_dir) / "manifest.json").read_text(encoding="utf-8")
     )
     assert "analysis.dex_test.email_skew" in manifest["nodes"]
 

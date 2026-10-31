@@ -74,8 +74,32 @@ from .semantic_catalog import (
 
 PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
+# Where dbt writes by default. Readers go through :func:`manifest_file` and
+# :func:`semantic_manifest_file`, which honor the project's target path and
+# Dex's own isolated artifact directory (issue #1014); these name the default
+# for messages and for callers that predate them.
 MANIFEST_PATH = Path("target") / "manifest.json"
 SEMANTIC_MANIFEST_PATH = Path("target") / "semantic_manifest.json"
+
+
+def manifest_file(project: Path | str) -> Path:
+    """The ``manifest.json`` to read: the newest of Dex's and the project's.
+
+    See :func:`~.transform.artifact_runtime.readable_artifact`.
+    """
+
+    from .transform.artifact_runtime import readable_artifact
+
+    return readable_artifact(project, "manifest.json")
+
+
+def semantic_manifest_file(project: Path | str) -> Path:
+    """The ``semantic_manifest.json`` to read, chosen as :func:`manifest_file`."""
+
+    from .transform.artifact_runtime import readable_artifact
+
+    return readable_artifact(project, "semantic_manifest.json")
+
 
 # The ref()/source() call shapes as they appear in model SQL, schema YAML test
 # arguments, and semantic-model `model:` fields. Shared by every reader that
@@ -309,14 +333,12 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
             )
 
     manifest: dict[str, Any] | None = None
-    manifest_file = root / MANIFEST_PATH
-    if manifest_file.is_file():
+    compiled = manifest_file(root)
+    if compiled.is_file():
         try:
-            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            manifest = json.loads(compiled.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise DbtProjectError(
-                f"corrupt manifest at {manifest_file}: {exc}"
-            ) from exc
+            raise DbtProjectError(f"corrupt manifest at {compiled}: {exc}") from exc
 
     return DbtProjectView(
         root=str(root),
@@ -1764,7 +1786,7 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
 
 
 def _read_semantic_manifest(project: Path) -> tuple[dict[str, Any], str] | None:
-    return _read_semantic_manifest_file(project, SEMANTIC_MANIFEST_PATH)
+    return _read_semantic_manifest_file(project, semantic_manifest_file(project))
 
 
 @dataclass

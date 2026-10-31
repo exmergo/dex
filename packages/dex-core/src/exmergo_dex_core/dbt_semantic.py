@@ -11,7 +11,7 @@ from .metricflow_dialect import METRIC_TIME, STANDARD_GRAINS, order_grains
 
 
 def read_semantic_manifest(
-    project: Path, manifest_path: str
+    project: Path, manifest_path: str | Path
 ) -> tuple[dict[str, Any], str] | None:
     """Return a usable compiled semantic manifest and its original text."""
 

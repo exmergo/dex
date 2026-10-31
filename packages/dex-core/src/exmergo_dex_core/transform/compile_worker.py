@@ -14,9 +14,58 @@ import threading
 from pathlib import Path
 
 
+def guard_unopened_connections(manager, lazy, states) -> None:
+    """Release a connection that was never opened without opening it.
+
+    Releasing such a connection is not database access. dbt-bigquery's
+    ``close()`` reads ``connection.handle`` only to close it, and reading the
+    property resolves the lazy handle, which this worker refuses. So every
+    compile on BigQuery failed in ``before_run``'s ``connection_named("master")``
+    before any model compiled (#1001, found dogfooding #1015). A connection
+    whose handle is still lazy is marked closed instead. One that was opened
+    cannot exist here, since opening is what the worker refuses.
+
+    ``manager``, ``lazy`` and ``states`` are dbt's ``BaseConnectionManager``,
+    ``LazyHandle`` and ``ConnectionState``, passed in so this module still
+    imports without dbt.
+    """
+
+    def never_opened(connection) -> bool:
+        return isinstance(getattr(connection, "_handle", None), lazy)
+
+    original_release = manager.release
+    original_cleanup = manager.cleanup_all
+
+    def release(self):
+        with self.lock:
+            connection = self.get_if_exists()
+        if connection is not None and never_opened(connection):
+            connection.state = states.CLOSED
+            return None
+        return original_release(self)
+
+    def cleanup_all(self):
+        with self.lock:
+            unopened = [c for c in self.thread_connections.values() if never_opened(c)]
+            for connection in unopened:
+                connection.state = states.CLOSED
+            if len(unopened) == len(self.thread_connections):
+                self.thread_connections.clear()
+                return None
+        return original_cleanup(self)
+
+    manager.release = release
+    manager.cleanup_all = cleanup_all
+
+
 def main() -> int:
     import agate
-    from dbt.adapters.contracts.connection import AdapterResponse, LazyHandle
+    from dbt.adapters.base.connections import BaseConnectionManager
+    from dbt.adapters.contracts.connection import (
+        AdapterResponse,
+        ConnectionState,
+        LazyHandle,
+    )
     from dbt.cli.main import dbtRunner
     from dbt.context.providers import ParseDatabaseWrapper, RuntimeDatabaseWrapper
     from dbt_common.exceptions import CompilationError
@@ -110,6 +159,8 @@ def main() -> int:
         RuntimeDatabaseWrapper.__getattr__
     )
     LazyHandle.resolve = no_handle
+
+    guard_unopened_connections(BaseConnectionManager, LazyHandle, ConnectionState)
 
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     argv = [

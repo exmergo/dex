@@ -3266,6 +3266,8 @@ def build(
     for_plan: str | None = None,
     for_plan_document: Any = None,
     dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
+    full_refresh: bool = False,
+    artifacts: str | None = None,
 ) -> BuildResult:
     """Run ``dbt build`` against the dev target, cost-surfaced first.
 
@@ -3292,6 +3294,15 @@ def build(
     ``dependencies`` is the sandbox switch. The default installs missing packages
     post-gate as it always has; ``REFUSE`` names them and stops, which is the
     right outcome where there is no network to install from.
+
+    ``full_refresh`` rebuilds the selected incremental models and seeds from
+    scratch (issue #1015): the build passes ``--full-refresh`` to dbt, the
+    pricing compile renders the same full rebuild, and the result names what was
+    rebuilt under ``full_refresh``.
+
+    Every dbt invocation here (the pricing compile, the build, the settlement
+    read after a failure) uses one artifact directory, resolved once from
+    ``transform.artifacts`` before anything runs (issue #1014).
 
     The order mirrors the documented gate: the dev-target check runs first (free,
     and it must refuse a broken or undeployable target before anyone weighs a
@@ -3321,6 +3332,7 @@ def build(
     # re-exports the build *function* under the same name as the module, and the
     # submodule-path form resolves the module unambiguously.
     from . import dev_target
+    from .artifact_runtime import resolve_build_artifact_dir
     from .build import assert_dev_target, assert_packages_installed
     from .build import (
         build as run_build,
@@ -3336,6 +3348,10 @@ def build(
     connector = engine.connector or config.connector
 
     project = engine.project_dir()
+    # Free, and ahead of the dev-target check and pricing: a shared directory
+    # another dbt runtime left incompatible refuses before anything is spent.
+    policy = artifacts or config.transform.artifacts
+    artifacts_dir = resolve_build_artifact_dir(project, policy)
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
@@ -3368,6 +3384,8 @@ def build(
             relation_columns=dev_target.seed_relation_columns(
                 project, target, repo_root, effective, engine.connection
             ),
+            artifact_directory=artifacts_dir,
+            full_refresh=full_refresh,
         )
         # Before the shaping on both paths, so the two read the same way; here
         # there is no gate to outlive, on the billed path below there is.
@@ -3381,7 +3399,14 @@ def build(
             extra_notes=skipped_handshake_warning(paradigm, engine.confirmed),
             verification=verification,
             evidence=_build_evidence(
-                engine, project, target, select, for_plan, for_plan_document
+                engine,
+                project,
+                target,
+                select,
+                for_plan,
+                for_plan_document,
+                artifact_directory=artifacts_dir,
+                full_refresh=full_refresh,
             ),
             decisions=_built_decisions(engine, summary),
             engine=engine,
@@ -3398,7 +3423,13 @@ def build(
         assert_packages_installed(project)
 
     estimate, per_node, price_notes, upper_bounds, adapter = _price_build(
-        engine, project, target, select, verify=verify
+        engine,
+        project,
+        target,
+        select,
+        verify=verify,
+        artifact_directory=artifacts_dir,
+        full_refresh=full_refresh,
     )
     if estimate is not None:
         command_args.billed_handshake(
@@ -3426,6 +3457,8 @@ def build(
             dev_target_check=None,
             dependencies=dependencies,
             approved_functions=frozenset(config.guards.approved_functions),
+            artifact_directory=artifacts_dir,
+            full_refresh=full_refresh,
         )
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
@@ -3460,6 +3493,7 @@ def build(
                 store=store,
                 estimate=estimate,
                 adapter=adapter,
+                artifact_directory=artifacts_dir,
             )
         raise
 
@@ -3498,7 +3532,14 @@ def build(
         adapter=adapter,
         verification=verification,
         evidence=_build_evidence(
-            engine, project, target, select, for_plan, for_plan_document
+            engine,
+            project,
+            target,
+            select,
+            for_plan,
+            for_plan_document,
+            artifact_directory=artifacts_dir,
+            full_refresh=full_refresh,
         ),
         decisions=decisions,
         uncapped=bool(dev_target.missing_cap_references(project, target, connector)),
@@ -3566,6 +3607,7 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     if getattr(args, "no_install_deps", False)
                     else DependencyPolicy.INSTALL
                 ),
+                full_refresh=getattr(args, "full_refresh", False),
             )
         )
     except BuildFailedError as exc:
@@ -4042,6 +4084,7 @@ def _settle_raised_build_spend(
     store: Store,
     estimate: float | None,
     adapter=None,
+    artifact_directory: Path | None = None,
 ) -> None:
     """Settle spend and warehouse uptime when a billed dbt run raises.
 
@@ -4059,7 +4102,10 @@ def _settle_raised_build_spend(
 
     gate = command_args.cost_gate(adapter) if adapter is not None else None
     uptime = getattr(adapter, "warehouse_uptime", None)
-    run_results_path = project / "target" / "run_results.json"
+    from .artifact_runtime import artifact_paths, readable_artifact_dir
+
+    directory = artifact_directory or readable_artifact_dir(project)
+    run_results_path = artifact_paths(directory).run_results
     summary: dict[str, Any] | None = None
 
     if run_results_path.is_file():
@@ -4069,7 +4115,9 @@ def _settle_raised_build_spend(
             completed = subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr=""
             )
-            summary = _summarize(project, target, completed)
+            summary = _summarize(
+                project, target, completed, artifact_directory=directory
+            )
         except Exception:
             summary = None
 
@@ -4134,6 +4182,8 @@ def _price_build(
     select: str | None,
     *,
     verify: bool = False,
+    artifact_directory: Path | None = None,
+    full_refresh: bool = False,
 ):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
@@ -4146,6 +4196,11 @@ def _price_build(
     server-side cap, with a note saying why no number was shown. ClickHouse
     Cloud first proves and caches its mandatory live capacity; failure there is
     re-raised before dbt can spend.
+
+    ``artifact_directory`` is the build's own, so the compile writes, and every
+    read below reads, where the build will. ``full_refresh`` prices each
+    incremental node as the full rebuild it will run, so there is no batch
+    filter left to call an upper bound.
     """
 
     from .build import _build_env, compile_estimate, needs_deps
@@ -4202,6 +4257,8 @@ def _price_build(
             select=select,
             env=compile_env,
             overhead=uptime.quote() if uptime is not None else 0.0,
+            artifact_directory=artifact_directory,
+            full_refresh=full_refresh,
             **guard_options,
         )
         if verify:
@@ -4211,7 +4268,7 @@ def _price_build(
             from .build import compiled_model_ids
             from .verify import price_declared_facts, price_verification
 
-            scope = compiled_model_ids(Path(project))
+            scope = compiled_model_ids(Path(project), artifact_directory)
             scan, scan_notes = price_verification(adapter, Path(project), scope=scope)
             notes = [*notes, *scan_notes]
             if scan:
@@ -4225,13 +4282,17 @@ def _price_build(
                 estimate += facts
                 per_node = {**per_node, "(declared facts)": facts}
         upper_bounds: dict[str, str] = {}
-        if getattr(adapter, "prunes_dynamic_bounds_at_run_time", False):
+        if not full_refresh and getattr(
+            adapter, "prunes_dynamic_bounds_at_run_time", False
+        ):
             from .build import dynamic_bound_nodes
 
             upper_bounds = {
                 label: reason
                 for label, reason in dynamic_bound_nodes(
-                    project, dialect=adapter.dialect
+                    project,
+                    dialect=adapter.dialect,
+                    artifact_directory=artifact_directory,
                 ).items()
                 if label in per_node
             }
@@ -4271,6 +4332,9 @@ def _build_evidence(
     select: str | None,
     for_plan: str | None,
     for_plan_document: Any = None,
+    *,
+    artifact_directory: Path | None = None,
+    full_refresh: bool = False,
 ) -> BuildEvidence | None:
     """Read dbt's artifacts and say what the build established, or nothing.
 
@@ -4313,6 +4377,8 @@ def _build_evidence(
             edits=edits,
             plan_digest=plan_digest,
             source_digest=source_digest,
+            artifact_directory=artifact_directory,
+            full_refresh=full_refresh,
         )
     except Exception:
         return None
@@ -4456,7 +4522,11 @@ def _shape_build_result(
     refresh_info = summary.get("full_refresh")
     if deps_info and not deps_info.get("success", True):
         prefix = "dbt deps failed"
-    elif refresh_info and not refresh_info.get("success", True):
+    elif (
+        refresh_info
+        and not refresh_info.get("requested")
+        and not refresh_info.get("success", True)
+    ):
         prefix = "dbt seed --full-refresh failed"
     else:
         prefix = "dbt build failed"

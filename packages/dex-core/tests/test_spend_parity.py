@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from tests.dbt_artifacts import dex_target
 
 pytest.importorskip("google.cloud.bigquery")
 
@@ -244,7 +245,7 @@ def _route_build(monkeypatch, root: Path, project: Path) -> None:
 
     def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
-            artifact = project / "target" / "run_results.json"
+            artifact = dex_target(project) / "run_results.json"
             artifact.parent.mkdir(parents=True, exist_ok=True)
             artifact.write_text(run_results, encoding="utf-8")
             return subprocess.CompletedProcess(

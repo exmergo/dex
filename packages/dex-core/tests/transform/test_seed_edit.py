@@ -15,6 +15,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cache import (
     ColumnProfile,
@@ -455,7 +456,7 @@ def test_a_seed_that_gains_a_column_is_rebuilt_with_full_refresh(
         ),
     )
     if cleaned:
-        shutil.rmtree(dbt_project_dir / "target")
+        shutil.rmtree(dex_target(dbt_project_dir))
     rc, envelope = _run([*build, "--verify", "--confirm"], capsys)
     assert rc == 0, envelope["errors"]
     statuses = {n["name"]: n["status"] for n in envelope["data"]["nodes"]}
@@ -490,8 +491,8 @@ def _a_seed_the_last_manifest_names(project: Path) -> str:
     seeds = project / "seeds"
     seeds.mkdir()
     (seeds / "brand_terms.csv").write_text("term,property\nacme,web\n")
-    target = project / "target"
-    target.mkdir()
+    target = dex_target(project)
+    target.mkdir(parents=True)
     uid = "seed.dex_test.brand_terms"
     (target / "manifest.json").write_text(
         json.dumps(
