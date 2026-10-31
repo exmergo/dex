@@ -4345,10 +4345,15 @@ def _apply_declared_grain(
         status = "proven"
     elif len(resolved) == 1 and live[resolved[0].lower()].is_unique is False:
         status = "contradicted"
-        dataset.data_quality.append(
-            f"{resolved[0]} is the model's declared grain but profiling found "
-            "duplicates"
-        )
+        if not any(
+            note.lower().startswith(f"{resolved[0].lower()} is declared unique in ")
+            and "profiling found duplicates" in note
+            for note in dataset.data_quality
+        ):
+            dataset.data_quality.append(
+                f"{resolved[0]} is the model's declared grain but profiling found "
+                "duplicates"
+            )
     else:
         status = "unmeasured"
     if [c.lower() for c in dataset.grain or []] != [c.lower() for c in resolved]:
