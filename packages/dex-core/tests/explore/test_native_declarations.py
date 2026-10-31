@@ -511,6 +511,31 @@ def test_catalog_withholds_stale_or_malformed_population_description(population)
     assert "private-person" not in json.dumps(notes)
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Orders. Population:\nprivate-person@example.test.",
+        "Orders. population: private-person@example.test.",
+        "Orders. Population:private-person@example.test.",
+        "Orders. Population: old-rule. Population: private-person@example.test.",
+        "Orders. Population - private-person@example.test.",
+        "Orders. Population private-person@example.test.",
+        "Orders. Population = private-person@example.test.",
+        "Orders. Populations: private-person@example.test.",
+        "Orders. population_rule: private-person@example.test.",
+    ],
+)
+def test_catalog_withholds_population_suffix_with_drifted_marker(description):
+    population = {"rule": "private-person@example.test"}
+    notes = []
+    assert (
+        catalog_description(description, {"dex": {"population": population}}, notes)
+        is None
+    )
+    assert notes
+    assert "private-person" not in json.dumps(notes)
+
+
 def test_catalog_preserves_unrelated_author_prose():
     description = "Population: the author's own description."
     assert catalog_description(description, {}, []) == description
