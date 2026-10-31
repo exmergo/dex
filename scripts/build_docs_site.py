@@ -434,13 +434,6 @@ GENERATED_PAGES: dict[str, PageMeta] = {
         "diffs.",
         "maintain",
     ),
-    "cli/viz": PageMeta(
-        "dex viz",
-        "Reference for dex viz preview, which is not yet implemented and returns a "
-        "not_implemented envelope, with the flags it accepts and the shape of what "
-        "it prints.",
-        "viz",
-    ),
     "cli/config": PageMeta(
         "dex config",
         "Reference for dex config: read every effective setting, validate "

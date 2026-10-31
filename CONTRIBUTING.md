@@ -726,7 +726,6 @@ replaces the folder.
 
 - The hosted dbt Cloud Semantic Layer is the one path outside dex's cost guard.
   Say so; never write that nothing runs without a ceiling.
-- `viz preview` is "not yet implemented", and nothing more specific.
 - No quality claims dex has not measured.
 - No connector or semantic-layer promises with dates.
 - Demo numbers come from the pinned demo output only.

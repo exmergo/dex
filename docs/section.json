@@ -70,7 +70,6 @@
               "cli/semantic",
               "cli/maintain",
               "cli/config",
-              "cli/viz",
               "cli/demo",
               "cli/procedure"
             ]

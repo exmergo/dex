@@ -242,7 +242,3 @@ the model's own tests against each, and reports which defects nothing caught.
 
 Installs or refreshes dbt packages. No confirmation needed: it writes only inside
 the project and never touches the warehouse.
-
-## `viz preview`
-
-Not yet implemented; it returns `not_implemented`.

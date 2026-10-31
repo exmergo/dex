@@ -528,9 +528,8 @@ def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
     """`dex` is a console script the wheel declares, and every agent wrapper
     invokes it expecting exactly one JSON envelope on stdout and nothing else.
 
-    `viz preview` is the command to prove that with: it is scaffolded against
-    the contract but not yet implemented, so it returns a real envelope without
-    needing a warehouse, a config, or a credential.
+    `procedure` returns the packaged agent instructions without needing a
+    warehouse, a config, or a credential.
     """
 
     import json
@@ -544,8 +543,7 @@ def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
             "--with",
             wheel,
             "dex",
-            "viz",
-            "preview",
+            "procedure",
         ],
         capture_output=True,
         text=True,
@@ -553,8 +551,9 @@ def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
     assert done.returncode == 0, done.stderr
     assert done.stdout.count("\n") == 1, "exactly one line on stdout"
     envelope = json.loads(done.stdout)
-    assert envelope["status"] == "not_implemented"
-    assert envelope["data"]["command"] == "viz preview"
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["text"].startswith("## Procedure")
+    assert envelope["data"]["digest"]
 
 
 def test_the_wheel_ships_the_typed_marker(wheel: str):

@@ -71,8 +71,7 @@ did not write.
 
 Capabilities, not final spelling. Implemented incrementally: `demo`, `procedure`, `connect test`,
 the `config` group, the `explore` group, the authoring surface (`transform`,
-`semantic`), and the `maintain` group are live; `viz preview` returns a valid
-`not_implemented` envelope until the Viz integration lands.
+`semantic`), and the `maintain` group are live.
 
 ```
 dex demo [path]                   -> generate a seeded local DuckDB warehouse (7 tables,
@@ -478,8 +477,6 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      to compile is reported first and suppresses every other check;
                                      data.suppressed names each finding class that did not run and why,
                                      declared-fact classes (unit, additivity, population) included
-dex viz preview                   -> emit the dbt semantic model to the Viz preview (not yet implemented;
-                                     the Viz integration arrives later)
 ```
 
 ### How authored content reaches the engine
@@ -1262,7 +1259,7 @@ default, or a filter or operator after it is refused. A key naming a location
 
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
-fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
+fronts `transform` and `semantic`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, `snapshot` manages the baseline, `check`
 plus `schema`/`volume`/`grain`/`semantic` detect drift (read-only), and
 `reconcile` is the only verb that emits diffs (applied through `transform
@@ -1965,5 +1962,4 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
 
 Because every skill, test, and benchmark depends on it, the contract was locked
 before the engine logic was built, and the subcommands fill in against this
-fixed boundary. Exploration, authoring, and maintenance are live today; the Viz
-preview is the last stub, pending the Viz integration.
+fixed boundary. Exploration, authoring, and maintenance are live today.

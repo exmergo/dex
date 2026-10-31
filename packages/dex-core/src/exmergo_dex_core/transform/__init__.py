@@ -5,8 +5,7 @@ and the semantic layer (dbt semantic models / MetricFlow YAML).
 drive: ``init`` (dbt project bootstrap), ``plans`` (propose/apply as reviewable
 diffs), ``validate`` (per-kind edit checks), ``build`` (gated dev-target dbt
 builds), ``semantic`` (MetricFlow YAML), and ``scaffold`` (deterministic staging
-skeletons). The Viz preview is not part of this engine: it is a separate product
-surface and stays a stub here.
+skeletons).
 
 The engine entry points are re-exported here so callers address the capability,
 not its file layout: ``transform.plan(...)``, ``transform.apply(...)``,
