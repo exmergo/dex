@@ -279,6 +279,25 @@ def _has_semantic_layer(engine: DexEngine) -> bool:
         return False
 
 
+def _is_absent_transformation_project(editable: object) -> bool:
+    """Whether the transformation project is completely absent from disk (#994).
+
+    Distinguishes an absent project from one that exists but fails to load.
+    """
+    from pathlib import Path
+
+    from ..adapters.project import DbtProject
+    from ..dbt_project import PROJECT_FILE, discover_projects
+
+    if isinstance(editable, DbtProject):
+        if editable.project_dir is not None:
+            return not (Path(editable.project_dir) / PROJECT_FILE).is_file()
+        if editable.repo_root is None:
+            return True
+        return len(discover_projects(editable.repo_root)) == 0
+    return False
+
+
 def _declared_schema_drift(
     engine: DexEngine,
     current: list,
@@ -1903,7 +1922,10 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # A repository whose only layer is a semantic one (#912, #994) still
             # has that layer's own findings to reconcile, through its own route;
             # only the project's half has nowhere to land.
-            if not _has_semantic_layer(engine):
+            if not (
+                _has_semantic_layer(engine)
+                and _is_absent_transformation_project(editable)
+            ):
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(
                 f"no transformation project to edit ({exc}), so every proposal "

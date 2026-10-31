@@ -218,3 +218,22 @@ def test_reconcile_refuses_when_neither_project_nor_layer_is_configured(
         "reconcile edits a project" in err for err in payload.get("errors", [])
     )
 
+
+
+def test_reconcile_refuses_when_project_is_invalid_even_with_layer(
+    tmp_path: Path, capsys
+):
+    """#994: An invalid transformation project refuses rather than degrading."""
+    repo = _repo(tmp_path, duplicate_line_no=True)
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+    _cli(repo, "maintain", "grain", capsys=capsys)
+
+    # Introduce an invalid dbt_project.yml (broken YAML)
+    (repo / "dbt_project.yml").write_text("name: [unclosed list", encoding="utf-8")
+
+    payload = _cli(repo, "maintain", "reconcile", capsys=capsys)
+    assert payload["_exit"] != 0
+    assert payload["status"] == "error"
+    assert any(
+        "reconcile edits a project" in err for err in payload.get("errors", [])
+    )
