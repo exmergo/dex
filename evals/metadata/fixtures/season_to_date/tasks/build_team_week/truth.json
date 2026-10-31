@@ -1,0 +1,46 @@
+{
+  "models": {
+    "fct_team_week": {
+      "grain": [
+        "season",
+        "week",
+        "team_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "wins_to_date": {
+          "role": "measure",
+          "aggregation": "max",
+          "additivity": "semi_additive",
+          "unit": "count"
+        },
+        "losses_to_date": {
+          "role": "measure",
+          "aggregation": "max",
+          "additivity": "semi_additive",
+          "unit": "count"
+        },
+        "team_id": {
+          "role": [
+            "foreign_key",
+            "key"
+          ]
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every standings row is kept",
+      "expect": 336,
+      "sql": "select count(*) from main.fct_team_week"
+    },
+    {
+      "name": "every row has its team name",
+      "expect": 0,
+      "sql": "select count(*) from main.fct_team_week where team_name is null"
+    }
+  ]
+}

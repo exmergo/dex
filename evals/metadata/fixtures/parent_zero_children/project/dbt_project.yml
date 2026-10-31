@@ -1,0 +1,11 @@
+name: support
+version: "1.0.0"
+profile: support
+model-paths: ["models"]
+
+models:
+  support:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

@@ -1468,3 +1468,18 @@ def test_a_yaml_literal_alias_is_recognized_the_same_way():
     drafts, _ = draft(["fct"], files, ["models"], cache, dialect="duckdb")
     refs = drafts["fct"]["drafted"]["columns"]["customer_id"]["references"]
     assert refs["value"] == "stg_customers.customer_id"
+
+
+def test_a_grain_narrower_than_the_group_by_is_named_as_a_condition_not_an_error():
+    from exmergo_dex_core.transform.drafting import _grain_disagreement
+
+    narrower = _grain_disagreement(
+        "customer_orders", ["customer_id"], ["customer_id", "country_code"]
+    )
+    assert "narrower than the [customer_id, country_code]" in narrower
+    assert "determines country_code" in narrower
+    assert "is wrong" not in narrower
+    wider = _grain_disagreement("m", ["order_id", "status"], ["order_id"])
+    assert "wider than the [order_id]" in wider
+    disjoint = _grain_disagreement("m", ["a"], ["b"])
+    assert disjoint.endswith("one of them is wrong")

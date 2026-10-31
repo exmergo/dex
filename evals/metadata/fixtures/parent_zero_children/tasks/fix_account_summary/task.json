@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "account_ticket_summary"
+  ],
+  "prompt": "Some accounts are missing from `account_ticket_summary`, and a few of its rows have no account name. It should have one row per account. Fix the model and rebuild it on dev."
+}

@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "fct_team_week"
+  ],
+  "prompt": "Build a mart model `fct_team_week` in models/marts with one row per team per game week of each season and these columns: `season`, `week`, `team_id`, `team_name`, `wins_to_date` and `losses_to_date`, as the published standings report them. Build it on dev when you are done."
+}

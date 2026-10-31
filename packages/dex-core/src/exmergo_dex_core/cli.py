@@ -125,6 +125,11 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     # that creates a data file, which is why it lives on its own path (see
     # `demo/warehouse.py`) rather than anywhere near a connector.
     "demo": [],
+    # procedure: the agent procedure (#502), the one text every SKILL.md and
+    # AGENTS.md carries between markers. No subcommands, and routed in `main`
+    # before an engine is built, like `config`: an agent with only the package,
+    # or a harness with no project yet, must be able to get it.
+    "procedure": [],
 }
 
 
@@ -275,6 +280,8 @@ _GROUP_HELP: dict[str, str] = {
     "config": "read, check and change .dex/config.yml, as reviewable diffs",
     "demo": "create a seeded local DuckDB warehouse to try dex against "
     "(no credentials, no network)",
+    "procedure": "print the agent procedure, or the block to paste into "
+    "CLAUDE.md / AGENTS.md (no connection)",
 }
 
 #: (group, subcommand) -> (summary, description). The summary is the one line
@@ -608,6 +615,20 @@ def _build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="DuckDB file to create, refused if it exists "
                 "(default: dex_demo.duckdb)",
+            )
+        if group == "procedure":
+            gp.add_argument(
+                "--block",
+                action="store_true",
+                help="also return data.block, ready to paste into CLAUDE.md or "
+                "AGENTS.md",
+            )
+            gp.add_argument(
+                "--check",
+                action="append",
+                metavar="FILE",
+                default=None,
+                help="report whether FILE carries the current procedure (repeatable)",
             )
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
@@ -1758,6 +1779,13 @@ def main(argv: list[str] | None = None) -> int:
 
             require_allowed(result_mode, _command_label(args))
             envelope = cmd_config(args)
+        elif args.group == "procedure":
+            # No engine either: the procedure is package data, and it must reach
+            # an agent before any project, config or connector exists (#502).
+            from .procedure.commands import cmd_procedure
+
+            require_allowed(result_mode, _command_label(args))
+            envelope = cmd_procedure(args)
         else:
             # One engine per process, built from the resolved repo root. The default
             # backend is what lets the subcommands stay stateless across invocations:

@@ -1,0 +1,9 @@
+version: 2
+models:
+  - name: stg_stores
+    description: One row per store.
+    columns:
+      - name: store_id
+        data_tests: [unique, not_null]
+  - name: stg_stock_levels
+    description: Units on hand per store and SKU at the end of each day.

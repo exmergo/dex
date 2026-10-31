@@ -1,0 +1,5 @@
+{
+  "name": "season_to_date",
+  "seed": 4922,
+  "description": "A league's weekly standings carry wins and losses to date, season-to-date totals that must be aggregated with max, never sum. The current season is unfinished."
+}

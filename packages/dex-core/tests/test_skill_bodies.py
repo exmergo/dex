@@ -4,9 +4,10 @@ A body enters an agent's context only when the Skill tool loads it, and its
 bundled reference files are read even less, so what a body says first decides
 what an agent does (#489). Four properties are held here:
 
-- Each body opens with the procedure, delimited by markers. #502 will assert the
-  text between the markers against the engine's own; until then the three copies
-  are held equal to each other, so they cannot drift apart before it lands.
+- Each body opens with the procedure, delimited by markers, and the text between
+  them is exactly the engine's (#502), as is the copy in `AGENTS.md`. A change
+  lands in `exmergo_dex_core/procedure/procedure.md` and
+  `scripts/sync_procedure.py` carries it to every copy.
 - Every `${CLAUDE_SKILL_DIR}` path a skill cites exists in that skill's directory.
   A broken pointer deletes guidance rather than moving it.
 - No skill cites a repository-root document as though it could open it. A skill
@@ -126,15 +127,23 @@ def test_the_frontmatter_fits_the_agent_skills_caps(skill: str):
     )
 
 
-def test_the_three_procedure_sections_are_one_text():
-    """Until #502 holds them to the engine's text, they are held to each other."""
+def test_every_procedure_copy_is_the_engines_text():
+    """The procedure lives once, in the engine (#502). Every copy an agent reads
+    (the three skill bodies and `AGENTS.md`) is held to it, and a failure names
+    every stale copy at once rather than the first."""
 
-    texts = {skill: procedure(body(skill)) for skill in SKILLS}
-    reference = texts[SKILLS[0]]
-    stale = [skill for skill, text in texts.items() if text != reference]
+    from exmergo_dex_core.procedure import text
+
+    copies = [f"skills/{skill}/SKILL.md" for skill in SKILLS] + ["AGENTS.md"]
+    stale = [
+        relpath
+        for relpath in copies
+        if procedure((ROOT / relpath).read_text(encoding="utf-8")) != "\n" + text()
+    ]
     assert not stale, (
-        f"the procedure in {stale} differs from skills/{SKILLS[0]}/SKILL.md; a "
-        "change to it lands in all three"
+        f"these copies of the procedure differ from the engine's text: {stale}. "
+        "Edit packages/dex-core/src/exmergo_dex_core/procedure/procedure.md, then "
+        "run `uv run --project packages/dex-core python scripts/sync_procedure.py`"
     )
 
 

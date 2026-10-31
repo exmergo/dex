@@ -116,6 +116,8 @@ ALLOWED_COMMANDS = frozenset(
         "explore diagram",
         "explore query",
         "explore semantic list",
+        # Package text and marker checks on instruction files; no table is read.
+        "procedure",
     }
 )
 

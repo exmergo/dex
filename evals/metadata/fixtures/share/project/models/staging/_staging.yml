@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: stg_products
+    description: One row per product.
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]
+  - name: stg_sales
+    description: One row per sale.
+    columns:
+      - name: sale_id
+        data_tests: [unique, not_null]

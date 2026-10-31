@@ -455,6 +455,12 @@ GENERATED_PAGES: dict[str, PageMeta] = {
         "dex command on.",
         "demo",
     ),
+    "cli/procedure": PageMeta(
+        "dex procedure",
+        "Reference for dex procedure: print the agent procedure every dex skill "
+        "carries, the block to paste into CLAUDE.md or AGENTS.md, and a stale check.",
+        "procedure",
+    ),
     "changelog": PageMeta(
         "Changelog",
         "Release notes for exmergo-dex-core and the dex skills: what was added, "

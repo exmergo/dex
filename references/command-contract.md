@@ -69,7 +69,7 @@ did not write.
 
 ## The command surface
 
-Capabilities, not final spelling. Implemented incrementally: `demo`, `connect test`,
+Capabilities, not final spelling. Implemented incrementally: `demo`, `procedure`, `connect test`,
 the `config` group, the `explore` group, the authoring surface (`transform`,
 `semantic`), and the `maintain` group are live; `viz preview` returns a valid
 `not_implemented` envelope until the Viz integration lands.
@@ -86,6 +86,19 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (7
                                      and not confirmable: an existing target refuses, no
                                      directory is ever created, and an existing config
                                      at or above the target is left alone with a warning
+dex procedure [--block] [--check <file>...]
+                                  -> the agent procedure every skill and AGENTS.md
+                                     carry, held once in the engine: data.text,
+                                     data.digest, data.engine_version, data.markers.
+                                     --block adds data.block, the text between the
+                                     dex:procedure markers, to paste into CLAUDE.md or
+                                     AGENTS.md (dex never writes either). --check reads
+                                     each file and reports its copy current, stale,
+                                     missing, malformed, absent or unreadable under
+                                     data.copies, never echoing content; any copy that
+                                     is not current is status error (reason request).
+                                     Routed before any engine: no config, no connector
+                                     extra, no connection; allowed in values-free mode
 dex connect test                  -> {capabilities, dialect, read_only: true}
 dex config get [key]              -> the effective value of every setting, or of those
                                      under key, as flat rows under data.settings: value,

@@ -2026,8 +2026,43 @@ def _join_equality_pairs(join, in_scope_relations: list, sql_shape):
         return [], None  # a CROSS JOIN/UNNEST: not this check's business
     pairs = sql_shape.conjunctive_equality_pairs(join.on)
     if pairs is None:
+        if _pairs_keys_and_filters(join.on):
+            # `on o.customer_id = c.customer_id and o.status <> 'cancelled'`:
+            # the keys are there, but the filter beside them narrows which rows
+            # can match. A probe of the keys alone counts the rows that filter
+            # excludes as matches, so a parent whose only matches are excluded
+            # (every order cancelled) would read as covered when it is not.
+            return [], (
+                "its condition filters as well as pairing keys (a conjunct "
+                "that is not a column-to-column equality), and an overlap "
+                "probe on the keys alone would count the rows that filter "
+                "excludes as matches, hiding the rows left with none"
+            )
         return [], "no conjunctive column-to-column equality"
     return pairs, None
+
+
+def _pairs_keys_and_filters(on) -> bool:
+    """Whether an ON's top-level conjuncts include a column-to-column equality
+    beside something else, as opposed to holding no key equality at all."""
+
+    from sqlglot import expressions as exp
+
+    stack, conjuncts = [on], []
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.And):
+            stack.extend((node.this, node.expression))
+        elif isinstance(node, exp.Paren):
+            stack.append(node.this)
+        else:
+            conjuncts.append(node)
+    return any(
+        isinstance(c, exp.EQ)
+        and isinstance(c.this, exp.Column)
+        and isinstance(c.expression, exp.Column)
+        for c in conjuncts
+    )
 
 
 def _select_branches(tree, sql_shape) -> list:

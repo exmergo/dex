@@ -286,6 +286,35 @@ def test_a_miscased_literal_names_the_value_it_was_probably_meant_to_be(tmp_path
     assert "'cancelled' matches it ignoring case and whitespace" in warning
 
 
+_LEFT_JOIN_FILTER = (
+    "select c.customer_id, count(o.order_id) as n\n"
+    "from {{ ref('stg_customers') }} as c\n"
+    "left join {{ ref('stg_orders') }} as o\n"
+    "    on o.customer_id = c.customer_id and o.status <> 'Cancelled'\n"
+    "group by 1\n"
+)
+
+
+def test_a_literal_in_a_join_condition_is_checked_like_a_where(tmp_path):
+    """Under a LEFT JOIN that must keep every parent, the child filter lives in
+    the ON clause; a misspelled literal there drops nothing and keeps everything,
+    so it is the one place the check matters most."""
+
+    drafted, warnings = _draft(tmp_path, _LEFT_JOIN_FILTER, {})
+    [warning] = [w for w in warnings if "profiled values" in w]
+    assert "stg_orders.status to 'Cancelled'" in warning
+    assert "'cancelled' matches it ignoring case and whitespace" in warning
+    # The key equality beside it compares two columns and is not a usage.
+    assert [u["usage"] for u in _status(drafted)["this_model"]] == ["join"]
+
+
+def test_a_join_condition_filter_in_a_sibling_is_precedent(tmp_path):
+    sibling = _LEFT_JOIN_FILTER.replace("'Cancelled'", "'cancelled'")
+    drafted, _ = _draft(tmp_path, EXCLUDE, {"clv": sibling})
+    usages = {group["usage"] for group in _status(drafted)["groups"]}
+    assert "join" in usages
+
+
 @pytest.mark.parametrize(
     ("where", "cache"),
     [

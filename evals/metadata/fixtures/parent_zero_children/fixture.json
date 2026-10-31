@@ -1,0 +1,5 @@
+{
+  "name": "parent_zero_children",
+  "seed": 4925,
+  "description": "Support accounts and their tickets. Fifteen accounts never opened a ticket, and six tickets name accounts that do not exist. An account summary must drive from accounts so every account survives with a count of zero."
+}

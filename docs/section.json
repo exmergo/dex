@@ -71,7 +71,8 @@
               "cli/maintain",
               "cli/config",
               "cli/viz",
-              "cli/demo"
+              "cli/demo",
+              "cli/procedure"
             ]
           },
           {

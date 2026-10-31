@@ -1,0 +1,4 @@
+version: 2
+models:
+  - name: account_ticket_summary
+    description: Ticket activity per account.
