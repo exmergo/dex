@@ -297,6 +297,60 @@ def test_with_no_document_holding_a_parent_it_is_proposed_as_its_own(
     assert not (project / model["path"]).exists()
 
 
+@pytest.mark.parametrize("command", ["plan", "declare"])
+def test_a_configured_missing_document_is_included_as_an_applicable_plan(
+    project: Path, capsys, no_warehouse, command: str
+):
+    path = "semantic/fct_orders.ossie.yaml"
+    _configure(project, [path])
+    if command == "plan":
+        rc, envelope = _plan(project, capsys)
+    else:
+        put(project / "analytics", SQL_PATH, MART_SQL)
+        rc, envelope = run(
+            capsys,
+            project,
+            "transform",
+            "declare",
+            "fct_orders",
+            "--edits-file",
+            _payload(project, {"declarations": [POPULATED]}),
+        )
+
+    assert rc == 0, envelope["errors"]
+    proposal = _proposed(envelope)
+    assert proposal["mode"] == "included"
+    model = proposal["models"]["fct_orders"]
+    assert model["status"] == "included"
+    assert model["path"] == path
+    for check in ("ossie", "catalog", "plan"):
+        assert model["validation"][check]["result"] == "passed"
+    assert "dex config set" not in proposal.get("next", "")
+    assert not (project / path).exists()
+
+    rc, applied = run(capsys, project, "transform", "apply", proposal["plan_id"])
+    assert rc == 0, applied
+    assert read(project, path) == model["content"]
+
+
+def test_a_new_document_does_not_bypass_validation_of_other_configured_files(
+    project: Path, capsys, no_warehouse
+):
+    _configure(
+        project, ["semantic/fct_orders.ossie.yaml", "semantic/missing.ossie.yaml"]
+    )
+
+    _rc, envelope = _plan(project, capsys)
+
+    proposal = _proposed(envelope)
+    model = proposal["models"]["fct_orders"]
+    assert model["status"] == "failed"
+    assert model["validation"]["plan"]["result"] == "failed"
+    assert "semantic/missing.ossie.yaml" in model["reason"]
+    assert "plan_id" not in proposal
+    assert not (project / "semantic/fct_orders.ossie.yaml").exists()
+
+
 def test_parents_in_different_documents_are_proposed_not_split(
     project: Path, capsys, no_warehouse
 ):

@@ -30,9 +30,10 @@ spliced into the configured document holding the datasets its foreign keys
 reference, or, with no foreign key and exactly one configured document, into
 that one. It is appended as a list item, so every other byte of the document is
 kept, and *included* as a plan of its own beside the mart's. Where the parents
-span documents, or no document is configured, it is *proposed* as a document of
-its own, validated by the same checks, with the configuration change that adopts
-it.
+span documents, or no document can hold it, it is derived as a document of its
+own. If that path is already configured, it is included as a plan even before
+the file exists; otherwise it is proposed with the configuration change that
+adopts it. Both paths pass the same validation checks.
 
 **Annotate.** ``semantic ossie plan`` with ``declarations`` renders each one
 into the dataset it names, field by field; only that dataset's list item is
@@ -225,17 +226,17 @@ def _build(
         notes.append(
             "its foreign keys reference datasets in different documents "
             f"({', '.join(homes)}), and a relationship joins datasets of one model "
-            "only, so it is proposed as a document of its own with no relationship"
+            "only, so it is derived as a document of its own with no relationship"
         )
     elif not homes and documents:
         notes.append(
             "no configured document holds a dataset its foreign keys reference, so "
-            "it is proposed as a document of its own"
+            "it is derived as a document of its own"
         )
     elif not documents:
         notes.append(
             "no configured Ossie document could be read to hold it, so it is "
-            "proposed as a document of its own"
+            "derived as a document of its own"
         )
 
     if target is not None:
@@ -371,7 +372,7 @@ def _build(
     else:
         for reference in declaration.references:
             reasons[f"columns.{reference.column}.references"] = (
-                "the dataset is proposed as a document of its own, and a "
+                "the dataset is derived as a document of its own, and a "
                 "relationship joins datasets of one model only"
             )
 
@@ -404,8 +405,12 @@ def _build(
         definition.content = dump_items(
             {"version": VERSION, "name": model, "datasets": [body]}
         )
-        definition.status = "proposed"
-        definition.next = _adopt(layer, definition)
+        if definition.path in layer.files:
+            texts[definition.path] = definition.content
+            definition.status = "included"
+        else:
+            definition.status = "proposed"
+            definition.next = _adopt(layer, definition)
         return definition
 
     text = append_item(texts[target], "datasets", body)
@@ -678,7 +683,7 @@ def _validate(
         validate_plan(
             layer,
             [_edit(path, texts[path]) for path in paths],
-            "update",
+            "plan",
             cache=request.cache,
         )
     except ValueError as exc:
@@ -692,7 +697,7 @@ def _validate(
 
 
 def _adopt(layer: OssieSemanticLayer, definition: DerivedDefinition) -> str:
-    listed = ", ".join([*layer.files, definition.path or ""])
+    listed = ", ".join(dict.fromkeys([*layer.files, definition.path or ""]))
     return (
         f"{definition.path} is not under semantic.ossie.files, the documents dex "
         f"may write: run `dex config set semantic.ossie.files '[{listed}]'`, then "

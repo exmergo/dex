@@ -298,7 +298,10 @@ byte of the document is kept, and stored as a companion plan beside the mart's
 no document is configured, or the mart's relation already has a dataset, it is
 *proposed* or *skipped* with the reason, and a proposal is a new document of its
 own with the `dex config set semantic.ossie.files` that adopts it. A dataset name
-another definition holds fails the derivation rather than being renamed.
+another definition holds fails the derivation rather than being renamed. If a
+new document's derived path is already listed in `semantic.ossie.files`, it is
+included as a companion plan even when the file does not exist yet; no
+configuration change is needed.
 
 Every derived or annotated document passes the same checks a hand-authored one
 does (schema, integrity, expression syntax, the cache) before a plan is stored.

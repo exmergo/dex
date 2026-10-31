@@ -706,7 +706,8 @@ document, where it references none) and stored as a plan of its own on the Ossie
 layer, named by `data.semantic_proposal.plan_id`; apply both. Where the parents
 span documents or no document can hold it, it is proposed as a document of its
 own, validated the same way, with the `dex config set semantic.ossie.files` that
-adopts it.
+adopts it. If that new document's path is already in `semantic.ossie.files`, it
+is included as a companion plan even before the file exists.
 
 The preservation contract is exact and predictable: Dex does not parse and
 re-serialize accepted content. Apply writes the authored bytes byte-for-byte,
