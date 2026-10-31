@@ -1848,6 +1848,28 @@ class SnowflakeAdapter:
 
         self._utc_session = True
 
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, compiled and not run: the connector's
+        ``describe`` is served by the cloud-services layer with no warehouse."""
+
+        from snowflake.connector.constants import FIELD_ID_TO_NAME
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        columns: list[ColumnMeta] = []
+        for ordinal, field in enumerate(self._conn.cursor().describe(checked) or []):
+            kind = FIELD_ID_TO_NAME.get(field.type_code, str(field.type_code))
+            if kind == "FIXED":
+                kind = f"NUMBER({field.precision},{field.scale})"
+            columns.append(
+                ColumnMeta(
+                    name=str(field.name),
+                    data_type=kind,
+                    nullable=bool(field.is_nullable),
+                    ordinal=ordinal,
+                )
+            )
+        return columns
+
     def run_query(
         self,
         sql: str,

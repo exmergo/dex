@@ -212,6 +212,58 @@ test over the smaller result.
   A cold dev target that cannot be priced upfront is priced again after the
   build, against the reservation it already holds.
 
+## `transform compare [plan-id] [--model <m>] [--map old=new] [--key <column>] [--target dev]`
+
+Whether a stored plan keeps one model's results. Use it on a refactor, after
+`transform plan` and before `transform apply`: `data.refactor_comparison_offer` on
+the plan names the command. A green build and a matching row count do not establish
+this, since a join rewrite can keep both and still change a measure.
+
+- Read `data.status`, then `data.reason_code`. `equivalent` holds for
+  `data.input_scope` at `data.compared_at`, on the dev relations as they stand. Say
+  that when you report it. It is not a proof for future inputs.
+- `different` with `schemas_differ`: read `data.schema`. A rename is a difference
+  until `--map old=new` states it. Types are compared exactly, so `INTEGER` to
+  `BIGINT` is a difference too, and the rows are then not compared.
+- `different` with `rows_differ`: `data.multiset` counts excess rows on each side,
+  so equal distinct rows with different duplicates still show. `data.keyed` adds
+  keys missing, added and changed, when `--key` or the declared grain is unique on
+  both sides; otherwise `keyed_reason` is `key_not_unique`.
+- `not_checked` is not a pass. Fix what the code names:
+
+| `reason_code` | What to do |
+|---|---|
+| `plan_applied`, `plan_stale` | plan the change again against the tree as it is |
+| `baseline_not_compilable`, `proposed_not_compilable` | the model does not compile on that side; `detail` quotes a compile error, and a connection failure says to run `dbt compile` |
+| `inputs_unsynchronized` | build the named parents on dev. A plan that changes a seed or snapshot cannot be compared, because dev holds the old rows |
+| `nondeterministic_expression` | the model calls a random, uuid or current-time function, or samples, so two runs can differ on their own |
+| `unsupported_type` | the named column cannot be grouped on this connector; `detail` names it and its type |
+| `firewall_refused`, `baseline_refused`, `proposed_refused` | a statement is not a single SELECT the firewall admits |
+| `baseline_not_executable`, `proposed_not_executable`, `comparison_unreadable` | the warehouse would not plan or run it; `detail` is an exception class, never its text |
+| `invalid_mapping`, `invalid_key`, `duplicate_output_name` | fix the flag, or give the model unique output names |
+| `awaiting_confirmation` | the priced ask, as on any metered command |
+| `comparison_unsupported_on_connector` | this connector has no `describe_query` |
+
+What counts as one value is the warehouse's own grouping, measured on every
+connector: NULL groups with NULL and not with `''` or `0`; NaN groups with NaN;
+`-0.0` groups with `0.0`, so a change in zero's sign is not reported; `'a'` differs
+from `'a '` and from `'A'` on these connectors with their default collation for
+`VARCHAR`. A case-insensitive collation or a blank-padded `CHAR` column on your
+warehouse applies its own equality here. Floats have no tolerance.
+
+Column names in `--key` and `--map` match case-insensitively when that names one
+column, so `--key team_id` works on Snowflake, which reports `TEAM_ID`. On ClickHouse
+a joined `select t.id` builds a column named `t.id`, so a rewrite that changes the
+join can report a real rename; alias the column.
+
+The nondeterminism check knows built-in functions only. A nondeterministic UDF or
+an unordered `LIMIT` can show as `different` with no real change, so compare again
+if a `rows_differ` looks unexplained.
+
+A plan that changes a macro or project configuration carries a warning: untouched
+parents are read as built on dev, so the comparison does not cover how they would
+recompile. Refused in values-free mode.
+
 ## `transform test --scaffold <model>`
 
 Plans a `unit_tests:` skeleton: a `given` block per `ref()`/`source()` input

@@ -116,6 +116,7 @@ if TYPE_CHECKING:
         PlanResult,
         PreflightResult,
         PropagationResult,
+        RefactorComparisonResult,
     )
     from .transform.semantic import DefinitionEdit
 
@@ -1444,6 +1445,28 @@ class DexEngine:
             declarations=declarations,
             scaffold=scaffold,
             attribute_rows=attribute_rows,
+        )
+
+    def compare(
+        self,
+        plan_id: str | None = None,
+        *,
+        model: str | None = None,
+        column_mapping: dict[str, str] | None = None,
+        key_columns: list[str] | None = None,
+        target: str | None = None,
+    ) -> RefactorComparisonResult:
+        """One model before and after a stored plan, on the same dev inputs."""
+
+        from .transform.refactor_compare import compare
+
+        return compare(
+            self,
+            plan_id,
+            model=model,
+            column_mapping=column_mapping,
+            key_columns=key_columns,
+            target=target,
         )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:

@@ -86,6 +86,8 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # plan per call, repo-and-cache only.
         "declare",
         "test",
+        # Whether a stored plan keeps a model's results (#856).
+        "compare",
         # The host boundary (#441): a plan a second process can carry and check,
         # what that plan depends on, what its edits actually contain, and what
         # the warehouse will enforce on the build that validates it. Every one is
@@ -410,6 +412,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "one defect at a time and reports which ones no test caught; "
         "--downstream also counts the tests of the models that read it. "
         "Mutation runs dbt on the dev target and is billed on metered connectors.",
+    ),
+    ("transform", "compare"): (
+        "compare a model before and after a stored plan",
+        "Compile the model with and without the plan, then compare output "
+        "columns and the exact row multiset on the same dev inputs. Returns "
+        "counts, never rows. equivalent holds for the compared inputs only. "
+        "Scans go through --confirm --budget on metered connectors.",
     ),
     ("transform", "export"): (
         "export a stored plan as a portable, digested document",
@@ -1292,6 +1301,38 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=None,
                         help="one line saying what the plan is for",
                     )
+                if group == "transform" and name == "compare":
+                    sp.add_argument(
+                        "plan_id",
+                        nargs="?",
+                        default=None,
+                        help="stored plan id; defaults to the latest unapplied plan",
+                    )
+                    sp.add_argument(
+                        "--model",
+                        default=None,
+                        metavar="MODEL",
+                        help="the model whose results should not change",
+                    )
+                    sp.add_argument(
+                        "--map",
+                        action="append",
+                        default=None,
+                        metavar="OLD=NEW",
+                        help="a baseline output column the plan renames (repeatable)",
+                    )
+                    sp.add_argument(
+                        "--key",
+                        action="append",
+                        default=None,
+                        metavar="COLUMN",
+                        help="baseline key column, repeatable; default: declared grain",
+                    )
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help="dbt dev target to read; prod-looking targets are refused",
+                    )
                 if group == "transform" and name == "test":
                     # Two modes, and they are opposites: `--scaffold` writes a
                     # unit test, `--mutate` measures the tests that already
@@ -1608,6 +1649,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "place"): "cmd_place",
         ("transform", "declare"): "cmd_declare",
         ("transform", "test"): "cmd_test",
+        ("transform", "compare"): "cmd_compare",
         ("transform", "export"): "cmd_export",
         ("transform", "ground"): "cmd_ground",
         ("transform", "classify"): "cmd_classify",

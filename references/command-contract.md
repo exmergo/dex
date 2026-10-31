@@ -363,6 +363,14 @@ dex transform preflight           -> what the warehouse will enforce on the next
                                      always false and says why. Free and connectionless
 dex transform macro [name]        -> list the shipped dbt macros, or plan scaffolding one into the
                                      project's macro directory (dbt-parse-checked; apply like any plan)
+dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one model's results: each
+                                     side compiled in its own project copy with every touched model
+                                     inlined, then output names and types, then the exact row multiset,
+                                     as counts and never rows. --model picks the model, --map old=new
+                                     states a rename, --key (or the declared grain) adds per-key counts.
+                                     data.status is equivalent, different or not_checked with
+                                     data.reason_code; equivalent holds for data.input_scope at
+                                     data.compared_at only. Priced before spend on metered connectors
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until

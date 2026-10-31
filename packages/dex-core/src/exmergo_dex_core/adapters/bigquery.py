@@ -1320,6 +1320,24 @@ class BigQueryAdapter:
 
     # --- execution (the single billed door) -----------------------------------
 
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from the free dry run's own schema."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        job_config = self._bq.QueryJobConfig(dry_run=True, use_query_cache=False)
+        job = self._client.query(
+            checked, job_config=job_config, location=self.target.location
+        )
+        return [
+            ColumnMeta(
+                name=field.name,
+                data_type=self._render_type(field),
+                nullable=(field.mode or "NULLABLE") != "REQUIRED",
+                ordinal=ordinal,
+            )
+            for ordinal, field in enumerate(job.schema or [])
+        ]
+
     def run_query(
         self,
         sql: str,

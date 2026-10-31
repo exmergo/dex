@@ -417,6 +417,7 @@ def plan(
         _store_companion(engine, intent, derived, result)
     _attribute_rows(engine, result, edits, requested=attribute_rows)
     _contradiction_warnings(result)
+    _offer_refactor_comparison(engine, result, edits)
     return result
 
 
@@ -710,6 +711,33 @@ def _plan_decisions(
         declarations_mod.post_change_files(view, edits),
         declarations_mod.touched_models(edits, declared),
     )
+
+
+def _offer_refactor_comparison(
+    engine: DexEngine, result: PlanResult, edits: list[PlanEdit]
+) -> None:
+    """Name the comparison a plan that rewrites a model can ask for (#856).
+
+    Reads the plan and the tree and nothing else. Planning stores the change and
+    offers this; it never scans for it.
+    """
+
+    from .refactor_compare import edited_existing_models
+
+    try:
+        models = edited_existing_models(edits, engine.project_dir())
+    except (OSError, ValueError, DexError):
+        # A format with no dbt project has nothing this command could compile.
+        return
+    if not models or not result.plan_id:
+        return
+    result.refactor_comparison_offer = {
+        "models": sorted(models),
+        "command": (
+            f"transform compare {result.plan_id} --model {sorted(models)[0]} "
+            "[--map old=new] [--key column]"
+        ),
+    }
 
 
 def _attribute_rows(
@@ -2718,6 +2746,40 @@ def _merge_spend(running: dict | None, latest: dict | None) -> dict | None:
         elif previous is None:
             merged[key] = value
     return merged
+
+
+def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from .refactor_compare import compare
+
+    try:
+        return to_envelope(
+            compare(
+                engine,
+                getattr(args, "plan_id", None),
+                model=getattr(args, "model", None),
+                column_mapping=_column_map(getattr(args, "map", None)),
+                key_columns=getattr(args, "key", None),
+                target=getattr(args, "target", None),
+            )
+        )
+    except ValueError as exc:
+        return env.error_for(exc)
+
+
+def _column_map(pairs: list[str] | None) -> dict[str, str] | None:
+    """``--map old=new`` pairs as the comparator's mapping."""
+
+    if not pairs:
+        return None
+    mapping: dict[str, str] = {}
+    for pair in pairs:
+        old, separator, new = pair.partition("=")
+        if not separator or not old or not new:
+            raise ValueError(f"--map takes old=new, got {pair!r}")
+        if old in mapping:
+            raise ValueError(f"--map names '{old}' twice")
+        mapping[old] = new
+    return mapping
 
 
 def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
