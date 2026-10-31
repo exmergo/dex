@@ -93,8 +93,9 @@ class MyStore:
         return self.locator(Document.CACHE)
 
     def spend_since(self, cutoff_iso, *, field="billed_bytes", connector=None):
-        return spend_total(self._entries("spend"), cutoff_iso,
-                           field=field, connector=connector)
+        return spend_total(
+            self._entries("spend"), cutoff_iso, field=field, connector=connector
+        )
 
     def locator(self, document: Document) -> str:
         return f"mystore://{self.tenant}/{document.value}"
@@ -172,8 +173,11 @@ not correctness.
 ```python
 class MyStore:
     def spend_entries(self, *, connector=None, limit=500):
-        entries = [e for e in self._entries("spend")
-                   if connector is None or e.get("connector") == connector]
+        entries = [
+            e
+            for e in self._entries("spend")
+            if connector is None or e.get("connector") == connector
+        ]
         return entries[-limit:]
 ```
 

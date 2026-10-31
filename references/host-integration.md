@@ -56,8 +56,8 @@ with DexEngine.from_repo(repo) as engine:
     result = engine.plan("define a revenue metric", edits=edits)
     exported = engine.export_plan(result.plan_id)
 
-document = exported.plan     # send this wherever
-digest = exported.digest     # send this through a channel you trust
+document = exported.plan  # send this wherever
+digest = exported.digest  # send this through a channel you trust
 ```
 
 The document carries every edit's operation, kind, preimage hash, content hash,
@@ -454,9 +454,9 @@ then, because there is no figure to append.
 from exmergo_dex_core.host import conformance_vectors
 
 for vector in conformance_vectors():
-    vector["contract"]     # portable-plan | classification | grounding | build-evidence
-    vector["payload"]      # what a host will be handed
-    vector["expect"]       # the verdict it should reach
+    vector["contract"]  # portable-plan | classification | grounding | build-evidence
+    vector["payload"]  # what a host will be handed
+    vector["expect"]  # the verdict it should reach
 ```
 
 Twenty-three fixtures ship in the wheel beside the reader: a valid plan and the

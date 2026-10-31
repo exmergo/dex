@@ -119,9 +119,7 @@ def matching_ruff_configs() -> dict[str, str]:
             "    hooks:\n"
             "      - id: ruff-check\n"
         ),
-        PYPROJECT_PATH: (
-            "[project.optional-dependencies]\n" 'dev = ["ruff==0.17.2"]\n'
-        ),
+        PYPROJECT_PATH: ('[project.optional-dependencies]\ndev = ["ruff==0.17.2"]\n'),
         LOCK_PATH: '[[package]]\nname = "ruff"\nversion = "0.17.2"\n',
     }
 
