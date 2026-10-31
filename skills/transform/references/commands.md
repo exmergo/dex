@@ -239,11 +239,13 @@ this, since a join rewrite can keep both and still change a measure.
 |---|---|
 | `plan_applied`, `plan_stale` | plan the change again against the tree as it is |
 | `baseline_not_compilable`, `proposed_not_compilable` | the model does not compile on that side; `detail` quotes a compile error, and a connection failure says to run `dbt compile` |
-| `inputs_unsynchronized` | build the named parents on dev. A plan that changes a seed or snapshot, or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows: apply it on a branch, build, and compare from there |
+| `inputs_unsynchronized` | build the named parents on dev. A plan that changes a seed or snapshot, or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows. This plan stays uncompared: once it is applied the baseline is gone (`plan_applied`). After applying and building, a further change needs its own new, unapplied plan to compare |
 | `nondeterministic_expression` | the model calls a random, uuid or current-time function, or samples, so two runs can differ on their own |
 | `unsupported_type` | the named column cannot be grouped on this connector; `detail` names it and its type |
-| `firewall_refused`, `baseline_refused`, `proposed_refused` | a statement is not a single SELECT the firewall admits |
-| `baseline_not_executable`, `proposed_not_executable`, `comparison_unreadable` | the warehouse would not plan or run it; `detail` is an exception class, never its text |
+| `baseline_refused`, `proposed_refused` | before anything reaches the warehouse, that side's compiled SQL is not a single SELECT; fix the model |
+| `firewall_refused` | the firewall refused the generated comparison, which can happen to a valid model, for example over a relation with no usable profile; `explore profile --target dev` the relations it names, then compare again |
+| `baseline_not_executable`, `proposed_not_executable` | reading that side's output schema failed, so the warehouse would not plan it, or it returns no columns; `detail` is an exception class or a message Dex wrote, never warehouse text. Run the model on dev |
+| `comparison_unreadable` | pricing or running the comparison failed, or its result could not be read as counts, or an output column uses a name the comparison reserves; `detail` is an exception class or a message Dex wrote, never warehouse text. A reserved name needs an alias; otherwise compare again, and if it persists, run the statement's model on dev |
 | `invalid_mapping`, `invalid_key`, `invalid_type_acceptance`, `duplicate_output_name` | fix the flag, or give the model unique output names |
 | `awaiting_confirmation` | the priced ask, as on any metered command |
 | `comparison_unsupported_on_connector` | this connector has no `describe_query` |

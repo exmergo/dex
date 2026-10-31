@@ -38,7 +38,13 @@ from ..errors import DexError
 from ..guards.sql_guard import referenced_relations
 from ..storage import readable_cache
 from .build import DbtRunError, ShadowRun, assert_dev_target
-from .multiset_compare import ReasonCode, RefactorCompareResult, compare_refactors
+from .multiset_compare import (
+    ReasonCode,
+    RefactorCompareResult,
+    _NotCheckedError,
+    _raw_estimate,
+    compare_refactors,
+)
 from .mutation import EPHEMERAL_HEADER
 from .plans import EditKind, PlanEdit, TransformPlan
 from .results import RefactorComparisonResult
@@ -193,19 +199,23 @@ def _compare(
             "transform compare needs a connector: set `connector:` in "
             ".dex/config.yml or pass --connector"
         )
-    chosen = _chosen_model(stored, project, model)
-    identity: dict[str, Any] = {"plan_id": plan_id, "model": chosen, "target": target}
-
-    def not_checked(code: ReasonCode, detail: str) -> RefactorComparisonResult:
-        return _not_checked_result(identity, code, detail, warnings)
-
     warnings: list[str] = []
+    # Ahead of choosing a model: once applied, the models this plan created exist
+    # on disk and would read as rewritten, which asks for a --model that cannot help.
     if stored.applied_at:
-        return not_checked(
+        return _not_checked_result(
+            {"plan_id": plan_id, "model": model or "", "target": target},
             "plan_applied",
             "this plan is already applied, so the tree no longer holds the "
             "baseline; plan the change again from the prior commit to compare it",
+            warnings,
         )
+    chosen = _chosen_model(stored, project, model)
+    identity: dict[str, Any] = {"plan_id": plan_id, "model": chosen, "target": target}
+
+    def not_checked(code: ReasonCode, detail: str | None) -> RefactorComparisonResult:
+        return _not_checked_result(identity, code, detail, warnings)
+
     stale = _stale_paths(stored, project)
     if stale:
         return not_checked(
@@ -308,9 +318,12 @@ def _compare(
     prepriced = False
     profiled: list[str] = []
     if gap.to_profile:
-        estimate = _profile_handshake(
-            adapter, gap.to_profile, baseline.sql, proposed.sql, keys, config
-        )
+        try:
+            estimate = _profile_handshake(
+                adapter, gap.to_profile, baseline.sql, proposed.sql, keys, config
+            )
+        except _NotCheckedError as exc:
+            return not_checked(exc.reason_code, exc.detail)
         if estimate is not None:
             result = _not_checked_result(
                 identity,
@@ -626,9 +639,9 @@ def _profile_handshake(adapter, to_profile, left, right, keys, config):
     profile_estimate, per_table = explore._profile_estimate(
         adapter, to_profile, include_blobs=blob_override_paths(config.blob_overrides)
     )
-    estimator = getattr(adapter, "query_estimate", None)
-    reads = float(estimator(left)) + float(estimator(right)) if estimator else 0.0
-    comparison = reads * (2 if keys else 1)
+    # Raises _NotCheckedError with the exception's class name alone, so a warehouse
+    # refusal here reads as it does when every input already has a profile.
+    comparison = _raw_estimate(left, right, adapter, keyed=bool(keys))
     return command_args.confirmation_request(
         COMMAND,
         adapter,

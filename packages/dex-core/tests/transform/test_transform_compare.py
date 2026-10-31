@@ -223,6 +223,57 @@ def test_an_applied_plan_is_not_checked(project):
     assert result.reason_code == "plan_applied"
 
 
+def test_an_applied_plan_that_created_a_model_needs_no_model_flag(project):
+    """Once applied, the created model exists and would read as a second rewrite."""
+
+    engine = _engine(project)
+    plan_id = _plan(
+        engine,
+        project,
+        ("models/int_counts.sql", _INTERMEDIATE),
+        ("models/team_activity.sql", _EXTRACTED),
+    )
+    engine.apply(plan_id)
+    result = engine.compare(plan_id)
+    assert result.reason_code == "plan_applied"
+    assert result.model == ""
+
+
+def test_a_failed_estimate_while_profiling_carries_no_warehouse_text(monkeypatch):
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.config import DexConfig as Config
+    from exmergo_dex_core.explore import commands as explore
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+    from exmergo_dex_core.transform import refactor_compare as module
+    from exmergo_dex_core.transform.multiset_compare import _NotCheckedError
+
+    class _RefusedError(Exception):
+        pass
+
+    class _Adapter:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def query_estimate(self, sql):
+            raise self.exc
+
+    monkeypatch.setattr(command_args, "cost_gate", lambda adapter: object())
+    monkeypatch.setattr(explore, "_profile_estimate", lambda *a, **k: (1.0, {}))
+
+    def handshake(adapter):
+        return module._profile_handshake(
+            adapter, ["t"], "select 1", "select 2", None, Config()
+        )
+
+    with pytest.raises(_NotCheckedError) as caught:
+        handshake(_Adapter(_RefusedError("the warehouse quoted secret-value")))
+    assert caught.value.reason_code == "comparison_unreadable"
+    assert caught.value.detail == "_RefusedError"
+
+    with pytest.raises(OverCeilingError):
+        handshake(_Adapter(OverCeilingError("over")))
+
+
 def test_a_parent_nobody_built_is_not_checked(project, tmp_path):
     (tmp_path / "dev.duckdb").unlink()
     import duckdb
