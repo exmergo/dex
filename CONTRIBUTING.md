@@ -733,12 +733,18 @@ replaces the folder.
 
 ## Keeping the Ruff version in sync
 
-The pinned Ruff version appears in three places that must move together when you
+The pinned Ruff version appears in four places that must move together when you
 bump it:
 
 - `.github/workflows/lint.yml` (the `uvx ruff@<version>` calls)
-- `.pre-commit-config.yaml` (the `rev:` tag)
-- `packages/dex-core/pyproject.toml` (the `ruff==<version>` pin in the `dev` extra)
+- `.pre-commit-config.yaml` (the Ruff hook's `rev:` tag, without its leading `v`)
+- `packages/dex-core/pyproject.toml` (the exact `ruff==<version>` pin in the `dev` extra)
+- `packages/dex-core/uv.lock` (the locked Ruff package version)
+
+The dev extra's exact pin is the source of truth. The consistency test at
+`packages/dex-core/tests/test_ruff_version_pins.py` reads all four surfaces
+without fetching packages or resolving dependencies. Its in-memory fixture
+checks drift reporting without modifying the checkout.
 
 ## Keeping the towncrier version in sync
 

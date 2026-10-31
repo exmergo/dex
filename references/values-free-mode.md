@@ -169,6 +169,7 @@ release it pins:
 ```python
 from exmergo_dex_core.values_free_conformance import ValuesFreeContract
 
+
 class TestDexValuesFree(ValuesFreeContract):
     pass
 ```
