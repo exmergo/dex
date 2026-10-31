@@ -53,6 +53,18 @@ found the way every command finds it, by walking up to the git root.
   under a credential-like name. The diff shows such a value as `<withheld>`, on a
   context line as on a changed one.
 
+## `procedure [--block] [--check <file>...]`
+
+The procedure at the top of `SKILL.md`, as the engine holds it. Like `config`,
+it runs before the engine is built: no project, no connection, no connector
+extra. `data.text` is the procedure and `data.digest` fingerprints it.
+`--block` adds `data.block`, the same text between its two markers, which is
+what a person or a harness pastes into a repository's `CLAUDE.md` or
+`AGENTS.md`; Dex never writes either file, so offer the block rather than
+editing one. `--check <file>` reports each file's copy as `current`, `stale`,
+`missing` or `malformed` under `data.copies`, and the envelope is an error when
+any copy is not current.
+
 ## `explore profile <objects>`
 
 Objects are space- or comma-separated. Each profile carries column profiles, PII
@@ -91,8 +103,9 @@ column named `window`, which DuckDB reserves and dbt must quote).
   `contradicted`, `unmeasured`, `missing_columns`, `unprofiled`) says how they
   compare. It is read from the repository each run, never cached, so a cache hit
   is annotated too. Declared columns are capped at 12 unless `--columns all`.
-  Population values and the rule are withheld in values-free mode and for a
-  filter on a PII-flagged column, named in `withheld_fields`.
+  Values-free mode withholds the rule and all population filter values. In full
+  mode, any PII-flagged filter withholds the entire rule and that filter's values,
+  at any confidence, named in `withheld_fields`.
 - A native semantic layer (Ossie, SLayer, Cube) answers `--use-project` the same
   way, with no dbt project in the repository. Its `primary_key` is the declared
   grain at either arity, overriding a measured key; a `unique_keys` entry or a
