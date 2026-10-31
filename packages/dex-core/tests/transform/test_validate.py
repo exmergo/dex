@@ -178,6 +178,40 @@ def test_validate_model_sql_drops_jinja_config_header(header: str, gap: str):
 
 
 @pytest.mark.parametrize(
+    "sql",
+    [
+        "{{ config(materialized='view') }} select 1 as id\n",
+        "{{- config(materialized='view') -}} select 1 as id\n",
+        "{{ config(materialized='view', tags=['a']) }} select 1 as id\n",
+        "  {{ config(materialized='view') }} select 1 as id\n",
+        "-- note\n{{ config(materialized='view') }} select 1 as id\n",
+        "/* note */ {{ config(materialized='view') }} select 1 as id\n",
+        "{{ config(materialized='table', unique_key='id') }}\nselect 1 as id\n",
+    ],
+    ids=[
+        "inline-plain",
+        "inline-whitespace-control",
+        "inline-nested-parens",
+        "inline-leading-ws",
+        "inline-after-line-comment",
+        "inline-after-block-comment",
+        "separate-line-still-ok",
+    ],
+)
+def test_validate_model_sql_accepts_inline_config_header(sql: str):
+    """#1003: a config() header may share its line with the SELECT."""
+    assert validate_edit(_model_sql(sql)) == []
+
+
+def test_validate_model_sql_does_not_drop_non_config_leading_jinja():
+    """Only config() headers are removed; a leading macro stays a placeholder."""
+    from exmergo_dex_core.transform.validate import strip_jinja
+
+    stripped = strip_jinja("{{ generate_model() }} select 1 as id\n")
+    assert stripped.startswith("__dex_jinja__")
+
+
+@pytest.mark.parametrize(
     "comment",
     [
         "-- SELECT is only mentioned in this comment",

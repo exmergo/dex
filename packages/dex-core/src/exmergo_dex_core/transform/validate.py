@@ -215,16 +215,61 @@ _CONFIG_CALL = re.compile(r"\{\{-?\s*config\s*\(", re.DOTALL)
 _SNAPSHOT_STRATEGY_FIELDS = {"timestamp": "updated_at", "check": "check_cols"}
 
 
+def _drop_leading_config_headers(text: str) -> str:
+    """Remove recognized leading ``{{ config(...) }}`` headers only.
+
+    A header may share its line with the SQL that follows. Arbitrary Jinja
+    expressions are left alone so a whole-query macro or a mid-query call is
+    not mistaken for configuration. Leading whitespace and SQL comments
+    (``--`` / ``/* */``) before the header are preserved.
+    """
+
+    remaining = text
+    while True:
+        start = 0
+        while True:
+            chunk = remaining[start:]
+            ws = re.match(r"\s*", chunk)
+            start += ws.end() if ws else 0
+            chunk = remaining[start:]
+            if chunk.startswith("--"):
+                nl = chunk.find("\n")
+                if nl < 0:
+                    return remaining
+                start += nl + 1
+                continue
+            if chunk.startswith("/*"):
+                end = chunk.find("*/")
+                if end < 0:
+                    return remaining
+                start += end + 2
+                continue
+            break
+        if not re.match(r"\{\{-?\s*config\s*\(", remaining[start:]):
+            return remaining
+        open_paren = remaining.find("(", start)
+        _args, after_paren = _balanced_call(remaining, open_paren + 1)
+        if _args is None:
+            return remaining
+        close = re.match(r"\s*-?\s*\}\}", remaining[after_paren:])
+        if close is None:
+            return remaining
+        end = after_paren + close.end()
+        remaining = remaining[:start] + remaining[end:]
+
+
 def strip_jinja(sql: str) -> str:
     """Reduce a dbt model to plain SQL for the SELECT-only check.
 
     Inline expressions (``{{ ref(...) }}``) become an identifier placeholder;
-    statement and comment blocks are removed. Before the query starts, a
-    placeholder-only line is dropped at the top level (a ``{{ config(...) }}``
-    header). Once the first SQL ``SELECT`` or ``WITH`` token has started the
-    query, it is preserved as an identifier so a line-broken ``ref()`` remains
-    parseable. Inside parentheses it becomes a placeholder subquery, because
-    there it is a macro rendering a whole SELECT
+    statement and comment blocks are removed. A recognized leading
+    ``{{ config(...) }}`` header is dropped entirely (including when the SQL
+    follows on the same line) so header formatting does not change validity.
+    Before the query starts, any remaining placeholder-only line is also
+    dropped at the top level. Once the first SQL ``SELECT`` or ``WITH`` token
+    has started the query, a placeholder is preserved as an identifier so a
+    line-broken ``ref()`` remains parseable. Inside parentheses it becomes a
+    placeholder subquery, because there it is a macro rendering a whole SELECT
     (``from ( {{ unpivot_json_object(...) }} )``), and dropping it would leave
     unparseable SQL. Depth counting is naive about parens inside string literals;
     a miscount only ever refuses, never admits.
@@ -232,6 +277,7 @@ def strip_jinja(sql: str) -> str:
 
     text = _JINJA_COMMENT.sub("", sql)
     text = _JINJA_STMT.sub("", text)
+    text = _drop_leading_config_headers(text)
     text = _JINJA_EXPR.sub(_PLACEHOLDER, text)
     # Token lines locate the query without mistaking keywords in comments or
     # strings for its start.
