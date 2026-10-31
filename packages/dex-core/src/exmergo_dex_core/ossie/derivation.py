@@ -144,6 +144,10 @@ def derive(
         if definition.status == "included" and definition.path not in changed:
             changed.append(definition.path or "")
 
+    for definition in built:
+        if definition.status == "included":
+            definition.content = texts[definition.path or ""]
+
     _validate(layer, request, texts, built, changed)
     definitions = {d.model: d for d in built}
     included = [
@@ -220,7 +224,12 @@ def _build(
     target: str | None = None
     if len(homes) == 1:
         target = homes[0]
-    elif not homes and len(documents) == 1 and not declaration.references:
+    elif (
+        not homes
+        and len(documents) == 1
+        and len(layer.files) == 1
+        and not declaration.references
+    ):
         target = documents[0][0]
     elif len(homes) > 1:
         notes.append(

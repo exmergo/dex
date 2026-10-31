@@ -333,6 +333,57 @@ def test_a_configured_missing_document_is_included_as_an_applicable_plan(
     assert read(project, path) == model["content"]
 
 
+@pytest.mark.parametrize("separate_documents", [True, False])
+def test_batch_derivation_keeps_configured_paths_and_final_content(
+    project: Path, capsys, no_warehouse, separate_documents: bool
+):
+    paths = ["semantic/fct_orders.ossie.yaml"]
+    if separate_documents:
+        paths.append("semantic/fct_other.ossie.yaml")
+    _configure(project, paths)
+    declarations = []
+    edits = []
+    for name in ("fct_orders", "fct_other"):
+        declaration = copy.deepcopy(POPULATED)
+        declaration["model"] = name
+        declaration["columns"]["customer_id"].pop("references")
+        declarations.append(declaration)
+        edits.append(
+            {
+                "path": f"models/marts/{name}.sql",
+                "kind": "model_sql",
+                "content": MART_SQL,
+            }
+        )
+    rc, envelope = run(
+        capsys,
+        project,
+        "transform",
+        "plan",
+        "two marts",
+        "--edits-file",
+        _payload(project, {"edits": edits, "declarations": declarations}),
+    )
+
+    assert rc == 0, envelope["errors"]
+    proposal = _proposed(envelope)
+    assert proposal["mode"] == "included", proposal
+    models = proposal["models"]
+    assert models["fct_orders"]["path"] == paths[0]
+    assert models["fct_other"]["path"] == paths[-1]
+    assert all(model["status"] == "included" for model in models.values())
+    assert all(not (project / path).exists() for path in paths)
+
+    rc, applied = run(capsys, project, "transform", "apply", proposal["plan_id"])
+    assert rc == 0, applied
+    for name, model in models.items():
+        assert model["content"] == read(project, model["path"])
+        dataset_names = {
+            d["name"] for d in yaml.safe_load(model["content"])["datasets"]
+        }
+        assert dataset_names == ({name} if separate_documents else set(models))
+
+
 def test_a_new_document_does_not_bypass_validation_of_other_configured_files(
     project: Path, capsys, no_warehouse
 ):
