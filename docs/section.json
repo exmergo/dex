@@ -9,50 +9,26 @@
           {
             "group": "Get started",
             "pages": [
-              "index"
+              "index",
+              "quickstart",
+              "installation",
+              "connect"
             ]
           },
           {
-            "group": "Guardrails",
+            "group": "Workflows",
             "pages": [
-              "guardrails/cost-controls",
-              "guardrails/pii-policy",
-              "guardrails/values-free-mode"
+              "guides/explore",
+              "guides/transform",
+              "guides/maintain",
+              "guides/semantic-layer"
             ]
           },
           {
-            "group": "Concepts",
+            "group": "Tutorials and help",
             "pages": [
-              "concepts/source-of-truth",
-              "concepts/methodology",
-              "concepts/dbt-project"
-            ]
-          },
-          {
-            "group": "Connectors",
-            "pages": [
-              "connectors/duckdb",
-              "connectors/bigquery",
-              "connectors/snowflake",
-              "connectors/databricks",
-              "connectors/redshift",
-              "connectors/postgres",
-              "connectors/clickhouse",
-              "connectors/trino"
-            ]
-          },
-          {
-            "group": "Semantic layers",
-            "pages": [
-              "semantic-layers/overview",
-              "semantic-layers/ossie",
-              "semantic-layers/cube"
-            ]
-          },
-          {
-            "group": "Guides",
-            "pages": [
-              "guides/ossie-semantic-layer"
+              "guides/ossie-semantic-layer",
+              "guides/troubleshooting"
             ]
           }
         ]
@@ -75,21 +51,53 @@
             ]
           },
           {
-            "group": "Using dex",
+            "group": "Connectors",
             "pages": [
-              "reference/command-contract"
+              "connectors/duckdb",
+              "connectors/bigquery",
+              "connectors/snowflake",
+              "connectors/databricks",
+              "connectors/redshift",
+              "connectors/postgres",
+              "connectors/clickhouse",
+              "connectors/trino"
             ]
           },
           {
-            "group": "Extending dex",
+            "group": "Safety and spending",
             "pages": [
+              "guardrails/cost-controls",
+              "guardrails/pii-policy",
+              "guardrails/values-free-mode"
+            ]
+          },
+          {
+            "group": "Project and exploration",
+            "pages": [
+              "concepts/source-of-truth",
+              "concepts/methodology",
+              "concepts/dbt-project"
+            ]
+          },
+          {
+            "group": "Semantic layer compatibility",
+            "pages": [
+              "semantic-layers/overview",
+              "semantic-layers/ossie",
+              "semantic-layers/cube"
+            ]
+          },
+          {
+            "group": "Integration contracts",
+            "pages": [
+              "reference/command-contract",
               "reference/project-formats",
               "reference/storage-backends",
               "reference/host-integration"
             ]
           },
           {
-            "group": "Project",
+            "group": "Project quality",
             "pages": [
               "reference/evaluation"
             ]

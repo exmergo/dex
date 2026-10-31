@@ -1,0 +1,87 @@
+---
+title: Explore a warehouse
+sidebarTitle: Explore
+description: Find the tables that matter, inspect their grain and data quality, and verify joins before writing SQL. Turn a warehouse map into a focused investigation.
+---
+
+**Outcome:** a map of the relevant tables, evidence for their grain, and measured
+join behavior. Start from a [connected project](/dex/connect), or use the
+[demo warehouse](/dex/quickstart).
+
+## Start with a question
+
+Give your agent a purpose for the exploration:
+
+```text
+Use Dex to investigate how orders relate to customers. Profile the tables
+we need, verify their joins, and report duplicate keys or missing parents.
+```
+
+On a large warehouse, scope the request to a business area before widening it.
+
+## Map, then inspect
+
+```bash
+dex explore inventory --rank
+dex explore map
+```
+
+Inventory identifies the important objects; the map adds profiles and inferred
+relationships. Read the map's skipped objects and elision counts before treating
+it as a complete inventory of the warehouse.
+
+Then profile the relations your question actually reads. On the demo:
+
+```bash
+dex explore profile orders customers
+dex explore relationships --verify
+```
+
+Check whether a proposed key is unique, whether it contains NULLs, and whether
+the join has unmatched rows or multiplies the parent. A declared relationship
+states the project's intent; verification measures the data behind that claim.
+
+## Ask the data question
+
+```bash
+dex explore query "select status, count(*) as order_count from orders group by status"
+```
+
+Use `explore query` for SQL questions so profiling, scope, cost, and PII checks
+apply. Read the reported truncation and warnings along with the answer.
+
+## Keep the evidence useful
+
+A useful exploration report names the grain, joins that were verified, findings
+that affect the question, and anything left unmeasured. It distinguishes what
+the project declares from what the data proves.
+
+<Accordion title="Include the existing project and semantic layer">
+
+```bash
+dex explore map --use-project
+dex explore relationships --verify --use-project
+```
+
+These commands include local project declarations and semantic relationships.
+A declaration can inform a map without proving its assertion against the data.
+
+</Accordion>
+
+<Accordion title="Show the map as a diagram">
+
+```bash
+dex explore diagram
+```
+
+The result contains Mermaid text under `data.mermaid`. Your agent can render it.
+The diagram reads the cached map and does not query the warehouse. Use `--full`
+when you need more of the cached objects and columns.
+
+</Accordion>
+
+## Continue
+
+Use the evidence to [transform a model](/dex/guides/transform). For selection
+rules and measurement detail, read the [exploration methodology](/dex/concepts/methodology).
+For every option, use [`dex explore`](/dex/cli/explore).

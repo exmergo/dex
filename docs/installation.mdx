@@ -1,0 +1,116 @@
+---
+title: Install Dex
+sidebarTitle: Installation
+description: Set up Dex for a coding agent or use its CLI directly. Choose one installation path, verify uv is available, and run from your project directory.
+---
+
+Choose the way you want to use Dex. The skills guide an agent through the same
+engine that the CLI exposes directly.
+
+## Prerequisite
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) version
+0.13.4 or later and check that your terminal can find it:
+
+```bash
+uv --version
+```
+
+Dex's skill wrappers use uv to install and run the engine. Your agent needs a
+local shell and access to your project directory.
+
+## Choose one installation path
+
+<Tabs>
+  <Tab title="Agent skills">
+
+Run this in your terminal and choose your agent when prompted:
+
+```bash
+npx skills add exmergo/dex
+```
+
+For Codex, you can select the agent explicitly:
+
+```bash
+npx skills add exmergo/dex --agent codex
+```
+
+Open your project in the agent and ask it to use Dex. The three skills are
+`explore`, `transform`, and `maintain`.
+
+  </Tab>
+  <Tab title="Claude Code plugin">
+
+Run these inside Claude Code, one at a time:
+
+```text
+/plugin marketplace add exmergo/exmergo-agent-plugins
+```
+
+```text
+/plugin install dex@exmergo
+```
+
+The skills appear as `/dex:explore`, `/dex:transform`, and `/dex:maintain`.
+Update the marketplace later with `/plugin marketplace update exmergo`.
+
+  </Tab>
+  <Tab title="Standalone CLI">
+
+Start locally with DuckDB:
+
+```bash
+uv tool install "exmergo-dex-core[duckdb]"
+dex --help
+```
+
+For another warehouse, install its connector extra instead. For example:
+
+```bash
+uv tool install "exmergo-dex-core[snowflake]"
+```
+
+If Dex is already installed with a different set of extras, use
+`uv tool install --force` with the complete set you need, such as
+`"exmergo-dex-core[duckdb,snowflake]"`.
+
+  </Tab>
+</Tabs>
+
+## Start from the project directory
+
+Open the directory containing your project. Dex discovers `.dex/config.yml`
+up the directory tree, and uses the dbt project and semantic definitions in
+that repository.
+
+Try this prompt after [connecting your data](/dex/connect):
+
+```text
+Use Dex to map this warehouse. Show me the tables worth investigating,
+their likely grain, and the joins that need verification.
+```
+
+<Accordion title="The first command takes longer than later commands">
+
+The skill wrapper downloads the engine and connector dependencies on its first
+run. Ask your agent to warm the installed wrapper with `--warm` if you want to
+pay that setup cost ahead of an interactive session. Warm-up installs packages;
+it does not query the warehouse.
+
+</Accordion>
+
+<Accordion title="My agent does not load skills">
+
+Point it at the repository's
+[AGENTS.md](https://github.com/exmergo/dex/blob/main/AGENTS.md).
+It contains the engine procedure and command contract.
+
+With the CLI installed, `dex procedure --block` also prints the current procedure
+for inclusion in an agent's instructions. See
+[`dex procedure`](/dex/cli/procedure) for checking that a copied procedure is current.
+
+</Accordion>
+
+Continue with the [local quickstart](/dex/quickstart), or
+[connect an existing warehouse](/dex/connect).

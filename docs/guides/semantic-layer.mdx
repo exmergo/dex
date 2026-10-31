@@ -1,0 +1,68 @@
+---
+title: Use a semantic layer
+sidebarTitle: Semantic layers
+description: Find the metrics your project defines, choose the right semantic backend, and author changes through reviewable plans. Check query support before running them.
+---
+
+**Outcome:** find the definitions your project already owns, then choose whether
+to query them or change them. A catalog that can be read is not necessarily a
+backend that can execute queries.
+
+## 1. Identify the layer
+
+| Your project uses | Where definitions live | Read next |
+| --- | --- | --- |
+| dbt semantic models | MetricFlow YAML in the dbt project | [Semantic layer reference](/dex/semantic-layers/overview) |
+| dbt Cloud Semantic Layer | Hosted catalog and query API | [Hosted backend](/dex/semantic-layers/overview#hosted-backend-api-dbt-cloud-semantic-layer) |
+| Apache Ossie | Native YAML documents in the repository | [Ossie walkthrough](/dex/guides/ossie-semantic-layer) |
+| SLayer | Native model files in the repository | [SLayer support](/dex/semantic-layers/overview#slayer-models-vendor-slayer) |
+| Cube | Cube YAML model files in the repository | [Cube compatibility](/dex/semantic-layers/cube) |
+
+Use the configuration and extras for that backend. Keep the existing format as
+the source of truth; choosing Dex does not require converting it to another one.
+
+## 2. Inspect the catalog first
+
+```bash
+dex explore semantic list
+```
+
+Read the available metrics, dimensions, entities, and physical mappings. The
+mapping to warehouse columns matters: it connects semantic queries to profiling
+and PII checks.
+
+Ask your agent:
+
+```text
+Use Dex to list the revenue metrics in this project's semantic layer.
+Explain their dimensions and physical sources before running a query.
+```
+
+## 3. Query or author
+
+**To answer a metric question**, use `explore semantic query` or
+`explore semantic values` on a backend that supports it. Start with the names
+returned by the catalog and the [semantic query reference](/dex/semantic-layers/overview).
+
+**To change definitions**, ask the agent to prepare a plan using `semantic
+define|update|plan` for dbt semantic models, or the matching `semantic ossie`,
+`semantic slayer`, or `semantic cube` command for native documents. Review the
+plan and apply it through `transform apply`.
+
+<Warning>
+Hosted dbt Cloud semantic queries are outside Dex's cost guard. Understand that
+boundary before running them. Other backends have different query capabilities;
+reading a native document does not authorize a hosted catalog or query request.
+</Warning>
+
+## A complete local example
+
+The [Apache Ossie walkthrough](/dex/guides/ossie-semantic-layer) takes a native
+layer from local files through catalog inspection, exploration, a drift baseline,
+and authoring. It also explains the cases where metric queries are refused and
+how to ask a governed warehouse question instead.
+
+For exact schemas and validation limits, use the
+[semantic layer reference](/dex/semantic-layers/overview),
+[Ossie compatibility](/dex/semantic-layers/ossie), or
+[Cube compatibility](/dex/semantic-layers/cube).

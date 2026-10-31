@@ -1,0 +1,98 @@
+---
+title: Your first warehouse map
+sidebarTitle: Quickstart
+description: Install Dex, create a local demo warehouse, and investigate a broken key and join. Learn to read the results before connecting your own warehouse.
+---
+
+Start with a local DuckDB warehouse that contains deliberate data defects. By the
+end, you will have a map of its tables and evidence about a key and a join that
+cannot be trusted.
+
+You need a terminal and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+Installation downloads packages; the demo and exploration run locally afterwards.
+
+## 1. Install the CLI
+
+```bash
+uv tool install "exmergo-dex-core[duckdb]"
+dex --help
+```
+
+Already using the Dex skills? Ask your agent to run the commands below through
+its installed wrapper. The wrapper and the CLI use the same engine.
+
+## 2. Create the demo
+
+Use a new directory outside an existing Dex project so the demo can create its
+own configuration.
+
+```bash
+mkdir dex-first-run
+cd dex-first-run
+dex demo
+```
+
+The command creates `dex_demo.duckdb` and `.dex/config.yml`. The warehouse has
+seven tables and 29,512 rows. It refuses to replace an existing warehouse file.
+
+## 3. Map the warehouse
+
+```bash
+dex explore map
+```
+
+Read `data.objects` for each table's grain, candidate key, and findings, then
+`data.edges` for the inferred joins. A candidate key is a measurement; a shared
+column name alone is not proof of a join.
+
+Every command prints a JSON envelope. Start with these fields:
+
+| Field | What to read |
+| --- | --- |
+| `status` | Whether the command succeeded, failed, or needs confirmation |
+| `data` | The map, profile, or other result you asked for |
+| `warnings` | Limits or qualifications that affect the result |
+| `errors` and `reason` | Why a command could not finish |
+
+## 4. Investigate the findings
+
+```bash
+dex explore profile order_items products
+dex explore relationships --verify
+```
+
+The demo's `order_item_id` has duplicates, so it is not a valid grain. The
+`web_events.customer_id` join also fails verification: its values do not match
+the customer keys. These are intentional defects, not installation failures.
+
+To ask a data question, use Dex's query command:
+
+```bash
+dex explore query "select count(*) as order_count from orders"
+```
+
+This returns 5,000 orders. Queries go through the same profiling and PII checks
+as the rest of exploration.
+
+<Accordion title="See how a PII refusal works">
+
+```bash
+dex explore query "select email from customers"
+```
+
+This query is expected to be refused. The email column is flagged as personal
+data. Do not clear a flag just to make an example run; see the
+[PII policy](/dex/guardrails/pii-policy) for how flags are reviewed.
+
+</Accordion>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Connect your own data" href="/dex/connect">
+    Choose a connector, verify access, and set the scope for exploration.
+  </Card>
+  <Card title="Explore with your agent" href="/dex/guides/explore">
+    Turn the map into a focused investigation and verify the joins it needs.
+  </Card>
+</CardGroup>
