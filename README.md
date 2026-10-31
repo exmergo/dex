@@ -200,11 +200,12 @@ checks a project as it stands, with no baseline needed.
 <img width="484" height="344" alt="Maintain" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
 
 > [!TIP]
-> **Give every agent in your repository the same procedure.** `dex procedure
-> --block` prints the procedure every Dex skill follows, ready to paste into your
-> `CLAUDE.md` or `AGENTS.md`, so an agent follows it even before it loads a skill.
-> Dex never writes the file; `dex procedure --check CLAUDE.md` tells you when an
-> upgrade has made your copy stale. See
+> **Give every agent in your repository the same procedure.**
+> `dex procedure --block` prints the procedure every Dex skill follows, ready to
+> paste into your `CLAUDE.md` or `AGENTS.md`, so an agent follows it even before
+> it loads a skill. Dex never writes the file;
+> `dex procedure --check CLAUDE.md` tells you when an upgrade has made your copy
+> stale. See
 > [`dex procedure`](https://docs.exmergo.com/dex/cli/procedure).
 
 ## Connectors

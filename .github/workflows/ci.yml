@@ -188,8 +188,11 @@ jobs:
       # engine's [duckdb] extra pins, so its scorer and fixtures are tested in the
       # engine's environment (and skip in the stdlib-only step above). No agent and
       # no spend: every task's reference answer is scored and built with dbt.
+      # Pinned to 3.13: on the runner's default 3.14, dbt's parse fails importing
+      # pydantic.v1, so every reference answer would fail the build gate on the
+      # interpreter rather than on the declaration under test.
       - name: Metadata eval scorer and fixtures
-        run: uv run --project packages/dex-core --locked --extra duckdb --with pytest pytest evals/tests/test_metadata.py -q
+        run: uv run --python 3.13 --project packages/dex-core --locked --extra duckdb --with pytest pytest evals/tests/test_metadata.py -q
 
   # On brand for Exmergo (easter egg): all shipped prose is em-dash free. That
   # includes the documentation site's own pages and its config, where the site
