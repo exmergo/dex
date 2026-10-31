@@ -1,0 +1,1 @@
+**`transform plan` accepts inline `config()` headers when SQL follows on the same line.** Rather than refusing models with a leading Jinja placeholder error, recognized leading `config()` headers are blanked out prior to expression replacement, permitting valid queries formatted on the same or subsequent lines to plan successfully.
