@@ -122,6 +122,7 @@ def build(
     target: str,
     configured_target: str | None = None,
     select: str | None = None,
+    full_refresh: bool = False,
     ceiling: float | None = None,
     confirmed: bool = False,
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
@@ -235,6 +236,8 @@ def build(
     argv = [_dbt_executable(), "build", *flags]
     if select:
         argv += ["--select", select]
+    if full_refresh:
+        argv.append("--full-refresh")
 
     named_artifacts = artifact_directory is not None or runtime_key is not None
     if artifact_directory is not None:

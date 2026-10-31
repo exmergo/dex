@@ -1108,6 +1108,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="SELECTOR",
                         help="dbt node selection, passed through to dbt",
                     )
+                    # Seeds whose CSV columns changed need dbt's full-refresh
+                    # path; without this flag transform build cannot finish
+                    # that change under Dex (#943).
+                    sp.add_argument(
+                        "--full-refresh",
+                        dest="full_refresh",
+                        action="store_true",
+                        default=False,
+                        help="pass --full-refresh through to dbt build",
+                    )
                     # Opt-in on every connector, free ones included. Verifying
                     # on DuckDB costs nothing, so defaulting it on there was
                     # available; one flag meaning one thing everywhere is worth

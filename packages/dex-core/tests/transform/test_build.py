@@ -757,6 +757,41 @@ def test_build_paths_are_absolute_from_a_relative_project_dir(
     assert project_arg.parent.name != "analytics"
 
 
+def test_build_passes_full_refresh_through_to_dbt(dbt_project_dir: Path, monkeypatch):
+    """#943: seed column changes need dbt --full-refresh; the flag must reach argv."""
+
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    captured: dict = {}
+
+    def runner(argv: list[str]):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    summary, _cost = build_module.build(
+        dbt_project_dir,
+        target="dev",
+        confirmed=True,
+        full_refresh=True,
+        runner=runner,
+    )
+    assert summary["success"] is True
+    assert "--full-refresh" in captured["argv"]
+
+    summary, _cost = build_module.build(
+        dbt_project_dir,
+        target="dev",
+        confirmed=True,
+        full_refresh=False,
+        runner=runner,
+    )
+    assert summary["success"] is True
+    assert "--full-refresh" not in captured["argv"]
+
+
 def test_shadow_parse_profiles_dir_is_absolute_from_a_relative_project(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch
 ):

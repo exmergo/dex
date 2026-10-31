@@ -695,6 +695,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "args": {
             "target": "target",
             "select": "select",
+            "full_refresh": "full_refresh",
             "verify": "verify",
             "for_plan": "for_plan",
             # Read from the file into `for_plan_document`.
