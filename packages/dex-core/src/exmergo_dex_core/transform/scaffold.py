@@ -26,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from ..cache import Dataset
+from ..cache import Dataset, match_identifier
 from ..dbt_project import DbtProjectError, DbtProjectView
 from ..dbt_project import load as load_dbt_project
 from ..errors import ConfigurationError, DexError, PrerequisiteError
@@ -207,15 +207,15 @@ def model_edits(dataset: Dataset, connector: str | None = None) -> list[PlanEdit
     the scaffold declared.
     """
 
-    table = _table_name(dataset.identifier)
+    model = _model_name(dataset.identifier)
     return [
         PlanEdit(
-            path=f"models/staging/stg_{table}.sql",
+            path=f"models/staging/{model}.sql",
             kind=EditKind.MODEL_SQL,
             new_content=_model_sql(dataset, connector),
         ),
         PlanEdit(
-            path=f"models/staging/stg_{table}.yml",
+            path=f"models/staging/{model}.yml",
             kind=EditKind.SCHEMA_YML,
             new_content=_model_yaml(dataset),
         ),
@@ -226,15 +226,9 @@ def model_edits(dataset: Dataset, connector: str | None = None) -> list[PlanEdit
 
 
 def _resolve_dataset(datasets: list[Dataset], name: str) -> Dataset:
-    matches = sorted(
-        {
-            d.identifier
-            for d in datasets
-            if d.identifier == name
-            or d.identifier.endswith(f".{name}")
-            or d.identifier.split(".")[-1] == name
-        }
-    )
+    # Case-insensitive, as every other place a name is given: an upper-casing
+    # warehouse (Snowflake) caches `DB.RAW.ORDERS` for a table asked for as `orders`.
+    matches = match_identifier(name, [d.identifier for d in datasets])
     if not matches:
         raise ScaffoldPrerequisiteError(
             f"no cached object named '{name}'; run `explore map` first"
@@ -247,6 +241,13 @@ def _resolve_dataset(datasets: list[Dataset], name: str) -> Dataset:
 
 def _table_name(identifier: str) -> str:
     return identifier.split(".")[-1]
+
+
+def _model_name(identifier: str) -> str:
+    """The staging model a relation scaffolds to, ``stg_<table>`` in lower case: a
+    dbt model name does not follow the warehouse's folding, while the ``source()``
+    call keeps the table as the warehouse spells it (:func:`_table_name`)."""
+    return f"stg_{_table_name(identifier).lower()}"
 
 
 def _source_schema(identifier: str) -> str:
@@ -306,21 +307,22 @@ def _refuse_model_collisions(
     named.
     """
 
-    by_table: dict[str, str] = {}
+    by_model: dict[str, str] = {}
     for dataset in datasets:
-        table = _table_name(dataset.identifier)
-        other = by_table.setdefault(table, dataset.identifier)
+        model = _model_name(dataset.identifier)
+        other = by_model.setdefault(model, dataset.identifier)
         if other != dataset.identifier:
             raise ScaffoldError(
                 f"{other} and {dataset.identifier} would both scaffold "
-                f"stg_{table}; scaffold them in separate calls, renaming the "
+                f"{model}; scaffold them in separate calls, renaming the "
                 "first model in between (`transform rename model`)"
             )
     if view is None:
         return
     for dataset in datasets:
         table = _table_name(dataset.identifier)
-        path = f"models/staging/stg_{table}.sql"
+        model = _model_name(dataset.identifier)
+        path = f"models/staging/{model}.sql"
         current = view.files.get(path)
         if current is None:
             continue
@@ -330,9 +332,9 @@ def _refuse_model_collisions(
             named = ", ".join(f"source('{s}', '{t}')" for s, t in reads)
             raise ScaffoldError(
                 f"{path} already reads {named}, not {dataset.identifier}; "
-                f"scaffolding it would repoint stg_{table} at a different "
+                f"scaffolding it would repoint {model} at a different "
                 "relation. Rename the existing model first (`transform rename "
-                f"model stg_{table} <new name>`), then scaffold"
+                f"model {model} <new name>`), then scaffold"
             )
 
 
@@ -536,10 +538,10 @@ def _model_sql(dataset: Dataset, connector: str | None = None) -> str:
 
 
 def _model_yaml(dataset: Dataset) -> str:
-    table = _table_name(dataset.identifier)
+    model = _model_name(dataset.identifier)
     key_columns = set(dataset.candidate_keys[0]) if dataset.candidate_keys else set()
 
-    lines = ["version: 2", "", "models:", f"  - name: stg_{table}"]
+    lines = ["version: 2", "", "models:", f"  - name: {model}"]
     if any(c.pii for c in dataset.columns):
         lines += stamp_lines("    ")
     lines.append("    columns:")

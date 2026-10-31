@@ -101,7 +101,7 @@ def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str
         # callers holding no format, so answering a path where it answers `None`
         # would make the shim and the format disagree about the same input.
         suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
-        model = table if table.startswith("stg_") else f"stg_{table}"
+        model = table if table.startswith("stg_") else f"stg_{table.lower()}"
         return None if suffix is None else f"models/staging/{model}.{suffix}"
     return placement.edit_path(kind, table)
 
@@ -234,7 +234,7 @@ def build(
                     action=(
                         "this project format places a staging model somewhere "
                         "dex cannot author one for it; update "
-                        f"stg_{table} wherever that model is defined"
+                        f"stg_{table.lower()} wherever that model is defined"
                     ),
                 )
                 for finding in written
@@ -248,7 +248,7 @@ def build(
             for call in jinja_calls(view.files[model_path].content)
         ):
             reason = (
-                f"stg_{table} does not read source(..., '{table}'), "
+                f"stg_{table.lower()} does not read source(..., '{table}'), "
                 "so dex did not edit it"
             )
             proposals.extend(

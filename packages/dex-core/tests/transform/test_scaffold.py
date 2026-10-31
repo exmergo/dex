@@ -556,6 +556,44 @@ def test_an_object_the_cache_does_not_hold_names_the_command_that_maps_it():
         _resolve_dataset([Dataset(identifier="p.a.orders")], "nope")
 
 
+@pytest.mark.parametrize(
+    "name", ["orders", "ORDERS", "raw.orders", "DEX_DB.RAW.ORDERS"]
+)
+def test_a_scaffold_name_resolves_case_insensitively(name):
+    """Snowflake folds an unquoted name to upper case, so `explore map` caches
+    `DEX_DB.RAW.ORDERS`; `--scaffold orders` finds it, as `explore profile` does."""
+
+    dataset = Dataset(identifier="DEX_DB.RAW.ORDERS")
+    assert _resolve_dataset([dataset], name) is dataset
+
+
+def test_an_upper_case_relation_scaffolds_a_lower_case_model():
+    """The model and its files are `stg_orders`, as a dbt project names a model;
+    the source() call keeps the table as the warehouse spells it."""
+
+    from exmergo_dex_core.transform.scaffold import model_edits
+
+    edits = model_edits(Dataset(identifier="DEX_DB.RAW.ORDERS"), "snowflake")
+    assert [e.path for e in edits] == [
+        "models/staging/stg_orders.sql",
+        "models/staging/stg_orders.yml",
+    ]
+    sql, yml = (e.new_content for e in edits)
+    assert "'ORDERS') }}" in sql
+    assert "  - name: stg_orders" in yml
+
+
+def test_tables_differing_only_in_case_collide_on_one_model():
+    """`a.ORDERS` and `b.orders` both scaffold to `stg_orders`, so the collision
+    refusal names the lower-case model they would share."""
+
+    from exmergo_dex_core.transform.scaffold import _refuse_model_collisions
+
+    datasets = [Dataset(identifier="db.a.ORDERS"), Dataset(identifier="db.b.orders")]
+    with pytest.raises(ScaffoldError, match="would both scaffold stg_orders"):
+        _refuse_model_collisions(datasets, None, "snowflake")
+
+
 def test_an_ambiguous_name_is_the_callers_input():
     """Two cached objects share the short name. No `explore` command resolves
     that and no file needs editing; the caller qualifies the name. So the
@@ -663,7 +701,7 @@ def test_a_source_in_another_database_names_it(connector):
             "tables": [{"name": "CUSTOMER"}],
         }
     ]
-    model = next(e for e in edits if e.path.endswith("stg_CUSTOMER.sql"))
+    model = next(e for e in edits if e.path.endswith("stg_customer.sql"))
     assert "source('TPCH_SF1', 'CUSTOMER')" in model.new_content
 
 
