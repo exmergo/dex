@@ -625,6 +625,7 @@ def _profile_into_cache(
     prior: DexCache | None,
     now: datetime,
     *,
+    fresh: list[Dataset] | None = None,
     withhold: bool = False,
 ) -> tuple[list[Dataset], DexCache, str, str]:
     """Scan the named objects and fold the profiles into the cache.
@@ -676,7 +677,8 @@ def _profile_into_cache(
     if withhold:
         for dataset in profiled:
             withhold_values(dataset)
-    cache, stats = _merge_profiles(prior, profiled, adapter.name, now)
+    to_merge = profiled + (list(fresh) if fresh else [])
+    cache, stats = _merge_profiles(prior, to_merge, adapter.name, now)
     locator = store.save_cache(cache, now=now)
     note = _persist_note(stats, len(profiled), keeps_relationships=True)
     return profiled, cache, locator, note
@@ -788,7 +790,15 @@ def profile(
     # project at output time, on a copy, so the cache does not keep a claim the
     # next run would have to refresh to drop (#926).
     profiled, cache, locator, persist_note = _profile_into_cache(
-        store, adapter, config, None, stale, prior, now, withhold=values_free
+        store,
+        adapter,
+        config,
+        None,
+        stale,
+        prior,
+        now,
+        fresh=list(fresh_reused.values()),
+        withhold=values_free,
     )
 
     # Freshly profiled plus fresh-cached: the full requested set, whether scanned
@@ -5329,11 +5339,19 @@ def _split_fresh_stale(
             continue
         # The same free, no-scan metadata call profile() makes first: confirms
         # the schema has not drifted since the cached profile was written.
-        _meta, columns = adapter.table_metadata(identifier)
+        meta, columns = adapter.table_metadata(identifier)
         if _column_signature(columns) != _column_signature(prior_ds.columns):
             stale.append(identifier)
             continue
-        fresh[identifier] = prior_ds.model_copy(deep=True)
+        reused = prior_ds.model_copy(deep=True)
+        # Refresh row_count and byte_size from the warehouse's cheap metadata (#985).
+        # A fresh-cached profile retains its detailed column verdicts, but must never
+        # pin a row count older than the inventory it was taken alongside.
+        if meta.row_count is not None:
+            reused.row_count = meta.row_count
+        if meta.byte_size is not None:
+            reused.byte_size = meta.byte_size
+        fresh[identifier] = reused
     return stale, fresh
 
 

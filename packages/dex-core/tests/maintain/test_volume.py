@@ -132,3 +132,43 @@ def test_an_object_that_never_had_a_baseline_count_is_not_worth_naming():
     snap = _volume_snapshot(**{"p.d.a_view": None})
     current = [Dataset(identifier="p.d.a_view", row_count=None)]
     assert uncomparable_volume(current, snap) == []
+
+
+def test_fresh_cached_profile_accepts_expected_volume_change_without_refresh(
+    maintain_repo,
+):
+    """#985: A fresh cached profile refreshes row_count from metadata.
+
+    After an expected volume change, `explore map` (without --refresh), then
+    `maintain snapshot`, then `maintain check` reports no row_count_changed
+    for that object, within the freshness window.
+    """
+    maintain_repo.snapshot()
+
+    # Induce an expected volume change: delete 90% of orders (200 -> 20 rows)
+    maintain_repo.sql("DELETE FROM orders WHERE order_id > 20")
+
+    # maintain volume reports the change against the old baseline
+    _rc, payload = maintain_repo.dex("maintain", "volume")
+    assert payload["data"]["finding_count"] > 0
+    orders_finding = next(
+        f
+        for f in payload["data"]["findings"]
+        if f["identifier"] == "warehouse.main.orders"
+    )
+    assert orders_finding["code"] == "row_count_changed"
+
+    # User follows advisory: re-run explore map (WITHOUT --refresh) and snapshot
+    rc, map_payload = maintain_repo.dex("explore", "map")
+    assert rc == 0
+    # Verify orders was reused from cache as fresh
+    assert map_payload["data"]["cache_hit_count"] > 0
+
+    # Snapshot pins the updated cache
+    maintain_repo.snapshot()
+
+    # maintain check now sees no volume drift
+    rc, check_payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0
+    volume_findings = check_payload["data"]["axes"]["volume"]["findings"]
+    assert not any(f["identifier"] == "warehouse.main.orders" for f in volume_findings)
