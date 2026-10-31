@@ -19,10 +19,59 @@ CONFIG_PATHS = (WORKFLOW_PATH, PRE_COMMIT_PATH, PYPROJECT_PATH, LOCK_PATH)
 RUFF_HOOK_REPO = "https://github.com/astral-sh/ruff-pre-commit"
 
 
-def _read_ruff_pins(configs: Mapping[str, str]) -> dict[str, list[str]]:
-    workflow_versions = re.findall(r"\bruff@(\d+\.\d+\.\d+)\b", configs[WORKFLOW_PATH])
-    if not workflow_versions:
+def _workflow_ruff_versions(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    run_scripts = []
+    index = 0
+    while index < len(lines):
+        match = re.match(
+            r"^(?P<indent>[ \t]*(?:-[ \t]+)?)run:[ \t]*(?P<value>.*)$",
+            lines[index],
+        )
+        if match is None:
+            index += 1
+            continue
+
+        run_indent = len(match.group("indent"))
+        value = match.group("value").strip()
+        index += 1
+        if re.match(r"^[|>][+-]?(?:[ \t]|$)", value):
+            script_lines = []
+            while index < len(lines):
+                line = lines[index]
+                line_indent = len(line) - len(line.lstrip(" \t"))
+                if line.strip() and line_indent <= run_indent:
+                    break
+                script_lines.append(line)
+                index += 1
+            run_scripts.append("\n".join(script_lines))
+        else:
+            run_scripts.append(value)
+
+    versions = []
+    for script in run_scripts:
+        for command in script.splitlines():
+            if command.lstrip().startswith("#"):
+                continue
+            for match in re.finditer(
+                r"(?<![\w.-])ruff(?:@(?P<version>\d+\.\d+\.\d+))?(?![\w.-])",
+                command,
+            ):
+                version = match.group("version")
+                if version is None:
+                    raise AssertionError(
+                        f"Expected an exact Ruff version pin in {WORKFLOW_PATH}, "
+                        f"found run command {command.strip()!r}"
+                    )
+                versions.append(version)
+
+    if not versions:
         raise AssertionError(f"No pinned Ruff invocation found in {WORKFLOW_PATH}")
+    return versions
+
+
+def _read_ruff_pins(configs: Mapping[str, str]) -> dict[str, list[str]]:
+    workflow_versions = _workflow_ruff_versions(configs[WORKFLOW_PATH])
 
     pre_commit_versions = []
     lines = configs[PRE_COMMIT_PATH].splitlines()
@@ -144,3 +193,32 @@ def test_reports_a_mismatched_ruff_pin(
 
     assert path in str(error.value)
     assert "0.15.19" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        (
+            "steps:\n"
+            "  - run: uvx ruff@0.17.2 check .\n"
+            "  - run: uvx ruff format .\n"
+        ),
+        (
+            "steps:\n"
+            "  - run: |\n"
+            "      uvx ruff@0.17.2 check .\n"
+            "      uvx ruff format .\n"
+        ),
+    ],
+)
+def test_rejects_unpinned_ruff_workflow_invocation(
+    matching_ruff_configs: dict[str, str], workflow: str
+) -> None:
+    matching_ruff_configs[WORKFLOW_PATH] = workflow
+
+    with pytest.raises(AssertionError) as error:
+        _assert_ruff_pins_match(matching_ruff_configs)
+
+    assert WORKFLOW_PATH in str(error.value)
+    assert "run command" in str(error.value)
+    assert "ruff format" in str(error.value)
