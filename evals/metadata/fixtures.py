@@ -4,7 +4,8 @@ On disk, one directory per fixture under ``evals/metadata/fixtures/``::
 
     <fixture>/fixture.json        {"name", "description", "seed"}
     <fixture>/warehouse.py        tables(seed) -> list[Table]: the raw source data
-    <fixture>/project/            the dbt project the agent starts from
+    <fixture>/project/            the dbt project the agent starts from (its
+                                  profiles.yml is generated, see write_profile)
     <fixture>/tasks/<id>/task.json   {"prompt", "kind": "build"|"fix", "models": [...]}
     <fixture>/tasks/<id>/truth.json  the known right answers (see score.py)
     <fixture>/tasks/<id>/setup/      optional overlay: the task's starting state
@@ -19,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -199,7 +201,36 @@ def starting_project(task: Task, fixture: Fixture, destination: Path) -> Path:
 
     shutil.copytree(fixture.project, destination, ignore=_IGNORED)
     overlay(task.directory / "setup", destination)
+    write_profile(destination)
     return destination
+
+
+def write_profile(project: Path) -> None:
+    """The dev profile, written rather than committed.
+
+    The repository ignores every ``profiles.yml`` so a credential can never be
+    committed by accident, and a fixture's profile holds nothing but a local
+    DuckDB path, so it is generated from the profile ``dbt_project.yml`` names.
+    """
+
+    match = re.search(
+        r"^profile:\s*[\"']?([\w-]+)",
+        (project / "dbt_project.yml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if match is None:
+        raise ValueError(f"{project / 'dbt_project.yml'} names no profile")
+    (project / "profiles.yml").write_text(
+        f"{match.group(1)}:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      type: duckdb\n"
+        f"      path: {WAREHOUSE_FILE}\n"
+        "      schema: main\n"
+        "      threads: 1\n",
+        encoding="utf-8",
+    )
 
 
 def materialize(
