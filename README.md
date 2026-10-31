@@ -323,7 +323,7 @@ data values:
 | File | Commit? | Can it contain data values? |
 | --- | --- | --- |
 | `.dex/config.yml` | Yes | No: connector targets, `pii_overrides` (column names, not values), budgets and limits. Credentials live in environment variables or dbt profiles, never in this file. |
-| `.dex/snapshot.json` | Yes, like a lockfile | Yes: when snapshotted from a cache it pins the cache's datasets wholesale, including each non-PII column's capped value domain and min/max. A metadata-only baseline (no cache) carries schema and volume only. PII-flagged columns never carry value domains. |
+| `.dex/snapshot.json` | Like a lockfile, where its values may be public; otherwise take a metadata-only baseline or keep it out | Yes: when snapshotted from a cache it pins the cache's datasets wholesale, including each non-PII column's capped value domain and min/max. A metadata-only baseline (no cache) carries schema and volume only. PII-flagged columns never carry value domains. |
 | `.dex/cache.json` | Only if values may be public | Yes: column profiles with capped value domains (actual values with counts). Never for PII-flagged columns. |
 | `.dex/plans/*.json` | Optional, as an audit trail | No warehouse values: the proposed contents of project files. |
 | `.dex/queries.jsonl` | Optional, as a ledger | SQL text, which may hold literals. |

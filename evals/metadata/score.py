@@ -46,6 +46,7 @@ from .fixtures import (
 
 EVIDENCE_TIERS = ("request", "contract", "precedent", "data", "default")
 MEASURE_FIELDS = ("aggregation", "additivity", "unit")
+GATE_TIMEOUT_S = 600
 
 
 # --- reading declarations ---------------------------------------------------
@@ -203,13 +204,18 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
     )
     build_warehouse(scratch / WAREHOUSE_FILE, fixture.tables())
     for stage, args in (("parse", ["parse"]), ("build", ["build"])):
-        proc = subprocess.run(
-            [_dbt(), *args, "--profiles-dir", ".", "--no-use-colors"],
-            cwd=scratch,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        try:
+            proc = subprocess.run(
+                [_dbt(), *args, "--profiles-dir", ".", "--no-use-colors"],
+                cwd=scratch,
+                capture_output=True,
+                text=True,
+                timeout=GATE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return Gate(
+                False, stage, [f"dbt {stage} timed out after {GATE_TIMEOUT_S}s"]
+            )
         if proc.returncode != 0:
             return Gate(False, stage, _tail(proc.stdout + "\n" + proc.stderr))
     return Gate(True, "ok")
@@ -271,6 +277,10 @@ def completeness(decl: Declared, columns: list[str] | None) -> dict[str, Any]:
             a.get("evidence") in EVIDENCE_TIERS for a in decl.assumptions
         ),
     }
+    if columns is None:
+        # Nothing to judge column roles against: the model was not built (a task
+        # that asked for it and got only YAML). Counted, so it cannot score 1.0.
+        items["built_relation"] = False
     for column in columns or []:
         facts = decl.columns.get(column, {})
         items[f"role:{column}"] = bool(facts.get("role"))

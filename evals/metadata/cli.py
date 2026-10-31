@@ -1,12 +1,13 @@
 """``python -m evals metadata``: run, score and report the metadata-quality eval.
 
     # Free: score every task's reference answer (the scorer's own self-test).
-    uv run --project packages/dex-core --extra duckdb \
+    uv run --python 3.13 --project packages/dex-core --extra duckdb \
         python -m evals metadata --reference
 
     # Paid: one headless Claude Code session per task, then score.
-    uv run --project packages/dex-core --extra duckdb python -m evals metadata \\
-        --model claude-sonnet-5-5 --out evals/metadata/runs/<name>
+    uv run --python 3.13 --project packages/dex-core --extra duckdb \\
+        python -m evals metadata --model claude-sonnet-5-5 \\
+        --out evals/metadata/runs/<name>
 
     # Re-score a workspace a run left behind.
     ... python -m evals metadata --score-only <workspace> --task <fixture/task>

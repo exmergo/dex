@@ -2029,13 +2029,14 @@ def _join_equality_pairs(join, in_scope_relations: list, sql_shape):
         if _pairs_keys_and_filters(join.on):
             # `on o.customer_id = c.customer_id and o.status <> 'cancelled'`:
             # the keys are there, but the filter beside them narrows which rows
-            # can match, and a probe of the keys alone would report every row
-            # that filter drops as an orphan.
+            # can match. A probe of the keys alone counts the rows that filter
+            # excludes as matches, so a parent whose only matches are excluded
+            # (every order cancelled) would read as covered when it is not.
             return [], (
                 "its condition filters as well as pairing keys (a conjunct "
                 "that is not a column-to-column equality), and an overlap "
                 "probe on the keys alone would count the rows that filter "
-                "drops as orphans"
+                "excludes as matches, hiding the rows left with none"
             )
         return [], "no conjunctive column-to-column equality"
     return pairs, None

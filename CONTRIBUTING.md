@@ -390,8 +390,8 @@ needs DuckDB, PyYAML and dbt and so runs in the engine's environment. It imports
 them only when run, so the core above stays stdlib-only:
 
 ```
-uv run --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
-uv run --project packages/dex-core --extra duckdb python -m evals metadata --reference
+uv run --python 3.13 --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
+uv run --python 3.13 --project packages/dex-core --extra duckdb python -m evals metadata --reference
 ```
 
 ## Writing a storage backend

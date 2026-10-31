@@ -2387,8 +2387,9 @@ def test_a_range_join_is_skipped_and_stated():
 
 def test_a_join_that_filters_beside_its_keys_says_so_rather_than_no_key():
     """`left join orders o on o.customer_id = c.id and o.status <> 'x'` has a
-    key; the skip is right (a probe of the key alone would read the filtered
-    rows as orphans), and the reason must not claim there is no key."""
+    key; the skip is right (a probe of the key alone would count the orders the
+    filter excludes as matches, hiding customers left with none), and the reason
+    must not claim there is no key."""
 
     candidates, skipped = verify_mod._model_joins(
         _parsed(

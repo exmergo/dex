@@ -26,6 +26,6 @@ Unlike the Tier 2 core in ``evals/`` (stdlib only), this suite needs DuckDB,
 PyYAML and dbt, so it runs in the engine's own environment, whose ``[duckdb]``
 extra pins all three: the build gate then runs the dbt ``transform build`` runs.
 
-    uv run --project packages/dex-core --extra duckdb \
+    uv run --python 3.13 --project packages/dex-core --extra duckdb \
         python -m evals metadata --reference
 """

@@ -174,17 +174,18 @@ by a comparison; no LLM judge is needed for any field.
 
 It needs DuckDB, PyYAML and dbt, which the engine's `[duckdb]` extra pins, so it
 runs in the engine's environment (and the build gate uses the dbt `transform
-build` uses):
+build` uses). It is pinned to Python 3.13 because dbt's parse fails on 3.14,
+which would fail every task's build gate on the interpreter:
 
 ```bash
 # Free: score every reference answer. This is the scorer's own self-test.
-uv run --project packages/dex-core --extra duckdb python -m evals metadata --reference
+uv run --python 3.13 --project packages/dex-core --extra duckdb python -m evals metadata --reference
 
 # The scorer and fixture tests (also in CI):
-uv run --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
+uv run --python 3.13 --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
 
 # Paid: one headless Claude Code session per task, then score.
-uv run --project packages/dex-core --extra duckdb python -m evals metadata \
+uv run --python 3.13 --project packages/dex-core --extra duckdb python -m evals metadata \
     --model claude-sonnet-5-5 --out <dir>
 ```
 

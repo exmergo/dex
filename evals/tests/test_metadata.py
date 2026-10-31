@@ -275,3 +275,69 @@ def test_the_transcript_summary_counts_dex_commands_on_every_route():
     }
     assert session.candidate_plugin_loaded is True
     assert (session.cost_usd, session.turns) == (0.5, 7)
+
+
+def test_a_model_that_was_not_built_cannot_be_complete():
+    from evals.metadata.score import Declared, completeness
+
+    declared_only = Declared(
+        description="d",
+        grain=["id"],
+        population={"rule": "all"},
+        assumptions=[{"evidence": "default"}],
+    )
+    result = completeness(declared_only, None)
+    assert "built_relation" in result["missing"]
+    assert result["score"] < 1
+
+
+def test_a_dbt_stage_that_hangs_fails_the_gate(tmp_path, monkeypatch):
+    import subprocess
+
+    from evals.metadata import score
+
+    _task, fixture, workspace = _reference(
+        tmp_path, "revenue_population/build_daily_revenue"
+    )
+
+    def hang(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout"))
+
+    monkeypatch.setattr(score, "_dbt", lambda: "dbt")
+    monkeypatch.setattr(score.subprocess, "run", hang)
+    gate = score.build_gate(workspace, fixture, tmp_path / "built")
+    assert (gate.passed, gate.stage) == (False, "parse")
+    assert "timed out" in gate.detail[0]
+
+
+def test_a_failed_process_stays_failed_whatever_its_result_event_says(
+    tmp_path, monkeypatch
+):
+    import json
+    import subprocess
+
+    from evals.metadata import live
+
+    result = {
+        "type": "result",
+        "is_error": False,
+        "total_cost_usd": 0.2,
+        "num_turns": 3,
+    }
+
+    def exits_nonzero(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, json.dumps(result) + "\n", "boom")
+
+    monkeypatch.setattr(live, "_require_claude", lambda binary: binary)
+    monkeypatch.setattr(live.subprocess, "run", exits_nonzero)
+    session = live.run_session(
+        "p",
+        tmp_path,
+        tmp_path / "t.jsonl",
+        model="m",
+        max_turns=1,
+        max_budget_usd=1,
+        timeout=5,
+    )
+    assert session.is_error is True and session.error == "boom"
+    assert (session.cost_usd, session.turns) == (0.2, 3)

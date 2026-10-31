@@ -199,7 +199,7 @@ def run_session(
                 events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        if proc.returncode != 0 and not events:
+        if proc.returncode != 0:
             session.error = (proc.stderr or "").strip()[
                 -2000:
             ] or f"exit {proc.returncode}"
@@ -210,4 +210,10 @@ def run_session(
         transcript.write_text(partial, encoding="utf-8")
         session.error = f"timed out after {timeout}s"
     session.duration_s = round(time.monotonic() - started, 1)
-    return summarize(events, session)
+    summarize(events, session)
+    if session.error is not None:
+        # A result event can say `is_error: false` for a process that then exited
+        # non-zero or timed out; the process failure wins, and the event's cost
+        # and turns are kept.
+        session.is_error = True
+    return session
