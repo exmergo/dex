@@ -1252,6 +1252,12 @@ def verify(
                 warnings.extend(join.notes)
                 join_coverage = join.records
                 join_offer = join.offer
+                if not join.records:
+                    suppressed["join_contract"] = (
+                        join.notes[0]
+                        if join.notes
+                        else "no model in scope writes an equality join"
+                    )
                 facts = facts_mod.findings(
                     adapter,
                     prepared,
