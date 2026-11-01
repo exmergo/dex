@@ -1831,6 +1831,35 @@ def test_profile_reuses_fresh_cached_profile(
     assert refreshed["data"]["cache_hit_count"] == 0
 
 
+def test_fresh_cached_profile_refreshes_row_count_from_metadata(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """#985: A fresh cached profile refreshes row_count from metadata on reuse."""
+    import duckdb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+    store = FilesystemStore(repo)
+    initial_row_count = _dataset(store.load_cache(), "RAW_HOSTS").row_count
+    assert initial_row_count is not None
+
+    # Insert a row into RAW_HOSTS
+    conn = duckdb.connect(str(airbnb_duckdb))
+    conn.execute(
+        "INSERT INTO RAW_HOSTS VALUES (999999, 'Test Host')"
+    )
+    conn.close()
+
+    # Re-profile without --refresh: reuse the fresh profile with updated row_count
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    assert payload["data"]["profiled_count"] == 0
+    assert payload["data"]["cache_hit_count"] == 1
+    served = payload["data"]["datasets"][0]
+    assert served["row_count"] == initial_row_count + 1
+    assert _dataset(store.load_cache(), "RAW_HOSTS").row_count == initial_row_count + 1
+
+
 def test_a_cache_written_before_the_current_schema_version_is_not_reused(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
