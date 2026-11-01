@@ -617,10 +617,17 @@ def write_edits(
     Any conflict with ``confirmed=False`` writes nothing and surfaces the
     divergence as diffs of current content against the plan's proposal. With
     ``confirmed=True`` the conflicts are overridden explicitly.
+
+    A create and a delete whose paths differ only by case (#981) are one rename
+    on a case-insensitive filesystem: the create would otherwise read as already
+    applied against the file the delete then removes. Those two edits are kept
+    together and written through a temporary name so the model file survives.
     """
 
     root = Path(project_dir)
     view = load(project_dir)
+
+    case_renames = _case_only_renames(edits)
 
     staged: list[tuple[Path, Edit, str | None]] = []
     conflicts: list[Conflict] = []
@@ -639,10 +646,19 @@ def write_edits(
             edit.op is EditOp.UPSERT
             and current is not None
             and current == edit.new_content
+            and _casefold_path(edit.path) not in case_renames
         ):
-            # Already applied (e.g. a re-run): a no-op, not a conflict.
+            # Already applied (e.g. a re-run): a no-op, not a conflict. A
+            # case-only rename's create looks identical on a case-insensitive
+            # filesystem, so that pair is not skipped here.
             continue
-        if current_hash != edit.old_content_hash:
+        if current_hash != edit.old_content_hash and not (
+            _casefold_path(edit.path) in case_renames
+            and edit.op is EditOp.UPSERT
+            and edit.old_content_hash is None
+        ):
+            # A case-only rename's create resolves to the file being renamed on a
+            # case-insensitive filesystem; that is not a human conflict (#981).
             conflicts.append(
                 Conflict(
                     path=edit.path,
@@ -658,13 +674,79 @@ def write_edits(
         return ApplyResult(written=[], diffs=diffs, conflicts=conflicts)
 
     written: list[str] = []
+    handled_keys: set[str] = set()
+    staged_by_path = {
+        edit.path: (target_path, edit, current) for target_path, edit, current in staged
+    }
     for target_path, edit, _current in staged:
+        key = _casefold_path(edit.path)
+        if key in handled_keys:
+            continue
+        pair = case_renames.get(key)
+        if (
+            pair is not None
+            and pair[0].path in staged_by_path
+            and pair[1].path in staged_by_path
+        ):
+            delete_edit, create_edit = pair
+            delete_path = staged_by_path[delete_edit.path][0]
+            create_path = staged_by_path[create_edit.path][0]
+            _apply_case_only_rename(
+                delete_path, create_path, create_edit.new_content or ""
+            )
+            written.append(create_edit.path)
+            handled_keys.add(key)
+            continue
         if edit.op is EditOp.DELETE:
             target_path.unlink(missing_ok=True)
         else:
             write_project_file(target_path, edit.new_content)
         written.append(edit.path)
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
+
+
+def _casefold_path(path: str) -> str:
+    return Path(path).as_posix().casefold()
+
+
+def _case_only_renames(edits: list[Edit]) -> dict[str, tuple[Edit, Edit]]:
+    """Casefold key → (delete, create) when both appear with different spellings."""
+
+    deletes: dict[str, Edit] = {}
+    creates: dict[str, Edit] = {}
+    for edit in edits:
+        key = _casefold_path(edit.path)
+        if edit.op is EditOp.DELETE:
+            deletes[key] = edit
+        elif edit.op is EditOp.UPSERT and edit.old_content_hash is None:
+            creates[key] = edit
+    out: dict[str, tuple[Edit, Edit]] = {}
+    for key, delete in deletes.items():
+        create = creates.get(key)
+        if create is not None and delete.path != create.path:
+            out[key] = (delete, create)
+    return out
+
+
+def _apply_case_only_rename(
+    delete_path: Path, create_path: Path, new_content: str
+) -> None:
+    """Rename through a temporary sibling so a case-only change sticks (#981)."""
+
+    parent = delete_path.parent
+    tmp_path = parent / (delete_path.name + ".__dex_case_rename__")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    # Move the existing inode aside first. On a case-insensitive filesystem
+    # delete_path and create_path name the same file; replace through a temp so
+    # the final spelling is the create's.
+    source = delete_path if delete_path.exists() else create_path
+    if source.exists():
+        source.replace(tmp_path)
+    write_project_file(tmp_path, new_content)
+    if create_path.exists() and create_path.resolve() != tmp_path.resolve():
+        create_path.unlink()
+    tmp_path.replace(create_path)
 
 
 def contained_path(root: Path, rel_path: str, view: DbtProjectView) -> Path:
