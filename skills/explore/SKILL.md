@@ -300,7 +300,8 @@ need is not described here.
   `AUTO_SUSPEND` tail costs more than the work, put the choice to the person
   before the first billed command, with the commands it names: lower
   `AUTO_SUSPEND` to 60 on a dedicated warehouse, or turn on
-  `snowflake.suspend_after_command` and run the `GRANT OPERATE` it prints. Either
+  `snowflake.suspend_after_command`, run the `GRANT OPERATE`, or both, as it
+  prints them (it names the setting only while the setting is off). Either
   cuts a short command from about 600 warehouse-seconds to about 60. Never run
   the grant or change the warehouse yourself, and never turn the setting on
   without the person's yes, since it acts on a warehouse others may share.

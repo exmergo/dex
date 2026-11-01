@@ -301,15 +301,18 @@ GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE DEX_ROLE;
 ```
 
 Without the grant the suspend is refused, the command completes and warns with
-the grant to add, and it settles the tail as before. Every warning about the
-tail, from `connect test`, an estimate's note or a refused suspend, prints the
-grant with the warehouse and the session's own role filled in (the role comes
-from the login response, so reading it runs no statement), and the `dex config
-set` that turns the setting on, so adopting it is two copied commands. dex cannot test the grant
-without suspending something, so the quote counts on a suspend only once one has
-worked: the first command after the setting is turned on is quoted the tail and
-settled at what the suspend did, and later ones are quoted the resume minimum,
-until a refusal is recorded. `connect test` reports
+the grant to add, and it settles the tail as before. The warnings about the
+tail print their commands ready to copy, with the warehouse and the session's
+own role filled in (the role comes from the login response, so reading it runs
+no statement). While the setting is off, `connect test` prints the `dex config
+set` that turns it on and the grant, so adopting it is two copied commands. An
+estimate's note names only what is missing: the `dex config set` while the
+setting is off, and the grant once a suspend has been refused for lacking it.
+dex cannot test the grant without suspending something, so the quote counts on
+a suspend only once one has worked: the first command after the setting is
+turned on is quoted the tail, with a note saying why, and is settled at what
+the suspend did; later ones are quoted the resume minimum, until a refusal is
+recorded. `connect test` reports
 `budget.warehouse.suspend_after_command` (`enabled`, `last_outcome`) and lists
 `OPERATE` under `required_grants` while the setting is on. If the grant is
 revoked after a suspend has worked, one command is quoted the resume minimum

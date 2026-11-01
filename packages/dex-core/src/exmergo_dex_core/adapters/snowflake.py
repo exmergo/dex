@@ -229,11 +229,15 @@ def _grant(warehouse: str, role: str | None) -> str:
     return f"GRANT OPERATE ON WAREHOUSE {_sql_name(warehouse)} TO ROLE {who}"
 
 
+#: The command that turns ``suspend_after_command`` on, as advice prints it.
+_ENABLE_SUSPEND = "`dex config set snowflake.suspend_after_command true`"
+
+
 def _adoption(warehouse: str, role: str | None) -> str:
     """The two steps that stop the idle tail, as commands to copy."""
 
     return (
-        "`dex config set snowflake.suspend_after_command true` and, run by a "
+        f"{_ENABLE_SUSPEND} and, run by a "
         f"role that may grant it, `{_grant(warehouse, role)}`"
     )
 
@@ -418,16 +422,7 @@ class _WarehouseUptime:
         afterwards: the setting is on and the latest suspend dex recorded for
         this warehouse succeeded."""
 
-        if self._suspend is None:
-            return False
-        name = str((self.before or {}).get("name") or "").upper()
-        outcomes = [
-            claim.get("suspend")
-            for claim in self._ledger_claims()
-            if str(claim.get("warehouse") or "").upper() == name
-            and claim.get("suspend") is not None
-        ]
-        return bool(outcomes) and outcomes[-1] == "suspended"
+        return self._suspend is not None and self._last_suspend() == "suspended"
 
     def estimate_note(self) -> str | None:
         """What the quoted overhead is, for the handshake beside the number."""
@@ -457,13 +452,22 @@ class _WarehouseUptime:
                 "the command is done, so no idle tail is quoted"
             )
         if self._found_suspended():
-            return (
+            note = (
                 f"includes {quoted:g} warehouse-seconds no statement will "
                 f"report: {name} is suspended, so the first statement resumes it "
                 f"(Snowflake bills at least {_RESUME_MINIMUM_SECONDS:g} seconds per "
                 f"resume), and it then idles {auto_suspend} seconds (AUTO_SUSPEND) "
                 "before suspending"
             )
+            if self._suspend is not None and self._last_suspend() is None:
+                # The quote counts on a suspend only once one has worked (issue #1021).
+                note += (
+                    ". snowflake.suspend_after_command is on, but dex has not yet "
+                    f"seen a suspend of {name} succeed from this project, so this "
+                    "command is quoted the whole tail; once one has, a command "
+                    f"that resumes {name} is quoted the resume minimum instead"
+                )
+            return note
         prior = self._prior_claim()
         if prior is not None and quoted < auto_suspend:
             return (
@@ -482,21 +486,30 @@ class _WarehouseUptime:
     def tail_advice(self, work: float) -> str | None:
         """Name the fix where the idle tail, not the work, sets the price:
         what the work alone is, what AUTO_SUSPEND makes it bill, and what would
-        bring it down. Advice only: dex never changes the warehouse."""
+        bring it down. It recommends ``suspend_after_command`` only while the
+        setting is off, and names the grant only once a suspend was refused for
+        lacking it (issue #1021). Advice only: dex never changes the warehouse."""
 
         before = self.before
         if before is None or before.get("auto_suspend") is None:
             return None
+        if self._found_suspended() and self.suspend_expected():
+            return None  # the suspend already keeps the tail out of the quote
         auto_suspend = int(before["auto_suspend"])
         quoted = 0.0 if self._settled else self.pending()
         if auto_suspend <= _RESUME_MINIMUM_SECONDS or quoted <= max(work, 0.0):
             return None
         name = before["name"] or "the warehouse"
+        steps = [_ENABLE_SUSPEND] if self._suspend is None else []
+        if self._last_suspend() == "refused_grant":
+            steps.append(f"`{_grant(name, self._role)}`")
+        fix = "A dedicated warehouse with AUTO_SUSPEND = 60"
+        if steps:
+            fix += f", or {' and '.join(steps)},"
         return (
             f"this command's own work is about {work:.0f} warehouse-seconds, and "
             f"{name}'s {auto_suspend}-second AUTO_SUSPEND makes it bill about "
-            f"{work + quoted:.0f}. A dedicated warehouse with AUTO_SUSPEND = 60, "
-            f"or {_adoption(name, self._role)}, would bring it to about "
+            f"{work + quoted:.0f}. {fix} would bring it to about "
             f"{max(work, _RESUME_MINIMUM_SECONDS):.0f}. "
             "Dex never changes AUTO_SUSPEND itself"
         )
@@ -668,6 +681,19 @@ class _WarehouseUptime:
                     "suspend": outcome,
                 }
             )
+
+    def _last_suspend(self) -> str | None:
+        """The outcome of the latest suspend dex recorded for this warehouse in
+        the spend ledger, or ``None`` when none is recorded."""
+
+        name = str((self.before or {}).get("name") or "").upper()
+        outcomes = [
+            claim.get("suspend")
+            for claim in self._ledger_claims()
+            if str(claim.get("warehouse") or "").upper() == name
+            and claim.get("suspend") is not None
+        ]
+        return outcomes[-1] if outcomes else None
 
     def _ledger_claims(self) -> list[dict]:
         if self._claims is None:
