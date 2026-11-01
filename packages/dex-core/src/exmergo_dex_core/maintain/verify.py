@@ -1459,6 +1459,7 @@ def row_population_plan(
     dialect: str,
     *,
     scope: set[str] | None = None,
+    rebuilt_models: set[str] | None = None,
 ) -> tuple[list[RowPopulationCheck], list[str], list[str]]:
     """Line every buildable model up against the relation it is built from.
 
@@ -1553,8 +1554,17 @@ def row_population_plan(
             uncompiled.append(name)
             continue
         if materialized in _UNCOMPARABLE_MATERIALIZATIONS:
-            incremental.append(name)
-            continue
+            is_rebuilt = bool(
+                rebuilt_models
+                and (
+                    name in rebuilt_models
+                    or uid in rebuilt_models
+                    or name.lower() in {m.lower() for m in rebuilt_models}
+                )
+            )
+            if not is_rebuilt:
+                incremental.append(name)
+                continue
 
         try:
             tree = sqlglot.parse_one(code, read=dialect)

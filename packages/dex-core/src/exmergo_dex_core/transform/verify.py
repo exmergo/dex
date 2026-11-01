@@ -128,7 +128,11 @@ def built_models(summary: dict[str, Any]) -> dict[str, str]:
 
 
 def price_verification(
-    adapter: Adapter, project_dir: Path, *, scope: set[str]
+    adapter: Adapter,
+    project_dir: Path,
+    *,
+    scope: set[str],
+    rebuilt_models: set[str] | None = None,
 ) -> tuple[float, list[str]]:
     """What the row counts this build will need would cost, priced before it runs.
 
@@ -156,7 +160,7 @@ def price_verification(
         return 0.0, []
     try:
         checks, _, _ = verify_mod.row_population_plan(
-            project_dir, adapter.dialect, scope=scope
+            project_dir, adapter.dialect, scope=scope, rebuilt_models=rebuilt_models
         )
         countable = _uncounted_by_materialization(project_dir, checks)
         if not countable:
@@ -444,8 +448,9 @@ def _row_population(
     except DexError as exc:
         return f"warehouse unreachable: {exc}"
 
+    rebuilt_models = set(summary.get("full_refresh", {}).get("models", []))
     checks, plan_notes, informational = verify_mod.row_population_plan(
-        project_dir, adapter.dialect, scope=scope
+        project_dir, adapter.dialect, scope=scope, rebuilt_models=rebuilt_models
     )
     result.notes.extend(informational)
     result.warnings.extend(note for note in plan_notes if note not in informational)
