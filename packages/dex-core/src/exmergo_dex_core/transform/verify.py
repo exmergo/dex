@@ -80,6 +80,9 @@ class BuildVerification:
     join_coverage: list[dict] | None = None
     #: One record per declared ``population.parent`` among the built models.
     parent_population: list[dict] = field(default_factory=list)
+    #: Which built models had their declared columns compared (#1002); ``None``
+    #: when the comparison never reached a model (see ``suppressed``).
+    column_contract: dict[str, Any] | None = None
 
     def payload(self) -> dict[str, Any]:
         if not self.ran:
@@ -95,6 +98,8 @@ class BuildVerification:
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:
             payload["parent_population"] = self.parent_population
+        if self.column_contract is not None:
+            payload["column_contract"] = self.column_contract
         return payload
 
 
@@ -230,6 +235,10 @@ def verify_build(
     # matter most (#857). Only the models that themselves built are judged.
     summary, scope = _judgeable(summary, built, result)
 
+    reason = _column_contract(project_dir, summary, built, scope, adapter_once, result)
+    if reason is not None:
+        result.suppressed["column_contract"] = reason
+
     reason = _row_population(engine, project_dir, summary, scope, adapter_once, result)
     if reason is not None:
         result.suppressed["row_population"] = reason
@@ -291,6 +300,100 @@ def _judgeable(
         "run; the failures are tests or other nodes, reported under build status"
     )
     return {**summary, "success": True}, good
+
+
+def _column_contract(
+    project_dir: Path,
+    summary: dict[str, Any],
+    built: dict[str, str],
+    scope: set[str],
+    resolve_adapter: Callable[[], Adapter],
+    result: BuildVerification,
+) -> str | None:
+    """The built models' columns against their declared ones (#1002).
+
+    The detector `maintain verify` runs, over this build's nodes. Metadata only,
+    through the adapter the build already holds, so it adds no statement and no
+    handshake. A model that failed or was skipped keeps whatever relation an
+    earlier run left, which is not this build's output, so it is named rather
+    than compared. Returns the suppression reason when no model was compared.
+    """
+
+    from ..envelope import redact
+    from ..errors import DexError
+    from ..guards.cost_guard import CostGuardError
+    from ..maintain import verify as verify_mod
+
+    if not built:
+        return "this build ran no models"
+    not_built = [
+        {"model": label, "reason_code": "not_built"}
+        for uid, label in sorted(built.items(), key=lambda item: item[1])
+        if uid not in scope or not summary.get("success")
+    ]
+    if len(not_built) == len(built):
+        result.column_contract = {
+            "checked": [],
+            "no_declared_columns": [],
+            "unchecked": not_built,
+        }
+        return (
+            "no model built in this run, so any relation in the dev target is "
+            "an earlier run's output rather than this build's"
+        )
+
+    declared, _undeclared, plan_notes = verify_mod.column_contract_plan(
+        project_dir, scope=scope
+    )
+    if plan_notes:
+        result.warnings.extend(plan_notes)
+        return plan_notes[0]
+
+    labels = {built[uid] for uid in scope}
+    record: dict[str, Any] = {
+        "checked": [],
+        "no_declared_columns": sorted(labels - set(declared)),
+        "unchecked": not_built,
+    }
+    result.column_contract = record
+    if not declared:
+        return "no model this build ran declares columns in schema.yml"
+
+    try:
+        adapter = resolve_adapter()
+    except CostGuardError:
+        raise
+    except DexError as exc:
+        return f"warehouse unreachable: {exc}"
+    try:
+        live = adapter.list_objects()
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        return redact(
+            "the relations this build wrote could not be listed "
+            f"({type(exc).__name__}: {exc})"
+        )
+
+    relations = verify_mod.built_model_relations(project_dir, scope)
+    # The no-columns count is reported by name in the record above.
+    check = verify_mod.column_contract_check(
+        adapter, declared, relations, [meta.identifier for meta in live], 0
+    )
+    result.findings.extend(check.findings)
+    result.warnings.extend(check.notes)
+    record["checked"] = sorted(check.checked)
+    record["unchecked"] = sorted(
+        not_built
+        + [
+            {"model": model, "reason_code": code}
+            for model, code in check.unchecked.items()
+        ],
+        key=lambda entry: entry["model"],
+    )
+    if not check.checked:
+        return "no declared column contract could be compared: see `unchecked`"
+    return None
 
 
 def _row_population(

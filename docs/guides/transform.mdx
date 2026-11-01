@@ -76,7 +76,9 @@ is only part of the result. `--for-plan` makes the build report whether it ran
 every node the plan changed: read `data.outcome` (only `validated` means it did)
 and `data.evidence.coverage`. Then read `data.verification.ran`, its findings,
 and `suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
-need investigation before the change is finished.
+need investigation before the change is finished. `data.verification.column_contract`
+says which built models had their columns compared with `schema.yml`, which declare
+none, and which could not be checked and why.
 
 <Accordion title="Rebuild an incremental model from its full history">
 

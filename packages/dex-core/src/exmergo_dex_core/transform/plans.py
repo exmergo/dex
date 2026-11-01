@@ -14,6 +14,7 @@ re-planning the same change is idempotent and yields the same id.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -457,11 +458,11 @@ def plan(
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
     diffs: list[dict[str, Any]] = []
-    # Read at most once, and only when a seed is actually in the plan: the cache
-    # is a stored document, and every other kind has no use for it.
+    # Read at most once, and only when something needs it: a seed in the plan, or
+    # a star the contract comparison can only read through a profile.
     cached: list[Any] = []
 
-    def seed_cache() -> Any:
+    def read_cache() -> Any:
         if not cached:
             from ..storage import CacheUnreadableError, readable_cache
 
@@ -475,7 +476,8 @@ def plan(
                 warnings.append(
                     f"the exploration cache could not be read ({exc}), so a "
                     "seed's columns were checked against their own names only, "
-                    "not against columns a profile already flagged"
+                    "not against columns a profile already flagged, and a `*` "
+                    "over a relation was not read through a profile"
                 )
         return cached[0]
 
@@ -490,7 +492,7 @@ def plan(
                     edit,
                     view,
                     project,
-                    cache=seed_cache() if edit.kind is EditKind.SEED_CSV else None,
+                    cache=read_cache() if edit.kind is EditKind.SEED_CSV else None,
                     pii_overrides=pii_overrides,
                     compiled=(compiled_models or {}).get(edit.path),
                 )
@@ -583,7 +585,9 @@ def plan(
         from .scaffold import missing_macro_warnings
 
         warnings.extend(missing_macro_warnings(edits, view))
-        warnings.extend(column_contract_warnings(edits, view))
+        warnings.extend(
+            column_contract_warnings(edits, view, cache=read_cache, dialect=dialect)
+        )
         if dialect is not None:
             warnings.extend(reserved_column_warnings(edits, dialect))
 
@@ -907,7 +911,13 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     return warnings
 
 
-def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[str]:
+def column_contract_warnings(
+    edits: list[PlanEdit],
+    view: DbtProjectView,
+    *,
+    cache: Callable[[], Any] | None = None,
+    dialect: str | None = None,
+) -> list[str]:
     """Warn when a model's authored SELECT list diverges from what its
     schema.yml declares, in either direction (issue #214).
 
@@ -925,10 +935,12 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
     together in the same plan are compared against each other, not against a
     stale on-disk declaration.
 
-    Where the authored SELECT list cannot be resolved statically (a bare
-    ``select *``, a qualified ``t.*``, or an unaliased macro call standing in
-    for a column), the comparison is skipped and that is said outright,
-    rather than guessed at.
+    A star is followed to what it mirrors (#643): a CTE, a subquery, the other
+    models of this project as this plan leaves them, then a cached profile, named
+    in any warning that rests on one, since a profile can be stale. ``cache`` is
+    called only when a star needs it. Where the columns still cannot be resolved,
+    the comparison is skipped and the warning says which case it was, rather than
+    guessing.
     """
 
     schema_sources = {
@@ -960,8 +972,10 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
                 declared_by_model[entry["name"]] = columns
 
     from ..dbt_project import column_contract_divergence
+    from .select_list import resolve_select_list
 
     warnings: list[str] = []
+    catalog = _ProjectCatalog(edits, view, schema_sources, cache, dialect)
     for edit in edits:
         if (
             edit.kind is not EditKind.MODEL_SQL
@@ -975,15 +989,25 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
             continue
         declared_lower = {c.lower(): None for c in declared}
 
-        produced = select_columns(edit.new_content)
+        resolved = resolve_select_list(
+            edit.new_content,
+            dialect=dialect,
+            relation_columns=catalog.reader(frozenset({model.lower()})),
+        )
+        produced = resolved.columns
         if produced is None:
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) for {model}, but "
-                "the SELECT list could not be resolved statically (a `select "
-                "*`/`t.*`, or a macro standing in for a column); the "
-                "contract comparison was skipped"
+                f"the SELECT list could not be resolved statically ({resolved.reason}"
+                "); the contract comparison was skipped"
             )
             continue
+        basis = (
+            " (a `*` was read from the cached profile of "
+            f"{', '.join(resolved.read_from)}, which may be stale)"
+            if resolved.read_from
+            else ""
+        )
 
         # No type info on either side here: a SELECT list names no types at
         # all, so this call never resolves a mismatch, only the two name-only
@@ -994,14 +1018,127 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
         if missing:
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) {', '.join(missing)} "
-                f"for {model} that the SELECT list does not produce"
+                f"for {model} that the SELECT list does not produce{basis}"
             )
         if extra:
             warnings.append(
                 f"{edit.path}: the SELECT list produces column(s) "
-                f"{', '.join(extra)} not declared in schema.yml for {model}"
+                f"{', '.join(extra)} not declared in schema.yml for {model}{basis}"
             )
     return warnings
+
+
+class _ProjectCatalog:
+    """What a star over a relation reads, for the contract comparison.
+
+    A project model is read from its own SQL as this plan leaves it, which beats
+    any profile: a profile predates the plan. A model this plan changes or removes
+    is never read from the cache, for the same reason. Everything else, and a
+    model whose SQL cannot be read, comes from the cache when it has a profile.
+    """
+
+    def __init__(
+        self,
+        edits: list[PlanEdit],
+        view: DbtProjectView,
+        schema_sources: dict[str, str],
+        cache: Callable[[], Any] | None,
+        dialect: str | None,
+    ) -> None:
+        from .declarations import post_change_files
+
+        self.files = post_change_files(view, edits)
+        self.model_paths = view.model_paths
+        self.schema_sources = schema_sources
+        self.cache = cache
+        self.dialect = dialect
+        self.changed = {
+            Path(edit.path).stem.lower()
+            for edit in edits
+            if edit.kind is EditKind.MODEL_SQL
+        }
+
+    def reader(self, stack: frozenset[str]) -> Callable[[Any], Any]:
+        return lambda relation: self._columns(relation, stack)
+
+    def _columns(self, relation: Any, stack: frozenset[str]) -> Any:
+        from .declarations import model_sql_path
+        from .select_list import RelationColumns, resolve_select_list
+
+        inner: str | None = None
+        if relation.kind == "ref" and len(relation.parts) == 1:
+            model = relation.name.lower()
+            if model in stack:
+                return RelationColumns(reason=f"a ref() cycle through {relation.name}")
+            path = model_sql_path(self.files, self.model_paths, relation.name)
+            if path is not None:
+                resolved = resolve_select_list(
+                    self.files[path],
+                    dialect=self.dialect,
+                    relation_columns=self.reader(stack | {model}),
+                )
+                if resolved.columns is not None:
+                    return RelationColumns(
+                        sorted(resolved.columns), read_from=resolved.read_from
+                    )
+                inner = resolved.reason
+            if model in self.changed:
+                return RelationColumns(
+                    reason=(
+                        f"a `*` over {relation}, which this plan changes and whose "
+                        f"own columns could not be read ({inner or 'it is removed'})"
+                    )
+                )
+        return self._profiled(relation, inner)
+
+    def _profiled(self, relation: Any, inner: str | None) -> Any:
+        from .drafting import _dataset_for_model, dataset_for
+        from .select_list import RelationColumns
+
+        cache = self.cache() if self.cache is not None else None
+        if relation.kind == "ref":
+            dataset = _dataset_for_model(
+                cache, relation.name, self.files, self.model_paths
+            )
+        elif relation.kind == "source":
+            dataset = dataset_for(cache, self._source_identifier(relation))
+        else:
+            dataset = dataset_for(cache, str(relation))
+        if dataset is None or not dataset.columns:
+            why = f"; its own SELECT list holds {inner}" if inner else ""
+            return RelationColumns(
+                reason=(
+                    f"a `*` over {relation} with no single cached profile{why}; "
+                    f"`dex explore profile {relation.name}` would supply one"
+                )
+            )
+        return RelationColumns(
+            [column.name for column in dataset.columns],
+            read_from=[dataset.identifier],
+        )
+
+    def _source_identifier(self, relation: Any) -> str:
+        """``schema.identifier`` as the project's YAML names this source table, or
+        the bare table name where the YAML does not say so literally."""
+
+        source = relation.parts[0] if len(relation.parts) > 1 else None
+        for content in self.schema_sources.values():
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError:
+                continue
+            entries = parsed.get("sources") if isinstance(parsed, dict) else None
+            for entry in entries or []:
+                if not isinstance(entry, dict) or entry.get("name") != source:
+                    continue
+                for table in entry.get("tables") or []:
+                    if isinstance(table, dict) and table.get("name") == relation.name:
+                        schema = entry.get("schema") or source
+                        identifier = table.get("identifier") or relation.name
+                        if "{{" in f"{schema}{identifier}":
+                            return relation.name
+                        return f"{schema}.{identifier}"
+        return relation.name
 
 
 def reserved_column_warnings(edits: list[PlanEdit], dialect: str) -> list[str]:
@@ -1057,45 +1194,20 @@ def select_columns(sql: str) -> set[str] | None:
     """The lowercased output column names of a model's outermost SELECT, or
     ``None`` if they cannot be resolved statically.
 
-    Unresolvable covers a bare ``select *``, a qualified ``t.*``, an unaliased
-    macro call standing in for a column (indistinguishable from a real column
-    once jinja is stripped to a placeholder, and can expand to any number of
-    real columns), a set operation (a UNION's branches can each project
-    differently), and anything that fails to parse. An *aliased* macro call
-    (``{{ some_macro(x) }} as total``) is resolvable: the alias is the real
-    output name regardless of what expression computed it.
+    Follows a star through this statement's own CTEs and subqueries and no further
+    (:mod:`.select_list`): callers refuse on this answer, so it never rests on a
+    cached profile. Unresolvable covers a star over a relation, an unaliased macro
+    call standing in for a column (indistinguishable from a real column once jinja
+    is stripped to a placeholder, and can expand to any number of real columns), a
+    set operation (a UNION's branches can each project differently), and anything
+    that fails to parse. An *aliased* macro call (``{{ some_macro(x) }} as total``)
+    is resolvable: the alias is the real output name regardless of what expression
+    computed it.
     """
 
-    import sqlglot
-    from sqlglot import expressions as exp
+    from .select_list import resolve_select_list
 
-    from .validate import _PLACEHOLDER, strip_jinja
-
-    stripped = strip_jinja(sql)
-    if not stripped:
-        return None
-    try:
-        parsed = sqlglot.parse_one(stripped, read="duckdb")
-    except Exception:
-        return None
-
-    node = parsed
-    while isinstance(node, (exp.With, exp.Subquery)):
-        node = node.this
-    if not isinstance(node, exp.Select):
-        return None
-
-    columns: set[str] = set()
-    for projection in node.expressions:
-        if isinstance(projection, exp.Star):
-            return None
-        if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
-            return None
-        name = projection.alias_or_name
-        if not name or _PLACEHOLDER in name:
-            return None
-        columns.add(name.lower())
-    return columns or None
+    return resolve_select_list(sql).columns
 
 
 def _plan_id(

@@ -913,10 +913,19 @@ default, or a filter or operator after it is refused. A key naming a location
   first compares the authored SELECT list against the columns the model's
   `schema.yml` declares, in both directions: a declared column the SELECT does
   not produce, and a produced column the declaration does not name. A model with
-  no declared columns has no contract and produces nothing; a SELECT list that
-  cannot be resolved statically (a `select *`, a `t.*`, an unaliased macro
-  standing in for a column) says so rather than guessing, and an *aliased* macro
-  call is resolved by its alias. The declaration is read with this same plan's
+  no declared columns has no contract and produces nothing. A `*` or `t.*` is
+  followed through the statement's CTEs, subqueries and joins (a semi or anti join
+  adds nothing, `EXCLUDE`/`EXCEPT` removes its columns), then to a `ref()`'d
+  model's own SQL as the plan leaves it, then to the cache's profile, which any
+  divergence warning resting on it names, since a profile can be stale. A model
+  the plan changes is never read from the cache. A SELECT list that still cannot
+  be resolved says which case it was (a `*` over a relation with no single
+  profile, a macro standing in for a column, an unaliased expression, a set
+  operation, a `RENAME`, a table function, SQL that did not parse) rather than
+  guessing, and an *aliased* macro call is resolved by its alias. The same read,
+  with no cache, checks a declaration's columns against the model, so a
+  declaration naming a column absent from `final` is refused as it is for a direct
+  SELECT list. The declaration is read with this same plan's
   own `schema.yml` edits overlaid, so a model and its documentation edited
   together are compared against each other rather than against a stale file.
 
@@ -1168,6 +1177,17 @@ default, or a filter or operator after it is refused. A key naming a location
   one that lists no nodes is `empty_selection`. `success` stays dbt's exit code,
   so it can be `true` for either of those: read `data.outcome`, never `success`
   alone, to learn whether the build established anything.
+- `transform build --verify` also compares each built model's columns with its
+  `schema.yml`, with the detector and the finding codes of `maintain verify`
+  (`column_missing`, `column_undeclared`, `column_type_mismatch`), scoped by
+  unique id so one version of a model does not answer for another. It reads
+  metadata through the adapter the build holds: no statement, no estimate line, no
+  second handshake. `data.verification.column_contract` holds `checked`,
+  `no_declared_columns` and `unchecked` (`model`, `reason_code`: `not_built`,
+  `no_relation`, `relation_not_found`, `metadata_unreadable`), and
+  `suppressed.column_contract` gives the reason when nothing was compared. A
+  metadata failure explains the gap and keeps the build's result; a cost refusal
+  is raised as usual.
 - `transform build --verify` runs the `maintain verify` sweep over the nodes
   this build touched and reports it under `data.verification`, in one envelope
   with the build result. Opt-in on every connector, free ones included.
