@@ -1093,8 +1093,23 @@ class TrinoAdapter:
         """Exact COUNT(DISTINCT) for near-unique columns, spent only within the
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let uniqueness verdicts stay approximate.
-        A metered adapter never self-escalates past its ceiling."""
+        A metered adapter never self-escalates past its ceiling.
 
+        Degraded columns are skipped, not counted: the engine also sends columns
+        with no distinct count at all, which is what a degraded column reports,
+        and one Trino cannot count would fail the whole statement. A column the
+        inventory does not know is kept, since its type cannot be proven degraded.
+        """
+
+        if not columns:
+            return {}
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        columns = [
+            name
+            for name in columns
+            if name not in types or not is_degraded_type(types[name])
+        ]
         if not columns:
             return {}
         estimate = self._table_seconds(identifier, columns)

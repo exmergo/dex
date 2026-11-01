@@ -49,7 +49,8 @@
 # admin `snow` connection; the default connection is used otherwise.
 #
 # Overrides via environment: DEX_CI_REPO (owner/name),
-# DEX_CI_CREDIT_QUOTA (monthly credits before the monitor suspends, default 5),
+# DEX_CI_CREDIT_QUOTA (monthly credits before the monitor suspends, default 15;
+# applies only when the monitor is created, so change an existing one with ALTER),
 # DEX_CI_STATEMENT_TIMEOUT (warehouse-level seconds, default 600).
 
 set -euo pipefail
@@ -62,7 +63,7 @@ if [[ -z "$ACCOUNT" ]]; then
 fi
 
 REPO="${DEX_CI_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
-CREDIT_QUOTA="${DEX_CI_CREDIT_QUOTA:-5}"
+CREDIT_QUOTA="${DEX_CI_CREDIT_QUOTA:-15}"
 STATEMENT_TIMEOUT="${DEX_CI_STATEMENT_TIMEOUT:-600}"
 WAREHOUSE="DEX_CI_WH"
 MONITOR="DEX_CI_MONITOR"

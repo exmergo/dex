@@ -138,6 +138,34 @@ def test_a_degraded_column_gets_only_a_non_null_count(fake_trino_connection):
     assert "MIN(" not in sql
 
 
+def test_exact_distinct_counts_skips_a_degraded_column(fake_trino_connection):
+    """The engine also sends columns with no distinct count, which is what a
+    degraded column reports, and one Trino cannot count would fail the scan."""
+
+    fake_trino_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 50, "d_0": 50}]
+    )
+    adapter = make_adapter(fake_trino_connection)
+    assert adapter.exact_distinct_counts("memory.shop.customers", ["id", "tags"]) == {
+        "id": 50
+    }
+    statements = [
+        q.sql for q in fake_trino_connection.data_queries if "COUNT(DISTINCT" in q.sql
+    ]
+    assert statements
+    assert all('"tags"' not in sql for sql in statements)
+
+
+def test_exact_distinct_counts_runs_nothing_for_only_degraded_columns(
+    fake_trino_connection,
+):
+    adapter = make_adapter(fake_trino_connection)
+    assert adapter.exact_distinct_counts("memory.shop.customers", ["tags"]) == {}
+    assert not [
+        q for q in fake_trino_connection.data_queries if "COUNT(DISTINCT" in q.sql
+    ]
+
+
 # --- the guard -----------------------------------------------------------------
 
 
