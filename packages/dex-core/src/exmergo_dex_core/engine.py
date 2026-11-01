@@ -1610,6 +1610,8 @@ class DexEngine:
         for_plan: str | None = None,
         for_plan_document: Any = None,
         dependencies: Any = None,
+        full_refresh: bool = False,
+        artifacts: str | None = None,
     ) -> BuildResult:
         """Run ``dbt build`` against the dev target, cost-surfaced first.
 
@@ -1623,6 +1625,12 @@ class DexEngine:
         :class:`~.transform.build.DependencyPolicy`; the default installs missing
         packages as it always has, and ``REFUSE`` names them and stops, which is
         the right outcome in a sandbox with no network.
+        ``full_refresh`` passes ``--full-refresh`` to dbt, rebuilding the selected
+        incremental models and seeds from scratch, and prices them that way.
+        ``artifacts`` overrides ``transform.artifacts`` for this call:
+        ``isolated`` writes Dex's own ``<target-path>/dex/<runtime>`` directory,
+        ``shared`` the project's target path, refused when another dbt runtime
+        left it incompatible.
         """
 
         from .transform import commands as transform
@@ -1637,6 +1645,8 @@ class DexEngine:
             for_plan=for_plan,
             for_plan_document=for_plan_document,
             dependencies=dependencies or DependencyPolicy.INSTALL,
+            full_refresh=full_refresh,
+            artifacts=artifacts,
         )
 
     def test_mutations(

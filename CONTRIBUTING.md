@@ -682,6 +682,20 @@ committed to `main` here:
   `dex --help` prints, so a flag without help text fails the build.
 - `CHANGELOG.md`: the ten most recent releases.
 
+**Reader paths.** The Documentation tab starts with the local quickstart,
+installation, and connection setup, then task guides for Explore, Transform,
+Maintain, and semantic layers. Put exact flags, connector rules, compatibility,
+and integration contracts in Reference. Keep existing routes when reorganizing
+navigation so shared links and archived versions keep working.
+
+A guide starts with the reader's outcome and prerequisites, gives the shortest
+working path, explains how to interpret the result, and links to the next task
+and the canonical reference. Use tabs for mutually exclusive setup paths and
+accordions for optional detail. Keep required steps, spending decisions, and
+correctness checks visible. Do not copy policy thresholds or full command
+contracts into guides. The generated CLI pages keep command headings linkable
+and collapse their full usage and argument tables.
+
 **Linking.** A page under `docs/` links by site route
 (`/dex/guardrails/cost-controls`), never by file, and to the rest of the site by
 its full URL. A reference links by relative path
@@ -726,7 +740,6 @@ replaces the folder.
 
 - The hosted dbt Cloud Semantic Layer is the one path outside dex's cost guard.
   Say so; never write that nothing runs without a ceiling.
-- `viz preview` is "not yet implemented", and nothing more specific.
 - No quality claims dex has not measured.
 - No connector or semantic-layer promises with dates.
 - Demo numbers come from the pinned demo output only.

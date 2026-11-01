@@ -41,7 +41,6 @@ import yaml
 from ..config import CONFIG_FILE, DexConfig
 from ..connect import _profile_scalar
 from ..dbt_project import (
-    MANIFEST_PATH,
     PROFILES_FILE,
     duckdb_target_path,
     target_auth_method,
@@ -49,6 +48,9 @@ from ..dbt_project import (
     target_role,
 )
 from ..dbt_project import load as load_project
+from ..dbt_project import (
+    manifest_file as compiled_manifest_file,
+)
 from ..errors import DexError
 from ..storage import DEX_DIR, ExploreStore
 
@@ -1083,7 +1085,7 @@ def _manifest_namespaces(project: Path, field: str) -> set[str] | None:
     check, the same as before this existed (issue #110).
     """
 
-    manifest_file = project / MANIFEST_PATH
+    manifest_file = compiled_manifest_file(project)
     if not manifest_file.is_file():
         return None
     try:

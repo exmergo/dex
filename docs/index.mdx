@@ -1,36 +1,59 @@
 ---
 title: Dex
 sidebarTitle: Introduction
-description: Dex is the agent-native analytics engineering toolkit. Explore a warehouse, transform it with reviewable dbt edits, and maintain it as schemas and data drift.
+description: Explore a warehouse, change dbt models with reviewable plans, and check for drift. Start with a local demo, then bring Dex to your agent and data.
 ---
 
-Dex lets a coding agent work on your warehouse and your dbt project without the
-risks that usually come with it. It explores an unfamiliar warehouse, authors dbt
-models and semantic layers as reviewable diffs, and keeps the project correct as
-the data underneath it changes.
+Dex gives your coding agent a repeatable way to understand a warehouse, change
+its dbt project, and check that the results are right. You keep your existing
+project; Dex adds profiling, reviewable plans, dev builds, and drift checks.
 
-Every rule that makes this safe lives in the engine, not in a prompt. Dex never
-writes to your data, never pulls personal data into the agent's context, never
-spends on a metered warehouse before quoting the cost, never changes your project
-except as a diff you review, and never builds anywhere but a dev target. The
-[cost controls](/dex/guardrails/cost-controls) and the [PII policy](/dex/guardrails/pii-policy)
-describe two of those rules in full.
+<CardGroup cols={2}>
+  <Card title="Try Dex locally" icon="play" href="/dex/quickstart">
+    Map a demo warehouse and investigate its deliberately broken joins and keys.
+    No cloud account or credentials needed.
+  </Card>
+  <Card title="Use Dex with your agent" icon="terminal" href="/dex/installation">
+    Install the skills, open your project, and ask your agent to explore or make
+    a change.
+  </Card>
+</CardGroup>
 
-## Explore, Transform, Maintain
+## What do you want to do?
 
-- **Explore** ranks what matters in a warehouse, profiles it from aggregates, flags
-  personal data, and infers how tables join. See the
-  [exploration methodology](/dex/concepts/methodology).
-- **Transform** writes and refactors dbt models, tests, and semantic layers as
-  plans you review before anything is applied. See
-  [what Dex reads and writes in a dbt project](/dex/concepts/dbt-project).
-- **Maintain** compares the warehouse and the project against a known-good
-  snapshot and proposes the edits that reconcile any drift.
+<CardGroup cols={2}>
+  <Card title="Explore a warehouse" href="/dex/guides/explore">
+    Understand unfamiliar data with a ranked map, measured keys, and verified joins.
+  </Card>
+  <Card title="Transform a project" href="/dex/guides/transform">
+    Review a model change, build on dev, and check the resulting rows.
+  </Card>
+  <Card title="Maintain a project" href="/dex/guides/maintain">
+    Find drift against a baseline and review the proposed fixes.
+  </Card>
+  <Card title="Use a semantic layer" href="/dex/guides/semantic-layer">
+    Discover metric definitions and choose a path for querying or authoring them.
+  </Card>
+</CardGroup>
 
-## Where to go next
+## How it fits
 
-- The [CLI reference](/dex/cli/overview) lists every command and flag.
-- The connector pages, starting with [DuckDB](/dex/connectors/duckdb), cover
-  credentials, cost, and read-only enforcement for each warehouse.
-- The [Apache Ossie tutorial](/dex/guides/ossie-semantic-layer) walks a native
-  semantic layer through every command on a local warehouse.
+Run Dex from your project directory. Your agent drives the commands and reads
+their JSON results. The same commands work directly in a terminal.
+
+Exploration reads your source data. Authoring produces plans for your project
+files; applying a plan writes those files, and a build writes to a dev target.
+Your repository remains the source of truth.
+
+Cost checks and PII handling live in the engine. Before using a warehouse of your
+own, follow [Connect your data](/dex/connect) to set the scope and spending limits.
+For the precise boundaries, including the hosted dbt semantic-layer exception,
+read [cost controls](/dex/guardrails/cost-controls) and the
+[PII policy](/dex/guardrails/pii-policy).
+
+## Find the right level of detail
+
+**Documentation** takes you through setup and common tasks. **Reference** holds
+connector settings, command flags, compatibility rules, and integration contracts.
+If you know the command you need, go straight to the
+[CLI reference](/dex/cli/overview).

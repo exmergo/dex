@@ -1,15 +1,17 @@
 # Querying the semantic layer (`explore semantic`)
 
+Start with [Use a semantic layer](https://docs.exmergo.com/dex/guides/semantic-layer) for the workflow.
+This reference covers catalog fields, backend configuration, and query support.
+
 dex can author a semantic layer (`transform` / `semantic define|update` for dbt,
 `semantic ossie define|update` for native Apache Ossie documents, `semantic slayer
 define|update` for SLayer model files, `semantic cube define|update` for Cube
 model files) and detect drift
 in it (`maintain semantic`). `explore semantic` is the third piece: it *queries*
 the layer, so an agent can discover metrics and, where the layer defines a
-runtime, run governed metric queries. Four layers answer the same commands
-through one abstraction (a local dbt project, a hosted dbt Cloud deployment,
-native Apache Ossie documents, and SLayer model files), and the differences
-between them are load-bearing, so they are spelled out here.
+runtime, run governed metric queries. The catalog covers local dbt projects,
+hosted dbt Cloud deployments, and native Apache Ossie, SLayer, and Cube files.
+Query capabilities differ by backend; the sections below explain those limits.
 
 ## The three commands
 

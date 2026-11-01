@@ -1,5 +1,8 @@
 # dbt as a first-class input (and the write target for transformations)
 
+Start with [Transform a dbt project](https://docs.exmergo.com/dex/guides/transform) for the workflow.
+This reference describes the files Dex reads and writes, and how it runs dbt.
+
 The dbt project is the source of truth for the transformation model. dex
 maintains no parallel model: it loads the project, reasons over it together with
 warehouse introspection and the `.dex/` cache, and writes changes back into the
@@ -44,8 +47,9 @@ No model materialization runs during planning.
   author but does not load would hash as absent, so a later edit to it would
   register as a create and the apply after it would conflict on a file nobody
   touched; the scan covers every family for that reason, not for completeness.
-- `target/manifest.json` when the project has been compiled; a fresh project
-  loads fine without one.
+- The newer available `manifest.json` from Dex's isolated artifact directory
+  or the project's own target path when the project has been compiled; a fresh
+  project loads fine without one.
 - `profiles.yml` (searched the way dbt searches: `$DBT_PROFILES_DIR`, the project
   directory, `~/.dbt`), but only to resolve a target's **name and adapter type**.
   Connection fields, credentials included, never leave the engine.
@@ -169,6 +173,14 @@ dex never builds to a non-dev target, and a delete only ever removes a file from
 the repo, never a relation from the warehouse.
 
 ## Running dbt (build, deps, parse)
+
+By default, Dex writes artifacts under `<target-path>/dex/<dbt-version>/`, and
+`data.artifact_directory` reports the directory used. This keeps artifacts from
+different dbt runtimes apart. `transform.artifacts: shared` selects the project's
+normal target path, with compatibility checks before anything writes. The
+[command contract](command-contract.md) describes the artifact policy and the
+`transform build --full-refresh` option for rebuilding selected incremental
+models on dev.
 
 Every dbt subprocess runs with its working directory pinned to the project dir, so
 relative paths in `profiles.yml` and anywhere else resolve against the project, not

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.envelope import Paradigm
@@ -525,8 +526,8 @@ def test_build_ignores_a_stale_run_results_json_from_a_prior_invocation(
     build must not be reported as this invocation's node results -- verified
     against real dbt behavior (its mtime is untouched by such a failure)."""
 
-    target_dir = dbt_project_dir / "target"
-    target_dir.mkdir(exist_ok=True)
+    target_dir = dex_target(dbt_project_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / "run_results.json").write_text(
         json.dumps(
             {
@@ -656,6 +657,8 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         # The assumptions the built models declare (#491); empty here, since the
         # fixture project declares none.
         "decisions",
+        # Where dbt wrote this build's artifacts (#1014).
+        "artifact_directory",
     }
     assert envelope["data"]["decisions"] == []
     # `success` is dbt's exit code; `outcome` is whether anything was validated,
@@ -1005,7 +1008,7 @@ def _write_incremental_artifacts(project: Path) -> None:
         },
     }
     _write_manifest(project, nodes)
-    (project / "target" / "run_results.json").write_text(
+    (dex_target(project) / "run_results.json").write_text(
         json.dumps({"results": [{"unique_id": uid} for uid in nodes]}),
         encoding="utf-8",
     )
@@ -1224,7 +1227,7 @@ def test_clickhouse_cloud_build_uses_compute_time_and_translates_settled_seconds
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1383,7 +1386,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
         confirmed=True,
         ceiling=100_000_000,
     )
-    target_dir = bigquery_project_dir / "target"
+    target_dir = dex_target(bigquery_project_dir)
     run_results = json_mod.dumps(
         {
             "results": [
@@ -1508,7 +1511,7 @@ def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1573,7 +1576,7 @@ def test_a_build_whose_statements_reported_no_billing_figure_says_so(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1636,7 +1639,7 @@ def test_engine_settled_spend_reports_unknown_settlement_on_failed_build(
         monkeypatch,
         returncode=1,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1719,7 +1722,7 @@ def test_engine_settled_spend_reports_unknown_settlement_on_successful_build(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1774,7 +1777,7 @@ def test_engine_settled_spend_reflects_build_known_spend_on_success_and_failure(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results_success,
         ),
     )
@@ -1810,7 +1813,7 @@ def test_engine_settled_spend_reflects_build_known_spend_on_success_and_failure(
         monkeypatch,
         returncode=1,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results_failure,
         ),
     )
@@ -1861,7 +1864,7 @@ def test_build_timeout_after_running_nodes_ledgers_their_seconds(
         monkeypatch,
         raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
         run_results_json=(
-            dbt_project_dir / "target" / "run_results.json",
+            dex_target(dbt_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -2450,8 +2453,8 @@ def _guard_compile_runner(monkeypatch, project, code, *, mode="ok"):
                 if mode == "failed":
                     return subprocess.CompletedProcess(argv, 1, "", "")
                 if mode != "absent":
-                    target = project / "target"
-                    target.mkdir(exist_ok=True)
+                    target = dex_target(project)
+                    target.mkdir(parents=True, exist_ok=True)
                     uid = "model.dex_test.guarded"
                     (target / "run_results.json").write_text(
                         json.dumps(
@@ -2474,7 +2477,7 @@ def _guard_compile_runner(monkeypatch, project, code, *, mode="ok"):
                     )
             else:
                 assert command == "build"
-                assert not (project / "target/run_results.json").exists()
+                assert not (dex_target(project) / "run_results.json").exists()
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         return run
@@ -2545,8 +2548,8 @@ def _compile_runner(
             assert env == expected_env
 
         def run(argv: list[str]):
-            (project / "target").mkdir(parents=True, exist_ok=True)
-            (project / "target" / "run_results.json").write_text(
+            (dex_target(project)).mkdir(parents=True, exist_ok=True)
+            (dex_target(project) / "run_results.json").write_text(
                 json.dumps(run_results), encoding="utf-8"
             )
             return subprocess.CompletedProcess(argv, returncode, "", "")
@@ -2594,8 +2597,8 @@ class _EstimatingAdapter:
 
 
 def _write_manifest(project: Path, nodes: dict) -> None:
-    (project / "target").mkdir(parents=True, exist_ok=True)
-    (project / "target" / "manifest.json").write_text(
+    (dex_target(project)).mkdir(parents=True, exist_ok=True)
+    (dex_target(project) / "manifest.json").write_text(
         json.dumps({"nodes": nodes}), encoding="utf-8"
     )
 
@@ -2738,7 +2741,7 @@ def test_dynamic_bound_nodes_finds_an_incremental_watermark_and_nothing_else(
         ),
     }
     _write_manifest(dbt_project_dir, nodes)
-    (dbt_project_dir / "target" / "run_results.json").write_text(
+    (dex_target(dbt_project_dir) / "run_results.json").write_text(
         json.dumps({"results": [{"unique_id": uid} for uid in nodes]}),
         encoding="utf-8",
     )
@@ -2847,7 +2850,7 @@ def test_a_failed_billed_build_still_reports_what_it_burned(
         returncode=1,
         stdout=json.dumps({"info": {"level": "error", "msg": msg}}),
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -3051,7 +3054,7 @@ def test_a_running_build_holds_its_headroom_and_gives_it_back(
         finally:
             concurrent.settle()
 
-    target_dir = bigquery_project_dir / "target"
+    target_dir = dex_target(bigquery_project_dir)
     run_results = json_mod.dumps(
         {
             "results": [
@@ -3128,7 +3131,7 @@ def test_a_warning_test_node_is_named_rather_than_hashed(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            dbt_project_dir / "target" / "run_results.json",
+            dex_target(dbt_project_dir) / "run_results.json",
             _node_results(
                 {
                     "unique_id": "model.dex_test.stg_customers",
@@ -3181,7 +3184,7 @@ def test_a_versioned_model_is_named_with_its_version(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            dbt_project_dir / "target" / "run_results.json",
+            dex_target(dbt_project_dir) / "run_results.json",
             _node_results(
                 *(
                     {
@@ -3233,7 +3236,7 @@ def test_a_verified_build_reports_findings_and_stays_ok(
     warnings alone still learns about them.
     """
 
-    target = dbt_project_dir / "target"
+    target = dex_target(dbt_project_dir)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -3287,7 +3290,7 @@ def test_a_failed_verified_build_names_the_failed_and_skipped_nodes(
     when "which node failed, and what did it take down with it" is worth most.
     """
 
-    target = dbt_project_dir / "target"
+    target = dex_target(dbt_project_dir)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -3363,7 +3366,7 @@ def _verifiable_manifest(project: Path, *, materialized: str) -> None:
     what scopes the sweep. A build that follows overwrites them with its own.
     """
 
-    target = project / "target"
+    target = dex_target(project)
     target.mkdir(parents=True, exist_ok=True)
     (target / "run_results.json").write_text(
         json.dumps(
@@ -3437,7 +3440,7 @@ def test_a_metered_build_does_not_verify_or_connect_unless_asked(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             _built_run_results(),
         ),
     )
@@ -3575,7 +3578,7 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             _built_run_results(),
         ),
     )
@@ -3643,7 +3646,7 @@ def test_a_verified_build_whose_dev_target_is_out_of_scope_says_so(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             _built_run_results(),
         ),
     )
@@ -3798,7 +3801,7 @@ def _snowflake_build(
         "  session_ceiling: 3600\n",
         encoding="utf-8",
     )
-    target = project / "target"
+    target = dex_target(project)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -4336,7 +4339,7 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
         "  dev_dataset: dbt_dev\n",
         encoding="utf-8",
     )
-    target = bigquery_project_dir / "target"
+    target = dex_target(bigquery_project_dir)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(

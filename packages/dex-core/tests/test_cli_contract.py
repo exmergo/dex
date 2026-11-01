@@ -95,11 +95,20 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
     assert rc in (0, 1)
 
 
-def test_unbuilt_commands_report_not_implemented(capsys):
-    # The Viz preview is the one remaining stub; it lands later as an
-    # integration with the Viz product.
-    assert main(["viz", "preview"]) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
+def test_removed_viz_preview_is_an_unknown_command(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["viz", "preview"])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "invalid choice: 'viz'" in captured.err
+
+
+def test_root_help_does_not_advertise_viz(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert "viz" not in capsys.readouterr().out.lower()
 
 
 def test_connect_test_against_duckdb_is_ok(duckdb_file: Path, capsys):
@@ -701,6 +710,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "for_plan_file": _TRANSLATED,
             # An off switch the shim turns into a DependencyPolicy value.
             "no_install_deps": _TRANSLATED,
+            "full_refresh": "full_refresh",
         },
     },
     ("transform", "export"): {
@@ -857,12 +867,6 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     ("maintain", "reconcile"): {
         "method": "reconcile",
         "args": {"drift_class": "drift_class"},
-    },
-    ("viz", "preview"): {
-        "reason": (
-            "not yet implemented; returns a not_implemented envelope until the "
-            "Viz integration lands"
-        ),
     },
     ("demo", None): {
         "reason": (

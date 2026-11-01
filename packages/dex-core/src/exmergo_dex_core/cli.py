@@ -13,9 +13,7 @@ command runs against that engine and hands back a result the shim wraps in an
 envelope. Dogfooding the API this way is what stops the two surfaces drifting.
 
 ``connect test``, the ``explore`` group, the authoring surface (``transform``,
-``semantic``), and the ``maintain`` group are live. ``viz preview`` returns a
-valid envelope with status ``not_implemented`` until the Viz integration lands,
-so the contract, the wrappers, and the eval harness stay exercisable.
+``semantic``), and the ``maintain`` group are live.
 """
 
 from __future__ import annotations
@@ -117,7 +115,6 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # (#224), unlike every other maintain subcommand above.
         "verify",
     ],
-    "viz": ["preview"],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
     # and a file that cannot build one is exactly when these are needed.
@@ -278,7 +275,6 @@ _GROUP_HELP: dict[str, str] = {
     "transform": "author and refactor dbt models, tests, and the semantic layer",
     "semantic": "define dbt or native semantic layers as reviewable diffs",
     "maintain": "detect drift against the last snapshot and propose the fix",
-    "viz": "preview the semantic layer (not yet implemented)",
     "config": "read, check and change .dex/config.yml, as reviewable diffs",
     "demo": "create a seeded local DuckDB warehouse to try dex against "
     "(no credentials, no network)",
@@ -517,10 +513,6 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "Check build status, column contracts, row population, grain and join "
         "contracts against the built relations. Mostly free metadata; view row "
         "counts and join probes are offered with an estimate.",
-    ),
-    ("viz", "preview"): (
-        "preview the semantic layer (not yet implemented)",
-        "Not yet implemented: returns a not_implemented envelope.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -1173,6 +1165,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=False,
                         help="refuse missing dbt packages instead of installing them",
+                    )
+                    # dbt's own flag, for the one case an incremental build
+                    # cannot handle: its logic changed, and the rows the old
+                    # logic wrote stay until the model is rebuilt (#1015).
+                    sp.add_argument(
+                        "--full-refresh",
+                        action="store_true",
+                        default=False,
+                        help="rebuild selected incremental models after their "
+                        "logic changed",
                     )
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is

@@ -1,0 +1,79 @@
+---
+title: Understand a refusal or incomplete result
+sidebarTitle: Troubleshooting
+description: Find the next step when Dex needs confirmation, lacks a dependency, refuses a query, or cannot verify a build. Resolve the cause without bypassing the guards.
+---
+
+Start with the JSON envelope's `status`, `reason`, `errors`, and `warnings`.
+A refusal explains a boundary; a successful result may still contain findings
+or checks that did not run.
+
+## Choose the symptom
+
+<AccordionGroup>
+  <Accordion title="The command returns needs_confirmation">
+
+Read what it is asking you to approve. A cost estimate, configuration diff, and
+file changed since planning require different decisions.
+
+For spend, follow [cost controls](/dex/guardrails/cost-controls). For a config
+change, review the diff in [`dex config`](/dex/cli/config). If a planned file has
+changed, plan again against the current file before applying.
+
+Do not treat `--confirm` as a universal retry flag.
+
+  </Accordion>
+  <Accordion title="uv or a connector dependency is missing">
+
+Check `uv --version` in the terminal your agent uses. Follow
+[Installation](/dex/installation) if it is missing. A `reason: prerequisite`
+response names the extra the command needs; install that extra or use the skill
+wrapper that selects it. Do not replace the command with a raw warehouse client.
+
+  </Accordion>
+  <Accordion title="Dex cannot find the connection or project">
+
+Run from your project directory, inspect `dex config get`, and run
+`dex config validate`. Then use `dex connect test` to check the selected target.
+See [Connect your data](/dex/connect) for connector discovery and scope.
+
+For dbt, check that Dex can discover one project or that `dbt_project_dir`
+selects the intended one. `DBT_PROFILES_DIR` locates dbt profiles; it does not by
+itself select Dex's connector.
+
+  </Accordion>
+  <Accordion title="A query is blocked by a PII flag">
+
+Read the [PII policy](/dex/guardrails/pii-policy). Only a human clears a flag.
+If an aggregate answers the question, ask for the aggregate instead of returning
+individual values. Do not alter flags to make a query pass.
+
+  </Accordion>
+  <Accordion title="The demo refuses to create its files">
+
+Use a fresh directory outside an existing Dex project. The demo is create-only
+and will not replace an existing warehouse file. A configuration above the
+directory can also keep it from creating the demo configuration. See the
+[quickstart](/dex/quickstart).
+
+  </Accordion>
+  <Accordion title="The build succeeds but verification reports a problem">
+
+Read `data.verification`, including findings and suppressed checks. A successful
+dbt run does not prove the population, joins, or grain are right. Investigate
+row loss, fan-out, and NULL columns, fix the plan, then rebuild with `--verify`.
+See [Transform a dbt project](/dex/guides/transform).
+
+  </Accordion>
+  <Accordion title="A map or drift check looks incomplete">
+
+Read the elision counts, skipped objects, suppressed checks, and any optional
+measurement offer. Narrow the question or request the missing evidence.
+A check that did not run is not a clean result. See
+[Explore](/dex/guides/explore) or [Maintain](/dex/guides/maintain).
+
+  </Accordion>
+</AccordionGroup>
+
+For the exact response fields, use the
+[command contract](/dex/reference/command-contract#the-envelope).

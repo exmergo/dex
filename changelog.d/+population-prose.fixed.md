@@ -1,1 +1,0 @@
-**Population prose follows its withholding policy.** A PII-flagged population filter now withholds the entire free-text rule in profile/map. Native semantic catalogs omit Dex-generated population sentences, including from existing files, while preserving the authored description where identifiable.

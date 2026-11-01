@@ -120,24 +120,47 @@ def compile_check(project_dir: Path) -> tuple[DriftFinding | None, list[str]]:
     return finding, []
 
 
+def _artifact(project_dir: Path, name: str) -> Path:
+    """``name`` in the directory holding the manifest this sweep reads.
+
+    The manifest and the run results are read from one directory, the newest
+    one on disk (issue #1014): after a Dex build that is Dex's own artifact
+    directory, after the user's own dbt run it is the project's target path, and
+    a run results file is never paired with another run's manifest.
+    """
+
+    from ..transform.artifact_runtime import readable_artifact_dir
+
+    return readable_artifact_dir(project_dir) / name
+
+
 def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
-    path = project_dir / "target" / "manifest.json"
+    path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8")).get("nodes", {})
 
 
 def _run_results(project_dir: Path) -> list[dict] | None:
-    path = project_dir / "target" / "run_results.json"
+    from ..transform.artifact_runtime import pinned_invocation_id
+
+    path = _artifact(project_dir, "run_results.json")
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8")).get("results", [])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    # A build's own sweep reads only its own invocation's results; another
+    # run's passing tests must not vouch for this build's rows.
+    expected = pinned_invocation_id()
+    written = (document.get("metadata") or {}).get("invocation_id")
+    if expected is not None and written is not None and str(written) != expected:
+        return None
+    return document.get("results", [])
 
 
 def read_manifest_target(project_dir: Path) -> str | None:
-    """The target dbt compiled the manifest against, from target/manifest.json."""
+    """The target dbt compiled the manifest against, from its manifest.json."""
 
-    path = project_dir / "target" / "manifest.json"
+    path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return None
     try:
@@ -1121,7 +1144,7 @@ class RowPopulationCheck:
 
 
 def _manifest_sources(project_dir: Path) -> dict[str, dict]:
-    path = project_dir / "target" / "manifest.json"
+    path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return {}
     return json.loads(path.read_text(encoding="utf-8")).get("sources", {})

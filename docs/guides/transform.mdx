@@ -1,0 +1,118 @@
+---
+title: Transform a dbt project
+sidebarTitle: Transform
+description: Take a model change from verified source data through a reviewable plan, apply it, and build on dev. Check the resulting rows before calling the change done.
+---
+
+**Outcome:** a reviewed project change, built on dev, with evidence that its
+rows match the request. You need a connected warehouse and a dbt project with a
+dev target. Start with [Connect your data](/dex/connect) if either is missing.
+
+## 1. State what the model should mean
+
+Tell the agent the grain and population you want, not just the model name:
+
+```text
+Use Dex to create a customer summary with one row per customer, including
+customers who have no orders. Include an order count of zero for those
+customers. Show me the plan and verify the resulting rows on dev.
+```
+
+The agent should profile the source relations and verify the joins before
+writing the SQL. It records the model's meaning in a declaration: grain,
+population, column roles, units, and any assumptions it had to make.
+
+<Accordion title="Start a new dbt project">
+
+After connecting and exploring, use `dex transform init analytics` to create a
+project named `analytics`. This command creates the project files and records
+the connection in configuration, returning the changes as diffs. It refuses to
+overwrite an existing project. Existing projects are discovered from the
+repository; `dbt_project_dir` can select one when the repository holds several.
+
+The generated dev profile still needs a valid target. For DuckDB, a new dev file
+that reads sources must be populated before the build can succeed. Follow the
+[DuckDB dev-target guidance](/dex/connectors/duckdb#dev-target-seeding-convention).
+
+</Accordion>
+
+## 2. Review the plan
+
+The agent submits the edits and declarations together:
+
+```bash
+dex transform plan "Create a customer summary" --edits-file edits.json
+```
+
+`edits.json` is the agent's prepared change, not a file Dex creates from this
+command alone. The result includes a plan ID, diffs, warnings, and declaration
+feedback. Resolve missing intent and contradictions, then plan again before
+applying. For an existing model, also review row attribution: a refactor should
+preserve its results.
+
+Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)
+when you need to construct the edits payload yourself.
+
+## 3. Apply the reviewed plan
+
+Replace `PLAN_ID` with the ID returned by planning:
+
+```bash
+dex transform apply PLAN_ID
+```
+
+This writes project files. If a file changed after planning, re-plan against its
+current content so the diff you review is the one you apply.
+
+## 4. Build and verify on dev
+
+```bash
+dex transform build --target dev --verify --for-plan PLAN_ID
+```
+
+On a metered connector, review the estimate and follow the
+[cost confirmation flow](/dex/guardrails/cost-controls). A successful dbt build
+is only part of the result. `--for-plan` makes the build report whether it ran
+every node the plan changed: read `data.outcome` (only `validated` means it did)
+and `data.evidence.coverage`. Then read `data.verification.ran`, its findings,
+and `suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
+need investigation before the change is finished.
+
+<Accordion title="Rebuild an incremental model from its full history">
+
+Use `--full-refresh` when the requested change requires rebuilding the selected
+incremental relation, rather than processing its next batch:
+
+```bash
+dex transform build --target dev --select fct_orders --full-refresh --verify
+```
+
+A full refresh drops and rebuilds selected incremental relations on dev. It can
+scan substantially more data. Review the full-rebuild estimate before approving
+it; this flag is not a routine fix for a failed build.
+
+A model configured with `full_refresh: false` is not rebuilt: check
+`data.full_refresh.not_refreshed` before treating a selected relation as
+rebuilt. `--verify` does not run its row-population checks on incremental
+models, so a green verification does not show the rebuilt history is right.
+Check the rebuilt rows yourself before accepting the change, for example with
+`dex explore profile <relation> --target dev --refresh`.
+
+</Accordion>
+
+<Accordion title="Find the dbt artifacts">
+
+By default, Dex writes dbt artifacts under `target/dex/<dbt-version>/` rather
+than mixing them with another runtime's artifacts. The build result's
+`data.artifact_directory` names the directory used. Follow that path when
+investigating a failure instead of assuming the project's previous manifest
+describes this run. See the
+[build command contract](/dex/reference/command-contract).
+
+</Accordion>
+
+## Keep it correct
+
+Once the change is verified, [establish a maintenance baseline](/dex/guides/maintain).
+For refactoring tools, test scaffolding, mutation testing, and every build flag,
+see [`dex transform`](/dex/cli/transform).
