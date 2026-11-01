@@ -598,12 +598,58 @@ class _Lineage:
             ]
             if not expanded:
                 return None
+            # A star carries its own reshaping: EXCLUDE/EXCEPT drop columns,
+            # REPLACE keeps the name but changes the expression, RENAME moves
+            # the name. The star itself holds them. A modifier may name its
+            # column qualified (`a.id`); a qualified name matches that source
+            # alone, a bare one every source the star expands.
+            star_node = star.this if isinstance(star, exp.Column) else star
+            excluded = {
+                (column.table.lower() or "", column.name.lower())
+                for column in star_node.args.get("except_") or []
+                if isinstance(column, exp.Column)
+            }
+            replaced = {
+                replacement.alias.lower(): replacement
+                for replacement in star_node.args.get("replace") or []
+                if isinstance(replacement, exp.Alias)
+            }
+            renamed = {
+                (
+                    replacement.this.table.lower() or "",
+                    replacement.this.name.lower(),
+                ): replacement
+                for replacement in star_node.args.get("rename") or []
+                if isinstance(replacement, exp.Alias)
+                and isinstance(replacement.this, exp.Column)
+            }
             for alias, relation in expanded:
                 columns = self.columns_of(relation)
                 if columns is None:
                     return None
                 for column in columns:
-                    out.setdefault(column.lower(), exp.column(column, table=alias))
+                    name = column.lower()
+                    if (alias, name) in excluded or ("", name) in excluded:
+                        continue
+                    move = renamed.get((alias, name)) or renamed.get(("", name))
+                    if move is not None:
+                        # RENAME moves the name; a REPLACE of the same column
+                        # still decides what it produces (Snowflake runs both),
+                        # so the replacement expression carries the new name.
+                        replacement = replaced.get(name)
+                        produced = (
+                            replacement.this
+                            if replacement is not None
+                            else exp.column(column, table=alias)
+                        )
+                        out.setdefault(
+                            move.alias.lower(), exp.alias_(produced, move.alias)
+                        )
+                        continue
+                    if name in replaced:
+                        out.setdefault(name, replaced[name])
+                        continue
+                    out.setdefault(name, exp.column(column, table=alias))
         self._outputs[id(select)] = out
         return out
 
