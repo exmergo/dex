@@ -154,6 +154,14 @@ def _annotate(
     parsed = parse_declarations(entries)
     if not parsed:
         return edits, []
+    with_history = [d.model for d in parsed if d.history is not None]
+    if with_history:
+        raise ValueError(
+            f"`semantic {vendor}` does not take a `history` declaration "
+            f"({', '.join(with_history)}): a temporal contract is verified against "
+            "a dbt snapshot, and no native layer can carry or check one. Declare it "
+            "on the dbt model through `transform plan`, or leave it out"
+        )
     documents = {
         path: entry.content for path, entry in layer.semantic_edit_view().files.items()
     }

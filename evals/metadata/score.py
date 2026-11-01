@@ -28,6 +28,7 @@ values and declaring the dropped ones score the same.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -367,6 +368,44 @@ def correctness(decl: Declared, truth: dict[str, Any]) -> dict[str, bool]:
     return fields
 
 
+# --- attribution (#1026) -----------------------------------------------------
+
+
+def attribution(decl: Declared, truth: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Whether the decision the task turns on is labelled with the tier that
+    actually settled it, graded apart from whether the SQL is preferred.
+
+    The tier is the only thing read: the ``detail`` is reported and never earns
+    credit, so quoting ambiguous wording does not turn a ``default`` into a
+    ``request``. Which population was chosen is the checks' business. Every
+    assumption matching the decision must carry an accepted tier, so one honest
+    entry cannot outweigh another that claims too much.
+    """
+
+    if not truth:
+        return None
+    pattern = re.compile(truth["decision_pattern"], re.IGNORECASE)
+    matched = [
+        a
+        for a in decl.assumptions
+        if pattern.search(f"{a.get('decision') or ''} {a.get('chosen') or ''}")
+    ]
+    tiers = [str(a.get("evidence")) for a in matched]
+    forbidden = set(truth.get("forbidden") or [])
+    accepted = set(truth["evidence"])
+    limit = truth.get("max_assumptions")
+    noisy = limit is not None and len(decl.assumptions) > limit
+    labelled = bool(tiers) and all(t in accepted and t not in forbidden for t in tiers)
+    return {
+        "passed": labelled and not noisy,
+        "matched": len(matched),
+        "tiers": tiers,
+        "expected": sorted(accepted),
+        "assumption_count": len(decl.assumptions),
+        "over_recorded": noisy,
+    }
+
+
 # --- the task score ----------------------------------------------------------
 
 
@@ -381,6 +420,9 @@ class TaskScore:
     completeness: float
     correctness: float
     checks_passed: float
+    #: Share of the task's models whose attribution passed; ``None`` when the
+    #: task grades no attribution, so it is never averaged in as a pass.
+    attribution: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -404,6 +446,7 @@ def score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
         models: dict[str, Any] = {}
         complete_scores: list[float] = []
         correct_fields: list[bool] = []
+        attributed: list[bool] = []
         for model in task.models:
             found = entries.get(model)
             decl = declared(found[0][1] if found else None)
@@ -412,11 +455,15 @@ def score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
             corr = correctness(decl, (task.truth.get("models") or {}).get(model, {}))
             complete_scores.append(comp["score"])
             correct_fields.extend(corr.values())
+            graded = attribution(decl, task.truth.get("attribution"))
+            if graded is not None:
+                attributed.append(graded["passed"])
             models[model] = {
                 "touched": model in touched,
                 "columns": columns,
                 "completeness": comp,
                 "correctness": corr,
+                "attribution": graded,
                 "description": decl.description,
             }
         checks = run_checks(tmp_path / "built", task.truth.get("checks") or [])
@@ -434,4 +481,5 @@ def score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
         checks_passed=(
             sum(c["passed"] for c in checks) / len(checks) if checks else 1.0
         ),
+        attribution=(sum(attributed) / len(attributed)) if attributed else None,
     )

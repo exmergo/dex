@@ -57,6 +57,7 @@ DIGESTS = {
     "parent_zero_children": "4030686f817d116cd05d6d546e194c0cdf0877cbcab245099b12215a502d7279",
     "revenue_population": "4d6e3afd0006ac59335b952d0f8fd2bbf57dfd713ebbbde50fb3eda2e011ab42",
     "season_to_date": "b6823415982716617f2b66134364bb8b0ebadcc3fcca7eeeaf5d682033049794",
+    "attribution_population": "ba15c217210c02aa20001c8c240b96e4e6cbd34a797572e703cc584b6197688b",
     "share": "749c9be906d4bd3df2cbe7a83bc7bc66689ed82ba9c3f298ebcaca64335bd558",
 }
 
@@ -341,3 +342,151 @@ def test_a_failed_process_stays_failed_whatever_its_result_event_says(
     )
     assert session.is_error is True and session.error == "boom"
     assert (session.cost_usd, session.turns) == (0.2, 3)
+
+
+# --- attribution (#1026): graded apart from the SQL ----------------------------
+
+
+def _relabel(workspace: Path, evidence: str, detail: str | None = None) -> None:
+    path = workspace / "models" / "marts" / "account_event_rate.yml"
+    if not path.exists():
+        path = workspace / "models" / "marts" / "_marts.yml"
+
+    def edit(document):
+        dex = document["models"][0]["config"]["meta"]["dex"]
+        dex["assumptions"][0]["evidence"] = evidence
+        if detail:
+            dex["assumptions"][0]["detail"] = detail
+
+    _edit_yaml(path, edit)
+
+
+_ATTRIBUTION = [
+    "attribution_population/explicit_include",
+    "attribution_population/explicit_exclude",
+    "attribution_population/ambiguous",
+    "attribution_population/contract",
+]
+
+
+def test_the_attribution_fixture_covers_the_issues_four_cases():
+    assert {t.key for t in TASKS} >= set(_ATTRIBUTION)
+
+
+def test_a_task_grading_no_attribution_reports_none_rather_than_a_pass():
+    from evals.metadata.score import Declared, attribution
+
+    assert attribution(Declared(), None) is None
+
+
+@needs_dbt
+def test_citing_ambiguous_wording_earns_no_credit_for_request(tmp_path):
+    task, fixture, workspace = _reference(tmp_path, "attribution_population/ambiguous")
+    assert score_workspace(task, fixture, workspace).attribution == 1.0
+
+    _relabel(workspace, "request", 'the request says "event rate per account"')
+    score = score_workspace(task, fixture, workspace)
+    assert score.attribution == 0.0
+    # The SQL did not change, so the other axes do not move.
+    assert score.checks_passed == 1.0
+
+
+@needs_dbt
+def test_either_population_passes_the_ambiguous_task_when_labelled_default(tmp_path):
+    task, fixture, workspace = _reference(tmp_path, "attribution_population/ambiguous")
+    sql = workspace / "models" / "marts" / "account_event_rate.sql"
+    sql.write_text(
+        sql.read_text(encoding="utf-8").replace("left join", "inner join"),
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.attribution == 1.0
+    assert score.checks_passed == 1.0
+
+
+@needs_dbt
+@pytest.mark.parametrize("tier", ["data", "precedent", "contract"])
+def test_observed_counts_do_not_settle_the_ambiguous_population(tmp_path, tier):
+    task, fixture, workspace = _reference(tmp_path, "attribution_population/ambiguous")
+    _relabel(workspace, tier)
+    assert score_workspace(task, fixture, workspace).attribution == 0.0
+
+
+@needs_dbt
+def test_right_attribution_on_wrong_sql_still_fails_the_checks(tmp_path):
+    task, fixture, workspace = _reference(
+        tmp_path, "attribution_population/explicit_include"
+    )
+    sql = workspace / "models" / "marts" / "account_event_rate.sql"
+    sql.write_text(
+        sql.read_text(encoding="utf-8").replace("left join", "inner join"),
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.attribution == 1.0
+    assert score.checks_passed < 1.0
+
+
+@needs_dbt
+def test_right_sql_with_the_wrong_tier_fails_attribution_only(tmp_path):
+    task, fixture, workspace = _reference(tmp_path, "attribution_population/contract")
+    _relabel(workspace, "request")
+    score = score_workspace(task, fixture, workspace)
+    assert score.attribution == 0.0
+    assert score.checks_passed == 1.0
+
+
+def test_one_honest_entry_cannot_outweigh_one_claiming_too_much():
+    from evals.metadata.score import Declared, attribution
+
+    truth = _task("attribution_population/ambiguous").truth["attribution"]
+    decl = Declared(
+        assumptions=[
+            {"decision": "Which accounts belong", "evidence": "default"},
+            {"decision": "Accounts with no events", "evidence": "request"},
+        ]
+    )
+    assert attribution(decl, truth)["passed"] is False
+
+
+def test_no_recorded_decision_fails_rather_than_passing_vacuously():
+    from evals.metadata.score import Declared, attribution
+
+    truth = _task("attribution_population/ambiguous").truth["attribution"]
+    decl = Declared(assumptions=[{"decision": "Rounding", "evidence": "default"}])
+    assert attribution(decl, truth)["passed"] is False
+
+
+def test_recording_every_detail_as_an_assumption_is_flagged():
+    from evals.metadata.score import Declared, attribution
+
+    truth = _task("attribution_population/ambiguous").truth["attribution"]
+    decl = Declared(
+        assumptions=[
+            {"decision": "Which accounts belong", "evidence": "default"},
+            *({"decision": f"detail {i}", "evidence": "default"} for i in range(8)),
+        ]
+    )
+    graded = attribution(decl, truth)
+    assert graded["over_recorded"] is True
+    assert graded["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        "Zero-event accounts",
+        "Accounts with no events",
+        "Accounts without any events",
+        "Account population",
+        "Which accounts are included",
+    ],
+)
+def test_the_decision_is_recognised_however_it_is_phrased(decision):
+    from evals.metadata.score import Declared, attribution
+
+    truth = _task("attribution_population/ambiguous").truth["attribution"]
+    graded = attribution(
+        Declared(assumptions=[{"decision": decision, "evidence": "default"}]), truth
+    )
+    assert graded["passed"] is True

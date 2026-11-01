@@ -1075,6 +1075,7 @@ def verify(
     offer = None
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
+    temporal_contracts: list[dict] | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
@@ -1269,6 +1270,7 @@ def verify(
                 findings.extend(facts.findings)
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
+                temporal_contracts = facts.temporal_contracts
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
                 findings = verify_mod.damp_fanout(
@@ -1298,6 +1300,7 @@ def verify(
         manifest_target=manifest_target,
         join_coverage=join_coverage,
         parent_population=parent_population,
+        temporal_contracts=temporal_contracts,
     )
     if cost is not None:
         result.cost = cost

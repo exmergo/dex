@@ -173,6 +173,8 @@ class VerifyResult(Result):
     join_coverage: list[dict] | None = None
     #: One record per declared ``population.parent`` (#857).
     parent_population: list[dict] | None = None
+    #: One record per declared ``history`` temporal contract (#1027).
+    temporal_contracts: list[dict] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -184,6 +186,8 @@ class VerifyResult(Result):
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:
             payload["parent_population"] = self.parent_population
+        if self.temporal_contracts:
+            payload["temporal_contracts"] = self.temporal_contracts
         if self.target is not None:
             payload["target"] = self.target
         if self.judged_namespace is not None:

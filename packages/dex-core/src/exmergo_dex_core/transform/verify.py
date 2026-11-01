@@ -80,6 +80,8 @@ class BuildVerification:
     join_coverage: list[dict] | None = None
     #: One record per declared ``population.parent`` among the built models.
     parent_population: list[dict] = field(default_factory=list)
+    #: One record per declared ``history`` among the built models (#1027).
+    temporal_contracts: list[dict] = field(default_factory=list)
     #: Which built models had their declared columns compared (#1002); ``None``
     #: when the comparison never reached a model (see ``suppressed``).
     column_contract: dict[str, Any] | None = None
@@ -98,6 +100,8 @@ class BuildVerification:
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:
             payload["parent_population"] = self.parent_population
+        if self.temporal_contracts:
+            payload["temporal_contracts"] = self.temporal_contracts
         if self.column_contract is not None:
             payload["column_contract"] = self.column_contract
         return payload
@@ -749,6 +753,7 @@ def _declared_facts(
     result.findings.extend(facts.findings)
     result.warnings.extend(facts.notes)
     result.parent_population = facts.parent_coverage
+    result.temporal_contracts = facts.temporal_contracts
     for finding_class, reason in facts.suppressed.items():
         result.suppressed[finding_class] = reason
     if grain_models and facts.offer is not None:

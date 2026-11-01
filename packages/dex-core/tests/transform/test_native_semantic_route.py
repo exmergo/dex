@@ -316,6 +316,28 @@ def test_declarations_reach_the_layer_through_its_hook_in_annotate_mode(vendor):
     assert ("validate", "plan") in vendor.calls
 
 
+def test_a_native_layer_refuses_a_history_it_cannot_carry_or_check(vendor):
+    vendor.layer_type[0] = _DerivingLayer
+    history = {
+        "snapshot": "s",
+        "entity": {"id": "id"},
+        "status": {"column": "x", "target": True},
+    }
+
+    with DexEngine.from_repo(str(vendor.root)) as engine:
+        with pytest.raises(ValueError) as refused:
+            engine.semantic_native(
+                VENDOR,
+                "plan",
+                "declare orders",
+                [],
+                declarations=[{"model": "orders", "history": history}],
+            )
+        assert engine.require_full_store("listing").list_plans() == []
+
+    assert "does not take a `history` declaration (orders)" in str(refused.value)
+
+
 def test_a_declared_mart_derives_into_any_vendor_with_the_hook_as_a_companion_plan(
     vendor, dbt_project_dir: Path, capsys, monkeypatch
 ):

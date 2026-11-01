@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "account_event_rate"
+  ],
+  "prompt": "Build a mart model `account_event_rate` in models/marts: the event rate per account. Over the 30-day window in raw.events: `account_id`, `event_count`, and `events_per_day` (`event_count` / 30.0). Build it on dev when you are done."
+}

@@ -104,7 +104,9 @@ _DEX_CALL = re.compile(
 )
 
 
-def summarize(events: list[dict[str, Any]], session: Session) -> Session:
+def summarize(
+    events: list[dict[str, Any]], session: Session, plugin_dir: Path = REPO
+) -> Session:
     skills: list[str] = []
     commands: dict[str, int] = {}
     for event in events:
@@ -134,7 +136,8 @@ def summarize(events: list[dict[str, Any]], session: Session) -> Session:
     session.dex_commands = commands
     dex_plugins = [p for p in session.plugins if "dex" in str(p.get("name", ""))]
     session.candidate_plugin_loaded = bool(dex_plugins) and all(
-        Path(str(p.get("path", ""))).resolve() == REPO for p in dex_plugins
+        Path(str(p.get("path", ""))).resolve() == plugin_dir.resolve()
+        for p in dex_plugins
     )
     return session
 
@@ -148,7 +151,9 @@ def run_session(
     max_turns: int,
     max_budget_usd: float,
     timeout: int,
+    plugin_dir: Path | None = None,
 ) -> Session:
+    plugin_dir = plugin_dir or REPO
     binary = _require_claude("claude")
     env = _child_env()
     # The candidate engine's `dex` and the dbt it pins, first on PATH.
@@ -167,7 +172,7 @@ def run_session(
         "--max-budget-usd",
         str(max_budget_usd),
         "--plugin-dir",
-        str(REPO),
+        str(plugin_dir),
         # The user's own settings would load their installed plugins, the wrong
         # dex among them (#791), and their memory; the project's are the fixture's.
         "--setting-sources",
@@ -210,7 +215,7 @@ def run_session(
         transcript.write_text(partial, encoding="utf-8")
         session.error = f"timed out after {timeout}s"
     session.duration_s = round(time.monotonic() - started, 1)
-    summarize(events, session)
+    summarize(events, session, plugin_dir)
     if session.error is not None:
         # A result event can say `is_error: false` for a process that then exited
         # non-zero or timed out; the process failure wins, and the event's cost

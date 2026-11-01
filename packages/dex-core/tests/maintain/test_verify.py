@@ -1427,6 +1427,7 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "additivity",
         "population",
         "parent_population",
+        "temporal",
     }
 
 

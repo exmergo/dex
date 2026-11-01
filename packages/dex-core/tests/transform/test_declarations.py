@@ -893,3 +893,170 @@ def test_a_population_with_only_a_parent_reads_back():
     assert population.parent is not None
     assert population.parent.key == {"customer_id": "customer_id"}
     assert read_population({"parent": {"model": "x", "key": {"a": 1}}}) is None
+
+
+# --- history: a temporal contract (#1027) -----------------------------------------
+
+_SNAPSHOT = (
+    "{% snapshot hosts_snapshot %}\n{{ config(unique_key='host_id', "
+    "strategy='check', check_cols='all') }}\nselect 1 as host_id\n{% endsnapshot %}\n"
+)
+_HISTORY_SQL = "select 1 as host_id, 0 as changes, current_date as latest_at\n"
+_HISTORY = {
+    "snapshot": "hosts_snapshot",
+    "entity": {"host_id": "host_id"},
+    "status": {"column": "is_super", "target": True},
+    "initial_observation": "baseline",
+    "null_status": "ignore",
+    "population": "ever_target",
+    "time": {"column": "dbt_valid_from", "provenance": "capture"},
+    "measures": {
+        "transition_count": "changes",
+        "latest_target_transition_at": "latest_at",
+    },
+}
+
+
+def _history_view(**extra: str) -> DbtProjectView:
+    view = _view(
+        {
+            "models/marts/host_history.sql": _HISTORY_SQL,
+            "snapshots/hosts_snapshot.sql": _SNAPSHOT,
+            **extra,
+        }
+    )
+    return view.model_copy(update={"snapshot_paths": ["snapshots"]})
+
+
+def _declare_history(history: dict, view: DbtProjectView | None = None):
+    parsed = parse_declarations([{"model": "host_history", "history": history}])
+    return apply_declarations(parsed, view or _history_view(), [])
+
+
+def test_a_history_renders_into_meta_as_declared():
+    edits, warnings = _declare_history(_HISTORY)
+    entry = _entry(edits[0].new_content, "host_history")
+    assert entry["config"]["meta"]["dex"]["history"] == _HISTORY
+    assert not any("declares history without" in w for w in warnings)
+
+
+def test_a_history_on_a_yaml_defined_snapshot_is_accepted():
+    view = _view(
+        {
+            "models/marts/host_history.sql": _HISTORY_SQL,
+            "snapshots/hosts.yml": (
+                "snapshots:\n  - name: hosts_snapshot\n    relation: ref('x')\n"
+            ),
+        }
+    )
+    edits, _warnings = _declare_history(_HISTORY, view)
+    assert _entry(edits[0].new_content, "host_history")
+
+
+def test_a_population_parent_can_name_a_yaml_defined_snapshot():
+    view = _view(
+        {
+            "models/marts/fct_orders.sql": ORDERS_SQL,
+            "snapshots/hosts.yml": (
+                "snapshots:\n  - name: hosts_snapshot\n    relation: ref('x')\n"
+            ),
+        }
+    )
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "population": {
+                    "parent": {
+                        "model": "hosts_snapshot",
+                        "key": {"customer_id": "customer_id"},
+                    }
+                },
+            }
+        ]
+    )
+    assert apply_declarations(parsed, view, [])
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({"initial_observation": "maybe"}, "initial_observation"),
+        ({"null_status": "as_false"}, "null_status"),
+        ({"population": "some"}, "population"),
+        ({"time": {"column": "x", "provenance": "wall"}}, "provenance"),
+        ({"entity": {}}, "entity"),
+        ({"surprise": 1}, "surprise"),
+    ],
+)
+def test_a_malformed_history_is_refused_naming_the_field(change, expected):
+    with pytest.raises(DeclarationError) as caught:
+        parse_declarations(
+            [{"model": "host_history", "history": {**_HISTORY, **change}}]
+        )
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({"snapshot": "stg_hosts"}, "no snapshot by that name"),
+        ({"entity": {"nope": "host_id"}}, "nope"),
+        ({"measures": {"transition_count": "nope"}}, "nope"),
+    ],
+)
+def test_a_history_the_project_cannot_satisfy_is_refused(change, expected):
+    with pytest.raises(DeclarationError) as caught:
+        _declare_history({**_HISTORY, **change})
+    assert expected in str(caught.value)
+
+
+def test_a_status_target_on_personal_data_is_refused():
+    with pytest.raises(DeclarationError) as caught:
+        _declare_history(
+            {**_HISTORY, "status": {"column": "email", "target": "a@example.com"}}
+        )
+    assert "personal data" in str(caught.value)
+    assert "history" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("dropped", "owed"),
+    [
+        ("initial_observation", "initial_observation"),
+        ("null_status", "null_status"),
+        ("population", "population"),
+        ("time", "time, with its provenance"),
+    ],
+)
+def test_a_policy_left_out_warns_and_is_never_assumed(dropped, owed):
+    history = {k: v for k, v in _HISTORY.items() if k != dropped}
+    edits, warnings = _declare_history(history)
+    rendered = _entry(edits[0].new_content, "host_history")["config"]["meta"]["dex"]
+    assert dropped not in rendered["history"]
+    assert any(owed in w and "assumes no temporal policy" in w for w in warnings)
+
+
+def test_a_declaration_with_no_history_renders_no_history_key():
+    edits, _warnings = apply_declarations(
+        parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}]),
+        _view(_project()),
+        [],
+    )
+    assert "history" not in edits[0].new_content
+
+
+@pytest.mark.parametrize(
+    ("sql", "owed"),
+    [
+        ("select host_id, lag(s) over (order by t) from {{ ref('snap') }}", True),
+        ("select host_id, min(dbt_valid_from) from {{ ref('snap') }} group by 1", True),
+        ("select host_id from {{ ref('snap') }} where dbt_valid_to is null", False),
+        ("select host_id, lag(s) over (order by t) from {{ ref('stg') }}", False),
+    ],
+)
+def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owed):
+    from exmergo_dex_core.transform import drafting
+
+    files = {"snapshots/snap.sql": "{% snapshot snap %}select 1{% endsnapshot %}"}
+    assert drafting._reads_snapshot_history(sql, files) is owed

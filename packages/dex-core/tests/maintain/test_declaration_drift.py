@@ -490,3 +490,20 @@ def test_reconcile_advises_and_never_rewrites_a_declaration(maintain_repo):
     assert "maintain snapshot --project-only" in proposal["action"]
     assert "plan_id" not in payload["data"]
     assert (maintain_repo.root / YML_PATH).read_text("utf-8") == changed
+
+
+def test_a_changed_temporal_policy_is_high_severity_drift():
+    from exmergo_dex_core.maintain.drift import _declaration_weight
+
+    assert _declaration_weight("history") == "high"
+    before = DECLARED_YML.replace(
+        "          grain: [order_id]\n",
+        "          grain: [order_id]\n"
+        "          history: {initial_observation: baseline}\n",
+    )
+    after = before.replace("baseline", "transition")
+
+    def fingerprint(text: str):
+        return declaration_fingerprints([(yaml.safe_load(text), YML_PATH)])
+
+    assert fingerprint(before) != fingerprint(after)

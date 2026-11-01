@@ -18,6 +18,7 @@ The build gate is not a threshold: a run where any task fails it exits 1.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import tempfile
@@ -39,6 +40,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for r in rows
         if r.get("session") and r["session"]["cost_usd"]
     ]
+    attributed = [s["attribution"] for s in scored if s.get("attribution") is not None]
     return {
         "tasks": len(scored),
         "build_gate_pass_rate": round(1 - len(gate_failed) / n, 4),
@@ -47,17 +49,29 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "completeness": round(sum(s["completeness"] for s in scored) / n, 4),
         "correctness": round(sum(s["correctness"] for s in scored) / n, 4),
         "checks_passed": round(sum(s["checks_passed"] for s in scored) / n, 4),
+        # Over the tasks that grade it, so the others cannot inflate or dilute it.
+        "attribution": (
+            round(sum(attributed) / len(attributed), 4) if attributed else None
+        ),
         "cost_usd": round(sum(costs), 4) if costs else None,
     }
 
 
 def _print_table(report: dict[str, Any]) -> None:
-    print(f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7}")
+    print(
+        f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
+        f"{'attrib':>7}"
+    )
     for row in report["results"]:
         s = row["score"]
         print(
             f"{s['task']:48} {s['status']:12} {s['completeness']:8.2f} "
-            f"{s['correctness']:8.2f} {s['checks_passed']:7.2f}"
+            f"{s['correctness']:8.2f} {s['checks_passed']:7.2f} "
+            + (
+                f"{s['attribution']:7.2f}"
+                if s.get("attribution") is not None
+                else f"{'-':>7}"
+            )
         )
     agg = report["aggregate"]
     print(
@@ -65,6 +79,11 @@ def _print_table(report: dict[str, Any]) -> None:
         f"completeness {agg['completeness']:.2f}; "
         f"correctness {agg['correctness']:.2f}; "
         f"checks {agg['checks_passed']:.2f}"
+        + (
+            f"; attribution {agg['attribution']:.2f}"
+            if agg.get("attribution") is not None
+            else ""
+        )
         + (f"; cost ${agg['cost_usd']:.2f}" if agg.get("cost_usd") is not None else "")
     )
 
@@ -94,6 +113,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=2400, help="per task, seconds")
     parser.add_argument(
         "--out", default=None, help="directory for workspaces and the report"
+    )
+    parser.add_argument(
+        "--procedure-file",
+        default=None,
+        help=(
+            "live runs: give the agent this file instead of the engine's procedure, "
+            "to measure a baseline against an older text; recorded in the report"
+        ),
+    )
+    parser.add_argument(
+        "--plugin-dir",
+        default=None,
+        help=(
+            "live runs: load the plugin from this directory rather than the working "
+            "tree. A baseline needs it, because the skills carry the procedure too"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     args = parser.parse_args(argv)
@@ -125,6 +160,12 @@ def main(argv: list[str] | None = None) -> int:
             "max_budget_usd": args.max_budget_usd,
         }
         agent_config = procedure_envelope()["block"]
+        if args.procedure_file:
+            agent_config = Path(args.procedure_file).read_text(encoding="utf-8")
+            digest = hashlib.sha256(agent_config.encode()).hexdigest()
+            report["settings"]["procedure_file_sha256"] = digest
+        if args.plugin_dir:
+            report["settings"]["plugin_dir"] = args.plugin_dir
 
     for task in tasks:
         fixture = fixture_of(task, fixtures)
@@ -149,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=args.max_turns,
                 max_budget_usd=args.max_budget_usd,
                 timeout=args.timeout,
+                plugin_dir=Path(args.plugin_dir) if args.plugin_dir else None,
             )
             row["session"] = session.__dict__
         row["workspace"] = str(workspace)
@@ -172,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             r["score"]["completeness"],
             r["score"]["correctness"],
             r["score"]["checks_passed"],
+            1 if r["score"]["attribution"] is None else r["score"]["attribution"],
         )
         < 1
         for r in report["results"]
