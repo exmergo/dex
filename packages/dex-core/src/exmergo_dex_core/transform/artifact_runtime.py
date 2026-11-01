@@ -307,19 +307,26 @@ ARTIFACT_POLICIES: tuple[str, ...] = ("isolated", "shared")
 DEFAULT_ARTIFACT_POLICY: ArtifactPolicy = "isolated"
 
 
+#: The runtime key when the installed dbt-core version cannot be read: the build
+#: then runs a ``dbt`` found on ``PATH``, whose version Dex does not know.
+UNKNOWN_RUNTIME_KEY = "dbt-unknown"
+
+
 @functools.lru_cache(maxsize=1)
-def dbt_runtime_key() -> str | None:
-    """``dbt-<version>`` of the dbt-core Dex runs, or ``None`` without one.
+def dbt_runtime_key() -> str:
+    """``dbt-<version>`` of the dbt-core Dex runs, or :data:`UNKNOWN_RUNTIME_KEY`.
 
     Read from the installed distribution's metadata, so nothing is imported and
     no subprocess is spawned. The build runs the ``dbt`` beside this interpreter
-    (see ``build._dbt_executable``), which is this distribution.
+    (see ``build._dbt_executable``), which is this distribution. Without one it
+    falls back to a ``dbt`` on ``PATH``, and the isolated policy still isolates
+    it, under ``dbt-unknown`` rather than in the shared target path.
     """
 
     try:
         return f"dbt-{metadata.version('dbt-core')}"
     except metadata.PackageNotFoundError:
-        return None
+        return UNKNOWN_RUNTIME_KEY
 
 
 def shared_target_dir(project_root: Path | str) -> Path:
@@ -394,7 +401,7 @@ def resolve_build_artifact_dir(
         )
     key = runtime_key or dbt_runtime_key()
     shared = shared_target_dir(project_root)
-    if policy == "isolated" and key is not None:
+    if policy == "isolated":
         isolated = runtime_artifact_dir(shared, key)
         isolated.mkdir(parents=True, exist_ok=True)
         return isolated
@@ -424,7 +431,8 @@ def _foreign_manifest_version(shared: Path, runtime_key: str | None) -> str | No
 
     import json
 
-    if runtime_key is None:
+    # An unknown version cannot be compared, so it is no reason to refuse.
+    if runtime_key is None or runtime_key == UNKNOWN_RUNTIME_KEY:
         return None
     try:
         document = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))

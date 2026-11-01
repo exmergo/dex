@@ -612,3 +612,27 @@ def test_a_pinned_block_reads_the_build_directory_and_its_invocation_only(
 
     # Outside a build, the newest on disk is still the answer.
     assert _manifest_nodes(dbt_project_dir) == {}
+
+
+def test_an_unknown_dbt_version_still_isolates(dbt_project_dir: Path, monkeypatch):
+    """A `dbt` found on PATH has no version Dex can read, and must not send the
+    isolated policy into the shared target path."""
+
+    from exmergo_dex_core.transform import artifact_runtime
+
+    def missing(name):
+        raise artifact_runtime.metadata.PackageNotFoundError(name)
+
+    artifact_runtime.dbt_runtime_key.cache_clear()
+    monkeypatch.setattr(artifact_runtime.metadata, "version", missing)
+    try:
+        chosen = resolve_build_artifact_dir(dbt_project_dir, "isolated")
+        assert chosen == dbt_project_dir / "target" / "dex" / "dbt-unknown"
+        # An unknown version is no reason for the shared policy to refuse.
+        shared = dbt_project_dir / "target"
+        (shared / "manifest.json").write_text(
+            json.dumps({"metadata": {"dbt_version": "1.10.11"}}), encoding="utf-8"
+        )
+        assert resolve_build_artifact_dir(dbt_project_dir, "shared") == shared
+    finally:
+        artifact_runtime.dbt_runtime_key.cache_clear()

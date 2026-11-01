@@ -1119,9 +1119,13 @@ default, or a filter or operator after it is refused. A key naming a location
   after a failed run.
   - `isolated`, the default, is `<target-path>/dex/<dbt-version>/`. The runtime
     key is the dbt-core version, so two Dex runs share partial-parse state while
-    another runtime never sees it. It sits inside the project's target path, so
-    git, `dbt clean` and Dex's own shadow copies ignore it as they ignore
-    `target/`. The project's own `target/` is never written.
+    another runtime never sees it. Where the version cannot be read (the build
+    falls back to a `dbt` on `PATH`), the key is `dbt-unknown`, which still
+    isolates. The directory sits inside the project's target path, so git and
+    Dex's own shadow copies ignore it as they ignore `target/`. `dbt clean`
+    deletes it with the rest of the target path when `clean-targets` lists that
+    path, as it does by default; the next build writes it afresh. The project's
+    own `target/` is never written.
   - `shared` is the project's own target path, for tooling that must find the
     artifacts there. Before anything runs, Dex refuses (`reason: guard`) a
     directory that holds a snapshot path another runtime left as a directory,
