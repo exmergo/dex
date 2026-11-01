@@ -335,6 +335,47 @@ def test_a_declaration_that_contradicts_the_project_is_refused(declaration, expe
     assert expected in str(caught.value)
 
 
+def test_a_declaration_against_a_union_model_refuses_an_absent_column():
+    files = {
+        "models/marts/fct_orders.sql": (
+            "select 1 as order_id, 2 as customer_id\nunion all\nselect 3, 4\n"
+        ),
+    }
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "columns": {"absent": {"role": "dimension"}},
+            }
+        ]
+    )
+    with pytest.raises(DeclarationError, match="does not produce"):
+        apply_declarations(parsed, _view(files), [])
+
+
+def test_a_declaration_against_a_union_model_accepts_declared_columns():
+    files = {
+        "models/marts/fct_orders.sql": (
+            "select 1 as order_id, 2 as customer_id\nunion all\nselect 3, 4\n"
+        ),
+    }
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "columns": {
+                    "order_id": {"role": "key"},
+                    "customer_id": {"role": "dimension"},
+                },
+            }
+        ]
+    )
+    _edits, warnings = apply_declarations(parsed, _view(files), [])
+    assert not any("not checked" in w for w in warnings)
+
+
 def test_a_filter_on_a_column_that_looks_like_personal_data_is_refused():
     parsed = parse_declarations(
         [

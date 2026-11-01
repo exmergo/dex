@@ -1466,6 +1466,55 @@ def test_an_incremental_model_not_rebuilt_is_still_skipped(tmp_path, full_refres
     )
 
 
+def test_a_copy_whose_own_setting_ignores_the_flag_keeps_the_skip(tmp_path: Path):
+    """The label can be in the rebuilt list on behalf of another package's copy."""
+
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+        config={"full_refresh": False},
+    )
+    assert "row_loss" not in _codes(result)
+    assert any(
+        "holds what previous runs loaded" in w and "events" in w
+        for w in result.warnings
+    )
+
+
+def test_a_rebuilt_model_is_compared_with_a_parent_outside_the_manifest(tmp_path: Path):
+    """Quoted names and a raw parent, with the model's verdict stated whole."""
+
+    uid = "model.shop.fct_events"
+    _artifacts(
+        tmp_path,
+        nodes={
+            uid: {
+                "name": "fct_events",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_events"',
+                "compiled_code": 'select * from "warehouse"."raw"."events"',
+                "config": {"materialized": "incremental"},
+            },
+        },
+        results=[],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_events"), _Meta("warehouse.raw.events")],
+        counts={"warehouse.dbt_dev.fct_events": 10, "warehouse.raw.events": 100},
+    )
+    summary = _summary([_node(uid)])
+    summary["full_refresh"] = {**_REFRESHED, "models": ["fct_events"]}
+
+    result = _sweep(tmp_path, summary, adapter)
+    assert result.scope == ["fct_events"]
+    assert "row_population" not in result.suppressed
+    assert [(f.code, f.identifier) for f in result.findings] == [
+        ("row_loss", "fct_events")
+    ]
+
+
 def test_a_rebuilt_model_that_failed_is_not_judged(tmp_path: Path):
     result = _incremental(
         tmp_path,
