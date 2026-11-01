@@ -1265,13 +1265,11 @@ def relationships(
     # connector, same as the profiles below.
     reusable = prior if prior and prior.provenance.connector == connector else None
     examined = {d.identifier for d in datasets}
-    in_scope = getattr(adapter, "in_scope", None)
     rels, carried_relationships = _carry_forward_relationships(
         reusable,
         examined,
         rels,
         observed_namespaces=observed_namespaces,
-        in_scope=in_scope,
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -2705,13 +2703,11 @@ def map(
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
-    in_scope = getattr(adapter, "in_scope", None)
     relationship_set, carried_relationships = _carry_forward_relationships(
         reusable,
         examined,
         relationship_set,
         observed_namespaces=observed_namespaces,
-        in_scope=in_scope,
     )
     final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
     # After inference, so it saw the same profiles in either mode.
@@ -2724,7 +2720,6 @@ def map(
         final_scores,
         reusable,
         observed_namespaces=observed_namespaces,
-        in_scope=in_scope,
     )
 
     # A verified join at a catastrophic orphan rate is a finding, not just a
@@ -4685,7 +4680,6 @@ def _carry_forward_relationships(
     relationships: list[Relationship],
     *,
     observed_namespaces: set[str] | None = None,
-    in_scope: Callable[[str], bool] | None = None,
 ) -> tuple[list[Relationship], int]:
     """Union back in any prior relationship this run could not possibly have
     regenerated or superseded: one with an endpoint outside ``examined`` (the
@@ -4712,9 +4706,7 @@ def _carry_forward_relationships(
         if identifier in examined:
             return False
         ns = identifier.rpartition(".")[0].lower()
-        if observed_namespaces is not None and ns in observed_namespaces:
-            return True
-        return in_scope is not None and in_scope(ns)
+        return bool(observed_namespaces is not None and ns in observed_namespaces)
 
     carried = [
         rel
@@ -5417,7 +5409,6 @@ def _compose_datasets(
     prior: DexCache | None,
     *,
     observed_namespaces: set[str] | None = None,
-    in_scope: Callable[[str], bool] | None = None,
 ) -> tuple[list[Dataset], int, int, list[str]]:
     """Merge this run's profiles over the full inventory. Returns the composed
     datasets, how many prior profiles were carried forward within this run's
@@ -5482,7 +5473,7 @@ def _compose_datasets(
         is_observed = (
             observed_namespaces is not None and namespace in observed_namespaces
         )
-        if is_observed or (in_scope is not None and in_scope(namespace)):
+        if is_observed:
             dropped.append(identifier)
             continue
         datasets.append(previous.model_copy(deep=True))

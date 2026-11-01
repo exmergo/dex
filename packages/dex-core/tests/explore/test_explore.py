@@ -1301,7 +1301,7 @@ def test_map_drops_relation_when_whole_schema_is_dropped_between_maps(
     _run(["maintain", "snapshot", "--path", str(path)], capsys)
     check_payload = _run(["maintain", "check", "--path", str(path)], capsys)
     findings = check_payload["data"]["findings"]
-    table_dropped = [f for f in findings if f.get("rule") == "table_dropped"]
+    table_dropped = [f for f in findings if f.get("code") == "table_dropped"]
     assert not any("stg_orders" in f.get("detail", "") for f in table_dropped)
 
 
