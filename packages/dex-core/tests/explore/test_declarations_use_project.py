@@ -549,3 +549,34 @@ def test_values_free_withholds_every_population_value(
     assert declaration["grain"] == ["order_id", "line_no"]
     cache_text = (repo / ".dex" / "cache.json").read_text(encoding="utf-8")
     assert "cancelled_zq7" not in cache_text
+
+
+@pytest.mark.parametrize("values_free", [False, True])
+def test_a_declared_parent_is_carried_as_names_in_every_mode(
+    values_free: bool, warehouse: Path, tmp_path: Path, capsys
+):
+    """A `population.parent` (#857) names a model and columns, never a value,
+    so it is carried whole in values-free mode too, and every path it adds was
+    reviewed for the mode."""
+
+    schema = _DECLARED_ORDERS.replace(
+        "            filters:\n",
+        "            parent:\n"
+        "              model: customers\n"
+        "              key: {customer_id: customer_id}\n"
+        "            filters:\n",
+    )
+    repo = _repo(tmp_path, schema)
+    extra = ["--values-free"] if values_free else []
+    payload = _run(
+        _args("profile", warehouse, repo, "fct_orders", "--use-project", *extra),
+        capsys,
+    )
+    declaration = _orders(payload)["declaration"]
+    assert declaration["population"]["parent"] == {
+        "model": "customers",
+        "columns": ["customer_id"],
+        "parent_columns": ["customer_id"],
+    }
+    if values_free:
+        assert _unknown_paths("profile", payload["data"]) == []

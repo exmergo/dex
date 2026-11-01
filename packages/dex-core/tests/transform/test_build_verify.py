@@ -315,7 +315,7 @@ def test_a_failed_build_suppresses_row_population_and_says_why(tmp_path: Path):
     )
     result = _sweep(
         tmp_path,
-        _summary([_node("model.shop.fct_orders")], success=False),
+        _summary([_node("model.shop.fct_orders", status="error")], success=False),
     )
     assert "did not complete" in result.suppressed["row_population"]
     assert any(f.code == "node_failed" for f in result.findings)
@@ -902,7 +902,9 @@ def test_a_build_checks_what_its_models_declare(tmp_path: Path):
 
 def test_a_failed_build_suppresses_the_declared_facts_and_says_why(tmp_path: Path):
     _declared_manifest(tmp_path)
-    result = _sweep(tmp_path, _summary([_node("model.p.fct_orders")], success=False))
+    result = _sweep(
+        tmp_path, _summary([_node("model.p.fct_orders", status="error")], success=False)
+    )
     for finding_class in ("grain", "unit", "additivity", "population"):
         assert "did not complete" in result.suppressed[finding_class]
 
@@ -1078,3 +1080,187 @@ def test_a_failing_unique_test_unproves_a_passing_one(tmp_path: Path):
     assert passed_grain_tests(tmp_path) == {
         "fct": {"columns": ["id"], "source": "unique_test"}
     }
+
+
+# --- join coverage and parent population on the build path (#857) ---------------
+
+_REPRO_SQL = (
+    'select s.subscription_id, s.created_at from "wh"."dbt_dev"."activity" a '
+    'left join "wh"."dbt_dev"."subscriptions" s '
+    "on a.subscription_id = s.subscription_id"
+)
+
+
+def _repro_manifest(project: Path) -> None:
+    _artifacts(
+        project,
+        nodes={
+            "model.p.subscriptions": {
+                "name": "subscriptions",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."subscriptions"',
+                "compiled_code": 'select * from "wh"."raw"."subscriptions"',
+            },
+            "model.p.rpt_subscriptions": {
+                "name": "rpt_subscriptions",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."rpt_subscriptions"',
+                "compiled_code": _REPRO_SQL,
+                "config": {
+                    "materialized": "table",
+                    "meta": {
+                        "dex": {
+                            "population": {
+                                "parent": {
+                                    "model": "subscriptions",
+                                    "key": {"subscription_id": "subscription_id"},
+                                }
+                            }
+                        }
+                    },
+                },
+                "columns": {
+                    "created_at": {
+                        "name": "created_at",
+                        "config": {"meta": {"dex": {"null_rule": "never"}}},
+                    }
+                },
+            },
+        },
+        results=[{"unique_id": "model.p.rpt_subscriptions", "status": "success"}],
+    )
+
+
+def test_a_build_measures_its_joins_and_its_declared_parent(tmp_path: Path):
+    """The issue's reproduction through the build sweep, on real relations: a
+    green build, every subscription column NULL, the join matching nothing, and
+    all three subscriptions missing from a model declared one row each."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.subscriptions AS SELECT * FROM (VALUES "
+        "('sub_elm', TIMESTAMP '2026-01-01'), ('sub_oak', TIMESTAMP '2026-01-02'), "
+        "('sub_pine', TIMESTAMP '2026-01-03')) t(subscription_id, created_at)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.activity AS SELECT * FROM (VALUES "
+        "(1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')) t(activity_id, subscription_id)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_subscriptions AS " + _REPRO_SQL.replace('"wh".', "")
+    )
+    conn.close()
+    _repro_manifest(tmp_path)
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_subscriptions")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    codes = {f.code: f for f in result.findings}
+    assert codes["join_no_match"].severity == "high"
+    assert codes["join_field_all_null"].column == "created_at"
+    assert codes["parent_population_missing"].data["missing_parents"] == 3
+    assert "join_contract" not in result.suppressed
+    payload = result.payload()
+    (record,) = payload["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["measured"]["eligible_rows"] == 4
+    (parent,) = payload["parent_population"]
+    assert parent["status"] == "contradicted"
+
+
+def test_a_failed_build_suppresses_the_join_contract_and_says_why(tmp_path: Path):
+    _repro_manifest(tmp_path)
+    result = _sweep(
+        tmp_path,
+        _summary([_node("model.p.rpt_subscriptions", status="error")], success=False),
+    )
+    assert "did not complete" in result.suppressed["join_contract"]
+    assert "join_coverage" not in result.payload()
+
+
+def test_join_coverage_is_priced_with_the_build(tmp_path: Path):
+    from exmergo_dex_core.transform.verify import price_join_contract
+
+    _repro_manifest(tmp_path)
+    adapter = _Estimator()
+    adapter.cost_gate = object()
+    price, notes = price_join_contract(
+        adapter, tmp_path, scope={"model.p.rpt_subscriptions"}
+    )
+    assert notes == []
+    # One coverage probe and one NULL count on the model.
+    assert price == 2048.0
+    assert len(adapter.sql) == 2
+    assert all(sql.upper().startswith("SELECT") for sql in adapter.sql)
+
+
+def test_join_coverage_that_does_not_fit_comes_back_as_an_offer():
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.transform.verify import _join_handshake
+
+    class _Adapter:
+        name = "bigquery"
+        dialect = "bigquery"
+        paradigm = Paradigm.BYTES_SCANNED
+        cost_gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=1_000.0,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=True,
+            connector="bigquery",
+            command="transform build",
+        )
+
+    offer = _join_handshake(_Adapter())(50_000.0, 2)
+    assert offer is not None
+    assert offer.data["phase"] == "join_contract"
+    assert offer.data["per_table_bytes"] == {"(join overlap probes)": 50_000.0}
+    assert offer.data["statement_count"] == 2
+
+
+def test_a_build_failed_only_by_its_tests_still_judges_the_models_it_built(
+    tmp_path: Path,
+):
+    """A declaration's `not_null` or `relationships` test failing makes dbt
+    report the build as failed, and that is exactly when the row checks matter
+    (#857): every model built in this run, so each one is judged."""
+
+    _repro_manifest(tmp_path)
+    summary = _summary(
+        [
+            _node("model.p.rpt_subscriptions"),
+            _node("test.p.not_null_rpt_subscriptions_created_at.1a2b", status="fail"),
+        ],
+        success=False,
+    )
+    result = _sweep(tmp_path, summary, _StubAdapter([]))
+    assert "did not complete" not in result.suppressed.get("join_contract", "")
+    assert "did not complete" not in result.suppressed.get("parent_population", "")
+
+
+def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
+    _repro_manifest(tmp_path)
+    summary = _summary(
+        [
+            _node("model.p.rpt_subscriptions"),
+            _node("model.p.subscriptions", status="error"),
+        ],
+        success=False,
+    )
+    result = _sweep(tmp_path, summary, _StubAdapter([]))
+    assert any("subscriptions failed or were skipped" in w for w in result.warnings), (
+        result.warnings
+    )

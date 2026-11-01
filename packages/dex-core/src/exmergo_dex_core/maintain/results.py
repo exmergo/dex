@@ -168,6 +168,11 @@ class VerifyResult(Result):
     target: str | None = None
     judged_namespace: str | None = None
     manifest_target: str | None = None
+    #: One record per join the project writes (#857): declared, measured,
+    #: contradicted or unchecked. ``None`` when the axis did not run at all.
+    join_coverage: list[dict] | None = None
+    #: One record per declared ``population.parent`` (#857).
+    parent_population: list[dict] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -175,6 +180,10 @@ class VerifyResult(Result):
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.join_coverage is not None:
+            payload["join_coverage"] = self.join_coverage
+        if self.parent_population:
+            payload["parent_population"] = self.parent_population
         if self.target is not None:
             payload["target"] = self.target
         if self.judged_namespace is not None:

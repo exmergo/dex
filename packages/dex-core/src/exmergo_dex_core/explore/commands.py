@@ -46,6 +46,7 @@ from ..cache import (
     DatasetDeclaration,
     DeclaredColumn,
     DeclaredFilter,
+    DeclaredParent,
     DeclaredRows,
     DexCache,
     Relationship,
@@ -4302,7 +4303,20 @@ def _dataset_declaration(
                     excludes=None if hide else item.excludes,
                 )
             )
-        population = DeclaredRows(rule=rule, filters=filters)
+        stated_parent = declaration.population.parent
+        population = DeclaredRows(
+            rule=rule,
+            filters=filters,
+            parent=(
+                DeclaredParent(
+                    model=stated_parent.model,
+                    columns=list(stated_parent.key),
+                    parent_columns=list(stated_parent.key.values()),
+                )
+                if stated_parent is not None
+                else None
+            ),
+        )
 
     grain = declaration.grain
     status = None

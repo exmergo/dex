@@ -3500,12 +3500,14 @@ def test_the_upfront_estimate_covers_the_build_and_its_verification(
     )
     assert rc == 0, envelope
     assert envelope["status"] == "needs_confirmation"
-    assert envelope["data"]["estimated_bytes"] == 51_000.0
+    # The build, the row counts, and the coverage probe of its one join (#857).
+    assert envelope["data"]["estimated_bytes"] == 101_000.0
     assert envelope["data"]["per_table_bytes"]["(row counts)"] == 50_000.0
+    assert envelope["data"]["per_table_bytes"]["(join overlap probes)"] == 50_000.0
     assert envelope["data"]["per_table_bytes"]["fct_orders"] == 1000.0
 
 
-def test_a_table_materialization_adds_nothing_to_the_estimate(
+def test_a_table_materialization_adds_no_row_count_to_the_estimate(
     bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
     """A warehouse keeps a row count for a table, so nothing has to be scanned
@@ -3535,8 +3537,10 @@ def test_a_table_materialization_adds_nothing_to_the_estimate(
         capsys,
     )
     assert rc == 0, envelope
-    assert envelope["data"]["estimated_bytes"] == 1000.0
+    # Only the join's coverage probe is a scan; the table's count is metadata.
+    assert envelope["data"]["estimated_bytes"] == 51_000.0
     assert "(row counts)" not in envelope["data"]["per_table_bytes"]
+    assert envelope["data"]["per_table_bytes"]["(join overlap probes)"] == 50_000.0
 
 
 def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
@@ -3569,6 +3573,7 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         query_estimate=50_000.0,
         objects=[
             _Meta("dex-test.raw.orders", 1000),
+            _Meta("dex-test.raw.events", 1000),
             _Meta("dex-test.dbt_dev.fct_orders", None),
         ],
         counts=[0],
@@ -3599,10 +3604,13 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
     )
     assert rc == 0, envelope
     assert envelope["status"] == "ok"
-    assert len(adapter.queries) == 1, "the counts are one batched statement"
-    # 3000 from dbt, 50000 from the count statement dex issued through the gate.
-    assert envelope["data"]["spend"]["bytes_billed"] == 53_000.0
-    assert envelope["data"]["spend"]["session_spent_today"] == 53_000.0
+    # The counts are one batched statement, and the join's coverage one more.
+    assert len(adapter.queries) == 2
+    assert sum("dex_cov_rows_0" in sql for sql in adapter.queries) == 1
+    # 3000 from dbt, 50000 each from the two statements dex issued through
+    # the gate.
+    assert envelope["data"]["spend"]["bytes_billed"] == 103_000.0
+    assert envelope["data"]["spend"]["session_spent_today"] == 103_000.0
     verification = envelope["data"]["verification"]
     assert verification["ran"] is True
     assert verification["scope"] == ["fct_orders"]
@@ -3613,13 +3621,12 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         for line in (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
     ]
     settlements = [r for r in rows if r["entry"] == "settlement"]
-    assert len(settlements) == 2
+    assert len(settlements) == 3
     assert [r["reservation_id"] for r in settlements] == [
-        adapter.cost_gate.reservation_id,
-        adapter.cost_gate.reservation_id,
-    ]
+        adapter.cost_gate.reservation_id
+    ] * 3
     assert settled_ratios(rows, connector="bigquery", field="billed_bytes") == [
-        pytest.approx(53_000.0 / 51_000.0)
+        pytest.approx(103_000.0 / 101_000.0)
     ]
 
 
@@ -3922,10 +3929,14 @@ def test_a_first_verified_snowflake_build_judges_the_schema_it_created(
         "RAW.PUBLIC",
         "DEV.DBT_DEV",
     ]
-    # The 4-second run plus the 60-second idle tail, on a warehouse it resumed.
-    assert envelope["data"]["spend"]["seconds_billed"] == pytest.approx(64.0)
-    assert _settled_seconds(run.ledger) == pytest.approx(64.0)
-    assert run.connection.data_statements == [], "the counts came from the catalog"
+    # The 4-second run plus the 60-second idle tail, on a warehouse it resumed,
+    # plus the coverage probe of the model's one join (#857).
+    assert envelope["data"]["spend"]["seconds_billed"] == pytest.approx(64.5)
+    assert _settled_seconds(run.ledger) == pytest.approx(64.5)
+    # The counts came from the catalog: the only data statement is the probe.
+    assert [
+        "DEX_COV_ROWS_0" in stmt.sql.upper() for stmt in run.connection.data_statements
+    ] == [True]
 
 
 def test_a_first_verified_snowflake_build_into_an_empty_schema_judges_it(

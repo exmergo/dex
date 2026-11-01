@@ -148,6 +148,7 @@ def test_verify_runs_portable_checks_through_the_project_format(
         "unit",
         "additivity",
         "population",
+        "parent_population",
     }
     assert all(
         "'graph' project format does not provide dbt target/ artifacts" in reason

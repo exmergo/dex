@@ -275,6 +275,11 @@ def _check(
 
     if declaration.population is not None:
         _check_filters(model, declaration.population, cache, pii_overrides)
+        parent = declaration.population.parent
+        if parent is not None:
+            warnings.extend(
+                _check_parent(model, declaration, parent, produced, files, view)
+            )
 
     declared_columns = _declared_column_roles(files, declaration.model)
     declared_columns.update(name.lower() for name in declaration.columns)
@@ -288,28 +293,87 @@ def _check_reference(
     target: str,
     files: Mapping[str, str],
     view: DbtProjectView,
+    *,
+    claim: str | None = None,
 ) -> None:
+    """Refuse a reference whose parent or parent column the project lacks.
+
+    ``claim`` is how the refusal names what made the reference, so a
+    ``population.parent`` key reads as that rather than as a column's
+    ``references``."""
+
+    said = claim or f"'{model}.{column}' references '{target}'"
     parent, _, parent_column = target.rpartition(".")
     if not parent or not parent_column:
-        raise DeclarationError(
-            f"'{model}.{column}' references '{target}'; write the target as "
-            "<model>.<column>"
-        )
+        raise DeclarationError(f"{said}; write the target as <model>.<column>")
     parent_sql = model_sql_path(files, view.model_paths, parent)
     if parent_sql is not None:
         produced = select_columns(files[parent_sql])
         if produced is not None and parent_column.lower() not in produced:
             raise DeclarationError(
-                f"'{model}.{column}' references '{target}', and {parent_sql} does not "
-                f"produce a column '{parent_column}'"
+                f"{said}, and {parent_sql} does not produce a column '{parent_column}'"
             )
         return
     if _is_seed_or_snapshot(files, view, parent):
         return
     raise DeclarationError(
-        f"'{model}.{column}' references '{target}', and the project has no model, "
-        f"seed or snapshot named '{parent}'"
+        f"{said}, and the project has no model, seed or snapshot named '{parent}'"
     )
+
+
+def _check_parent(
+    model: str,
+    declaration: Declaration,
+    parent: Any,
+    produced: set[str] | None,
+    files: Mapping[str, str],
+    view: DbtProjectView,
+) -> list[str]:
+    """Validate ``population.parent`` (#857): every output key column is one the
+    model produces, and every parent column is one the parent produces.
+
+    A parent that is the model itself is refused: a key set always equals
+    itself, so the check would prove nothing. A key that is not the declared
+    grain is a warning rather than a refusal, since a model may legitimately
+    hold one row per parent at a grain written differently, but the check then
+    counts entities the grain does not name.
+    """
+
+    if parent.model.lower() == model.lower():
+        raise DeclarationError(
+            f"'{model}' declares itself as its population.parent; name the model, "
+            "seed or snapshot its rows are drawn from"
+        )
+    if produced is not None:
+        unknown = [c for c in parent.key if c.lower() not in produced]
+        if unknown:
+            raise DeclarationError(
+                f"'{model}' declares population.parent key column(s) "
+                f"{', '.join(unknown)} that its SELECT list does not produce; the "
+                "key maps output columns to the parent's"
+            )
+    for output_column, parent_column in parent.key.items():
+        _check_reference(
+            model,
+            output_column,
+            f"{parent.model}.{parent_column}",
+            files,
+            view,
+            claim=(
+                f"'{model}' declares population.parent {parent.model} keyed "
+                f"{output_column} -> {parent_column}"
+            ),
+        )
+    grain = [g.lower() for g in declaration.grain or []]
+    keys = [k.lower() for k in parent.key]
+    if grain and sorted(grain) != sorted(keys):
+        return [
+            f"'{model}' declares population.parent keyed on {', '.join(parent.key)} "
+            f"but its grain is {', '.join(declaration.grain or [])}; the parent "
+            "check counts entities by the key, so the two describe different rows "
+            "unless the key is the grain"
+        ]
+    return []
 
 
 def _is_seed_or_snapshot(
@@ -628,6 +692,8 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
     plain = yaml.safe_load(yaml.serialize(node)) if node is not None else None
     existing = (entry_meta(plain) or {}).get(DEX_META_KEY)
     merged = {**existing, **dex} if isinstance(existing, dict) else dict(dex)
+    if isinstance(existing, dict):
+        merged = _merge_population(existing, merged)
 
     config = _child(node, "config")
     if config is None:
@@ -646,6 +712,20 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         return found[1] if found else None
 
     return _set_key(text, meta_node, DEX_META_KEY, merged)
+
+
+def _merge_population(existing: Mapping[str, Any], merged: dict[str, Any]) -> dict:
+    """Keep ``population``'s own keys a later declaration leaves out (#857).
+
+    A model-level key is replaced whole, but ``population`` holds three
+    independent statements (a rule, filters, a parent), and a payload that adds
+    a parent to a model whose filters were declared earlier would otherwise
+    erase the filters. One level, the same rule one level down."""
+
+    before, after = existing.get("population"), merged.get("population")
+    if isinstance(before, dict) and isinstance(after, dict) and before is not after:
+        merged["population"] = {**before, **after}
+    return merged
 
 
 def _add_tests(text: str, locate, specs: list[Any]) -> str:

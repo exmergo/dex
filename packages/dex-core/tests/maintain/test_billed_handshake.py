@@ -543,9 +543,9 @@ def _client_with_a_view(fake_bq_client):
 
 def _row_and_probe_resolver(row_count: int):
     """A ``row_resolver`` answering every query shape a confirmed `maintain
-    verify` run can now issue (#228, #849): the row-count aggregate this suite
-    already exercised, the join-overlap probe alongside it, the grain
-    heuristic's aggregate scan (which rides COUNT(*) along, so its row
+    verify` run can now issue (#228, #849, #857): the row-count aggregate this
+    suite already exercised, the join coverage probe and NULL count alongside
+    it, the grain heuristic's aggregate scan (which rides COUNT(*) along, so its row
     carries ``n_total`` plus one non-null and one distinct count per column),
     and the exact-distinct escalation that follows a near-unique aggregate.
     Reports the join healthy (zero orphans) so it never adds a finding these
@@ -554,6 +554,18 @@ def _row_and_probe_resolver(row_count: int):
     def resolve(sql: str):
         if "nonnull_fk_0" in sql:
             return [{"nonnull_fk_0": 100, "orphans_0": 0}]
+        if "dex_cov_rows_0" in sql:
+            return [
+                {
+                    "dex_cov_rows_0": 100,
+                    "dex_cov_eligible_0": 100,
+                    "dex_cov_matched_0": 100,
+                    "dex_cov_keys_0": 10,
+                    "dex_cov_matched_keys_0": 10,
+                }
+            ]
+        if "dex_nn_0" in sql:
+            return [{"dex_rows": row_count, "dex_nn_0": row_count}]
         if "n_total" in sql:
             return [{"n_total": row_count, "nn_0": row_count, "nd_0": row_count}]
         if "COUNT(DISTINCT" in sql:

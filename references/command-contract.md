@@ -479,11 +479,21 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      0..1, a percent wholly inside it, with the observed min and max),
                                      additivity_contradicted (an additive column the cumulative
                                      detector reads as a running total), population_contradicted (an
-                                     excluded value still present, as a count), each class priced into
-                                     the same single offer on a metered connector. A project that fails
+                                     excluded value still present, as a count), parent_population_missing
+                                     and parent_population_unexpected (a declared population.parent's
+                                     keys against the model's, as distinct-key counts), each class
+                                     priced into the same single offer on a metered connector. Join
+                                     contract: every equality join's coverage, rows and distinct keys
+                                     apart, one data.join_coverage record per join (satisfied,
+                                     contradicted, not_applicable for an empty input, unchecked with a
+                                     reason_code); join_no_match for a nonempty population matching
+                                     nothing, join_orphans and join_zero_overlap against the contract or
+                                     the stated defaults, join_field_all_null and join_field_newly_null
+                                     for a column the join supplies that came back all NULL. A project that fails
                                      to compile is reported first and suppresses every other check;
                                      data.suppressed names each finding class that did not run and why,
-                                     declared-fact classes (unit, additivity, population) included
+                                     declared-fact classes (unit, additivity, population,
+                                     parent_population) included
 ```
 
 ### How authored content reaches the engine
@@ -1203,8 +1213,16 @@ default, or a filter or operator after it is refused. A key naming a location
   grain always), reported as `grain_broken` with `source: declaration`. A
   single-column declared grain renders as a `unique` test, which the build
   itself runs, and `null_rule: never` renders as `not_null`, so neither is
-  checked twice. Every class that did not run is named in `suppressed`
-  (`grain`, `unit`, `additivity`, `population`).
+  checked twice. A declared `population.parent` is held to the parent's keys
+  (`parent_population_missing`, `parent_population_unexpected`, #857). Every
+  class that did not run is named in `suppressed` (`grain`, `unit`,
+  `additivity`, `population`, `parent_population`).
+
+  **Join coverage.** Every equality join the built models write is measured as
+  `maintain verify` measures it (#857), with one record per join under
+  `data.verification.join_coverage` and per declared parent under
+  `data.verification.parent_population`, and `join_contract` suppressed with
+  its reason when it could not run (a failed build, no joins, no connection).
 
   `no_relation` is never reported from a build: dbt's run results are
   authoritative for the nodes it just ran, and a node it reports as `success`
@@ -1214,7 +1232,8 @@ default, or a filter or operator after it is refused. A key naming a location
   pricing pass, off the manifest the free `dbt compile` wrote, and folded into
   the same estimate under a `(row counts)` entry in the per-table breakdown, so
   one `--budget` covers both phases. The declared-fact statements are priced the
-  same way under `(declared facts)`, and gated after the build as their own
+  same way under `(declared facts)`, and the join coverage statements under
+  `(join overlap probes)`, each gated after the build as their own
   phase of the same reservation, never as a second budget. Only relations the warehouse keeps no row
   count for cost anything, which is any view, and a view is dbt's default
   materialization; a table's count is free metadata. On a connector with no
