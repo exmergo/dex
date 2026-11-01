@@ -309,6 +309,36 @@ def test_the_transcript_summary_counts_dex_commands_through_a_same_command_alias
     }
 
 
+def test_an_alias_match_inside_quotes_is_not_counted():
+    """Quoted alias text is data, not an invocation — an echo in the wrapper's
+    own body must not record a call, while a `$(...)` substitution still does."""
+
+    from evals.metadata.live import Session, summarize
+
+    def bash(command):
+        return {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+                ]
+            },
+        }
+
+    events = [
+        bash(
+            'R() { echo "R transform apply";'
+            ' uv run --no-project --script /x/run.py "$@"; }'
+        ),
+        bash(
+            'R() { uv run --no-project --script /x/run.py "$@"; };'
+            ' out=$(R transform apply p1); echo "$out"'
+        ),
+    ]
+    session = summarize(events, Session())
+    assert session.dex_commands == {"transform apply": 1}
+
+
 def test_a_model_that_was_not_built_cannot_be_complete():
     from evals.metadata.score import Declared, completeness
 

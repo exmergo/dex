@@ -138,6 +138,30 @@ def _alias_call(name: str) -> re.Pattern:
     )
 
 
+def _quoted_spans(command: str) -> list[tuple[int, int]]:
+    """Half-open [start, end) spans of single- and double-quoted text. Quoted
+    alias text is data, not an invocation — `echo "R transform apply"` never
+    runs R. Matches inside `$(...)` and wrapper bodies stay counted: those run
+    when the command does."""
+    spans: list[tuple[int, int]] = []
+    quote: str | None = None
+    start = 0
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\" and quote is not None:
+            i += 2
+            continue
+        if quote is None:
+            if ch in "\"'":
+                quote, start = ch, i
+        elif ch == quote:
+            spans.append((start, i + 1))
+            quote = None
+        i += 1
+    return spans
+
+
 def summarize(events: list[dict[str, Any]], session: Session) -> Session:
     skills: list[str] = []
     commands: dict[str, int] = {}
@@ -159,8 +183,13 @@ def summarize(events: list[dict[str, Any]], session: Session) -> Session:
                     patterns = [_DEX_CALL] + [
                         _alias_call(name) for name in _aliases(command)
                     ]
+                    quoted = _quoted_spans(command)
                     for pattern in patterns:
                         for match in pattern.finditer(command):
+                            if pattern is not _DEX_CALL and any(
+                                begin <= match.start() < end for begin, end in quoted
+                            ):
+                                continue
                             group, sub = match.group(1), match.group(2)
                             label = f"{group} {sub}" if sub else group
                             commands[label] = commands.get(label, 0) + 1
