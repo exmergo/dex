@@ -1346,25 +1346,406 @@ def strip_relation_quoting(relation: str) -> str:
     return ".".join(part for part in parts if part)
 
 
+_BIGQUERY_TYPE_ALIASES: dict[str, str] = {
+    "int64": "INT64",
+    "integer": "INT64",
+    "int": "INT64",
+    "smallint": "INT64",
+    "bigint": "INT64",
+    "tinyint": "INT64",
+    "byteint": "INT64",
+    "float64": "FLOAT64",
+    "float": "FLOAT64",
+    "numeric": "NUMERIC",
+    "decimal": "NUMERIC",
+    "bignumeric": "BIGNUMERIC",
+    "bigdecimal": "BIGNUMERIC",
+    "bool": "BOOL",
+    "boolean": "BOOL",
+    "string": "STRING",
+    "varchar": "STRING",
+    "text": "STRING",
+    "timestamp": "TIMESTAMP",
+    "datetime": "DATETIME",
+    "date": "DATE",
+    "time": "TIME",
+    "bytes": "BYTES",
+    "record": "STRUCT",
+    "struct": "STRUCT",
+}
+
+_DUCKDB_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "int4": "INTEGER",
+    "signed": "INTEGER",
+    "bigint": "BIGINT",
+    "int8": "BIGINT",
+    "long": "BIGINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "short": "SMALLINT",
+    "tinyint": "TINYINT",
+    "int1": "TINYINT",
+    "hugeint": "HUGEINT",
+    "uinteger": "UINTEGER",
+    "uint4": "UINTEGER",
+    "ubigint": "UBIGINT",
+    "uint8": "UBIGINT",
+    "usmallint": "USMALLINT",
+    "uint2": "USMALLINT",
+    "utinyint": "UTINYINT",
+    "uint1": "UTINYINT",
+    "uhugeint": "UHUGEINT",
+    "varchar": "VARCHAR",
+    "char": "VARCHAR",
+    "bpchar": "VARCHAR",
+    "text": "VARCHAR",
+    "string": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "logical": "BOOLEAN",
+    "float": "FLOAT",
+    "float4": "FLOAT",
+    "real": "FLOAT",
+    "double": "DOUBLE",
+    "float8": "DOUBLE",
+    "decimal": "DECIMAL",
+    "numeric": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "datetime": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamptz": "TIMESTAMPTZ",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "time without time zone": "TIME",
+    "timetz": "TIMETZ",
+    "time with time zone": "TIMETZ",
+    "blob": "BLOB",
+    "bytea": "BLOB",
+    "binary": "BLOB",
+    "varbinary": "BLOB",
+}
+
+_POSTGRES_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "int4": "INTEGER",
+    "bigint": "BIGINT",
+    "int8": "BIGINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "varchar": "VARCHAR",
+    "character varying": "VARCHAR",
+    "text": "VARCHAR",
+    "char": "VARCHAR",
+    "character": "VARCHAR",
+    "bpchar": "VARCHAR",
+    "string": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "double precision": "DOUBLE PRECISION",
+    "float8": "DOUBLE PRECISION",
+    "float": "DOUBLE PRECISION",
+    "real": "REAL",
+    "float4": "REAL",
+    "numeric": "NUMERIC",
+    "decimal": "NUMERIC",
+    "timestamp": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamptz": "TIMESTAMPTZ",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "time without time zone": "TIME",
+    "timetz": "TIMETZ",
+    "time with time zone": "TIMETZ",
+    "bytea": "BYTEA",
+}
+
+_SNOWFLAKE_TYPE_ALIASES: dict[str, str] = {
+    "number": "NUMBER",
+    "decimal": "NUMBER",
+    "numeric": "NUMBER",
+    "int": "NUMBER",
+    "integer": "NUMBER",
+    "bigint": "NUMBER",
+    "smallint": "NUMBER",
+    "tinyint": "NUMBER",
+    "byteint": "NUMBER",
+    "fixed": "NUMBER",
+    "varchar": "VARCHAR",
+    "string": "VARCHAR",
+    "text": "VARCHAR",
+    "char": "VARCHAR",
+    "character": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "float": "FLOAT",
+    "float4": "FLOAT",
+    "float8": "FLOAT",
+    "double": "FLOAT",
+    "double precision": "FLOAT",
+    "real": "FLOAT",
+    "timestamp": "TIMESTAMP_NTZ",
+    "datetime": "TIMESTAMP_NTZ",
+    "timestamp_ntz": "TIMESTAMP_NTZ",
+    "timestamp without time zone": "TIMESTAMP_NTZ",
+    "timestamptz": "TIMESTAMP_TZ",
+    "timestamp_tz": "TIMESTAMP_TZ",
+    "timestamp with time zone": "TIMESTAMP_TZ",
+    "timestamp_ltz": "TIMESTAMP_LTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "binary": "BINARY",
+    "varbinary": "BINARY",
+}
+
+_CLICKHOUSE_TYPE_ALIASES: dict[str, str] = {
+    "int8": "INT8",
+    "tinyint": "INT8",
+    "int16": "INT16",
+    "smallint": "INT16",
+    "int32": "INT32",
+    "int": "INT32",
+    "integer": "INT32",
+    "int64": "INT64",
+    "bigint": "INT64",
+    "uint8": "UINT8",
+    "uint16": "UINT16",
+    "uint32": "UINT32",
+    "uint64": "UINT64",
+    "string": "STRING",
+    "text": "STRING",
+    "varchar": "STRING",
+    "char": "STRING",
+    "bool": "BOOL",
+    "boolean": "BOOL",
+    "float32": "FLOAT32",
+    "float": "FLOAT32",
+    "float64": "FLOAT64",
+    "double": "FLOAT64",
+    "decimal": "DECIMAL",
+    "datetime": "DATETIME",
+    "datetime64": "DATETIME",
+    "date": "DATE",
+    "date32": "DATE",
+}
+
+_DATABRICKS_TYPE_ALIASES: dict[str, str] = {
+    "int": "INT",
+    "integer": "INT",
+    "bigint": "BIGINT",
+    "long": "BIGINT",
+    "smallint": "SMALLINT",
+    "short": "SMALLINT",
+    "tinyint": "TINYINT",
+    "byte": "TINYINT",
+    "string": "STRING",
+    "text": "STRING",
+    "varchar": "STRING",
+    "char": "STRING",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "float": "FLOAT",
+    "real": "FLOAT",
+    "double": "DOUBLE",
+    "decimal": "DECIMAL",
+    "dec": "DECIMAL",
+    "numeric": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "timestamp_ntz": "TIMESTAMP",
+    "date": "DATE",
+}
+
+_TRINO_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "bigint": "BIGINT",
+    "smallint": "SMALLINT",
+    "tinyint": "TINYINT",
+    "varchar": "VARCHAR",
+    "char": "VARCHAR",
+    "string": "VARCHAR",
+    "text": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "double": "DOUBLE",
+    "real": "REAL",
+    "decimal": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp with time zone": "TIMESTAMP WITH TIME ZONE",
+    "date": "DATE",
+    "time": "TIME",
+}
+
+_GENERIC_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "int4": "INTEGER",
+    "signed": "INTEGER",
+    "bigint": "BIGINT",
+    "int8": "BIGINT",
+    "long": "BIGINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "short": "SMALLINT",
+    "tinyint": "TINYINT",
+    "int1": "TINYINT",
+    "varchar": "VARCHAR",
+    "character varying": "VARCHAR",
+    "text": "VARCHAR",
+    "string": "VARCHAR",
+    "char": "VARCHAR",
+    "character": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "logical": "BOOLEAN",
+    "double": "DOUBLE",
+    "double precision": "DOUBLE",
+    "float8": "DOUBLE",
+    "float": "FLOAT",
+    "float4": "FLOAT",
+    "real": "FLOAT",
+    "decimal": "DECIMAL",
+    "numeric": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "datetime": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp_ntz": "TIMESTAMP",
+    "timestamptz": "TIMESTAMPTZ",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "timestamp_tz": "TIMESTAMPTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "time without time zone": "TIME",
+    "timetz": "TIMETZ",
+    "time with time zone": "TIMETZ",
+}
+
+_CONNECTOR_TYPE_ALIASES: dict[str, dict[str, str]] = {
+    "bigquery": _BIGQUERY_TYPE_ALIASES,
+    "duckdb": _DUCKDB_TYPE_ALIASES,
+    "postgres": _POSTGRES_TYPE_ALIASES,
+    "redshift": _POSTGRES_TYPE_ALIASES,
+    "snowflake": _SNOWFLAKE_TYPE_ALIASES,
+    "clickhouse": _CLICKHOUSE_TYPE_ALIASES,
+    "databricks": _DATABRICKS_TYPE_ALIASES,
+    "trino": _TRINO_TYPE_ALIASES,
+}
+
+
+def _normalize_base_type(base: str, connector: str | None = None) -> str | None:
+    lowered = base.lower().strip()
+    if connector:
+        mapping = _CONNECTOR_TYPE_ALIASES.get(connector.lower().strip())
+        if mapping and lowered in mapping:
+            return mapping[lowered]
+    return _GENERIC_TYPE_ALIASES.get(lowered)
+
+
+def _split_type_and_params(type_str: str) -> tuple[str, str | None]:
+    """Split a data type into base name and normalized parameters.
+
+    Examples:
+        'VARCHAR(10)' -> ('VARCHAR', '10')
+        'decimal( 10, 2 )' -> ('DECIMAL', '10,2')
+        'TIMESTAMP(6) WITH TIME ZONE' -> ('TIMESTAMP WITH TIME ZONE', '6')
+        'ARRAY<INT64>' -> ('ARRAY<INT64>', None)
+    """
+    clean = type_str.strip()
+    if clean.upper().startswith("ARRAY<") and clean.endswith(">"):
+        return clean, None
+
+    match = re.search(r"\(([^)]*)\)", clean)
+    if not match:
+        return re.sub(r"\s+", " ", clean).strip().upper(), None
+
+    params = re.sub(r"\s+", "", match.group(1))
+    base = clean[: match.start()] + clean[match.end() :]
+    base = re.sub(r"\s+", " ", base).strip().upper()
+    return base, params
+
+
+def types_equal(
+    declared: str | None,
+    actual: str | None,
+    connector: str | None = None,
+) -> bool:
+    """Whether declared and actual data types are equivalent (#1033).
+
+    Normalizes connector-specific aliases across integer, string, float/numeric,
+    boolean, and temporal type families.
+
+    Parameterized types (such as `VARCHAR(10)` against `VARCHAR`) are treated as
+    compatible when one side omits parameters, accommodating engines (such as
+    DuckDB or Snowflake) that do not report length/scale in metadata reflection.
+    When both sides specify parameters, the parameters must match (normalizing
+    whitespace).
+
+    A type Dex cannot normalize falls back to case-insensitive exact string
+    match and is not silently assumed to pass.
+    """
+    if declared is None or actual is None:
+        return True
+
+    dec_clean = declared.strip()
+    act_clean = actual.strip()
+    if dec_clean.lower() == act_clean.lower():
+        return True
+
+    if (
+        dec_clean.upper().startswith("ARRAY<")
+        and dec_clean.endswith(">")
+        and act_clean.upper().startswith("ARRAY<")
+        and act_clean.endswith(">")
+    ):
+        return types_equal(dec_clean[6:-1], act_clean[6:-1], connector=connector)
+
+    base_dec, params_dec = _split_type_and_params(dec_clean)
+    base_act, params_act = _split_type_and_params(act_clean)
+
+    norm_dec = _normalize_base_type(base_dec, connector)
+    norm_act = _normalize_base_type(base_act, connector)
+
+    if norm_dec is None or norm_act is None:
+        return False
+
+    if norm_dec != norm_act:
+        return False
+
+    if params_dec is not None and params_act is not None:
+        return params_dec == params_act
+
+    # One side specified parameters and the other was unparameterized:
+    # Deliberately treated as compatible (e.g. varchar(10) against VARCHAR).
+    return True
+
+
 def column_contract_divergence(
-    declared: dict[str, str | None], actual: dict[str, str | None]
+    declared: dict[str, str | None],
+    actual: dict[str, str | None],
+    connector: str | None = None,
 ) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
     """A declared column contract against what actually exists, in both
     directions, plus type mismatches where both sides state one.
 
     Shared between `transform plan`'s authored-SELECT-list comparison
-    (#214) and `maintain verify`'s built-relation comparison (#230): both
-    reduce to the same set math over a model's declared and actual columns,
-    and only differ in where each side's names and types come from.
+    (#214) and `maintain verify`'s built-relation comparison (#230, #1033):
+    both reduce to the same set math over a model's declared and actual
+    columns, and only differ in where each side's names and types come from.
 
     ``declared``/``actual`` are column name (already lowercased by the
     caller) -> its type, or ``None`` where the caller has no type for that
-    side -- a plan-time SELECT list names no types at all, so #214's caller
+    side: a plan-time SELECT list names no types at all, so #214's caller
     never passes one. Returns ``(missing, extra, mismatched)``: names in
     ``declared`` and not ``actual``, names in ``actual`` and not
     ``declared``, and ``(name, declared_type, actual_type)`` for a name both
-    sides state with a type that disagrees. A name whose type is absent on
-    either side is not a mismatch: absence is not evidence of a difference.
+    sides state with a type that disagrees under the connector's type
+    aliases (#1033). A name whose type is absent on either side is not a
+    mismatch: absence is not evidence of a difference.
     """
 
     missing = sorted(set(declared) - set(actual))
@@ -1375,7 +1756,7 @@ def column_contract_divergence(
         if (
             declared_type
             and actual_type
-            and declared_type.lower() != actual_type.lower()
+            and not types_equal(declared_type, actual_type, connector=connector)
         ):
             mismatched.append((name, declared_type, actual_type))
     return missing, extra, mismatched

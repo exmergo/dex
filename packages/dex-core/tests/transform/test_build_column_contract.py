@@ -315,3 +315,26 @@ def test_the_contract_runs_no_statement(tmp_path: Path, monkeypatch):
     assert reason is None
     assert result.findings == []
     assert result.column_contract["checked"] == ["a"]
+
+
+def test_equivalent_type_spelling_int_matches_duckdb_integer(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    """#1033: declaring `data_type: int` on DuckDB does not trigger a mismatch
+    against the adapter's reported `INTEGER`."""
+    _model(
+        dbt_project_dir,
+        "type_alias_model",
+        "select 1 as id, 'hello' as note\n",
+        "    columns:\n"
+        "      - name: id\n        data_type: int\n"
+        "      - name: note\n        data_type: varchar(10)\n",
+    )
+    built = _build(repo, capsys, "type_alias_model")
+    assert built["status"] == "ok", built
+    verification = built["data"]["verification"]
+    assert verification["column_contract"]["checked"] == ["type_alias_model"]
+    findings = [
+        f for f in verification["findings"] if f["code"] == "column_type_mismatch"
+    ]
+    assert findings == []
