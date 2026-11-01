@@ -5,6 +5,41 @@ The operational database AEs pull from. Namespace: `database.schema.table`
 database). Cost paradigm: **database load**, expressed as database-seconds.
 Read-only against data, enforced in depth.
 
+## Managed Postgres platforms
+
+Use the same `postgres` connector with these platforms' PostgreSQL services:
+
+- [Supabase](https://supabase.com/docs/guides/database/connecting-to-postgres)
+- [Neon](https://neon.com/docs/connect/connect-from-any-app)
+- [PlanetScale Postgres](https://planetscale.com/docs/postgres/connecting)
+- [Amazon RDS for PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html)
+- [Amazon Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraPostgreSQL.html)
+- [Google Cloud SQL for PostgreSQL](https://docs.cloud.google.com/sql/docs/postgres/introduction)
+- [Google AlloyDB for PostgreSQL](https://docs.cloud.google.com/alloydb/docs/overview)
+- [Azure Database for PostgreSQL](https://learn.microsoft.com/en-us/azure/postgresql/overview)
+- [Render Postgres](https://render.com/docs/postgresql-creating-connecting)
+- [Railway PostgreSQL](https://docs.railway.com/databases/postgresql)
+- [Heroku Postgres](https://devcenter.heroku.com/articles/connecting-heroku-postgres)
+- [DigitalOcean Managed PostgreSQL](https://docs.digitalocean.com/products/databases/postgresql/how-to/connect/)
+- [Aiven for PostgreSQL](https://aiven.io/docs/products/postgresql/howto/list-code-samples)
+
+Set `connector: postgres` and supply the service's PostgreSQL connection details
+through [the credential sources below](#authentication-discover-dont-ask), such
+as `DATABASE_URL`. The endpoint must be reachable from the machine running Dex;
+keep the provider's required TLS settings in the connection details. Use a direct
+connection or a session pool that preserves session settings across statements,
+since Dex sets read-only mode and statement timeouts on the connection.
+
+The service names above refer to their PostgreSQL offerings. PlanetScale's
+Vitess offering, for example, uses MySQL. A PostgreSQL-compatible protocol alone
+does not establish compatibility with the catalogs, statistics, and session
+settings Dex uses. The [integration suite](#testing) exercises PostgreSQL; the
+list above describes hosted services using that connection path.
+
+Hosted services can charge for compute, storage, and other resources. Dex's
+database-seconds budget controls query load; it does not estimate the provider's
+hosting bill.
+
 ## Authentication: discover, don't ask
 
 The engine discovers a connection at runtime and never prompts for or
