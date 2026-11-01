@@ -20,6 +20,8 @@ by re-reading it: it must parse to the original with exactly those entries gone.
   as often a rename to follow (repoint ``sql_table``) as a cube to retire;
 - a view source whose join path walks a removed join: dropping a whole source
   changes what the view is, which is a decision rather than a repair;
+- a view left with no sources: removing a whole view is not something reconcile
+  authors, as with a whole cube;
 - a file that already holds a key Cube does not declare: authoring refuses any
   edit to such a file (Cube's own validator would), so the proposal names it;
 - a ``sql`` cube whose query selects the dropped column itself, which no member
@@ -179,7 +181,11 @@ def _held_back(removal: Mapping[str, Any]) -> bool:
     """Whether this removal is one dex proposes but does not write: nothing in
     it is dex's to cut on its own."""
 
-    if removal.get("broken_sources") or removal.get("sql_reads_dropped"):
+    if (
+        removal.get("broken_sources")
+        or removal.get("sql_reads_dropped")
+        or removal.get("empties_view")
+    ):
         return True
     return describe(removal) == "nothing"
 
@@ -193,6 +199,12 @@ def _advisory(finding: DriftFinding, path: str) -> Proposal:
             "sql_table at wherever the table went, or remove the cube and what "
             "reads it with `semantic cube update`; dex does neither, because a "
             "vanished table is as often a rename as a retirement"
+        )
+    elif removal.get("empties_view"):
+        action = (
+            f"view '{name}' ({path}) would be left with no sources. "
+            "Add another source, or remove the view with `semantic cube update`; "
+            "dex does not drop a whole view on its own"
         )
     elif removal.get("broken_sources"):
         action = (
@@ -227,6 +239,10 @@ def describe(removal: Mapping[str, Any]) -> str:
             ("measure(s)", removal.get("measures") or []),
             ("segment(s)", removal.get("segments") or []),
             ("join(s) to", removal.get("joins") or []),
+            (
+                "source(s)",
+                [s["join_path"] for s in removal.get("removed_sources") or []],
+            ),
             (
                 "include(s)",
                 [n for i in removal.get("includes") or [] for n in i["names"]],
@@ -360,6 +376,23 @@ def _view_changes(
             return name in names
 
         planned = _cut(text, source_node, source, key, selected)
+        if planned is None:
+            return None
+        changes.extend(planned)
+    removed = removal.get("removed_sources") or []
+    if removed:
+
+        def source_selected(item: Any) -> bool:
+            if not isinstance(item, dict):
+                return False
+            for target in removed:
+                if str(item.get("join_path")) == target["join_path"] and item.get(
+                    "alias"
+                ) == target.get("alias"):
+                    return True
+            return False
+
+        planned = _cut(text, node, entry, "cubes", source_selected)
         if planned is None:
             return None
         changes.extend(planned)
