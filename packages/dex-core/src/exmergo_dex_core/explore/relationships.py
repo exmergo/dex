@@ -1351,6 +1351,208 @@ def _quote_part(name: str) -> str:
     return f'"{escaped}"'
 
 
+# --- issue #857: join coverage, rows and distinct keys -------------------------
+#
+# The overlap probe above answers one question with two numbers: how many of a
+# child's non-null keys have no parent. That is enough to rank an inferred join,
+# and it is what `explore relationships --verify` and drift keep using. A model's
+# own join needs more to be judged: whether anything was eligible at all (an
+# empty or all-NULL input has no coverage, which is not the same as full
+# coverage), how many rows the NULL keys took out, and whether a low match rate
+# is a few distinct keys repeated over many rows or the other way round. So the
+# coverage probe is a sibling rather than a change to the shared one, and it is
+# batched the same way, through `probe_batches`, so a child is read once per
+# statement for its row counts.
+
+
+class JoinCoverageCounts(NamedTuple):
+    """One join's coverage, as aggregate counts and nothing else.
+
+    Rows and distinct keys are counted separately because they answer different
+    questions: rows say how much of the model a join reaches, keys say how many
+    entities. ``eligible_*`` excludes rows whose key has a NULL component; the
+    caller decides whether its contract counts those as unmatched instead.
+    """
+
+    rows: int
+    null_key_rows: int
+    eligible_rows: int
+    matched_rows: int
+    eligible_keys: int
+    matched_keys: int
+
+
+def coverage_probe_sql(
+    batch: list[Relationship], *, key_cast: str | None = None
+) -> str:
+    """One aggregate statement measuring every edge of ``batch``'s coverage.
+
+    Per child, one read for the row counts, with a LEFT JOIN per edge against
+    that edge's DISTINCT parent keys (a hit flag rather than a parent column, so
+    a NULL key on the parent side cannot read as a miss, and a connector that
+    fills unmatched columns with a default rather than NULL still counts a miss:
+    every test is ``= 1``). Each edge then has its own distinct-key subquery:
+    ``SELECT DISTINCT`` over the key tuple and its hit flag, counted. A key's hit
+    flag depends only on the key, so the distinct set holds each key once and
+    ``COUNT(*)`` is the distinct eligible keys whatever the arity, which is what
+    keeps a composite key portable where ``COUNT(DISTINCT (a, b))`` is not.
+
+    Every subquery is an ungrouped aggregate over exactly one row, so they are
+    cross-joined into one row. No value is projected anywhere.
+    """
+
+    def _cast_key(expr: str) -> str:
+        return expr if key_cast is None else f"CAST({expr} AS {key_cast})"
+
+    by_child: dict[str, list[tuple[int, Relationship]]] = {}
+    for index, rel in enumerate(batch):
+        by_child.setdefault(rel.from_dataset, []).append((index, rel))
+
+    aggregates: list[str] = []
+    for child, edges in by_child.items():
+        child_sql = _quote_identifier(child)
+        counts: list[str] = []
+        joins: list[str] = []
+        for index, rel in edges:
+            fks = [_quote_part(column) for column in rel.from_columns]
+            keys = [_quote_part(column) for column in rel.to_columns]
+            parent = _quote_identifier(rel.to_dataset)
+            nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
+            parent_keys = ", ".join(
+                f"{_cast_key(key)} AS pk{pair}" for pair, key in enumerate(keys)
+            )
+            predicate = " AND ".join(
+                f"d{index}.pk{pair} = {_cast_key(f'c.{fk}')}"
+                for pair, fk in enumerate(fks)
+            )
+            distinct_parent = (
+                f"(SELECT DISTINCT {parent_keys}, 1 AS dex_hit FROM {parent})"  # noqa: S608
+            )
+            counts.append(
+                f"COUNT(*) AS dex_cov_rows_{index}, "
+                f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS dex_cov_eligible_{index}, "
+                f"COUNT(CASE WHEN {nonnull} AND d{index}.dex_hit = 1 THEN 1 END) "
+                f"AS dex_cov_matched_{index}"
+            )
+            joins.append(f"LEFT JOIN {distinct_parent} d{index} ON {predicate}")
+            key_columns = ", ".join(f"c.{fk} AS k{pair}" for pair, fk in enumerate(fks))
+            aggregates.append(
+                f"SELECT COUNT(*) AS dex_cov_keys_{index}, "  # noqa: S608
+                "COUNT(CASE WHEN h.dex_hit = 1 THEN 1 END) "
+                f"AS dex_cov_matched_keys_{index} "
+                f"FROM (SELECT DISTINCT {key_columns}, d{index}.dex_hit AS dex_hit "
+                f"FROM {child_sql} c LEFT JOIN {distinct_parent} d{index} "
+                f"ON {predicate} WHERE {nonnull}) h"
+            )
+        aggregates.append(
+            f"SELECT {', '.join(counts)} "  # noqa: S608
+            f"FROM {child_sql} c {' '.join(joins)}"
+        )
+
+    joined = " CROSS JOIN ".join(f"({sql}) a{i}" for i, sql in enumerate(aggregates))
+    return f"SELECT * FROM {joined}"  # noqa: S608
+
+
+def coverage_statements(relationships: list[Relationship], dialect: str) -> list[str]:
+    """The exact statements :func:`measure_coverage` runs, for pricing first."""
+
+    return [
+        _transpile_probe(coverage_probe_sql(batch), dialect)
+        for batch in probe_batches(probe_candidates(relationships))
+    ]
+
+
+def _run_coverage_batch(
+    adapter: Adapter,
+    batch: list[Relationship],
+    *,
+    timeout_seconds: float,
+    key_cast: str | None = None,
+) -> list[tuple[Relationship, JoinCoverageCounts]]:
+    sql = _transpile_probe(
+        coverage_probe_sql(batch, key_cast=key_cast), adapter.dialect
+    )
+    result = adapter.run_query(
+        sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
+    )
+    values = {
+        str(column).lower(): value
+        for column, value in zip(result.columns, result.cells[0], strict=True)
+    }
+
+    def read(name: str) -> int:
+        return int(values.get(name) or 0)
+
+    measured = []
+    for index, rel in enumerate(batch):
+        rows = read(f"dex_cov_rows_{index}")
+        eligible = read(f"dex_cov_eligible_{index}")
+        measured.append(
+            (
+                rel,
+                JoinCoverageCounts(
+                    rows=rows,
+                    null_key_rows=rows - eligible,
+                    eligible_rows=eligible,
+                    matched_rows=read(f"dex_cov_matched_{index}"),
+                    eligible_keys=read(f"dex_cov_keys_{index}"),
+                    matched_keys=read(f"dex_cov_matched_keys_{index}"),
+                ),
+            )
+        )
+    return measured
+
+
+def measure_coverage(
+    adapter: Adapter,
+    relationships: list[Relationship],
+    *,
+    timeout_seconds: float = 30.0,
+) -> tuple[
+    list[tuple[Relationship, JoinCoverageCounts]], list[tuple[Relationship, str]]
+]:
+    """Measure every relationship's coverage; return ``(measured, refused)``.
+
+    Refusals follow :func:`verify_relationships`: a refused batch is retried
+    edge by edge, a ClickHouse no-supertype refusal once more with both keys
+    cast, and an edge that still refuses is returned with its reason rather
+    than raised. Budget, timeout and connection failures still raise.
+    """
+
+    measured: list[tuple[Relationship, JoinCoverageCounts]] = []
+    refused: list[tuple[Relationship, str]] = []
+    for batch in probe_batches(probe_candidates(relationships)):
+        try:
+            measured.extend(
+                _run_coverage_batch(adapter, batch, timeout_seconds=timeout_seconds)
+            )
+            continue
+        except WarehouseQueryError:
+            pass
+        for rel in batch:
+            try:
+                measured.extend(
+                    _run_coverage_batch(adapter, [rel], timeout_seconds=timeout_seconds)
+                )
+                continue
+            except WarehouseQueryError as exc:
+                if not _is_clickhouse_supertype_refusal(adapter, exc):
+                    refused.append((rel, _refusal_text(rel, exc)))
+                    continue
+            try:
+                measured.extend(
+                    _run_coverage_batch(
+                        adapter,
+                        [rel],
+                        timeout_seconds=timeout_seconds,
+                        key_cast=_CLICKHOUSE_INT128,
+                    )
+                )
+            except WarehouseQueryError as cast_exc:
+                refused.append((rel, _refusal_text(rel, cast_exc)))
+    return measured, refused
+
+
 # --- issue #220: propose joins from measured value overlap -------------------
 #
 # Name-based inference above exhausts every naming convention it knows before

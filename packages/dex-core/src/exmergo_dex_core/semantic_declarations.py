@@ -30,7 +30,7 @@ from collections.abc import Iterable, Mapping
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from .errors import DexError
 from .project_definitions import (
@@ -89,9 +89,43 @@ class PopulationFilter(_Strict):
     excludes: list[str | int | float | bool] | None = None
 
 
+class PopulationParent(_Strict):
+    """The entity a model's rows are drawn from (#857): one output row per
+    parent key, so a parent key absent from the output is a missing entity and
+    an output key absent from the parent is an unexpected one.
+
+    ``key`` maps each output column to the parent column it carries, in the
+    order the composite key is written. A parent the model only joins to is a
+    column's ``references``, not this.
+    """
+
+    model: str
+    key: dict[str, str]
+
+    @field_validator("model")
+    @classmethod
+    def _model_named(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name the parent model, seed or snapshot")
+        return value.strip()
+
+    @field_validator("key")
+    @classmethod
+    def _key_pairs(cls, value: dict[str, str]) -> dict[str, str]:
+        if not value:
+            raise ValueError(
+                "map at least one output column to the parent column it carries, "
+                "as {<output column>: <parent column>}"
+            )
+        if any(not k.strip() or not v.strip() for k, v in value.items()):
+            raise ValueError("a key column name is empty")
+        return {k.strip(): v.strip() for k, v in value.items()}
+
+
 class Population(_Strict):
     rule: str | None = None
     filters: list[PopulationFilter] = []
+    parent: PopulationParent | None = None
 
 
 class ColumnDeclaration(_Strict):
@@ -413,10 +447,12 @@ def _read_native_population(raw: Any, where: str, notes: list[str]) -> Any:
     population = read_population(raw)
     stated = raw.get("filters") if isinstance(raw, dict) else None
     read = len(population.filters) if population is not None else 0
+    stated_parent = raw.get("parent") if isinstance(raw, dict) else None
     malformed = (
         population is None
         or (isinstance(stated, list) and read < len(stated))
         or (bool(stated) and not isinstance(stated, list))
+        or (stated_parent is not None and population.parent is None)
     )
     if malformed:
         notes.append(

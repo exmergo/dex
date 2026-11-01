@@ -4298,7 +4298,11 @@ def _price_build(
             # asked about again once the build has already spent.
             from .artifact_runtime import pinned_artifacts
             from .build import compiled_model_ids
-            from .verify import price_declared_facts, price_verification
+            from .verify import (
+                price_declared_facts,
+                price_join_contract,
+                price_verification,
+            )
 
             scope = compiled_model_ids(Path(project), artifact_directory)
             # Priced off the manifest this compile just wrote, not whichever
@@ -4315,6 +4319,9 @@ def _price_build(
                 facts, facts_notes = price_declared_facts(
                     adapter, Path(project), scope=scope
                 )
+                joins, join_notes = price_join_contract(
+                    adapter, Path(project), scope=scope
+                )
             notes = [*notes, *scan_notes]
             if scan:
                 estimate += scan
@@ -4323,6 +4330,10 @@ def _price_build(
             if facts:
                 estimate += facts
                 per_node = {**per_node, "(declared facts)": facts}
+            notes = [*notes, *join_notes]
+            if joins:
+                estimate += joins
+                per_node = {**per_node, "(join overlap probes)": joins}
         upper_bounds: dict[str, str] = {}
         # Under a full refresh the rebuilt nodes compile without their batch
         # filter, so only a model whose `full_refresh: false` keeps it is named.

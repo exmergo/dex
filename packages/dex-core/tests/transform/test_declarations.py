@@ -780,3 +780,116 @@ def test_a_command_that_takes_no_declarations_refuses_a_payload_carrying_them(
 
     assert envelope["status"] == "error"
     assert "does not take declarations" in envelope["errors"][0]
+
+
+# --- population.parent (#857) ------------------------------------------------------
+
+PARENT = {"model": "dim_customers", "key": {"customer_id": "customer_id"}}
+
+
+@pytest.mark.parametrize(
+    ("parent", "expected"),
+    [
+        ({"model": "dim_customers"}, "population.parent.key is required"),
+        ({"model": "dim_customers", "key": {}}, "map at least one output column"),
+        ({"model": " ", "key": {"a": "b"}}, "name the parent model"),
+        ({"model": "dim_customers", "key": {"a": "b"}, "kind": "x"}, "kind"),
+    ],
+)
+def test_a_malformed_population_parent_is_refused_naming_the_field(parent, expected):
+    with pytest.raises(DeclarationError, match="declarations\\[0\\]") as caught:
+        parse_declarations([{"model": "m", "population": {"parent": parent}}])
+
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("parent", "expected"),
+    [
+        (
+            {"model": "dim_people", "key": {"customer_id": "customer_id"}},
+            "no model, seed or snapshot named 'dim_people'",
+        ),
+        (
+            {"model": "dim_customers", "key": {"customer_id": "cust_key"}},
+            "does not produce a column 'cust_key'",
+        ),
+        (
+            {"model": "dim_customers", "key": {"cust": "customer_id"}},
+            "population.parent key column(s) cust",
+        ),
+        (
+            {"model": "fct_orders", "key": {"order_id": "order_id"}},
+            "declares itself as its population.parent",
+        ),
+    ],
+)
+def test_a_population_parent_the_project_cannot_satisfy_is_refused(parent, expected):
+    parsed = parse_declarations(
+        [{"model": "fct_orders", "population": {"parent": parent}}]
+    )
+
+    with pytest.raises(DeclarationError) as caught:
+        apply_declarations(parsed, _view(_project()), [])
+
+    assert expected in str(caught.value)
+    assert "population.parent" in str(caught.value)
+
+
+def test_a_population_parent_renders_into_meta_and_warns_off_the_grain():
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "population": {"parent": PARENT},
+            }
+        ]
+    )
+
+    edits, warnings = apply_declarations(parsed, _view(_project()), [])
+
+    entry = _entry(edits[0].new_content)
+    assert entry["config"]["meta"]["dex"]["population"] == {"parent": PARENT}
+    assert any("keyed on customer_id but its grain is order_id" in w for w in warnings)
+
+
+def test_adding_a_parent_keeps_the_population_rule_and_filters_already_declared():
+    [first] = parse_declarations([FULL])
+    [second] = parse_declarations(
+        [{"model": "fct_orders", "population": {"parent": PARENT}}]
+    )
+
+    population = _entry(render(render(HAND_WRITTEN, first), second))["config"]["meta"][
+        "dex"
+    ]["population"]
+
+    assert population["rule"] == FULL["population"]["rule"]
+    assert population["filters"] == FULL["population"]["filters"]
+    assert population["parent"] == PARENT
+
+    # And the other way round: restating the filters keeps the parent.
+    [third] = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "population": {"filters": [{"column": "status", "excludes": ["x"]}]},
+            }
+        ]
+    )
+    again = _entry(render(render(HAND_WRITTEN, second), third))["config"]["meta"][
+        "dex"
+    ]["population"]
+    assert again["parent"] == PARENT
+    assert again["filters"] == [{"column": "status", "excludes": ["x"]}]
+
+
+def test_a_population_with_only_a_parent_reads_back():
+    from exmergo_dex_core.project_definitions import read_population
+
+    population = read_population({"parent": PARENT})
+
+    assert population is not None
+    assert population.parent is not None
+    assert population.parent.key == {"customer_id": "customer_id"}
+    assert read_population({"parent": {"model": "x", "key": {"a": 1}}}) is None

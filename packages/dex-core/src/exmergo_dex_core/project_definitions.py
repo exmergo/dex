@@ -143,11 +143,40 @@ class DeclaredPopulationFilter(BaseModel):
     excludes: list[str | int | float | bool] | None = None
 
 
+class DeclaredPopulationParent(BaseModel):
+    """The entity a model's rows are drawn from (#857): its parent and the
+    output-column-to-parent-column key that identifies one row per parent."""
+
+    model: str
+    key: dict[str, str]
+
+
 class DeclaredPopulation(BaseModel):
-    """Which rows a model keeps: a sentence, structured filters, or both."""
+    """Which rows a model keeps: a sentence, structured filters, the parent its
+    rows are drawn from, or any of them together."""
 
     rule: str | None = None
     filters: list[DeclaredPopulationFilter] = Field(default_factory=list)
+    parent: DeclaredPopulationParent | None = None
+
+
+def read_population_parent(raw: Any) -> DeclaredPopulationParent | None:
+    """A declared ``population.parent`` from repository text, or None when it is
+    absent or not shaped as ``{model: <name>, key: {<output>: <parent>}}``."""
+
+    if not isinstance(raw, dict):
+        return None
+    model, key = raw.get("model"), raw.get("key")
+    if not (isinstance(model, str) and model.strip() and isinstance(key, dict)):
+        return None
+    pairs = {
+        k.strip(): v.strip()
+        for k, v in key.items()
+        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+    }
+    if not pairs or len(pairs) != len(key):
+        return None
+    return DeclaredPopulationParent(model=model.strip(), key=pairs)
 
 
 def read_population(raw: Any) -> DeclaredPopulation | None:
@@ -174,10 +203,11 @@ def read_population(raw: Any) -> DeclaredPopulation | None:
                     column=entry["column"], includes=includes, excludes=excludes
                 )
             )
-    if not (rule and rule.strip()) and not filters:
+    parent = read_population_parent(raw.get("parent"))
+    if not (rule and rule.strip()) and not filters and parent is None:
         return None
     return DeclaredPopulation(
-        rule=rule if rule and rule.strip() else None, filters=filters
+        rule=rule if rule and rule.strip() else None, filters=filters, parent=parent
     )
 
 

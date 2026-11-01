@@ -75,17 +75,27 @@ class BuildVerification:
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     offer: ConfirmationRequest | None = None
+    #: One record per join the built models write (#857); ``None`` when the
+    #: join contract did not run at all (its reason is in ``suppressed``).
+    join_coverage: list[dict] | None = None
+    #: One record per declared ``population.parent`` among the built models.
+    parent_population: list[dict] = field(default_factory=list)
 
     def payload(self) -> dict[str, Any]:
         if not self.ran:
             return {"ran": False, "reason": self.reason}
-        return {
+        payload: dict[str, Any] = {
             "ran": True,
             "scope": self.scope,
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.join_coverage is not None:
+            payload["join_coverage"] = self.join_coverage
+        if self.parent_population:
+            payload["parent_population"] = self.parent_population
+        return payload
 
 
 def built_models(summary: dict[str, Any]) -> dict[str, str]:
@@ -214,9 +224,19 @@ def verify_build(
         "dbt's run results are authoritative for the nodes this build ran"
     )
 
+    # A build dbt reports as failed because a *test* failed still built every
+    # model it selected, and those relations are this run's: a declaration's
+    # `not_null` or `relationships` test failing is exactly when the row checks
+    # matter most (#857). Only the models that themselves built are judged.
+    summary, scope = _judgeable(summary, built, result)
+
     reason = _row_population(engine, project_dir, summary, scope, adapter_once, result)
     if reason is not None:
         result.suppressed["row_population"] = reason
+
+    reason = _join_contract(engine, project_dir, summary, scope, adapter_once, result)
+    if reason is not None:
+        result.suppressed["join_contract"] = reason
 
     proven = _declared_facts(engine, project_dir, summary, scope, adapter_once, result)
     # A grain this build proved, by its own passing uniqueness test or by the
@@ -235,6 +255,42 @@ def verify_build(
             "model, so fix the ranked ones and re-run"
         )
     return result
+
+
+def _judgeable(
+    summary: dict[str, Any], built: dict[str, str], result: BuildVerification
+) -> tuple[dict[str, Any], set[str]]:
+    """The summary and scope the row-level checks judge.
+
+    dbt's ``success`` is false when any node failed, a test included. A model
+    that dbt reports as built in this run has this run's relation whatever a
+    test said about it, and none of its parents was skipped (dbt would have
+    skipped it too), so it is judged. A model that failed or was skipped is
+    not, and is named; when no model built at all, the build is reported as not
+    complete, as before.
+    """
+
+    if summary.get("success"):
+        return summary, set(built)
+    status = {
+        str(node.get("unique_id") or ""): str(node.get("status") or "").lower()
+        for node in summary.get("nodes") or []
+    }
+    good = {uid for uid in built if status.get(uid) == "success"}
+    if not good:
+        return summary, set(built)
+    left_out = sorted(label for uid, label in built.items() if uid not in good)
+    if left_out:
+        result.warnings.append(
+            "the row-level checks judge only the models this build built: "
+            + ", ".join(left_out)
+            + " failed or were skipped and were not judged"
+        )
+    result.notes.append(
+        "dbt reported the build as failed, but every judged model built in this "
+        "run; the failures are tests or other nodes, reported under build status"
+    )
+    return {**summary, "success": True}, good
 
 
 def _row_population(
@@ -339,6 +395,147 @@ def _row_population(
     result.warnings.extend(measured.notes + finding_notes)
     result.offer = measured.offer
     return None
+
+
+def _join_contract(
+    engine: DexEngine,
+    project_dir: Path,
+    summary: dict[str, Any],
+    scope: set[str],
+    resolve_adapter: Callable[[], Adapter],
+    result: BuildVerification,
+) -> str | None:
+    """Coverage of every equality join the built models write (#228, #857).
+
+    The same detector `maintain verify` runs, scoped to this build and gated as
+    a phase of it: the probes and NULL counts were priced with the build (see
+    :func:`price_join_contract`), so a caller who confirmed that estimate is not
+    asked again. Returns the suppression reason, or ``None`` when it ran.
+    """
+
+    from ..errors import DexError
+    from ..guards.cost_guard import CostGuardError
+    from ..maintain import commands as maintain_commands
+    from ..maintain import verify as verify_mod
+
+    if not summary.get("success"):
+        return (
+            "the build did not complete, so its relations are a mix of this "
+            "run's output and the last one's; join coverage over that says nothing"
+        )
+    if not scope:
+        return "this build ran no models"
+    try:
+        adapter = resolve_adapter()
+    except CostGuardError:
+        raise
+    except DexError as exc:
+        return f"warehouse unreachable: {exc}"
+
+    plan = verify_mod.plan_join_contract(project_dir, adapter.dialect, scope=scope)
+    if not plan.candidates and not plan.skips:
+        result.join_coverage = []
+        result.warnings.extend(plan.notes)
+        return (
+            plan.notes[0]
+            if plan.notes
+            else "no model this build ran writes an equality join"
+        )
+    try:
+        live = adapter.list_objects()
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        from ..envelope import redact
+
+        return redact(
+            "the relations this build wrote could not be listed "
+            f"({type(exc).__name__}: {exc})"
+        )
+    try:
+        joined = verify_mod.join_coverage(
+            adapter,
+            plan,
+            {},
+            [meta.identifier for meta in live],
+            timeout_seconds=engine.config.query.timeout_seconds,
+            handshake=_join_handshake(adapter),
+            baseline=maintain_commands.null_baseline(engine),
+        )
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        from ..envelope import redact
+
+        return redact(
+            f"the join coverage could not be measured ({type(exc).__name__}: {exc})"
+        )
+    result.findings.extend(joined.findings)
+    result.warnings.extend(joined.notes)
+    result.join_coverage = joined.records
+    if joined.offer is not None and result.offer is None:
+        result.offer = joined.offer
+    return None
+
+
+def price_join_contract(
+    adapter: Adapter, project_dir: Path, *, scope: set[str]
+) -> tuple[float, list[str]]:
+    """What this build's join coverage probes and NULL counts would cost, priced
+    before it runs and folded into the build's estimate the way
+    :func:`price_verification` folds the row counts. Best-effort for the same
+    reason: on a first build the relations are not there to dry-run against."""
+
+    from ..maintain import verify as verify_mod
+
+    if getattr(adapter, "query_estimate", None) is None:
+        return 0.0, []
+    try:
+        estimate, _count = verify_mod.join_contract_cost(
+            project_dir, adapter, {}, None, scope=scope
+        )
+        return estimate, []
+    except Exception as exc:
+        from ..envelope import redact
+
+        return 0.0, [
+            redact(
+                "could not price this build's join coverage upfront "
+                f"({type(exc).__name__}: {exc}); it is priced again after the "
+                "build and offered if it does not fit the confirmed budget"
+            )
+        ]
+
+
+def _join_handshake(adapter: Adapter):
+    """The join coverage statements as a phase of the build, gated exactly as
+    :func:`_count_handshake` gates the row counts."""
+
+    from .. import command_args
+
+    def ask(estimate: float, statement_count: int):
+        return command_args.phase_handshake(
+            "transform build",
+            adapter,
+            estimate,
+            phase="join_contract",
+            per_table_key="(join overlap probes)",
+            extra={"statement_count": statement_count},
+            skip=statement_count == 0,
+            notes=[
+                "the build is complete and its spend is settled; this estimate "
+                "buys only the coverage checks of the joins its models write"
+            ],
+            hint=lambda cost, unit, budget: (
+                f"{statement_count} aggregate statement(s) measure the coverage of "
+                f"this build's joins, estimated at {cost:.0f} {unit} beyond what "
+                "remains of the confirmed budget. The build itself is done and "
+                f"billed; re-run with --verify --confirm --budget {budget} to build "
+                "and judge in one pass"
+            ),
+        )
+
+    return ask
 
 
 def _declared_facts(
@@ -448,6 +645,7 @@ def _declared_facts(
 
     result.findings.extend(facts.findings)
     result.warnings.extend(facts.notes)
+    result.parent_population = facts.parent_coverage
     for finding_class, reason in facts.suppressed.items():
         result.suppressed[finding_class] = reason
     if grain_models and facts.offer is not None:

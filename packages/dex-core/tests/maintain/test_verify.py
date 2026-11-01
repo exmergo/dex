@@ -1424,6 +1424,7 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "unit",
         "additivity",
         "population",
+        "parent_population",
     }
 
 
@@ -2382,7 +2383,7 @@ def test_a_range_join_is_skipped_and_stated():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "no conjunctive column-to-column equality" in skipped[0]
+    assert "no conjunctive column-to-column equality" in str(skipped[0])
 
 
 def test_a_join_that_filters_beside_its_keys_says_so_rather_than_no_key():
@@ -2401,8 +2402,8 @@ def test_a_join_that_filters_beside_its_keys_says_so_rather_than_no_key():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "filters as well as pairing keys" in skipped[0]
-    assert "no conjunctive" not in skipped[0]
+    assert "filters as well as pairing keys" in str(skipped[0])
+    assert "no conjunctive" not in str(skipped[0])
 
 
 def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
@@ -2420,7 +2421,7 @@ def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "no conjunctive column-to-column equality" in skipped[0]
+    assert "no conjunctive column-to-column equality" in str(skipped[0])
 
 
 def test_a_cte_renamed_column_resolves_to_the_physical_one():
@@ -2452,7 +2453,7 @@ def test_a_cte_computed_column_is_unresolvable_and_skipped():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert "could not be resolved" in str(skipped[0])
 
 
 def test_a_select_star_cte_passes_the_column_through_unchanged():
@@ -2526,7 +2527,7 @@ def test_a_chained_using_join_with_two_relations_in_scope_is_skipped():
     assert len(candidates) == 1
     assert candidates[0].to_relation == "wh.main.customers"
     assert len(skipped) == 1
-    assert "more than one relation already in scope" in skipped[0]
+    assert "more than one relation already in scope" in str(skipped[0])
 
 
 def test_a_cte_column_projected_from_a_joined_relation_resolves_correctly():
@@ -2568,7 +2569,7 @@ def test_one_unresolvable_composite_component_skips_the_whole_join():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert "could not be resolved" in str(skipped[0])
 
 
 def test_a_join_inside_an_inline_subquery_is_still_visited():
@@ -2678,7 +2679,7 @@ def test_a_column_read_through_a_union_cte_is_unresolvable():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert skipped[0].code == "set_operation_cte"
 
 
 def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
@@ -2697,7 +2698,7 @@ def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert skipped[0].code == "filtered_cte"
 
 
 def test_a_cross_join_is_silently_excluded():
@@ -2860,21 +2861,37 @@ class _FreeAdapter:
     dialect = "duckdb"
 
 
-def _fake_verify_relationships(fractions_by_from_column: dict[str, float]):
-    """A stand-in for `explore.relationships.verify_relationships` that sets
-    ``verified``/``orphan_fraction`` from a lookup keyed by the driving
-    column, instead of running the real probe SQL: #228's own logic (the
-    threshold grading, the finding shape, the handshake wiring) is what
-    these tests check, not the probe `explore relationships --verify`
-    already owns and already tests."""
+def _fake_measure_coverage(fractions_by_from_column: dict[str, float]):
+    """A stand-in for `explore.relationships.measure_coverage` that reports
+    100 eligible rows over 10 distinct keys per join, unmatched in the given
+    fraction, keyed by the driving column, instead of running the real probe
+    SQL: the grading, the finding shape and the handshake wiring are what
+    these tests check; the probe has tests of its own."""
 
-    def verify(adapter, relationships, *, timeout_seconds=30.0, progress=None):
+    from exmergo_dex_core.explore.relationships import JoinCoverageCounts
+
+    def measure(adapter, relationships, *, timeout_seconds=30.0):
+        measured = []
         for rel in relationships:
             fraction = fractions_by_from_column.get(rel.from_columns[0])
-            rel.verified = fraction is not None
-            rel.orphan_fraction = fraction
+            if fraction is None:
+                continue
+            measured.append(
+                (
+                    rel,
+                    JoinCoverageCounts(
+                        rows=100,
+                        null_key_rows=0,
+                        eligible_rows=100,
+                        matched_rows=round(100 * (1 - fraction)),
+                        eligible_keys=10,
+                        matched_keys=round(10 * (1 - fraction)),
+                    ),
+                )
+            )
+        return measured, []
 
-    return verify
+    return measure
 
 
 def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
@@ -2882,8 +2899,8 @@ def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.95}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.95}),
     )
     candidates = {
         "fct_orders": [
@@ -2915,8 +2932,8 @@ def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.3}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.3}),
     )
     candidates = {
         "fct_orders": [
@@ -2925,7 +2942,7 @@ def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
                 from_columns=("customer_id",),
                 to_relation="b",
                 to_columns=("id",),
-                side="left",
+                side="inner",
             )
         ]
     }
@@ -2942,8 +2959,8 @@ def test_a_healthy_join_reports_nothing(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.01}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.01}),
     )
     candidates = {
         "fct_orders": [
@@ -2989,8 +3006,8 @@ def test_the_handshake_defers_when_supplied(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.95}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.95}),
     )
     candidates = {
         "fct_orders": [
@@ -3158,7 +3175,7 @@ def _join_node(name: str, sql: str) -> dict:
     }
 
 
-def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
+def test_verify_reports_disjoint_keys_as_join_no_match_end_to_end(
     maintain_repo, _assume_the_project_compiles
 ):
     """#228's first acceptance bullet: a model joining two relations with
@@ -3181,9 +3198,13 @@ def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
     rc, payload = maintain_repo.dex("maintain", "verify")
     assert rc == 0 and payload["status"] == "ok", payload
     findings = payload["data"]["findings"]
-    assert findings[0]["code"] == "join_zero_overlap"
+    assert findings[0]["code"] == "join_no_match"
     assert findings[0]["severity"] == "high"
     assert findings[0]["data"]["orphan_fraction"] == 1.0
+    assert findings[0]["data"]["matched_rows"] == 0
+    (record,) = payload["data"]["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["coverage"] == {"rows": 0.0, "keys": 0.0}
 
 
 def test_verify_reports_nothing_for_a_healthy_join_end_to_end(
@@ -3239,13 +3260,45 @@ def test_verify_reports_sparse_orphans_as_join_orphans_not_broken_end_to_end(
     )
     rc, payload = maintain_repo.dex("maintain", "verify")
     assert rc == 0 and payload["status"] == "ok", payload
+    # A LEFT join keeps its unmatched rows, and nothing in the declaration
+    # says they must match: evidence on the record, not a finding (#857).
+    assert not any(
+        f["code"].startswith("join_") for f in payload["data"]["findings"]
+    ), payload["data"]["findings"]
+    (record,) = payload["data"]["join_coverage"]
+    assert record["status"] == "satisfied"
+    assert record["optional_unmatched"] is True
+    assert 0.1 < record["coverage"]["rows"] < 0.8
+
+
+def test_verify_reports_sparse_orphans_on_an_inner_join_as_join_orphans(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The same sparse right side behind an inner join drops the unmatched
+    rows, which is reported at its measured fraction against the stated
+    default threshold, and not characterized as broken."""
+
+    maintain_repo.sql("DELETE FROM customers WHERE id <= 10")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id, c.name from "warehouse"."main"."stg_orders" o '
+                'inner join "warehouse"."main"."customers" c '
+                "on o.customer_id = c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
     findings = [f for f in payload["data"]["findings"] if f["code"] == "join_orphans"]
     assert len(findings) == 1
     assert findings[0]["severity"] == "medium"
     assert 0.2 <= findings[0]["data"]["orphan_fraction"] < 0.9
-    assert not any(
-        f["code"] == "join_zero_overlap" for f in payload["data"]["findings"]
-    )
+    assert findings[0]["data"]["threshold_source"] == "default"
+    assert findings[0]["data"]["threshold"] == 0.2
 
 
 def test_verify_states_a_skipped_non_equality_join_end_to_end(
