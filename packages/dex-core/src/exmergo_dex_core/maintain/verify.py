@@ -563,8 +563,14 @@ def column_contract_check(
             continue
         check.checked.append(model)
         actual_lower = {column.name.lower(): column.data_type for column in columns}
+        try:
+            connector = getattr(adapter, "name", None) or getattr(
+                adapter, "dialect", None
+            )
+        except Exception:
+            connector = None
         missing, extra, mismatched = column_contract_divergence(
-            declared_lower, actual_lower
+            declared_lower, actual_lower, connector=connector
         )
 
         if missing:

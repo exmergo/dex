@@ -315,3 +315,76 @@ def test_the_contract_runs_no_statement(tmp_path: Path, monkeypatch):
     assert reason is None
     assert result.findings == []
     assert result.column_contract["checked"] == ["a"]
+
+
+def test_equivalent_type_spelling_int_matches_duckdb_integer(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    """#1033: declaring `data_type: int` on DuckDB does not trigger a mismatch
+    against the adapter's reported `INTEGER`."""
+    _model(
+        dbt_project_dir,
+        "type_alias_model",
+        "select 1 as id, 'hello' as note\n",
+        "    columns:\n"
+        "      - name: id\n        data_type: int\n"
+        "      - name: note\n        data_type: varchar(10)\n",
+    )
+    built = _build(repo, capsys, "type_alias_model")
+    assert built["status"] == "ok", built
+    verification = built["data"]["verification"]
+    assert verification["column_contract"]["checked"] == ["type_alias_model"]
+    findings = [
+        f for f in verification["findings"] if f["code"] == "column_type_mismatch"
+    ]
+    assert findings == []
+
+
+def test_bigquery_column_contract_type_aliases_on_build_path(
+    tmp_path: Path, monkeypatch
+):
+    """#1033: build path with a BigQuery adapter treats int64 vs reported INTEGER
+    as matching and still reports real mismatches."""
+
+    class BigQueryAdapter:
+        name = "bigquery"
+        dialect = "bigquery"
+
+        def list_objects(self):
+            return [type("M", (), {"identifier": "project.dataset.m"})()]
+
+        def table_metadata(self, _identifier):
+            columns = [
+                type("C", (), {"name": "id", "data_type": "INTEGER"})(),
+                type("C", (), {"name": "val", "data_type": "INTEGER"})(),
+            ]
+            return object(), columns
+
+    monkeypatch.setattr(
+        "exmergo_dex_core.maintain.verify.column_contract_plan",
+        lambda *_a, **_k: (
+            {"m": {"id": "int64", "val": "string"}},
+            0,
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        "exmergo_dex_core.maintain.verify.built_model_relations",
+        lambda *_a, **_k: {"m": "project.dataset.m"},
+    )
+    result = verify_mod.BuildVerification(ran=True)
+    adapter = BigQueryAdapter()
+    reason = verify_mod._column_contract(
+        tmp_path,
+        {"success": True},
+        {"model.p.m": "m"},
+        {"model.p.m"},
+        lambda: adapter,
+        result,
+    )
+    assert reason is None
+    mismatches = [f for f in result.findings if f.code == "column_type_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0].data["mismatches"] == [
+        {"column": "val", "declared": "string", "actual": "INTEGER"}
+    ]

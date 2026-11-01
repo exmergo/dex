@@ -264,8 +264,14 @@ def test_a_model_in_dev_namespace_missing_with_target_dev_is_reported():
 class _ColumnAdapter:
     """Just ``table_metadata``, keyed by identifier."""
 
-    def __init__(self, columns_by_identifier: dict[str, list[tuple[str, str]]]):
+    def __init__(
+        self,
+        columns_by_identifier: dict[str, list[tuple[str, str]]],
+        name: str = "duckdb",
+    ):
         self._columns = columns_by_identifier
+        self.name = name
+        self.dialect = name
 
     def table_metadata(self, identifier: str):
         cols = [
@@ -378,6 +384,106 @@ def test_a_matching_contract_reports_nothing():
         undeclared=0,
     )
     assert findings == []
+
+
+def test_bigquery_type_aliases_do_not_report_mismatch():
+    """#1033: BigQuery equivalent types (such as canonical int64 vs reported
+    INTEGER) are treated as matching rather than column_type_mismatch."""
+    from exmergo_dex_core.dbt_project import column_contract_divergence, types_equal
+
+    adapter = _ColumnAdapter(
+        {
+            "project.dataset.m": [
+                ("id", "INTEGER"),
+                ("is_active", "BOOLEAN"),
+                ("score", "FLOAT"),
+                ("title", "STRING"),
+                ("tags", "ARRAY<INTEGER>"),
+            ]
+        },
+        name="bigquery",
+    )
+    findings, notes = column_contract_findings(
+        adapter,
+        declared_by_model={
+            "m": {
+                "id": "int64",
+                "is_active": "bool",
+                "score": "float64",
+                "title": "string",
+                "tags": "ARRAY<INT64>",
+            }
+        },
+        model_relations={"m": "project.dataset.m"},
+        live_identifiers=["project.dataset.m"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert findings == []
+
+    # Also int vs INTEGER
+    assert types_equal("int", "INTEGER", connector="bigquery")
+
+    # Real mismatch is still reported
+    _missing, _extra, mismatched = column_contract_divergence(
+        {"id": "string"},
+        {"id": "INTEGER"},
+        connector="bigquery",
+    )
+    assert mismatched == [("id", "string", "INTEGER")]
+
+
+def test_duckdb_type_aliases_and_parameterized_types_match():
+    """#1033: DuckDB equivalent types and parameterized varchar(10) vs VARCHAR
+    match."""
+    from exmergo_dex_core.dbt_project import column_contract_divergence
+
+    adapter = _ColumnAdapter(
+        {
+            "db.main.m": [
+                ("id", "INTEGER"),
+                ("name", "VARCHAR"),
+                ("active", "BOOLEAN"),
+                ("amount", "DECIMAL(10,2)"),
+            ]
+        },
+        name="duckdb",
+    )
+    findings, notes = column_contract_findings(
+        adapter,
+        declared_by_model={
+            "m": {
+                "id": "int",
+                "name": "varchar(10)",
+                "active": "bool",
+                "amount": "decimal( 10, 2 )",
+            }
+        },
+        model_relations={"m": "db.main.m"},
+        live_identifiers=["db.main.m"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert findings == []
+
+    # Real mismatch is still reported
+    _missing, _extra, mismatched = column_contract_divergence(
+        {"id": "bigint", "name": "varchar(20)"},
+        {"id": "INTEGER", "name": "varchar(10)"},
+        connector="duckdb",
+    )
+    assert ("id", "bigint", "INTEGER") in mismatched
+    assert ("name", "varchar(20)", "varchar(10)") in mismatched
+
+
+def test_unnormalizable_type_falls_back_to_exact_match():
+    """#1033: Types Dex cannot normalize fall back to exact match and do not
+    silently pass."""
+    from exmergo_dex_core.dbt_project import types_equal
+
+    assert types_equal("CUSTOM_UDT", "custom_udt", connector="duckdb")
+    assert not types_equal("CUSTOM_UDT_A", "CUSTOM_UDT_B", connector="duckdb")
+    assert not types_equal("CUSTOM_UDT(10)", "CUSTOM_UDT", connector="duckdb")
 
 
 def test_undeclared_models_are_named_once_at_the_summary_level_not_per_model():
