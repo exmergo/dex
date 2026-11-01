@@ -119,6 +119,10 @@ def test_duckdb_real_mismatches_are_reported():
         ("datetime", "TIMESTAMP_NTZ", "snowflake"),
         ("long", "BIGINT", "databricks"),
         ("tinyint", "INT8", "clickhouse"),
+        ("real", "FLOAT32", "clickhouse"),
+        ("double precision", "FLOAT64", "clickhouse"),
+        ("char", "character", "postgres"),
+        ("bpchar", "char", "postgres"),
         ("int", "INTEGER", "trino"),
     ],
 )
@@ -137,6 +141,13 @@ def test_distinct_connector_types_do_not_match():
     assert not types_equal("timestamp", "timestamp_ntz", connector="databricks")
     assert types_equal("timestamp", "timestamp", connector="databricks")
     assert types_equal("timestamp_ntz", "timestamp_ntz", connector="databricks")
+
+    # Postgres fixed-width vs variable-width character types
+    assert not types_equal("char", "varchar", connector="postgres")
+    assert not types_equal("character", "varchar", connector="postgres")
+    assert not types_equal("bpchar", "text", connector="postgres")
+    assert types_equal("char", "character", connector="postgres")
+    assert types_equal("char", "bpchar", connector="postgres")
 
 
 def test_parameterized_types_matching_rules():
