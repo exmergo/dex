@@ -338,3 +338,53 @@ def test_equivalent_type_spelling_int_matches_duckdb_integer(
         f for f in verification["findings"] if f["code"] == "column_type_mismatch"
     ]
     assert findings == []
+
+
+def test_bigquery_column_contract_type_aliases_on_build_path(
+    tmp_path: Path, monkeypatch
+):
+    """#1033: build path with a BigQuery adapter treats int64 vs reported INTEGER
+    as matching and still reports real mismatches."""
+
+    class BigQueryAdapter:
+        name = "bigquery"
+        dialect = "bigquery"
+
+        def list_objects(self):
+            return [type("M", (), {"identifier": "project.dataset.m"})()]
+
+        def table_metadata(self, _identifier):
+            columns = [
+                type("C", (), {"name": "id", "data_type": "INTEGER"})(),
+                type("C", (), {"name": "val", "data_type": "INTEGER"})(),
+            ]
+            return object(), columns
+
+    monkeypatch.setattr(
+        "exmergo_dex_core.maintain.verify.column_contract_plan",
+        lambda *_a, **_k: (
+            {"m": {"id": "int64", "val": "string"}},
+            0,
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        "exmergo_dex_core.maintain.verify.built_model_relations",
+        lambda *_a, **_k: {"m": "project.dataset.m"},
+    )
+    result = verify_mod.BuildVerification(ran=True)
+    adapter = BigQueryAdapter()
+    reason = verify_mod._column_contract(
+        tmp_path,
+        {"success": True},
+        {"model.p.m": "m"},
+        {"model.p.m"},
+        lambda: adapter,
+        result,
+    )
+    assert reason is None
+    mismatches = [f for f in result.findings if f.code == "column_type_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0].data["mismatches"] == [
+        {"column": "val", "declared": "string", "actual": "INTEGER"}
+    ]

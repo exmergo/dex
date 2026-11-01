@@ -1528,9 +1528,9 @@ _CLICKHOUSE_TYPE_ALIASES: dict[str, str] = {
     "double": "FLOAT64",
     "decimal": "DECIMAL",
     "datetime": "DATETIME",
-    "datetime64": "DATETIME",
+    "datetime64": "DATETIME64",
     "date": "DATE",
-    "date32": "DATE",
+    "date32": "DATE32",
 }
 
 _DATABRICKS_TYPE_ALIASES: dict[str, str] = {

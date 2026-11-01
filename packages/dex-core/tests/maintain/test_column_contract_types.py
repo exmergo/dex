@@ -126,6 +126,19 @@ def test_other_connector_aliases_match(declared: str, actual: str, connector: st
     assert types_equal(declared, actual, connector=connector)
 
 
+def test_distinct_connector_types_do_not_match():
+    # ClickHouse distinct types
+    assert not types_equal("DateTime", "DateTime64", connector="clickhouse")
+    assert not types_equal("Date", "Date32", connector="clickhouse")
+    assert types_equal("DateTime", "DateTime", connector="clickhouse")
+    assert types_equal("DateTime64", "DateTime64", connector="clickhouse")
+
+    # Databricks distinct timestamp types
+    assert not types_equal("timestamp", "timestamp_ntz", connector="databricks")
+    assert types_equal("timestamp", "timestamp", connector="databricks")
+    assert types_equal("timestamp_ntz", "timestamp_ntz", connector="databricks")
+
+
 def test_parameterized_types_matching_rules():
     # One side unconstrained matches parameterized base
     assert types_equal("varchar(10)", "VARCHAR", connector="duckdb")
