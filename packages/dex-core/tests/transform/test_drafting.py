@@ -1543,3 +1543,70 @@ def test_a_star_replace_keeps_the_name_and_a_rename_leaves_the_old_one():
         vars={},
     )
     assert reading.produced == ["id", "e2"]
+
+
+def test_a_qualified_exclusion_only_drops_its_own_tables_column():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * exclude (a.id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["extra", "id", "e2"]
+
+    reading = drafting.read(
+        "select * exclude (id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["extra", "e2"]
+
+
+def test_a_qualified_rename_only_moves_its_own_tables_column():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * rename (a.id as a_id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["a_id", "extra", "id", "e2"]
+
+
+def test_a_renamed_column_is_traced_through_its_star_qualifier():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select a.* rename (id as a_id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["a_id", "extra"]
+    assert reading.incomplete == []
+
+
+def test_a_replace_and_a_rename_on_one_column_stack():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * replace (0 as id) rename (id as new_id) from"
+        " (select 1 as id, 2 as extra) t",
+        None,
+        dialect="snowflake",
+        vars={},
+    )
+    assert reading.produced == ["new_id", "extra"]
+    assert reading.expressions["new_id"].sql() == "0 AS new_id"
