@@ -925,6 +925,65 @@ def test_the_estimate_names_the_fix_when_the_tail_dominates(tail_600):
     assert "600-second AUTO_SUSPEND" in advice
     assert "AUTO_SUSPEND = 60" in advice
     assert "never changes AUTO_SUSPEND" in advice
+    # The setting is off, so the advice offers it; no suspend has been refused,
+    # so it names no grant (issue #1021).
+    assert "`dex config set snowflake.suspend_after_command true`" in advice
+    assert "GRANT OPERATE" not in advice
+
+
+def _estimate_notes(adapter) -> list[str]:
+    work = adapter.query_estimate(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    )
+    shown, lines, _ = with_uptime(adapter, work, {"probe": work})
+    return adapter.describe_estimate(shown, lines)["notes"]
+
+
+def test_the_first_estimate_with_suspend_on_says_why_it_quotes_the_tail(tail_600):
+    """Issue #1021: the setting is on and the role may suspend, but no suspend
+    has worked yet, so the tail is quoted. The note says why, and the advice
+    does not recommend the setting or the grant the role already has."""
+
+    # A one-second estimate, so the resume minimum alone outweighs the work and
+    # only the no-tail rule keeps the advice out once a suspend has worked.
+    tail_600.tables[0].bytes = 5_000_000
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    notes = _estimate_notes(first)
+    assert any(
+        "dex has not yet seen a suspend of DEX_WH succeed" in n
+        and "quoted the resume minimum instead" in n
+        for n in notes
+    )
+    advice = next(n for n in notes if "own work is about" in n)
+    assert "AUTO_SUSPEND = 60" in advice
+    assert "dex config set" not in advice
+    assert "GRANT OPERATE" not in advice
+    _one_query(first)
+    _settled(first)
+
+    # Once a suspend has worked the quote carries no tail, so no tail advice.
+    notes = _estimate_notes(_ledgered(tail_600, entries, suspend=True, ceiling=1200.0))
+    assert any("no idle tail is quoted" in n for n in notes)
+    assert not any("own work is about" in n for n in notes)
+    assert not any("has not yet seen a suspend" in n for n in notes)
+
+
+def test_after_a_refused_suspend_the_estimate_names_only_the_grant(tail_600):
+    tail_600.warehouses[0].operate_granted = False
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    _one_query(first)
+    _settled(first)
+    # Its tail runs out and the warehouse suspends on its own.
+    tail_600.clock.now += 700.0
+    tail_600.warehouses[0].state = "SUSPENDED"
+
+    notes = _estimate_notes(_ledgered(tail_600, entries, suspend=True, ceiling=1200.0))
+    advice = next(n for n in notes if "own work is about" in n)
+    assert "`GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE <dex role>`" in advice
+    assert "dex config set" not in advice
+    assert not any("has not yet seen a suspend" in n for n in notes)
 
 
 def test_session_remainder_binds_across_commands(fake_sf_connection):
