@@ -277,6 +277,38 @@ def test_the_transcript_summary_counts_dex_commands_on_every_route():
     assert (session.cost_usd, session.turns) == (0.5, 7)
 
 
+def test_the_transcript_summary_counts_dex_commands_through_a_same_command_alias():
+    """A wrapper bound in the same command string — a shell function or a
+    shell variable — counts like a direct call; the binding itself and a bare
+    mention of a command with no alias defined do not."""
+
+    from evals.metadata.live import Session, summarize
+
+    def bash(command):
+        return {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+                ]
+            },
+        }
+
+    events = [
+        bash("uv run --no-project --script /x/run.py transform apply p1"),
+        bash(
+            'R() { uv run --no-project --script /x/run.py "$@"; }; R transform apply p1'
+        ),
+        bash('R="uv run --no-project --script /x/run.py"; $R explore profile t'),
+        bash('echo "R transform apply"'),
+    ]
+    session = summarize(events, Session())
+    assert session.dex_commands == {
+        "transform apply": 2,
+        "explore profile": 1,
+    }
+
+
 def test_a_model_that_was_not_built_cannot_be_complete():
     from evals.metadata.score import Declared, completeness
 

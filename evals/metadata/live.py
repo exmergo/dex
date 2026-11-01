@@ -102,6 +102,40 @@ _DEX_CALL = re.compile(
     r"(?:--[\w-]+(?:[ =]\S+)?\s+)*"
     rf"({_GROUPS})\b(?:\s+([a-z]+))?"
 )
+# A wrapper bound in the same command string — a shell function
+# (`R() { uv ... run.py "$@"; }`) or a variable (`R="uv ... run.py"`). Calls
+# through the bound name reach Dex like direct ones; the lookbehinds keep
+# `--script $R`, the path-in-a-variable route above, from counting twice.
+_WRAPPER = re.compile(r"\bdex\b|run\.py|exmergo_dex_core|--script\s+\S+")
+_FN_DEF = re.compile(r"([A-Za-z_]\w*)\s*\(\)\s*\{([^{}]*)\}")
+_VAR_DEF = re.compile(
+    r"(?:^|;)\s*([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|\S+)", re.MULTILINE
+)
+
+
+def _aliases(command: str) -> list[str]:
+    """Names bound to a Dex wrapper in this same command string. A wrapper
+    defined in an earlier call needs no handling: shell state does not survive
+    between calls."""
+    fn_names = [
+        match.group(1)
+        for match in _FN_DEF.finditer(command)
+        if _WRAPPER.search(match.group(2))
+    ]
+    var_names = [
+        match.group(1)
+        for match in _VAR_DEF.finditer(command)
+        if _WRAPPER.search(match.group(2).strip("\"'"))
+    ]
+    return list(dict.fromkeys(fn_names + var_names))
+
+
+def _alias_call(name: str) -> re.Pattern:
+    return re.compile(
+        rf"(?<!--script\s)(?<!--script\s\$)\$?\b{re.escape(name)}\b(?!\s*[=(])"
+        r"(?:\s+(?:--[\w-]+(?:[ =]\S+)?\s+)*)?"
+        rf"({_GROUPS})\b(?:\s+([a-z]+))?"
+    )
 
 
 def summarize(events: list[dict[str, Any]], session: Session) -> Session:
@@ -121,10 +155,15 @@ def summarize(events: list[dict[str, Any]], session: Session) -> Session:
                     if name and name not in skills:
                         skills.append(name)
                 if block.get("name") == "Bash":
-                    for match in _DEX_CALL.finditer(payload.get("command") or ""):
-                        group, sub = match.group(1), match.group(2)
-                        label = f"{group} {sub}" if sub else group
-                        commands[label] = commands.get(label, 0) + 1
+                    command = payload.get("command") or ""
+                    patterns = [_DEX_CALL] + [
+                        _alias_call(name) for name in _aliases(command)
+                    ]
+                    for pattern in patterns:
+                        for match in pattern.finditer(command):
+                            group, sub = match.group(1), match.group(2)
+                            label = f"{group} {sub}" if sub else group
+                            commands[label] = commands.get(label, 0) + 1
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")
