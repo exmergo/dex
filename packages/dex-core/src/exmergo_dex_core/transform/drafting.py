@@ -598,12 +598,41 @@ class _Lineage:
             ]
             if not expanded:
                 return None
+            # A star carries its own reshaping: EXCLUDE/EXCEPT drop columns,
+            # REPLACE keeps the name but changes the expression, RENAME moves
+            # the name. The star itself holds them, under the qualified column.
+            star_node = star.this if isinstance(star, exp.Column) else star
+            excluded = {
+                column.name.lower()
+                for column in star_node.args.get("except_") or []
+                if isinstance(column, exp.Column)
+            }
+            replaced = {
+                replacement.alias.lower(): replacement
+                for replacement in star_node.args.get("replace") or []
+                if isinstance(replacement, exp.Alias)
+            }
+            renamed = {
+                replacement.this.name.lower(): replacement
+                for replacement in star_node.args.get("rename") or []
+                if isinstance(replacement, exp.Alias)
+                and isinstance(replacement.this, exp.Column)
+            }
             for alias, relation in expanded:
                 columns = self.columns_of(relation)
                 if columns is None:
                     return None
                 for column in columns:
-                    out.setdefault(column.lower(), exp.column(column, table=alias))
+                    name = column.lower()
+                    if name in excluded:
+                        continue
+                    if name in renamed:
+                        out.setdefault(renamed[name].alias.lower(), renamed[name])
+                        continue
+                    if name in replaced:
+                        out.setdefault(name, replaced[name])
+                        continue
+                    out.setdefault(name, exp.column(column, table=alias))
         self._outputs[id(select)] = out
         return out
 

@@ -1483,3 +1483,63 @@ def test_a_grain_narrower_than_the_group_by_is_named_as_a_condition_not_an_error
     assert "wider than the [order_id]" in wider
     disjoint = _grain_disagreement("m", ["a"], ["b"])
     assert disjoint.endswith("one of them is wrong")
+
+
+def test_a_star_hands_on_only_the_columns_its_exclusions_leave():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * exclude (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+    reading = drafting.read(
+        "select * except (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="bigquery",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+
+def test_a_qualified_star_exclusion_drops_the_column_too():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select t.* exclude (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+    reading = drafting.read(
+        "select t.* except (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="bigquery",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+
+def test_a_star_replace_keeps_the_name_and_a_rename_leaves_the_old_one():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * replace (extra + 1 as extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="bigquery",
+        vars={},
+    )
+    assert reading.produced == ["id", "extra"]
+
+    reading = drafting.read(
+        "select * rename (extra as e2) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["id", "e2"]
