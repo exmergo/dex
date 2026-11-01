@@ -309,6 +309,14 @@ class CubeSemanticLayer:
 
     # --- the derivation channel (#927, #911) -------------------------------------
 
+    
+    def declaration_models(self, documents: dict[str, str]) -> dict[str, set[str]]:
+        """Cubes in ``documents`` and the members each exposes (#1030)."""
+
+        from .derivation import declaration_models as _models
+
+        return _models(documents)
+
     def derive_semantic(self, request: Any) -> Any:
         """Declared marts as Cube model files; see :mod:`.derivation`.
 

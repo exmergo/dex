@@ -1125,3 +1125,26 @@ def _without_population(description: Any) -> str | None:
     if sep:
         return head
     return None if description.startswith("Population: ") else description
+
+
+
+def declaration_models(
+    documents: Mapping[str, str], connector: str | None = None
+) -> dict[str, set[str]]:
+    """Each dataset in ``documents`` to the columns/fields it exposes (#1030)."""
+
+    out: dict[str, set[str]] = {}
+    for _path, data in _documents(documents):
+        for dataset in data.get("datasets") or []:
+            if not isinstance(dataset, dict) or not isinstance(dataset.get("name"), str):
+                continue
+            cols: set[str] = set()
+            for field_ in dataset.get("fields") or []:
+                if not isinstance(field_, dict) or not isinstance(field_.get("name"), str):
+                    continue
+                cols.add(field_["name"].lower())
+                linked = catalog_mod._link(field_, connector, None)[3]
+                if isinstance(linked, str) and linked:
+                    cols.add(linked.lower())
+            out[dataset["name"].lower()] = cols
+    return out

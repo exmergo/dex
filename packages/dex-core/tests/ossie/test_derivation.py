@@ -743,3 +743,68 @@ class TestOssieDerivation(SemanticDerivationContract):
             },
             connector="duckdb",
         )
+
+
+
+# --- population.parent on the native route (#1030) -----------------------------------
+
+
+def test_a_population_parent_that_names_nothing_is_refused(
+    tmp_path: Path, capsys, no_warehouse
+):
+    put(tmp_path, COMMERCE, ORDERS_TEXT)
+    _configure(tmp_path, [COMMERCE])
+
+    rc, envelope = _ossie_plan(
+        tmp_path,
+        capsys,
+        {
+            "declarations": [
+                {
+                    "model": "orders",
+                    "population": {
+                        "parent": {
+                            "model": "no_such_model",
+                            "key": {"not_a_column": "nope"},
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    assert rc != 0
+    message = " ".join(envelope["errors"])
+    assert "population.parent" in message or "not_a_column" in message or "no_such_model" in message
+    assert _stored_plans(tmp_path) == []
+
+
+def test_a_population_parent_the_layer_defines_still_plans(
+    tmp_path: Path, capsys, no_warehouse
+):
+    put(tmp_path, COMMERCE, ORDERS_TEXT)
+    _configure(tmp_path, [COMMERCE])
+
+    rc, envelope = _ossie_plan(
+        tmp_path,
+        capsys,
+        {
+            "declarations": [
+                {
+                    "model": "orders",
+                    "population": {
+                        "parent": {
+                            "model": "customers",
+                            "key": {"buyer": "customer_key"},
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    assert rc == 0, envelope.get("errors") or envelope
+    (stored,) = _stored_plans(tmp_path)
+    content = stored["edits"][0]["new_content"]
+    assert "customers" in content
+    assert "customer_key" in content
