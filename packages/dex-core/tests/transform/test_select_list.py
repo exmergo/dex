@@ -80,11 +80,6 @@ def test_bigquery_except_is_read_in_the_bigquery_dialect():
         ("select * from {{ m() }}", "macro standing in for a relation"),
         ("select count(*) from t", "unaliased expression"),
         ("select max(a) from t", "unaliased expression"),
-        ("select a from x union all select a from y", "set operation"),
-        (
-            "with u as (select a from x union all select a from y) select * from u",
-            "set operation",
-        ),
         ("select * rename (a as b) from (select 1 as a)", "RENAME"),
         ("select * from (select 1 as a) p cross join unnest([1])", "table function"),
         ("select * from (values (1)) v", "table function"),
@@ -98,6 +93,94 @@ def test_what_cannot_be_read_says_which_case_it_was(sql, reason):
     assert resolved.columns is None
     assert resolved.reason
     assert reason in resolved.reason
+
+
+@pytest.mark.parametrize(
+    ("sql", "columns"),
+    [
+        ("select a, b as c from t1 union all select d, e from t2", {"a", "c"}),
+        ("select a, b from t1 union select c, d from t2", {"a", "b"}),
+        ("select a, b from t1 except select c, d from t2", {"a", "b"}),
+        ("select a, b from t1 intersect select c, d from t2", {"a", "b"}),
+        ("select a from x union all select b from y union all select c from z", {"a"}),
+        ("(select a from x) union all (select b from y)", {"a"}),
+        ("select * from (select a, b from x union all select c, d from y)", {"a", "b"}),
+        (
+            "with u as (select a, b from x union all select c, d from y) "
+            "select * from u",
+            {"a", "b"},
+        ),
+        (
+            "with u as (select a, b from x except select c, d from y) select * from u",
+            {"a", "b"},
+        ),
+        (
+            "with u as (select a, b from x intersect select c, d from y) "
+            "select * from u",
+            {"a", "b"},
+        ),
+        (
+            "with cte as (select 1 as a, 2 as b) "
+            "select * from cte union all select 3, 4",
+            {"a", "b"},
+        ),
+        (
+            "select a, b from t1 union all by name select b, c from t2",
+            {"a", "b", "c"},
+        ),
+        ("select a from t1 union by name select b from t2", {"a", "b"}),
+        (
+            "with u as (select a from t1 union all by name select b from t2) "
+            "select * from u",
+            {"a", "b"},
+        ),
+        (
+            "select a from t1 union all by name select b from t2 "
+            "union all by name select c from t3",
+            {"a", "b", "c"},
+        ),
+        ("select 1 as a union all select * from {{ ref('x') }}", {"a"}),
+    ],
+)
+def test_set_operations_read_columns(sql, columns):
+    resolved = resolve_select_list(sql)
+    assert resolved.columns == columns, resolved.reason
+    assert select_columns(sql) == columns
+
+
+@pytest.mark.parametrize(
+    ("sql", "reason"),
+    [
+        ("select * from {{ ref('x') }} union all select 1 as a", "ref('x')"),
+        (
+            "with u as (select * from {{ ref('x') }} union all select 1 as a) "
+            "select * from u",
+            "ref('x')",
+        ),
+        ("select count(*) from t union all select 1 as a", "unaliased expression"),
+        ("select {{ m() }} from t union all select 1 as a", "macro standing in"),
+        (
+            "select 1 as a union all by name select * from {{ ref('x') }}",
+            "ref('x')",
+        ),
+        (
+            "select a, b from t1 except by name select b from t2",
+            "set operation with BY NAME",
+        ),
+    ],
+)
+def test_set_operations_unresolvable_cases(sql, reason):
+    resolved = resolve_select_list(sql)
+    assert resolved.columns is None
+    assert resolved.reason
+    assert reason in resolved.reason
+
+
+def test_union_by_name_with_on_clause_modifier_is_unresolved():
+    sql = "SELECT 1 AS a, 2 AS b UNION ALL BY NAME ON (b) SELECT 2 AS b, 3 AS c"
+    resolved = resolve_select_list(sql, dialect="bigquery")
+    assert resolved.columns is None
+    assert "ON column list" in resolved.reason
 
 
 def test_a_recursive_cte_is_named_rather_than_followed_forever():

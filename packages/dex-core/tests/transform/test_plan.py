@@ -857,6 +857,107 @@ def test_column_contract_resolves_an_aliased_macro_column(dbt_project_dir: Path)
     ), warnings
 
 
+def test_column_contract_resolves_a_union_model(dbt_project_dir: Path):
+    """#1035: A model ending in a UNION resolves columns from its first branch."""
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n      - name: name\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id, 'alice' as name from t1\nunion all\nselect 2, 'bob' from t2\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "union customers",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert not any(
+        "could not be resolved statically" in w or "declares column" in w
+        for w in warnings
+    ), warnings
+
+
+def test_column_contract_warns_on_union_model_divergence(dbt_project_dir: Path):
+    """#1035: A union model whose first branch omits a declared column warns."""
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n      - name: missing_col\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id from t1 union all select 2 as id from t2\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "union missing col",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert any(
+        "declares column(s) missing_col" in w and "does not produce" in w
+        for w in warnings
+    ), warnings
+
+
+def test_a_declaration_against_a_union_model_is_refused_for_an_absent_column(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#1035: Declarations against a union model refuse an undeclared column."""
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/marts/mart.sql",
+                        "kind": "model_sql",
+                        "content": (
+                            "select 1 as id from t1\n"
+                            "union all\n"
+                            "select 2 as id from t2\n"
+                        ),
+                    }
+                ],
+                "declarations": [
+                    {
+                        "model": "mart",
+                        "description": "One row per thing.",
+                        "grain": ["id"],
+                        "columns": {"absent": {"role": "attribute"}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc != 0
+    assert "absent" in json.dumps(envelope["errors"])
+
+
 def test_plan_cli_refuses_an_inlined_profiles_secret(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

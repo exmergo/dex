@@ -1198,11 +1198,10 @@ def select_columns(sql: str) -> set[str] | None:
     (:mod:`.select_list`): callers refuse on this answer, so it never rests on a
     cached profile. Unresolvable covers a star over a relation, an unaliased macro
     call standing in for a column (indistinguishable from a real column once jinja
-    is stripped to a placeholder, and can expand to any number of real columns), a
-    set operation (a UNION's branches can each project differently), and anything
-    that fails to parse. An *aliased* macro call (``{{ some_macro(x) }} as total``)
-    is resolvable: the alias is the real output name regardless of what expression
-    computed it.
+    is stripped to a placeholder, and can expand to any number of real columns),
+    and anything that fails to parse. An *aliased* macro call (``{{ some_macro(x) }}
+    as total``) is resolvable: the alias is the real output name regardless of what
+    expression computed it.
     """
 
     from .select_list import resolve_select_list
