@@ -508,6 +508,17 @@ class TrinoAdapter:
             self._resolved_scopes = self._resolve_scopes()
         return self._resolved_scopes
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this command's Trino scope (#984)."""
+        token = namespace.strip().lower()
+        catalog, _, schema = token.partition(".")
+        for c, s in self._scopes():
+            if c.lower() != catalog:
+                continue
+            if s is None or s.lower() == schema:
+                return True
+        return False
+
     def _resolve_scopes(self) -> list[tuple[str, str | None]]:
         if not self.target.catalogs:
             # Nothing committed: every catalog the identity can see is the

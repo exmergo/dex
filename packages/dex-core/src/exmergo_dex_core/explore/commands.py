@@ -1002,10 +1002,8 @@ def relationships(
     metas = inventory_mod.inventory(adapter)
     connector = adapter.name
     # See map()'s identical computation: tells carry-forward "out of this
-    # run's scope" apart from "gone from the warehouse" (issue #149).
-    observed_namespaces = {
-        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
-    }
+    # run's scope" apart from "gone from the warehouse" (issues #149, #984).
+    observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
     # Skip re-scanning objects whose cached profile is still fresh (same
     # connector, schema unchanged, within the freshness window); only the stale
     # remainder is estimated, confirmed, and profiled below.
@@ -1268,7 +1266,10 @@ def relationships(
     reusable = prior if prior and prior.provenance.connector == connector else None
     examined = {d.identifier for d in datasets}
     rels, carried_relationships = _carry_forward_relationships(
-        reusable, examined, rels, observed_namespaces=observed_namespaces
+        reusable,
+        examined,
+        rels,
+        observed_namespaces=observed_namespaces,
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -2444,11 +2445,9 @@ def map(
     baselined = _baselined_identifiers(store) if orphaned else set()
     # The schema/dataset namespaces this run's inventory actually saw, so
     # carry-forward can tell "out of this run's scope" from "gone from the
-    # warehouse" (issue #149) -- an identifier whose own namespace is here but
-    # who is itself absent from metas was looked at and is not there.
-    observed_namespaces = {
-        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
-    }
+    # warehouse" (issues #149, #984): an identifier whose own namespace is here
+    # but who is itself absent from metas was looked at and is not there.
+    observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
     # First-pass rank on cheap signals (no connectivity yet) to choose what to
     # profile; re-ranked with connectivity once relationships are known.
     first_pass = rank_mod.rank(metas, None, hints, orphaned)
@@ -2705,7 +2704,10 @@ def map(
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
     relationship_set, carried_relationships = _carry_forward_relationships(
-        reusable, examined, relationship_set, observed_namespaces=observed_namespaces
+        reusable,
+        examined,
+        relationship_set,
+        observed_namespaces=observed_namespaces,
     )
     final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
     # After inference, so it saw the same profiles in either mode.
@@ -2755,11 +2757,19 @@ def map(
 
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
+    listed_namespaces = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
+    dropped_namespaces = {id.rpartition(".")[0].lower() for id in dropped}
+    surviving_namespaces = {d.identifier.rpartition(".")[0].lower() for d in datasets}
     cache.provenance.inventory_namespaces = sorted(
-        {
-            *(reusable.provenance.inventory_namespaces if reusable else []),
-            *observed_namespaces,
-        }
+        (
+            {
+                *(reusable.provenance.inventory_namespaces if reusable else []),
+                *listed_namespaces,
+            }
+        )
+        - (dropped_namespaces - surviving_namespaces)
     )
     cache.provenance.created_at = (
         prior.provenance.created_at
@@ -4685,7 +4695,7 @@ def _carry_forward_relationships(
 
     ``observed_namespaces`` (see `_compose_datasets`) excludes an edge whose
     endpoint is gone from the warehouse rather than merely out of scope, so a
-    deleted relation's join does not resurrect either (issue #149).
+    deleted relation's join does not resurrect either (issues #149, #984).
     """
 
     if prior is None or not prior.relationships:
@@ -4693,11 +4703,10 @@ def _carry_forward_relationships(
     existing = {_relationship_edge_key(rel) for rel in relationships}
 
     def dropped(identifier: str) -> bool:
-        return (
-            observed_namespaces is not None
-            and identifier not in examined
-            and identifier.rpartition(".")[0].lower() in observed_namespaces
-        )
+        if identifier in examined:
+            return False
+        ns = identifier.rpartition(".")[0].lower()
+        return bool(observed_namespaces is not None and ns in observed_namespaces)
 
     carried = [
         rel
@@ -5351,6 +5360,48 @@ def _split_fresh_stale(
     return stale, fresh
 
 
+def _compute_observed_namespaces(
+    metas: list[ObjectMeta],
+    prior: DexCache | None,
+    adapter: Adapter,
+) -> set[str]:
+    """The schema/dataset namespaces this run's inventory actually examined,
+    so carry-forward can tell "out of this run's scope" from "gone from the
+    warehouse" (issues #149, #984).
+
+    Starts from the namespaces of objects listed this run, and extends to any
+    namespace present in the prior cache that falls within what this run's
+    adapter scope inspected. If a schema was dropped entirely or left empty,
+    its former relations are recognized as dropped rather than carried forward
+    forever (#984), while namespaces outside a narrowed ``--scope`` remain
+    untouched (#111).
+    """
+    observed = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
+    in_scope = getattr(adapter, "in_scope", None)
+    if in_scope is None or prior is None:
+        return observed
+
+    candidate_namespaces: set[str] = set()
+    for ds in prior.datasets:
+        if "." in ds.identifier:
+            candidate_namespaces.add(ds.identifier.rpartition(".")[0].lower())
+    if prior.relationships:
+        for rel in prior.relationships:
+            if "." in rel.from_dataset:
+                candidate_namespaces.add(rel.from_dataset.rpartition(".")[0].lower())
+            if "." in rel.to_dataset:
+                candidate_namespaces.add(rel.to_dataset.rpartition(".")[0].lower())
+
+    for ns in candidate_namespaces:
+        if ns not in observed:
+            with contextlib.suppress(Exception):
+                if in_scope(ns):
+                    observed.add(ns)
+    return observed
+
+
 def _compose_datasets(
     metas: list[ObjectMeta],
     profiled: list[Dataset],
@@ -5419,7 +5470,10 @@ def _compose_datasets(
         if identifier in seen:
             continue
         namespace = identifier.rpartition(".")[0].lower()
-        if observed_namespaces is not None and namespace in observed_namespaces:
+        is_observed = (
+            observed_namespaces is not None and namespace in observed_namespaces
+        )
+        if is_observed:
             dropped.append(identifier)
             continue
         datasets.append(previous.model_copy(deep=True))

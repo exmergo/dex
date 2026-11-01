@@ -585,6 +585,19 @@ class RedshiftAdapter:
             self._dev_target = scope
             self.forget_metadata()
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this Redshift scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            db, _, schema = token.partition(".")
+            if db != self._current_database().lower():
+                return False
+        else:
+            schema = token
+        if not self.target.schemas:
+            return True
+        return schema in {s.lower() for s in self._schema_scope()}
+
     def _resolve_schemas(self) -> list[str]:
         visible = self._schemas()
         if not self.target.schemas:

@@ -402,6 +402,16 @@ class BigQueryAdapter:
             self._resolved_datasets = self._resolve_datasets()
         return self._resolved_datasets
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this BigQuery scope (#984)."""
+        qualified = namespace.strip().lower()
+        if "." not in qualified:
+            qualified = f"{self.project.lower()}.{qualified}"
+        project, _, _dataset = qualified.partition(".")
+        if not self.target.datasets:
+            return project == self.project.lower()
+        return qualified in {d.lower() for d in self._dataset_ids()}
+
     def _resolve_datasets(self) -> list[str]:
         if not self.target.datasets:
             datasets = self._request(

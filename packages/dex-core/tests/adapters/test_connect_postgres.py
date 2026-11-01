@@ -1112,3 +1112,17 @@ def test_a_utc_session_is_pinned_only_when_asked(fake_pg_connection):
     adapter.pin_utc_session()
     adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
     assert fake_pg_connection.session_parameters["timezone"] == "UTC"
+
+
+def test_postgres_in_scope_respects_schemas_and_database(fake_pg_connection):
+    """#984: a postgres namespace is in scope if its database matches and
+    its schema lies in the configured scope (or all schemas if unrestricted)."""
+
+    adapter = make_adapter(fake_pg_connection)
+    assert adapter.in_scope("dexdb.shop") is True
+    assert adapter.in_scope("dexdb.legacy") is True
+    assert adapter.in_scope("other_db.shop") is False
+
+    scoped = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
+    assert scoped.in_scope("dexdb.shop") is True
+    assert scoped.in_scope("dexdb.legacy") is False

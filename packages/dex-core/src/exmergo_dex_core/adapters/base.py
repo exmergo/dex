@@ -1037,6 +1037,11 @@ class Adapter(Protocol):
     - ``describe_query_free``: ``False`` where ``describe_query`` runs on paid
       compute (it can start a stopped warehouse), so a comparison prices first.
       Absent reads as free.
+    - ``in_scope(namespace)``: whether a dotted namespace lies inside the
+      scope this command examined (issue #984). Tells carry-forward whether
+      an object missing from this run's inventory was looked for and is gone
+      from the warehouse (dropped), versus lived outside a narrowed ``--scope``
+      or allowlist and must be carried forward untouched (#111, #149).
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".
