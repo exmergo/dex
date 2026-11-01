@@ -176,6 +176,13 @@ def test_set_operations_unresolvable_cases(sql, reason):
     assert reason in resolved.reason
 
 
+def test_union_by_name_with_on_clause_modifier_is_unresolved():
+    sql = "SELECT 1 AS a, 2 AS b UNION ALL BY NAME ON (b) SELECT 2 AS b, 3 AS c"
+    resolved = resolve_select_list(sql, dialect="bigquery")
+    assert resolved.columns is None
+    assert "ON column list" in resolved.reason
+
+
 def test_a_recursive_cte_is_named_rather_than_followed_forever():
     sql = "with a as (select * from a) select * from a"
     resolved = resolve_select_list(sql)

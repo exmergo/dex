@@ -156,6 +156,14 @@ class _Reader:
         if isinstance(node, exp.SetOperation):
             ctes = {**ctes, **_local_ctes(node)}
             if node.args.get("by_name"):
+                if (
+                    node.args.get("kind")
+                    or node.args.get("side")
+                    or node.args.get("on")
+                ):
+                    raise _UnresolvedError(
+                        "a set operation with BY NAME in a mode or an ON column list"
+                    )
                 if isinstance(node, exp.Union):
                     return self.outputs(node.this, ctes, seen) | self.outputs(
                         node.expression, ctes, seen
