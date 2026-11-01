@@ -1113,6 +1113,10 @@ class SnowflakeAdapter:
             self._resolved_scopes = self._resolve_scopes()
         return self._resolved_scopes
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this Snowflake scope (#984)."""
+        return scope_within(namespace, self._scopes())
+
     def _resolve_scopes(self) -> list[str]:
         committed = self.target.databases
         if committed:

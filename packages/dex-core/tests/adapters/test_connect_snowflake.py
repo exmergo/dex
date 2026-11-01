@@ -1973,3 +1973,22 @@ def test_a_utc_session_is_pinned_only_when_asked(fake_sf_connection):
     adapter.pin_utc_session()
     _one_query(adapter)
     assert fake_sf_connection.session_parameters["TIMEZONE"] == "UTC"
+
+
+def test_snowflake_in_scope_respects_databases_and_scopes(multi_db_connection):
+    """#984: a snowflake namespace is in scope if it lies inside the resolved scopes."""
+
+    adapter = make_adapter(
+        multi_db_connection, target=SnowflakeTarget(databases=["RAW"])
+    )
+    assert adapter.in_scope("RAW.PUBLIC") is True
+    assert adapter.in_scope("raw.legacy") is True
+    assert adapter.in_scope("SAMPLE.PUBLIC") is False
+
+    scoped = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(databases=["RAW"]),
+        scope_override=["RAW.PUBLIC"],
+    )
+    assert scoped.in_scope("RAW.PUBLIC") is True
+    assert scoped.in_scope("RAW.STAGING") is False

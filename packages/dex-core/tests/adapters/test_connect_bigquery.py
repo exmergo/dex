@@ -1742,3 +1742,17 @@ def test_a_host_cap_bounds_maximum_bytes_billed(fake_bq_client):
     for call in (c for c in fake_bq_client.query_calls if not c.dry_run):
         # Never the 1,000 MB per-command ceiling: the capped day is the bound.
         assert call.job_config.maximum_bytes_billed <= 300 * MB
+
+
+def test_bigquery_in_scope_respects_datasets_and_project(fake_bq_client):
+    """#984: a bigquery namespace is in scope if it matches the project and
+    falls inside the configured datasets (or all datasets if unrestricted)."""
+
+    adapter = make_adapter(fake_bq_client)
+    assert adapter.in_scope("test-proj.shop") is True
+    assert adapter.in_scope("test-proj.legacy") is True
+    assert adapter.in_scope("other-proj.shop") is False
+
+    scoped = make_adapter(fake_bq_client, target=BigQueryTarget(datasets=["shop"]))
+    assert scoped.in_scope("test-proj.shop") is True
+    assert scoped.in_scope("test-proj.legacy") is False

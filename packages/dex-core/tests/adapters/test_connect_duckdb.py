@@ -175,3 +175,16 @@ def test_a_host_cap_gates_nothing_on_duckdb(duckdb_file: Path):
         "source": "host",
     }
     assert getattr(engine._adapter(), "cost_gate", None) is None
+
+
+def test_duckdb_in_scope_matches_attached_database(duckdb_file: Path):
+    """#984: duckdb inspects the attached database file, so namespaces in that
+    database are within scope and other databases are not."""
+    adapter = DuckDBAdapter(duckdb_file)
+    try:
+        db = adapter._current_database()
+        assert adapter.in_scope(f"{db}.legacy") is True
+        assert adapter.in_scope("legacy") is True
+        assert adapter.in_scope("other_warehouse.legacy") is False
+    finally:
+        adapter.close()

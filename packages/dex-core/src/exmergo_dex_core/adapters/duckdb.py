@@ -102,6 +102,33 @@ class DuckDBAdapter:
         self._memory_limit = memory_limit
         self._threads = threads
         self._conn = self._connect()
+        self._database: str | None = None
+        try:
+            self._database = str(
+                self._conn.execute("SELECT current_database()").fetchone()[0]
+            )
+        except Exception:
+            self._database = None
+
+    def _current_database(self) -> str:
+        if self._database is None and self._conn is not None:
+            self._database = str(
+                self._conn.execute("SELECT current_database()").fetchone()[0]
+            )
+        return self._database or "memory"
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside the attached DuckDB database.
+
+        DuckDB inspects a single local file; --scope is rejected, so every
+        schema in this database is within what this command looked at (#984).
+        """
+        token = namespace.strip().lower()
+        db = self._current_database().lower()
+        if "." in token:
+            ns_db = token.split(".")[0]
+            return ns_db == db
+        return True
 
     def _connect(self):
         # Imported lazily so the base package import does not require the [duckdb]

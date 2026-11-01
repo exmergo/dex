@@ -694,6 +694,15 @@ class ClickHouseAdapter:
             self._dev_target = scope
             self.forget_metadata()
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a namespace lies inside this ClickHouse scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            token = token.split(".")[0]
+        if not self.target.databases:
+            return True
+        return token in {d.lower() for d in self._resolve_databases()}
+
     def _resolve_databases(self) -> list[str]:
         visible = self._databases()
         if not self.target.databases:
