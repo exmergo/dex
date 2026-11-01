@@ -1,0 +1,1 @@
+A contradicted single-column primary key that is both the model's declared grain and declared unique now reports a single contradiction note under `data_quality` on the declaration path, while preserving the persisted note in cache.

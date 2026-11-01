@@ -171,10 +171,39 @@ def test_a_contradicted_single_primary_key_keeps_the_evidence_beside_the_claim(
     assert dataset["grain"] == ["event_id"]
     assert dataset["declaration"]["grain_status"] == "contradicted"
     assert ["event_id"] not in dataset["candidate_keys"]
-    assert any("found duplicates" in note for note in dataset["data_quality"])
+    # #998: Only one contradiction note when the key is both the grain
+    # and declared unique.
+    assert (
+        sum(1 for note in dataset["data_quality"] if "found duplicates" in note) == 1
+    )
     assert any(
         "declared primary key" in note and "seq" in note
         for note in dataset["data_quality"]
+    )
+
+
+def test_contradicted_single_primary_key_and_separate_unique_key(tmp_path, capsys):
+    """#998: One contradiction note when the column is both the grain and declared
+    unique; a separate unique key column keeps its own note."""
+    root = _ossie_repo(
+        tmp_path,
+        _ossie_dataset(
+            "lookups",
+            ["tenant", "ref", "code"],
+            primary_key=["tenant"],
+            unique_keys=[["ref"]],
+        ),
+    )
+    dataset = _profiled(root, capsys, UNIQUE_ONLY)[UNIQUE_ONLY]
+
+    assert dataset["grain"] == ["tenant"]
+    assert dataset["declaration"]["grain_status"] == "contradicted"
+    dup_notes = [n for n in dataset["data_quality"] if "found duplicates" in n]
+    assert len(dup_notes) == 2
+    assert any("tenant is declared unique in the Ossie layer" in n for n in dup_notes)
+    assert any("ref is declared unique in the Ossie layer" in n for n in dup_notes)
+    assert not any(
+        "declared grain but profiling found" in n for n in dataset["data_quality"]
     )
 
 
