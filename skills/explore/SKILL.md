@@ -299,12 +299,13 @@ need is not described here.
 - On Snowflake, when `connect test` or an estimate's note says the warehouse's
   `AUTO_SUSPEND` tail costs more than the work, put the choice to the person
   before the first billed command, with the commands it names: lower
-  `AUTO_SUSPEND` to 60 on a dedicated warehouse, or turn on
-  `snowflake.suspend_after_command`, run the `GRANT OPERATE`, or both, as it
-  prints them (it names the setting only while the setting is off). Either
-  cuts a short command from about 600 warehouse-seconds to about 60. Never run
-  the grant or change the warehouse yourself, and never turn the setting on
-  without the person's yes, since it acts on a warehouse others may share.
+  `AUTO_SUSPEND` to 60 on a dedicated warehouse, or let dex suspend it, which
+  needs both `snowflake.suspend_after_command` on and `OPERATE` granted to the
+  role; relay the `dex config set` and the `GRANT OPERATE` exactly as it prints
+  them. Either cuts a short command from about 600 warehouse-seconds to about
+  60. Never run the grant or change the warehouse yourself, and never turn the
+  setting on without the person's yes, since it acts on a warehouse others may
+  share.
 - `--api` (a hosted dbt Cloud layer) runs where no cost guard can reach. Relay
   the warning every such result carries.
 
