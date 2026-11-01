@@ -18,7 +18,6 @@ The build gate is not a threshold: a run where any task fails it exits 1.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import tempfile
@@ -153,19 +152,20 @@ def main(argv: list[str] | None = None) -> int:
     if live:
         from .live import procedure_envelope, provenance, run_session
 
-        report["provenance"] = provenance()
+        procedure_text = (
+            Path(args.procedure_file).read_text(encoding="utf-8")
+            if args.procedure_file
+            else None
+        )
+        report["provenance"] = provenance(args.plugin_dir, procedure_text)
         report["settings"] = {
             "model": args.model,
             "max_turns": args.max_turns,
             "max_budget_usd": args.max_budget_usd,
         }
-        agent_config = procedure_envelope()["block"]
-        if args.procedure_file:
-            agent_config = Path(args.procedure_file).read_text(encoding="utf-8")
-            digest = hashlib.sha256(agent_config.encode()).hexdigest()
-            report["settings"]["procedure_file_sha256"] = digest
-        if args.plugin_dir:
-            report["settings"]["plugin_dir"] = args.plugin_dir
+        agent_config = (
+            procedure_envelope()["block"] if procedure_text is None else procedure_text
+        )
 
     for task in tasks:
         fixture = fixture_of(task, fixtures)

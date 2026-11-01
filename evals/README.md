@@ -208,8 +208,8 @@ it records which plugins actually loaded, the commit, the engine version, the
 procedure's digest and the Claude Code version in `report.json`'s `provenance`.
 Each task is capped by `--max-budget-usd` (default 5) and `--max-turns`
 (default 50). `--procedure-file <file>` gives the agent that text instead of the
-engine's procedure, to measure a baseline against an older one, and records its
-digest in `settings`. A baseline also needs `--plugin-dir <dir>`, an export of the
+engine's procedure, to measure a baseline against an older one. `provenance` then
+says `procedure_source: file` and carries that text's digest. A baseline also needs `--plugin-dir <dir>`, an export of the
 older skills, because each skill carries a copy of the procedure. Put
 `packages/dex-core` beside the exported `skills/` too (a symlink to the candidate
 will do): the skill wrapper uses a local engine only if it finds one there, and

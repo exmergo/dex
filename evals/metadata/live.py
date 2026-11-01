@@ -14,6 +14,7 @@ the working tree is flagged, because its numbers would describe another release.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -52,7 +53,26 @@ def procedure_envelope() -> dict[str, Any]:
     return json.loads(proc.stdout)["data"]
 
 
-def provenance() -> dict[str, Any]:
+def resolve_plugin_dir(plugin_dir: Path | str | None) -> Path:
+    """The plugin directory as an absolute path, the working tree by default.
+
+    A session runs with its workspace as the working directory, so a relative
+    path would name one plugin to Claude and another to the provenance check.
+    """
+
+    return Path(plugin_dir).expanduser().resolve() if plugin_dir else REPO
+
+
+def provenance(
+    plugin_dir: Path | str | None = None, procedure_text: str | None = None
+) -> dict[str, Any]:
+    """What this run actually gave the agent, including a baseline's overrides.
+
+    ``procedure_text`` is the text a ``--procedure-file`` run hands the agent. It
+    replaces the engine's digest, because a report naming the engine's procedure
+    would describe a text the agent never saw.
+    """
+
     def git(*args: str) -> str:
         return subprocess.run(
             ["git", *args], cwd=REPO, capture_output=True, text=True
@@ -72,9 +92,14 @@ def provenance() -> dict[str, Any]:
         "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
         "engine_version": procedure["engine_version"],
-        "procedure_digest": procedure["digest"],
+        "procedure_source": "engine" if procedure_text is None else "file",
+        "procedure_digest": (
+            procedure["digest"]
+            if procedure_text is None
+            else hashlib.sha256(procedure_text.encode()).hexdigest()[:12]
+        ),
         "claude_code_version": version,
-        "plugin_dir": str(REPO),
+        "plugin_dir": str(resolve_plugin_dir(plugin_dir)),
         "engine_python": sys.executable,
     }
 
@@ -153,7 +178,7 @@ def run_session(
     timeout: int,
     plugin_dir: Path | None = None,
 ) -> Session:
-    plugin_dir = plugin_dir or REPO
+    plugin_dir = resolve_plugin_dir(plugin_dir)
     binary = _require_claude("claude")
     env = _child_env()
     # The candidate engine's `dex` and the dbt it pins, first on PATH.

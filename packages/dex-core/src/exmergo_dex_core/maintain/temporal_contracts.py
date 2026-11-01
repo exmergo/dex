@@ -105,7 +105,8 @@ def snapshot_nodes(nodes: dict[str, Any], project_dir: Path) -> dict[str, Snapsh
             or not node["relation_name"]
         ):
             continue
-        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        raw_config = node.get("config")
+        config = raw_config if isinstance(raw_config, dict) else {}
         renamed = config.get("snapshot_meta_column_names")
         renamed = renamed if isinstance(renamed, dict) else {}
         out[node["name"].lower()] = SnapshotNode(
@@ -621,13 +622,13 @@ def _judge(
         "unexpected_entities": unexpected,
     }
     if entities == 0 and out_rows == 0:
-        reason = (
+        empty = (
             "the snapshot and the model hold no rows, so there is no history to judge"
         )
-        prepared.dropped["temporal"].append(f"{model}: {reason}")
+        prepared.dropped["temporal"].append(f"{model}: {empty}")
         result.temporal_contracts.append(
             _record(
-                model, rule, written, measured, "not_applicable", "empty_input", reason
+                model, rule, written, measured, "not_applicable", "empty_input", empty
             )
         )
         return
@@ -819,7 +820,9 @@ def _judge(
     unchecked_codes = [item["reason_code"] for item in unchecked] + [
         item["reason_code"] for item in assertions if item["status"] == "unchecked"
     ]
-    status, reason_code, reason = "satisfied", None, None
+    status = "satisfied"
+    reason_code: str | None = None
+    reason: str | None = None
     if contradicted:
         status = "contradicted"
     elif unchecked_codes:

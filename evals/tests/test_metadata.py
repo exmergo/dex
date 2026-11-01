@@ -490,3 +490,50 @@ def test_the_decision_is_recognised_however_it_is_phrased(decision):
         Declared(assumptions=[{"decision": decision, "evidence": "default"}]), truth
     )
     assert graded["passed"] is True
+
+
+# --- provenance names what a baseline run actually gave the agent ---------------
+
+
+def _stub_engine_procedure(monkeypatch):
+    from evals.metadata import live
+
+    monkeypatch.setattr(
+        live,
+        "procedure_envelope",
+        lambda: {"digest": "enginedigest", "engine_version": "0", "block": "x"},
+    )
+    return live
+
+
+def test_a_default_run_reports_the_engines_procedure_and_the_working_tree(monkeypatch):
+    live = _stub_engine_procedure(monkeypatch)
+    report = live.provenance()
+    assert report["procedure_source"] == "engine"
+    assert report["procedure_digest"] == "enginedigest"
+    assert report["plugin_dir"] == str(live.REPO)
+
+
+def test_a_baseline_run_reports_its_own_procedure_and_plugin(monkeypatch, tmp_path):
+    import hashlib
+
+    live = _stub_engine_procedure(monkeypatch)
+    report = live.provenance(tmp_path, "the older text")
+    assert report["procedure_source"] == "file"
+    assert (
+        report["procedure_digest"]
+        == (hashlib.sha256(b"the older text").hexdigest()[:12])
+    )
+    assert report["procedure_digest"] != "enginedigest"
+    assert report["plugin_dir"] == str(tmp_path.resolve())
+
+
+def test_a_relative_plugin_dir_is_resolved_before_a_session_can_disagree(
+    monkeypatch, tmp_path
+):
+    from evals.metadata.live import resolve_plugin_dir
+
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_plugin_dir("older/plugin")
+    assert resolved.is_absolute()
+    assert resolved == (tmp_path / "older" / "plugin").resolve()
