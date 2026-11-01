@@ -3,11 +3,12 @@
 # repo root, so the same rules apply everywhere.
 #
 # Install once with: pre-commit install
-# When bumping Ruff, keep `rev` here, the version in .github/workflows/lint.yml,
-# and the `ruff==` pin in packages/dex-core/pyproject.toml [dev] in lockstep.
+# When bumping Ruff, keep `rev` here, the workflow versions, the `ruff==` dev pin
+# in packages/dex-core/pyproject.toml, and the lockfile entry in
+# packages/dex-core/uv.lock in lockstep. test_ruff_version_pins.py checks them.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.19
+    rev: v0.17.2
     hooks:
       - id: ruff-check
         args: [--fix]

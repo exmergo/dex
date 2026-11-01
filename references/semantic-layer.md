@@ -1419,6 +1419,7 @@ from exmergo_dex_core.explore.semantic.conformance import (
     SemanticCatalogContract,
 )
 
+
 class TestMyBackend(SemanticBackendContract, SemanticCatalogContract):
     def make_backend(self):
         return MyBackend(...)
