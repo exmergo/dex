@@ -466,7 +466,9 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      readable key (a range or inequality join) at medium
                                      (data.join_key_read: false) (#841); a model with a filter, aggregate,
                                      de-duplication or set operation is never reported for loss, and an
-                                     incremental model is skipped. A model generated in SQL with no parent
+                                     incremental model is skipped (under transform build --full-refresh
+                                     --verify, one it rebuilt is compared, except a microbatch model, which
+                                     rebuilds only from its begin). A model generated in SQL with no parent
                                      relation is named in notes. A real parent relation missing from the
                                      warehouse is still a warning. Free on metadata alone, and every
                                      count made exact where counting bills nothing; a relation the
@@ -483,7 +485,9 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      and parent_population_unexpected (a declared population.parent's
                                      keys against the model's, as distinct-key counts), temporal_* (a
                                      declared history contract against the snapshot's versions, as
-                                     entity counts, one data.temporal_contracts record per contract),
+                                     entity counts, one data.temporal_contracts record per contract;
+                                     unchecked with snapshot_not_ancestor or lineage_unavailable where
+                                     the manifest does not show the model descending from it),
                                      each class
                                      priced into the same single offer on a metered connector. Join
                                      contract: every equality join's coverage, rows and distinct keys
@@ -1125,8 +1129,11 @@ default, or a filter or operator after it is refused. A key naming a location
   whole project unless a default selector in `selectors.yml` narrows it. The
   DuckDB stale-seed refresh above does not run, since the build already
   rebuilds every seed it selects. A failed build keeps `dbt build failed` as
-  its `errors[0]` prefix. `--verify` is unchanged; its row-population checks
-  still skip incremental models.
+  its `errors[0]` prefix. `--verify` compares the rows of each model in
+  `data.full_refresh.models` with its driving parent (#1020), and prices that
+  parent's count in the same estimate. An incremental model this build did not
+  rebuild, one in `not_refreshed` and a microbatch model, which rebuilds only
+  from its `begin`, keep the row-population skip, named in `warnings`.
 - **Every dbt invocation Dex runs on the project writes one artifact directory**
   (#862, #1014). Dex's pinned dbt and a project's own runtime (a CI image, a
   teammate's install, a benchmark grader) used to share `target/`. When their

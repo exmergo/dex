@@ -23,6 +23,12 @@ else is reported, never guessed:
   still compare, since capture order is intact, and the timestamps do not
   (``business_timestamp_unreliable``). A source timestamp that merely equals a
   creation timestamp is not evidence either way, so it is not flagged.
+- A model the manifest does not show descending from the declared snapshot is
+  not measured (``snapshot_not_ancestor``), since its values would be judged
+  against a history it may not read: an agreement would mean nothing, and a
+  mismatch would blame its logic. Unchecked rather than a finding, because a
+  hard-coded relation is invisible to the manifest. A manifest that cannot answer
+  is ``lineage_unavailable``.
 - Hard-delete records are versions that are not observations of the status, so
   a snapshot writing them is not measured (``hard_delete_records``).
 
@@ -61,6 +67,7 @@ _MEASURE_FINDINGS = {
 
 @dataclass(frozen=True)
 class SnapshotNode:
+    unique_id: str
     name: str
     relation: str
     strategy: str | None
@@ -72,11 +79,22 @@ class SnapshotNode:
 
 
 @dataclass(frozen=True)
+class Lineage:
+    #: ``None`` when the manifest cannot answer.
+    descends: bool | None
+    #: The snapshots the model does descend from, by name.
+    other_snapshots: tuple[str, ...] = ()
+    why_unknown: str | None = None
+
+
+@dataclass(frozen=True)
 class HistoryRule:
     #: The contract as declared, or ``None`` when the YAML is malformed.
     history: History | None
     node: SnapshotNode | None
     malformed: str | None = None
+    #: Whether the model descends from the declared snapshot, per the manifest.
+    lineage: Lineage | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +128,7 @@ def snapshot_nodes(nodes: dict[str, Any], project_dir: Path) -> dict[str, Snapsh
         renamed = config.get("snapshot_meta_column_names")
         renamed = renamed if isinstance(renamed, dict) else {}
         out[node["name"].lower()] = SnapshotNode(
+            unique_id=uid,
             name=node["name"],
             relation=strip_relation_quoting(node["relation_name"]),
             strategy=config.get("strategy"),
@@ -121,7 +140,55 @@ def snapshot_nodes(nodes: dict[str, Any], project_dir: Path) -> dict[str, Snapsh
     return out
 
 
-def read_rule(raw: Any, snapshots: dict[str, SnapshotNode]) -> HistoryRule | None:
+def snapshot_lineage(
+    nodes: dict[str, Any], model_uid: str, snapshot_uid: str
+) -> Lineage:
+    """Whether ``model_uid`` descends from the snapshot ``snapshot_uid``.
+
+    By id, because that node is the one measured: a package's snapshot of the same
+    name is a different history. Walks the manifest's ``depends_on.nodes``, so it
+    is free and opens nothing. This is reachability, not column lineage: a snapshot
+    reached only through an unrelated join counts as an ancestor.
+    Finding the snapshot settles it whatever else the walk met. Not finding it
+    only settles it when every model, seed and snapshot on the way could be read;
+    a source has no parents, so it ends a path rather than interrupting one.
+    """
+
+    seen: set[str] = set()
+    pending = [model_uid]
+    others: set[str] = set()
+    gap: str | None = None
+    while pending:
+        uid = pending.pop()
+        if uid in seen:
+            continue
+        seen.add(uid)
+        if uid == snapshot_uid:
+            return Lineage(True)
+        node = nodes.get(uid)
+        if not isinstance(node, dict):
+            if uid.split(".", 1)[0] in ("model", "seed", "snapshot"):
+                gap = gap or f"the manifest does not hold {uid}"
+            continue
+        if node.get("resource_type") == "snapshot":
+            others.add(str(node.get("name") or uid))
+        depends_on = node.get("depends_on")
+        parents = depends_on.get("nodes") if isinstance(depends_on, dict) else None
+        if isinstance(parents, list):
+            pending.extend(str(parent) for parent in parents)
+        elif node.get("resource_type") != "seed":
+            gap = gap or f"the manifest records no dependencies for {uid}"
+    if gap is not None:
+        return Lineage(None, why_unknown=gap)
+    return Lineage(False, other_snapshots=tuple(sorted(others)))
+
+
+def read_rule(
+    raw: Any,
+    snapshots: dict[str, SnapshotNode],
+    nodes: dict[str, Any],
+    model_uid: str,
+) -> HistoryRule | None:
     """A model's ``history`` from repository text. A malformed one stays a rule,
     so an obligation someone wrote reads as unchecked rather than as absent."""
 
@@ -135,7 +202,9 @@ def read_rule(raw: Any, snapshots: dict[str, SnapshotNode]) -> HistoryRule | Non
             for error in exc.errors()
         )
         return HistoryRule(None, None, malformed=f"malformed at: {problems}")
-    return HistoryRule(history, snapshots.get(history.snapshot.lower()))
+    node = snapshots.get(history.snapshot.lower())
+    lineage = snapshot_lineage(nodes, model_uid, node.unique_id) if node else None
+    return HistoryRule(history, node, lineage=lineage)
 
 
 # --- the statement ----------------------------------------------------------------
@@ -180,6 +249,33 @@ def write_probe(
             model,
             "relation_not_found",
             f"the project has no built snapshot named '{history.snapshot}'",
+        )
+        return
+    lineage = rule.lineage
+    if lineage is not None and lineage.descends is False:
+        reads = (
+            f"it descends from {', '.join(lineage.other_snapshots)} instead"
+            if lineage.other_snapshots
+            else "it descends from no snapshot"
+        )
+        _unwritten(
+            prepared,
+            model,
+            "snapshot_not_ancestor",
+            f"the manifest does not show this model descending from the declared "
+            f"snapshot '{node.name}' ({reads}), so its values were not compared "
+            "with that snapshot's history; correct `history.snapshot` or read the "
+            "snapshot through ref()",
+        )
+        return
+    if lineage is None or lineage.descends is None:
+        why = lineage.why_unknown if lineage else "no lineage was read"
+        _unwritten(
+            prepared,
+            model,
+            "lineage_unavailable",
+            f"whether this model descends from the declared snapshot '{node.name}' "
+            f"could not be read ({why})",
         )
         return
     if node.execution in ("error", "fail", "skipped"):

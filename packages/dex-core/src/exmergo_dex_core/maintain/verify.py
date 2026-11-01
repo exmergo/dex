@@ -40,7 +40,7 @@ bounded metadata) alone.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1459,7 +1459,7 @@ def row_population_plan(
     dialect: str,
     *,
     scope: set[str] | None = None,
-    rebuilt_models: set[str] | None = None,
+    recomputed: Collection[str] = (),
 ) -> tuple[list[RowPopulationCheck], list[str], list[str]]:
     """Line every buildable model up against the relation it is built from.
 
@@ -1479,6 +1479,13 @@ def row_population_plan(
     never asked about reads as a gap in the answer it did ask for. Ids rather
     than names, because two versions of one model share a name and a build
     that ran one of them did not run the other.
+
+    ``recomputed`` names, by label, the incremental models this run rebuilt from
+    their parents with ``--full-refresh``, which is the one time an incremental
+    model's row count is a function of its parent's. Only a build knows that, so
+    a caller with no build behind it leaves it empty. A microbatch model stays
+    skipped even so: it rebuilds only from its own ``begin``, so what it holds is
+    still not its whole parent, and nothing in its SQL would say so.
     """
 
     import sqlglot
@@ -1524,6 +1531,7 @@ def row_population_plan(
     uncompiled: list[str] = []
     informational: list[str] = []
     incremental: list[str] = []
+    microbatch: list[str] = []
     generated: list[str] = []
     unfollowable: list[str] = []
     for uid, node in nodes.items():
@@ -1550,21 +1558,25 @@ def row_population_plan(
         )
         if materialized == "ephemeral":
             continue
+        # Ahead of the compiled-SQL check, because dbt's manifest holds no compiled
+        # SQL for a microbatch model however often it built: asking for a compile
+        # would send the caller after an answer that would not change.
+        if materialized in _UNCOMPARABLE_MATERIALIZATIONS:
+            # A label can repeat across packages, and one copy's own setting
+            # decides whether dbt rebuilt that copy.
+            if name not in recomputed or (
+                isinstance(config, dict) and config.get("full_refresh") is False
+            ):
+                incremental.append(name)
+                continue
+            if isinstance(config, dict) and (
+                config.get("incremental_strategy") == "microbatch"
+            ):
+                microbatch.append(name)
+                continue
         if not (isinstance(code, str) and code.strip()):
             uncompiled.append(name)
             continue
-        if materialized in _UNCOMPARABLE_MATERIALIZATIONS:
-            is_rebuilt = bool(
-                rebuilt_models
-                and (
-                    name in rebuilt_models
-                    or uid in rebuilt_models
-                    or name.lower() in {m.lower() for m in rebuilt_models}
-                )
-            )
-            if not is_rebuilt:
-                incremental.append(name)
-                continue
 
         try:
             tree = sqlglot.parse_one(code, read=dialect)
@@ -1616,6 +1628,12 @@ def row_population_plan(
             f"row population was not compared for {', '.join(sorted(incremental))}: "
             "an incremental model holds what previous runs loaded into it, so its "
             "row count is not a function of its parent's"
+        )
+    if microbatch:
+        notes.append(
+            f"row population was not compared for {', '.join(sorted(microbatch))}: "
+            "a full refresh rebuilds a microbatch model only from its `begin`, so "
+            "its row count is not a function of its whole parent's"
         )
     if generated:
         generated_note = "row population was not compared for " + ", ".join(

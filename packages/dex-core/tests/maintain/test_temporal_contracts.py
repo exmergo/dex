@@ -55,6 +55,8 @@ def _run(
     strategy: str = "check",
     hard_deletes: str | None = None,
     run_status: str | None = "success",
+    depends_on: list[str] | None = None,
+    extra_nodes: dict | None = None,
 ):
     """``versions``: (host_id, name, is_super, source_at, valid_from) SQL literals.
     ``answers``: (host_id, changes, latest_at, first_at) SQL literals."""
@@ -93,13 +95,20 @@ def _run(
                 "meta": {"dex": {"history": history or _history()}},
             },
             "columns": {},
+            "depends_on": {
+                "nodes": (
+                    ["snapshot.p.hosts_snapshot"] if depends_on is None else depends_on
+                )
+            },
         },
         "snapshot.p.hosts_snapshot": {
             "name": "hosts_snapshot",
             "resource_type": "snapshot",
             "relation_name": '"warehouse"."main"."hosts_snapshot"',
             "config": snapshot_config,
+            "depends_on": {"nodes": []},
         },
+        **(extra_nodes or {}),
     }
     (target / "manifest.json").write_text(json.dumps({"nodes": nodes}))
     if run_status:
@@ -601,6 +610,7 @@ def test_a_date_measure_compares_at_date_precision(tmp_path):
                         "relation_name": '"warehouse"."main"."host_history"',
                         "config": {"meta": {"dex": {"history": history}}},
                         "columns": {},
+                        "depends_on": {"nodes": ["snapshot.p.hosts_snapshot"]},
                     },
                     "snapshot.p.hosts_snapshot": {
                         "name": "hosts_snapshot",
@@ -623,3 +633,156 @@ def test_a_date_measure_compares_at_date_precision(tmp_path):
         adapter.close()
     assert [f.code for f in result.findings] == []
     assert _assertion(_record(result), "first_target_at")["status"] == "satisfied"
+
+
+# --- whether the model reads the declared snapshot (#1040) --------------------------
+
+
+_FLIP = [
+    (1, "a", "false", "null", "timestamp '2026-01-01'"),
+    (1, "a", "true", "null", "timestamp '2026-01-02'"),
+]
+_RIGHT = [(1, 1, "timestamp '2026-01-02'", "timestamp '2026-01-02'")]
+_WRONG = [(1, 9, "timestamp '2026-01-02'", "timestamp '2026-01-02'")]
+_OTHER_SNAPSHOT = {
+    "snapshot.p.snap_other": {
+        "name": "snap_other",
+        "resource_type": "snapshot",
+        "relation_name": '"warehouse"."main"."hosts_snapshot"',
+        "config": {"strategy": "check"},
+        "depends_on": {"nodes": []},
+    }
+}
+
+
+def _intermediate(materialized: str) -> dict:
+    return {
+        "model.p.stg_hosts": {
+            "name": "stg_hosts",
+            "resource_type": "model",
+            "config": {"materialized": materialized},
+            "depends_on": {"nodes": ["snapshot.p.hosts_snapshot"]},
+        }
+    }
+
+
+@pytest.mark.parametrize("materialized", ["view", "ephemeral"])
+def test_a_model_reading_the_snapshot_through_another_model_is_unaffected(
+    tmp_path, materialized
+):
+    result = _run(
+        tmp_path,
+        _FLIP,
+        _RIGHT,
+        depends_on=["model.p.stg_hosts"],
+        extra_nodes=_intermediate(materialized),
+    )
+    assert _record(result)["status"] == "satisfied"
+
+
+def test_a_model_reading_the_snapshot_directly_is_satisfied(tmp_path):
+    assert _record(_run(tmp_path, _FLIP, _RIGHT))["status"] == "satisfied"
+
+
+def test_a_model_reading_another_snapshot_is_never_satisfied(tmp_path):
+    """Both snapshots hold the same versions, so the counts would agree: without
+    the walk this reads as a clean check of a history the model never read."""
+
+    result = _run(
+        tmp_path,
+        _FLIP,
+        _RIGHT,
+        depends_on=["snapshot.p.snap_other"],
+        extra_nodes=_OTHER_SNAPSHOT,
+    )
+    record = _record(result)
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "snapshot_not_ancestor"
+    assert "hosts_snapshot" in record["reason"] and "snap_other" in record["reason"]
+    assert "measured" not in record, "nothing was measured"
+    assert "hosts_snapshot" in result.suppressed["temporal"]
+
+
+def test_the_wrong_snapshot_does_not_blame_the_models_logic(tmp_path):
+    """Values that disagree with the declared snapshot are no finding here: the
+    model never read it, so a mismatch would send the reader to the wrong place."""
+
+    result = _run(
+        tmp_path,
+        _FLIP,
+        _WRONG,
+        depends_on=["snapshot.p.snap_other"],
+        extra_nodes=_OTHER_SNAPSHOT,
+    )
+    assert _codes(result) == []
+    assert _record(result)["reason_code"] == "snapshot_not_ancestor"
+
+
+def test_a_model_with_no_snapshot_ancestor_says_so(tmp_path):
+    record = _record(_run(tmp_path, _FLIP, _RIGHT, depends_on=[]))
+    assert record["reason_code"] == "snapshot_not_ancestor"
+    assert "no snapshot" in record["reason"]
+
+
+def test_a_missing_intermediate_cannot_answer_and_does_not_pass(tmp_path):
+    record = _record(_run(tmp_path, _FLIP, _RIGHT, depends_on=["model.p.gone"]))
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "lineage_unavailable"
+    assert "model.p.gone" in record["reason"]
+
+
+def test_a_model_with_no_recorded_dependencies_cannot_answer():
+    nodes = {"model.p.m": {"name": "m", "resource_type": "model"}}
+    lineage = temporal_mod.snapshot_lineage(nodes, "model.p.m", "snapshot.p.snap")
+    assert lineage.descends is None and "model.p.m" in (lineage.why_unknown or "")
+
+
+def test_finding_the_snapshot_settles_it_despite_a_gap_elsewhere():
+    nodes = {
+        "model.p.m": {
+            "resource_type": "model",
+            "depends_on": {"nodes": ["model.p.gone", "snapshot.p.SNAP"]},
+        },
+        "snapshot.p.SNAP": {"name": "SNAP", "resource_type": "snapshot"},
+    }
+    lineage = temporal_mod.snapshot_lineage(nodes, "model.p.m", "snapshot.p.SNAP")
+    assert lineage.descends is True
+
+
+def test_a_same_named_snapshot_in_a_package_is_another_history():
+    nodes = {
+        "model.p.m": {
+            "resource_type": "model",
+            "depends_on": {"nodes": ["snapshot.pkg.snap"]},
+        },
+        "snapshot.pkg.snap": {
+            "name": "snap",
+            "resource_type": "snapshot",
+            "depends_on": {"nodes": []},
+        },
+    }
+    lineage = temporal_mod.snapshot_lineage(nodes, "model.p.m", "snapshot.p.snap")
+    assert lineage.descends is False and lineage.other_snapshots == ("snap",)
+
+
+def test_a_source_ends_a_path_and_a_cycle_ends_the_walk():
+    nodes = {
+        "model.p.a": {
+            "resource_type": "model",
+            "depends_on": {"nodes": ["model.p.b", "source.p.raw.t"]},
+        },
+        "model.p.b": {
+            "resource_type": "model",
+            "depends_on": {"nodes": ["model.p.a", "seed.p.s"]},
+        },
+        "seed.p.s": {"resource_type": "seed", "name": "s"},
+    }
+    lineage = temporal_mod.snapshot_lineage(nodes, "model.p.a", "snapshot.p.snap")
+    assert lineage.descends is False and lineage.other_snapshots == ()
+
+
+def test_an_undeclared_snapshot_stays_relation_not_found(tmp_path):
+    record = _record(
+        _run(tmp_path, _FLIP, _RIGHT, _history(snapshot="nope"), depends_on=[])
+    )
+    assert record["reason_code"] == "relation_not_found"

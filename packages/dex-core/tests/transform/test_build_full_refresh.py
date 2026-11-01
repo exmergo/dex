@@ -427,3 +427,68 @@ def test_a_model_that_keeps_its_batch_filter_is_still_an_upper_bound(
     )
     assert rc == 0
     assert set(envelope["data"]["upper_bounds"]) == {"stg_events"}
+
+
+def test_the_billed_verify_pricing_is_told_what_the_refresh_rebuilds(
+    bigquery_project_dir: Path,  # noqa: F811 -- the fixture imported above
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    """The wiring #1020 depends on: the count of a rebuilt model's parent has to
+    reach the one estimate the caller confirms."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=1000.0,
+        per_node={"events": 1000.0},
+        confirmed=False,
+        ceiling=10_000_000_000,
+    )
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    verify_module = importlib.import_module("exmergo_dex_core.transform.verify")
+    monkeypatch.setattr(
+        build_module,
+        "compile_estimate",
+        lambda *a, **k: (1000.0, {"events": 1000.0}, []),
+    )
+    monkeypatch.setattr(
+        build_module, "compiled_model_ids", lambda *a: {"model.p.events"}
+    )
+    monkeypatch.setattr(
+        build_module,
+        "full_refresh_nodes",
+        lambda _dir: {"models": ["events"], "seeds": [], "not_refreshed": []},
+    )
+    seen: dict = {}
+
+    def spy(_adapter, _project, *, scope, recomputed=()):
+        seen["recomputed"] = list(recomputed)
+        return 0.0, []
+
+    monkeypatch.setattr(verify_module, "price_verification", spy)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--select",
+            "events",
+            "--full-refresh",
+            "--verify",
+            "--budget",
+            "10000000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert seen["recomputed"] == ["events"]

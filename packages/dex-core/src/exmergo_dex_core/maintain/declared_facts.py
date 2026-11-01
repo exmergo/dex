@@ -203,6 +203,8 @@ def plan(
         history = temporal_mod.read_rule(
             model_dex.get("history") if isinstance(model_dex, dict) else None,
             snapshots,
+            nodes,
+            uid,
         )
         if not (units or additive or filters or grain or parent or history):
             continue
