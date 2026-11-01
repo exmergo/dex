@@ -156,6 +156,24 @@ def test_exact_distinct_counts_skips_a_degraded_column(fake_trino_connection):
     assert all('"tags"' not in sql for sql in statements)
 
 
+def test_exact_distinct_counts_keeps_a_comparable_binary_column(fake_trino_connection):
+    """A binary hash can be a declared grain, and Trino can count it."""
+
+    fake_trino_connection.tables.append(
+        FakeTrinoTable(
+            catalog="memory",
+            schema="shop",
+            name="files",
+            columns=[("hash", "varbinary", True)],
+        )
+    )
+    fake_trino_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 50, "d_0": 49}]
+    )
+    adapter = make_adapter(fake_trino_connection)
+    assert adapter.exact_distinct_counts("memory.shop.files", ["hash"]) == {"hash": 49}
+
+
 def test_exact_distinct_counts_runs_nothing_for_only_degraded_columns(
     fake_trino_connection,
 ):

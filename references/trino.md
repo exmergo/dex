@@ -35,7 +35,7 @@ Configure each source in Trino first, then include its catalog or schema in
 See [Trino's connector catalog](https://trino.io/docs/current/connector.html)
 for other sources, including Iceberg, Hive, and Delta Lake.
 
-Use `connector: trino` and [Trino credentials](#authentication-discover-dont-ask)
+Use `connector: trino` and the Trino credentials under Authentication below
 in Dex. Trino manages the underlying database connections. Access and available
 operations depend on your Trino version, catalog configuration, type mappings,
 and permissions. The [Dex integration suite](#testing) covers the catalogs named

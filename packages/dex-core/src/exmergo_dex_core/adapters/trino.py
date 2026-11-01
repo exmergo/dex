@@ -199,6 +199,17 @@ def is_degraded_type(data_type: str) -> bool:
     return data_type.strip().lower().startswith(_DEGRADED_TYPE_PREFIXES)
 
 
+def counts_exactly(data_type: str) -> bool:
+    """Whether the exact-count pass may read a Trino column of this type.
+
+    ``varbinary`` is degraded for profiling but comparable, so a binary hash
+    declared as a grain can still be checked for duplicates.
+    """
+
+    declared = data_type.strip().lower()
+    return declared.startswith("varbinary") or not is_degraded_type(declared)
+
+
 # The table arguments that turn a read of a table into a read of its past; the
 # same node shapes the query firewall refuses for agent SQL.
 _HISTORICAL_READ_ARGS = ("version", "when", "changes")
@@ -1095,10 +1106,11 @@ class TrinoAdapter:
         extra scan, return nothing and let uniqueness verdicts stay approximate.
         A metered adapter never self-escalates past its ceiling.
 
-        Degraded columns are skipped, not counted: the engine also sends columns
-        with no distinct count at all, which is what a degraded column reports,
-        and one Trino cannot count would fail the whole statement. A column the
-        inventory does not know is kept, since its type cannot be proven degraded.
+        Degraded columns are skipped, not counted, except a comparable binary
+        one: the engine also sends columns with no distinct count at all, which
+        is what a degraded column reports, and one Trino cannot count would fail
+        the whole statement. A column the inventory does not know is kept, since
+        its type cannot be proven degraded.
         """
 
         if not columns:
@@ -1106,9 +1118,7 @@ class TrinoAdapter:
         _meta, table_columns = self.table_metadata(identifier)
         types = {col.name: col.data_type for col in table_columns}
         columns = [
-            name
-            for name in columns
-            if name not in types or not is_degraded_type(types[name])
+            name for name in columns if name not in types or counts_exactly(types[name])
         ]
         if not columns:
             return {}

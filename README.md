@@ -106,7 +106,8 @@ guardrails enforced in the engine.
 
 ## Try it in three commands
 
-No existing database, no credentials, no cloud account, no network.
+No existing database, no credentials, no cloud account, and no network once the
+package is installed.
 
 ```bash
 pip install "exmergo-dex-core[duckdb]"
@@ -224,10 +225,10 @@ baseline needed.
 | <img src="https://www.exmergo.com/connectors/bigquery.png" width="20" height="20" alt=""> [**BigQuery**](https://docs.exmergo.com/dex/connectors/bigquery) | Cloud warehouse | ❌ | `bigquery` | Bytes scanned | Application Default Credentials |
 | <img src="https://www.exmergo.com/connectors/databricks.png" width="20" height="20" alt=""> [**Databricks**](https://docs.exmergo.com/dex/connectors/databricks) | Lakehouse via SQL endpoint | ❌ | `databricks` | Warehouse-seconds, with DBUs | `databricks auth login`, `DATABRICKS_*` env, or a dbt profile |
 | <img src="https://www.exmergo.com/connectors/redshift.png" width="20" height="20" alt=""> [**Amazon Redshift**](https://docs.exmergo.com/dex/connectors/redshift) | Cloud warehouse, Serverless-first | ❌ | `redshift` | Compute-seconds, with RPU-hours | The AWS credential chain or `REDSHIFT_*` env |
-| <img src="https://www.exmergo.com/connectors/postgresql.png" width="20" height="20" alt=""> [**Postgres**](https://docs.exmergo.com/dex/connectors/postgres) | Operational database | ✅ | `postgres` | Database-seconds | `pg_service.conf`, `DATABASE_URL`, `PG*` env, or a dbt profile<br>Also works with <img src="assets/supabase-logo.png" width="20" height="20" alt=""> [Supabase](https://supabase.com/), <img src="assets/neon-logo.png" width="20" height="20" alt=""> [Neon](https://neon.com/), and [more](references/postgres.md#managed-postgres-platforms) |
+| <img src="https://www.exmergo.com/connectors/postgresql.png" width="20" height="20" alt=""> [**Postgres**](https://docs.exmergo.com/dex/connectors/postgres) | Operational database | ✅ | `postgres` | Database-seconds | `pg_service.conf`, `DATABASE_URL`, `PG*` env, or a dbt profile<br>Also works with <img src="assets/supabase-logo.png" width="20" height="20" alt=""> [Supabase](https://supabase.com/), <img src="assets/neon-logo.png" width="20" height="20" alt=""> [Neon](https://neon.com/), and [more managed Postgres platforms](references/postgres.md#managed-postgres-platforms) |
 | <img src="https://www.exmergo.com/connectors/duckdb.png" width="20" height="20" alt=""> [**DuckDB**](https://docs.exmergo.com/dex/connectors/duckdb) | Embedded analytical | ✅ | `duckdb` | Free and local | None, just a file path |
 | <img src="https://www.exmergo.com/connectors/clickhouse.png" width="20" height="20" alt=""> [**ClickHouse**](https://docs.exmergo.com/dex/connectors/clickhouse) | Analytical database | ✅ | `clickhouse` | Compute-seconds on Cloud, database-seconds self-hosted | `CLICKHOUSE_URL`, `CLICKHOUSE_*` env, or a dbt profile |
-| <img src="https://www.exmergo.com/connectors/trino.png" width="20" height="20" alt=""> [**Trino**](https://docs.exmergo.com/dex/connectors/trino) | Federated query engine | ✅ | `trino` | Cluster-seconds| `TRINO_URL`, `TRINO_*` env, or a dbt profile<br>Also works with: <img src="assets/mysql-logo.png" width="20" height="20" alt=""> MySQL, <img src="assets/sqlserver-logo.png" width="20" height="20" alt=""> SQL Server, <img src="assets/mongodb-logo.png" width="20" height="20" alt=""> MongoDB, and [more](references/trino.md#databases-through-configured-catalogs)  |
+| <img src="https://www.exmergo.com/connectors/trino.png" width="20" height="20" alt=""> [**Trino**](https://docs.exmergo.com/dex/connectors/trino) | Federated query engine | ✅ | `trino` | Cluster-seconds| `TRINO_URL`, `TRINO_*` env, or a dbt profile<br>Also works with: <img src="assets/mysql-logo.png" width="20" height="20" alt=""> MySQL, <img src="assets/sqlserver-logo.png" width="20" height="20" alt=""> SQL Server, <img src="assets/mongodb-logo.png" width="20" height="20" alt=""> MongoDB, and [more databases through Trino catalogs](references/trino.md#databases-through-configured-catalogs)  |
 
 Credentials are discovered and never enter the agent's context.
 Every scan is estimated, confirmed, and capped server-side, and settled spend is

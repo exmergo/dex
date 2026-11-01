@@ -24,8 +24,8 @@ Use the same `postgres` connector with these platforms' PostgreSQL services:
 - [Aiven for PostgreSQL](https://aiven.io/docs/products/postgresql/howto/list-code-samples)
 
 Set `connector: postgres` and supply the service's PostgreSQL connection details
-through [the credential sources below](#authentication-discover-dont-ask), such
-as `DATABASE_URL`. The endpoint must be reachable from the machine running Dex;
+through the credential sources under Authentication below, such as
+`DATABASE_URL`. The endpoint must be reachable from the machine running Dex;
 keep the provider's required TLS settings in the connection details. Use a direct
 connection or a session pool that preserves session settings across statements,
 since Dex sets read-only mode and statement timeouts on the connection.
