@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "account_event_rate"
+  ],
+  "prompt": "Build the `account_event_rate` mart described in models/marts/_marts.yml, with `event_count` and `events_per_day` (`event_count` / 30.0). Build it on dev when you are done."
+}

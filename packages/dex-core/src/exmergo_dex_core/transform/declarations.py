@@ -281,6 +281,13 @@ def _check(
                 _check_parent(model, declaration, parent, produced, files, view)
             )
 
+    if declaration.history is not None:
+        warnings.extend(
+            _check_history(
+                model, declaration, produced, files, view, cache, pii_overrides
+            )
+        )
+
     declared_columns = _declared_column_roles(files, declaration.model)
     declared_columns.update(name.lower() for name in declaration.columns)
     warnings.extend(_partial_intent(declaration, produced, declared_columns))
@@ -376,25 +383,132 @@ def _check_parent(
     return []
 
 
+def _check_history(
+    model: str,
+    declaration: Declaration,
+    produced: set[str] | None,
+    files: Mapping[str, str],
+    view: DbtProjectView,
+    cache: Any,
+    pii_overrides: Any,
+) -> list[str]:
+    """Validate a ``history`` block (#1027): a real snapshot, output columns the
+    model produces, and a target that is safe to commit. A policy left out is a
+    warning, since it is intent still owed rather than a malformed statement."""
+
+    history = declaration.history
+    if history is None:  # pragma: no cover - the caller only passes a history
+        return []
+    if not snapshot_defined(files, history.snapshot, view.snapshot_paths):
+        raise DeclarationError(
+            f"'{model}' declares history from '{history.snapshot}', and the project "
+            "has no snapshot by that name; a temporal contract is verified against "
+            "a dbt snapshot's versions"
+        )
+    measures = history.measures
+    named = [
+        *history.entity,
+        *(
+            column
+            for column in (
+                measures.transition_count,
+                measures.latest_target_transition_at,
+                measures.first_target_at,
+            )
+            if column is not None
+        ),
+    ]
+    if produced is not None:
+        unknown = [c for c in named if c.lower() not in produced]
+        if unknown:
+            raise DeclarationError(
+                f"'{model}' declares history column(s) {', '.join(unknown)} that its "
+                "SELECT list does not produce; `entity` keys and `measures` name "
+                "output columns of the model"
+            )
+    try:
+        _check_filters(
+            model,
+            Population(
+                filters=[
+                    PopulationFilter(
+                        column=history.status.column,
+                        includes=[history.status.target],
+                    )
+                ]
+            ),
+            cache,
+            pii_overrides,
+        )
+    except DeclarationError as exc:
+        raise DeclarationError(
+            f"'{model}' declares history on status column "
+            f"'{history.status.column}', whose target would be committed to git, "
+            f"and the column looks like personal data: {exc}"
+        ) from exc
+
+    owed: list[str] = []
+    if history.initial_observation is None:
+        owed.append("initial_observation (`baseline` or `transition`)")
+    if history.null_status is None:
+        owed.append("null_status (`ignore` or `state`)")
+    if history.population is None:
+        owed.append("population (`ever_target` or `all_observed`)")
+    timed = measures.latest_target_transition_at or measures.first_target_at
+    if timed and (history.time is None or history.time.provenance is None):
+        owed.append("time, with its provenance (`business` or `capture`)")
+    if owed:
+        return [
+            f"'{model}' declares history without stating {', '.join(owed)}; Dex "
+            "assumes no temporal policy, so verification reports what depends on "
+            "it as unchecked"
+        ]
+    return []
+
+
 def _is_seed_or_snapshot(
     files: Mapping[str, str], view: DbtProjectView, name: str
 ) -> bool:
     seed_roots = [PurePosixPath(p) for p in view.seed_paths]
-    snapshot_roots = [PurePosixPath(p) for p in view.snapshot_paths]
-    for path, content in files.items():
+    for path in files:
         candidate = PurePosixPath(path)
-        is_seed = (
+        if (
             candidate.suffix == ".csv"
             and candidate.stem == name
             and any(root in candidate.parents for root in seed_roots)
-        )
-        is_snapshot = (
-            candidate.suffix == ".sql"
-            and any(root in candidate.parents for root in snapshot_roots)
-            and re.search(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}", content)
-        )
-        if is_seed or is_snapshot:
+        ):
             return True
+    return snapshot_defined(files, name, view.snapshot_paths)
+
+
+def snapshot_defined(
+    files: Mapping[str, str], name: str, snapshot_paths: Iterable[str] | None = None
+) -> bool:
+    """Whether the project defines a snapshot called ``name``: a ``{% snapshot %}``
+    block (under ``snapshot_paths``, where given), or a ``snapshots:`` entry in a
+    YAML file, which is how dbt 1.9 and later define one."""
+
+    roots = (
+        None if snapshot_paths is None else [PurePosixPath(p) for p in snapshot_paths]
+    )
+    block = re.compile(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}")
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if candidate.suffix == ".sql":
+            placed = roots is None or any(r in candidate.parents for r in roots)
+            if placed and block.search(content):
+                return True
+        elif candidate.suffix in (".yml", ".yaml") and "snapshots" in content:
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError:
+                continue
+            entries = parsed.get("snapshots") if isinstance(parsed, dict) else None
+            if any(
+                isinstance(entry, dict) and entry.get("name") == name
+                for entry in (entries if isinstance(entries, list) else [])
+            ):
+                return True
     return False
 
 
@@ -594,6 +708,10 @@ def _model_dex(declaration: Declaration) -> dict[str, Any]:
             assumption.model_dump(mode="json", exclude_none=True)
             for assumption in declaration.assumptions
         ]
+    if declaration.history is not None:
+        dex["history"] = declaration.history.model_dump(
+            mode="json", exclude_none=True, exclude_defaults=True
+        )
     return dex
 
 

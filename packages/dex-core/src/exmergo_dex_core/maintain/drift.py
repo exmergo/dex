@@ -462,6 +462,7 @@ def transform_drift(
 #: cannot tell how much it matters.
 _DECLARATION_WEIGHT = {
     "population": "high",
+    "history": "high",
     "grain": "high",
     "additivity": "high",
     "unit": "high",

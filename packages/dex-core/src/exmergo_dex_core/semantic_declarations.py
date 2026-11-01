@@ -128,6 +128,88 @@ class Population(_Strict):
     parent: PopulationParent | None = None
 
 
+class InitialObservation(str, Enum):
+    # The first observation establishes where an entity starts; nothing changed.
+    BASELINE = "baseline"
+    # A first observation at the target counts as a transition into it. This
+    # assumes a prior non-target state, so it applies only when selected.
+    TRANSITION = "transition"
+
+
+class NullStatus(str, Enum):
+    # A version with a NULL status is not an observation of the status.
+    IGNORE = "ignore"
+    # NULL is a state of its own, so moving into or out of it is a change.
+    STATE = "state"
+
+
+class HistoryPopulation(str, Enum):
+    EVER_TARGET = "ever_target"
+    ALL_OBSERVED = "all_observed"
+
+
+class TimeProvenance(str, Enum):
+    # A timestamp the source system recorded for the business event.
+    BUSINESS = "business"
+    # The time the snapshot observed the change.
+    CAPTURE = "capture"
+
+
+class HistoryStatus(_Strict):
+    column: str
+    target: str | int | float | bool
+
+
+class HistoryTime(_Strict):
+    column: str
+    provenance: TimeProvenance | None = None
+
+
+class HistoryMeasures(_Strict):
+    """The model's output columns the declared policy gives an expected value for."""
+
+    transition_count: str | None = None
+    latest_target_transition_at: str | None = None
+    first_target_at: str | None = None
+
+
+class History(_Strict):
+    """The temporal contract of a model derived from a snapshot's status history
+    (#1027). One output row per entity, against versions the snapshot recorded.
+
+    Only ``snapshot``, ``entity`` and ``status`` are required. A policy left out
+    is intent still owed: planning warns and verification reports what depends
+    on it as unchecked, because no policy is ever assumed on the author's behalf.
+    """
+
+    snapshot: str
+    #: {<output column>: <snapshot column>}, in the order the key is written.
+    entity: dict[str, str]
+    status: HistoryStatus
+    initial_observation: InitialObservation | None = None
+    null_status: NullStatus | None = None
+    population: HistoryPopulation | None = None
+    time: HistoryTime | None = None
+    measures: HistoryMeasures = HistoryMeasures()
+
+    @field_validator("snapshot")
+    @classmethod
+    def _snapshot_named(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name the snapshot the history is read from")
+        return value.strip()
+
+    @field_validator("entity")
+    @classmethod
+    def _entity_pairs(cls, value: dict[str, str]) -> dict[str, str]:
+        if not value or any(not k.strip() or not v.strip() for k, v in value.items()):
+            raise ValueError(
+                "map each output key column to the snapshot column it carries, as "
+                "{<output column>: <snapshot column>}"
+            )
+        return {k.strip(): v.strip() for k, v in value.items()}
+
+
 class ColumnDeclaration(_Strict):
     role: Role | None = None
     description: str | None = None
@@ -154,6 +236,7 @@ class Declaration(_Strict):
     population: Population | None = None
     columns: dict[str, ColumnDeclaration] = {}
     assumptions: list[Assumption] = []
+    history: History | None = None
 
 
 # --- reading the payload ------------------------------------------------------
@@ -218,6 +301,10 @@ def declared_shape(declaration: Declaration) -> dict[str, Any]:
             a.model_dump(mode="json", exclude_none=True)
             for a in declaration.assumptions
         ]
+    if declaration.history is not None:
+        out["history"] = declaration.history.model_dump(
+            mode="json", exclude_none=True, exclude_defaults=True
+        )
     columns = {
         name: column.model_dump(mode="json", exclude_none=True)
         for name, column in declaration.columns.items()
@@ -235,7 +322,7 @@ def declared_shape(declaration: Declaration) -> dict[str, Any]:
 DEX_META_KEY = "dex"
 
 #: Model-level fields a declaration may state.
-MODEL_FIELDS = ("description", "grain", "population", "assumptions")
+MODEL_FIELDS = ("description", "grain", "population", "assumptions", "history")
 
 #: Column-level fields a declaration may state.
 COLUMN_FIELDS = (

@@ -24,6 +24,9 @@ relation dbt built, with one aggregate statement per relation:
   stated as distinct-key counts. A ``population.filters`` entry whose column the
   parent also has is applied to the parent first, so a parent the declaration
   excludes is counted as excluded rather than missing.
+- **Temporal contract** (#1027). A ``history`` block states how a model reads a
+  snapshot's versions. :mod:`~.temporal_contracts` derives each entity's expected
+  values from the snapshot and that policy and counts the disagreements.
 - **Grain**, on the build path only. `maintain verify` checks a declared grain
   through its own grain axis, where the declaration is the first of four
   sources (:func:`~.verify.grain_plan`); a build's sweep folds a declared grain
@@ -52,10 +55,11 @@ from ..cache import match_identifier
 from ..dbt_project import manifest_node_label, strip_relation_quoting
 from ..errors import WarehouseQueryError
 from ..guards.pii_meta import entry_meta
+from . import temporal_contracts as temporal_mod
 from .drift import DriftFinding
 
 #: The declared-fact finding classes this module owns, as `suppressed` names them.
-CLASSES = ("unit", "additivity", "population", "parent_population")
+CLASSES = ("unit", "additivity", "population", "parent_population", "temporal")
 
 #: The units this module can check. Anything else (``currency:EUR``, ``count``,
 #: a plain unit) has no range to check against.
@@ -105,6 +109,7 @@ class DeclaredModel:
     #: The manifest's declared ``data_type`` per lowered column, where one is.
     declared_types: tuple[tuple[str, str], ...] = ()
     parent: ParentRule | None = None
+    history: temporal_mod.HistoryRule | None = None
 
     def declares(self, finding_class: str) -> bool:
         return bool(
@@ -113,6 +118,7 @@ class DeclaredModel:
                 "additivity": self.additive,
                 "population": self.filters,
                 "parent_population": self.parent,
+                "temporal": self.history,
             }[finding_class]
         )
 
@@ -166,6 +172,8 @@ def plan(
                 node["name"].lower(), strip_relation_quoting(node["relation_name"])
             )
 
+    snapshots = temporal_mod.snapshot_nodes(nodes, project_dir)
+
     models: list[DeclaredModel] = []
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
@@ -191,7 +199,12 @@ def plan(
             if stated_parent is not None
             else None
         )
-        if not (units or additive or filters or grain or parent):
+        model_dex = entry_meta(node).get("dex")
+        history = temporal_mod.read_rule(
+            model_dex.get("history") if isinstance(model_dex, dict) else None,
+            snapshots,
+        )
+        if not (units or additive or filters or grain or parent or history):
             continue
         models.append(
             DeclaredModel(
@@ -206,6 +219,7 @@ def plan(
                 unique_tested=frozenset(unique_tested.get(uid, set())),
                 declared_types=types,
                 parent=parent,
+                history=history,
             )
         )
     return sorted(models, key=lambda m: m.model), []
@@ -304,10 +318,19 @@ class _Probe:
     parent_identifier: str | None = None
     parent_filters_applied: list[str] = field(default_factory=list)
     parent_filters_unapplied: list[str] = field(default_factory=list)
+    #: The temporal contract's statement (#1027) and what it measured.
+    temporal: temporal_mod.Written | None = None
 
     def statements(self) -> list[str]:
         return [
-            s for s in (self.aggregate_sql, self.cumulative_sql, self.parent_sql) if s
+            s
+            for s in (
+                self.aggregate_sql,
+                self.cumulative_sql,
+                self.parent_sql,
+                self.temporal.sql if self.temporal else None,
+            )
+            if s
         ]
 
 
@@ -329,6 +352,10 @@ class Prepared:
     #: Every model in scope that declares a parent population, so each one gets
     #: a record whether or not a statement could be written for it.
     parent_models: list[DeclaredModel] = field(default_factory=list)
+    #: Every model in scope that declares a temporal contract (#1027).
+    temporal_models: list[DeclaredModel] = field(default_factory=list)
+    #: Each contract no statement could be written for, with why (#1027).
+    temporal_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def statements(self) -> list[str]:
         return [s for probe in self.probes for s in probe.statements()]
@@ -370,6 +397,7 @@ def prepare(
         )
         prepared.dropped[finding_class] = []
     prepared.parent_models = [m for m in models if m.parent is not None]
+    prepared.temporal_models = [m for m in models if m.history is not None]
 
     for model in models:
         if live_identifiers is None:
@@ -413,7 +441,9 @@ def prepare(
         )
         if model.parent is not None:
             _parent_probe(adapter, probe, live, live_identifiers, prepared)
-        if probe.aggregate_sql or probe.cumulative_sql or probe.parent_sql:
+        if model.history is not None:
+            temporal_mod.write_probe(adapter, probe, live, live_identifiers, prepared)
+        if probe.statements():
             prepared.probes.append(probe)
     return prepared
 
@@ -896,6 +926,8 @@ class DeclaredFactsResult:
     #: declaration, the counts, and a status, so a clean check is visible as
     #: evidence rather than as an absent finding.
     parent_coverage: list[dict] = field(default_factory=list)
+    #: One record per declared temporal contract, measured or not (#1027).
+    temporal_contracts: list[dict] = field(default_factory=list)
 
 
 def nothing_declared(finding_class: str, where: str) -> str:
@@ -906,6 +938,7 @@ def nothing_declared(finding_class: str, where: str) -> str:
             f"no model {where} declares population filters with includes or excludes"
         ),
         "parent_population": f"no model {where} declares a population.parent",
+        "temporal": f"no model {where} declares a history temporal contract",
     }[finding_class]
 
 
@@ -957,6 +990,7 @@ def findings(
                 )
             result.offer = offer
             _unchecked_parents(prepared, result, "scan_offered", reason)
+            temporal_mod.record_unmeasured(prepared, result, "scan_offered", reason)
             return result
 
     checked: dict[str, int] = dict.fromkeys(CLASSES, 0)
@@ -987,6 +1021,10 @@ def findings(
                 )
         if probe.parent_sql:
             _run_parent(adapter, probe, result, checked, prepared, timeout_seconds)
+        if probe.temporal is not None:
+            temporal_mod.run_probe(
+                adapter, probe, result, checked, prepared, timeout_seconds
+            )
         if probe.cumulative is not None:
             try:
                 fractions = cumulative_mod.measure_fractions(
@@ -1010,6 +1048,7 @@ def findings(
                 _judge_additivity(probe, fractions, result, checked, prepared)
 
     _unchecked_parents(prepared, result, "not_measured", None)
+    temporal_mod.record_unmeasured(prepared, result, "not_measured", None)
     for finding_class in CLASSES:
         if finding_class in result.suppressed:
             continue

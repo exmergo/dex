@@ -126,8 +126,8 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Five fixture projects, written for this suite and derived from no benchmark task,
-with seven tasks phrased the way users ask:
+Six fixture projects, written for this suite and derived from no benchmark task,
+with eleven tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
 |---|---|---|
@@ -138,6 +138,10 @@ with seven tasks phrased the way users ask:
 | `composite_grain` | build `store_daily_stock` | a two-column grain, a stock balance that is `semi_additive`, a distinct count that is `non_additive` |
 | `parent_zero_children` | build `account_ticket_summary` | driven from accounts with tickets left-joined, so every account survives with a count of zero and orphan tickets stay out |
 | `parent_zero_children` | fix the same model ("accounts are missing") | the same, starting from a model driven from the child table |
+| `attribution_population` | `explicit_include`: "include accounts with zero events" | the choice attributed to `request`, and those accounts present |
+| `attribution_population` | `explicit_exclude`: "leave out accounts with zero events" | the choice attributed to `request`, and those accounts absent |
+| `attribution_population` | `ambiguous`: "the event rate per account" | the choice labelled `default`; either population passes |
+| `attribution_population` | `contract`: a terse request, with the population in `_marts.yml` | the choice attributed to `contract`, and the declared population built |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -162,6 +166,13 @@ starting state) and a `reference/` overlay (a correct answer).
 - **Checks** (0 to 1, per task): SQL over the built relation, such as "every
   account is present" or "shares sum to 1". They catch a right declaration on
   wrong SQL.
+- **Attribution** (0 to 1, only on tasks that grade it, `-` otherwise): whether
+  every assumption about the decision the task turns on carries the tier that
+  actually settled it (#1026). It is graded apart from correctness and checks, so
+  a preferred population cannot buy back an overclaimed label, nor the reverse.
+  Only the tier is read: a `detail` quoting ambiguous wording earns nothing. No
+  matching assumption fails, and so does recording more than `max_assumptions`
+  entries, since every implementation detail is not a decision.
 - A task where the agent touched none of the models it was asked for scores 0 on
   every axis (`no_models`), never a vacuous 1.
 
@@ -196,7 +207,15 @@ so a dex plugin installed on the machine cannot stand in for the candidate, and
 it records which plugins actually loaded, the commit, the engine version, the
 procedure's digest and the Claude Code version in `report.json`'s `provenance`.
 Each task is capped by `--max-budget-usd` (default 5) and `--max-turns`
-(default 50). `--fixture` and `--task` narrow the run; `--score-only <workspace>
+(default 50). `--procedure-file <file>` gives the agent that text instead of the
+engine's procedure, to measure a baseline against an older one. `provenance` then
+says `procedure_source: file` and carries that text's digest. A baseline also needs `--plugin-dir <dir>`, an export of the
+older skills, because each skill carries a copy of the procedure. Put
+`packages/dex-core` beside the exported `skills/` too (a symlink to the candidate
+will do): the skill wrapper uses a local engine only if it finds one there, and
+otherwise installs the pinned release, so the two arms would differ in engine as
+well as in text. Run arms one after another, not at once: agents write scratch
+payloads to shared paths such as `/tmp/edits.json`. `--fixture` and `--task` narrow the run; `--score-only <workspace>
 --task <fixture/task>` re-scores a workspace a run left behind.
 
 The release threshold for completeness and correctness is set from the first

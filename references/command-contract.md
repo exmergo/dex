@@ -481,7 +481,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      detector reads as a running total), population_contradicted (an
                                      excluded value still present, as a count), parent_population_missing
                                      and parent_population_unexpected (a declared population.parent's
-                                     keys against the model's, as distinct-key counts), each class
+                                     keys against the model's, as distinct-key counts), temporal_* (a
+                                     declared history contract against the snapshot's versions, as
+                                     entity counts, one data.temporal_contracts record per contract),
+                                     each class
                                      priced into the same single offer on a metered connector. Join
                                      contract: every equality join's coverage, rows and distinct keys
                                      apart, one data.join_coverage record per join (satisfied,
@@ -493,7 +496,7 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      to compile is reported first and suppresses every other check;
                                      data.suppressed names each finding class that did not run and why,
                                      declared-fact classes (unit, additivity, population,
-                                     parent_population) included
+                                     parent_population, temporal) included
 ```
 
 ### How authored content reaches the engine
@@ -1234,9 +1237,11 @@ default, or a filter or operator after it is refused. A key naming a location
   single-column declared grain renders as a `unique` test, which the build
   itself runs, and `null_rule: never` renders as `not_null`, so neither is
   checked twice. A declared `population.parent` is held to the parent's keys
-  (`parent_population_missing`, `parent_population_unexpected`, #857). Every
-  class that did not run is named in `suppressed` (`grain`, `unit`,
-  `additivity`, `population`, `parent_population`).
+  (`parent_population_missing`, `parent_population_unexpected`, #857), and a
+  declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
+  per contract under `data.verification.temporal_contracts`). Every class that
+  did not run is named in `suppressed` (`grain`, `unit`, `additivity`,
+  `population`, `parent_population`, `temporal`).
 
   **Join coverage.** Every equality join the built models write is measured as
   `maintain verify` measures it (#857), with one record per join under

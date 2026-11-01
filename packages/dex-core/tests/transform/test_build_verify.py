@@ -1270,3 +1270,75 @@ def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
     assert any("subscriptions failed or were skipped" in w for w in result.warnings), (
         result.warnings
     )
+
+
+def test_a_build_holds_a_status_history_to_its_declared_policy(tmp_path: Path):
+    """The build path reports a temporal contract, keeping the snapshot's own
+    success apart from the history claim that is still wrong (#1027)."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "create table hosts_snapshot as select * from (values "
+        "(1, true, timestamp '2026-01-01')) t(host_id, is_super, dbt_valid_from)"
+    )
+    # A first observation at the target, counted as a change it never made.
+    conn.execute("create table host_history as select 1 as host_id, 1 as changes")
+    conn.close()
+    _artifacts(
+        tmp_path,
+        nodes={
+            "snapshot.p.hosts_snapshot": {
+                "name": "hosts_snapshot",
+                "resource_type": "snapshot",
+                "relation_name": '"wh"."main"."hosts_snapshot"',
+                "config": {"strategy": "check"},
+            },
+            "model.p.host_history": {
+                "name": "host_history",
+                "resource_type": "model",
+                "relation_name": '"wh"."main"."host_history"',
+                "compiled_code": 'select * from "wh"."main"."hosts_snapshot"',
+                "config": {
+                    "materialized": "table",
+                    "meta": {
+                        "dex": {
+                            "history": {
+                                "snapshot": "hosts_snapshot",
+                                "entity": {"host_id": "host_id"},
+                                "status": {"column": "is_super", "target": True},
+                                "initial_observation": "baseline",
+                                "null_status": "ignore",
+                                "measures": {"transition_count": "changes"},
+                            }
+                        }
+                    },
+                },
+                "columns": {},
+            },
+        },
+        results=[
+            {"unique_id": "snapshot.p.hosts_snapshot", "status": "success"},
+            {"unique_id": "model.p.host_history", "status": "success"},
+        ],
+    )
+
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.host_history")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    assert "temporal_transition_count_mismatch" in {f.code for f in result.findings}
+    (record,) = result.payload()["temporal_contracts"]
+    assert record["status"] == "contradicted"
+    assert record["snapshot_execution"]["status"] == "success"

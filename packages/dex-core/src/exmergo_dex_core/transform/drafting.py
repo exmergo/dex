@@ -44,7 +44,7 @@ from ..cache import (
     match_identifier,
 )
 from ..guards.pii_meta import entry_meta
-from .declarations import DEX_META_KEY, model_sql_path
+from .declarations import DEX_META_KEY, model_sql_path, snapshot_defined
 
 if TYPE_CHECKING:
     from ..references import ReferenceIndex
@@ -219,6 +219,16 @@ def draft(
             grain_judged=any(c["check"] == "grain" for c in found or []),
         )
         model_warnings.extend(_literal_warnings(model, reading, cache))
+        if not declared.get("history") and _reads_snapshot_history(
+            files[sql_path], files
+        ):
+            missing.append("history")
+            model_warnings.append(
+                f"'{model}' reads a snapshot's versions and declares no `history`: "
+                "whether the first observation is a transition, the NULL-status "
+                "policy, its entities and its timestamp provenance stay unstated, "
+                "and verification cannot check them"
+            )
         out[model] = {
             "drafted": _untoken(drafted, reading.tokens),
             "declared": declared,
@@ -321,7 +331,7 @@ def _declared_from(entry: dict[str, Any]) -> dict[str, Any]:
         out["description"] = entry["description"]
     dex = entry_meta(entry).get(DEX_META_KEY)
     if isinstance(dex, dict):
-        for key in ("grain", "population", "assumptions"):
+        for key in ("grain", "population", "assumptions", "history"):
             if dex.get(key):
                 out[key] = dex[key]
     columns: dict[str, Any] = {}
@@ -1857,6 +1867,27 @@ def _closest(literal: str | Decimal, values: list[Any], limit: int = 3) -> list[
 
 
 # --- what is missing ------------------------------------------------------------------
+
+
+#: SQL that walks a snapshot's versions, rather than reading its current rows.
+_VERSION_WALK = re.compile(
+    r"\b(lag|lead|row_number|dbt_valid_from|dbt_updated_at)\b", re.IGNORECASE
+)
+
+
+def _reads_snapshot_history(sql: str, files: Mapping[str, str]) -> bool:
+    """A model that refs a snapshot and walks its versions, read from the text.
+
+    Only ever raises a warning, so the cost of a wrong answer is one sentence. A
+    model that only takes the current row (`dbt_valid_to is null`) is not one.
+    """
+
+    if not _VERSION_WALK.search(sql):
+        return False
+    return any(
+        snapshot_defined(files, name)
+        for name in re.findall(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", sql)
+    )
 
 
 def _missing(declared: dict[str, Any], reading: _Reading) -> list[str]:
