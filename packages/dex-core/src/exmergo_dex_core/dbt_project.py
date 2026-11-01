@@ -652,11 +652,21 @@ def write_edits(
             # case-only rename's create looks identical on a case-insensitive
             # filesystem, so that pair is not skipped here.
             continue
-        if current_hash != edit.old_content_hash and not (
-            _casefold_path(edit.path) in case_renames
+        pair = case_renames.get(_casefold_path(edit.path))
+        is_rename_create = (
+            pair is not None
             and edit.op is EditOp.UPSERT
             and edit.old_content_hash is None
+            and current_hash in (None, pair[0].old_content_hash)
+        )
+        if (
+            edit.op is EditOp.UPSERT
+            and current is not None
+            and current == edit.new_content
+            and not is_rename_create
         ):
+            continue
+        if current_hash != edit.old_content_hash and not is_rename_create:
             # A case-only rename's create resolves to the file being renamed on a
             # case-insensitive filesystem; that is not a human conflict (#981).
             conflicts.append(
