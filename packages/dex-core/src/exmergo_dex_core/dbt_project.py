@@ -1555,7 +1555,7 @@ _DATABRICKS_TYPE_ALIASES: dict[str, str] = {
     "dec": "DECIMAL",
     "numeric": "DECIMAL",
     "timestamp": "TIMESTAMP",
-    "timestamp_ntz": "TIMESTAMP",
+    "timestamp_ntz": "TIMESTAMP_NTZ",
     "date": "DATE",
 }
 
