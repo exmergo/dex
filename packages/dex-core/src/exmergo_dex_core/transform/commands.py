@@ -4296,8 +4296,8 @@ def _price_build(
             # The compile above wrote the manifest this reads, so the sweep's
             # scan can be priced here and confirmed with the build rather than
             # asked about again once the build has already spent.
-            from .artifact_runtime import pinned_artifacts
-            from .build import compiled_model_ids
+            from .artifact_runtime import pinned_artifacts, readable_artifact_dir
+            from .build import compiled_model_ids, full_refresh_nodes
             from .verify import (
                 price_declared_facts,
                 price_join_contract,
@@ -4305,6 +4305,15 @@ def _price_build(
             )
 
             scope = compiled_model_ids(Path(project), artifact_directory)
+            # The sweep compares what a full refresh rebuilds, so it prices the
+            # counts of those models' parents too.
+            recomputed = (
+                full_refresh_nodes(
+                    artifact_directory or readable_artifact_dir(Path(project))
+                )["models"]
+                if full_refresh
+                else []
+            )
             # Priced off the manifest this compile just wrote, not whichever
             # manifest on disk is newest.
             pin = (
@@ -4314,7 +4323,7 @@ def _price_build(
             )
             with pin:
                 scan, scan_notes = price_verification(
-                    adapter, Path(project), scope=scope
+                    adapter, Path(project), scope=scope, recomputed=recomputed
                 )
                 facts, facts_notes = price_declared_facts(
                     adapter, Path(project), scope=scope

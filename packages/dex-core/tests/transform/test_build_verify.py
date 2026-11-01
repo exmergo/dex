@@ -1303,6 +1303,7 @@ def test_a_build_holds_a_status_history_to_its_declared_policy(tmp_path: Path):
                 "resource_type": "model",
                 "relation_name": '"wh"."main"."host_history"',
                 "compiled_code": 'select * from "wh"."main"."hosts_snapshot"',
+                "depends_on": {"nodes": ["snapshot.p.hosts_snapshot"]},
                 "config": {
                     "materialized": "table",
                     "meta": {
@@ -1342,3 +1343,215 @@ def test_a_build_holds_a_status_history_to_its_declared_policy(tmp_path: Path):
     (record,) = result.payload()["temporal_contracts"]
     assert record["status"] == "contradicted"
     assert record["snapshot_execution"]["status"] == "success"
+
+
+# --- what a full refresh just recomputed is comparable (#1020) ----------------------
+
+
+def _incremental(
+    project: Path,
+    sql: str,
+    *,
+    counts: dict[str, int],
+    full_refresh: dict | None,
+    status: str = "success",
+    config: dict | None = None,
+):
+    """A built incremental model over a parent, judged on the given counts."""
+
+    uid = "model.p.events"
+    _artifacts(
+        project,
+        nodes={
+            uid: {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.events",
+                "config": {"materialized": "incremental", **(config or {})},
+                "compiled_code": sql,
+            },
+            "model.p.stg_events": {
+                "name": "stg_events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg_events",
+                "config": {"materialized": "table"},
+                "compiled_code": "select * from wh.raw.events",
+            },
+            "model.p.dim": {
+                "name": "dim",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.dim",
+                "config": {"materialized": "table"},
+                "compiled_code": "select * from wh.raw.dim",
+            },
+        },
+        results=[{"unique_id": uid, "status": status}],
+    )
+    summary = _summary([_node(uid, status)], success=status == "success")
+    if full_refresh is not None:
+        summary["full_refresh"] = full_refresh
+    relations = {f"wh.dbt_dev.{name}": rows for name, rows in counts.items()}
+    adapter = _StubAdapter([_Meta(r, rows) for r, rows in relations.items()], relations)
+    return _sweep(project, summary, adapter)
+
+
+_LOSES = (
+    "select e.id from wh.dbt_dev.stg_events e join wh.dbt_dev.dim d on e.dim_id = d.id"
+)
+_REFRESHED = {"requested": True, "models": ["events"], "seeds": [], "not_refreshed": []}
+
+
+def _codes(result) -> set[str]:
+    return {finding.code for finding in result.findings}
+
+
+def test_a_full_refresh_reports_row_loss_on_the_incremental_model_it_rebuilt(
+    tmp_path: Path,
+):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+    )
+    assert "row_loss" in _codes(result)
+    assert not any("incremental" in w for w in result.warnings)
+
+
+def test_a_full_refresh_reports_fanout_on_the_incremental_model_it_rebuilt(
+    tmp_path: Path,
+):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 500, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+    )
+    assert "row_fanout" in _codes(result)
+
+
+def test_a_filter_in_the_rebuilt_model_still_explains_a_shortfall(tmp_path: Path):
+    result = _incremental(
+        tmp_path,
+        _LOSES + " where e.id > 5",
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+    )
+    assert "row_loss" not in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "full_refresh",
+    [
+        None,
+        # The stale-seed step writes this key too, and rebuilt no model.
+        {"seeds": ["countries"], "success": True},
+        # `full_refresh: false` made dbt ignore the flag.
+        {"requested": True, "models": [], "seeds": [], "not_refreshed": ["events"]},
+        # Rebuilt, but a different model.
+        {"requested": True, "models": ["other"], "seeds": [], "not_refreshed": []},
+    ],
+)
+def test_an_incremental_model_not_rebuilt_is_still_skipped(tmp_path, full_refresh):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=full_refresh,
+    )
+    assert "row_loss" not in _codes(result)
+    assert any(
+        "holds what previous runs loaded" in w and "events" in w
+        for w in result.warnings
+    )
+
+
+def test_a_rebuilt_model_that_failed_is_not_judged(tmp_path: Path):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+        status="error",
+    )
+    assert not {"row_loss", "row_fanout"} & _codes(result)
+    assert "row_population" in result.suppressed
+
+
+def test_a_rebuilt_microbatch_model_stays_skipped_and_says_why(tmp_path: Path):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+        config={"incremental_strategy": "microbatch"},
+    )
+    assert "row_loss" not in _codes(result)
+    assert any("microbatch" in w and "events" in w for w in result.warnings)
+
+
+def test_a_microbatch_model_with_no_compiled_sql_is_not_sent_to_compile(tmp_path: Path):
+    """dbt's manifest holds no compiled SQL for a microbatch model, even after a
+    build that succeeded, so the skip has to be named ahead of that check."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.events": {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.events",
+                "config": {
+                    "materialized": "incremental",
+                    "incremental_strategy": "microbatch",
+                },
+                "compiled_code": None,
+            }
+        },
+        results=[],
+    )
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["events"]
+    )
+    assert checks == []
+    assert len(notes) == 1 and "microbatch" in notes[0] and "compile" not in notes[0]
+
+
+def test_a_rebuilt_models_view_parent_is_priced_with_the_build(tmp_path: Path):
+    """The count of a view parent is a scan, and without this the caller would
+    confirm a number that leaves it out and be asked again after the build."""
+
+    from exmergo_dex_core.transform.verify import price_verification
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.stg_events": {
+                "name": "stg_events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg_events",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.events",
+            },
+            "model.p.events": {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.events",
+                "config": {"materialized": "incremental"},
+                "compiled_code": "select * from wh.dbt_dev.stg_events",
+            },
+        },
+        results=[],
+    )
+    scope = {"model.p.events"}
+
+    adapter = _Estimator()
+    assert price_verification(adapter, tmp_path, scope=scope) == (0.0, [])
+    assert adapter.sql == []
+
+    adapter = _Estimator()
+    price, _ = price_verification(adapter, tmp_path, scope=scope, recomputed=["events"])
+    assert price == 1024.0
+    assert "stg_events" in adapter.sql[0]

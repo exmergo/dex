@@ -31,7 +31,7 @@ a standalone sweep:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -127,8 +127,24 @@ def built_models(summary: dict[str, Any]) -> dict[str, str]:
     return built
 
 
+def rebuilt_incrementals(summary: dict[str, Any]) -> list[str]:
+    """The incremental models a requested ``--full-refresh`` recomputed.
+
+    A model whose own ``full_refresh: false`` made dbt ignore the flag is not in
+    the list, and the stale-seed step shares the summary's key with no ``models``
+    of its own, so neither lifts the incremental skip.
+    """
+
+    info = summary.get("full_refresh") or {}
+    return list(info.get("models") or []) if info.get("requested") else []
+
+
 def price_verification(
-    adapter: Adapter, project_dir: Path, *, scope: set[str]
+    adapter: Adapter,
+    project_dir: Path,
+    *,
+    scope: set[str],
+    recomputed: Collection[str] = (),
 ) -> tuple[float, list[str]]:
     """What the row counts this build will need would cost, priced before it runs.
 
@@ -147,6 +163,10 @@ def price_verification(
     project the relations to count are not there to be dry-run priced, so this
     returns zero and a note, and the phase check after the build prices them
     against the confirmed budget instead.
+
+    ``recomputed`` is what the sweep will compare beyond the usual: the
+    incremental models a full refresh rebuilds. Each brings its parent's count,
+    and a parent that is a view costs a scan.
     """
 
     from ..maintain import verify as verify_mod
@@ -156,7 +176,7 @@ def price_verification(
         return 0.0, []
     try:
         checks, _, _ = verify_mod.row_population_plan(
-            project_dir, adapter.dialect, scope=scope
+            project_dir, adapter.dialect, scope=scope, recomputed=recomputed
         )
         countable = _uncounted_by_materialization(project_dir, checks)
         if not countable:
@@ -445,7 +465,10 @@ def _row_population(
         return f"warehouse unreachable: {exc}"
 
     checks, plan_notes, informational = verify_mod.row_population_plan(
-        project_dir, adapter.dialect, scope=scope
+        project_dir,
+        adapter.dialect,
+        scope=scope,
+        recomputed=rebuilt_incrementals(summary),
     )
     result.notes.extend(informational)
     result.warnings.extend(note for note in plan_notes if note not in informational)

@@ -2026,6 +2026,69 @@ def test_an_incremental_model_is_skipped_and_the_note_says_why(tmp_path: Path):
     assert "incremental" in notes[0] and "events" in notes[0]
 
 
+def test_only_a_model_this_run_recomputed_passes_the_incremental_skip(tmp_path: Path):
+    """`maintain verify` passes nothing here, so on its own it stays unchanged."""
+
+    target = tmp_path / "target"
+    target.mkdir()
+    incremental = {"materialized": "incremental"}
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "m.1": _model(
+                        "rebuilt",
+                        'select * from "wh"."main"."raw"',
+                        config=incremental,
+                    ),
+                    "m.2": _model(
+                        "kept", 'select * from "wh"."main"."raw"', config=incremental
+                    ),
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["rebuilt"]
+    )
+    assert [c.model for c in checks] == ["rebuilt"]
+    assert len(notes) == 1 and "kept" in notes[0] and "rebuilt" not in notes[0]
+
+    checks, notes, _ = verify_mod.row_population_plan(tmp_path, "duckdb")
+    assert checks == []
+    assert "kept" in notes[0] and "rebuilt" in notes[0]
+
+
+def test_a_same_named_copy_dbt_did_not_rebuild_keeps_the_skip(tmp_path: Path):
+    """The label is in the list because another package's copy was rebuilt."""
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.pkg.events": _model(
+                        "events",
+                        'select * from "wh"."main"."raw"',
+                        config={"materialized": "incremental", "full_refresh": False},
+                    )
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["events"]
+    )
+    assert checks == []
+    assert "events" in notes[0]
+
+
 def test_an_ephemeral_model_contributes_nothing(tmp_path: Path):
     """It compiles with no relation of its own, so there is no count to
     compare; dbt inlines it into whatever reads it."""
