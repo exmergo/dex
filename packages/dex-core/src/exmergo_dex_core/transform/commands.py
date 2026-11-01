@@ -4297,7 +4297,7 @@ def _price_build(
             # scan can be priced here and confirmed with the build rather than
             # asked about again once the build has already spent.
             from .artifact_runtime import pinned_artifacts
-            from .build import compiled_model_ids
+            from .build import compiled_model_ids, full_refresh_nodes
             from .verify import (
                 price_declared_facts,
                 price_join_contract,
@@ -4313,8 +4313,12 @@ def _price_build(
                 else contextlib.nullcontext()
             )
             with pin:
+                rebuilt_models = None
+                if full_refresh:
+                    rebuilt = full_refresh_nodes(artifact_directory or Path(project))
+                    rebuilt_models = set(rebuilt.get("models", []))
                 scan, scan_notes = price_verification(
-                    adapter, Path(project), scope=scope
+                    adapter, Path(project), scope=scope, rebuilt_models=rebuilt_models
                 )
                 facts, facts_notes = price_declared_facts(
                     adapter, Path(project), scope=scope

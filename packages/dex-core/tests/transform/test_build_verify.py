@@ -1342,3 +1342,98 @@ def test_a_build_holds_a_status_history_to_its_declared_policy(tmp_path: Path):
     (record,) = result.payload()["temporal_contracts"]
     assert record["status"] == "contradicted"
     assert record["snapshot_execution"]["status"] == "success"
+
+
+def test_full_refresh_incremental_model_is_verified_for_row_population(tmp_path: Path):
+    """An incremental model rebuilt under --full-refresh is checked for row loss."""
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.fct_events": {
+                "name": "fct_events",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_events"',
+                "compiled_code": 'select * from "warehouse"."raw"."events"',
+                "config": {"materialized": "incremental"},
+            },
+        },
+        results=[],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_events"), _Meta("warehouse.raw.events")],
+        counts={"warehouse.dbt_dev.fct_events": 10, "warehouse.raw.events": 100},
+    )
+    summary = _summary([{"unique_id": "model.shop.fct_events", "status": "success"}])
+    summary["full_refresh"] = {
+        "models": ["fct_events"],
+        "not_refreshed": [],
+        "success": True,
+    }
+
+    result = _sweep(tmp_path, summary, adapter)
+    assert result.scope == ["fct_events"]
+    assert "row_population" not in result.suppressed
+    assert [(f.code, f.identifier) for f in result.findings] == [
+        ("row_loss", "fct_events")
+    ]
+
+
+def test_incremental_model_not_in_full_refresh_is_skipped(tmp_path: Path):
+    """An ordinary incremental build or one not rebuilt keeps the skip."""
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.fct_events": {
+                "name": "fct_events",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_events"',
+                "compiled_code": 'select * from "warehouse"."raw"."events"',
+                "config": {"materialized": "incremental"},
+            },
+        },
+        results=[],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_events"), _Meta("warehouse.raw.events")],
+        counts={"warehouse.dbt_dev.fct_events": 10, "warehouse.raw.events": 100},
+    )
+    summary = _summary([{"unique_id": "model.shop.fct_events", "status": "success"}])
+    # No full_refresh in summary
+    result = _sweep(tmp_path, summary, adapter)
+    assert not any(f.code == "row_loss" for f in result.findings)
+    assert any(
+        "row population was not compared for fct_events" in w for w in result.warnings
+    )
+
+
+def test_incremental_model_not_refreshed_keeps_the_skip(tmp_path: Path):
+    """A model with full_refresh: false is not refreshed and keeps the skip."""
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.fct_events": {
+                "name": "fct_events",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_events"',
+                "compiled_code": 'select * from "warehouse"."raw"."events"',
+                "config": {"materialized": "incremental", "full_refresh": False},
+            },
+        },
+        results=[],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_events"), _Meta("warehouse.raw.events")],
+        counts={"warehouse.dbt_dev.fct_events": 10, "warehouse.raw.events": 100},
+    )
+    summary = _summary([{"unique_id": "model.shop.fct_events", "status": "success"}])
+    summary["full_refresh"] = {
+        "models": [],
+        "not_refreshed": ["fct_events"],
+        "success": True,
+    }
+
+    result = _sweep(tmp_path, summary, adapter)
+    assert not any(f.code == "row_loss" for f in result.findings)
+    assert any(
+        "row population was not compared for fct_events" in w for w in result.warnings
+    )
