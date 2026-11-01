@@ -14,6 +14,143 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.1] - 2026-11-01
+
+### Added
+
+- **Verification checks the temporal contract of a snapshot-backed status history.**
+  A snapshot can build while a model over it disagrees about whether the first
+  observation is a transition, whether an unrelated edit counts, or whether a
+  timestamp is business or capture time. A model can now declare `history`: its
+  snapshot, entity and status, and those policies. `maintain verify` and
+  `transform build --verify` derive each entity's expected transition count, latest
+  transition and first attainment from the snapshot's versions and the declared
+  policy, and report disagreements as entity counts (`temporal_*`). Each contract
+  gets a `temporal_contracts` record keeping the snapshot's execution, the assertions
+  checked, and what stayed unchecked apart. A policy left out, late-arriving data
+  whose business and capture order disagree, or a run in which no entity made a
+  transition is never reported as clean. Supported today: one dbt snapshot, one status
+  column, one output row per entity.
+- **Verification measures join coverage and checks a declared parent population.**
+  A left join can keep every driving row and match nothing, so a model builds with
+  plausible row counts and every joined field NULL. `maintain verify` and
+  `transform build --verify` now measure every equality join a model writes, rows
+  and distinct keys apart, and record each one under `join_coverage` as
+  satisfied, contradicted, not applicable (an empty input, never reported as full
+  coverage) or unchecked with a reason code. A join that matches nothing is
+  `join_no_match`; a join the declaration requires is judged against the contract
+  rather than a default threshold; and a column a join supplies that came back all
+  NULL is reported against its declared NULL rule or the cached profile. A model
+  can now declare `population.parent`, the entity it holds one row per, and
+  verification counts the parents missing from it and the keys the parent does not
+  have. The build path runs the join contract for the first time, priced into the
+  build's estimate as `(join overlap probes)`.
+
+### Changed
+
+- **`transform plan` reads set operations from their first branch.**
+  a model whose outermost query is a `UNION`, `UNION ALL`, `EXCEPT`, or
+  `INTERSECT` previously skipped contract comparison because set operations were
+  treated as unresolvable. `transform plan` now reads the model's output columns
+  from its first branch (or from the union of branches for `UNION ALL BY NAME`).
+  declarations pick this up, refusing a declared column absent from a union as
+  they do for a direct SELECT list. ([#1042](https://github.com/exmergo/dex/pull/1042))
+- **A temporal contract no longer reads as `satisfied` for a model that does not
+  descend from its declared snapshot.** Verification walks the manifest's dependencies, free and
+  with no connection. A model that does not descend from `history.snapshot` is
+  `unchecked` with `reason_code: snapshot_not_ancestor`, naming the snapshot and any
+  other snapshot it descends from, and no mismatch is reported against a history it
+  never read. A manifest that cannot answer is `lineage_unavailable`.
+- **The agent procedure separates what a request settles from an inferred default.**
+  The procedure now names `request` or `contract` as an assumption's evidence only
+  when that source actually settles the choice: "event rate per account" alone does
+  not say whether accounts with no events belong, so a reasonable choice there is
+  recorded as `default`, explained in a line, and the work continues. Observed counts
+  describe the data and do not establish an intended population or NULL policy. The
+  metadata-quality eval gains an attribution score, graded apart from the SQL, over
+  four new tasks.
+- **`transform build --full-refresh --verify` checks the rows of the incremental
+  models it rebuilt.** A rebuilt model holding materially fewer or more rows than its
+  driving parent is now reported as `row_loss` or `row_fanout`, as a table is, and
+  the parent's row count is priced in the build's one estimate. An incremental
+  model this build did not rebuild, one whose `full_refresh: false` made dbt ignore
+  the flag, and a microbatch model keep the skip, named in `warnings`. A microbatch
+  model is no longer told to run `dbt compile`, which would not have helped.
+  `maintain verify` compares no incremental model, as before.
+- **`transform plan` checks the column contract through `select *`.** The comparison
+  with `schema.yml` was skipped for every model ending in `select * from final`. It now
+  follows a star through CTEs, subqueries and joins, then to a referenced model's SQL,
+  then to a cached profile, which the warning names. A skipped comparison says what
+  stopped it. Existing projects may see new warnings. Two checks that read the same SELECT
+  list also see through CTEs: a declaration naming a column absent from `final` is now
+  refused, as it already was for a direct SELECT list, and the resolved-key convention
+  warning can fire on more models.
+
+### Fixed
+
+- **Deriving an Ossie document at an already configured path produces a plan.**
+  When the document did not exist yet, `transform plan` and `transform declare`
+  only proposed its contents and incorrectly asked to add the same path to
+  `semantic.ossie.files` again. The derived document is now validated with the
+  configured layer and stored as a companion plan that `transform apply` can write.
+  Unconfigured paths still require explicit adoption. ([#1024](https://github.com/exmergo/dex/pull/1024))
+- **A Snowflake estimate no longer recommends `snowflake.suspend_after_command`
+  when it is already on.** With the setting on, dex still quotes a project's first
+  command that resumes the warehouse the whole `AUTO_SUSPEND` tail, because it
+  counts on a suspend only once it has seen one succeed. The note beside the
+  estimate now says so, and says that later commands get the resume minimum. The
+  advice next to it used to recommend turning the setting on and running
+  `GRANT OPERATE` even when both were done. It now names the `dex config set` only
+  while the setting is off and the grant only after a suspend was refused for
+  lacking it, and dex drops it once a suspend keeps the tail out of the quote. ([#1025](https://github.com/exmergo/dex/pull/1025))
+- **dropped schemas are no longer carried forward as out-of-scope.** when a
+  schema holding cached relations was dropped from the warehouse or left empty,
+  `explore map` treated it as an unobserved namespace and carried its relations
+  forward indefinitely, causing recurring `table_dropped` findings after every
+  snapshot. observed namespaces are now derived from what the adapter examined,
+  so relations in dropped schemas are dropped from the cache while namespaces
+  outside a narrowed `--scope` continue to be carried forward untouched. ([#1032](https://github.com/exmergo/dex/pull/1032))
+- **A star's EXCLUDE/EXCEPT, REPLACE and RENAME now match columns the way the
+  warehouse does.** A qualified modifier (`exclude (a.id)`, `rename (a.id as
+  a_id)`) used to be read as its bare column name, so over a join it also hit the
+  other table's same-named column: an exclusion dropped a column the warehouse
+  keeps, and a rename swallowed it whole. A renamed column now also keeps its
+  star's qualifier, so its lineage resolves in a join instead of being reported
+  unreadable, and a REPLACE of a renamed column decides what the column produces
+  under its new name (Snowflake runs both clauses), rather than the replacement
+  being silently dropped. ([#1036](https://github.com/exmergo/dex/pull/1036))
+- **equivalent column data type aliases are no longer reported as mismatches.**
+  the column contract in `maintain verify` and `transform build --verify`
+  previously compared declared and actual types with a raw case-insensitive
+  string match, reporting equivalent spellings like bigquery `int64` against
+  reported `INTEGER` or duckdb `int` against `INTEGER` as `column_type_mismatch`.
+  type comparison now normalizes connector-specific aliases across integer,
+  string, float, boolean, and temporal families, treats parameterized types
+  compatibly when metadata reflection omits parameters, and falls back to exact
+  matching for unnormalizable types. ([#1037](https://github.com/exmergo/dex/pull/1037))
+- **The metadata eval now counts Dex commands invoked through a wrapper bound in
+  the same command string.** A shell function (`R() { uv ... run.py "$@"; }`) or
+  a variable (`R="uv ... run.py"`) wrapping a Dex invocation used to be invisible
+  to the command tally; calls through the bound name now count like direct ones,
+  while quoted mentions of the bound name (an `echo` inside the wrapper's own
+  body) still stay uncounted. ([#1043](https://github.com/exmergo/dex/pull/1043))
+- **Trino profiling no longer counts distinct values of nested and sketch columns.**
+  Since the exact-count pass began measuring columns with no distinct count,
+  `explore profile` and `explore map` on Trino could run `COUNT(DISTINCT)` on columns
+  such as `array(varchar)`, `json` or `hyperloglog`, which report only a non-null
+  count. Those columns are now skipped, so they keep no distinct count and cannot
+  fail the scan for the rest of the table.
+- **`transform build --verify` reports the column contract `maintain verify` does.**
+  A verified build could return no findings while `maintain verify` reported
+  `column_undeclared` on the same models. The build now reports `column_missing`,
+  `column_undeclared` and `column_type_mismatch` for the models it built, from
+  metadata, with no added statement or estimate. `data.verification.column_contract`
+  names the models checked, those declaring no columns, and those not checked with a
+  reason, such as a failed model whose older relation is still in place. Findings do
+  not change the build's status. `maintain verify` now reports a relation whose
+  metadata cannot be read and carries on, instead of stopping.
+
+
 ## [1.17.0] - 2026-10-31
 
 ### Added
