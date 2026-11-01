@@ -246,7 +246,9 @@ a field, flag, or macro you need is not described here.
   says which side looks out of date; `unchecked` means Dex could not read the
   SQL for that rule, so read it yourself before applying.
 - A SELECT list that diverges from the model's `schema.yml` is warned in both
-  directions. Fix whichever side is stale, and tell the user which one you
+  directions, including through a `select * from final`; a warning resting on a
+  cached profile names it, so check that profile is current. `--verify` reports
+  the same comparison against the built relation. Fix whichever side is stale, and tell the user which one you
   decided it was.
 - A warning that a model **exposes a raw foreign key with no resolved
   counterpart** names sibling precedent and a parent. Prefer resolving it the way

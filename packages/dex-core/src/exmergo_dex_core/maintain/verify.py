@@ -395,11 +395,11 @@ def column_contract_plan(
     command needs a build to have produced already for its other two finding
     classes. ``scope`` narrows which models are even considered, so a model
     outside it is neither checked nor counted toward the undeclared total,
-    the same rule :func:`row_population_plan` follows. Compared lowercase on
-    both sides: the caller here is `maintain verify`'s own ``objects``
-    argument, already lowered before it reaches this function, and a model
-    name is conventionally lowercase already, so this never narrows past
-    what an exact-case match would.
+    the same rule :func:`row_population_plan` follows. It holds unique ids, which
+    is what a build has and what keeps two versions of one model apart, or
+    lowered labels, which is what `maintain verify`'s own ``objects`` argument
+    has: a model name is conventionally lowercase already, so this never narrows
+    past what an exact-case match would.
 
     Returns ``(declared_by_model, undeclared_count, notes)``. A model with no
     ``columns:`` entry contributes to the count and nothing to the mapping:
@@ -429,7 +429,7 @@ def column_contract_plan(
         if not (isinstance(node.get("name"), str) and node["name"]):
             continue
         name = manifest_node_label(uid, node)
-        if scope is not None and name.lower() not in scope:
+        if scope is not None and uid not in scope and name.lower() not in scope:
             continue
         columns = node.get("columns")
         if not isinstance(columns, dict) or not columns:
@@ -447,6 +447,38 @@ def column_contract_plan(
     return declared_by_model, undeclared, []
 
 
+@dataclass
+class ColumnContractCheck:
+    """What the column-contract comparison found, and which models it reached.
+
+    ``unchecked`` maps a model to why it was not compared: ``no_relation``,
+    ``relation_not_found`` or ``metadata_unreadable``. A caller reporting
+    coverage needs these apart from ``checked``, because no findings over no
+    comparison is not a clean contract.
+    """
+
+    findings: list[DriftFinding] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    checked: list[str] = field(default_factory=list)
+    unchecked: dict[str, str] = field(default_factory=dict)
+
+
+def built_model_relations(project_dir: Path, scope: set[str]) -> dict[str, str]:
+    """Each in-scope model's label to its relation, from the compiled manifest.
+
+    ``scope`` holds unique ids. An ephemeral model has no relation and no entry.
+    """
+
+    return {
+        manifest_node_label(uid, node): strip_relation_quoting(node["relation_name"])
+        for uid, node in (_manifest_nodes(project_dir) or {}).items()
+        if uid in scope
+        and isinstance(node, dict)
+        and isinstance(node.get("relation_name"), str)
+        and node["relation_name"]
+    }
+
+
 def column_contract_findings(
     adapter,
     declared_by_model: dict[str, dict[str, str | None]],
@@ -454,6 +486,21 @@ def column_contract_findings(
     live_identifiers: list[str],
     undeclared: int,
 ) -> tuple[list[DriftFinding], list[str]]:
+    """:func:`column_contract_check`, as findings and notes alone."""
+
+    check = column_contract_check(
+        adapter, declared_by_model, model_relations, live_identifiers, undeclared
+    )
+    return check.findings, check.notes
+
+
+def column_contract_check(
+    adapter,
+    declared_by_model: dict[str, dict[str, str | None]],
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    undeclared: int,
+) -> ColumnContractCheck:
     """A built relation's actual columns against what its schema.yml declares,
     in both directions, plus a type check where a type is declared (#230).
 
@@ -475,23 +522,46 @@ def column_contract_findings(
     already explains the missing-entirely case, so naming it again here
     would only be additive if the model resolved ambiguously, which is worth
     knowing about but does not deserve its own high-severity finding.
+
+    A relation whose metadata cannot be read is named and the rest still
+    compared. A cost-guard refusal is re-raised: it is the caller's own limit
+    rather than a gap in this check.
     """
 
     from ..dbt_project import column_contract_divergence
+    from ..envelope import redact
+    from ..guards.cost_guard import CostGuardError
 
-    findings: list[DriftFinding] = []
+    check = ColumnContractCheck()
+    findings = check.findings
     unchecked: list[str] = []
+    unreadable: list[str] = []
     for model, declared in sorted(declared_by_model.items()):
         relation = model_relations.get(model)
         if relation is None:
+            check.unchecked[model] = "no_relation"
             continue
         matches = match_identifier(relation, live_identifiers)
         if len(matches) != 1:
             unchecked.append(model)
+            check.unchecked[model] = "relation_not_found"
             continue
 
         declared_lower = {name.lower(): dtype for name, dtype in declared.items()}
-        _meta, columns = adapter.table_metadata(matches[0])
+        try:
+            _meta, columns = adapter.table_metadata(matches[0])
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            unreadable.append(
+                redact(
+                    f"the column contract was not checked for {model}: its "
+                    f"metadata could not be read ({type(exc).__name__}: {exc})"
+                )
+            )
+            check.unchecked[model] = "metadata_unreadable"
+            continue
+        check.checked.append(model)
         actual_lower = {column.name.lower(): column.data_type for column in columns}
         missing, extra, mismatched = column_contract_divergence(
             declared_lower, actual_lower
@@ -554,7 +624,8 @@ def column_contract_findings(
                 )
             )
 
-    notes: list[str] = []
+    notes = check.notes
+    notes.extend(unreadable)
     if unchecked:
         notes.append(
             "the column contract was not checked for "
@@ -566,7 +637,7 @@ def column_contract_findings(
             f"{undeclared} model(s) considered declare no columns in "
             "schema.yml, so the column contract was not checked for them"
         )
-    return findings, notes
+    return check
 
 
 # --- grain: a built relation against its intended one-row-per-entity key -------

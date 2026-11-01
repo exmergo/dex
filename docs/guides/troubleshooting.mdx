@@ -62,6 +62,8 @@ directory can also keep it from creating the demo configuration. See the
 Read `data.verification`, including findings and suppressed checks. A successful
 dbt run does not prove the population, joins, or grain are right. Investigate
 row loss, fan-out, and NULL columns, fix the plan, then rebuild with `--verify`.
+A `column_missing`, `column_undeclared`, or `column_type_mismatch` finding means
+the built relation and `schema.yml` disagree: fix whichever is out of date.
 See [Transform a dbt project](/dex/guides/transform).
 
   </Accordion>

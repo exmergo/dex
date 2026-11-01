@@ -139,6 +139,8 @@ INTERNAL_REFUSALS = {
     "PropagationRefusedError",
     "RewriteError",
     "TestScaffoldError",
+    # Never leaves select_list: it becomes SelectList.reason.
+    "_UnresolvedError",
 }
 
 

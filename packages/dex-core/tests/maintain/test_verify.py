@@ -15,6 +15,8 @@ from exmergo_dex_core.errors import WarehouseQueryError
 from exmergo_dex_core.maintain import verify as verify_mod
 from exmergo_dex_core.maintain.verify import (
     build_status_findings,
+    built_model_relations,
+    column_contract_check,
     column_contract_findings,
     column_contract_plan,
     compile_check,
@@ -3954,3 +3956,90 @@ def test_verify_suppression_when_model_is_driven_by_union_cte(
     assert "it is driven by a set operation, so it has no single parent" in suppressed
     warnings = payload.get("warnings", [])
     assert not any("nothing built at combined" in w for w in warnings)
+
+
+# --- column contract from a build: scope by id, per-model failure (#1002) ------
+
+
+def test_the_column_contract_plan_scopes_by_unique_id_and_keeps_versions_apart(
+    tmp_path: Path,
+):
+    v1 = {**_node_with_columns("m", {"id": None}), "version": 1}
+    v2 = {**_node_with_columns("m", {"id": None, "x": None}), "version": 2}
+    _write_artifacts(
+        tmp_path,
+        {
+            "model.p.m.v1": v1,
+            "model.p.m.v2": v2,
+            "model.p.other": _node_with_columns("other", {"id": None}),
+            "model.p.bare": {"name": "bare", "resource_type": "model"},
+        },
+        [],
+    )
+    declared, undeclared, _ = column_contract_plan(tmp_path, scope={"model.p.m.v2"})
+    assert declared == {"m.v2": {"id": None, "x": None}}
+    assert undeclared == 0
+    declared, _, _ = column_contract_plan(tmp_path, scope={"other"})
+    assert set(declared) == {"other"}
+
+
+def test_built_model_relations_omit_an_ephemeral_model_and_out_of_scope_ones(
+    tmp_path: Path,
+):
+    _write_artifacts(
+        tmp_path,
+        {
+            "model.p.a": {"name": "a", "relation_name": '"db"."main"."a"'},
+            "model.p.b": {"name": "b", "relation_name": '"db"."main"."b"'},
+            "model.p.e": {"name": "e", "relation_name": None},
+        },
+        [],
+    )
+    assert built_model_relations(tmp_path, {"model.p.a", "model.p.e"}) == {
+        "a": "db.main.a"
+    }
+
+
+class _UnreadableAdapter(_ColumnAdapter):
+    def __init__(self, columns, failing: BaseException):
+        super().__init__(columns)
+        self._failing = failing
+
+    def table_metadata(self, identifier: str):
+        if identifier == "db.main.bad":
+            raise self._failing
+        return super().table_metadata(identifier)
+
+
+def test_one_unreadable_relation_does_not_lose_the_others():
+    check = column_contract_check(
+        _UnreadableAdapter(
+            {"db.main.good": [("id", "INTEGER"), ("x", "INTEGER")]},
+            RuntimeError("boom"),
+        ),
+        {"bad": {"id": None}, "good": {"id": None}, "gone": {"id": None}, "eph": {}},
+        {"bad": "db.main.bad", "good": "db.main.good", "gone": "db.main.gone"},
+        ["db.main.bad", "db.main.good"],
+        0,
+    )
+    assert check.checked == ["good"]
+    assert [f.code for f in check.findings] == ["column_undeclared"]
+    assert check.unchecked == {
+        "bad": "metadata_unreadable",
+        "eph": "no_relation",
+        "gone": "relation_not_found",
+    }
+    assert any("bad" in note and "boom" in note for note in check.notes)
+
+
+def test_a_cost_refusal_in_the_column_contract_is_not_swallowed():
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    with pytest.raises(CostGuardError):
+        column_contract_check(
+            _UnreadableAdapter({}, CostGuardError("over the ceiling")),
+            {"bad": {"id": None}},
+            {"bad": "db.main.bad"},
+            ["db.main.bad"],
+            0,
+        )

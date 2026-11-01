@@ -889,7 +889,13 @@ def test_a_build_checks_what_its_models_declare(tmp_path: Path):
     finally:
         adapter.close()
     codes = sorted(f.code for f in result.findings)
-    assert codes == ["grain_broken", "population_contradicted", "unit_out_of_range"]
+    # The manifest declares fewer columns than the relation has (#1002).
+    assert codes == [
+        "column_undeclared",
+        "grain_broken",
+        "population_contradicted",
+        "unit_out_of_range",
+    ]
     population = next(f for f in result.findings if f.code == "population_contradicted")
     assert population.data["contradicting_rows"] == 3
     grain = next(f for f in result.findings if f.code == "grain_broken")
