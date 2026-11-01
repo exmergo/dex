@@ -151,13 +151,19 @@ class _Reader:
         from .validate import _PLACEHOLDER
 
         while isinstance(node, exp.Subquery):
+            ctes = {**ctes, **_local_ctes(node)}
             node = node.this
+        if isinstance(node, exp.SetOperation):
+            ctes = {**ctes, **_local_ctes(node)}
+            if node.args.get("by_name"):
+                if isinstance(node, exp.Union):
+                    return self.outputs(node.this, ctes, seen) | self.outputs(
+                        node.expression, ctes, seen
+                    )
+                raise _UnresolvedError("a set operation with BY NAME")
+            return self.outputs(node.this, ctes, seen)
         if not isinstance(node, exp.Select):
-            raise _UnresolvedError(
-                "a set operation, whose branches each project their own columns"
-                if isinstance(node, exp.SetOperation)
-                else "the statement is not a plain SELECT"
-            )
+            raise _UnresolvedError("the statement is not a plain SELECT")
         ctes = {**ctes, **_local_ctes(node)}
 
         names: set[str] = set()
