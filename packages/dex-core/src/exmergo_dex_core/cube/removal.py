@@ -346,23 +346,30 @@ def _cube_changes(
     return changes
 
 
+def _member(item: Mapping[str, Any], key: str) -> Any:
+    """The value under ``key``, matched by canonical spelling."""
+
+    for k, v in item.items():
+        if canonical_key(str(k)) == key:
+            return v
+    return None
+
+
 def _source_path(item: Mapping[str, Any]) -> str | None:
     """The join path of one view source, recognizing canonical join_path/joinPath."""
 
-    for k, v in item.items():
-        if canonical_key(str(k)) == "join_path" and v is not None:
-            return str(v)
-    return None
+    path = _member(item, "join_path")
+    return str(path) if path is not None else None
 
 
 def _source_includes(item: Mapping[str, Any]) -> set[str]:
     """The member names explicitly included in one view source."""
 
-    raw = item.get("includes")
+    raw = _member(item, "includes")
     if not isinstance(raw, list):
         return set()
     return {
-        i.get("name") if isinstance(i, dict) else str(i)
+        _member(i, "name") if isinstance(i, dict) else str(i)
         for i in raw
         if not isinstance(i, str) or i != "*"
     }
@@ -394,7 +401,7 @@ def _view_changes(
             for source_node, source in zip(sources.value, listed, strict=True)
             if isinstance(source, dict)
             and _source_path(source) == target["join_path"]
-            and source.get("alias") == target.get("alias")
+            and _member(source, "alias") == target.get("alias")
             and (
                 target_source_names is None
                 or _source_includes(source) == target_source_names
@@ -407,7 +414,7 @@ def _view_changes(
         def selected(item: Any, names: set[str] = names) -> bool:
             """Whether this item is one of the members named for removal."""
 
-            name = item.get("name") if isinstance(item, dict) else item
+            name = _member(item, "name") if isinstance(item, dict) else item
             return name in names
 
         planned = _cut(text, source_node, source, key, selected)
@@ -432,7 +439,7 @@ def _view_changes(
                 for source in listed
                 if isinstance(source, dict)
                 and _source_path(source) == join_path
-                and source.get("alias") == alias
+                and _member(source, "alias") == alias
                 and (not target_names or _source_includes(source) == target_names)
             ]
             if len(matched_sources) != count:

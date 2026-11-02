@@ -631,7 +631,7 @@ def test_reconcile_view_left_with_no_sources_is_advisory(repo: Path, capsys):
             "views": [
                 view(
                     "sales",
-                    {"join_path": "orders", "includes": ["revenue", "status"]},
+                    {"join_path": "orders", "includes": ["status"]},
                 )
             ]
         },
@@ -1158,3 +1158,35 @@ def test_advisory_retains_reroute_guidance_for_broken_source():
     proposal = _advisory(finding, "models/views.yml")
     assert "whose join path walks a join that goes" in proposal.action
     assert "Re-route or remove them" in proposal.action
+
+
+def test_a_removal_cuts_a_view_source_written_with_capitalized_keys():
+    """Capitalized keys like Alias and Includes are recognized canonically."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - JoinPath: orders\n"
+        "        Alias: ord\n"
+        "        Includes:\n"
+        "          - Name: revenue\n"
+        "          - Name: status\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": "ord",
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
