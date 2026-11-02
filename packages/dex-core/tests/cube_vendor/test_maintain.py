@@ -697,6 +697,49 @@ def test_reconcile_removes_emptied_view_source_when_another_remains(repo: Path, 
     assert after_views[0]["includes"] == ["region"]
 
 
+def test_reconcile_disambiguates_sources_sharing_path_by_includes(repo: Path, capsys):
+    """Reconcile uses source_names to cut includes from the intended source."""
+
+    _write(
+        repo,
+        VIEWS_FILE,
+        {
+            "views": [
+                view(
+                    "sales",
+                    {"join_path": "orders", "includes": ["revenue", "order_count"]},
+                    {"join_path": "orders", "includes": ["status"]},
+                )
+            ]
+        },
+    )
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders DROP COLUMN amount")
+    _cli(repo, capsys, "maintain", "schema")
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload
+    plan_id = payload["data"].get("semantic_plan_id")
+    assert plan_id is not None
+    view_proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_dependency_dropped"
+        and "view 'sales'" in p["action"]
+    ]
+    assert view_proposals
+    assert all(p["kind"] == "mechanical" for p in view_proposals)
+
+    applied = _cli(repo, capsys, "transform", "apply", plan_id)
+    assert applied["_exit"] == 0, applied
+
+    after_views = yaml.safe_load((repo / VIEWS_FILE).read_text())["views"][0]["cubes"]
+    assert len(after_views) == 2
+    assert after_views[0]["includes"] == ["order_count"]
+    assert after_views[1]["includes"] == ["status"]
+
+
 # --- nothing off the machine ----------------------------------------------------------
 
 
