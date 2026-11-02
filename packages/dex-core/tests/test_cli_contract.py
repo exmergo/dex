@@ -710,6 +710,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "for_plan_file": _TRANSLATED,
             # An off switch the shim turns into a DependencyPolicy value.
             "no_install_deps": _TRANSLATED,
+            "cold_deps": "cold_deps",
             "full_refresh": "full_refresh",
         },
     },

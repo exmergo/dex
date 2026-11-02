@@ -75,6 +75,9 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # CacheRequiredError and NoBaselineError stayed unreachable long enough for
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
+    # Wrapped before a caller sees it: `transform build --cold-deps` turns it into
+    # BuildFailedError, with the report under cold_verification.
+    "ColdReinstallError",
     # Wrapped before a caller sees it: the Cube layer turns each into
     # SemanticBackendError, or SemanticQueryRefusedError for a refusal.
     "CubeFilterError",

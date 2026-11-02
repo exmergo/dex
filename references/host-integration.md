@@ -330,7 +330,10 @@ A declaration dex cannot check by name (a git URL names a repository, and dbt
 installs under the package's own name) is reported separately rather than named
 on a guess. `REFUSE` checks every declaration even when `dbt_packages/` is
 non-empty, and stops on missing or unverifiable packages. This checks presence;
-it does not verify lockfile versions or installed package contents.
+it does not verify lockfile versions or installed package contents. To verify
+contents, `transform build --cold-deps` reinstalls into an isolated copy, builds from
+it, and reports `data.cold_verification.installed_edits`; it may reach the network,
+so a host selects it explicitly, and it is refused together with `--no-install-deps`.
 
 ```bash
 dex transform preflight

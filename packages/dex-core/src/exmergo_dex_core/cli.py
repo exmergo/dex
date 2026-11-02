@@ -1166,6 +1166,14 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="refuse missing dbt packages instead of installing them",
                     )
+                    # Explicit because it may reach the network: an ordinary build
+                    # never reinstalls what is already there (#860).
+                    sp.add_argument(
+                        "--cold-deps",
+                        action="store_true",
+                        default=False,
+                        help="reinstall packages in an isolated copy and build from it",
+                    )
                     # dbt's own flag, for the one case an incremental build
                     # cannot handle: its logic changed, and the rows the old
                     # logic wrote stay until the model is rebuilt (#1015).

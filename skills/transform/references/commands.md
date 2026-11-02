@@ -207,6 +207,10 @@ Runs `dbt build` against a dev target, with a cost preflight first.
   paths in `profiles.yml` resolve against the project. When packages are declared
   and `dbt_packages/` is missing, the engine runs `dbt deps` first;
   `--no-install-deps` refuses instead.
+- A failed node gets a `data.prerequisites` entry naming its owner, its relation
+  to the plan and the repairs dbt supports. `--cold-deps` reinstalls packages into
+  an isolated copy and builds from it, to prove a repair survives. See
+  [prerequisite-repairs.md](prerequisite-repairs.md).
 - On DuckDB, a seed whose CSV header no longer matches its table in the dev
   target (a column added, dropped or reordered) is rebuilt with
   `dbt seed --full-refresh` before the build, only when the build selects it.

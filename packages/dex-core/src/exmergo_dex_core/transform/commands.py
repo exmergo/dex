@@ -34,7 +34,7 @@ from .. import envelope as env
 from ..config import pii_override_paths
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
-from ..errors import DexError
+from ..errors import DexError, RequestError
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
@@ -3424,6 +3424,124 @@ def build(
     dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
     full_refresh: bool = False,
     artifacts: str | None = None,
+    cold_deps: bool = False,
+) -> BuildResult:
+    """Run ``dbt build`` on the dev target; ``cold_deps`` runs it from a fresh install.
+
+    ``cold_deps`` is the explicit proof that a repair survives a reinstall (#860):
+    the build runs from a copy of the project whose packages ``dbt deps`` just
+    installed, under every gate an ordinary build has, and rebuilds the dev
+    relations from it. The result says what the installed tree held that the
+    reinstall did not. Never implied: an ordinary build does not reinstall. See
+    :func:`_build_project` for the rest.
+    """
+
+    from .build import (
+        ColdReinstallError,
+        assert_dev_target,
+        cold_checkout,
+        has_package_spec,
+    )
+
+    kwargs: dict[str, Any] = {
+        "target": target,
+        "select": select,
+        "verify": verify,
+        "for_plan": for_plan,
+        "for_plan_document": for_plan_document,
+        "dependencies": dependencies,
+        "full_refresh": full_refresh,
+        "artifacts": artifacts,
+    }
+    if not cold_deps:
+        return _build_project(engine, **kwargs)
+    if dependencies is DependencyPolicy.REFUSE:
+        raise RequestError(
+            "--cold-deps installs packages and --no-install-deps refuses to; "
+            "pass one of them"
+        )
+    # Ahead of the install: a prod target must not get as far as a reinstall.
+    assert_dev_target(
+        target or engine.config.dbt_target or "dev", engine.config.dbt_target
+    )
+    project = engine.project_dir()
+    if not has_package_spec(project):
+        return _build_project(
+            engine,
+            **kwargs,
+            cold_report={
+                "ran": False,
+                "reason": "the project declares no packages, so nothing to reinstall",
+            },
+        )
+    try:
+        with cold_checkout(project) as cold:
+            return _build_project(engine, **kwargs, cold=cold)
+    except ColdReinstallError as exc:
+        failed = BuildResult(
+            success=False,
+            summary={"success": False},
+            evidence=_unbuilt_evidence(engine, for_plan, for_plan_document, project),
+        )
+        _attach_completion(
+            failed,
+            None,
+            {
+                **_completion_inputs(
+                    engine, for_plan, for_plan_document, None, project
+                ),
+                "cold": exc.report,
+                # Nothing ran, so nothing here reads a manifest of this tree.
+                "graph": None,
+                "manifest": None,
+            },
+        )
+        raise BuildFailedError(str(exc), result=failed) from exc
+
+
+def _unbuilt_evidence(
+    engine: DexEngine, for_plan: str | None, document: Any, project: Path
+) -> BuildEvidence:
+    """Evidence for a build that never started: every required node is missing."""
+
+    from .evidence import BuildCoverage, BuildEvidence, required_nodes
+
+    edits: list[PlanEdit] | None = None
+    with contextlib.suppress(Exception):
+        if for_plan:
+            edits = list(
+                engine.require_full_store("reading a plan").load_plan(for_plan).edits
+            )
+        elif document is not None:
+            from .portable import verify_plan_document
+
+            edits = [edit.as_edit() for edit in verify_plan_document(document).edits]
+    if edits is None:
+        return BuildEvidence()
+    required, basis, undetermined = required_nodes(edits, Path(project))
+    return BuildEvidence(
+        coverage=BuildCoverage(
+            required=required,
+            missing=required,
+            basis=basis,
+            undetermined=undetermined,
+        )
+    )
+
+
+def _build_project(
+    engine: DexEngine,
+    *,
+    target: str | None = None,
+    select: str | None = None,
+    verify: bool = False,
+    for_plan: str | None = None,
+    for_plan_document: Any = None,
+    dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
+    full_refresh: bool = False,
+    artifacts: str | None = None,
+    cold: Any = None,
+    cold_report: dict[str, Any] | None = None,
 ) -> BuildResult:
     """Run ``dbt build`` against the dev target, cost-surfaced first.
 
@@ -3455,6 +3573,11 @@ def build(
     scratch (issue #1015): the build passes ``--full-refresh`` to dbt, the
     pricing compile renders the same full rebuild, and the result names what was
     rebuilt under ``full_refresh``.
+
+    ``cold`` is a :class:`~.build.ColdCheckout`: dbt, pricing, verification and
+    evidence read that copy, while the dev-target checks keep reading the real
+    project, whose relative paths are the ones that reach the real warehouse.
+    ``cold_report`` is what a ``--cold-deps`` run with nothing to reinstall says.
 
     Every dbt invocation here (the pricing compile, the build, the settlement
     read after a failure) uses one artifact directory, resolved once from
@@ -3488,7 +3611,10 @@ def build(
     # re-exports the build *function* under the same name as the module, and the
     # submodule-path form resolves the module unambiguously.
     from . import dev_target
-    from .artifact_runtime import resolve_build_artifact_dir
+    from .artifact_runtime import (
+        resolve_build_artifact_dir,
+        sanitize_artifact_directory,
+    )
     from .build import assert_dev_target, assert_packages_installed
     from .build import (
         build as run_build,
@@ -3508,6 +3634,18 @@ def build(
     # another dbt runtime left incompatible refuses before anything is spent.
     policy = artifacts or config.transform.artifacts
     artifacts_dir = resolve_build_artifact_dir(project, policy)
+    checkout = project
+    if cold is not None:
+        # Outside the copy so they outlive it, and apart from the ordinary build's,
+        # which readers of "the last build" keep finding.
+        artifacts_dir = artifacts_dir / "cold"
+        checkout = cold.path
+        cold_report = {
+            **cold.report,
+            "artifact_directory": sanitize_artifact_directory(
+                artifacts_dir, project_root=project
+            ),
+        }
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
@@ -3526,7 +3664,7 @@ def build(
     # check and gates the ceiling/ready-to-run checks that still apply.
     if paradigm is Paradigm.FREE_LOCAL:
         summary, cost = run_build(
-            project,
+            checkout,
             target=target,
             configured_target=config.dbt_target,
             select=select,
@@ -3534,6 +3672,7 @@ def build(
             confirmed=engine.confirmed,
             paradigm=paradigm,
             connector=connector,
+            run_cwd=project,
             dev_target_check=dev_check,
             dependencies=dependencies,
             approved_functions=frozenset(config.guards.approved_functions),
@@ -3548,7 +3687,7 @@ def build(
         # there is no gate to outlive, on the billed path below there is.
         verification = _verify_build(
             engine,
-            project,
+            checkout,
             summary,
             verify,
             artifact_directory=artifacts_dir,
@@ -3564,7 +3703,7 @@ def build(
             verification=verification,
             evidence=_build_evidence(
                 engine,
-                project,
+                checkout,
                 target,
                 select,
                 for_plan,
@@ -3576,7 +3715,12 @@ def build(
             decisions=_built_decisions(engine, summary),
             engine=engine,
             completion_inputs=_completion_inputs(
-                engine, for_plan, for_plan_document, artifacts_dir, project
+                engine,
+                for_plan,
+                for_plan_document,
+                artifacts_dir,
+                checkout,
+                cold_report,
             ),
         )
 
@@ -3592,7 +3736,7 @@ def build(
 
     estimate, per_node, price_notes, upper_bounds, adapter = _price_build(
         engine,
-        project,
+        checkout,
         target,
         select,
         verify=verify,
@@ -3610,7 +3754,7 @@ def build(
         )
     try:
         summary, cost = run_build(
-            project,
+            checkout,
             target=target,
             configured_target=config.dbt_target,
             select=select,
@@ -3618,6 +3762,7 @@ def build(
             confirmed=engine.confirmed,
             paradigm=paradigm,
             connector=connector,
+            run_cwd=project,
             estimate=estimate,
             estimate_quality=estimate_quality_of(adapter, estimate, paradigm=paradigm),
             # The dev-target check already ran above; passing None keeps the
@@ -3655,7 +3800,7 @@ def build(
         with contextlib.suppress(Exception):
             _settle_raised_build_spend(
                 engine,
-                project,
+                checkout,
                 target,
                 paradigm=paradigm,
                 connector=connector,
@@ -3684,7 +3829,7 @@ def build(
     # reservation that has already been released.
     verification = _verify_build(
         engine,
-        project,
+        checkout,
         summary,
         verify,
         adapter=adapter,
@@ -3710,7 +3855,7 @@ def build(
         verification=verification,
         evidence=_build_evidence(
             engine,
-            project,
+            checkout,
             target,
             select,
             for_plan,
@@ -3723,7 +3868,7 @@ def build(
         uncapped=bool(dev_target.missing_cap_references(project, target, connector)),
         engine=engine,
         completion_inputs=_completion_inputs(
-            engine, for_plan, for_plan_document, artifacts_dir, project
+            engine, for_plan, for_plan_document, artifacts_dir, checkout, cold_report
         ),
     )
 
@@ -3800,6 +3945,7 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     else DependencyPolicy.INSTALL
                 ),
                 full_refresh=getattr(args, "full_refresh", False),
+                cold_deps=getattr(args, "cold_deps", False),
             )
         )
     except BuildFailedError as exc:
@@ -4785,6 +4931,96 @@ def _shape_build_result(
     raise BuildFailedError(_failure_message(prefix, messages), result=failed)
 
 
+def _cold_with_outcome(
+    result: BuildResult, report: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The cold report, saying whether this run really rebuilt anything in dev."""
+
+    if report is None or not report.get("reinstalled"):
+        return report
+    nodes = result.evidence.nodes if result.evidence is not None else []
+    return {
+        **report,
+        "rebuilt_dev_relations": sum(
+            1
+            for node in nodes
+            if node.unique_id.startswith(("model.", "seed.", "snapshot."))
+            and node.status.lower() == "success"
+        ),
+    }
+
+
+def _attach_prerequisites(
+    result: BuildResult, inputs: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Name each failed node's owner, plan relation and repair routes (#860).
+
+    Returns every diagnosis, so each blocker in the bounded block is annotated. The
+    payload keeps the most useful: what stops a deliverable, then models before tests.
+    """
+
+    from .evidence import FAILED_STATUSES
+    from .prerequisites import MAX_PREREQUISITES, diagnose
+
+    evidence = result.evidence
+    if evidence is None:
+        return []
+    failed = [
+        (node.unique_id, node.status, node.message)
+        for node in evidence.nodes
+        if node.status.lower() in FAILED_STATUSES
+    ]
+    if not failed:
+        return []
+    coverage = evidence.coverage
+    found = diagnose(
+        failed,
+        inputs.get("manifest"),
+        # A plan whose edits name no node could have reached any of them.
+        required=(
+            list(coverage.required)
+            if coverage is not None and not coverage.undetermined
+            else None
+        ),
+        edits=inputs.get("edits"),
+    )
+    found.sort(
+        key=lambda entry: (
+            not entry["blocks"],
+            entry["unique_id"].startswith(("test.", "unit_test.")),
+        )
+    )
+    result.prerequisites = found[:MAX_PREREQUISITES]
+    result.prerequisites_elided = max(0, len(found) - MAX_PREREQUISITES)
+    return found
+
+
+def _prose_population(result: BuildResult, inputs: dict[str, Any]) -> list[str]:
+    """The required models whose population nothing can run, as their YAML says."""
+
+    from ..dbt_project import load as load_project
+    from . import drafting
+
+    coverage = result.evidence.coverage if result.evidence is not None else None
+    project = inputs.get("project")
+    if coverage is None or not coverage.required or project is None:
+        return []
+    # An annotation on the block: failing here leaves it unnamed, nothing more.
+    with contextlib.suppress(Exception):
+        files = {
+            path: source.content
+            for path, source in load_project(project).files.items()
+            if path.endswith((".yml", ".yaml"))
+        }
+        return [
+            name
+            for name in coverage.required
+            if drafting.population_contract(drafting.read_declared(files, name))
+            == "prose"
+        ]
+    return []
+
+
 def _attach_completion(
     result: BuildResult,
     verification: BuildVerification | None,
@@ -4800,11 +5036,13 @@ def _attach_completion(
 
     from .completion import ChangeRef, ComparisonState, summarize_completion
 
+    inputs = inputs or {}
+    result.cold_verification = _cold_with_outcome(result, inputs.get("cold"))
     if result.evidence is None:
         return
-    inputs = inputs or {}
     try:
         states = inputs.get("comparisons")
+        diagnosed = _attach_prerequisites(result, inputs)
         result.completion = summarize_completion(
             result.evidence,
             result.verification,
@@ -4825,6 +5063,9 @@ def _attach_completion(
             ),
             findings_dropped=verification.dropped if verification is not None else 0,
             verification_offered=result.pending_offer is not None,
+            prerequisites=diagnosed,
+            cold=result.cold_verification,
+            prose_population=_prose_population(result, inputs),
         )
     except Exception as exc:
         result.notes.append(
@@ -4839,24 +5080,30 @@ def _completion_inputs(
     for_plan_document: Any,
     artifact_directory: Path | None,
     project: Path,
+    cold_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """What the completion block reads beyond the result: the change it was
     asked to validate, the manifest's dependency edges (a skip's cause, a
     test's model), and the plan's recorded refactor comparisons. Each is
     best-effort; a missing one leaves its part of the block unnamed."""
 
-    inputs: dict[str, Any] = {}
+    inputs: dict[str, Any] = {"project": project}
+    if cold_report is not None:
+        inputs["cold"] = cold_report
     if for_plan:
         inputs.update(plan_id=for_plan, source="for_plan")
         with contextlib.suppress(Exception):
             stored = engine.require_full_store("reading a plan").load_plan(for_plan)
+            inputs["edits"] = list(stored.edits)
             inputs["comparisons"] = refactor_comparison_states(stored)
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):
             from .portable import verify_plan_document
 
-            inputs["plan_id"] = verify_plan_document(for_plan_document).plan_id
+            document = verify_plan_document(for_plan_document)
+            inputs["plan_id"] = document.plan_id
+            inputs["edits"] = [edit.as_edit() for edit in document.edits]
     with contextlib.suppress(Exception):
         from .artifact_runtime import artifact_paths, readable_artifact_dir
 
@@ -4864,6 +5111,7 @@ def _completion_inputs(
         manifest = json.loads(
             artifact_paths(directory).manifest.read_text(encoding="utf-8")
         )
+        inputs["manifest"] = manifest
         inputs["graph"] = {
             uid: list((node.get("depends_on") or {}).get("nodes") or [])
             for section in ("nodes", "unit_tests")

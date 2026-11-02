@@ -1612,6 +1612,7 @@ class DexEngine:
         dependencies: Any = None,
         full_refresh: bool = False,
         artifacts: str | None = None,
+        cold_deps: bool = False,
     ) -> BuildResult:
         """Run ``dbt build`` against the dev target, cost-surfaced first.
 
@@ -1627,6 +1628,10 @@ class DexEngine:
         the right outcome in a sandbox with no network.
         ``full_refresh`` passes ``--full-refresh`` to dbt, rebuilding the selected
         incremental models and seeds from scratch, and prices them that way.
+        ``cold_deps`` reinstalls the packages into an isolated copy and builds from
+        it, proving a repair survives a reinstall; it may reach the network, and it
+        is refused with a ``dependencies`` policy that refuses to install.
+
         ``artifacts`` overrides ``transform.artifacts`` for this call:
         ``isolated`` writes Dex's own ``<target-path>/dex/<runtime>`` directory,
         ``shared`` the project's target path, refused when another dbt runtime
@@ -1646,6 +1651,7 @@ class DexEngine:
             for_plan_document=for_plan_document,
             dependencies=dependencies or DependencyPolicy.INSTALL,
             full_refresh=full_refresh,
+            cold_deps=cold_deps,
             artifacts=artifacts,
         )
 

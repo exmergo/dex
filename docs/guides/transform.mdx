@@ -97,6 +97,15 @@ the nodes the plan changed were built, failed, skipped, missing or stale, and
 `blocked` names what stopped each one. A skipped report is not done, even if dev
 still holds a table from an earlier run. `assurance.build_only` lists what built
 with nothing checking its rows. Without `--for-plan`, `coverage` is `unknown`.
+
+When something upstream stopped the build, `data.prerequisites` names the failed
+node's owner (your project or an installed package), whether the plan could have
+caused it, and the repairs dbt supports for it. An edit under `dbt_packages/` is
+not one of them, because the next `dbt deps` replaces it. Add `--cold-deps` to
+reinstall packages into an isolated copy and build from there, which proves the
+repair survives and lists anything your installed tree held that a reinstall does
+not reproduce. It may reach the network, so a normal build never does it.
+
 The [command contract](/dex/reference/command-contract) gives every
 field. Then read `data.outcome` (only `validated` means every required node ran
 and passed) and `data.verification.ran`, its findings,
