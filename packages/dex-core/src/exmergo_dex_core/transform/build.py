@@ -1022,10 +1022,40 @@ def assert_packages_installed(
 
     missing = missing_packages(project_dir)
     unverifiable = unverifiable_packages(project_dir)
-    if missing or (unverifiable_is_fatal and unverifiable) or needs_deps(project_dir):
+    shortfall = has_package_shortfall(project_dir)
+    if (
+        missing
+        or (unverifiable_is_fatal and unverifiable)
+        or needs_deps(project_dir)
+        or shortfall
+    ):
+        # A count shortfall is a definite absence somewhere, so the packages dex
+        # could not check are worth naming even when the caller tolerates an
+        # unverifiable installation on its own.
         raise MissingPackagesError(
-            missing, unverifiable if unverifiable_is_fatal else []
+            missing, unverifiable if (unverifiable_is_fatal or shortfall) else []
         )
+
+
+def has_package_shortfall(project_dir: Path | str) -> bool:
+    """True when fewer packages are installed than the project declares.
+
+    A git declaration's install directory name is unknown, so it can never be
+    named as missing and a partly installed project would otherwise look
+    complete. The count needs no name: every declaration installs into one
+    directory of its own, so an installation that is missing one of them cannot
+    reach the number of declarations.
+    """
+
+    project = Path(project_dir)
+    declared = declared_packages(project)
+    if not declared:
+        return False
+    root = package_install_dir(project)
+    if not root.is_dir():
+        return False
+    installed = sum(1 for child in root.iterdir() if child.is_dir())
+    return installed < len(declared)
 
 
 def needs_deps(project_dir: Path | str) -> bool:

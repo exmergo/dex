@@ -19,6 +19,7 @@ from exmergo_dex_core.transform.build import (
     assert_packages_installed,
     build,
     declared_packages,
+    has_package_shortfall,
     installed_packages,
     missing_packages,
     unverifiable_packages,
@@ -271,4 +272,36 @@ def test_an_installed_but_unverifiable_package_does_not_refuse_a_plan(
 
     with pytest.raises(MissingPackagesError):
         assert_packages_installed(dbt_project_dir)
+    assert_packages_installed(dbt_project_dir, unverifiable_is_fatal=False)
+
+
+def test_a_partly_installed_project_refuses_before_dbt_reports_deps(
+    dbt_project_dir: Path,
+):
+    """One installed hub package beside a missing git one is a definite
+    shortfall, even though the git package cannot be named as missing. The plan
+    must route the user to `transform deps` rather than let dbt say `dbt deps`.
+    """
+
+    (dbt_project_dir / "packages.yml").write_text(PACKAGES, encoding="utf-8")
+    (dbt_project_dir / "dbt_packages" / "dbt_utils").mkdir(parents=True)
+    (dbt_project_dir / "dbt_packages" / "shared").mkdir(parents=True)
+
+    assert missing_packages(dbt_project_dir) == []
+    assert has_package_shortfall(dbt_project_dir) is True
+
+    with pytest.raises(MissingPackagesError) as caught:
+        assert_packages_installed(dbt_project_dir, unverifiable_is_fatal=False)
+
+    message = str(caught.value)
+    assert "transform deps" in message
+    assert "https://github.com/org/repo.git" in message
+
+
+def test_a_fully_installed_project_has_no_shortfall(dbt_project_dir: Path):
+    (dbt_project_dir / "packages.yml").write_text(PACKAGES, encoding="utf-8")
+    for name in ("dbt_utils", "repo", "shared"):
+        (dbt_project_dir / "dbt_packages" / name).mkdir(parents=True)
+
+    assert has_package_shortfall(dbt_project_dir) is False
     assert_packages_installed(dbt_project_dir, unverifiable_is_fatal=False)
