@@ -1039,8 +1039,12 @@ default, or a filter or operator after it is refused. A key naming a location
   (relative `profiles.yml` paths resolve there, never against the caller's
   shell). When
   `packages.yml` (or a `dependencies.yml` with packages) is declared and
-  `dbt_packages/` is missing, `dbt deps` runs automatically first; `transform
-  deps` is the explicit install/refresh. A missing dev DuckDB database is an
+  `dbt_packages/` is missing, `dbt deps` runs automatically first; `transform deps`
+  is the explicit install/refresh. `--cold-deps` is the explicit proof that
+  a repair survives a reinstall: packages install into an isolated copy, the build
+  runs from it, and `data.cold_verification` lists what the installed tree held
+  that the reinstall did not reproduce. `data.prerequisites` names each failed
+  node's owner, plan relation and supported repairs. A missing dev DuckDB database is an
   actionable refusal when the project reads from sources (seed it first), and a
   warning otherwise. On failure the envelope's `errors[0]` carries the first
   real dbt message; the rest land in `warnings`, per-entry capped, deduplicated,

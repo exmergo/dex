@@ -191,8 +191,9 @@ can read any variable through `env_var()`; warehouse credentials a profile reads
 still reach it. When the project declares packages (`packages.yml`, or a
 `dependencies.yml` with a `packages:` key) and `dbt_packages/` is missing or empty,
 `transform build` runs `dbt deps` automatically before building; `transform deps`
-is the explicit install/refresh. Package installation writes only `dbt_packages/`
-and the lockfile inside the project and spends nothing against the warehouse, so it
+is the explicit install/refresh. `transform build --cold-deps` reinstalls into an
+isolated copy instead, leaving this project's `dbt_packages/` alone. Package
+installation writes only `dbt_packages/` and the lockfile inside the project and spends nothing against the warehouse, so it
 runs without the cost gate.
 
 Semantic plans are validated up to and including dbt's own parser before they are

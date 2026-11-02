@@ -586,6 +586,11 @@ class BuildResult(Result):
     # The bounded lead (#855): what the run established about the change, held
     # to a size that survives a truncated read, ahead of every unbounded list.
     completion: BuildCompletion | None = None
+    # Who owns each failed node and which repairs dbt has for it (#860).
+    prerequisites: list[dict[str, Any]] | None = None
+    prerequisites_elided: int = 0
+    # What `--cold-deps` reinstalled and what the installed tree lost (#860).
+    cold_verification: dict[str, Any] | None = None
 
     def evidence_model(self) -> BuildEvidence | None:
         """The typed :class:`~exmergo_dex_core.transform.evidence.BuildEvidence`
@@ -614,6 +619,14 @@ class BuildResult(Result):
             payload["verification"] = self.verification
         if self.decisions is not None:
             payload["decisions"] = self.decisions
+        lead: dict[str, Any] = {}
+        if self.prerequisites:
+            lead["prerequisites"] = self.prerequisites
+            if self.prerequisites_elided:
+                lead["prerequisites_elided"] = self.prerequisites_elided
+        if self.cold_verification is not None:
+            lead["cold_verification"] = self.cold_verification
+        payload = {**lead, **payload}
         if self.completion is not None:
             # First, by construction rather than by luck: key order means
             # nothing to a parser and everything to a reader whose harness cut

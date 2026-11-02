@@ -122,6 +122,13 @@ class _Reading:
     #: Bare column names the SQL filters on, for the population hint.
     filtered: list[str] = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
+    #: The relations that decide which rows exist: the FROM relation followed
+    #: through CTEs and subqueries, plus what a RIGHT, FULL or CROSS join keeps.
+    driving: list[str] = field(default_factory=list)
+    #: The subset of ``driving`` written as a literal name, not through jinja.
+    driving_literal: list[str] = field(default_factory=list)
+    #: Why the driving relations could not be read in full, when they could not.
+    driving_unread: str | None = None
     #: The statement manufactures its rows and names no warehouse relation.
     generated_sql: bool = False
     incomplete: list[str] = field(default_factory=list)
@@ -209,6 +216,7 @@ def draft(
             vars=vars,
             cumulative=cumulative,
             warnings=warnings,
+            index=reference_index,
         )
         model_warnings = _warnings(
             model,
@@ -234,6 +242,8 @@ def draft(
             "declared": declared,
             "missing": _untoken(missing, reading.tokens),
         }
+        if isinstance(declared.get("population"), dict):
+            out[model]["population_contract"] = population_contract(declared)
         if found is not None:
             out[model]["contradictions"] = found
         warnings.extend(_untoken(model_warnings, reading.tokens))
@@ -253,20 +263,30 @@ def _contradictions(
     vars: Mapping[str, Any] | None,
     cumulative: Mapping[str, set[str]],
     warnings: list[str],
+    index: Callable[[], ReferenceIndex | None],
 ) -> list[dict[str, Any]] | None:
     """What this edit contradicts in the model's declaration, or None where
-    there is nothing to compare: a model the plan creates has no prior."""
+    there is nothing to report. A model the plan creates has no prior to compare,
+    so only the rule that needs none applies: its declared parent (#1029)."""
 
     if prior is None:
         return None
     prior_path = model_sql_path(prior, model_paths, model)
-    if prior_path is None:
-        return None
-    from .contradictions import check
+    from .contradictions import check, check_new
 
     # Commentary on the plan, like the draft around it: a defect here is a
     # warning naming the exception, never a draft or a plan that fails to exist.
     try:
+        if prior_path is None:
+            created = check_new(
+                model,
+                reading=reading,
+                declared=declared,
+                files=files,
+                model_paths=model_paths,
+                index=index,
+            )
+            return [item.as_dict() for item in created] or None
         found = check(
             model,
             prior_reading=read(prior[prior_path], cache, dialect=dialect, vars=vars),
@@ -278,6 +298,7 @@ def _contradictions(
             model_paths=model_paths,
             cache=cache,
             cumulative=cumulative,
+            index=index,
         )
     except Exception as exc:
         warnings.append(
@@ -286,6 +307,22 @@ def _contradictions(
         )
         return None
     return [item.as_dict() for item in found]
+
+
+def population_contract(declared: Mapping[str, Any]) -> str:
+    """What the declared population is, to anything that could check it.
+
+    ``executable`` states a parent or filters verification can measure. ``prose``
+    is a rule only, which nothing can run. Whether a measurement actually ran is
+    the build's to say, under ``data.verification``.
+    """
+
+    population = declared.get("population")
+    if not isinstance(population, dict):
+        return "none"
+    if population.get("parent") or population.get("filters"):
+        return "executable"
+    return "prose" if population.get("rule") else "none"
 
 
 def _untoken(value: Any, tokens: Mapping[str, str]) -> Any:
@@ -407,6 +444,15 @@ def read(
     return reading
 
 
+def _keeps_joined_rows(join: Any) -> bool:
+    """Whether a join keeps every row of the relation it joins in."""
+
+    words = join.side.split()
+    if "right" in words or "full" in words or "cross" in words:
+        return True
+    return join.on is None and not join.using
+
+
 class _Lineage:
     """Column lineage and key propagation through one statement's scopes."""
 
@@ -435,6 +481,7 @@ class _Lineage:
         from sqlglot import expressions as exp
 
         shape = self.shape
+        self._read_driving()
         if shape.SET_OPERATIONS and isinstance(self.tree, shape.SET_OPERATIONS):
             self.reading.incomplete.append(
                 "the model is a set operation (UNION and the like), so no column "
@@ -493,6 +540,54 @@ class _Lineage:
             parentless = True
         self.reading.relations = named
         self.reading.generated_sql = parentless and not named
+
+    def _read_driving(self) -> None:
+        """Walk the FROM chain to the relations the model's rows come from.
+
+        A RIGHT, FULL or CROSS join keeps the joined side's rows too, so a date
+        spine crossed with a parent is driven by that parent as well.
+        """
+
+        from sqlglot import expressions as exp
+
+        reading = self.reading
+        seen: set[int] = set()
+        pending = [self.tree]
+        while pending:
+            scope = pending.pop()
+            if id(scope) in seen:
+                continue
+            seen.add(id(scope))
+            if not isinstance(scope, exp.Select):
+                reading.driving_unread = (
+                    "it is driven by a set operation (UNION and the like), which "
+                    "has no single driving relation"
+                )
+                continue
+            driving = self.shape.from_relation(scope)
+            if driving is None:
+                reading.driving_unread = "it selects from nothing"
+                continue
+            keeping = [
+                join.relation
+                for join in self.shape.joins(scope)
+                if _keeps_joined_rows(join)
+            ]
+            for relation in (driving, *keeping):
+                kind, target = self.target(relation)
+                if kind == "scope":
+                    pending.append(target)
+                elif kind == "physical":
+                    if target not in reading.driving:
+                        reading.driving.append(target)
+                    literal = relation.name not in self.relations
+                    if literal and target not in reading.driving_literal:
+                        reading.driving_literal.append(target)
+                elif relation is driving:
+                    reading.driving_unread = (
+                        "its driving relation is generated in SQL or is not a "
+                        "table or subquery dex can follow"
+                    )
 
     @staticmethod
     def _output_order(outputs: dict[str, Any] | None):

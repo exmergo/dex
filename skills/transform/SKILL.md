@@ -143,7 +143,13 @@ declares is `contract`.
   entities.
 - Test logic with `dex transform test --scaffold <model>` (dbt unit tests) and
   measure the tests with `dex transform test --mutate <model>`.
-- Never edit installed packages (`dbt_packages/`); override in the project.
+- Never edit installed packages (`dbt_packages/`) and never repair only in the
+  warehouse: a reinstall or a reload undoes both. When a prerequisite blocks a
+  deliverable, read `data.prerequisites` for its owner, its `plan_relation` and
+  the repairs dbt supports, make a supported one through a plan (an explicit
+  cast, never dropped rows), and prove it with `--cold-deps` on the build. With no
+  repair in scope the deliverable is incomplete: report the prerequisite and the
+  remedy tried. Recipe: `skills/transform/references/prerequisite-repairs.md`.
 
 **Spending authority.** It comes from the person running this session, or from
 limits committed before it started: `budget.ceiling` (per command) and
@@ -477,6 +483,9 @@ a field, flag, or macro you need is not described here.
 - `${CLAUDE_SKILL_DIR}/references/declarations.md`: the `declarations` payload,
   every field and its allowed values, what each renders into, and
   `transform declare` for models that already exist.
+- `${CLAUDE_SKILL_DIR}/references/prerequisite-repairs.md`: a failed prerequisite's
+  owner and repair routes, keeping a type repair's meaning, proving it with
+  `--cold-deps`, and reporting a deliverable incomplete.
 - `${CLAUDE_SKILL_DIR}/references/commands.md`: `references`, `rename`, `remove`,
   `place`, `declare`, `build`, `build --verify`, `test --mutate`, and `deps` in detail.
 - `${CLAUDE_SKILL_DIR}/references/init-and-dev-target.md`: per-connector init and

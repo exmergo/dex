@@ -150,6 +150,11 @@ class Assurance(BaseModel):
 class Blocker(BaseModel):
     node: str
     status: str
+    #: ``project`` or ``package``, and how it relates to the named plan; the
+    #: repair routes are under ``data.prerequisites`` (#860).
+    owner: str | None = None
+    package: str | None = None
+    plan_relation: str | None = None
     message: str | None = None
 
 
@@ -195,6 +200,20 @@ class Obligations(BaseModel):
     contradicted: list[Obligation] = Field(default_factory=list)
     unchecked: list[Obligation] = Field(default_factory=list)
     no_declared_columns: NameList = Field(default_factory=NameList)
+    #: Required models whose declared population is a sentence: nothing can run
+    #: it, as distinct from a parent or filter a record above measured (#1029).
+    prose_population: NameList = Field(default_factory=NameList)
+
+
+class ColdSummary(BaseModel):
+    """What ``--cold-deps`` established, in counts (#860)."""
+
+    ran: bool = False
+    reinstalled: bool = False
+    installed_edits_lost: int = 0
+    paths: list[str] = Field(default_factory=list)
+    not_compared: list[str] = Field(default_factory=list)
+    reason: str | None = None
 
 
 class ComparisonState(BaseModel):
@@ -219,6 +238,7 @@ class BuildCompletion(BaseModel):
     verification: VerificationSummary = Field(default_factory=VerificationSummary)
     obligations: Obligations = Field(default_factory=Obligations)
     refactor_comparison: list[ComparisonState] | None = None
+    cold: ColdSummary | None = None
     details: list[str] = Field(default_factory=lambda: list(_DETAILS))
     elided: dict[str, int] = Field(default_factory=dict)
 
@@ -414,8 +434,29 @@ def _deliverables(
     )
 
 
-def _blockers(evidence: BuildEvidence, causes: list[str]) -> list[Blocker]:
+def _cold_summary(report: Mapping[str, Any] | None) -> ColdSummary | None:
+    if report is None:
+        return None
+    edits = report.get("installed_edits") or {}
+    groups = [edits.get(key) or {} for key in ("changed", "added", "removed")]
+    return ColdSummary(
+        ran=bool(report.get("ran")),
+        reinstalled=bool(report.get("reinstalled")),
+        installed_edits_lost=sum(int(g.get("count") or 0) for g in groups),
+        paths=[path for g in groups for path in g.get("paths") or []][:_NAMES],
+        not_compared=list(edits.get("not_compared") or [])[:_NAMES],
+        reason=report.get("reason"),
+    )
+
+
+def _blockers(
+    evidence: BuildEvidence,
+    causes: list[str],
+    prerequisites: Iterable[Mapping[str, Any]] = (),
+) -> list[Blocker]:
     """Every node that failed, the ones that stopped a deliverable first."""
+
+    diagnosed = {entry.get("unique_id"): entry for entry in prerequisites}
 
     failed = [n for n in evidence.nodes if _status_kind(n.status) == "failed"]
     rank = {name: index for index, name in enumerate(causes)}
@@ -424,6 +465,9 @@ def _blockers(evidence: BuildEvidence, causes: list[str]) -> list[Blocker]:
         Blocker(
             node=n.name,
             status=n.status,
+            owner=diagnosed.get(n.unique_id, {}).get("owner"),
+            package=diagnosed.get(n.unique_id, {}).get("package"),
+            plan_relation=diagnosed.get(n.unique_id, {}).get("plan_relation"),
             message=(n.message[:_MESSAGE] if n.message else None),
         )
         for n in failed
@@ -551,6 +595,9 @@ def summarize_completion(
     comparisons: list[ComparisonState] | None = None,
     findings_dropped: int = 0,
     verification_offered: bool = False,
+    prerequisites: list[dict[str, Any]] | None = None,
+    cold: Mapping[str, Any] | None = None,
+    prose_population: Iterable[str] = (),
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -563,12 +610,14 @@ def summarize_completion(
 
     The block is trimmed to ``budget`` bytes serialized, in a fixed order
     (messages, then lists, then names), and every cut is counted under
-    ``elided``.
+    ``elided``. ``prerequisites`` is :func:`~.prerequisites.diagnose`'s answer and
+    ``cold`` is what ``--cold-deps`` reported, both summarized here with the rest
+    under their own keys in ``data``.
     """
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
-    blockers = _blockers(evidence, causes)
+    blockers = _blockers(evidence, causes, prerequisites or ())
     asserted, failed_checks = _checked(evidence, graph, verification)
     statuses = Counter(n.status.lower() for n in evidence.nodes)
     completion = BuildCompletion(
@@ -595,7 +644,13 @@ def summarize_completion(
         ),
         obligations=_obligations(verification),
         refactor_comparison=comparisons,
+        cold=_cold_summary(cold),
     )
+    completion.obligations.prose_population = _names(prose_population)
+    if prerequisites:
+        completion.details = ["data.prerequisites", *completion.details]
+    if cold is not None:
+        completion.details = ["data.cold_verification", *completion.details]
     if verification_offered:
         completion.details = [*completion.details, "data.offer"]
     _fit(completion, budget)
@@ -658,13 +713,17 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         )
         if completion.refactor_comparison is not None:
             cap_list(completion, "refactor_comparison", keep, "refactor_comparison")
+        if completion.cold is not None:
+            # The count stays, and it is what says the installed tree lost edits.
+            cap_list(completion.cold, "paths", keep, "cold.paths")
+            cap_list(completion.cold, "not_compared", keep, "cold.not_compared")
         for owner, fields in (
             (
                 completion.deliverables,
                 ("built", "failed", "skipped", "missing", "stale"),
             ),
             (completion.assurance, ("asserted", "failed_checks", "build_only")),
-            (completion.obligations, ("no_declared_columns",)),
+            (completion.obligations, ("no_declared_columns", "prose_population")),
         ):
             for field in fields:
                 listed: NameList = getattr(owner, field)

@@ -19,12 +19,14 @@ That is what tells the sides apart:
 - both already disagreed and this plan touches neither: silent, so an unrelated
   edit is not buried under a contradiction it did not cause.
 
-Four rules are checked: a declared population filter, the declared grain, a
-declared column, and the additivity an upstream model declares for a column this
-one aggregates. Everything is compared on sqlglot's reading of the SQL rather
-than on its text, so a reformat or an alias rename is silent, and a construct dex
-cannot read (a macro, a function around the column, a subquery) is reported as
-*could not check*, never as a rule removed.
+Five rules are checked: a declared population filter, a declared population
+parent, the declared grain, a declared column, and the additivity an upstream
+model declares for a column this one aggregates. The parent rule is the one that
+also runs on a model the plan creates (#1029), since it needs no prior. Everything
+is compared on sqlglot's reading of the SQL rather than on its text, so a reformat
+or an alias rename is silent, and a construct dex cannot read (a macro, a function
+around the column, a subquery) is reported as *could not check*, never as a rule
+removed.
 
 Read-only and connectionless: it reads the repository and the stored cache and
 nothing else. It never refuses and never blocks apply. A warning here is a
@@ -34,16 +36,19 @@ question for the author, not enforcement.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
+from ..dbt_project import jinja_regions
 from .declarations import model_sql_path
 from .drafting import Usage, _Reading, _untoken, dataset_for, read_declared
 
 if TYPE_CHECKING:
     from ..cache import DexCache
+    from ..references import ReferenceIndex
 
 _FILTER_CLAUSES = ("where", "having", "qualify")
 _RATIO_UNITS = ("fraction", "percent")
@@ -84,6 +89,10 @@ class Contradiction:
     declared_on: str | None = None
     row_delta: int | None = None
     row_reason: str | None = None
+    #: The declared parent, for that rule.
+    parent: str | None = None
+    #: The plan creates this model, so "the plan changed both" means it wrote both.
+    created: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -91,7 +100,15 @@ class Contradiction:
             "status": self.status,
             "rule": self.rule,
         }
-        for key in ("column", "declared_on", "stale", "prior", "authored", "reason"):
+        for key in (
+            "column",
+            "parent",
+            "declared_on",
+            "stale",
+            "prior",
+            "authored",
+            "reason",
+        ):
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
@@ -99,6 +116,8 @@ class Contradiction:
             out["preexisting"] = self.preexisting
         if self.row_delta is not None:
             out["row_delta"] = self.row_delta
+        if self.created:
+            out["created"] = True
         return out
 
 
@@ -133,19 +152,22 @@ def check(
     model_paths: list[str],
     cache: DexCache | None = None,
     cumulative: Mapping[str, set[str]] | None = None,
+    index: Callable[[], ReferenceIndex | None] | None = None,
 ) -> list[Contradiction]:
     """Every declared rule ``model``'s prior and authored versions disagree on.
 
     ``prior_*`` is the model as the project holds it now and the rest is the
     model once the plan lands. ``cumulative`` maps a cache identifier to the
     columns the cumulative detector flagged there, for a running total no
-    declaration names yet.
+    declaration names yet. ``index`` builds the post-change reference index, called
+    only when a parent is declared.
     """
 
     before = _Side(prior_reading, prior_declared, prior_files)
     after = _Side(reading, declared, files)
     found: list[Contradiction] = []
     found.extend(_population(model, before, after))
+    found.extend(_parent(model, before, after, model_paths, index))
     grain = _grain(model, before, after)
     found.extend(grain)
     dropped = {c.column for c in grain if c.column}
@@ -155,6 +177,27 @@ def check(
     )
     for item in found:
         item.prior = _untoken(item.prior, prior_reading.tokens)
+        item.authored = _untoken(item.authored, reading.tokens)
+        item.reason = _untoken(item.reason, reading.tokens)
+    return found
+
+
+def check_new(
+    model: str,
+    *,
+    reading: _Reading,
+    declared: dict[str, Any],
+    files: Mapping[str, str],
+    model_paths: list[str],
+    index: Callable[[], ReferenceIndex | None] | None = None,
+) -> list[Contradiction]:
+    """What a model the plan creates contradicts: only its declared parent, the
+    one rule that means something with no prior version to compare."""
+
+    after = _Side(reading, declared, files)
+    before = _Side(_Reading(), {}, {})
+    found = _parent(model, before, after, model_paths, index, created=True)
+    for item in found:
         item.authored = _untoken(item.authored, reading.tokens)
         item.reason = _untoken(item.reason, reading.tokens)
     return found
@@ -238,6 +281,187 @@ def _population(model: str, before: _Side, after: _Side) -> list[Contradiction]:
         if found is not None:
             out.append(found)
     return out
+
+
+# --- population parent ------------------------------------------------------------
+
+
+def _declared_parent(declared: dict[str, Any]) -> str | None:
+    population = declared.get("population")
+    if not isinstance(population, dict):
+        return None
+    parent = population.get("parent")
+    if isinstance(parent, dict) and isinstance(parent.get("model"), str):
+        return parent["model"]
+    return None
+
+
+def _parent(
+    model: str,
+    before: _Side,
+    after: _Side,
+    model_paths: list[str],
+    index: Callable[[], ReferenceIndex | None] | None,
+    *,
+    created: bool = False,
+) -> list[Contradiction]:
+    """The relation driving the model against the parent it declares.
+
+    Any lineage link in either direction satisfies the rule: a relation derived
+    from the parent, however it joins, and a relation the parent itself is built
+    from, such as its source. That misses a model driven from a child table that
+    merely joins the parent upstream, which verification can still catch; a false
+    alarm on a legitimate model is the error avoided. Nothing is inferred from a
+    name: no declared parent, no check.
+    """
+
+    parent = _declared_parent(after.declared)
+    if parent is None:
+        return []
+    prior_parent = _declared_parent(before.declared)
+    graph = index() if index is not None else None
+    found = _judge(
+        model,
+        "population_parent",
+        f"population.parent {parent}",
+        _parent_verdict(before, prior_parent or parent, graph, model_paths, model),
+        _parent_verdict(after, parent, graph, model_paths, model),
+        rule_changed=prior_parent != parent,
+        parent=parent,
+        created=created,
+    )
+    return [found] if found is not None else []
+
+
+def _parent_verdict(
+    side: _Side,
+    parent: str,
+    graph: ReferenceIndex | None,
+    model_paths: list[str],
+    model: str,
+) -> _Verdict:
+    reading = side.reading
+    drivers = reading.driving
+    signature = (
+        frozenset(d.lower() for d in drivers),
+        reading.driving_unread is not None,
+    )
+    said = ", ".join(drivers) or None
+    if parent.lower() in {d.lower() for d in drivers}:
+        return _Verdict("holds", said=said, signature=signature)
+    if graph is not None and _in_lineage(graph, parent, drivers, model):
+        return _Verdict("holds", said=said, signature=signature)
+
+    def unknown(reason: str) -> _Verdict:
+        return _Verdict("unknown", said=said, reason=reason, signature=signature)
+
+    if reading.driving_unread:
+        return unknown(reading.driving_unread)
+    if not drivers:
+        return unknown(
+            reading.incomplete[0]
+            if reading.incomplete
+            else "the driving relation could not be read"
+        )
+    if reading.driving_literal:
+        return unknown(
+            f"`{reading.driving_literal[0]}` is written as a literal name, so dex "
+            "cannot place it in the ref() graph"
+        )
+    if graph is None:
+        return unknown("the project's ref() graph was not available")
+    opened = _unsettled(side, graph, parent, drivers, model_paths, model)
+    if opened:
+        return unknown(opened)
+    return _Verdict("contradicted", said=said, signature=signature)
+
+
+def _lowered(names: set[str]) -> set[str]:
+    return {name.lower() for name in names}
+
+
+def _in_lineage(
+    graph: ReferenceIndex, parent: str, drivers: list[str], model: str
+) -> bool:
+    """Whether any driver derives from the parent or feeds it."""
+
+    upstream = _lowered(graph.ancestors_of(parent))
+    for driver in drivers:
+        if parent.lower() in _lowered(graph.ancestors_of(driver)):
+            return True
+        if driver.lower() in upstream:
+            return True
+        # A source is no node of the ref() graph, so what links it to the parent
+        # is a model upstream of the parent reading it.
+        readers = {
+            PurePosixPath(path).stem.lower() for path in graph.readers_of(driver)
+        }
+        if (readers - {model.lower()}) & upstream:
+            return True
+    return False
+
+
+#: Jinja calls that cannot hide a relation a model reads.
+_TRANSPARENT_CALLS = frozenset(
+    {"ref", "source", "config", "var", "is_incremental", "this", "env_var"}
+)
+
+
+def _unsettled(
+    side: _Side,
+    graph: ReferenceIndex,
+    parent: str,
+    drivers: list[str],
+    model_paths: list[str],
+    model: str,
+) -> str | None:
+    """Why the lineage cannot rule the parent out, when something could hide it:
+    a relation the project does not define, a ref dex could not resolve, or a
+    macro call that may read a relation of its own."""
+
+    own_sql = side.files.get(model_sql_path(side.files, model_paths, model) or "", "")
+    regions, _ = jinja_regions(own_sql)
+    sources = {
+        str(call.args[-1]).lower()
+        for region in regions
+        for call in region.calls
+        if call.callee == "source" and call.args
+    }
+    if graph.node_kind(parent) is None:
+        return (
+            f"the declared parent '{parent}' is not defined in this project, so its "
+            "lineage cannot be read"
+        )
+    lineage = set(graph.ancestors_of(parent))
+    for driver in drivers:
+        if driver.lower() in sources:
+            continue
+        if graph.node_kind(driver) is None:
+            return (
+                f"'{driver}' is not defined in this project (an installed package, or "
+                "a name nothing defines), so its lineage cannot be read"
+            )
+        lineage |= graph.ancestors_of(driver)
+    stems = _lowered(lineage)
+    for reference in graph.indeterminate_for("model"):
+        if PurePosixPath(reference.path).stem.lower() in stems:
+            return (
+                f"{reference.path} carries a ref() dex could not resolve, so the "
+                "lineage may reach the parent"
+            )
+    for name in sorted(lineage):
+        path = model_sql_path(side.files, model_paths, name)
+        if path is None:
+            continue
+        regions, _ = jinja_regions(side.files[path])
+        for region in regions:
+            for call in region.calls:
+                if call.callee not in _TRANSPARENT_CALLS:
+                    return (
+                        f"'{name}' calls {call.callee}(), which may read a relation "
+                        "dex cannot see"
+                    )
+    return None
 
 
 def _describe_filter(entry: dict[str, Any]) -> str:
@@ -742,7 +966,13 @@ def _sentence(model: str, item: dict[str, Any]) -> str:
     check, rule = item["check"], item["rule"]
     prior, authored = item.get("prior"), item.get("authored")
     stale = item.get("stale")
-    if check == "population":
+    if check == "population_parent":
+        stated = f"'{model}' declares one row per entity of '{item.get('parent')}'"
+        change = (
+            f"its SQL is driven from '{authored}', which is neither that parent nor "
+            "derived from it"
+        )
+    elif check == "population":
         stated = f"'{model}' declares {rule}"
         if authored and (stale == "declaration" or authored == prior):
             change = f"its SQL filters `{authored}`, which does not implement it"
@@ -784,11 +1014,19 @@ def _sentence(model: str, item: dict[str, Any]) -> str:
             "edit the SQL in this same plan to implement the declaration, or "
             "correct the declaration if it is the side that is wrong"
         )
+    elif item.get("created"):
+        side = "this plan writes both the SQL and the declaration and they disagree"
+        fix = "make one match the other before applying"
     else:
         side = (
             "this plan changes both the SQL and the declaration and they still disagree"
         )
         fix = "make one match the other before applying"
+    if check == "population_parent":
+        fix = (
+            f"drive the model from '{item.get('parent')}' and left-join the rest, or "
+            "correct the declared parent if it is the side that is wrong"
+        )
     text = f"{stated}, and {change}; {side}. {fix[0].upper()}{fix[1:]}"
     if item.get("preexisting"):
         text += " (the two already disagreed before this plan)"
@@ -806,6 +1044,8 @@ def _sentence(model: str, item: dict[str, Any]) -> str:
 
 
 def _sql_fix(check: str, item: dict[str, Any]) -> str:
+    if check == "population_parent":
+        return ""  # _sentence names both fixes for this rule, whichever side is stale
     if check == "additivity":
         owner = item.get("declared_on")
         where = f"the declaration on '{owner}'" if owner else "a declaration on it"

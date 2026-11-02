@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -51,6 +54,7 @@ from .artifact_runtime import (
     DEFAULT_ARTIFACT_POLICY,
     artifact_paths,
     clear_run_results,
+    dbt_runtime_key,
     prepare_artifact_dir,
     readable_artifact_dir,
     resolve_build_artifact_dir,
@@ -142,6 +146,7 @@ def build(
     artifact_policy: str = DEFAULT_ARTIFACT_POLICY,
     relation_columns: Callable[[list[str]], dict[str, list[str]]] | None = None,
     full_refresh: bool = False,
+    run_cwd: Path | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -264,6 +269,14 @@ def build(
         "--target-path",
         str(artifacts),
     ]
+    # A copy's logs go with it, and a failure's "full output" line names the file.
+    detached = (
+        run_cwd is not None and Path(run_cwd).resolve() != Path(project).resolve()
+    )
+    log_file = None
+    if detached:
+        log_file = Path(artifacts) / "logs" / "dbt.log"
+        flags += ["--log-path", str(log_file.parent)]
     argv = [_dbt_executable(), "build", *flags]
     if select:
         argv += ["--select", select]
@@ -284,8 +297,10 @@ def build(
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
     # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
     # against whatever directory the caller happened to launch from.
+    # A cold checkout builds a copy and keeps cwd at the real project, for the
+    # relative DuckDB path the comment above is about (see `ShadowRun`).
     run = runner or _default_runner(
-        timeout, project, env=_build_env(connector, paradigm, ceiling)
+        timeout, run_cwd or project, env=_build_env(connector, paradigm, ceiling)
     )
     stale: list[dict[str, Any]] = []
     # A requested full refresh rebuilds every seed the build selects, stale or
@@ -343,7 +358,14 @@ def build(
         clear_run_results(artifacts)
     completed = run(argv)
 
-    summary = _summarize(project, target, completed, artifact_directory=artifacts)
+    summary = _summarize(
+        project,
+        target,
+        completed,
+        artifact_directory=artifacts,
+        log_file=log_file,
+        label_root=run_cwd if detached else None,
+    )
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
     if full_refresh:
@@ -475,7 +497,7 @@ def _exact_seed(node: dict[str, Any]) -> str:
 
 @contextlib.contextmanager
 def shadow_project(
-    project_dir: Path | str, edits: Sequence[Edit] = ()
+    project_dir: Path | str, edits: Sequence[Edit] = (), *, skip_packages: bool = False
 ) -> Iterator[Path]:
     """A throwaway copy of the project with ``edits`` overlaid, yielded by path.
 
@@ -488,17 +510,17 @@ def shadow_project(
     macros. Warehouse files deliberately are not: they can be huge, and a copy of
     a database is not the database, so a caller that needs the real warehouse must
     reach it through the profile rather than through the tree. ``.dex`` matters
-    when the project is the repo root.
+    when the project is the repo root. ``skip_packages`` leaves ``dbt_packages/``
+    out, for a caller about to install it afresh.
     """
 
     project = Path(project_dir).resolve()
     view = load_project(project)
-    by_name = shutil.ignore_patterns(
-        "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
-    )
+    by_name = shutil.ignore_patterns(".git", ".venv", ".dex", "*.duckdb", "*.db")
     # A configured target-path holds artifacts as surely as `target/` does,
     # Dex's own isolated ones included (issue #1014). It is skipped by its full
     # path: `target-path: models/target` must not skip `models/`.
+    packages = packages_dir(project).resolve()
     artifacts: Path | None = None
     with contextlib.suppress(ValueError, OSError):
         configured = shared_target_dir(project).resolve()
@@ -507,8 +529,13 @@ def shadow_project(
 
     def ignore(directory: str, names: list[str]) -> set[str]:
         skipped = set(by_name(directory, names))
+        # At the root only: `models/logs/` is a folder of models, not dbt's logs.
+        if Path(directory).resolve() == project:
+            skipped.update(name for name in names if name in ("target", "logs"))
         if artifacts is not None and Path(directory).resolve() == artifacts.parent:
             skipped.update(name for name in names if name == artifacts.name)
+        if skip_packages and Path(directory).resolve() == packages.parent:
+            skipped.update(name for name in names if name == packages.name)
         return skipped
 
     with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
@@ -1238,6 +1265,315 @@ def deps(
         "packages_dir_exists": packages_dir.is_dir() and any(packages_dir.iterdir()),
         "messages": messages,
     }
+
+
+#: How many paths one list of ``installed_edits`` names before counting the rest.
+_COLD_EDIT_NAMES = 20
+_LOCK_FILE = "package-lock.yml"
+_SPEC_FILES = ("packages.yml", "dependencies.yml")
+#: Never part of what a package ships, wherever they sit.
+_TREE_SKIPPED = frozenset({".git", "__pycache__"})
+#: dbt's own output, at a package's root only: `models/logs/` holds models.
+_PACKAGE_OUTPUT = frozenset({"target", "logs"})
+
+
+class ColdReinstallError(DbtRunError):
+    """The explicit reinstall failed, so nothing was built from the old tree."""
+
+    def __init__(self, message: str, report: dict[str, Any]):
+        super().__init__(message)
+        self.report = report
+
+
+@dataclass
+class ColdCheckout:
+    """A copy of the project holding only what ``dbt deps`` installed."""
+
+    path: Path
+    report: dict[str, Any]
+
+
+def _file_digest(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def packages_dir(project_dir: Path | str) -> Path:
+    """Where dbt installs this project's packages: ``packages-install-path``, or
+    ``dbt_packages``. A templated value falls back to the default."""
+
+    project = Path(project_dir)
+    configured = _configured_install_path(project)
+    if not isinstance(configured, str) or not configured or _is_templated(configured):
+        configured = "dbt_packages"
+    return project / configured
+
+
+def _configured_install_path(project: Path) -> Any:
+    """``packages-install-path`` as written, before dbt renders it."""
+
+    with contextlib.suppress(OSError, yaml.YAMLError, AttributeError):
+        parsed = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+        return parsed.get("packages-install-path")
+    return None
+
+
+def _is_templated(value: Any) -> bool:
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _keep_local_packages_reachable(shadow: Path, project: Path) -> bool:
+    """Make each relative ``local:`` package resolve from the copy. True if the
+    lockfile had to go.
+
+    dbt reads a ``local:`` path against the project directory, and the copy is
+    somewhere else. A link beside the copy keeps the path, the spec and the
+    lockfile's hash of that spec exactly as written, so every other package still
+    installs at its pin. A path climbing out of the temporary directory cannot be
+    linked, so it is rewritten to absolute, which changes the spec's hash: the
+    lockfile is dropped and the caller says so.
+    """
+
+    rewrote = False
+    # Unresolved like `place` below: /var and /private/var are one directory on macOS.
+    boundary = shadow.parent
+    for name in _SPEC_FILES:
+        path = shadow / name
+        if not path.is_file():
+            continue
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+        entries = parsed.get("packages") if isinstance(parsed, dict) else None
+        changed = False
+        for entry in entries or []:
+            local = entry.get("local") if isinstance(entry, dict) else None
+            if not isinstance(local, str) or Path(local).is_absolute():
+                continue
+            real = (project / local).resolve()
+            place = Path(os.path.normpath(shadow / local))
+            if place.exists():
+                continue
+            if place.is_relative_to(boundary):
+                place.parent.mkdir(parents=True, exist_ok=True)
+                place.symlink_to(real, target_is_directory=True)
+            else:
+                entry["local"] = str(real)
+                changed = True
+        if changed:
+            path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+            rewrote = True
+    if rewrote:
+        (shadow / _LOCK_FILE).unlink(missing_ok=True)
+    return rewrote
+
+
+def _file_digests(root: Path) -> dict[str, str]:
+    """Each file a package holds, by relative path, without following a link."""
+
+    digests: dict[str, str] = {}
+    for directory, names, files in os.walk(root):
+        at_root = Path(directory) == root
+        names[:] = [
+            n
+            for n in names
+            if n not in _TREE_SKIPPED and not (at_root and n in _PACKAGE_OUTPUT)
+        ]
+        for name in files:
+            path = Path(directory) / name
+            if path.is_file():
+                digests[path.relative_to(root).as_posix()] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+    return digests
+
+
+def _package_tree(root: Path, linked: Iterable[str]) -> dict[str, str]:
+    """Every file under an install directory, keyed ``<package>/<path>``."""
+
+    found: dict[str, str] = {}
+    if not root.is_dir():
+        return found
+    skipped = set(linked)
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and not child.is_symlink() and child.name not in skipped:
+            for rel, digest in _file_digests(child).items():
+                found[f"{child.name}/{rel}"] = digest
+    return found
+
+
+def _capped(paths: list[str]) -> dict[str, Any]:
+    return {
+        "count": len(paths),
+        "paths": paths[:_COLD_EDIT_NAMES],
+        "elided": max(0, len(paths) - _COLD_EDIT_NAMES),
+    }
+
+
+def _linked_packages(*roots: Path) -> list[str]:
+    return sorted(
+        {
+            child.name
+            for root in roots
+            if root.is_dir()
+            for child in root.iterdir()
+            if child.is_symlink()
+        }
+    )
+
+
+def _compare_installed(project: Path, shadow: Path) -> dict[str, Any]:
+    """What the install directory holds that a reinstall does not reproduce."""
+
+    installed = packages_dir(project)
+    fresh = packages_dir(shadow)
+    linked = _linked_packages(installed, fresh)
+    if not installed.is_dir():
+        return {
+            "compared": False,
+            "reason": "no packages were installed here, so there is nothing to lose",
+            **{key: _capped([]) for key in ("changed", "added", "removed")},
+            "not_compared": linked,
+        }
+    before = _package_tree(installed, linked)
+    after = _package_tree(fresh, linked)
+    changed: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+    for rel in sorted(set(before) | set(after)):
+        if rel not in after:
+            added.append(rel)
+        elif rel not in before:
+            removed.append(rel)
+        elif before[rel] != after[rel]:
+            changed.append(rel)
+    return {
+        "compared": True,
+        "changed": _capped(changed),
+        "added": _capped(added),
+        "removed": _capped(removed),
+        "not_compared": linked,
+    }
+
+
+def _locked_packages(shadow: Path) -> list[dict[str, Any]]:
+    """Name, source kind and pin of each locked package, never its URL, which may
+    carry a credential."""
+
+    path = shadow / _LOCK_FILE
+    if not path.is_file():
+        return []
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    entries = parsed.get("packages") if isinstance(parsed, dict) else None
+    out = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        source = next(
+            (
+                k
+                for k in ("package", "git", "local", "tarball", "private")
+                if k in entry
+            ),
+            "unknown",
+        )
+        pin = entry.get("revision") or entry.get("version")
+        name = entry.get("name") or (entry["package"] if source == "package" else None)
+        out.append({"name": name, "source": source, "pin": _version_text(pin)})
+    return out
+
+
+@contextlib.contextmanager
+def cold_checkout(
+    project_dir: Path | str, *, runner: Runner | None = None
+) -> Iterator[ColdCheckout]:
+    """The project copied without ``dbt_packages/``, then installed afresh (#860).
+
+    The explicit proof that a repair survives a reinstall: the real project's
+    packages are never touched, and whatever the build reads from a package here
+    came from ``dbt deps``. Honours the project's lockfile. May reach the network,
+    which is why only ``--cold-deps`` ever calls this. A failed install raises
+    rather than falling back to the installed tree.
+    """
+
+    project = Path(project_dir).resolve()
+    with shadow_project(project, skip_packages=True) as shadow:
+        # dbt renders a templated path (`env_var()`) to somewhere only it can name,
+        # so nothing here can show that `dbt deps` would write inside the copy.
+        if _is_templated(_configured_install_path(shadow)):
+            reason = (
+                "packages-install-path is templated, so dex cannot show that a "
+                "reinstall stays isolated from the installed packages"
+            )
+            raise ColdReinstallError(
+                reason, {"ran": True, "reinstalled": False, "reason": reason}
+            )
+        # An absolute or far-climbing packages-install-path names the same directory
+        # from the copy as from the project, so `dbt deps` would write over it.
+        if not Path(os.path.normpath(packages_dir(shadow))).is_relative_to(
+            shadow.parent
+        ):
+            reason = (
+                "packages-install-path points outside the project, so a reinstall "
+                "cannot be isolated from the installed packages"
+            )
+            raise ColdReinstallError(
+                reason, {"ran": True, "reinstalled": False, "reason": reason}
+            )
+        had_lock = (project / _LOCK_FILE).is_file()
+        rewrote = _keep_local_packages_reachable(shadow, project)
+        lock_before = _file_digest(shadow / _LOCK_FILE)
+        summary = deps(shadow, runner=runner)
+        report: dict[str, Any] = {
+            "ran": True,
+            "reinstalled": bool(summary["success"]),
+            "reinstalled_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "dbt_runtime": dbt_runtime_key(),
+        }
+        if not summary["success"]:
+            messages = summary.get("messages") or []
+            report["reason"] = (
+                "dbt deps failed in the isolated copy, so nothing was built; the "
+                "installed packages were not used in its place"
+            )
+            raise ColdReinstallError(
+                "dbt deps failed in the isolated copy"
+                + (f": {messages[0]}" if messages else ""),
+                report,
+            )
+        lock_after = _file_digest(shadow / _LOCK_FILE)
+        fresh_digests = _package_tree(packages_dir(shadow), ())
+        tree_digest = hashlib.sha256(
+            json.dumps(fresh_digests, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        report.update(
+            packages=_locked_packages(shadow),
+            lock_digest=lock_after,
+            installed_tree_digest=tree_digest,
+            installed_edits=_compare_installed(project, shadow),
+        )
+        notes = []
+        if rewrote and had_lock:
+            notes.append(
+                "a relative local: package climbs out of the copy's directory, so its "
+                "path was rewritten and package-lock.yml dropped in the copy; this "
+                "reinstall resolved every package's version afresh"
+            )
+        elif lock_before is None or lock_before != lock_after:
+            notes.append(
+                "the project has no lockfile matching its package spec, so this "
+                "reinstall resolved its versions afresh; commit package-lock.yml "
+                "for a reinstall that reproduces this one"
+            )
+        linked = report["installed_edits"]["not_compared"]
+        if linked:
+            notes.append(
+                f"{', '.join(linked)}: dbt links a local package rather than "
+                "copying it, so an edit through the install directory writes to its "
+                "source and a reinstall keeps it; this run cannot detect such an edit"
+            )
+        if notes:
+            report["notes"] = notes
+        yield ColdCheckout(shadow, report)
 
 
 _COMPILE_TIMEOUT_SECONDS = 300.0
@@ -2000,6 +2336,8 @@ def _summarize(
     *,
     artifact_directory: Path | None = None,
     read_from: Path | None = None,
+    log_file: Path | None = None,
+    label_root: Path | None = None,
 ) -> dict[str, Any]:
     """Reduce a dbt run to a sanitized summary; raw log text stays behind.
 
@@ -2074,9 +2412,13 @@ def _summarize(
 
     messages: list[str] = []
     if completed.returncode != 0:
-        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+        messages = _collect_messages(
+            completed, log_hint=log_file or project / "logs" / "dbt.log"
+        )
     if foreign is not None:
-        label = sanitize_artifact_directory(paths.directory, project_root=project)
+        label = sanitize_artifact_directory(
+            paths.directory, project_root=label_root or project
+        )
         messages = [
             f"the run results in {label} "
             f"belong to another dbt invocation ({foreign}), not this run's; none "
@@ -2105,7 +2447,7 @@ def _summarize(
         summary["elapsed_seconds"] = elapsed_seconds
     if artifact_directory is not None:
         summary["artifact_directory"] = sanitize_artifact_directory(
-            paths.directory, project_root=project
+            paths.directory, project_root=label_root or project
         )
     # An internal hand-off like `bytes_billed`, popped by the command layer
     # before shaping: the evidence read is held to the invocation this run
