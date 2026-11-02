@@ -432,7 +432,6 @@ def _compare(
     return command_args.stamp_spend(result, adapter)
 
 
-
 def _model_names_for_relations(project: Path, relations: Sequence[str]) -> list[str]:
     """Model labels the last compile placed on these relations, when known (#1058).
 
