@@ -1161,7 +1161,8 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     Both, because dbt installs a hub package into a directory named after the
     package's second segment while the package's own ``dbt_project.yml`` may say
     something else, and a check that reads only one of them reports a present
-    package as absent.
+    package as absent. Honours ``packages-install-path`` via
+    :func:`package_install_dir`.
     """
 
     installed: set[str] = set()
@@ -1306,9 +1307,10 @@ def has_package_shortfall(project_dir: Path | str) -> bool:
 
 
 def needs_deps(project_dir: Path | str) -> bool:
-    """True when declared packages are not installed yet (dbt_packages/ missing
+    """True when declared packages are not installed yet (install path missing
     or empty). Lockfile staleness is not tracked; `transform deps` is the
-    explicit refresh."""
+    explicit refresh. Honours ``packages-install-path`` via
+    :func:`package_install_dir`."""
 
     project = Path(project_dir)
     if not has_package_spec(project):
