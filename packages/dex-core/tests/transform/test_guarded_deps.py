@@ -16,6 +16,7 @@ import pytest
 from exmergo_dex_core import MissingPackagesError
 from exmergo_dex_core.transform.build import (
     DependencyPolicy,
+    assert_packages_installed,
     build,
     declared_packages,
     installed_packages,
@@ -210,3 +211,46 @@ def test_refuse_policy_does_not_assume_unknown_package_is_installed(dbt_project_
         )
     assert caught.value.packages == []
     assert len(caught.value.unverifiable) == 1
+
+
+def test_a_configured_packages_install_path_is_honoured(dbt_project_dir: Path):
+    """dbt may be told to install packages somewhere other than dbt_packages/;
+    checking the default anyway would refuse a project that is complete."""
+
+    config = dbt_project_dir / "dbt_project.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + 'packages-install-path: "vendor/packages"\n',
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "packages.yml").write_text(
+        "packages:\n  - package: dbt-labs/dbt_utils\n    version: 1.3.0\n",
+        encoding="utf-8",
+    )
+    installed = dbt_project_dir / "vendor" / "packages" / "dbt_utils"
+    installed.mkdir(parents=True)
+    (installed / "dbt_project.yml").write_text(
+        'name: dbt_utils\nversion: "1.3.0"\n', encoding="utf-8"
+    )
+
+    assert "dbt_utils" in installed_packages(dbt_project_dir)
+    assert missing_packages(dbt_project_dir) == []
+    assert_packages_installed(dbt_project_dir)
+
+
+def test_a_git_token_is_not_named_in_the_refusal(dbt_project_dir: Path):
+    """The refusal is readable by anyone who can run a plan; a credential in a
+    git URL must not travel with it, with or without a colon in the userinfo."""
+
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - git: "https://TOKEN@github.com/org/repo.git"\n'
+        "    revision: 0.1.0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MissingPackagesError) as caught:
+        assert_packages_installed(dbt_project_dir)
+
+    message = str(caught.value)
+    assert "TOKEN" not in message
+    assert "https://github.com/org/repo.git@0.1.0" in message

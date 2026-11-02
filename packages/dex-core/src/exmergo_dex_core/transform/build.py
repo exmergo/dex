@@ -789,7 +789,26 @@ class DeclaredPackage(BaseModel):
     install_name: str | None = None
 
     def describe(self) -> str:
-        return f"{self.name}@{self.version}" if self.version else self.name
+        name = _without_userinfo(self.name)
+        return f"{name}@{self.version}" if self.version else name
+
+
+def _without_userinfo(value: str) -> str:
+    """Drop credentials from a URL before it is named in an error.
+
+    ``https://TOKEN@github.com/org/repo.git`` is a valid git package, and a
+    caller who can run a plan can read its refusal. Keep the host and path so
+    the message still names the package, but never the token; ``git@host:path``
+    is a user name, not a secret, and has no ``://``.
+    """
+
+    if "://" not in value:
+        return value
+    scheme, rest = value.split("://", 1)
+    authority, separator, tail = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[-1]
+    return f"{scheme}://{authority}{separator}{tail}"
 
 
 def _package_entries(project: Path) -> list[dict[str, Any]]:
@@ -866,8 +885,31 @@ def _version_text(value: Any) -> str | None:
     return str(value)
 
 
+def packages_dir(project_dir: Path | str) -> Path:
+    """Where dbt installs declared packages, honoring ``packages-install-path``.
+
+    dbt defaults to ``dbt_packages/`` beside the project; a project may move it.
+    Checking the default unconditionally would refuse a project whose packages
+    are installed where dbt was told to put them.
+    """
+
+    project = Path(project_dir)
+    configured: str | None = None
+    config = project / "dbt_project.yml"
+    if config.is_file():
+        try:
+            parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("packages-install-path")
+            if isinstance(value, str) and value.strip():
+                configured = value.strip()
+    return project / (configured or "dbt_packages")
+
+
 def installed_packages(project_dir: Path | str) -> set[str]:
-    """What is actually in ``dbt_packages/``, by directory and by declared name.
+    """What is actually in the package directory, by directory and by declared name.
 
     Both, because dbt installs a hub package into a directory named after the
     package's second segment while the package's own ``dbt_project.yml`` may say
@@ -876,7 +918,7 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     """
 
     installed: set[str] = set()
-    root = Path(project_dir) / "dbt_packages"
+    root = packages_dir(project_dir)
     if not root.is_dir():
         return installed
     for child in root.iterdir():
@@ -986,8 +1028,8 @@ def needs_deps(project_dir: Path | str) -> bool:
     project = Path(project_dir)
     if not has_package_spec(project):
         return False
-    packages_dir = project / "dbt_packages"
-    return not packages_dir.is_dir() or not any(packages_dir.iterdir())
+    install_dir = packages_dir(project)
+    return not install_dir.is_dir() or not any(install_dir.iterdir())
 
 
 def deps(
@@ -1018,11 +1060,11 @@ def deps(
     messages: list[str] = []
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
-    packages_dir = project / "dbt_packages"
+    install_dir = packages_dir(project)
     return {
         "success": completed.returncode == 0,
         "returncode": completed.returncode,
-        "packages_dir_exists": packages_dir.is_dir() and any(packages_dir.iterdir()),
+        "packages_dir_exists": install_dir.is_dir() and any(install_dir.iterdir()),
         "messages": messages,
     }
 
