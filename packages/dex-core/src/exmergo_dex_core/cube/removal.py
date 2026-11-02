@@ -20,6 +20,8 @@ by re-reading it: it must parse to the original with exactly those entries gone.
   as often a rename to follow (repoint ``sql_table``) as a cube to retire;
 - a view source whose join path walks a removed join: dropping a whole source
   changes what the view is, which is a decision rather than a repair;
+- a view left with no sources: removing a whole view is not something reconcile
+  authors, as with a whole cube;
 - a file that already holds a key Cube does not declare: authoring refuses any
   edit to such a file (Cube's own validator would), so the proposal names it;
 - a ``sql`` cube whose query selects the dropped column itself, which no member
@@ -179,12 +181,18 @@ def _held_back(removal: Mapping[str, Any]) -> bool:
     """Whether this removal is one dex proposes but does not write: nothing in
     it is dex's to cut on its own."""
 
-    if removal.get("broken_sources") or removal.get("sql_reads_dropped"):
+    if (
+        removal.get("broken_sources")
+        or removal.get("sql_reads_dropped")
+        or removal.get("empties_view")
+    ):
         return True
     return describe(removal) == "nothing"
 
 
 def _advisory(finding: DriftFinding, path: str) -> Proposal:
+    """The advisory proposal when a drift finding requires manual intervention."""
+
     removal = finding.data.get("removal") or {}
     name = finding.data.get("semantic_model")
     if removal.get("whole_model"):
@@ -200,6 +208,12 @@ def _advisory(finding: DriftFinding, path: str) -> Proposal:
             f"{', '.join(removal['broken_sources'])} whose join path walks a join "
             "that goes. Re-route or remove them with `semantic cube update`; dex "
             "does not drop a view's source on its own"
+        )
+    elif removal.get("empties_view"):
+        action = (
+            f"view '{name}' ({path}) would be left with no sources. "
+            "Add another source, or remove the view with `semantic cube update`; "
+            "dex does not drop a whole view on its own"
         )
     elif removal.get("held_joins") and describe(removal) == "nothing":
         action = (
@@ -227,6 +241,10 @@ def describe(removal: Mapping[str, Any]) -> str:
             ("measure(s)", removal.get("measures") or []),
             ("segment(s)", removal.get("segments") or []),
             ("join(s) to", removal.get("joins") or []),
+            (
+                "source(s)",
+                [s["join_path"] for s in removal.get("removed_sources") or []],
+            ),
             (
                 "include(s)",
                 [n for i in removal.get("includes") or [] for n in i["names"]],
@@ -328,14 +346,45 @@ def _cube_changes(
     return changes
 
 
+def _member(item: Mapping[str, Any], key: str) -> Any:
+    """The value under ``key``, matched by canonical spelling."""
+
+    for k, v in item.items():
+        if canonical_key(str(k)) == key:
+            return v
+    return None
+
+
+def _source_path(item: Mapping[str, Any]) -> str | None:
+    """The join path of one view source, recognizing canonical join_path/joinPath."""
+
+    path = _member(item, "join_path")
+    return str(path) if path is not None else None
+
+
+def _source_includes(item: Mapping[str, Any]) -> set[str]:
+    """The member names explicitly included in one view source."""
+
+    raw = _member(item, "includes")
+    if not isinstance(raw, list):
+        return set()
+    return {
+        _member(i, "name") if isinstance(i, dict) else str(i)
+        for i in raw
+        if not isinstance(i, str) or i != "*"
+    }
+
+
 def _view_changes(
     text: str,
     node: yaml.MappingNode,
     entry: dict[str, Any],
     removal: Mapping[str, Any],
 ) -> list[_Change] | None:
+    """The changes that apply includes/excludes or source cuts to one view."""
+
     sources = _child(node, "cubes")
-    listed = entry.get("cubes")
+    listed = _member(entry, "cubes")
     if sources is None or not isinstance(listed, list):
         return None
     changes: list[_Change] = []
@@ -344,22 +393,65 @@ def _view_changes(
     ]
     for key, target in wanted:
         names = set(target["names"])
+        target_source_names = (
+            set(target["source_names"]) if "source_names" in target else None
+        )
         matched = [
             (source_node, source)
             for source_node, source in zip(sources.value, listed, strict=True)
             if isinstance(source, dict)
-            and str(source.get("join_path")) == target["join_path"]
-            and source.get("alias") == target.get("alias")
+            and _source_path(source) == target["join_path"]
+            and _member(source, "alias") == target.get("alias")
+            and (
+                target_source_names is None
+                or _source_includes(source) == target_source_names
+            )
         ]
         if len(matched) != 1 or not isinstance(matched[0][0], yaml.MappingNode):
             return None
         source_node, source = matched[0]
 
         def selected(item: Any, names: set[str] = names) -> bool:
-            name = item.get("name") if isinstance(item, dict) else item
+            """Whether this item is one of the members named for removal."""
+
+            name = _member(item, "name") if isinstance(item, dict) else item
             return name in names
 
         planned = _cut(text, source_node, source, key, selected)
+        if planned is None:
+            return None
+        changes.extend(planned)
+    removed = removal.get("removed_sources") or []
+    if removed:
+        counts: dict[tuple[str, Any, frozenset[str]], int] = {}
+        for target in removed:
+            group_key = (
+                target["join_path"],
+                target.get("alias"),
+                frozenset(target.get("names") or []),
+            )
+            counts[group_key] = counts.get(group_key, 0) + 1
+
+        to_cut: list[dict[str, Any]] = []
+        for (join_path, alias, target_names), count in counts.items():
+            matched_sources = [
+                source
+                for source in listed
+                if isinstance(source, dict)
+                and _source_path(source) == join_path
+                and _member(source, "alias") == alias
+                and (not target_names or _source_includes(source) == target_names)
+            ]
+            if len(matched_sources) != count:
+                return None
+            to_cut.extend(matched_sources)
+
+        def source_selected(item: Any) -> bool:
+            """Whether this item is one of the matched sources to cut."""
+
+            return any(item is m for m in to_cut)
+
+        planned = _cut(text, node, entry, "cubes", source_selected)
         if planned is None:
             return None
         changes.extend(planned)
@@ -367,6 +459,8 @@ def _view_changes(
 
 
 def _child(node: yaml.MappingNode, key: str) -> yaml.SequenceNode | None:
+    """Find the child sequence node matching a canonical key."""
+
     for key_node, value in node.value:
         if canonical_key(str(key_node.value)) == key and isinstance(
             value, yaml.SequenceNode
@@ -435,6 +529,8 @@ def _cut(
 def _proposal(
     finding: DriftFinding, kind: str, action: str, *, paths: list[str] | None = None
 ) -> Proposal:
+    """Construct a proposal for a schema drift finding."""
+
     from ..maintain.reconcile import Proposal
 
     return Proposal(

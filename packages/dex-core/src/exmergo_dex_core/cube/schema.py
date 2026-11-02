@@ -517,6 +517,7 @@ def _view_removal(view: View, state: _State) -> dict[str, Any] | None:
     excludes: list[dict[str, Any]] = []
     lost: list[str] = []
     broken: list[str] = []
+    removed_sources: list[dict[str, Any]] = []
     for source in view.sources:
         path = ".".join(source.join_path)
         hop = state.walks_removed(source.join_path[0], source.join_path[1:])
@@ -529,17 +530,27 @@ def _view_removal(view: View, state: _State) -> dict[str, Any] | None:
         coords = {"join_path": path, "alias": source.alias}
         if source.everything:
             lost.extend(f"{target}.{m}" for (c, m) in state.members if c == target)
+            names_ex = [n for n in source.excludes if state.gone(target, n)]
+            if names_ex:
+                excludes.append({**coords, "names": names_ex})
         else:
             names = [
                 i.name for i in source.includes or () if state.gone(target, i.name)
             ]
-            if names:
-                includes.append({**coords, "names": names})
-        names = [n for n in source.excludes if state.gone(target, n)]
-        if names:
-            excludes.append({**coords, "names": names})
-    if not (includes or excludes or lost or broken):
+            all_source_names = [i.name for i in source.includes or ()]
+            if names and len(names) == len(source.includes or ()):
+                removed_sources.append({**coords, "names": names})
+            else:
+                if names:
+                    includes.append(
+                        {**coords, "names": names, "source_names": all_source_names}
+                    )
+                names_ex = [n for n in source.excludes if state.gone(target, n)]
+                if names_ex:
+                    excludes.append({**coords, "names": names_ex})
+    if not (includes or excludes or lost or broken or removed_sources):
         return None
+    emptied_view = bool(view.sources and len(removed_sources) >= len(view.sources))
     return {
         "whole_model": False,
         "element": "view",
@@ -547,10 +558,14 @@ def _view_removal(view: View, state: _State) -> dict[str, Any] | None:
         "excludes": excludes,
         "lost": sorted(lost),
         "broken_sources": broken,
+        "removed_sources": removed_sources,
+        "empties_view": emptied_view,
     }
 
 
 def _path_cubes(source: ViewSource, state: _State) -> list[str]:
+    """The sequence of cubes traversed along a view source join path."""
+
     reached = [source.join_path[0]]
     cube = state.cubes.get(source.join_path[0])
     for segment in source.join_path[1:]:
@@ -563,12 +578,23 @@ def _path_cubes(source: ViewSource, state: _State) -> list[str]:
 
 
 def _target(source: ViewSource, state: _State) -> str | None:
+    """The terminal cube reached by a view source join path."""
+
     reached = _path_cubes(source, state)
     return reached[-1] if len(reached) == len(source.join_path) else None
 
 
 def _view_finding(view: View, removal: dict[str, Any]) -> DriftFinding:
+    """Construct the drift finding detailing what a view loses."""
+
     parts = [
+        (
+            f"the source(s) "
+            f"{', '.join(s['join_path'] for s in removal['removed_sources'])}, "
+            "whose includes all go"
+        )
+        if removal.get("removed_sources")
+        else "",
         f"includes {', '.join(n for i in removal['includes'] for n in i['names'])}"
         if removal["includes"]
         else "",

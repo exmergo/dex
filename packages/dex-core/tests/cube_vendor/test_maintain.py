@@ -30,6 +30,7 @@ from exmergo_dex_core.cli import main  # noqa: E402
 from exmergo_dex_core.cube.model import Member  # noqa: E402
 from exmergo_dex_core.cube.removal import apply_removal  # noqa: E402
 from exmergo_dex_core.cube.schema import type_conflict  # noqa: E402
+from exmergo_dex_core.cube.validator import check_view  # noqa: E402
 from exmergo_dex_core.semantic_types import bucket  # noqa: E402
 
 from .conftest import cube, view  # noqa: E402
@@ -620,6 +621,125 @@ def test_a_file_with_a_key_cube_does_not_declare_is_advisory(repo: Path, capsys)
     ), payload["warnings"]
 
 
+def test_reconcile_view_left_with_no_sources_is_advisory(repo: Path, capsys):
+    """A view emptied of all sources produces an advisory proposal."""
+
+    _write(
+        repo,
+        VIEWS_FILE,
+        {
+            "views": [
+                view(
+                    "sales",
+                    {"join_path": "orders", "includes": ["status"]},
+                )
+            ]
+        },
+    )
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders DROP COLUMN status")
+    _cli(repo, capsys, "maintain", "schema")
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    view_proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_dependency_dropped"
+        and "view 'sales'" in p["action"]
+    ]
+    assert view_proposals
+    assert all(p["kind"] == "advisory" for p in view_proposals)
+    assert any("left with no sources" in p["action"] for p in view_proposals)
+
+
+def test_reconcile_removes_emptied_view_source_when_another_remains(repo: Path, capsys):
+    """Removing one emptied source from a multi-source view applies mechanically."""
+
+    _write(
+        repo,
+        VIEWS_FILE,
+        {
+            "views": [
+                view(
+                    "sales",
+                    {"join_path": "orders", "includes": ["revenue", "status"]},
+                    {"join_path": "orders.customers", "includes": ["region"]},
+                )
+            ]
+        },
+    )
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders DROP COLUMN status")
+    _cli(repo, capsys, "maintain", "schema")
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload
+    plan_id = payload["data"].get("semantic_plan_id")
+    assert plan_id is not None
+    view_proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_dependency_dropped"
+        and "view 'sales'" in p["action"]
+    ]
+    assert view_proposals
+    assert all(p["kind"] == "mechanical" for p in view_proposals)
+    assert any("source(s) orders" in p["action"] for p in view_proposals)
+
+    applied = _cli(repo, capsys, "transform", "apply", plan_id)
+    assert applied["_exit"] == 0, applied
+
+    after_views = yaml.safe_load((repo / VIEWS_FILE).read_text())["views"][0]["cubes"]
+    assert len(after_views) == 1
+    assert after_views[0]["join_path"] == "orders.customers"
+    assert after_views[0]["includes"] == ["region"]
+
+
+def test_reconcile_disambiguates_sources_sharing_path_by_includes(repo: Path, capsys):
+    """Reconcile uses source_names to cut includes from the intended source."""
+
+    _write(
+        repo,
+        VIEWS_FILE,
+        {
+            "views": [
+                view(
+                    "sales",
+                    {"join_path": "orders", "includes": ["revenue", "order_count"]},
+                    {"join_path": "orders", "includes": ["status"]},
+                )
+            ]
+        },
+    )
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders DROP COLUMN amount")
+    _cli(repo, capsys, "maintain", "schema")
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload
+    plan_id = payload["data"].get("semantic_plan_id")
+    assert plan_id is not None
+    view_proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_dependency_dropped"
+        and "view 'sales'" in p["action"]
+    ]
+    assert view_proposals
+    assert all(p["kind"] == "mechanical" for p in view_proposals)
+
+    applied = _cli(repo, capsys, "transform", "apply", plan_id)
+    assert applied["_exit"] == 0, applied
+
+    after_views = yaml.safe_load((repo / VIEWS_FILE).read_text())["views"][0]["cubes"]
+    assert len(after_views) == 2
+    assert after_views[0]["includes"] == ["order_count"]
+    assert after_views[1]["includes"] == ["status"]
+
+
 # --- nothing off the machine ----------------------------------------------------------
 
 
@@ -764,3 +884,338 @@ def test_a_removal_it_cannot_place_is_not_offered():
     flow = "cubes: [{name: orders, dimensions: [{name: a}, {name: b}]}]\n"
 
     assert apply_removal(flow, "cubes", "orders", {"dimensions": ["b"]}) is None
+
+
+def test_a_removal_cuts_a_view_source_whose_includes_all_go():
+    """A view source is cut when all its includes are dropped."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+    raw = yaml.safe_load(edited)["views"][0]
+    _view, findings = check_view(raw, "views.yml")
+    assert not findings
+
+
+def test_a_removal_cuts_one_view_source_when_another_remains():
+    """Cutting one emptied view source leaves remaining sources intact."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+        "      - join_path: orders.customers\n"
+        "        includes: [region]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders.customers\n"
+        "        includes: [region]\n"
+    )
+    raw = yaml.safe_load(edited)["views"][0]
+    _view, findings = check_view(raw, "views.yml")
+    assert not findings
+
+
+def test_a_removal_cuts_a_view_source_written_with_camel_case_join_path():
+    """A view source using camelCase joinPath is cut cleanly."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - joinPath: orders\n"
+        "        includes: [revenue, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+
+
+def test_a_removal_disambiguates_sources_sharing_join_path_by_includes():
+    """Sources sharing join_path are disambiguated by their includes."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count]\n"
+    )
+    raw = yaml.safe_load(edited)["views"][0]
+    _view, findings = check_view(raw, "views.yml")
+    assert not findings
+
+
+def test_a_removal_refuses_ambiguous_duplicate_sources():
+    """Refuse edit when duplicate sources cannot be disambiguated."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+    )
+
+    assert (
+        apply_removal(
+            text,
+            "views",
+            "sales",
+            {
+                "removed_sources": [
+                    {
+                        "join_path": "orders",
+                        "alias": None,
+                        "names": ["status"],
+                    }
+                ]
+            },
+        )
+        is None
+    )
+
+
+def test_a_removal_cuts_identical_duplicate_sources_when_target_count_matches():
+    """Identical duplicate sources are both cut when target count matches."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["status"],
+                },
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["status"],
+                },
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+
+
+def test_a_removal_disambiguates_partial_includes_by_source_names():
+    """Partial includes cuts use source_names to target the right source."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "includes": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["status"],
+                    "source_names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue]\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count, status]\n"
+    )
+
+
+def test_advisory_retains_reroute_guidance_for_broken_source():
+    """Broken join paths retain re-route guidance even when empties_view is set."""
+
+    from exmergo_dex_core.cube.removal import _advisory
+    from exmergo_dex_core.maintain.drift import DriftFinding
+
+    finding = DriftFinding(
+        axis="schema",
+        code="declared_dependency_dropped",
+        identifier=None,
+        severity="medium",
+        detail="view 'sales' loses a source",
+        data={
+            "semantic_model": "sales",
+            "removal": {
+                "broken_sources": ["orders.customers"],
+                "empties_view": True,
+            },
+        },
+    )
+    proposal = _advisory(finding, "models/views.yml")
+    assert "whose join path walks a join that goes" in proposal.action
+    assert "Re-route or remove them" in proposal.action
+
+
+def test_a_removal_cuts_a_view_source_written_with_capitalized_keys():
+    """Capitalized keys like Alias and Includes are recognized canonically."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - JoinPath: orders\n"
+        "        Alias: ord\n"
+        "        Includes:\n"
+        "          - Name: revenue\n"
+        "          - Name: status\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": "ord",
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+
+
+def test_a_removal_cuts_a_view_source_under_capitalized_cubes():
+    """A view source under capitalized Cubes is recognized and cut."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    Cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    Cubes: []\n")
