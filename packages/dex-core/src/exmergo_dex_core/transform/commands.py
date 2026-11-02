@@ -236,6 +236,7 @@ def init_project(
         created=result.created,
         diffs=result.diffs,
         warnings=preflight,
+        notes=init_mod.identity_notes(connector, fresh, repo_root),
     )
 
 
@@ -343,6 +344,7 @@ def plan(
     )
     semantic_proposal: dict[str, Any] | None = None
     derivation_notes: list[str] = []
+    derived: Any = None
     if _has_dbt_project(engine):
         # The secret-guard runs first, so an inlined credential is never handed
         # to the dbt subprocess.
@@ -410,6 +412,8 @@ def plan(
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
     result.semantic_proposal = semantic_proposal
+    if derived is not None:
+        _store_companion(engine, intent, derived, result)
     _attribute_rows(engine, result, edits, requested=attribute_rows)
     _contradiction_warnings(result)
     return result
@@ -3282,6 +3286,9 @@ def build(
             dev_target_check=dev_check,
             dependencies=dependencies,
             approved_functions=frozenset(config.guards.approved_functions),
+            relation_columns=dev_target.seed_relation_columns(
+                project, target, repo_root, effective, engine.connection
+            ),
         )
         # Before the shaping on both paths, so the two read the same way; here
         # there is no gate to outlive, on the billed path below there is.
@@ -3467,11 +3474,14 @@ def _for_plan_document(args: argparse.Namespace) -> Any:
 
 def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
+        select = getattr(args, "select", None)
+        if select:
+            select = " ".join(select)
         return to_envelope(
             build(
                 engine,
                 target=getattr(args, "target", None),
-                select=getattr(args, "select", None),
+                select=select,
                 verify=getattr(args, "verify", False),
                 for_plan=getattr(args, "for_plan", None),
                 for_plan_document=_for_plan_document(args),
@@ -4367,11 +4377,14 @@ def _shape_build_result(
     # Agents triage from `errors` first, so the first real dbt message rides there;
     # the rest stay in warnings.
     deps_info = summary.get("deps")
-    prefix = (
-        "dbt deps failed"
-        if deps_info and not deps_info.get("success", True)
-        else "dbt build failed"
-    )
+    refresh_info = summary.get("full_refresh")
+    if deps_info and not deps_info.get("success", True):
+        prefix = "dbt deps failed"
+    elif refresh_info and not refresh_info.get("success", True):
+        prefix = "dbt seed --full-refresh failed"
+    else:
+        prefix = "dbt build failed"
+
     failed = BuildResult(
         success=False,
         summary=summary,
@@ -4612,52 +4625,108 @@ def _semantic_plan(
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
     result.semantic_proposal = derived.proposal
+    _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)
     return result
 
 
 def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any:
-    """The semantic model each declared mart in ``edits`` implies (issue #499).
+    """The semantic definition each declared mart in ``edits`` implies (#499, #927).
 
     Free on every connector: it reads the post-change project and the stored
-    cache, and runs dbt's parse on a throwaway copy. See
-    :mod:`.semantic_derivation`.
+    cache, and a derivation validates without a connection (MetricFlow's runs
+    dbt's parse on a throwaway copy). Which layer answers is the configured
+    vendor's :class:`~..semantic_source.SemanticDerivationSource`; see
+    :mod:`.semantic_hook`.
     """
 
     from ..adapters import get_dialect
     from ..storage import CacheUnreadableError
     from . import declarations as declarations_mod
-    from . import semantic_derivation
+    from . import semantic_hook
 
     models = declarations_mod.touched_models(edits)
     if not models:
-        return semantic_derivation.Outcome(edits=edits)
+        return semantic_hook.Outcome(edits=edits)
     try:
         cache = readable_cache(engine.store)
     except CacheUnreadableError:
         cache = None
     try:
-        return semantic_derivation.run(
+        return semantic_hook.derive(
+            engine,
             view,
             edits,
             models,
-            project=engine.project_dir(),
-            marts_paths=engine.config.transform.marts_paths,
             cache=cache,
             dialect=get_dialect(engine.connector or engine.config.connector),
-            target=engine.config.dbt_target,
-            vendor=engine.config.semantic.vendor,
         )
     except Exception as exc:
         # Total for the same reason drafting is: nothing was added to the plan
         # yet, so a defect here costs the proposal and nothing else.
-        return semantic_derivation.Outcome(
+        return semantic_hook.Outcome(
             edits=edits,
             warnings=[
                 "no semantic model was derived: the derivation failed "
                 f"({type(exc).__name__}: {exc})"
             ],
         )
+
+
+def _store_companion(
+    engine: DexEngine, intent: str, derived: Any, result: PlanResult
+) -> None:
+    """Store a native layer's included derivations as a plan of their own.
+
+    A plan has one edit target, and a native layer's documents sit on its own
+    write surface rather than in the dbt project, so they cannot ride in the
+    plan that declared the mart. They are stored beside it through the layer's
+    own authoring route, which validates them again, the way `maintain
+    reconcile` stores its semantic plan. After the dbt plan, so a refused dbt
+    plan never leaves an orphan beside it. A refusal here costs the companion
+    alone: each included definition becomes ``failed`` with the reason.
+    """
+
+    if not derived.companion or result.semantic_proposal is None:
+        return
+    from .native_semantic import semantic_native
+
+    proposal = result.semantic_proposal
+    included = [
+        name
+        for name, model in (proposal.get("models") or {}).items()
+        if model.get("status") == "included"
+    ]
+    try:
+        companion = semantic_native(
+            engine,
+            derived.vendor,
+            f"{intent} (derived {derived.vendor} models)",
+            derived.companion,
+            # `plan`, not `define`: a layer that keeps several definitions in
+            # one document (Ossie) adds a derived one to a model it already
+            # defines. Each derivation has already refused to overwrite or
+            # rename an authored definition, which is what `define` guards.
+            mode="plan",
+        )
+    except (DexError, ValueError) as exc:
+        for name in included:
+            proposal["models"][name]["status"] = "failed"
+            proposal["models"][name]["reason"] = str(exc)
+        proposal["mode"] = "proposed"
+        result.warnings.append(
+            f"the derived {derived.vendor} models were refused by the layer's own "
+            f"validation, so no {derived.vendor} plan was stored: {exc}"
+        )
+        return
+    proposal["plan_id"] = companion.plan_id
+    result.diffs = [*result.diffs, *companion.diffs]
+    result.warnings.append(
+        f"the derived {derived.vendor} models ({', '.join(included)}) are stored as "
+        f"plan {companion.plan_id} on the {derived.vendor} layer, beside this plan; "
+        f"apply both: `transform apply {result.plan_id}` and `transform apply "
+        f"{companion.plan_id}`"
+    )
 
 
 def _has_seed(edits: list[PlanEdit]) -> bool:
