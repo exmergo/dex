@@ -466,6 +466,17 @@ def _served(meta: dict, name: str) -> dict:
     raise KeyError(name)
 
 
+def _served_join(meta: dict, cube_name: str, join_name: str) -> dict:
+    """Find a join entry in served /v1/meta by cube and join name."""
+
+    for element in meta["cubes"]:
+        if element.get("name") == cube_name:
+            for entry in element.get("joins") or []:
+                if entry.get("name") == join_name:
+                    return entry
+    raise KeyError((cube_name, join_name))
+
+
 @pytest.mark.parametrize(
     ("edit", "says"),
     [
@@ -512,6 +523,192 @@ def test_a_stale_renderer_is_refused_naming_the_member(shop, cube, capsys, edit,
     assert "/cubejs-api/v1/sql" not in cube.paths
 
 
+@pytest.mark.parametrize(
+    ("edit", "says"),
+    [
+        (
+            lambda m: _served_join(m, "orders", "customers").update(
+                sql="`${CUBE}.customer_id = ${customers}.customer_id`"
+            ),
+            "orders join to customers has different SQL there",
+        ),
+        (
+            lambda m: _served_join(m, "orders", "customers").update(
+                relationship="hasMany"
+            ),
+            "orders join to customers joins as hasMany there and many_to_one here",
+        ),
+        (
+            lambda m: next(
+                el for el in m["cubes"] if el.get("name") == "orders"
+            ).update(joins=[]),
+            "orders join to customers is not in the server's /v1/meta",
+        ),
+        (
+            lambda m: _served_join(m, "orders", "customers").pop("sql", None),
+            "orders join to customers has no SQL in the server's /v1/meta",
+        ),
+        (
+            lambda m: _served_join(m, "orders", "customers").pop("relationship", None),
+            "orders join to customers has no relationship in the server's /v1/meta",
+        ),
+    ],
+)
+def test_a_stale_renderer_is_refused_naming_the_join(shop, cube, capsys, edit, says):
+    """Refuse when a reached cube's join differs in SQL, relationship, or presence."""
+
+    edit(cube.meta)
+    envelope = _query(capsys, shop, "by_status")
+
+    assert envelope["status"] == "error" and envelope["reason"] == "guard"
+    assert "serves a different model" in envelope["errors"][0]
+    assert says in envelope["errors"][0]
+    assert "/cubejs-api/v1/sql" not in cube.paths
+
+
+def test_a_join_difference_on_an_unreached_cube_is_not_refused(shop, cube, capsys):
+    """An edited join on a cube untouched by the query does not cause refusal."""
+
+    _served_join(cube.meta, "order_items", "orders").update(
+        sql="`${CUBE}.order_id = ${orders}.order_id`"
+    )
+    envelope = _query(capsys, shop, "by_status")
+
+    assert envelope["status"] == "ok"
+
+
+def test_a_view_query_refuses_when_underlying_cube_join_is_stale(shop, cube, capsys):
+    """A view exposing members of a cube checks that cube's joins."""
+
+    _served_join(cube.meta, "orders", "customers").update(
+        sql="`${CUBE}.customer_id = ${customers}.customer_id`"
+    )
+    envelope = _query(capsys, shop, "view")
+
+    assert envelope["status"] == "error" and envelope["reason"] == "guard"
+    assert "orders join to customers has different SQL there" in envelope["errors"][0]
+
+
+def test_check_renderer_includes_intermediate_and_root_cubes_of_view_join_path():
+    """Intermediate and root cubes along a view join path have their joins checked."""
+
+    from exmergo_dex_core.cube.model import Cube, Join, Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    a = Cube(
+        name="a",
+        file="cubes/a.yml",
+        joins=[
+            Join(target="b", sql="{CUBE}.b_id = {b}.id", relationship="many_to_one")
+        ],
+    )
+    b = Cube(
+        name="b",
+        file="cubes/b.yml",
+        joins=[
+            Join(target="c", sql="{CUBE}.c_id = {c}.id", relationship="many_to_one")
+        ],
+    )
+    c = Cube(
+        name="c",
+        file="cubes/c.yml",
+        dimensions=[Member(name="col", kind="dimension", type="string")],
+    )
+    cubes = {"a": a, "b": b, "c": c}
+    c_member = c.dimensions[0]
+    target = Target(
+        "v.col",
+        "dimension",
+        c_member,
+        "c",
+        "c.col",
+        join_path=("a", "b", "c"),
+    )
+    members = {"v.col": target, "c.col": Target("c.col", "dimension", c_member, "c")}
+
+    meta_b_stale = {
+        "cubes": [
+            {
+                "name": "a",
+                "joins": [
+                    {
+                        "name": "b",
+                        "sql": "${CUBE}.b_id = ${b}.id",
+                        "relationship": "belongsTo",
+                    }
+                ],
+            },
+            {
+                "name": "b",
+                "joins": [
+                    {
+                        "name": "c",
+                        "sql": "${CUBE}.c_id = ${c}.other_id",
+                        "relationship": "belongsTo",
+                    }
+                ],
+            },
+            {
+                "name": "c",
+                "dimensions": [{"name": "c.col", "type": "string"}],
+                "joins": [],
+            },
+            {
+                "name": "v",
+                "dimensions": [
+                    {"name": "v.col", "type": "string", "aliasMember": "c.col"}
+                ],
+                "joins": [],
+            },
+        ]
+    }
+    with pytest.raises(StaleRendererError, match="b join to c has different SQL there"):
+        check_renderer(
+            meta_b_stale, ["v.col"], members, where="http://localhost:4000", cubes=cubes
+        )
+
+    meta_a_stale = {
+        "cubes": [
+            {
+                "name": "a",
+                "joins": [
+                    {
+                        "name": "b",
+                        "sql": "${CUBE}.b_id = ${b}.other_id",
+                        "relationship": "belongsTo",
+                    }
+                ],
+            },
+            {
+                "name": "b",
+                "joins": [
+                    {
+                        "name": "c",
+                        "sql": "${CUBE}.c_id = ${c}.id",
+                        "relationship": "belongsTo",
+                    }
+                ],
+            },
+            {
+                "name": "c",
+                "dimensions": [{"name": "c.col", "type": "string"}],
+                "joins": [],
+            },
+            {
+                "name": "v",
+                "dimensions": [
+                    {"name": "v.col", "type": "string", "aliasMember": "c.col"}
+                ],
+                "joins": [],
+            },
+        ]
+    }
+    with pytest.raises(StaleRendererError, match="a join to b has different SQL there"):
+        check_renderer(
+            meta_a_stale, ["v.col"], members, where="http://localhost:4000", cubes=cubes
+        )
+
+
 def test_the_recorded_meta_agrees_with_the_model_it_was_recorded_from(
     shop, cube, capsys
 ):
@@ -524,6 +721,8 @@ def test_the_recorded_meta_agrees_with_the_model_it_was_recorded_from(
 
 
 def test_a_derived_meta_matches_the_recorded_one_on_what_the_check_reads():
+    """Verify that derived meta for loaded cubes matches recorded meta."""
+
     loaded = load_files(MODEL, MODEL_FILES)
     derived = meta_for(loaded)
     from .fake_cube import recorded_meta
@@ -536,6 +735,10 @@ def test_a_derived_meta_matches_the_recorded_one_on_what_the_check_reads():
                 for field in ("type", "aggType", "sql", "aliasMember"):
                     if field in entry:
                         assert served.get(field) == entry[field], (entry["name"], field)
+        for join_entry in element.get("joins") or []:
+            served = _served_join(real, element["name"], join_entry["name"])
+            assert served.get("sql") == join_entry["sql"]
+            assert served.get("relationship") == join_entry["relationship"]
 
 
 # --- the plan has to be the whole answer -----------------------------------------
