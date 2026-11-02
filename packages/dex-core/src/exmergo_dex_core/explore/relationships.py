@@ -1461,6 +1461,9 @@ def coverage_probe_sql(
         return expr if key_cast is None else f"CAST({expr} AS {key_cast})"
 
     def _apply(template: str | None, expr: str) -> str:
+        """``expr`` wrapped in the key conversion ``template``, or unchanged where there
+        is none.
+        """
         return expr if template is None else template.format(expr)
 
     by_child: dict[str, list[tuple[int, Relationship]]] = {}
@@ -1561,6 +1564,9 @@ def _run_coverage_batch(
     key_cast: str | None = None,
     key_exprs: KeyExprs | None = None,
 ) -> list[tuple[Relationship, JoinCoverageCounts]]:
+    """Run one batched coverage probe and read each relationship's counts back from its
+    single aggregate row.
+    """
     sql = _transpile_probe(
         coverage_probe_sql(batch, key_cast=key_cast, key_exprs=key_exprs),
         adapter.dialect,
@@ -1577,6 +1583,7 @@ def _run_coverage_batch(
         return int(values.get(name) or 0)
 
     def maybe(name: str) -> int | None:
+        """The count named ``name``, or None where the probe did not select it."""
         return int(values.get(name) or 0) if name in values else None
 
     measured = []

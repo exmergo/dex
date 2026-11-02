@@ -1003,6 +1003,9 @@ def attribute(
 
 
 def _fail_extra(extra: list[ExtraProbe], code: str, reason: str) -> None:
+    """Mark every extra probe that neither answered nor failed as failed with ``code``
+    and ``reason``.
+    """
     for probe in extra:
         if probe.row is None and probe.error is None:
             probe.error = (code, reason)
@@ -1180,6 +1183,9 @@ def _count(
     estimator = getattr(adapter, "query_estimate", None)
 
     def price(sql: str) -> float:
+        """The estimated cost of running ``sql``, zero where the connector gives no
+        estimate.
+        """
         return float(estimator(sql)) if estimator else 0.0
 
     # Priced one statement at a time, because pricing can fail on its own: a

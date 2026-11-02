@@ -97,6 +97,9 @@ class PlanResult(Result):
     identifier_conversions: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
+        """The plan envelope's ``data``, carrying each optional section only where it
+        was produced.
+        """
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
             "intent": self.intent,

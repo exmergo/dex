@@ -429,6 +429,9 @@ class KeyStep:
     target_type: str | None = None
 
     def label(self) -> str:
+        """How the step reads in a message: its name, with the cast's target type where
+        it has one.
+        """
         return f"{self.name}({self.target_type})" if self.target_type else self.name
 
 
@@ -637,6 +640,7 @@ def with_safe_casts(tree: exp.Expression, dialect: str) -> exp.Expression:
 
 
 def _clickhouse_type(to: exp.Expression) -> str:
+    """A ClickHouse cast target with any ``Nullable(...)`` wrapper removed."""
     rendered = to.sql("clickhouse")
     if rendered.startswith("Nullable(") and rendered.endswith(")"):
         return rendered[len("Nullable(") : -1]

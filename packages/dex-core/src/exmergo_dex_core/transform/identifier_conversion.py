@@ -208,6 +208,7 @@ def _site(node: exp.Expression, select: exp.Select) -> tuple[Site | None, Any]:
 
 
 def _within(node: exp.Expression, ancestor: exp.Expression) -> bool:
+    """Whether ``node`` sits at or below ``ancestor`` in the parse tree."""
     current: exp.Expression | None = node
     while current is not None:
         if current is ancestor:
@@ -217,6 +218,9 @@ def _within(node: exp.Expression, ancestor: exp.Expression) -> bool:
 
 
 def _outermost(node: exp.Expression) -> bool:
+    """Whether ``node`` is the outermost step of a conversion chain, parentheses aside,
+    so a chain is reported once.
+    """
     parent = node.parent
     while isinstance(parent, exp.Paren):
         parent = parent.parent
@@ -391,6 +395,9 @@ def _unsupported(scope: str, select: exp.Select, known: list[_Found]) -> list[_F
 
 
 def _declared_keys(declared: dict[str, Any]) -> set[str]:
+    """The lowercased columns a declaration names as keys: its grain, key and reference
+    roles, and the parent population key.
+    """
     keys = {str(c).lower() for c in declared.get("grain") or []}
     for name, fields in (declared.get("columns") or {}).items():
         if not isinstance(fields, dict):
@@ -403,6 +410,9 @@ def _declared_keys(declared: dict[str, Any]) -> set[str]:
 
 
 def _named_like_key(name: str) -> bool:
+    """Whether a column's name reads like an identifier (``id``, ``*_id``, ``*_key``,
+    ``*_code``, ``*_sku``).
+    """
     lowered = name.lower()
     return lowered == "id" or lowered.endswith(("_id", "_key", "_code", "_sku"))
 
@@ -430,6 +440,9 @@ def _relation_of(select: exp.Select, column: exp.Column) -> exp.Table | None:
 
 
 def _dataset_for(cache: DexCache | None, table: exp.Table | None) -> Any:
+    """The cached profile of ``table``, or None where the cache has none or more than
+    one relation matches.
+    """
     if cache is None or table is None:
         return None
     bare = table.copy()
@@ -448,6 +461,9 @@ def _dataset_for(cache: DexCache | None, table: exp.Table | None) -> Any:
 def _key_basis(
     found: _Found, declared_keys: set[str], cache: DexCache | None
 ) -> str | None:
+    """Why the converted column counts as an identifier (``join``, ``declared``,
+    ``profiled_key`` or ``name``), or None where nothing says it is one.
+    """
     name = found.column.name.lower()
     if found.site == "join":
         return "join"
@@ -496,6 +512,9 @@ _SCOPE_ROWS = "so its rows are not the rows the conversion reads"
 
 
 def _scope_unsupported(select: exp.Select) -> str | None:
+    """Why a scope's rows cannot be counted per identifier (it aggregates, deduplicates
+    or windows), or None where they can.
+    """
     if select.args.get("group") is not None or select.args.get("distinct"):
         return f"the scope aggregates or deduplicates, {_SCOPE_ROWS}"
     for projection in select.expressions:
@@ -522,6 +541,7 @@ def _detach_with(tree: exp.Expression, through: str | None = None) -> list:
 
 
 def _wrap(ctes: list[exp.Expression], body: str, dialect: str) -> str:
+    """``body`` prefixed with the CTEs it reads, rendered in ``dialect``."""
     if not ctes:
         return body
     rendered = ", ".join(cte.sql(dialect=dialect) for cte in ctes)
@@ -745,6 +765,9 @@ def _own_side_filters(
 
 
 def _outputs(tree: exp.Expression) -> set[str] | None:
+    """The lowercased output column names of a statement's first SELECT branch, or None
+    where they cannot be read (no branch, or a ``*``).
+    """
     body = tree.unnest() if hasattr(tree, "unnest") else tree
     branches = sql_shape.select_branches(body)
     if not branches:
@@ -816,6 +839,9 @@ class Diagnosis:
     assumptions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def probes(self) -> list[ExtraProbe]:
+        """Every distinct statement the diagnosis needs run, once each, for the row
+        attribution batch to carry.
+        """
         out: dict[int, ExtraProbe] = {}
         for entry in self.entries:
             for probe in (entry.probe, entry.baseline, entry.identity):
@@ -824,6 +850,9 @@ class Diagnosis:
         return list(out.values())
 
     def settle(self) -> list[IdentifierConversion]:
+        """Settle every conversion from the batch's answers, add one warning per
+        undeclared conversion, and return the records.
+        """
         for entry in self.entries:
             _settle(entry, self.assumptions.get(entry.record.model, []))
         records = [entry.record for entry in self.entries]
@@ -1119,6 +1148,9 @@ def _labels(conversion: _Found) -> tuple[str | None, str | None]:
 def _evidence(
     cache: DexCache | None, table: exp.Table | None, column: str
 ) -> list[str]:
+    """The profile's evidence that ``column`` mixes value shapes, as a sentence that
+    does not call either shape invalid.
+    """
     dataset = _dataset_for(cache, table)
     if dataset is None:
         return []
@@ -1142,11 +1174,17 @@ def _unchecked(record: IdentifierConversion, code: str, reason: str) -> None:
 
 
 def _int(row: dict[str, Any], name: str) -> int | None:
+    """The integer count named ``name`` in a probe row, None where the probe returned
+    none.
+    """
     value = row.get(name)
     return None if value is None else int(value)
 
 
 def _settle(entry: _Entry, assumptions: list[dict[str, Any]]) -> None:
+    """Read one conversion's probe answers back into its record and decide its status,
+    or mark it unchecked where the probe did not answer.
+    """
     record = entry.record
     if record.reason_code is not None:
         return
@@ -1208,6 +1246,9 @@ def _settle(entry: _Entry, assumptions: list[dict[str, Any]]) -> None:
 
 
 def _settle_identity(entry: _Entry) -> None:
+    """Compare the prior and authored identity sets for one conversion, or record why
+    the comparison could not run.
+    """
     record = entry.record
     identity = record.identity
     if identity is None:

@@ -235,6 +235,9 @@ class Assumption(_Strict):
     @field_validator("column")
     @classmethod
     def _column_named(cls, value: str | None) -> str | None:
+        """Strip the governed column's name, refusing an empty one rather than reading
+        it as absent.
+        """
         if value is None:
             return None
         if not value.strip():

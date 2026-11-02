@@ -1955,6 +1955,9 @@ class JoinCandidate:
     to_keys: tuple[str | None, ...] = ()
 
     def key_exprs(self) -> tuple[tuple[str | None, ...], tuple[str | None, ...]] | None:
+        """The conversion templates applied to each side's keys, or None where the join
+        compares its keys as they are (#861).
+        """
         if not any(self.from_keys) and not any(self.to_keys):
             return None
         return self.from_keys, self.to_keys
@@ -3079,6 +3082,9 @@ def _skip_record(model: str, skip: JoinSkip, **extra) -> dict:
 
 
 def _candidate_record(model: str, candidate: JoinCandidate, policy: JoinPolicy) -> dict:
+    """The join coverage record's declared half: the join, its sides and what the
+    declaration says about it, plus any key conversion.
+    """
     return {
         "model": model,
         "join": candidate.label or None,
@@ -3108,6 +3114,7 @@ def _key_conversion(candidate: JoinCandidate) -> dict:
     (a hard cast measured as its safe form), per side (#861)."""
 
     def side(columns, templates):
+        """Each column rendered through its side's conversion template, if any."""
         return [
             template.format(column) if template else column
             for column, template in zip(columns, templates, strict=False)

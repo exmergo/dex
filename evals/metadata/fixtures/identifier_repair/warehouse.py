@@ -11,6 +11,9 @@ TREES = ("cedar", "elm", "oak", "pine", "birch", "maple")
 
 
 def tables(seed: int) -> list[Table]:
+    """The fixture's raw tables: products under two legitimate id schemes, a zero-padded
+    id that collides with ``7`` once cast, and integer-keyed prices.
+    """
     rng = random.Random(seed)
     products = [(str(i), f"{rng.choice(WORDS)} {i:02d}", "acme") for i in range(1, 31)]
     # A different product whose catalogue id happens to read as 7 once cast.
