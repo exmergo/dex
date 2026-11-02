@@ -254,3 +254,21 @@ def test_a_git_token_is_not_named_in_the_refusal(dbt_project_dir: Path):
     message = str(caught.value)
     assert "TOKEN" not in message
     assert "https://github.com/org/repo.git@0.1.0" in message
+
+
+def test_an_installed_but_unverifiable_package_does_not_refuse_a_plan(
+    dbt_project_dir: Path,
+):
+    """A git package's directory name comes from its own dbt_project.yml, not
+    its URL. Once something is installed, the plan gate must not refuse the
+    whole project for a name it cannot check; the build's REFUSE still does."""
+
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - git: "https://github.com/org/unknown.git"\n',
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "dbt_packages" / "something").mkdir(parents=True)
+
+    with pytest.raises(MissingPackagesError):
+        assert_packages_installed(dbt_project_dir)
+    assert_packages_installed(dbt_project_dir, unverifiable_is_fatal=False)

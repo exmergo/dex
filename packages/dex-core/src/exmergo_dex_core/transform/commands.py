@@ -392,8 +392,10 @@ def plan(
                 # dbt refuses to parse a project whose declared packages are not
                 # installed, and its message names raw `dbt deps`. Refuse first
                 # with the verb this project has; plan installs nothing because
-                # deps can reach the network.
-                assert_packages_installed(project)
+                # deps can reach the network. An installed git package whose
+                # directory name dex cannot know is not a reason to refuse the
+                # whole plan: the parse either runs or degrades to a warning.
+                assert_packages_installed(project, unverifiable_is_fatal=False)
                 parse_result = shadow_parse(
                     project, edits, target=engine.config.dbt_target
                 )

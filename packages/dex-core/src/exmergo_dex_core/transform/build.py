@@ -1006,18 +1006,26 @@ class MissingPackagesError(PrerequisiteError):
         )
 
 
-def assert_packages_installed(project_dir: Path | str) -> None:
+def assert_packages_installed(
+    project_dir: Path | str, *, unverifiable_is_fatal: bool = True
+) -> None:
     """Check every declaration, even when some packages are already installed.
 
     REFUSE cannot establish an installation whose declared name is unknown;
     report that uncertainty instead of admitting it as an installed package.
-    The interactive installation heuristic remains separate.
+    The interactive installation heuristic remains separate. A caller that
+    only needs to know whether something declared is *missing* (a plan, which
+    still runs schema checks when dbt cannot parse) passes
+    ``unverifiable_is_fatal=False``: a git package's directory name is not
+    determined by its URL, so refusing on it would refuse the whole project.
     """
 
     missing = missing_packages(project_dir)
     unverifiable = unverifiable_packages(project_dir)
-    if missing or unverifiable or needs_deps(project_dir):
-        raise MissingPackagesError(missing, unverifiable)
+    if missing or (unverifiable_is_fatal and unverifiable) or needs_deps(project_dir):
+        raise MissingPackagesError(
+            missing, unverifiable if unverifiable_is_fatal else []
+        )
 
 
 def needs_deps(project_dir: Path | str) -> bool:
