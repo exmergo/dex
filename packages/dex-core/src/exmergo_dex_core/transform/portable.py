@@ -137,6 +137,8 @@ class PortablePlan(BaseModel):
     engine_version: str = ""
     edits: list[PortableEdit] = Field(default_factory=list)
     digest: str = ""
+    #: The retirement contract (#858), absent from a plan that has none.
+    retirement: dict[str, Any] | None = None
 
     def __getitem__(self, key: str) -> Any:
         if key in type(self).model_fields:
@@ -180,6 +182,11 @@ def _canonical(plan: PortablePlan) -> str:
             for edit in sorted(plan.edits, key=lambda e: e.path)
         ],
     }
+    # Only where present, so every plan without a contract keeps its digest. A
+    # contract decides what the edits are checked against, so changing it must
+    # not pass as the plan a caller pinned (#858).
+    if plan.retirement is not None:
+        payload["retirement"] = plan.retirement
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
@@ -260,6 +267,7 @@ def plan_document(
         edit_target=stored.edit_target,
         engine_version=__version__,
         edits=edits,
+        retirement=stored.retirement,
     )
     plan.digest = plan_digest(plan)
     return plan

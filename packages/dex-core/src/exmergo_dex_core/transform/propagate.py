@@ -110,6 +110,7 @@ def propagate(
     new: str | None = None,
     *,
     extra_edits: list[PlanEdit] | None = None,
+    retirement: bool = False,
 ) -> Propagation:
     """Every edit a rename (``new`` given) or a removal (``new`` omitted) needs.
 
@@ -137,7 +138,7 @@ def propagate(
             )
         )
     index = ReferenceIndex(view)
-    _refuse_incomplete(index, kind, old)
+    _refuse_incomplete(index, kind, old, retirement=retirement)
     owner, column = _resolve_target(index, kind, old)
     # Compared against the *bare* name for a column, since `old` carries the
     # model that scopes it and `new` never does: `stg_orders.order_id` renamed to
@@ -146,8 +147,10 @@ def propagate(
         raise PropagationRefusedError(f"'{new}' is already its name; nothing to do")
 
     builder = _Builder(view, project_dir, index, kind, old, new, owner, column)
-    builder.run()
+    builder.run(allow_nothing=retirement)
     edits = builder.edits() + list(extra_edits or [])
+    if retirement:
+        _refuse_local_dynamic_reads(view, old, edits)
     if new is None:
         _refuse_surviving_reads(view, kind, old, edits)
     else:
@@ -265,6 +268,37 @@ def _refuse_surviving_reads(
     )
 
 
+def _refuse_local_dynamic_reads(
+    view: DbtProjectView, name: str, edits: list[PlanEdit]
+) -> None:
+    """Refuse a retirement while this project may still read the flag (#858).
+
+    Judged on the project *after* the plan, so the repair this names can be made
+    in the same payload. A package's dynamic read is outside the owner's scope
+    and is reported instead. A read in YAML is checked here too, since the index
+    records no var form there.
+    """
+
+    from .retirement import yaml_reads
+
+    after = _project_after_edits(view, edits)
+    index = ReferenceIndex(after, scan_packages=False)
+    dynamic = [f"{ref.path}:{ref.line}" for ref in index.indeterminate_for("var")]
+    if dynamic:
+        raise PropagationRefusedError(
+            f"{len(dynamic)} var read(s) in this project name no literal variable, "
+            f"so any of them may read '{name}': {', '.join(sorted(dynamic))}. Dex "
+            "will not guess. In this payload, rewrite each to name its variable "
+            "directly, or remove it, and re-run"
+        )
+    written = yaml_reads({p: s.content for p, s in after.files.items()}, name)
+    if written:
+        raise PropagationRefusedError(
+            f"'{name}' is still read in YAML at {', '.join(written)}. Dex will not "
+            "invent what that setting should become: edit it in this payload"
+        )
+
+
 def _refuse_surviving_python_readers(
     view: DbtProjectView, kind: str, name: str, edits: list[PlanEdit]
 ) -> None:
@@ -297,7 +331,9 @@ def _refuse_surviving_python_readers(
     )
 
 
-def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
+def _refuse_incomplete(
+    index: ReferenceIndex, kind: str, name: str, *, retirement: bool = False
+) -> None:
     """Refuse while any reason to doubt the reference report is still standing.
 
     Each of these is a way the report can be short of complete, and acting on a
@@ -325,7 +361,9 @@ def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
             "rename applied to most of a project still compiles"
         )
 
-    unresolved = index.indeterminate_for(kind)
+    # A retirement judges these on the post-edit tree and keeps a package's out
+    # of its scope, so a repair in the same payload can satisfy it (#858).
+    unresolved = [] if retirement else index.indeterminate_for(kind)
     if unresolved:
         where = ", ".join(f"{ref.path}:{ref.line}" for ref in unresolved)
         raise PropagationRefusedError(
@@ -339,7 +377,7 @@ def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
     definitions = index.definitions_of(name, kind)
     packaged = sorted({str(d.package) for d in definitions if d.package})
     local = [d for d in definitions if not d.package]
-    if packaged and local:
+    if packaged and local and not retirement:
         here = ", ".join(sorted({d.path for d in local}))
         raise PropagationRefusedError(
             f"'{name}' is defined both in this project ({here}) and in "
@@ -425,7 +463,7 @@ class _Builder:
 
     # --- the walk ------------------------------------------------------------
 
-    def run(self) -> None:
+    def run(self, *, allow_nothing: bool = False) -> None:
         self._refuse_macro_arguments()
         for path in sorted(self.view.files):
             content = self.view.files[path].content
@@ -437,6 +475,10 @@ class _Builder:
                 self._seed_file(path, content)
         if self.kind in _FILE_NODES:
             self._node_file()
+        if allow_nothing:
+            # A read-only `var('x', true)` has no definition to remove, and the
+            # caller's read edits are the whole change.
+            return
         if not (self._spans or self._whole or self._moves or self._deletes):
             raise PropagationRefusedError(
                 f"'{self.old}' is not used as a {self.kind} anywhere in this "

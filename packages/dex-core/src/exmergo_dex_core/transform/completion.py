@@ -76,7 +76,12 @@ _BUILDABLE = frozenset({"model", "seed", "snapshot"})
 _SELECTOR = 200
 
 #: The record lists a verification payload carries, each judged per model.
-_RECORD_KINDS = ("join_coverage", "parent_population", "temporal_contracts")
+_RECORD_KINDS = (
+    "join_coverage",
+    "parent_population",
+    "temporal_contracts",
+    "retirement",
+)
 
 #: The deliverable lists that say the change is not done. Each keeps at least
 #: one name however tight the budget.

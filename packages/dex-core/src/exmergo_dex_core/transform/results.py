@@ -144,15 +144,22 @@ class PropagationResult(PlanResult):
     change: str = ""
     kind: str = ""
     sites: dict[str, int] = Field(default_factory=dict)
+    # The contract and how the proposal measured against it (#858).
+    retirement: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload = {
             "change": self.change,
             "kind": self.kind,
             "sites": self.sites,
             "site_count": sum(self.sites.values()),
+            **({"retirement": self.retirement} if self.retirement else {}),
             **super().data(),
         }
+        if not self.plan_id:
+            # Nothing to apply: an already complete retirement stores no plan.
+            payload["plan_id"] = None
+        return payload
 
 
 class PlacementResult(PlanResult):
@@ -480,9 +487,14 @@ class RefactorComparisonResult(Result):
     keyed: dict[str, Any] | None = None
     keyed_reason: str | None = None
     profiled_on_demand: list[str] = Field(default_factory=list)
+    # The values the baseline compiled at, where a retirement contract chose a
+    # branch (#858). Absent everywhere else.
+    baseline_vars: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
+        branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
         return {
+            **branch,
             "plan_id": self.plan_id,
             "model": self.model,
             "target": self.target,

@@ -269,7 +269,13 @@ dex transform rename <kind>       -> every edit the rename needs, as one plan: t
                                      and the plan says so. --edits-file carries related hand-authored
                                      edits into the same atomic plan
 dex transform remove <kind> <name>   -> the definition removed, and every read verified gone. Same kinds
-  [--edits-file <f>]                 as rename, same refusals. dex authors the removal of the
+  [--edits-file <f>]                 as rename, same refusals. On var, a `retirement` key in the payload
+                                     states which behavior survives (retained_value, required) and what
+                                     each output holds; data.retirement holds the proposal to it from
+                                     compiled SQL, transform compare compiles its baseline at that value,
+                                     and build --verify --for-plan checks the built columns
+                                     (skills/transform/references/feature-retirement.md).
+                                     dex authors the removal of the
                                      definition and REFUSES while any read survives, naming each with
                                      a file and a line. For a scaffolded model ending in a
                                      trailing `select * from <cte>`, a removed column's definition

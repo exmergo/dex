@@ -49,6 +49,7 @@ from .native_semantic import (
     payload_from_file,
     plan_hint,
     read_payload_file,
+    removal_payload,
 )
 from .plans import EditKind, PlanEdit, PlanError
 from .results import (
@@ -1064,7 +1065,9 @@ def rename(
     handshake in front of a change that is free and repo-only.
     """
 
-    return _propagate(engine, kind, old, new, edits_file=edits_file)
+    return _propagate(
+        engine, kind, old, new, extra_edits=edits_from_payload(edits_file)
+    )
 
 
 def remove(
@@ -1080,9 +1083,87 @@ def remove(
     ``edits_file`` is how the caller supplies those read edits. They are validated
     and stored in this same plan, so the removal stays atomic without dex guessing
     at semantics.
+
+    A ``retirement`` key in that payload states which behavior survives (#858).
+    Dex never chooses it; see :mod:`.retirement`.
     """
 
-    return _propagate(engine, kind, name, None, edits_file=edits_file)
+    edits, raw = removal_payload(edits_file)
+    if raw is None:
+        return _propagate(engine, kind, name, None, extra_edits=edits)
+    if kind != "var":
+        raise ValueError(
+            f"a retirement contract states which behavior survives a flag, so it "
+            f"applies to `transform remove var`, not to a {kind}"
+        )
+    return _retire(engine, name, edits, raw)
+
+
+def _retire(
+    engine: DexEngine, name: str, edits: list[PlanEdit], raw: Any
+) -> PropagationResult:
+    """Remove a flag under a stated outcome, and hold the proposal to it."""
+
+    from ..dbt_project import load as load_project
+    from . import retirement as retirement_mod
+
+    contract = retirement_mod.parse_contract(raw)
+    project = engine.project_dir()
+    view = load_project(project)
+    scope = retirement_mod.package_scope(view, Path(project), name)
+    stated = retirement_mod.stored_form(name, contract)
+    if retirement_mod.is_already_complete(view, name, edits):
+        return PropagationResult(
+            change=f"{name} already removed",
+            kind="var",
+            retirement={
+                "status": "already_complete",
+                "contract": stated,
+                "package_scope": scope,
+            },
+            notes=[
+                f"nothing in this project reads or defines '{name}' and this "
+                "payload changes no file, so no plan was stored. To check the "
+                "outputs the contract names, run `transform build --target dev "
+                "--verify` and `explore profile`"
+            ],
+            decisions=retirement_mod.decisions(stated),
+        )
+    result = _propagate(
+        engine,
+        "var",
+        name,
+        None,
+        extra_edits=edits,
+        retirement=True,
+        intent=(
+            f"{contract.behavior} var {name}, keeping the behavior of "
+            f"{contract.retained_value!r}"
+        ),
+    )
+    store = engine.require_full_store("recording a retirement contract")
+    stored = store.load_plan(result.plan_id)
+    stored.retirement = stated
+    store.save_plan(stored)
+    analysis = retirement_mod.analyze(
+        engine, stored, Path(project), view, contract, name
+    )
+    result.retirement = {
+        **analysis,
+        "contract": stated,
+        "package_scope": scope,
+    }
+    # First: these answer what this command was asked, and the plan's own notes
+    # about undeclared models would otherwise bury them.
+    result.warnings[:0] = [
+        *retirement_mod.plan_warnings(name, analysis),
+        *retirement_mod.package_warnings(name, scope),
+    ]
+    result.decisions = [
+        *(result.decisions or []),
+        *retirement_mod.decisions(stated),
+    ]
+    return result
 
 
 def _propagate(
@@ -1091,7 +1172,9 @@ def _propagate(
     old: str,
     new: str | None,
     *,
-    edits_file: str | None,
+    extra_edits: list[PlanEdit],
+    retirement: bool = False,
+    intent: str | None = None,
 ) -> PropagationResult:
     from ..dbt_project import load as load_project
     from .propagate import propagate
@@ -1103,9 +1186,12 @@ def _propagate(
         kind,
         old,
         new,
-        extra_edits=edits_from_payload(edits_file),
+        extra_edits=extra_edits,
+        retirement=retirement,
     )
-    planned = plan(engine, outcome.intent, edits=outcome.edits, attribute_rows=False)
+    planned = plan(
+        engine, intent or outcome.intent, edits=outcome.edits, attribute_rows=False
+    )
     return PropagationResult(
         change=f"{old} -> {new}" if new else f"{old} removed",
         kind=kind,
@@ -1117,6 +1203,8 @@ def _propagate(
         diffs=planned.diffs,
         warnings=planned.warnings,
         notes=outcome.notes,
+        decisions=planned.decisions,
+        refactor_comparison_offer=planned.refactor_comparison_offer,
     )
 
 
@@ -1141,6 +1229,8 @@ def cmd_remove(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         result = remove(
             engine, args.kind, args.name, edits_file=getattr(args, "edits_file", None)
         )
+        if not result.plan_id:
+            return to_envelope(result)
         return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
@@ -3105,11 +3195,32 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
         decisions=(
             None
             if stored.edit_target == "semantic"
-            else _project_decisions(
-                engine, _declarations().touched_models(stored.edits)
-            )
+            else [
+                *(
+                    _project_decisions(
+                        engine, _declarations().touched_models(stored.edits)
+                    )
+                    or []
+                ),
+                *_retirement_decisions(stored.retirement),
+            ]
         ),
     )
+
+
+def _retirement_decisions(stored: dict[str, Any] | None) -> list[dict[str, Any]]:
+    from .retirement import decisions
+
+    return decisions(stored)
+
+
+def _with_retirement(
+    declared: list[dict[str, Any]] | None, stored: dict[str, Any] | None
+) -> list[dict[str, Any]] | None:
+    """The build's decisions plus the contract's, keeping ``None`` where neither."""
+
+    extra = _retirement_decisions(stored)
+    return [*(declared or []), *extra] if extra else declared
 
 
 def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
@@ -3785,6 +3896,7 @@ def _build_project(
             verify,
             artifact_directory=artifacts_dir,
             invocation_id=logged_id,
+            retirement=_plan_retirement(engine, for_plan, for_plan_document),
         )
         return _shape_build_result(
             summary,
@@ -3805,7 +3917,10 @@ def _build_project(
                 full_refresh=full_refresh,
                 expected_invocation_id=logged_id,
             ),
-            decisions=_built_decisions(engine, summary),
+            decisions=_with_retirement(
+                _built_decisions(engine, summary),
+                _plan_retirement(engine, for_plan, for_plan_document),
+            ),
             engine=engine,
             completion_inputs=_completion_inputs(
                 engine,
@@ -3928,8 +4043,12 @@ def _build_project(
         adapter=adapter,
         artifact_directory=artifacts_dir,
         invocation_id=logged_id,
+        retirement=_plan_retirement(engine, for_plan, for_plan_document),
     )
-    decisions = _built_decisions(engine, summary)
+    decisions = _with_retirement(
+        _built_decisions(engine, summary),
+        _plan_retirement(engine, for_plan, for_plan_document),
+    )
     return _shape_build_result(
         summary,
         cost,
@@ -3966,6 +4085,22 @@ def _build_project(
     )
 
 
+def _plan_retirement(
+    engine: DexEngine, for_plan: str | None, for_plan_document: Any
+) -> dict[str, Any] | None:
+    """The retirement contract of the plan this build answers for (#858)."""
+
+    with contextlib.suppress(Exception):
+        if for_plan:
+            store = engine.require_full_store("reading a plan")
+            return store.load_plan(for_plan).retirement
+        if for_plan_document is not None:
+            from .portable import verify_plan_document
+
+            return verify_plan_document(for_plan_document).retirement
+    return None
+
+
 def _verify_build(
     engine: DexEngine,
     project,
@@ -3975,6 +4110,7 @@ def _verify_build(
     adapter=None,
     artifact_directory: Path | None = None,
     invocation_id: str | None = None,
+    retirement: dict[str, Any] | None = None,
 ) -> BuildVerification:
     """The sweep, or the statement that it did not run.
 
@@ -4008,9 +4144,21 @@ def _verify_build(
         else (lambda: engine._adapter("transform build", reads_dev_target=True))
     )
     if artifact_directory is None:
-        return verify_build(engine, Path(project), summary, resolve_adapter=opener)
+        return verify_build(
+            engine,
+            Path(project),
+            summary,
+            resolve_adapter=opener,
+            retirement=retirement,
+        )
     with pinned_artifacts(artifact_directory, invocation_id):
-        return verify_build(engine, Path(project), summary, resolve_adapter=opener)
+        return verify_build(
+            engine,
+            Path(project),
+            summary,
+            resolve_adapter=opener,
+            retirement=retirement,
+        )
 
 
 def _for_plan_document(args: argparse.Namespace) -> Any:

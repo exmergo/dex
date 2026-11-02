@@ -119,6 +119,10 @@ class TransformPlan(BaseModel):
     # digest, so a `--for-plan` build can carry an undeclared loss or an
     # unchecked conversion into its completion obligations.
     identifier_conversions: dict[str, list[dict[str, Any]]] | None = None
+    # The retirement contract (#858): which flag value's behavior survives and
+    # what each output must hold. Intent rather than bookkeeping, so unlike the
+    # two above it travels in the plan document and, where present, its digest.
+    retirement: dict[str, Any] | None = None
 
 
 def contained_key(rel_path: str, surface: list[str]) -> str:
