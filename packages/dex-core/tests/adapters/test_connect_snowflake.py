@@ -23,6 +23,7 @@ from exmergo_dex_core.adapters.snowflake import (
 from exmergo_dex_core.command_args import with_uptime
 from exmergo_dex_core.config import SnowflakeTarget
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     UPTIME_LINE,
     ConfirmationRequiredError,
@@ -1024,6 +1025,7 @@ def _aggregate_resolver(sql: str):
     for i in range(10):
         values[f"nn_{i}"] = 100
         values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"d_{i}"] = 100 if i == 0 else 40
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
     return [values]
@@ -1132,6 +1134,21 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_sf_connecti
         for note in adapter.table_notes("SHOP.PUBLIC.CUSTOMERS")
     )
     assert data_statements(fake_sf_connection) == []
+
+
+def test_profile_never_counts_a_skipped_column_exactly(fake_sf_connection):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    fake_sf_connection.row_resolver = _aggregate_resolver
+    adapter = make_adapter(fake_sf_connection, ceiling=100_000.0)
+    columns = {c.name: c for c in profile(adapter, ["SHOP.PUBLIC.EVENTS"])[0].columns}
+    for name in ("PAYLOAD", "LABELS"):
+        assert columns[name].null_fraction == 0.0
+        assert columns[name].distinct_count is None
+    statements = [s.sql for s in data_statements(fake_sf_connection)]
+    assert 'COUNT(DISTINCT "PAYLOAD")' not in " ".join(statements)
+    assert 'COUNT(DISTINCT "LABELS")' not in " ".join(statements)
 
 
 def test_distinct_combination_counts_batch_into_one_guarded_statement(

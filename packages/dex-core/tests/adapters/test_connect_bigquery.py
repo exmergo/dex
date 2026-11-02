@@ -20,6 +20,7 @@ from exmergo_dex_core.adapters.bigquery import BigQueryAdapter, BigQueryConnecti
 from exmergo_dex_core.config import BigQueryTarget
 from exmergo_dex_core.envelope import Paradigm, Reason, reason_for
 from exmergo_dex_core.errors import PrerequisiteError
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -870,6 +871,7 @@ def _aggregate_resolver(sql: str):
     for i in range(10):
         values[f"nn_{i}"] = 100
         values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"d_{i}"] = 100 if i == 0 else 40
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
     return [values]
@@ -1205,6 +1207,73 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_bq_client):
         for note in adapter.table_notes("test-proj.shop.customers")
     )
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_profile_never_counts_a_skipped_column_exactly(fake_bq_client):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+            bigquery.SchemaField("attrs", "JSON"),
+            bigquery.SchemaField("labels", "STRING", mode="REPEATED"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = _aggregate_resolver
+    adapter = make_adapter(fake_bq_client)
+    columns = {c.name: c for c in profile(adapter, [table.identifier])[0].columns}
+    for name in ("user_geom", "attrs"):
+        assert columns[name].null_fraction == 0.0
+        assert columns[name].distinct_count is None
+    assert columns["labels"].distinct_count is None
+    statements = " ".join(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
+    for name in ("user_geom", "attrs", "labels"):
+        assert f"COUNT(DISTINCT `{name}`)" not in statements
+
+
+def test_profile_of_a_refused_batch_stays_metadata_only(fake_bq_client, monkeypatch):
+    """A refused batch leaves every column with no count, none of them a column
+    the catalog knows nothing about, so the exact pass has nothing to send."""
+
+    from fakes.bigquery import FakeTable
+    from google.api_core import exceptions as api_exceptions
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="refused",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    plan = fake_bq_client.query
+
+    def refuse_the_batch(sql, job_config=None, location=None):
+        if "APPROX_COUNT_DISTINCT" in sql:
+            raise api_exceptions.BadRequest("the batch is refused")
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse_the_batch)
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    adapter = make_adapter(fake_bq_client)
+    dataset = profile(adapter, [table.identifier])[0]
+    assert dataset.columns[0].distinct_count is None
+    assert any(
+        "aggregate profiling failed and was skipped" in note
+        for note in dataset.data_quality
+    )
+    assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
 
 
 def test_distinct_combination_counts_batch_into_one_guarded_statement(fake_bq_client):

@@ -1107,9 +1107,9 @@ class TrinoAdapter:
         A metered adapter never self-escalates past its ceiling.
 
         Degraded columns are skipped, not counted, except a comparable binary
-        one: the engine also sends columns with no distinct count at all, which
-        is what a degraded column reports, and one Trino cannot count would fail
-        the whole statement. A column the inventory does not know is kept, since
+        one: `maintain verify` and `maintain drift` send key columns here
+        directly, and one Trino cannot count would fail the whole statement.
+        A column the inventory does not know is kept, since
         its type cannot be proven degraded.
         """
 

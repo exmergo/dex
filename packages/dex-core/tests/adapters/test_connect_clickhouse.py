@@ -9,6 +9,8 @@ deterministic, offline, free.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 pytest.importorskip("clickhouse_connect")
@@ -36,6 +38,7 @@ from exmergo_dex_core.config import ClickHouseTarget, DexConfig
 from exmergo_dex_core.connect import new_cost_gate, paradigm_for
 from exmergo_dex_core.envelope import Paradigm, error_for
 from exmergo_dex_core.errors import StatementStage, WarehouseQueryError
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -606,6 +609,26 @@ def test_exact_distinct_counts_use_uniq_exact(fake_clickhouse_connection):
     issued = fake_clickhouse_connection.data_queries[-1].sql
     assert "uniqExact(" in issued
     assert "uniq(" not in issued.replace("uniqExact(", "")
+
+
+def test_profile_never_counts_a_skipped_column_exactly(fake_clickhouse_connection):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    def null_free_rows(sql: str) -> FakeResult:
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(
+            rows=[{a: None if a[:3] in ("mn_", "mx_") else 100 for a in aliases}],
+            seconds=0.2,
+        )
+
+    fake_clickhouse_connection.row_resolver = null_free_rows
+    adapter = make_adapter(fake_clickhouse_connection)
+    columns = {c.name: c for c in profile(adapter, ["shop.customers"])[0].columns}
+    assert columns["tags"].null_fraction == 0.0
+    assert columns["tags"].distinct_count is None
+    statements = [q.sql for q in fake_clickhouse_connection.data_queries]
+    assert 'uniqExact("tags")' not in " ".join(statements)
 
 
 # --- run_query -----------------------------------------------------------------

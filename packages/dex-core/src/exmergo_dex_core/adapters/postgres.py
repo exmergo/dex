@@ -917,6 +917,9 @@ class PostgresAdapter:
                     # pg_stats estimates are never a uniqueness verdict; the
                     # near-unique escalation proves keys with an exact scan.
                     distinct_count=distinct,
+                    distinct_count_missing=(
+                        wants_distinct and n_total > 0 and distinct is None
+                    ),
                     is_unique=None,
                     min_value=(
                         json_safe(values.get(f"mn_{i}")) if wants_min_max else None
@@ -963,8 +966,8 @@ class PostgresAdapter:
 
         Columns the adapter degrades (json, xml and friends, which the
         aggregate scan itself refuses to count) are skipped, not counted:
-        the engine also sends columns the catalog had no statistics for,
-        and a degraded column among them would fail the whole statement.
+        `maintain verify` and `maintain drift` send key columns here directly,
+        and a degraded one among them would fail the whole statement.
         A column the inventory does not know is kept, since its type cannot
         be proven degraded. Measured columns are recorded so `table_notes`
         can say they were measured because the catalog had none.
