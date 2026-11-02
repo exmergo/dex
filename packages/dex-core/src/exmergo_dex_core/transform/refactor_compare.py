@@ -367,11 +367,17 @@ def _compare(
     cache = readable_cache(store)
     missing = _missing_relations(adapter, names)
     if missing:
+        select = _model_names_for_relations(project, missing)
+        build = (
+            f"`transform build --target dev --select {' '.join(select)}`"
+            if select
+            else "`transform build --target dev`"
+        )
         return not_checked(
             "inputs_unsynchronized",
             "this connection cannot see: "
             + ", ".join(missing)
-            + "; build them with `transform build --target dev`, or add a source "
+            + f"; build them with {build}, or add a source "
             "namespace to the allowlist",
         )
     gap = explore._object_gap(adapter, cache, names)
@@ -424,6 +430,56 @@ def _compare(
     )
     result = _result(identity, verdict, warnings, profiled)
     return command_args.stamp_spend(result, adapter)
+
+
+
+def _model_names_for_relations(project: Path, relations: Sequence[str]) -> list[str]:
+    """Model labels the last compile placed on these relations, when known (#1058).
+
+    Missing relations are named as the SQL wrote them; ``--select`` needs model
+    names. A relation the last manifest does not own is left out of the select
+    list — the allowlist clause still covers it.
+    """
+
+    import json
+
+    from ..dbt_project import manifest_node_label, strip_relation_quoting
+    from .artifact_runtime import artifact_paths, readable_artifact_dir
+
+    try:
+        paths = artifact_paths(readable_artifact_dir(project))
+        if not paths.manifest.is_file():
+            return []
+        nodes = json.loads(paths.manifest.read_text(encoding="utf-8")).get("nodes", {})
+    except (OSError, ValueError, DexError):
+        return []
+
+    by_relation: dict[str, str] = {}
+    by_bare: dict[str, str] = {}
+    for uid, node in nodes.items():
+        if not uid.startswith("model.") or not isinstance(node, dict):
+            continue
+        label = manifest_node_label(uid, node)
+        relation = node.get("relation_name")
+        if isinstance(relation, str) and relation:
+            physical = strip_relation_quoting(relation)
+            by_relation[physical] = label
+            by_bare.setdefault(physical.rsplit(".", 1)[-1].lower(), label)
+        name = node.get("name")
+        if isinstance(name, str) and name:
+            by_bare.setdefault(name.lower(), label)
+
+    found: list[str] = []
+    for relation in relations:
+        physical = strip_relation_quoting(str(relation))
+        label = by_relation.get(physical)
+        if label is None:
+            label = by_bare.get(physical.rsplit(".", 1)[-1].lower())
+        if label is None:
+            label = by_bare.get(physical.lower())
+        if label and label not in found:
+            found.append(label)
+    return found
 
 
 def _missing_relations(adapter: Any, names: Sequence[str]) -> list[str]:
