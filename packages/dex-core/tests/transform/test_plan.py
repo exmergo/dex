@@ -119,6 +119,49 @@ def test_plan_packages_yml_requires_a_packages_key(
     assert "packages" in envelope["errors"][0]
 
 
+def test_plan_refuses_uninstalled_declared_packages_with_the_dex_verb(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+        encoding="utf-8",
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": (
+                    "version: 2\n"
+                    "models:\n"
+                    "  - name: stg_customers\n"
+                    "    columns:\n"
+                    "      - name: id\n"
+                ),
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "add a column",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    message = envelope["errors"][0]
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    # Planning never installs: the package directory is still absent.
+    assert not (dbt_project_dir / "dbt_packages").exists()
+
+
 def test_plan_reads_stdin(dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch):
     payload = json.dumps(
         {

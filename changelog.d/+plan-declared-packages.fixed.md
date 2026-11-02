@@ -1,0 +1,1 @@
+**`transform plan` names `transform deps` when declared packages are missing.** dbt refuses to parse a project whose declared packages are not installed, and its message points at raw `dbt deps`; plan now runs the declared-package check first and refuses with the verb dex has. Planning installs nothing, because deps can reach the network.
