@@ -885,7 +885,7 @@ def _version_text(value: Any) -> str | None:
     return str(value)
 
 
-def packages_dir(project_dir: Path | str) -> Path:
+def package_install_dir(project_dir: Path | str) -> Path:
     """Where dbt installs declared packages, honoring ``packages-install-path``.
 
     dbt defaults to ``dbt_packages/`` beside the project; a project may move it.
@@ -918,7 +918,7 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     """
 
     installed: set[str] = set()
-    root = packages_dir(project_dir)
+    root = package_install_dir(project_dir)
     if not root.is_dir():
         return installed
     for child in root.iterdir():
@@ -1028,7 +1028,7 @@ def needs_deps(project_dir: Path | str) -> bool:
     project = Path(project_dir)
     if not has_package_spec(project):
         return False
-    install_dir = packages_dir(project)
+    install_dir = package_install_dir(project)
     return not install_dir.is_dir() or not any(install_dir.iterdir())
 
 
@@ -1060,7 +1060,7 @@ def deps(
     messages: list[str] = []
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
-    install_dir = packages_dir(project)
+    install_dir = package_install_dir(project)
     return {
         "success": completed.returncode == 0,
         "returncode": completed.returncode,
