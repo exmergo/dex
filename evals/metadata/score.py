@@ -406,6 +406,57 @@ def attribution(decl: Declared, truth: dict[str, Any] | None) -> dict[str, Any] 
     }
 
 
+# --- procedure steps ---------------------------------------------------------
+
+
+#: Procedure steps graded from the order of the agent's Dex calls (#1049, #855).
+#: Each reads ``Session.dex_sequence``; none reads what a command returned.
+PROCEDURE_STEPS = ("compare_before_apply", "build_after_apply")
+
+
+def procedure_steps(
+    truth: dict[str, Any] | None, sequence: list[str] | None
+) -> dict[str, Any] | None:
+    """Whether the agent took the procedure steps the task requires, in order.
+
+    ``truth`` is the task's ``procedure`` block, ``{"<step>": true, ...}``; a step
+    set to false or absent is not graded, so a task where a comparison is not
+    needed (an intentional behavior change) never penalizes one. ``None`` when
+    the task grades no step, or when there is no session to read (a reference
+    run), so neither is averaged in as a pass.
+
+    - ``compare_before_apply``: a ``transform compare`` precedes the last
+      ``transform apply``. The last, not the first: repairing a prerequisite is
+      its own plan and apply, and the refactor's comparison rightly follows it.
+      A comparison after every apply is a miss, since the baseline is gone.
+      Plan ids are not read, so a comparison of one plan before the apply of
+      another also passes; one trial per task cannot carry finer grading.
+    - ``build_after_apply``: a ``transform build`` follows the last
+      ``transform apply``, so the applied change is what was built.
+    """
+
+    required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
+    if not required or sequence is None:
+        return None
+    applies = [i for i, label in enumerate(sequence) if label == "transform apply"]
+    compares = [i for i, label in enumerate(sequence) if label == "transform compare"]
+    builds = [i for i, label in enumerate(sequence) if label == "transform build"]
+    results: dict[str, bool] = {}
+    if "compare_before_apply" in required:
+        results["compare_before_apply"] = bool(applies) and any(
+            i < applies[-1] for i in compares
+        )
+    if "build_after_apply" in required:
+        results["build_after_apply"] = bool(applies) and any(
+            i > applies[-1] for i in builds
+        )
+    return {
+        "passed": all(results.values()),
+        "steps": results,
+        "score": sum(results.values()) / len(results),
+    }
+
+
 # --- the task score ----------------------------------------------------------
 
 
@@ -423,12 +474,30 @@ class TaskScore:
     #: Share of the task's models whose attribution passed; ``None`` when the
     #: task grades no attribution, so it is never averaged in as a pass.
     attribution: float | None = None
+    #: Share of the required procedure steps the agent took in order; ``None``
+    #: when the task grades none or there was no session (see procedure_steps).
+    procedure: float | None = None
+    procedure_steps: dict[str, bool] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
+def score_workspace(
+    task: Task,
+    fixture: Fixture,
+    workspace: Path,
+    sequence: list[str] | None = None,
+) -> TaskScore:
+    score = _score_workspace(task, fixture, workspace)
+    graded = procedure_steps(task.truth.get("procedure"), sequence)
+    if graded is not None:
+        score.procedure = graded["score"]
+        score.procedure_steps = graded["steps"]
+    return score
+
+
+def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
     with tempfile.TemporaryDirectory(prefix="dex-metadata-") as tmp:
         tmp_path = Path(tmp)
         baseline = starting_project(task, fixture, tmp_path / "baseline")

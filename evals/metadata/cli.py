@@ -40,6 +40,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if r.get("session") and r["session"]["cost_usd"]
     ]
     attributed = [s["attribution"] for s in scored if s.get("attribution") is not None]
+    procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
     return {
         "tasks": len(scored),
         "build_gate_pass_rate": round(1 - len(gate_failed) / n, 4),
@@ -52,6 +53,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "attribution": (
             round(sum(attributed) / len(attributed), 4) if attributed else None
         ),
+        "procedure": (
+            round(sum(procedural) / len(procedural), 4) if procedural else None
+        ),
         "cost_usd": round(sum(costs), 4) if costs else None,
     }
 
@@ -59,7 +63,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _print_table(report: dict[str, Any]) -> None:
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
-        f"{'attrib':>7}"
+        f"{'attrib':>7} {'proc':>5}"
     )
     for row in report["results"]:
         s = row["score"]
@@ -71,6 +75,11 @@ def _print_table(report: dict[str, Any]) -> None:
                 if s.get("attribution") is not None
                 else f"{'-':>7}"
             )
+            + (
+                f" {s['procedure']:5.2f}"
+                if s.get("procedure") is not None
+                else f" {'-':>5}"
+            )
         )
     agg = report["aggregate"]
     print(
@@ -81,6 +90,11 @@ def _print_table(report: dict[str, Any]) -> None:
         + (
             f"; attribution {agg['attribution']:.2f}"
             if agg.get("attribution") is not None
+            else ""
+        )
+        + (
+            f"; procedure {agg['procedure']:.2f}"
+            if agg.get("procedure") is not None
             else ""
         )
         + (f"; cost ${agg['cost_usd']:.2f}" if agg.get("cost_usd") is not None else "")
@@ -194,7 +208,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             row["session"] = session.__dict__
         row["workspace"] = str(workspace)
-        row["score"] = score_workspace(task, fixture, workspace).to_dict()
+        row["score"] = score_workspace(
+            task,
+            fixture,
+            workspace,
+            sequence=row["session"]["dex_sequence"] if live else None,
+        ).to_dict()
         report["results"].append(row)
 
     report["aggregate"] = _aggregate(report["results"])

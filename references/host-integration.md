@@ -285,6 +285,17 @@ as "nothing required was built", which is the opposite of "nobody asked".
 method selectors. dex does not evaluate dbt's selector language, and a second
 implementation of it would disagree with dbt's.
 
+`result.completion` is the same answer in a bounded, typed form
+(`host.BuildCompletion`, at most `host.COMPLETION_BUDGET_BYTES` serialized): the
+required deliverables built, failed, skipped, missing and stale, what blocked
+each one, which of them anything checked, what verification ran and suppressed,
+and the declared obligations by status. It leads the CLI payload as
+`data.completion`, ahead of the node lists, for a reader that may only see the
+first few kilobytes. A host holding evidence from another process can rebuild it
+with `host.summarize_completion(evidence, verification_payload)`; pass the
+manifest's dependency edges as `graph` to name a skip's cause and a test's model.
+It reports and never decides: `outcome` above is still the verdict.
+
 `stale` deserves a note. The obvious reading is "the compiled artifacts predate
 the sources", and that is reported as `stale_artifacts`, but it is close to
 unreachable from a build that just ran, because a successful dbt build rewrites

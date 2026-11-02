@@ -686,6 +686,31 @@ class StoreContract(MaintainStoreContract):
             "so losing it re-applies work already written to the dbt project"
         )
 
+    def test_a_recorded_comparison_round_trips(self, store):
+        # How `transform compare` records its verdict (#1049): same id, the
+        # plan's bookkeeping updated, the edits untouched.
+        plan = a_plan("pabc", "2026-07-03T10:00:00+00:00")
+        plan.refactor_models = {"stg_orders": "unattributed"}
+        store.save_plan(plan)
+        plan.comparisons = {
+            "stg_orders": {
+                "status": "equivalent",
+                "reason_code": "equivalent_on_compared_inputs",
+                "compared_at": "2026-07-03T10:15:00+00:00",
+                "input_scope": ["dev.main.orders"],
+            }
+        }
+        store.save_plan(plan)
+        loaded = store.load_plan("pabc")
+        assert loaded.refactor_models == {"stg_orders": "unattributed"}, (
+            "a plan's rewritten models must round-trip: apply and a --for-plan "
+            f"build read them; got {loaded.refactor_models!r}"
+        )
+        assert loaded.comparisons["stg_orders"]["status"] == "equivalent", (
+            "a recorded comparison must round-trip, or apply reports a compared "
+            f"rewrite as not compared; got {loaded.comparisons!r}"
+        )
+
     def test_plan_locators_are_per_plan(self, store):
         first = store.save_plan(a_plan("pone", "2026-07-03T10:00:00+00:00"))
         second = store.save_plan(a_plan("ptwo", "2026-07-03T11:00:00+00:00"))

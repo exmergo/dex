@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..diffs import file_diff
 from ..edits import ApplyResult, Edit, EditOp, content_hash
@@ -102,6 +102,17 @@ class TransformPlan(BaseModel):
     edit_target: str = "project"
     edits: list[PlanEdit]
     applied_at: str | None = None
+    # The existing models this plan rewrites, each with what static row
+    # attribution could say about it (`attributed`, `unattributed`, `none`),
+    # recorded when the plan offered `transform compare` (#1049). None on a plan
+    # that rewrites no existing model, and on plans stored before the field.
+    refactor_models: dict[str, str] | None = None
+    # The last `transform compare` verdict per model (status, reason_code,
+    # compared_at, input_scope, compiled digests), so `transform apply` and a
+    # `--for-plan` build can say whether a rewrite was compared. Bookkeeping
+    # about the plan rather than part of it: the portable document and its
+    # digest carry the edits alone, so recording a verdict moves no digest.
+    comparisons: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 def contained_key(rel_path: str, surface: list[str]) -> str:

@@ -659,7 +659,16 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         "decisions",
         # Where dbt wrote this build's artifacts (#1014).
         "artifact_directory",
+        # The bounded lead, ahead of every unbounded list (#855).
+        "completion",
     }
+    assert next(iter(envelope["data"])) == "completion"
+    completion = envelope["data"]["completion"]
+    assert completion["outcome"] == envelope["data"]["outcome"]
+    # No plan was named, so nothing says which nodes were the point.
+    assert completion["deliverables"]["coverage"] == "unknown"
+    # The not_null test passed, so the model's rows were checked by something.
+    assert "stg_customers" in completion["assurance"]["asserted"]["names"]
     assert envelope["data"]["decisions"] == []
     # `success` is dbt's exit code; `outcome` is whether anything was validated,
     # and this run built real nodes against current artifacts.

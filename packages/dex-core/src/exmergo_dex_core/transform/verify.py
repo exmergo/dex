@@ -85,6 +85,9 @@ class BuildVerification:
     #: Which built models had their declared columns compared (#1002); ``None``
     #: when the comparison never reached a model (see ``suppressed``).
     column_contract: dict[str, Any] | None = None
+    #: Findings ranked below :data:`MAX_FINDINGS` and left out of ``findings``,
+    #: counted so a summary can say the list is not the whole answer.
+    dropped: int = 0
 
     def payload(self) -> dict[str, Any]:
         if not self.ran:
@@ -281,6 +284,7 @@ def verify_build(
     result.findings = drift_mod.rank_findings(findings + result.findings)
     if len(result.findings) > MAX_FINDINGS:
         dropped = len(result.findings) - MAX_FINDINGS
+        result.dropped = dropped
         result.findings = result.findings[:MAX_FINDINGS]
         result.warnings.append(
             f"{dropped} further finding(s) are not listed: a build reporting "

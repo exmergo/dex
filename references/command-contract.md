@@ -225,11 +225,17 @@ dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires 
                                      --layered-schemas routes staging/intermediate/marts to their
                                      own <layer>_<target name> schemas; warns when a target
                                      namespace already holds objects (free metadata check)
-dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet)
+dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet); a plan that
+                                     rewrites an existing model carries data.refactor_comparison_offer:
+                                     per model the transform compare command and static_attribution
+                                     (unattributed, unmeasured, none, attributed), and data.next names
+                                     the comparison before apply
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind; once
                                      something is written, data.commit_trailer is the
-                                     Co-authored-by line the commit of those files ends with
+                                     Co-authored-by line the commit of those files ends with;
+                                     data.refactor_comparison reports each rewritten model's recorded
+                                     comparison verdict or not_compared, never enforced
 dex transform plans               -> list stored plans, pending and applied, newest first
 dex transform references <name>   -> where each name is used: model SQL, schema.yml, dbt_project.yml,
   [more...] [--kind K] [--full]      macros, semantic YAML, seed headers, installed packages. Repo-only
@@ -326,7 +332,13 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      required, which of them ran, and how each requirement was derived.
                                      --no-install-deps refuses a declared-but-uninstalled package by
                                      name, before any subprocess and before pricing, instead of
-                                     installing it
+                                     installing it. data.completion leads data on success and on
+                                     failure: at most 4096 bytes summarizing the change, its required
+                                     deliverables (built, failed, skipped, missing, stale; coverage
+                                     unknown with no plan) and what blocked each, the failing nodes,
+                                     which deliverables anything checked, what verification ran and
+                                     suppressed, the declared obligations by status, and where the
+                                     full evidence is, so a truncated read still has the answer
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
 dex transform export [plan-id]    -> one stored plan as a portable document a second process can check
                                      and apply: every edit's operation, kind, preimage hash, content
@@ -377,7 +389,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      --key (or the declared grain) adds per-key counts.
                                      data.status is equivalent, different or not_checked with
                                      data.reason_code; equivalent holds for data.input_scope at
-                                     data.compared_at only. Priced before spend on metered connectors
+                                     data.compared_at only. Priced before spend on metered connectors.
+                                     The verdict is recorded on the stored plan for apply and a
+                                     --for-plan build; a parent the last build left error or skipped
+                                     is inputs_unsynchronized before anything compiles
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
@@ -1048,7 +1063,10 @@ default, or a filter or operator after it is refused. A key naming a location
   `data.evidence` is where the reasoning lives: the dbt invocation, per-node
   status and materialization and relation, what the selection asked for against
   what it matched, the manifest and run-results digests, the relations the run
-  generated, and the principal errors.
+  generated, and the principal errors. `data.completion` leads the payload with
+  the bounded summary of all of it, because `data.nodes` grows with the project
+  and a reader whose harness cuts the output after a few kilobytes otherwise sees
+  successful staging models and nothing about the deliverable that was skipped.
 
   `coverage` needs to be told which change the build is for, through `--for-plan`
   (a stored plan id) or `--for-plan-file` (an exported plan document, which is

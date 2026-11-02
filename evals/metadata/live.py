@@ -116,6 +116,9 @@ class Session:
     model: str | None = None
     skills_triggered: list[str] = field(default_factory=list)
     dex_commands: dict[str, int] = field(default_factory=dict)
+    #: The same calls in the order the agent made them, which is what a
+    #: procedure step such as "compare before apply" is graded on (#1049).
+    dex_sequence: list[str] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
 
@@ -192,6 +195,7 @@ def summarize(
 ) -> Session:
     skills: list[str] = []
     commands: dict[str, int] = {}
+    sequence: list[str] = []
     for event in events:
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
@@ -211,6 +215,7 @@ def summarize(
                         _alias_call(name) for name in _aliases(command)
                     ]
                     quoted = _quoted_spans(command)
+                    found: list[tuple[int, str]] = []
                     for pattern in patterns:
                         for match in pattern.finditer(command):
                             if pattern is not _DEX_CALL and any(
@@ -220,6 +225,9 @@ def summarize(
                             group, sub = match.group(1), match.group(2)
                             label = f"{group} {sub}" if sub else group
                             commands[label] = commands.get(label, 0) + 1
+                            found.append((match.start(), label))
+                    # Within one command string, in the order the shell runs them.
+                    sequence.extend(label for _, label in sorted(found))
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")
@@ -227,6 +235,7 @@ def summarize(
             session.final = str(event.get("result") or "")[-2000:]
     session.skills_triggered = skills
     session.dex_commands = commands
+    session.dex_sequence = sequence
     dex_plugins = [p for p in session.plugins if "dex" in str(p.get("name", ""))]
     session.candidate_plugin_loaded = bool(dex_plugins) and all(
         Path(str(p.get("path", ""))).resolve() == plugin_dir.resolve()

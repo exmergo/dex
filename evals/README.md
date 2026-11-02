@@ -126,8 +126,8 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Six fixture projects, written for this suite and derived from no benchmark task,
-with eleven tasks phrased the way users ask:
+Eight fixture projects, written for this suite and derived from no benchmark task,
+with fifteen tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
 |---|---|---|
@@ -142,6 +142,10 @@ with eleven tasks phrased the way users ask:
 | `attribution_population` | `explicit_exclude`: "leave out accounts with zero events" | the choice attributed to `request`, and those accounts absent |
 | `attribution_population` | `ambiguous`: "the event rate per account" | the choice labelled `default`; either population passes |
 | `attribution_population` | `contract`: a terse request, with the population in `_marts.yml` | the choice attributed to `contract`, and the declared population built |
+| `refactor_compare` | `extract_intermediate`: a pure refactor of `account_user_summary` into an intermediate | the counts unchanged (an inner join to display names drops the unnamed users while every account survives), and `transform compare` run before `transform apply` (#1049). The mart counts users through a project macro, so static row attribution cannot settle it |
+| `refactor_compare` | `blocked_baseline`: the same refactor, with `stg_users` failing on a text code | the prerequisite repaired without dropping a user, the counts unchanged, and the comparison run before apply |
+| `refactor_compare` | `intentional_change`: exclude test users from both counts | the new counts; no comparison is required, since the change is meant to alter results |
+| `blocked_report` | `finish_team_activity`: add a column to a report behind forty staging models | a membership intermediate fails on a date stored as text, so a build skips the report while every staging model succeeds (#855): the intermediate repaired without dropping a member, the report rebuilt with the new column |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -173,6 +177,17 @@ starting state) and a `reference/` overlay (a correct answer).
   Only the tier is read: a `detail` quoting ambiguous wording earns nothing. No
   matching assumption fails, and so does recording more than `max_assumptions`
   entries, since every implementation detail is not a decision.
+- **Procedure** (0 to 1, only on tasks that grade it, `-` otherwise): the share
+  of the task's required procedure steps the agent took, in order, read from the
+  sequence of its Dex calls (`Session.dex_sequence`). `compare_before_apply`
+  passes when a `transform compare` comes before the last `transform apply`
+  (a prerequisite repair is its own earlier apply); comparing only after every
+  apply is a miss, since the baseline is gone. Plan ids are not read.
+  `build_after_apply` passes when a `transform build` follows the last apply. A
+  step a task does not require is never graded, so comparing an intentional
+  change costs nothing. A reference run has no session and reports none. One
+  trial per task can show whether agents take a step at all; it cannot measure a
+  difference between two runs.
 - A task where the agent touched none of the models it was asked for scores 0 on
   every axis (`no_models`), never a vacuous 1.
 
