@@ -70,7 +70,10 @@ where the project can keep it:
 - a source table you do not load: state the type the loader must produce, and report
   it. Dex does not write to the warehouse.
 
-Never filter rows out to make a cast succeed. Check the row count after the repair.
+Never filter rows out to make a cast succeed. Check the row count after the repair,
+and read `data.identifier_conversions` on the plan. An identifier the cast cannot
+convert may belong to a second legitimate scheme, and a cast can merge two keys
+(`7` and `007`). Those counts show both, even when the row count holds.
 
 These look finished and are not:
 

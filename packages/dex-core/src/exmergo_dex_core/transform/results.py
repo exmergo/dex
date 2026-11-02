@@ -90,8 +90,16 @@ class PlanResult(Result):
     # that already exists (#856). Planning scans nothing for it. Absent when the
     # plan rewrites none.
     refactor_comparison_offer: dict[str, Any] | None = None
+    # Each conversion this plan adds to an identifier column (a cast, a safe
+    # cast, a lower/upper/trim), with what it does to the entities the model
+    # holds: counts with their denominator, and a status of lossless,
+    # declared, undeclared or unchecked (#861). Absent when the plan adds none.
+    identifier_conversions: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
+        """The plan envelope's ``data``, carrying each optional section only where it
+        was produced.
+        """
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
             "intent": self.intent,
@@ -101,6 +109,8 @@ class PlanResult(Result):
         }
         if self.refactor_comparison_offer is not None:
             payload["refactor_comparison_offer"] = self.refactor_comparison_offer
+        if self.identifier_conversions is not None:
+            payload["identifier_conversions"] = self.identifier_conversions
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.declarations is not None:

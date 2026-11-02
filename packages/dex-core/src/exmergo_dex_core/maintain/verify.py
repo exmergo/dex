@@ -1948,6 +1948,19 @@ class JoinCandidate:
     #: a coverage record names the join a reader can find in the SQL (#857).
     #: Not part of equality: two candidates are the same join by their keys.
     label: str = field(default="", compare=False)
+    #: Per key column, the conversion the join applies to it before comparing
+    #: (``TRY_CAST({} AS INT)``), or None for a bare column (#861). Empty when
+    #: neither side converts anything, which is every join written before this.
+    from_keys: tuple[str | None, ...] = ()
+    to_keys: tuple[str | None, ...] = ()
+
+    def key_exprs(self) -> tuple[tuple[str | None, ...], tuple[str | None, ...]] | None:
+        """The conversion templates applied to each side's keys, or None where the join
+        compares its keys as they are (#861).
+        """
+        if not any(self.from_keys) and not any(self.to_keys):
+            return None
+        return self.from_keys, self.to_keys
 
 
 @dataclass(frozen=True)
@@ -2167,28 +2180,54 @@ def _join_equality_pairs(join, in_scope_relations: list, sql_shape):
         from_alias = from_relation.alias_or_name
         to_alias = join.relation.alias_or_name
         return [
-            (exp.column(col, table=from_alias), exp.column(col, table=to_alias))
+            (
+                exp.column(col, table=from_alias),
+                exp.column(col, table=to_alias),
+                None,
+                None,
+            )
             for col in join.using
         ], None
     if join.on is None:
         return [], None  # a CROSS JOIN/UNNEST: not this check's business
-    pairs = sql_shape.conjunctive_equality_pairs(join.on)
-    if pairs is None:
-        if _pairs_keys_and_filters(join.on):
-            # `on o.customer_id = c.customer_id and o.status <> 'cancelled'`:
-            # the keys are there, but the filter beside them narrows which rows
-            # can match. A probe of the keys alone counts the rows that filter
-            # excludes as matches, so a parent whose only matches are excluded
-            # (every order cancelled) would read as covered when it is not.
-            return [], (
-                "key_and_filter_condition",
-                "its condition filters as well as pairing keys (a conjunct "
-                "that is not a column-to-column equality), and an overlap "
-                "probe on the keys alone would count the rows that filter "
-                "excludes as matches, hiding the rows left with none",
+    plain = sql_shape.conjunctive_equality_pairs(join.on)
+    if plain is not None:
+        return [(left, right, None, None) for left, right in plain], None
+    # A key compared through a cast or a lexical normalization (#861) is still
+    # a key: the probe applies the same conversion, and counts the values it
+    # fails on apart, rather than leaving the join unchecked.
+    converted = sql_shape.conjunctive_conversion_pairs(join.on)
+    if converted is not None:
+        return [
+            (
+                left,
+                right,
+                sql_shape.measuring_key_template(left_side, left),
+                sql_shape.measuring_key_template(right_side, right),
             )
-        return [], ("non_equality_join", "no conjunctive column-to-column equality")
-    return pairs, None
+            for left, right, left_side, right_side in converted
+        ], None
+    if _pairs_keys_and_filters(join.on):
+        # `on o.customer_id = c.customer_id and o.status <> 'cancelled'`:
+        # the keys are there, but the filter beside them narrows which rows
+        # can match. A probe of the keys alone counts the rows that filter
+        # excludes as matches, so a parent whose only matches are excluded
+        # (every order cancelled) would read as covered when it is not.
+        return [], (
+            "key_and_filter_condition",
+            "its condition filters as well as pairing keys (a conjunct "
+            "that is not a column-to-column equality), and an overlap "
+            "probe on the keys alone would count the rows that filter "
+            "excludes as matches, hiding the rows left with none",
+        )
+    if sql_shape.rewrites_a_key(join.on):
+        return [], (
+            "unsupported_key_expression",
+            "a key is rewritten by an expression dex does not measure (only "
+            "casts and lower, upper and trim are), so its coverage cannot be "
+            "probed",
+        )
+    return [], ("non_equality_join", "no conjunctive column-to-column equality")
 
 
 def _pairs_keys_and_filters(on) -> bool:
@@ -2339,10 +2378,12 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
             # Grouped by (from relation, to relation): every equality pair
             # between the same two relations is one composite key, not one
             # candidate per pair (see JoinCandidate's own docstring).
-            grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            grouped: dict[
+                tuple[str, str], list[tuple[str, str, str | None, str | None]]
+            ] = {}
             unresolved = False
             unresolved_code = "unresolved_column"
-            for left, right in pairs:
+            for left, right, left_tpl, right_tpl in pairs:
                 left_relation = alias_map.get((left.table or "").lower())
                 right_relation = alias_map.get((right.table or "").lower())
                 if left_relation is None or right_relation is None:
@@ -2364,16 +2405,18 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
                 left_table, left_col = left_resolved
                 right_table, right_col = right_resolved
                 if (left.table or "").lower() == join_alias:
-                    to_table, to_col = left_table, left_col
-                    from_table, from_col = right_table, right_col
+                    to_table, to_col, to_tpl = left_table, left_col, left_tpl
+                    from_table, from_col, from_tpl = right_table, right_col, right_tpl
                 elif (right.table or "").lower() == join_alias:
-                    to_table, to_col = right_table, right_col
-                    from_table, from_col = left_table, left_col
+                    to_table, to_col, to_tpl = right_table, right_col, right_tpl
+                    from_table, from_col, from_tpl = left_table, left_col, left_tpl
                 else:
                     unresolved = True
                     break
                 from_name, to_name = _table_name(from_table), _table_name(to_table)
-                grouped.setdefault((from_name, to_name), []).append((from_col, to_col))
+                grouped.setdefault((from_name, to_name), []).append(
+                    (from_col, to_col, from_tpl, to_tpl)
+                )
             if unresolved:
                 # Any unresolvable component drops the whole join, not just
                 # that pair: a composite key probed on only the pairs that
@@ -2393,9 +2436,12 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
                 )
                 continue
             for (from_name, to_name), column_pairs in grouped.items():
-                from_cols = tuple(c for c, _ in column_pairs)
-                to_cols = tuple(c for _, c in column_pairs)
-                if from_name == to_name and from_cols == to_cols:
+                from_cols = tuple(c for c, _t, _f, _g in column_pairs)
+                to_cols = tuple(c for _c, c, _f, _g in column_pairs)
+                from_keys = tuple(f for _c, _t, f, _g in column_pairs)
+                to_keys = tuple(g for _c, _t, _f, g in column_pairs)
+                converts = any(from_keys) or any(to_keys)
+                if from_name == to_name and from_cols == to_cols and not converts:
                     # The literal same key read twice off the same relation
                     # (t.col = t.col): every row matches itself, always --
                     # nothing to orphan-check. A self-join on *different*
@@ -2411,6 +2457,8 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
                         to_columns=to_cols,
                         side=join.side,
                         label=join.label,
+                        from_keys=from_keys if converts else (),
+                        to_keys=to_keys if converts else (),
                     )
                 )
 
@@ -2878,7 +2926,41 @@ def _null_checks(
     return checks, notes
 
 
-def join_probe_cost(adapter, relationships: list) -> tuple[float, int]:
+def _split_unsafe(pairs: list[tuple], dialect: str) -> tuple[list[tuple], list[tuple]]:
+    """The pairs a probe can measure on ``dialect``, and those it cannot: a key
+    conversion that needs a safe cast where the dialect has none (#861)."""
+
+    from .. import sql_shape
+
+    if dialect not in sql_shape.NO_SAFE_CAST:
+        return pairs, []
+    keep: list[tuple] = []
+    unsafe: list[tuple] = []
+    for item in pairs:
+        exprs = item[1].key_exprs()
+        needs = exprs is not None and any(
+            "TRY_CAST" in (template or "").upper()
+            for side in exprs
+            for template in side
+        )
+        (unsafe if needs else keep).append(item)
+    return keep, unsafe
+
+
+def _key_exprs(pairs) -> dict[int, tuple]:
+    """The conversions each probed relationship applies to its keys (#861),
+    by the relationship's identity, which is what the probe batches carry."""
+
+    return {
+        id(rel): exprs
+        for _m, candidate, rel in pairs
+        if (exprs := candidate.key_exprs()) is not None
+    }
+
+
+def join_probe_cost(
+    adapter, relationships: list, key_exprs: dict | None = None
+) -> tuple[float, int]:
     """``(estimate, probe_count)`` for measuring every relationship's coverage,
     without running it. Pure pricing, split out so a caller combining this axis
     with another can price both before asking once."""
@@ -2892,7 +2974,9 @@ def join_probe_cost(adapter, relationships: list) -> tuple[float, int]:
     estimator = getattr(adapter, "query_estimate", None)
     if estimator is None:
         return 0.0, len(to_probe)
-    statements = rel_mod.coverage_statements(relationships, adapter.dialect)
+    statements = rel_mod.coverage_statements(
+        relationships, adapter.dialect, key_exprs=key_exprs
+    )
     return sum(estimator(stmt) for stmt in statements), len(to_probe)
 
 
@@ -2925,22 +3009,28 @@ def join_contract_cost(
     pairs, _unresolved = _resolve_join_relationships(
         plan.candidates, model_relations, live_identifiers
     )
+    pairs, _unsafe = _split_unsafe(pairs, adapter.dialect)
     relationships = [rel for _m, _c, rel in pairs]
-    estimate, _joins = join_probe_cost(adapter, relationships)
+    exprs = _key_exprs(pairs)
+    estimate, _joins = join_probe_cost(adapter, relationships, exprs)
     checks, _notes = (
         _null_checks(adapter, plan, live_identifiers) if pairs else ([], [])
     )
     estimate += _statements_cost(adapter, [c.sql for c in checks])
-    return estimate, _statement_count(adapter, relationships, checks)
+    return estimate, _statement_count(adapter, relationships, checks, exprs)
 
 
-def _statement_count(adapter, relationships: list, checks: list) -> int:
+def _statement_count(
+    adapter, relationships: list, checks: list, key_exprs: dict | None = None
+) -> int:
     """How many statements the axis would issue: the batched coverage probes
     and one NULL count per model, which is what a handshake states it buys."""
 
     from ..explore import relationships as rel_mod
 
-    probes = rel_mod.coverage_statements(relationships, adapter.dialect)
+    probes = rel_mod.coverage_statements(
+        relationships, adapter.dialect, key_exprs=key_exprs
+    )
     return len(probes) + len(checks) if probes else 0
 
 
@@ -2992,6 +3082,9 @@ def _skip_record(model: str, skip: JoinSkip, **extra) -> dict:
 
 
 def _candidate_record(model: str, candidate: JoinCandidate, policy: JoinPolicy) -> dict:
+    """The join coverage record's declared half: the join, its sides and what the
+    declaration says about it, plus any key conversion.
+    """
     return {
         "model": model,
         "join": candidate.label or None,
@@ -3008,6 +3101,28 @@ def _candidate_record(model: str, candidate: JoinCandidate, policy: JoinPolicy) 
             "null_keys_by": policy.null_keys_unmatched_by,
             "derived_columns": list(policy.derived),
         },
+        **(
+            {"key_conversion": _key_conversion(candidate)}
+            if candidate.key_exprs() is not None
+            else {}
+        ),
+    }
+
+
+def _key_conversion(candidate: JoinCandidate) -> dict:
+    """The conversions a join applies to its keys, as the probe applied them
+    (a hard cast measured as its safe form), per side (#861)."""
+
+    def side(columns, templates):
+        """Each column rendered through its side's conversion template, if any."""
+        return [
+            template.format(column) if template else column
+            for column, template in zip(columns, templates, strict=False)
+        ]
+
+    return {
+        "from": side(candidate.from_columns, candidate.from_keys),
+        "to": side(candidate.to_columns, candidate.to_keys),
     }
 
 
@@ -3069,6 +3184,19 @@ def join_coverage(
                 "the warehouse",
             }
         )
+    pairs, unsafe = _split_unsafe(pairs, getattr(adapter, "dialect", ""))
+    for model, candidate, _rel in unsafe:
+        policy = join_policy(candidate, plan.context.get(model))
+        result.records.append(
+            {
+                **_candidate_record(model, candidate, policy),
+                "status": "unchecked",
+                "reason_code": "no_safe_cast_on_connector",
+                "reason": "the join converts its key with a cast, and this "
+                "connector has no cast that returns NULL instead of failing, so "
+                "the values it rejects cannot be counted",
+            }
+        )
     if unresolved:
         result.notes.append(
             "the join contract was not checked for "
@@ -3079,11 +3207,12 @@ def join_coverage(
         return result
 
     relationships = [rel for _m, _c, rel in pairs]
+    exprs = _key_exprs(pairs)
     checks, check_notes = _null_checks(adapter, plan, live_identifiers)
     result.notes.extend(check_notes)
-    estimate, probe_count = join_probe_cost(adapter, relationships)
+    estimate, probe_count = join_probe_cost(adapter, relationships, exprs)
     estimate += _statements_cost(adapter, [c.sql for c in checks])
-    statement_count = _statement_count(adapter, relationships, checks)
+    statement_count = _statement_count(adapter, relationships, checks, exprs)
     if statement_count == 0:
         return result
 
@@ -3107,8 +3236,13 @@ def join_coverage(
         result.offer = offer
         return result
 
+    # Only a join that converts a key passes the conversions, so the call is
+    # the one every other join has always made.
     measured, refused = rel_mod.measure_coverage(
-        adapter, relationships, timeout_seconds=timeout_seconds
+        adapter,
+        relationships,
+        timeout_seconds=timeout_seconds,
+        **({"key_exprs": exprs} if exprs else {}),
     )
     counts_of = {id(rel): counts for rel, counts in measured}
     refused_of = {id(rel): text for rel, text in refused}
@@ -3201,6 +3335,12 @@ def _judge_coverage(
         "matched_keys": matched_keys,
         "unmatched_keys": eligible_keys - matched_keys,
     }
+    if getattr(counts, "conversion_failed_rows", None) is not None:
+        # Non-NULL keys the join's conversion turns into NULL: they stay in the
+        # eligible population as unmatched, and are counted apart so a reader
+        # can tell a failed cast from a missing parent (#861).
+        record["measured"]["conversion_failed_rows"] = counts.conversion_failed_rows
+        record["measured"]["conversion_failed_keys"] = counts.conversion_failed_keys
     record["coverage"] = {"rows": coverage_rows, "keys": coverage_keys}
     record["threshold_source"] = threshold_source
     record["thresholds"] = (

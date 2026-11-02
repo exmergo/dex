@@ -61,6 +61,7 @@ DIGESTS = {
     "share": "749c9be906d4bd3df2cbe7a83bc7bc66689ed82ba9c3f298ebcaca64335bd558",
     "refactor_compare": "e8321bce6e29261a950dc01d7a48e77b2d5e77b13ac8c99e1240324296b04018",
     "blocked_report": "6c46e98e73a69412987fdf82e697ef1d70d42b7b4d4445e1ffc7a5d288fe1535",
+    "identifier_repair": "3cfd248dd23ef971b9bb0685c251b7d47997484097ab8bbf9da0750e6abf84e5",
 }
 
 
@@ -872,3 +873,57 @@ def test_a_task_or_run_grading_no_procedure_reports_none():
     assert procedure_steps({"compare_before_apply": False}, apply) is None
     # A reference run has no session to read.
     assert procedure_steps({"compare_before_apply": True}, None) is None
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("join", "lost"),
+    [
+        (
+            "on try_cast(p.product_id as integer) = l.product_id\n"
+            "where try_cast(p.product_id as integer) is not null",
+            "opaque identifiers are kept",
+        ),
+        (
+            "on try_cast(p.product_id as integer) = l.product_id",
+            None,
+        ),
+    ],
+)
+def test_an_identifier_repair_that_drops_a_scheme_fails_the_checks(
+    tmp_path, join, lost
+):
+    """#861: filtering to castable ids builds and loses the second scheme; a
+    cast kept on the join alone keeps every product. Neither is caught by the
+    row count of a model whose identity set changed."""
+
+    task, fixture, workspace = _reference(
+        tmp_path, "identifier_repair/fix_dim_products"
+    )
+    path = workspace / "models/marts/dim_products.sql"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "on p.product_id = cast(l.product_id as varchar)", join
+        ),
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored", score.gate
+    failed = {c["name"] for c in score.checks if not c["passed"]}
+    if lost is None:
+        assert "every product still sold is present" not in failed
+        assert "opaque identifiers are kept" not in failed
+    else:
+        assert lost in failed
+        assert "every product still sold is present" in failed
+
+
+@needs_dbt
+def test_the_broken_identifier_setup_fails_the_gate(tmp_path):
+    task, fixture, workspace = _reference(
+        tmp_path, "identifier_repair/fix_dim_products"
+    )
+    broken = "models/marts/dim_products.sql"
+    shutil.copyfile(task.directory / "setup" / broken, workspace / broken)
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "gate_failed", score.gate

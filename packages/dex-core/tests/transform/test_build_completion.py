@@ -571,3 +571,47 @@ def test_the_cli_failure_envelope_leads_with_the_skipped_deliverable(
     text = json.dumps(envelope)
     assert json.dumps(completion) in text[:PREFIX]
     assert text.index('"nodes"') > text.index(json.dumps(completion))
+
+
+def test_an_unsettled_identifier_conversion_is_an_obligation_on_its_model():
+    """The plan's undeclared or unmeasured identifier conversions ride into the
+    block for the models the change requires (#861); settled ones do not."""
+
+    nodes = [BuildNode(unique_id=_uid(REPORT), name=REPORT, status="success")]
+    completion = summarize_completion(
+        _evidence(nodes, required=[REPORT]),
+        None,
+        identifier_conversions={
+            REPORT: [
+                {"column": "product_id", "status": "undeclared"},
+                {"column": "product_id", "status": "lossless"},
+                {"column": "sku", "status": "unchecked", "reason_code": "counting_off"},
+            ],
+            "not_required": [{"column": "id", "status": "undeclared"}],
+        },
+    )
+    assert completion.data()["obligations"]["identifier_conversions"] == [
+        {
+            "model": REPORT,
+            "kind": "identifier_conversion",
+            "status": "undeclared",
+            "column": "product_id",
+        },
+        {
+            "model": REPORT,
+            "kind": "identifier_conversion",
+            "status": "unchecked",
+            "column": "sku",
+            "reason_code": "counting_off",
+        },
+    ]
+
+
+def test_no_unsettled_conversion_leaves_no_key():
+    nodes = [BuildNode(unique_id=_uid(REPORT), name=REPORT, status="success")]
+    completion = summarize_completion(
+        _evidence(nodes, required=[REPORT]),
+        None,
+        identifier_conversions={REPORT: [{"status": "declared"}]},
+    )
+    assert "identifier_conversions" not in completion.data()["obligations"]

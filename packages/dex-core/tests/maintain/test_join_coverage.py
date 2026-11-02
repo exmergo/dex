@@ -759,3 +759,146 @@ def test_a_column_newly_null_against_the_cached_profile_is_reported():
         "derived_columns_all_null": ["created_at"],
         "null_baseline": "none",
     }
+
+
+# --- a key compared through a conversion (#861) -----------------------------------
+
+
+def _products(repo) -> None:
+    repo.sql(
+        "CREATE TABLE raw_products (product_id VARCHAR, product_name VARCHAR)",
+        "INSERT INTO raw_products VALUES ('7', 'anvil'), ('007', 'anvil, boxed'), "
+        "('12', 'rope'), ('org_cedar', 'plank'), (NULL, 'unlabelled')",
+    )
+    repo.sql(
+        "CREATE TABLE product_prices (product_id INTEGER, price DOUBLE)",
+        "INSERT INTO product_prices VALUES (7, 10.0), (12, 3.5), (99, 1.0)",
+    )
+
+
+_CAST_JOIN = (
+    "select p.product_id, p.product_name, l.price "
+    f"from {W}.raw_products p left join {W}.product_prices l "
+    "on try_cast(p.product_id as integer) = l.product_id"
+)
+
+
+def test_a_join_through_a_safe_cast_is_measured_with_its_failures_apart(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`try_cast(p.product_id as integer) = l.product_id` used to be unchecked
+    as a non-equality join. It is a key equality through a conversion: the
+    probe applies the same cast, and the identifier that does not convert is
+    eligible, unmatched, and counted apart from a NULL key."""
+
+    _products(maintain_repo)
+    _build(maintain_repo, "dim_products", _CAST_JOIN)
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={"model.maintain_test.dim_products": _node("dim_products", _CAST_JOIN)},
+        results=[],
+    )
+    data = _verify(maintain_repo, "dim_products")
+    (record,) = _records(data, "dim_products")
+    assert record["status"] != "unchecked", record
+    assert record["key_conversion"] == {
+        "from": ["TRY_CAST(product_id AS INT)"],
+        "to": ["product_id"],
+    }
+    measured = record["measured"]
+    assert measured["rows"] == 5
+    assert measured["null_key_rows"] == 1
+    assert measured["eligible_rows"] == 4
+    assert measured["matched_rows"] == 3  # 7, 007 and 12
+    assert measured["conversion_failed_rows"] == 1  # org_cedar
+    assert measured["conversion_failed_keys"] == 1
+    assert measured["eligible_keys"] == 4
+    assert measured["matched_keys"] == 3
+
+
+def test_a_hard_cast_is_measured_as_its_safe_form_instead_of_failing(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A hard `cast` that the data cannot satisfy would fail the probe outright;
+    measured as `try_cast`, its failures are counts rather than an error."""
+
+    _products(maintain_repo)
+    sql = _CAST_JOIN.replace("try_cast(", "cast(")
+    _build(
+        maintain_repo,
+        "dim_products",
+        _CAST_JOIN,  # the built relation; the hard cast would not build
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={"model.maintain_test.dim_products": _node("dim_products", sql)},
+        results=[],
+    )
+    data = _verify(maintain_repo, "dim_products")
+    (record,) = _records(data, "dim_products")
+    assert record["measured"]["conversion_failed_rows"] == 1
+    assert record["key_conversion"]["from"] == ["TRY_CAST(product_id AS INT)"]
+
+
+def test_a_key_rewritten_by_an_unmeasured_expression_says_so(
+    maintain_repo, _assume_the_project_compiles
+):
+    _products(maintain_repo)
+    sql = (
+        "select p.product_id, l.price "
+        f"from {W}.raw_products p left join {W}.product_prices l "
+        "on cast(regexp_replace(p.product_id, '^0+', '') as integer) = l.product_id"
+    )
+    _build(maintain_repo, "dim_products", _CAST_JOIN)
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={"model.maintain_test.dim_products": _node("dim_products", sql)},
+        results=[],
+    )
+    data = _verify(maintain_repo, "dim_products")
+    (record,) = _records(data, "dim_products")
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "unsupported_key_expression"
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        "duckdb",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
+)
+def test_a_converted_key_probe_is_one_aggregate_select_on_every_dialect(dialect):
+    from exmergo_dex_core.cache import Relationship, RelationshipKind
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    rel = Relationship(
+        from_dataset="db.s.products",
+        from_columns=["product_id"],
+        to_dataset="db.s.prices",
+        to_columns=["product_id"],
+        kind=RelationshipKind.DECLARED,
+    )
+    exprs = {id(rel): (("TRY_CAST(LOWER({}) AS INT)",), (None,))}
+    if dialect == "postgres":
+        # No cast there returns NULL instead of failing: refused, not run.
+        from exmergo_dex_core.sql_shape import NoSafeCastError
+
+        with pytest.raises(NoSafeCastError):
+            rel_mod.coverage_statements([rel], dialect, key_exprs=exprs)
+        return
+    (statement,) = rel_mod.coverage_statements([rel], dialect, key_exprs=exprs)
+    assert assert_select_only(statement, dialect=dialect)
+    assert "dex_cov_failed_0" in statement.lower()
+    # The safe form survives the dialect: sqlglot renders a TryCast it did not
+    # parse as a failing CAST on Snowflake and ClickHouse.
+    safe = {"bigquery": "SAFE_CAST(", "clickhouse": "accurateCastOrNull("}
+    assert safe.get(dialect, "TRY_CAST(") in statement
+    if dialect == "snowflake":
+        assert "TRY_CAST(CAST(" in statement

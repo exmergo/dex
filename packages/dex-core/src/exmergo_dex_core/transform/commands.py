@@ -882,25 +882,111 @@ def _attribute_rows(
     from ..guards.cost_guard import CostGuardError
     from .row_attribution import attribute
 
+    diagnosis = _diagnose_conversions(engine, result, edits, requested=requested)
     try:
-        outcome = attribute(engine, edits, requested=requested)
+        outcome = attribute(
+            engine,
+            edits,
+            requested=requested,
+            extra=diagnosis.probes() if diagnosis is not None else None,
+        )
     except CostGuardError:
         raise
     except Exception as exc:
+        # The exception's type and not its words: a warehouse's message can
+        # quote a value from the data (#861).
         result.warnings.append(
             "could not analyse this edit's effect on the row population "
-            f"({type(exc).__name__}: {exc}); the plan itself is unaffected"
+            f"({type(exc).__name__}); the plan itself is unaffected"
         )
+        _settle_conversions(engine, result, diagnosis)
         return
     result.warnings.extend(outcome.warnings)
-    if not outcome:
-        return
-
-    result.row_attribution = [model.model_dump(mode="json") for model in outcome.models]
+    _settle_conversions(engine, result, diagnosis)
     if outcome.pending is not None:
         result.pending_confirmation = outcome.pending
     if outcome.adapter is not None:
         command_args.stamp_spend(result, outcome.adapter)
+    if not outcome:
+        return
+
+    result.row_attribution = [model.model_dump(mode="json") for model in outcome.models]
+
+
+def _diagnose_conversions(
+    engine: DexEngine,
+    result: PlanResult,
+    edits: list[PlanEdit],
+    *,
+    requested: bool | None,
+) -> Any:
+    """The identifier conversions this plan adds, with the statements that
+    would measure them (#861), or None where there is no dbt project to read.
+
+    Total for the same reason row attribution is: the plan is already stored.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+    from .identifier_conversion import diagnose
+
+    if not _has_dbt_project(engine):
+        return None
+    try:
+        view = load_project(engine.project_dir())
+        return diagnose(
+            engine,
+            edits,
+            requested=requested,
+            view=view,
+            post_change=declarations_mod.post_change_files(view, edits),
+        )
+    except Exception as exc:
+        result.warnings.append(
+            "could not look for identifier conversions in this edit "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+        return None
+
+
+def _settle_conversions(engine: DexEngine, result: PlanResult, diagnosis: Any) -> None:
+    """Read the conversions' counts back, report them, and remember the verdicts
+    on the stored plan so a `--for-plan` build can carry them forward."""
+
+    if diagnosis is None or not diagnosis.entries:
+        return
+    try:
+        records = diagnosis.settle()
+    except Exception as exc:
+        # The plan is stored; a defect here must not turn it into an error.
+        result.warnings.append(
+            "could not read back the identifier conversions' counts "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+        return
+    result.identifier_conversions = [
+        record.model_dump(mode="json", exclude_none=True) for record in records
+    ]
+    result.warnings.extend(diagnosis.warnings)
+    per_model: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        per_model.setdefault(record.model, []).append(
+            {
+                key: value
+                for key, value in (
+                    ("column", record.column),
+                    ("authored", record.authored),
+                    ("status", record.status),
+                    ("reason_code", record.reason_code),
+                )
+                if value is not None
+            }
+        )
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("recording identifier conversions")
+        stored = store.load_plan(result.plan_id)
+        stored.identifier_conversions = per_model
+        store.save_plan(stored)
 
 
 def _contradiction_warnings(result: PlanResult) -> None:
@@ -5066,6 +5152,7 @@ def _attach_completion(
             prerequisites=diagnosed,
             cold=result.cold_verification,
             prose_population=_prose_population(result, inputs),
+            identifier_conversions=inputs.get("identifier_conversions"),
         )
     except Exception as exc:
         result.notes.append(
@@ -5096,6 +5183,9 @@ def _completion_inputs(
             stored = engine.require_full_store("reading a plan").load_plan(for_plan)
             inputs["edits"] = list(stored.edits)
             inputs["comparisons"] = refactor_comparison_states(stored)
+            inputs["identifier_conversions"] = (
+                getattr(stored, "identifier_conversions", None) or {}
+            )
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):

@@ -182,6 +182,8 @@ class Obligation(BaseModel):
     model: str
     kind: str
     status: str
+    #: The column an identifier-conversion obligation is about (#861).
+    column: str | None = None
     #: The finding a contradicted record raised (`join_orphans`, ...), so the
     #: block says what was wrong without a trip to ``data.verification``.
     finding: str | None = None
@@ -203,6 +205,10 @@ class Obligations(BaseModel):
     #: Required models whose declared population is a sentence: nothing can run
     #: it, as distinct from a parent or filter a record above measured (#1029).
     prose_population: NameList = Field(default_factory=NameList)
+    #: Identifier conversions the plan added that change which entities a
+    #: model holds with nothing declared recording it (`undeclared`), or that
+    #: dex could not measure (`unchecked`), as the plan recorded them (#861).
+    identifier_conversions: list[Obligation] | None = None
 
 
 class ColdSummary(BaseModel):
@@ -598,6 +604,7 @@ def summarize_completion(
     prerequisites: list[dict[str, Any]] | None = None,
     cold: Mapping[str, Any] | None = None,
     prose_population: Iterable[str] = (),
+    identifier_conversions: Mapping[str, list[Mapping[str, Any]]] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -647,6 +654,9 @@ def summarize_completion(
         cold=_cold_summary(cold),
     )
     completion.obligations.prose_population = _names(prose_population)
+    completion.obligations.identifier_conversions = (
+        _conversion_obligations(identifier_conversions, evidence) or None
+    )
     if prerequisites:
         completion.details = ["data.prerequisites", *completion.details]
     if cold is not None:
@@ -655,6 +665,37 @@ def summarize_completion(
         completion.details = [*completion.details, "data.offer"]
     _fit(completion, budget)
     return completion
+
+
+def _conversion_obligations(
+    recorded: Mapping[str, list[Mapping[str, Any]]] | None,
+    evidence: BuildEvidence,
+) -> list[Obligation]:
+    """The plan's identifier conversions that are not settled, on the models
+    the change requires (every recorded model where coverage is unknown)."""
+
+    if not recorded:
+        return []
+    coverage = evidence.coverage
+    required = set(coverage.required) if coverage is not None else None
+    out = []
+    for model, conversions in sorted(recorded.items()):
+        if required and model not in required:
+            continue
+        for conversion in conversions:
+            status = str(conversion.get("status") or "unknown")
+            if status in ("lossless", "declared"):
+                continue
+            out.append(
+                Obligation(
+                    model=model,
+                    kind="identifier_conversion",
+                    status=status,
+                    column=conversion.get("column"),
+                    reason_code=conversion.get("reason_code"),
+                )
+            )
+    return out
 
 
 def _bounded_change(change: ChangeRef) -> ChangeRef:
@@ -685,6 +726,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     cap_list(completion.deliverables, "blocked", _NAMES, "deliverables.blocked")
     cap_list(completion.obligations, "contradicted", _NAMES, "obligations.contradicted")
     cap_list(completion.obligations, "unchecked", _NAMES, "obligations.unchecked")
+    cap_list(
+        completion.obligations,
+        "identifier_conversions",
+        _NAMES,
+        "obligations.identifier_conversions",
+    )
     if completion.refactor_comparison is not None:
         cap_list(completion, "refactor_comparison", _NAMES, "refactor_comparison")
     completion.elided = dict(elided)
@@ -705,6 +752,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             completion.obligations, "contradicted", keep, "obligations.contradicted"
         )
         cap_list(completion.obligations, "unchecked", keep, "obligations.unchecked")
+        cap_list(
+            completion.obligations,
+            "identifier_conversions",
+            max(keep, 1),
+            "obligations.identifier_conversions",
+        )
         cap_list(completion.verification, "top", keep, "verification.top")
         # The first blocked deliverable is the last thing to go: it is the
         # answer to "is the change done", which is what the block is for.

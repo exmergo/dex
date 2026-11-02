@@ -1,0 +1,26 @@
+version: 2
+models:
+  - name: dim_products
+    description: One row per product still sold, with its price where the catalogue has one.
+    config:
+      meta:
+        dex:
+          grain: [product_id]
+          population:
+            rule: Every product stg_products holds; nothing is filtered here.
+          assumptions:
+            - decision: How text product ids meet integer price keys
+              chosen: compare as text, so opaque ids and zero-padded ids stay distinct products
+              evidence: data
+              detail: opaque ids belong to a supplier's own scheme, and 007 is a different product from 7
+              column: product_id
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key}}}
+      - name: product_name
+        config: {meta: {dex: {role: attribute}}}
+      - name: supplier
+        config: {meta: {dex: {role: dimension}}}
+      - name: price
+        config: {meta: {dex: {role: attribute, unit: "currency:USD", null_rule: NULL when the catalogue has no integer price key for the product}}}

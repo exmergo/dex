@@ -75,6 +75,10 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # CacheRequiredError and NoBaselineError stayed unreachable long enough for
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
+    # Caught before a caller sees it: an identifier probe or a join coverage
+    # probe that needs a safe cast on Postgres becomes an `unchecked` record
+    # with `reason_code: no_safe_cast_on_connector` (#861).
+    "NoSafeCastError",
     # Wrapped before a caller sees it: `transform build --cold-deps` turns it into
     # BuildFailedError, with the report under cold_verification.
     "ColdReinstallError",

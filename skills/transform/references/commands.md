@@ -50,6 +50,51 @@ See the cost-controls reference for the shared budget mechanism.
   plus `--confirm --budget`. `attributed: false` carries the reason (macro SQL, a
   jinja conditional, a renamed CTE, an unprofiled parent). Advisory: nothing here
   refuses a plan.
+- `data.identifier_conversions` (#861): each conversion the plan adds to an
+  identifier column, on a new model or an edited one. A conversion is a `cast`, a
+  safe cast (`try_cast`, BigQuery `safe_cast`, Snowflake `try_to_number`) or a
+  `lower`, `upper` or `trim`, in a filter, a join or a projection. An identifier
+  is a declared key, foreign key or grain column, a join key, a profiled grain, or
+  an id-shaped name (`key_basis` says which). A conversion the prior model already
+  had is the existing contract, not reported. Gated like row attribution and
+  priced in its one handshake (`(identifier conversions)`). Each entry carries:
+  - `measured`: aggregate counts over the rows that reach the conversion (its
+    own filter removed, every other filter in the scope kept, so an intentional
+    exclusion is not counted again): `input_rows`, `null_key_rows` (never a
+    failure), `input_entities`, `failed_rows`/`failed_entities` (a hard cast is
+    measured as its safe form), `retained_entities`, `converted_entities`,
+    `collided_keys` and `colliding_source_entities` (`7` and `007` become one
+    key), `representation_changed_entities` (`007` read back as `7`), and on a
+    join `matched_entities` against the other side's distinct keys.
+    `denominator` states the population in words.
+  - `identity`: on an edited model, the prior and authored model's distinct keys
+    in one output column, as text: `kept`, `lost`, `gained` and both row counts.
+    `identity_changed` holds even when the row counts are equal.
+    `identity_reason_code` says why it is absent: `new_model`, `baseline_failed`
+    (the prior model does not run today), `no_shared_key_column`.
+  - `status`: `lossless`; `declared` when an assumption's `column` names the
+    column (its evidence tier is under `assumption`); `undeclared`, also a
+    warning listing the contract-compatible options (compare as text,
+    normalize, a bridge or a namespace, or record the exclusion); or `unchecked`
+    with a `reason_code`: `counting_off`, `awaiting_confirmation`,
+    `unprofiled_input` (the reason names the `explore profile` to run),
+    `unsupported_expression` (a rewrite such as `regexp_replace` or a regex
+    filter), `unsupported_scope` (a grouped, deduplicated or windowed scope, or
+    a UNION branch, subquery or nested CTE, under `scope: "(unaligned)"`),
+    `no_safe_cast_on_connector` (Postgres has no cast that returns NULL),
+    `unrenderable_sql`, `probe_refused`, `probe_failed`, `cap_reached` (4
+    measurable conversions per model, 8 per plan).
+  - What decides the status is what the conversion itself does: identifiers it
+    fails on anywhere, and merges and respellings outside a filter (in a filter
+    the converted key is never an output). Join matches are reported and never
+    decide it, since a key that was an orphan before is not this conversion's
+    loss. The identity comparison covers the whole edit, so it decides only for
+    a projection that defines the compared column. A respelling is counted only
+    for a text source: a numeric source's text form differs by formatting.
+  Shape alone never makes an identifier invalid or a duplicate, so nothing here
+  says so. No statement projects a value, PII-flagged keys included, and a
+  failed statement reports its exception type rather than the warehouse's
+  message, which for a failed cast quotes the value. Never a refusal.
 - `data.declarations.<model>`: for every model the plan creates, edits or
   declares, `drafted`, `declared` and `missing`. Free on every connector: it reads
   the `.dex/` cache and the repository and opens no connection. Shape in

@@ -1,0 +1,11 @@
+name: catalogue
+version: "1.0.0"
+profile: catalogue
+model-paths: ["models"]
+
+models:
+  catalogue:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

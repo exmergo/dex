@@ -103,6 +103,10 @@ def _entry(content: str, model: str = "fct_orders") -> dict:
             "assumptions.0.evidence",
         ),
         ({"model": "m", "owner": "me"}, "owner is not a declaration field"),
+        (
+            {"model": "m", "assumptions": [{"decision": "d", "column": "  "}]},
+            "assumptions.0.column",
+        ),
         ({"description": "no model"}, "model is required"),
     ],
 )

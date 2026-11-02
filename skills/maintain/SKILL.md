@@ -137,6 +137,11 @@ declares is `contract`.
 - A refactor keeps its results: `data.row_attribution` nets to zero,
   `count(*)` stays `count(*)`, and `transform compare` says `equivalent`.
 - Keep every valid row. Never filter rows out to make a cast or a join succeed.
+  An identifier that does not cast may be a second legitimate scheme, and
+  casting can merge keys (`7` and `007`). When `data.identifier_conversions`
+  reports a conversion `undeclared`, keep the other scheme (compare as text,
+  normalize, bridge or namespace) or record the exclusion as an assumption
+  naming its `column`; `unchecked` is not clean.
 - Change only what the request asks; keep the output columns the request and
   the existing model define.
 - A balance or a running total is `semi_additive`: never sum it across time.
