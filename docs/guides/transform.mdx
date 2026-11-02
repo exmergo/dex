@@ -50,6 +50,24 @@ feedback. Resolve missing intent and contradictions, then plan again before
 applying. For an existing model, also review row attribution: a refactor should
 preserve its results.
 
+When the plan rewrites a model that already exists, it carries
+`data.refactor_comparison_offer`. If the change is meant to keep that model's
+results (a refactor, an extracted intermediate, a cleanup), compare before
+applying, because applying discards the baseline:
+
+```bash
+dex transform compare PLAN_ID --model account_summary
+```
+
+`equivalent` holds for the relations named in `input_scope` at `compared_at`.
+`different` means the rewrite changed the rows or the schema: fix it, or state an
+intended rename with `--map` or type change with `--accept-type`. `not_checked`
+is not a pass: its `reason_code` names what to repair, such as a parent whose last
+build failed. The offer's `static_attribution` says when this comparison is the
+only evidence a refactor kept its results, for example when the model's SQL
+calls a macro. A change meant to alter results needs no comparison. The verdict
+is recorded on the plan, and `transform apply` reports it.
+
 Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)
 when you need to construct the edits payload yourself.
 
@@ -72,9 +90,16 @@ dex transform build --target dev --verify --for-plan PLAN_ID
 
 On a metered connector, review the estimate and follow the
 [cost confirmation flow](/dex/guardrails/cost-controls). A successful dbt build
-is only part of the result. `--for-plan` makes the build report whether it ran
-every node the plan changed: read `data.outcome` (only `validated` means it did)
-and `data.evidence.coverage`. Then read `data.verification.ran`, its findings,
+is only part of the result. Read `data.completion` first. It is the first key
+of the payload and is held to 4 KiB, so it survives a cut-off read even when
+hundreds of nodes follow it. With `--for-plan`, its `deliverables` say which of
+the nodes the plan changed were built, failed, skipped, missing or stale, and
+`blocked` names what stopped each one. A skipped report is not done, even if dev
+still holds a table from an earlier run. `assurance.build_only` lists what built
+with nothing checking its rows. Without `--for-plan`, `coverage` is `unknown`.
+The [command contract](/dex/reference/command-contract) gives every
+field. Then read `data.outcome` (only `validated` means every required node ran
+and passed) and `data.verification.ran`, its findings,
 and `suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
 need investigation before the change is finished. `data.verification.column_contract`
 says which built models had their columns compared with `schema.yml`, which declare

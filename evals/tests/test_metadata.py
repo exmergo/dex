@@ -59,6 +59,8 @@ DIGESTS = {
     "season_to_date": "b6823415982716617f2b66134364bb8b0ebadcc3fcca7eeeaf5d682033049794",
     "attribution_population": "ba15c217210c02aa20001c8c240b96e4e6cbd34a797572e703cc584b6197688b",
     "share": "749c9be906d4bd3df2cbe7a83bc7bc66689ed82ba9c3f298ebcaca64335bd558",
+    "refactor_compare": "e8321bce6e29261a950dc01d7a48e77b2d5e77b13ac8c99e1240324296b04018",
+    "blocked_report": "6c46e98e73a69412987fdf82e697ef1d70d42b7b4d4445e1ffc7a5d288fe1535",
 }
 
 
@@ -340,6 +342,92 @@ def test_an_alias_match_inside_quotes_is_not_counted():
     assert session.dex_commands == {"transform apply": 1}
 
 
+def _bash_call(command, tool_id=None):
+    block = {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+    return {
+        "type": "assistant",
+        "message": {"content": [{**block, **({"id": tool_id} if tool_id else {})}]},
+    }
+
+
+def test_quoted_text_is_not_a_call_but_a_quoted_string_the_shell_runs_is():
+    from evals.metadata.live import Session, summarize
+
+    session = summarize(
+        [
+            _bash_call('echo "dex transform compare p1"'),
+            _bash_call("echo 'uv run --script /x/run.py transform compare p1'"),
+            _bash_call('uv run --script "/x/run.py" transform plan i'),
+            _bash_call('python "/x/run.py" transform plan i'),
+            _bash_call('out="$(dex transform build --target dev)"'),
+            _bash_call('bash -c "dex maintain verify"'),
+            _bash_call("dex transform apply p1"),
+        ],
+        Session(),
+    )
+    assert session.dex_sequence == [
+        "transform plan",
+        "transform plan",
+        "transform build",
+        "maintain verify",
+        "transform apply",
+    ]
+
+
+def test_an_echoed_comparison_earns_no_credit_for_the_apply_after_it():
+    from evals.metadata.live import Session, summarize
+    from evals.metadata.score import procedure_steps
+
+    session = summarize(
+        [_bash_call('echo "dex transform compare p1"; dex transform apply p1')],
+        Session(),
+    )
+    assert session.dex_sequence == ["transform apply"]
+    graded = procedure_steps({"compare_before_apply": True}, session.dex_calls)
+    assert graded["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("result", "verdict"),
+    [
+        ('{"status": "ok", "data": {"status": "equivalent"}}', "equivalent"),
+        ('{"status": "ok", "data": {"status": "not_checked"}}', "not_checked"),
+        ([{"type": "text", "text": '{"status": "different"}'}], "different"),
+        ("not_checked\n", "not_checked"),
+        ('{"status": "error", "data": {}}', "not_run"),
+        ('{"status": "needs_confirmation", "data": {}}', "not_run"),
+        ("3 rows", None),
+    ],
+)
+def test_a_comparison_records_its_plan_and_what_it_returned(result, verdict):
+    from evals.metadata.live import Session, summarize
+
+    session = summarize(
+        [
+            _bash_call("dex transform compare p1 --model m", "t1"),
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": result}
+                    ]
+                },
+            },
+        ],
+        Session(),
+    )
+    assert session.dex_calls == [
+        {"label": "transform compare", "plan": "p1", "verdict": verdict}
+    ]
+
+
+def test_a_variable_plan_id_is_not_read_as_a_plan():
+    from evals.metadata.live import Session, summarize
+
+    session = summarize([_bash_call("dex transform apply $PLAN")], Session())
+    assert session.dex_calls[0]["plan"] is None
+
+
 def test_a_model_that_was_not_built_cannot_be_complete():
     from evals.metadata.score import Declared, completeness
 
@@ -599,3 +687,188 @@ def test_a_relative_plugin_dir_is_resolved_before_a_session_can_disagree(
     resolved = resolve_plugin_dir("older/plugin")
     assert resolved.is_absolute()
     assert resolved == (tmp_path / "older" / "plugin").resolve()
+
+
+# --- #1049 and #855: the refactor comparison and the blocked report ----------
+
+
+@needs_dbt
+def test_the_inner_join_extraction_fails_the_refactor_checks(tmp_path):
+    """The trap #1049 describes: joining names to users before counting drops
+    the unnamed users, so a refactor that builds and keeps every account still
+    changes the counts. Only the comparison (or these checks) can see it."""
+
+    task, fixture, workspace = _reference(
+        tmp_path, "refactor_compare/extract_intermediate"
+    )
+    path = workspace / "models/intermediate/int_account_users.sql"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("left join", "inner join"),
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored"
+    failed = {c["name"] for c in score.checks if not c["passed"]}
+    # Every account survives, so the row count alone cannot see the defect.
+    assert "every account is present" not in failed
+    assert "counts are what they were before the refactor" in failed
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("key", "broken"),
+    [
+        (
+            "blocked_report/finish_team_activity",
+            "models/intermediate/int_team_members.sql",
+        ),
+        ("refactor_compare/blocked_baseline", "models/staging/stg_users.sql"),
+    ],
+)
+def test_the_blocked_setup_fails_the_gate_until_the_prerequisite_is_repaired(
+    tmp_path, key, broken
+):
+    task, fixture, workspace = _reference(tmp_path, key)
+    # The reference repaired the prerequisite; put the broken one back.
+    shutil.copyfile(task.directory / "setup" / broken, workspace / broken)
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "gate_failed", score.gate
+
+
+@needs_dbt
+def test_a_repair_that_drops_rows_fails_the_blocked_checks(tmp_path):
+    task, fixture, workspace = _reference(
+        tmp_path, "blocked_report/finish_team_activity"
+    )
+    path = workspace / "models/intermediate/int_team_members.sql"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "where try_cast(joined_on as date) is not null\n",
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    failed = {c["name"] for c in score.checks if not c["passed"]}
+    assert "no member was dropped to make the build pass" in failed
+
+
+def _bash(command):
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+            ]
+        },
+    }
+
+
+def test_the_transcript_summary_keeps_the_order_of_dex_calls():
+    from evals.metadata.live import Session, summarize
+
+    events = [
+        _bash('dex transform plan "x" --edits-file e.json'),
+        _bash("dex transform compare p1 --model m && dex transform apply p1"),
+        _bash("dex transform build --target dev --verify --for-plan p1"),
+    ]
+    session = summarize(events, Session())
+    assert session.dex_sequence == [
+        "transform plan",
+        "transform compare",
+        "transform apply",
+        "transform build",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sequence", "expected"),
+    [
+        (
+            [
+                "transform plan",
+                "transform compare",
+                "transform apply",
+                "transform build",
+            ],
+            1.0,
+        ),
+        (
+            [
+                "transform plan",
+                "transform apply",
+                "transform compare",
+                "transform build",
+            ],
+            0.5,
+        ),
+        # A repair applied first, then the refactor compared and applied.
+        (
+            [
+                "transform apply",
+                "transform build",
+                "transform compare",
+                "transform apply",
+                "transform build",
+            ],
+            1.0,
+        ),
+        (["transform plan", "transform build", "transform apply"], 0.0),
+        (["transform plan", "transform compare"], 0.0),
+    ],
+)
+def test_procedure_steps_are_graded_in_order(sequence, expected):
+    from evals.metadata.score import procedure_steps
+
+    graded = procedure_steps(
+        {"compare_before_apply": True, "build_after_apply": True},
+        [{"label": label} for label in sequence],
+    )
+    assert graded["score"] == expected
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        # The blocked comparison, then the repair and the refactor applied.
+        ([("compare", None, "not_checked"), ("apply", "p1"), ("apply", "p2")], False),
+        # Usable, but of the repair rather than the refactor.
+        ([("compare", "p1", "equivalent"), ("apply", "p1"), ("apply", "p2")], False),
+        # No id on either side, and another apply changed what it read.
+        ([("compare", None, "equivalent"), ("apply",), ("apply",)], False),
+        ([("compare", "p2", "not_checked"), ("apply", "p2")], False),
+        ([("compare", "p2", "not_run"), ("apply", "p2")], False),
+        # The repair applied, then the refactor compared again.
+        (
+            [
+                ("compare", "p2", "not_checked"),
+                ("apply", "p1"),
+                ("compare", "p2", "equivalent"),
+                ("apply", "p2"),
+            ],
+            True,
+        ),
+        # The ids match across the repair's apply.
+        ([("compare", "p2", "equivalent"), ("apply", "p1"), ("apply", "p2")], True),
+        # A verdict the agent's pipe hid.
+        ([("compare", "p2", None), ("apply", "p2")], True),
+    ],
+)
+def test_a_comparison_counts_only_when_usable_and_of_the_applied_plan(calls, passed):
+    from evals.metadata.score import procedure_steps
+
+    def call(verb, plan=None, verdict=None):
+        return {"label": f"transform {verb}", "plan": plan, "verdict": verdict}
+
+    graded = procedure_steps(
+        {"compare_before_apply": True}, [call(*spec) for spec in calls]
+    )
+    assert graded["passed"] is passed
+
+
+def test_a_task_or_run_grading_no_procedure_reports_none():
+    from evals.metadata.score import procedure_steps
+
+    apply = [{"label": "transform apply"}]
+    assert procedure_steps(None, apply) is None
+    assert procedure_steps({"compare_before_apply": False}, apply) is None
+    # A reference run has no session to read.
+    assert procedure_steps({"compare_before_apply": True}, None) is None

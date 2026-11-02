@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "rpt_team_activity"
+  ],
+  "prompt": "Add `active_member_count` to `rpt_team_activity`: the members of each team who have not left (no `left_on`). Rebuild the report on dev and confirm it is built."
+}

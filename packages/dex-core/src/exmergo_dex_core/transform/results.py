@@ -15,6 +15,7 @@ from pydantic import Field
 from ..attribution import COMMIT_TRAILER
 from ..results import Result
 from .classify import ArtifactClassification
+from .completion import BuildCompletion
 from .evidence import BuildEvidence
 from .grounding import Grounding
 from .portable import PortablePlan
@@ -280,6 +281,11 @@ class ApplyResult(Result):
     # The assumptions declared on the models this apply wrote, as the project
     # now records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
+    # Per model this plan rewrote, the refactor comparison the plan recorded,
+    # or `not_compared` (#1049). Reported, never enforced: an intentional
+    # behavior change needs no equivalence. Absent when the plan rewrote no
+    # existing model.
+    refactor_comparison: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
         if self.pending_confirmation is not None:
@@ -289,6 +295,8 @@ class ApplyResult(Result):
             "written": self.written,
             "conflicts_overridden": self.conflicts_overridden,
         }
+        if self.refactor_comparison is not None:
+            payload["refactor_comparison"] = self.refactor_comparison
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.commit_trailer is not None:
@@ -575,6 +583,9 @@ class BuildResult(Result):
     # The assumptions declared on the models this build ran, as the project
     # records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
+    # The bounded lead (#855): what the run established about the change, held
+    # to a size that survives a truncated read, ahead of every unbounded list.
+    completion: BuildCompletion | None = None
 
     def evidence_model(self) -> BuildEvidence | None:
         """The typed :class:`~exmergo_dex_core.transform.evidence.BuildEvidence`
@@ -603,4 +614,9 @@ class BuildResult(Result):
             payload["verification"] = self.verification
         if self.decisions is not None:
             payload["decisions"] = self.decisions
+        if self.completion is not None:
+            # First, by construction rather than by luck: key order means
+            # nothing to a parser and everything to a reader whose harness cut
+            # the output after a few kilobytes (#855).
+            payload = {"completion": self.completion.data(), **payload}
         return payload

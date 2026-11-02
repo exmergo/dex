@@ -1,0 +1,55 @@
+{
+  "models": {
+    "account_user_summary": {
+      "grain": [
+        "account_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "account_id": {
+          "role": "key"
+        },
+        "user_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "named_users": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every account is present",
+      "expect": 30,
+      "sql": "select count(*) from main.account_user_summary"
+    },
+    {
+      "name": "accounts with no users count zero",
+      "expect": 6,
+      "sql": "select count(*) from main.account_user_summary where user_count = 0"
+    },
+    {
+      "name": "counts are what they were before the refactor",
+      "expect": 0,
+      "sql": "with e as (select a.account_id, count(u.user_id) as users, count(d.user_id) as named from raw.accounts a left join raw.users u on u.account_id = a.account_id left join raw.display_names d on d.user_id = u.user_id group by 1) select count(*) from main.account_user_summary s join e using (account_id) where s.user_count is distinct from e.users or s.named_users is distinct from e.named"
+    },
+    {
+      "name": "no user was dropped to make the build pass",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.users) - (select sum(user_count) from main.account_user_summary)"
+    }
+  ],
+  "procedure": {
+    "compare_before_apply": true,
+    "build_after_apply": true
+  }
+}

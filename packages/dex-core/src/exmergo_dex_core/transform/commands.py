@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -716,10 +717,23 @@ def _plan_decisions(
 def _offer_refactor_comparison(
     engine: DexEngine, result: PlanResult, edits: list[PlanEdit]
 ) -> None:
-    """Name the comparison a plan that rewrites a model can ask for (#856).
+    """Name the comparison a plan that rewrites a model can ask for (#856, #1049).
 
-    Reads the plan and the tree and nothing else. Planning stores the change and
-    offers this; it never scans for it.
+    Reads the plan, the tree and row attribution's report, and nothing else.
+    Planning stores the change and offers this; it never scans for it.
+
+    Each model carries what static row attribution could say about it, because
+    that is what decides whether the comparison is the only evidence a refactor
+    kept its results: ``unattributed`` (a change dex could not isolate, such as
+    macro-generated SQL), ``unmeasured`` (attributable, not yet counted, as on a
+    metered connector without ``--attribute-rows``), ``none`` (nothing that can
+    move rows changed, so a value change is invisible to attribution) or
+    ``attributed`` (every row-moving change was measured). Counts are not
+    values, so even ``attributed`` leaves the comparison worth running; it is
+    *recommended* before apply wherever attribution established nothing.
+
+    The offer is recorded on the stored plan too, so ``transform apply`` and a
+    ``--for-plan`` build can report whether each rewrite was compared.
     """
 
     from .refactor_compare import edited_existing_models
@@ -731,13 +745,111 @@ def _offer_refactor_comparison(
         return
     if not models or not result.plan_id:
         return
+    ordered = sorted(models)
+    per_model = []
+    for model in ordered:
+        static = _static_attribution(_attribution_for(result.row_attribution, model))
+        per_model.append(
+            {
+                "model": model,
+                "static_attribution": static,
+                "command": (
+                    f"transform compare {result.plan_id} --model {shlex.quote(model)}"
+                ),
+            }
+        )
+    recommended = any(m["static_attribution"] != "attributed" for m in per_model)
     result.refactor_comparison_offer = {
-        "models": sorted(models),
+        "plan_id": result.plan_id,
+        "recommended_before_apply": recommended,
+        "why": (
+            "static row attribution did not establish that "
+            + ("this rewrite keeps" if len(ordered) == 1 else "these rewrites keep")
+            + " the model's results; if the change is meant to keep them, compare "
+            "before `transform apply`"
+            if recommended
+            else "row counts were attributed, values were not; if the change is "
+            "meant to keep the model's results, compare before `transform apply`"
+        ),
+        "per_model": per_model,
+        "models": ordered,
         "command": (
-            f"transform compare {result.plan_id} --model {sorted(models)[0]} "
+            f"transform compare {result.plan_id} --model {shlex.quote(ordered[0])} "
             "[--map old=new] [--key column]"
         ),
     }
+    _record_refactor_models(engine, result.plan_id, per_model)
+
+
+def _static_attribution(entries: list[dict[str, Any]]) -> str:
+    """What row attribution established for one model, in one word."""
+
+    changes = [c for entry in entries for c in entry.get("changes") or []]
+    if not changes:
+        return "none"
+    # Only `unattributable` is a change dex cannot isolate. A change it named
+    # and did not count (opt-in on a billed connector, a cap, a failed count)
+    # is attributable and unmeasured, which a re-plan with `--attribute-rows`
+    # can settle and a comparison is not the only evidence for.
+    if any(c.get("kind") == "unattributable" for c in changes):
+        return "unattributed"
+    if any(
+        not c.get("attributed", True)
+        or (c.get("rows") is None and c.get("delta") is None)
+        for c in changes
+    ):
+        return "unmeasured"
+    return "attributed"
+
+
+def _record_refactor_models(
+    engine: DexEngine, plan_id: str, per_model: list[dict[str, Any]]
+) -> None:
+    """Remember which models the offer named, on the stored plan.
+
+    Best-effort by design: the plan is stored and the offer is in the payload
+    either way, and a store that cannot be rewritten loses only the later
+    "was this compared" report, which then says it does not know.
+    """
+
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("recording a refactor offer")
+        stored = store.load_plan(plan_id)
+        stored.refactor_models = {
+            m["model"]: m["static_attribution"] for m in per_model
+        }
+        store.save_plan(stored)
+
+
+def refactor_comparison_states(stored: Any) -> list[dict[str, Any]] | None:
+    """Per model a plan rewrote, its recorded comparison or ``not_compared``.
+
+    ``None`` when the plan recorded no rewritten model, which is both "this plan
+    rewrote nothing" and a plan stored before the field existed.
+    """
+
+    models = getattr(stored, "refactor_models", None) or {}
+    recorded = getattr(stored, "comparisons", None) or {}
+    if not models and not recorded:
+        return None
+    states = []
+    # A comparison of a model downstream of the rewrite (the contract the
+    # request keeps) is reported too, beside the rewritten models themselves.
+    for model in sorted(set(models) | set(recorded)):
+        verdict = recorded.get(model)
+        state: dict[str, Any] = {"model": model}
+        if model in models:
+            state["static_attribution"] = models[model]
+        if verdict:
+            state.update(
+                status=verdict.get("status"),
+                reason_code=verdict.get("reason_code"),
+                compared_at=verdict.get("compared_at"),
+            )
+        else:
+            state["status"] = "not_compared"
+        states.append(state)
+    return states
 
 
 def _attribute_rows(
@@ -2889,11 +3001,14 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
                 }
             ),
         )
+    comparison = refactor_comparison_states(stored)
     return ApplyResult(
         plan_id=plan_id,
         written=outcome.written,
         conflicts_overridden=[c.path for c in outcome.conflicts],
         diffs=outcome.diffs,
+        refactor_comparison=comparison,
+        notes=_comparison_notes(comparison),
         decisions=(
             None
             if stored.edit_target == "semantic"
@@ -2902,6 +3017,47 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
             )
         ),
     )
+
+
+def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
+    """One line naming the rewrites that went in uncompared, if any.
+
+    A note rather than a warning, and never a refusal: an intentional behavior
+    change has no equivalence to establish, and only the caller knows which
+    kind of change this was. What the line prevents is the other kind going in
+    with nobody having said so (#1049).
+    """
+
+    # Any comparison on the plan, a downstream one included, is the caller
+    # having checked the contract it meant to keep; the note is for a plan
+    # nobody compared at all.
+    compared = any(s.get("status") != "not_compared" for s in states or [])
+    uncompared = [
+        s["model"]
+        for s in states or []
+        if not compared
+        and s.get("status") == "not_compared"
+        and s.get("static_attribution") != "attributed"
+    ]
+    unproven = [
+        f"{s['model']} ({s.get('reason_code') or s.get('status')})"
+        for s in states or []
+        if s.get("status") in {"different", "not_checked"}
+    ]
+    notes: list[str] = []
+    if uncompared:
+        notes.append(
+            "applied without a refactor comparison, and static row attribution "
+            "did not establish the results were kept: "
+            + ", ".join(uncompared)
+            + "; if the change was meant to keep them, that is unverified"
+        )
+    if unproven:
+        notes.append(
+            "the last comparison did not establish equivalence for: "
+            + ", ".join(unproven)
+        )
+    return notes
 
 
 def _declarations() -> Any:
@@ -3419,6 +3575,9 @@ def build(
             ),
             decisions=_built_decisions(engine, summary),
             engine=engine,
+            completion_inputs=_completion_inputs(
+                engine, for_plan, for_plan_document, artifacts_dir, project
+            ),
         )
 
     dev_warnings = dev_check()
@@ -3563,6 +3722,9 @@ def build(
         decisions=decisions,
         uncapped=bool(dev_target.missing_cap_references(project, target, connector)),
         engine=engine,
+        completion_inputs=_completion_inputs(
+            engine, for_plan, for_plan_document, artifacts_dir, project
+        ),
     )
 
 
@@ -3646,6 +3808,8 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # successful one does. `to_envelope` is what normally lifts `spend` into
         # `data`, and this path does not go through it.
         data = exc.result.data()
+        if exc.result.notes:
+            data["notes"] = exc.result.notes
         if exc.result.spend is not None:
             data["spend"] = exc.result.spend
         return env.error_for(
@@ -4466,6 +4630,7 @@ def _shape_build_result(
     decisions: list[dict[str, Any]] | None = None,
     uncapped: bool = False,
     engine: DexEngine | None = None,
+    completion_inputs: dict[str, Any] | None = None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -4581,6 +4746,7 @@ def _shape_build_result(
             # tell a host nothing had run and invite it to pay for the whole
             # build a second time to get the counts.
             result.pending_offer = verification.offer
+        _attach_completion(result, verification, completion_inputs)
         return result
     # Agents triage from `errors` first, so the first real dbt message rides there;
     # the rest stay in warnings.
@@ -4615,7 +4781,96 @@ def _shape_build_result(
         # because of it" is worth most, and `cmd_build` builds that envelope by
         # hand from `result.data()`, so the payload reaches it from here.
         failed.verification = verification.payload()
+    _attach_completion(failed, verification, completion_inputs)
     raise BuildFailedError(_failure_message(prefix, messages), result=failed)
+
+
+def _attach_completion(
+    result: BuildResult,
+    verification: BuildVerification | None,
+    inputs: dict[str, Any] | None,
+) -> None:
+    """Lead the payload with the bounded completion block (#855).
+
+    Derived from what the result already holds, so it can never disagree with
+    the evidence beneath it. No evidence means nothing to summarize, and the
+    block is absent rather than a summary of a run nobody read. Total by
+    design: a defect here must not turn a finished, billed build into an error.
+    """
+
+    from .completion import ChangeRef, ComparisonState, summarize_completion
+
+    if result.evidence is None:
+        return
+    inputs = inputs or {}
+    try:
+        states = inputs.get("comparisons")
+        result.completion = summarize_completion(
+            result.evidence,
+            result.verification,
+            process={
+                "success": result.summary.get("success"),
+                "returncode": result.summary.get("returncode"),
+            },
+            change=ChangeRef(
+                plan_id=inputs.get("plan_id"),
+                source=inputs.get("source"),
+                selector=result.evidence.selection.requested,
+            ),
+            graph=inputs.get("graph"),
+            comparisons=(
+                [ComparisonState.model_validate(s) for s in states]
+                if states is not None
+                else None
+            ),
+            findings_dropped=verification.dropped if verification is not None else 0,
+            verification_offered=result.pending_offer is not None,
+        )
+    except Exception as exc:
+        result.notes.append(
+            f"could not summarize this build's completion ({type(exc).__name__}); "
+            "the full evidence is under data.evidence and data.verification"
+        )
+
+
+def _completion_inputs(
+    engine: DexEngine,
+    for_plan: str | None,
+    for_plan_document: Any,
+    artifact_directory: Path | None,
+    project: Path,
+) -> dict[str, Any]:
+    """What the completion block reads beyond the result: the change it was
+    asked to validate, the manifest's dependency edges (a skip's cause, a
+    test's model), and the plan's recorded refactor comparisons. Each is
+    best-effort; a missing one leaves its part of the block unnamed."""
+
+    inputs: dict[str, Any] = {}
+    if for_plan:
+        inputs.update(plan_id=for_plan, source="for_plan")
+        with contextlib.suppress(Exception):
+            stored = engine.require_full_store("reading a plan").load_plan(for_plan)
+            inputs["comparisons"] = refactor_comparison_states(stored)
+    elif for_plan_document is not None:
+        inputs["source"] = "for_plan_file"
+        with contextlib.suppress(Exception):
+            from .portable import verify_plan_document
+
+            inputs["plan_id"] = verify_plan_document(for_plan_document).plan_id
+    with contextlib.suppress(Exception):
+        from .artifact_runtime import artifact_paths, readable_artifact_dir
+
+        directory = artifact_directory or readable_artifact_dir(project)
+        manifest = json.loads(
+            artifact_paths(directory).manifest.read_text(encoding="utf-8")
+        )
+        inputs["graph"] = {
+            uid: list((node.get("depends_on") or {}).get("nodes") or [])
+            for section in ("nodes", "unit_tests")
+            for uid, node in (manifest.get(section) or {}).items()
+            if isinstance(node, dict)
+        }
+    return inputs
 
 
 def _failure_message(prefix: str, messages: list[str]) -> str:

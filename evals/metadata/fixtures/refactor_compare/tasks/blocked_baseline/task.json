@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "account_user_summary"
+  ],
+  "prompt": "Refactor `account_user_summary`: move its per-account user counting into a new intermediate model, `int_account_users` under `models/intermediate/`, and have the mart read it. This is a pure refactor for maintainability: the mart's output must not change. Rebuild it on dev: the work is done when the refactored mart is built there."
+}

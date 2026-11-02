@@ -1,0 +1,5 @@
+{
+  "name": "refactor_compare",
+  "seed": 1049,
+  "description": "Accounts, their users, and the display names some users have. An account summary counts users with a project macro and counts named users separately, so a refactor that joins names to users before counting loses the unnamed users. The macro means static row attribution cannot settle the refactor; only a comparison can."
+}

@@ -278,11 +278,23 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
     if companion:
         # Named both explicitly: a bare `transform apply` takes the latest
         # unapplied plan, which is the companion, and would leave the mart.
-        return {
-            "next": f"review the diffs, then `transform apply {result.plan_id}` and "
+        step = (
+            f"review the diffs, then `transform apply {result.plan_id}` and "
             f"`transform apply {companion}` (the derived semantic models)"
-        }
-    return {"next": f"review the diffs, then `transform apply {result.plan_id}`"}
+        )
+    else:
+        step = f"review the diffs, then `transform apply {result.plan_id}`"
+    offer = getattr(result, "refactor_comparison_offer", None) or {}
+    if offer.get("per_model"):
+        # The comparison comes first in the sentence because it has to come
+        # first in the sequence: once applied, the tree no longer holds the
+        # baseline and the plan cannot be compared (#1049).
+        commands = " and ".join(f"`{m['command']}`" for m in offer["per_model"][:3])
+        step = (
+            f"if this change should keep the existing results, run {commands} "
+            f"before applying; {step}"
+        )
+    return {"next": step}
 
 
 def edits_from_payload(

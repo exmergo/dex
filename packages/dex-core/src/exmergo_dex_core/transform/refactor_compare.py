@@ -146,7 +146,7 @@ def compare(
     if local:
         engine.close()
     try:
-        return _compare(
+        result = _compare(
             engine,
             plan_id,
             model=model,
@@ -158,6 +158,47 @@ def compare(
     finally:
         if local:
             engine.close()
+    _record_verdict(engine, result)
+    return result
+
+
+#: Verdicts that say nothing about the plan, so recording them would overwrite a
+#: verdict that does: a comparison still waiting on its price, and one refused
+#: because the plan is already applied.
+_UNRECORDED = frozenset({"awaiting_confirmation", "plan_applied"})
+
+
+def _record_verdict(engine: DexEngine, result: RefactorComparisonResult) -> None:
+    """Keep the verdict on the stored plan (#1049).
+
+    So that ``transform apply`` and a ``--for-plan`` build can say, per model
+    the plan rewrote, whether it was compared and what came back, instead of
+    leaving that to whatever the agent remembers. Best-effort: the verdict is in
+    the payload either way, and a store that cannot be rewritten loses only the
+    later report, which then says ``not_compared``.
+    """
+
+    if not result.plan_id or not result.model or result.reason_code in _UNRECORDED:
+        return
+    try:
+        store = engine.require_full_store("recording a comparison")
+        stored = store.load_plan(result.plan_id)
+        if stored.applied_at:
+            return
+        stored.comparisons = {
+            **(stored.comparisons or {}),
+            result.model: {
+                "status": result.status,
+                "reason_code": result.reason_code,
+                "compared_at": result.compared_at,
+                "input_scope": list(result.input_scope),
+                "baseline_compiled": result.baseline_compiled,
+                "proposed_compiled": result.proposed_compiled,
+            },
+        }
+        store.save_plan(stored)
+    except Exception:  # bookkeeping must not fail the comparison
+        return
 
 
 def _compare(
@@ -230,6 +271,26 @@ def _compare(
             "inputs_unsynchronized",
             "this plan changes a seed or a snapshot, and the dev relation still "
             "holds what the last build wrote: " + ", ".join(unsynchronized),
+        )
+    blocked = _blocked_parents(
+        project, chosen, {Path(edit.path).stem for edit in _touched(stored)}
+    )
+    if blocked:
+        names = [name for name, _ in blocked]
+        one = len(blocked) == 1
+        return not_checked(
+            "inputs_unsynchronized",
+            "the last build did not rebuild "
+            + ", ".join(f"{name} ({status})" for name, status in blocked)
+            + (
+                ", so its dev relation predates its current SQL and would stand in "
+                if one
+                else ", so their dev relations predate their current SQL and would "
+                "stand in "
+            )
+            + "for both sides as an obsolete input; repair what failed, rebuild "
+            f"with `transform build --target dev --select {' '.join(names)}`, then "
+            "compare again",
         )
     through_ancestors = any(edit.kind in _GLOBAL_KINDS for edit in stored.edits)
 
@@ -580,6 +641,82 @@ def _compile_side(
         grain=[str(column) for column in grain] if isinstance(grain, list) else [],
         parents=_built_parents(manifest, node) if through_ancestors else {},
     )
+
+
+#: Statuses dbt gives a node that did not produce this run's relation.
+_NOT_REBUILT = frozenset({"error", "runtime error", "fail", "failed", "skipped"})
+
+
+def _blocked_parents(
+    project: Path, model: str, touched: set[str]
+) -> list[tuple[str, str]]:
+    """Upstream models the last build tried and failed, or skipped (#1049).
+
+    Read from the last run's ``run_results.json`` and the manifest beside it,
+    both free. A parent whose last build errored or was skipped still has a
+    relation in the dev target, from some earlier run, and both sides of the
+    comparison would read it: the verdict would then hold for inputs the current
+    project no longer produces. Only the parents that last run *attempted* are
+    judged; a parent it did not select tells nothing, and no results at all
+    leaves the comparison exactly as it was. A model the plan itself rewrites
+    is compiled inline on both sides rather than read, so it is not judged.
+    """
+
+    import json
+
+    from ..dbt_project import manifest_node_label
+    from .artifact_runtime import artifact_paths, readable_artifact_dir
+
+    try:
+        paths = artifact_paths(readable_artifact_dir(project))
+        if not paths.run_results.is_file() or not paths.manifest.is_file():
+            return []
+        results = json.loads(paths.run_results.read_text(encoding="utf-8"))
+        nodes = json.loads(paths.manifest.read_text(encoding="utf-8")).get("nodes", {})
+    except (OSError, ValueError, DexError):
+        return []
+    status_of = {
+        str(r.get("unique_id")): str(r.get("status") or "").lower()
+        for r in results.get("results") or []
+        if isinstance(r, dict)
+    }
+
+    def names(node: Mapping[str, Any]) -> set[str]:
+        # A versioned model's name is shared by its versions; its file stem
+        # (`dim_customers_v2`) is what a plan edit and `--model` call it.
+        found = {str(node.get("name") or "")}
+        path = node.get("original_file_path")
+        if isinstance(path, str) and path:
+            found.add(Path(path).stem)
+        return found
+
+    start = [
+        uid
+        for uid, node in nodes.items()
+        if uid.startswith("model.") and model in names(node)
+    ]
+    blocked: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    pending = [
+        dep
+        for uid in start
+        for dep in (nodes[uid].get("depends_on") or {}).get("nodes") or []
+    ]
+    while pending:
+        uid = pending.pop()
+        if uid in seen or not uid.startswith("model."):
+            continue
+        seen.add(uid)
+        node = nodes.get(uid) or {}
+        pending.extend((node.get("depends_on") or {}).get("nodes") or [])
+        if (node.get("config") or {}).get("materialized") == "ephemeral":
+            continue
+        if names(node) & touched:
+            continue
+        status = status_of.get(uid)
+        if status in _NOT_REBUILT:
+            blocked.append((manifest_node_label(uid, node), status))
+    return sorted(blocked)
 
 
 def _built_parents(
