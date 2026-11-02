@@ -2923,7 +2923,7 @@ def _null_checks(
     return checks, notes
 
 
-def _split_unsafe(pairs, dialect: str):
+def _split_unsafe(pairs: list[tuple], dialect: str) -> tuple[list[tuple], list[tuple]]:
     """The pairs a probe can measure on ``dialect``, and those it cannot: a key
     conversion that needs a safe cast where the dialect has none (#861)."""
 
@@ -2931,7 +2931,8 @@ def _split_unsafe(pairs, dialect: str):
 
     if dialect not in sql_shape.NO_SAFE_CAST:
         return pairs, []
-    keep, unsafe = [], []
+    keep: list[tuple] = []
+    unsafe: list[tuple] = []
     for item in pairs:
         exprs = item[1].key_exprs()
         needs = exprs is not None and any(
