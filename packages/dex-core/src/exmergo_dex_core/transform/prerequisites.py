@@ -25,6 +25,7 @@ Read-only and connectionless: it reads a manifest dict and nothing else.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from pathlib import PurePosixPath
 from typing import Any
 
 import yaml
@@ -92,6 +93,23 @@ def _name_of(unique_id: str) -> str:
     return parts[2] if len(parts) >= 3 else unique_id
 
 
+def _required_names(unique_id: str, node: Any) -> set[str]:
+    """Every name a required deliverable may use for this node, lowercased: the
+    manifest name, and the file stem an edit's path gives it, which differs for a
+    versioned model (``dim_customers.v2`` in ``dim_customers_v2.sql``)."""
+
+    parts = unique_id.split(".")
+    if len(parts) < 3 or parts[0] in ("test", "unit_test"):
+        return set()
+    names = {parts[2].lower()}
+    if parts[0] == "model" and len(parts) == 4 and parts[3].startswith("v"):
+        names.add(f"{parts[2]}_{parts[3]}".lower())
+    path = node.get("original_file_path") if isinstance(node, Mapping) else None
+    if path:
+        names.add(PurePosixPath(str(path)).stem.lower())
+    return names
+
+
 def _children(graph: Mapping[str, list[str]]) -> dict[str, list[str]]:
     children: dict[str, list[str]] = {}
     for node, parents in graph.items():
@@ -141,6 +159,7 @@ def _reaches_any_node(edit: PlanEdit) -> bool:
 
 
 def _edited_nodes(
+    nodes: Mapping[str, Any],
     graph: Mapping[str, list[str]],
     root: str | None,
     required: list[str] | None,
@@ -158,9 +177,8 @@ def _edited_nodes(
         parts = unique_id.split(".")
         if (
             len(parts) >= 3
-            and parts[0] not in ("test", "unit_test")
             and parts[1] == root
-            and parts[2].lower() in names
+            and names & _required_names(unique_id, nodes.get(unique_id))
         ):
             edited.add(unique_id)
     return edited
@@ -303,8 +321,8 @@ def diagnose(
         if isinstance(node, Mapping)
     }
     children = _children(graph)
-    edited = _edited_nodes(graph, root, required, edits)
-    wanted = {name.lower() for name in required or []}
+    edited = _edited_nodes(nodes, graph, root, required, edits)
+    wanted = {name.lower(): name for name in required or []}
 
     out = []
     for unique_id, status, message in failed:
@@ -317,10 +335,12 @@ def diagnose(
             "unknown" if not known else ("project" if package == root else "package")
         )
         blocks = sorted(
-            _name_of(uid)
-            for uid in _reach([unique_id], children)
-            if not uid.startswith(("test.", "unit_test."))
-            and _name_of(uid).lower() in wanted
+            {
+                wanted[name]
+                for uid in _reach([unique_id], children)
+                for name in _required_names(uid, nodes.get(uid))
+                if name in wanted
+            }
         )
         entry: dict[str, Any] = {
             "node": str((node or {}).get("name") or _name_of(unique_id)),

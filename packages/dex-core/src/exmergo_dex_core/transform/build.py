@@ -1487,6 +1487,18 @@ def cold_checkout(
 
     project = Path(project_dir).resolve()
     with shadow_project(project, skip_packages=True) as shadow:
+        # An absolute or far-climbing packages-install-path names the same directory
+        # from the copy as from the project, so `dbt deps` would write over it.
+        if not Path(os.path.normpath(packages_dir(shadow))).is_relative_to(
+            shadow.parent
+        ):
+            reason = (
+                "packages-install-path points outside the project, so a reinstall "
+                "cannot be isolated from the installed packages"
+            )
+            raise ColdReinstallError(
+                reason, {"ran": True, "reinstalled": False, "reason": reason}
+            )
         had_lock = (project / _LOCK_FILE).is_file()
         rewrote = _keep_local_packages_reachable(shadow, project)
         lock_before = _file_digest(shadow / _LOCK_FILE)

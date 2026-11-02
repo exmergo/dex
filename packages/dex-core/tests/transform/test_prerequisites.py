@@ -109,6 +109,55 @@ def test_blocks_names_required_descendants_only():
     assert entry["blocks"] == ["rpt"]
 
 
+def _versioned_manifest() -> dict:
+    v2 = "model.proj.dim_customers.v2"
+    v1 = "model.proj.dim_customers.v1"
+    return _manifest(
+        **{
+            v1: _node(v1, original_file_path="models/dim_customers_v1.sql"),
+            v2: _node(v2, PKG, original_file_path="models/dim_customers_v2.sql"),
+            "model.proj.reader": _node("model.proj.reader", v2),
+        }
+    )
+
+
+def test_an_edited_versioned_model_is_not_independent():
+    edit = {"required": ["dim_customers_v2"], "edits": [_edit("models/x_v2.sql")]}
+    manifest = _versioned_manifest()
+    assert (
+        _one(manifest, node="model.proj.dim_customers.v2", **edit)["plan_relation"]
+        == "edited"
+    )
+    assert _one(manifest, node="model.proj.reader", **edit)["plan_relation"] == (
+        "downstream_of_edit"
+    )
+    # The sibling version is not what the plan edited.
+    assert _one(manifest, node="model.proj.dim_customers.v1", **edit)[
+        "plan_relation"
+    ] == ("independent")
+
+
+def test_a_versioned_deliverable_is_named_in_blocks():
+    entry = _one(
+        _versioned_manifest(),
+        required=["dim_customers_v2"],
+        edits=[_edit("models/dim_customers_v2.sql")],
+    )
+    assert entry["blocks"] == ["dim_customers_v2"]
+
+
+def test_a_model_whose_file_stem_is_its_required_name_is_matched_with_no_path():
+    """dbt's convention alone, for a manifest that carries no file path."""
+
+    v2 = "model.proj.dim_customers.v2"
+    entry = _one(
+        _manifest(**{v2: _node(v2, PKG)}),
+        required=["dim_customers_v2"],
+        edits=[_edit("models/dim_customers_v2.sql")],
+    )
+    assert entry["blocks"] == ["dim_customers_v2"]
+
+
 def test_a_failed_unit_test_of_an_edited_model_is_not_independent():
     test = "unit_test.proj.stg.t1"
     manifest = _manifest()

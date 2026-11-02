@@ -497,6 +497,33 @@ def test_a_custom_install_path_is_compared_and_not_copied(project, capsys):
     ] == ["tiny_pkg/models/pkg_task.sql"]
 
 
+@pytest.mark.parametrize("spelling", ["absolute", "climbing"])
+def test_an_install_path_outside_the_project_is_refused_untouched(
+    project, capsys, spelling
+):
+    outside = project.parent / "shared_pkgs"
+    (outside / "tiny_pkg").mkdir(parents=True)
+    kept = outside / "tiny_pkg" / "kept.sql"
+    kept.write_text("hand edit\n")
+    config = yaml.safe_load((project / "dbt_project.yml").read_text())
+    config["packages-install-path"] = (
+        str(outside)
+        if spelling == "absolute"
+        else f"{'../' * 40}{outside.relative_to('/')}"
+    )
+    (project / "dbt_project.yml").write_text(yaml.safe_dump(config, sort_keys=False))
+
+    built = _build(capsys, "--cold-deps")
+
+    assert built["status"] == "error"
+    cold = built["data"]["cold_verification"]
+    assert cold["reinstalled"] is False
+    assert "packages-install-path" in cold["reason"]
+    assert kept.read_text() == "hand edit\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["tiny_pkg"]
+    assert not (project / "dev.duckdb").exists()
+
+
 def test_a_relative_local_package_keeps_the_lockfile_of_the_others(
     tmp_path, monkeypatch, capsys
 ):
