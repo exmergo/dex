@@ -350,7 +350,7 @@ def plan(
         # The secret-guard runs first, so an inlined credential is never handed
         # to the dbt subprocess.
         from ..dbt_project import load as load_project
-        from .build import shadow_parse
+        from .build import assert_packages_installed, shadow_parse
         from .validate import assert_profiles_safe
 
         project = engine.project_dir()
@@ -393,6 +393,13 @@ def plan(
             elif blocker := _unparseable_reason(view, edits):
                 parse_result = {"available": False, "reason": blocker}
             else:
+                # dbt refuses to parse a project whose declared packages are not
+                # installed, and its message names raw `dbt deps`. Refuse first
+                # with the verb this project has; plan installs nothing because
+                # deps can reach the network. An installed git package whose
+                # directory name dex cannot know is not a reason to refuse the
+                # whole plan: the parse either runs or degrades to a warning.
+                assert_packages_installed(project, unverifiable_is_fatal=False)
                 parse_result = shadow_parse(
                     project, edits, target=engine.config.dbt_target
                 )

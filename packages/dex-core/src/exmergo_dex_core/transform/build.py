@@ -1029,7 +1029,26 @@ class DeclaredPackage(BaseModel):
     install_name: str | None = None
 
     def describe(self) -> str:
-        return f"{self.name}@{self.version}" if self.version else self.name
+        name = _without_userinfo(self.name)
+        return f"{name}@{self.version}" if self.version else name
+
+
+def _without_userinfo(value: str) -> str:
+    """Drop credentials from a URL before it is named in an error.
+
+    ``https://TOKEN@github.com/org/repo.git`` is a valid git package, and a
+    caller who can run a plan can read its refusal. Keep the host and path so
+    the message still names the package, but never the token; ``git@host:path``
+    is a user name, not a secret, and has no ``://``.
+    """
+
+    if "://" not in value:
+        return value
+    scheme, rest = value.split("://", 1)
+    authority, separator, tail = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[-1]
+    return f"{scheme}://{authority}{separator}{tail}"
 
 
 def _package_entries(project: Path) -> list[dict[str, Any]]:
@@ -1106,8 +1125,31 @@ def _version_text(value: Any) -> str | None:
     return str(value)
 
 
+def package_install_dir(project_dir: Path | str) -> Path:
+    """Where dbt installs declared packages, honoring ``packages-install-path``.
+
+    dbt defaults to ``dbt_packages/`` beside the project; a project may move it.
+    Checking the default unconditionally would refuse a project whose packages
+    are installed where dbt was told to put them.
+    """
+
+    project = Path(project_dir)
+    configured: str | None = None
+    config = project / "dbt_project.yml"
+    if config.is_file():
+        try:
+            parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("packages-install-path")
+            if isinstance(value, str) and value.strip():
+                configured = value.strip()
+    return project / (configured or "dbt_packages")
+
+
 def installed_packages(project_dir: Path | str) -> set[str]:
-    """What is actually in ``dbt_packages/``, by directory and by declared name.
+    """What is actually in the package directory, by directory and by declared name.
 
     Both, because dbt installs a hub package into a directory named after the
     package's second segment while the package's own ``dbt_project.yml`` may say
@@ -1116,7 +1158,7 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     """
 
     installed: set[str] = set()
-    root = Path(project_dir) / "dbt_packages"
+    root = package_install_dir(project_dir)
     if not root.is_dir():
         return installed
     for child in root.iterdir():
@@ -1204,18 +1246,56 @@ class MissingPackagesError(PrerequisiteError):
         )
 
 
-def assert_packages_installed(project_dir: Path | str) -> None:
+def assert_packages_installed(
+    project_dir: Path | str, *, unverifiable_is_fatal: bool = True
+) -> None:
     """Check every declaration, even when some packages are already installed.
 
     REFUSE cannot establish an installation whose declared name is unknown;
     report that uncertainty instead of admitting it as an installed package.
-    The interactive installation heuristic remains separate.
+    The interactive installation heuristic remains separate. A caller that
+    only needs to know whether something declared is *missing* (a plan, which
+    still runs schema checks when dbt cannot parse) passes
+    ``unverifiable_is_fatal=False``: a git package's directory name is not
+    determined by its URL, so refusing on it would refuse the whole project.
     """
 
     missing = missing_packages(project_dir)
     unverifiable = unverifiable_packages(project_dir)
-    if missing or unverifiable or needs_deps(project_dir):
-        raise MissingPackagesError(missing, unverifiable)
+    shortfall = has_package_shortfall(project_dir)
+    if (
+        missing
+        or (unverifiable_is_fatal and unverifiable)
+        or needs_deps(project_dir)
+        or shortfall
+    ):
+        # A count shortfall is a definite absence somewhere, so the packages dex
+        # could not check are worth naming even when the caller tolerates an
+        # unverifiable installation on its own.
+        raise MissingPackagesError(
+            missing, unverifiable if (unverifiable_is_fatal or shortfall) else []
+        )
+
+
+def has_package_shortfall(project_dir: Path | str) -> bool:
+    """True when fewer packages are installed than the project declares.
+
+    A git declaration's install directory name is unknown, so it can never be
+    named as missing and a partly installed project would otherwise look
+    complete. The count needs no name: every declaration installs into one
+    directory of its own, so an installation that is missing one of them cannot
+    reach the number of declarations.
+    """
+
+    project = Path(project_dir)
+    declared = declared_packages(project)
+    if not declared:
+        return False
+    root = package_install_dir(project)
+    if not root.is_dir():
+        return False
+    installed = sum(1 for child in root.iterdir() if child.is_dir())
+    return installed < len(declared)
 
 
 def needs_deps(project_dir: Path | str) -> bool:
@@ -1226,8 +1306,8 @@ def needs_deps(project_dir: Path | str) -> bool:
     project = Path(project_dir)
     if not has_package_spec(project):
         return False
-    packages_dir = project / "dbt_packages"
-    return not packages_dir.is_dir() or not any(packages_dir.iterdir())
+    install_dir = package_install_dir(project)
+    return not install_dir.is_dir() or not any(install_dir.iterdir())
 
 
 def deps(
@@ -1258,11 +1338,11 @@ def deps(
     messages: list[str] = []
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
-    packages_dir = project / "dbt_packages"
+    install_dir = package_install_dir(project)
     return {
         "success": completed.returncode == 0,
         "returncode": completed.returncode,
-        "packages_dir_exists": packages_dir.is_dir() and any(packages_dir.iterdir()),
+        "packages_dir_exists": install_dir.is_dir() and any(install_dir.iterdir()),
         "messages": messages,
     }
 
