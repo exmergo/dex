@@ -958,7 +958,7 @@ def declaration_models(documents: Mapping[str, str]) -> dict[str, set[str]]:
     """Each SLayer model in ``documents`` to the columns it exposes (#1030)."""
 
     out: dict[str, set[str]] = {}
-    for _path, entry in _parsed(documents).items():
+    for entry in _parsed(documents).values():
         name = entry.get("name")
         if not isinstance(name, str):
             continue
@@ -966,8 +966,5 @@ def declaration_models(documents: Mapping[str, str]) -> dict[str, set[str]]:
         for column in entry.get("columns") or []:
             if isinstance(column, dict) and isinstance(column.get("name"), str):
                 cols.add(column["name"].lower())
-        for measure in entry.get("measures") or []:
-            if isinstance(measure, dict) and isinstance(measure.get("name"), str):
-                cols.add(measure["name"].lower())
         out[name.lower()] = cols
     return out

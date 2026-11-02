@@ -309,7 +309,6 @@ class CubeSemanticLayer:
 
     # --- the derivation channel (#927, #911) -------------------------------------
 
-    
     def declaration_models(self, documents: dict[str, str]) -> dict[str, set[str]]:
         """Cubes in ``documents`` and the members each exposes (#1030)."""
 

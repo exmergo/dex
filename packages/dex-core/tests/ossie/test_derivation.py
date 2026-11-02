@@ -775,7 +775,37 @@ def test_a_population_parent_that_names_nothing_is_refused(
 
     assert rc != 0
     message = " ".join(envelope["errors"])
-    assert "population.parent" in message or "not_a_column" in message or "no_such_model" in message
+    assert "not_a_column" in message
+    assert _stored_plans(tmp_path) == []
+
+
+def test_a_population_parent_unknown_model_is_refused(
+    tmp_path: Path, capsys, no_warehouse
+):
+    put(tmp_path, COMMERCE, ORDERS_TEXT)
+    _configure(tmp_path, [COMMERCE])
+
+    rc, envelope = _ossie_plan(
+        tmp_path,
+        capsys,
+        {
+            "declarations": [
+                {
+                    "model": "orders",
+                    "population": {
+                        "parent": {
+                            "model": "no_such_model",
+                            "key": {"buyer": "x"},
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    assert rc != 0
+    message = " ".join(envelope["errors"])
+    assert "no_such_model" in message
     assert _stored_plans(tmp_path) == []
 
 

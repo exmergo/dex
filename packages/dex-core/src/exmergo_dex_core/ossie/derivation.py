@@ -1136,15 +1136,17 @@ def declaration_models(
     out: dict[str, set[str]] = {}
     for _path, data in _documents(documents):
         for dataset in data.get("datasets") or []:
-            if not isinstance(dataset, dict) or not isinstance(dataset.get("name"), str):
+            name = dataset.get("name") if isinstance(dataset, dict) else None
+            if not isinstance(name, str):
                 continue
             cols: set[str] = set()
             for field_ in dataset.get("fields") or []:
-                if not isinstance(field_, dict) or not isinstance(field_.get("name"), str):
+                field_name = field_.get("name") if isinstance(field_, dict) else None
+                if not isinstance(field_name, str):
                     continue
-                cols.add(field_["name"].lower())
+                cols.add(field_name.lower())
                 linked = catalog_mod._link(field_, connector, None)[3]
                 if isinstance(linked, str) and linked:
                     cols.add(linked.lower())
-            out[dataset["name"].lower()] = cols
+            out[name.lower()] = cols
     return out

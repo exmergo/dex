@@ -311,7 +311,6 @@ class SlayerSemanticLayer:
 
     # --- the derivation channel (#927) ------------------------------------------
 
-    
     def declaration_models(self, documents: dict[str, str]) -> dict[str, set[str]]:
         """SLayer models in ``documents`` and the columns each exposes (#1030)."""
 

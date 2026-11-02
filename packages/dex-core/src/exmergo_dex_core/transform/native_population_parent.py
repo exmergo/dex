@@ -3,7 +3,7 @@
 The dbt route checks a parent against the project in ``transform.declarations``.
 ``semantic ossie|slayer|cube`` only ran ``parse_declarations``, so a parent that
 named nothing was written into a reviewed document. This module is the one check
-the native route runs for every vendor: a parent must name the declared model’s
+the native route runs for every vendor: a parent must name the declared model's
 own columns, and either a model the layer (or the same payload) defines or a
 dbt model/seed/snapshot the project can resolve.
 """
@@ -23,7 +23,7 @@ def refuse_population_parents(
     inventory: Mapping[str, set[str]],
     engine: DexEngine,
 ) -> None:
-    """Raise ``ValueError`` naming the fix when any declaration’s parent is bad.
+    """Raise ``ValueError`` naming the fix when any declaration's parent is bad.
 
     ``inventory`` maps lowercased model/dataset/cube names to the lowercased
     column (or field/member) names each exposes in the prospective documents.
@@ -96,16 +96,16 @@ def _dbt_parent_resolvable(
     if engine.repo_root is None:
         return False
     try:
-        from ..dbt_project import find_project, load
+        from ..dbt_project import DbtProjectError, load
         from .declarations import _is_seed_or_snapshot, model_sql_path
         from .plans import select_columns
     except ImportError:
         return False
 
     try:
-        project_dir = find_project(engine.repo_root)
+        project_dir = engine.project_dir()
         view = load(project_dir)
-    except Exception:
+    except DbtProjectError:
         return False
 
     files = {path: source.content for path, source in view.files.items()}
