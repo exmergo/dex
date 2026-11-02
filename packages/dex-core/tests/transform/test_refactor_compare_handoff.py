@@ -17,11 +17,14 @@ left join, counting users and names separately, keeps the downstream result.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from tests.transform.test_transform_compare import _engine
 
+from exmergo_dex_core.transform import commands, refactor_compare
 from exmergo_dex_core.transform.artifact_runtime import (
     artifact_paths,
     readable_artifact_dir,
@@ -356,3 +359,23 @@ def test_blocked_parents_match_a_versioned_model_by_its_file_stem(dbt_project_di
     assert _blocked_parents(dbt_project_dir, "dim_customers_v2", {"int_rewritten"}) == [
         ("stg_customers", "error")
     ]
+
+
+def test_the_offered_command_quotes_a_model_name_the_shell_would_read(monkeypatch):
+    """The stem comes from a file name in the project, and the command is pasted."""
+
+    monkeypatch.setattr(
+        commands, "_record_refactor_models", lambda engine, plan_id, per_model: None
+    )
+    monkeypatch.setattr(
+        refactor_compare, "edited_existing_models", lambda edits, project: ["a;touch b"]
+    )
+    result = SimpleNamespace(plan_id="p1", row_attribution=[])
+    engine = SimpleNamespace(project_dir=Path)
+    commands._offer_refactor_comparison(engine, result, [])
+    offer = result.refactor_comparison_offer
+    assert offer["per_model"][0]["command"] == (
+        "transform compare p1 --model 'a;touch b'"
+    )
+    assert "--model 'a;touch b' " in offer["command"]
+    assert shlex.split(offer["per_model"][0]["command"])[-1] == "a;touch b"

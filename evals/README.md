@@ -179,10 +179,13 @@ starting state) and a `reference/` overlay (a correct answer).
   entries, since every implementation detail is not a decision.
 - **Procedure** (0 to 1, only on tasks that grade it, `-` otherwise): the share
   of the task's required procedure steps the agent took, in order, read from the
-  sequence of its Dex calls (`Session.dex_sequence`). `compare_before_apply`
-  passes when a `transform compare` comes before the last `transform apply`
-  (a prerequisite repair is its own earlier apply); comparing only after every
-  apply is a miss, since the baseline is gone. Plan ids are not read.
+  sequence of its Dex calls (`Session.dex_calls`). `compare_before_apply`
+  passes when a usable `transform compare` of the plan the last `transform apply`
+  wrote comes before that apply (a prerequisite repair is its own earlier apply);
+  comparing only after every apply is a miss, since the baseline is gone. Where
+  both calls name a plan the ids must match, and where either does not, no other
+  apply may sit between them. `not_checked` and a comparison that never ran are
+  not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
   `build_after_apply` passes when a `transform build` follows the last apply. A
   step a task does not require is never graded, so comparing an intentional
   change costs nothing. A reference run has no session and reports none. One

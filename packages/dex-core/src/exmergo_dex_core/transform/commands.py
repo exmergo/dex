@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -752,7 +753,9 @@ def _offer_refactor_comparison(
             {
                 "model": model,
                 "static_attribution": static,
-                "command": f"transform compare {result.plan_id} --model {model}",
+                "command": (
+                    f"transform compare {result.plan_id} --model {shlex.quote(model)}"
+                ),
             }
         )
     recommended = any(m["static_attribution"] != "attributed" for m in per_model)
@@ -771,7 +774,7 @@ def _offer_refactor_comparison(
         "per_model": per_model,
         "models": ordered,
         "command": (
-            f"transform compare {result.plan_id} --model {ordered[0]} "
+            f"transform compare {result.plan_id} --model {shlex.quote(ordered[0])} "
             "[--map old=new] [--key column]"
         ),
     }

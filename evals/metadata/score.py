@@ -410,12 +410,26 @@ def attribution(decl: Declared, truth: dict[str, Any] | None) -> dict[str, Any] 
 
 
 #: Procedure steps graded from the order of the agent's Dex calls (#1049, #855).
-#: Each reads ``Session.dex_sequence``; none reads what a command returned.
+#: Each reads ``Session.dex_calls``, in the order the agent made them.
 PROCEDURE_STEPS = ("compare_before_apply", "build_after_apply")
 
 
+def _compared_the_apply(
+    calls: list[dict[str, Any]], compare: int, applies: list[int]
+) -> bool:
+    """Whether the comparison at ``compare`` is a usable one of the last apply."""
+
+    last = applies[-1]
+    if compare > last or calls[compare].get("verdict") in ("not_checked", "not_run"):
+        return False
+    compared, applied = calls[compare].get("plan"), calls[last].get("plan")
+    if compared and applied:
+        return compared == applied
+    return not any(compare < i < last for i in applies)
+
+
 def procedure_steps(
-    truth: dict[str, Any] | None, sequence: list[str] | None
+    truth: dict[str, Any] | None, calls: list[dict[str, Any]] | None
 ) -> dict[str, Any] | None:
     """Whether the agent took the procedure steps the task requires, in order.
 
@@ -425,26 +439,30 @@ def procedure_steps(
     the task grades no step, or when there is no session to read (a reference
     run), so neither is averaged in as a pass.
 
-    - ``compare_before_apply``: a ``transform compare`` precedes the last
-      ``transform apply``. The last, not the first: repairing a prerequisite is
-      its own plan and apply, and the refactor's comparison rightly follows it.
-      A comparison after every apply is a miss, since the baseline is gone.
-      Plan ids are not read, so a comparison of one plan before the apply of
-      another also passes; one trial per task cannot carry finer grading.
+    - ``compare_before_apply``: a comparison of the plan the last
+      ``transform apply`` wrote precedes that apply and came back usable. The
+      last, not the first: repairing a prerequisite is its own plan and apply,
+      and the refactor's comparison rightly follows it. A comparison after every
+      apply is a miss, since the baseline is gone. Where both calls name a plan
+      the ids must match; where either does not (no id, ``$PLAN``), no other
+      apply may sit between them, since an apply changes what the comparison
+      read. ``not_checked`` and a comparison that never ran are not usable; a
+      verdict the agent's own pipe hid is given the benefit of the doubt.
     - ``build_after_apply``: a ``transform build`` follows the last
       ``transform apply``, so the applied change is what was built.
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
-    if not required or sequence is None:
+    if not required or calls is None:
         return None
-    applies = [i for i, label in enumerate(sequence) if label == "transform apply"]
-    compares = [i for i, label in enumerate(sequence) if label == "transform compare"]
-    builds = [i for i, label in enumerate(sequence) if label == "transform build"]
+    labels = [call["label"] for call in calls]
+    applies = [i for i, label in enumerate(labels) if label == "transform apply"]
+    compares = [i for i, label in enumerate(labels) if label == "transform compare"]
+    builds = [i for i, label in enumerate(labels) if label == "transform build"]
     results: dict[str, bool] = {}
     if "compare_before_apply" in required:
         results["compare_before_apply"] = bool(applies) and any(
-            i < applies[-1] for i in compares
+            _compared_the_apply(calls, i, applies) for i in compares
         )
     if "build_after_apply" in required:
         results["build_after_apply"] = bool(applies) and any(
@@ -487,10 +505,10 @@ def score_workspace(
     task: Task,
     fixture: Fixture,
     workspace: Path,
-    sequence: list[str] | None = None,
+    calls: list[dict[str, Any]] | None = None,
 ) -> TaskScore:
     score = _score_workspace(task, fixture, workspace)
-    graded = procedure_steps(task.truth.get("procedure"), sequence)
+    graded = procedure_steps(task.truth.get("procedure"), calls)
     if graded is not None:
         score.procedure = graded["score"]
         score.procedure_steps = graded["steps"]

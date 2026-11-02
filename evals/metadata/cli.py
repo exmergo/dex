@@ -212,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             task,
             fixture,
             workspace,
-            sequence=row["session"]["dex_sequence"] if live else None,
+            calls=row["session"]["dex_calls"] if live else None,
         ).to_dict()
         report["results"].append(row)
 

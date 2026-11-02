@@ -119,6 +119,10 @@ class Session:
     #: The same calls in the order the agent made them, which is what a
     #: procedure step such as "compare before apply" is graded on (#1049).
     dex_sequence: list[str] = field(default_factory=list)
+    #: The same calls with what the transcript shows about each: ``label``,
+    #: ``plan`` (the literal id named, or ``None``) and, on a comparison,
+    #: ``verdict`` (see ``_compare_verdict``). A procedure step reads these.
+    dex_calls: list[dict[str, Any]] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
 
@@ -167,10 +171,8 @@ def _alias_call(name: str) -> re.Pattern:
 
 
 def _quoted_spans(command: str) -> list[tuple[int, int]]:
-    """Half-open [start, end) spans of single- and double-quoted text. Quoted
-    alias text is data, not an invocation — `echo "R transform apply"` never
-    runs R. Matches inside `$(...)` and wrapper bodies stay counted: those run
-    when the command does."""
+    """Half-open [start, end) spans of single- and double-quoted text."""
+
     spans: list[tuple[int, int]] = []
     quote: str | None = None
     start = 0
@@ -190,13 +192,75 @@ def _quoted_spans(command: str) -> list[tuple[int, int]]:
     return spans
 
 
+# The shells' own way of running a quoted string: `bash -c "..."`, `eval "..."`.
+_RUNS_ITS_ARGUMENT = re.compile(
+    r"(?:\b(?:ba|da|k|z)?sh\s+(?:-\w+\s+)*-\w*c|\beval)\s+$"
+)
+
+
+def _is_quoted_data(
+    command: str, start: int, end: int, quoted: list[tuple[int, int]]
+) -> bool:
+    """Whether a match is text rather than a call: `echo "dex transform apply"`
+    runs nothing. A match has to sit wholly inside the quotes, since a quoted
+    path (`"/x/run.py" transform apply`) is a call, and a quoted string the
+    shell runs stays counted: `"$(dex ...)"`, `bash -c "dex ..."`."""
+
+    for begin, stop in quoted:
+        if begin <= start and end <= stop:
+            before = command[begin:start]
+            if command[begin] == '"' and before.count("$(") > before.count(")"):
+                return False
+            return not _RUNS_ITS_ARGUMENT.search(command[:begin])
+    return False
+
+
+# A literal plan id. `$PLAN`, a flag or a redirect names none this can read.
+_PLAN_ARGUMENT = re.compile(r"\s+(\w[\w.-]*)")
+_STATUS = re.compile(r'"status"\s*:\s*"(\w+)"')
+_VERDICTS = ("equivalent", "different", "not_checked")
+
+
+def _result_text(block: dict[str, Any]) -> str:
+    content = block.get("content")
+    if isinstance(content, list):
+        return "\n".join(str(part.get("text") or "") for part in content)
+    return str(content or "")
+
+
+def _compare_verdict(block: dict[str, Any]) -> str | None:
+    """What one comparison returned: a verdict, ``not_run`` when the command
+    came back without one (an error, a cost handshake), or ``None`` when the
+    agent's own pipe left nothing to read."""
+
+    text = _result_text(block)
+    statuses = _STATUS.findall(text)
+    for status in statuses:
+        if status in _VERDICTS:
+            return status
+    if text.strip().strip('"') in _VERDICTS:
+        return text.strip().strip('"')
+    if block.get("is_error") or {"error", "needs_confirmation"} & set(statuses):
+        return "not_run"
+    return None
+
+
 def summarize(
     events: list[dict[str, Any]], session: Session, plugin_dir: Path = REPO
 ) -> Session:
     skills: list[str] = []
     commands: dict[str, int] = {}
     sequence: list[str] = []
+    calls: list[dict[str, Any]] = []
+    pending_compares: dict[str, dict[str, Any]] = {}
     for event in events:
+        if event.get("type") == "user":
+            content = (event.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if block.get("type") == "tool_result":
+                    call = pending_compares.pop(str(block.get("tool_use_id")), None)
+                    if call is not None:
+                        call["verdict"] = _compare_verdict(block)
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
             session.model = event.get("model")
@@ -215,19 +279,37 @@ def summarize(
                         _alias_call(name) for name in _aliases(command)
                     ]
                     quoted = _quoted_spans(command)
-                    found: list[tuple[int, str]] = []
+                    found: list[tuple[int, dict[str, Any]]] = []
                     for pattern in patterns:
                         for match in pattern.finditer(command):
-                            if pattern is not _DEX_CALL and any(
-                                begin <= match.start() < end for begin, end in quoted
+                            if _is_quoted_data(
+                                command, match.start(), match.end(), quoted
                             ):
                                 continue
                             group, sub = match.group(1), match.group(2)
                             label = f"{group} {sub}" if sub else group
                             commands[label] = commands.get(label, 0) + 1
-                            found.append((match.start(), label))
+                            plan = _PLAN_ARGUMENT.match(command, match.end())
+                            found.append(
+                                (
+                                    match.start(),
+                                    {
+                                        "label": label,
+                                        "plan": plan.group(1) if plan else None,
+                                        "verdict": None,
+                                    },
+                                )
+                            )
                     # Within one command string, in the order the shell runs them.
-                    sequence.extend(label for _, label in sorted(found))
+                    ordered = [call for _, call in sorted(found, key=lambda f: f[0])]
+                    sequence.extend(call["label"] for call in ordered)
+                    calls.extend(ordered)
+                    # One result cannot be split between two comparisons.
+                    compares = [
+                        call for call in ordered if call["label"] == "transform compare"
+                    ]
+                    if len(compares) == 1 and block.get("id"):
+                        pending_compares[str(block["id"])] = compares[0]
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")
@@ -236,6 +318,7 @@ def summarize(
     session.skills_triggered = skills
     session.dex_commands = commands
     session.dex_sequence = sequence
+    session.dex_calls = calls
     dex_plugins = [p for p in session.plugins if "dex" in str(p.get("name", ""))]
     session.candidate_plugin_loaded = bool(dex_plugins) and all(
         Path(str(p.get("path", ""))).resolve() == plugin_dir.resolve()
