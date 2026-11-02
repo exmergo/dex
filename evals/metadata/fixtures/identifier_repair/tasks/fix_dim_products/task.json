@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "dim_products"
+  ],
+  "prompt": "The project is broken: `dim_products` does not build. Fix it and rebuild it on dev."
+}

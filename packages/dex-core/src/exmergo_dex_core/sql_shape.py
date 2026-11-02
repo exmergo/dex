@@ -34,6 +34,8 @@ from dataclasses import dataclass
 
 from sqlglot import expressions as exp
 
+from .errors import DexError
+
 #: Name given to the outermost select, so it can key a scope map beside the
 #: CTEs without colliding with a real CTE name.
 MAIN_SCOPE = "(final select)"
@@ -405,3 +407,237 @@ def names_a_cte(node: exp.Expression, ctes: set[str]) -> bool:
     """
 
     return isinstance(node, exp.Table) and node.name.lower() in ctes
+
+
+# --- identifier conversions (#861) ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class KeyStep:
+    """One step of a conversion applied to an identifier column.
+
+    ``kind`` is ``cast`` (fails the statement on a value it cannot convert),
+    ``try_cast`` (turns that value into NULL: ``TRY_CAST``, BigQuery's
+    ``SAFE_CAST``, Snowflake's ``TRY_TO_NUMBER``) or ``normalization`` (a
+    lexical rewrite: ``lower``, ``upper``, ``trim``, ``ltrim``, ``rtrim``).
+    ``name`` is how the step reads, and ``target_type`` the type a cast
+    converts to, rendered as written.
+    """
+
+    kind: str
+    name: str
+    target_type: str | None = None
+
+    def label(self) -> str:
+        return f"{self.name}({self.target_type})" if self.target_type else self.name
+
+
+def key_step(node: exp.Expression) -> KeyStep | None:
+    """The conversion ``node`` applies to its own ``this``, or None.
+
+    Only steps whose effect on identity can be measured with an aggregate are
+    recognized. Anything else (``regexp_replace``, ``concat``, a ``CASE``) is a
+    rewrite whose meaning dex does not claim to know, and a caller reports it
+    as unsupported rather than guessing.
+    """
+
+    if isinstance(node, exp.Cast):
+        to = node.args.get("to")
+        target = to.sql() if to is not None else None
+        safe = isinstance(node, exp.TryCast) or bool(node.args.get("safe"))
+        return KeyStep(
+            "try_cast" if safe else "cast", "try_cast" if safe else "cast", target
+        )
+    if isinstance(node, exp.ToNumber) and not node.args.get("format"):
+        safe = bool(node.args.get("safe"))
+        return KeyStep("try_cast" if safe else "cast", "to_number", "NUMBER")
+    if isinstance(node, exp.Lower):
+        return KeyStep("normalization", "lower")
+    if isinstance(node, exp.Upper):
+        return KeyStep("normalization", "upper")
+    if isinstance(node, exp.Trim):
+        position = str(node.args.get("position") or "").upper()
+        name = {"LEADING": "ltrim", "TRAILING": "rtrim"}.get(position, "trim")
+        return KeyStep("normalization", name)
+    return None
+
+
+def peel_key_conversion(
+    node: exp.Expression | None,
+) -> tuple[exp.Column, tuple[KeyStep, ...]] | None:
+    """The column a chain of recognized conversions is applied to, and the
+    chain outermost first; None for a bare column or anything else.
+
+    ``CAST(LOWER(TRIM(k)) AS INT)`` peels to ``k`` with three steps. A chain
+    broken by a step dex does not recognize returns None, and
+    :func:`wraps_one_column` is how a caller tells that apart from an
+    expression that is no conversion at all.
+    """
+
+    steps: list[KeyStep] = []
+    current = node
+    while current is not None and not isinstance(current, exp.Column):
+        if isinstance(current, exp.Paren):
+            current = current.this
+            continue
+        step = key_step(current)
+        if step is None:
+            return None
+        steps.append(step)
+        current = current.this
+    if current is None or not steps:
+        return None
+    return current, tuple(steps)
+
+
+def wraps_one_column(node: exp.Expression | None) -> exp.Column | None:
+    """The one column an expression reads, when it reads exactly one and is not
+    that bare column itself: the shape of a rewrite applied to an identifier."""
+
+    if node is None or isinstance(node, exp.Column):
+        return None
+    columns = {match_key(c): c for c in node.find_all(exp.Column)}
+    if len(columns) != 1:
+        return None
+    return next(iter(columns.values()))
+
+
+def conjunctive_conversion_pairs(
+    on: exp.Expression | None,
+) -> list[tuple[exp.Column, exp.Column, exp.Expression, exp.Expression]] | None:
+    """:func:`conjunctive_equality_pairs`, with each side allowed to be a
+    recognized conversion of a column (:func:`peel_key_conversion`) as well as
+    the bare column: ``TRY_CAST(a.k AS INT) = b.k`` is a key equality whose
+    left key is converted (#861).
+
+    Each entry is ``(left_column, right_column, left_side, right_side)``, the
+    sides as written. ``None`` on the same terms as the bare version: the moment
+    any top-level conjunct is not such an equality, so no subset of a condition
+    is ever probed as though it were the whole key.
+    """
+
+    if on is None:
+        return None
+    pairs = []
+    for conjunct in _flatten_and(on):
+        if isinstance(conjunct, exp.Paren):
+            conjunct = conjunct.this
+        if not isinstance(conjunct, exp.EQ):
+            return None
+        sides = []
+        for side in (conjunct.this, conjunct.expression):
+            if isinstance(side, exp.Column):
+                sides.append(side)
+                continue
+            peeled = peel_key_conversion(side)
+            if peeled is None:
+                return None
+            sides.append(peeled[0])
+        pairs.append((sides[0], sides[1], conjunct.this, conjunct.expression))
+    return pairs or None
+
+
+def rewrites_a_key(on: exp.Expression | None) -> bool:
+    """Whether an ON equates a column with a rewrite of one column that is not a
+    conversion dex can measure (``regexp_replace(a.k, ...) = b.k``)."""
+
+    if on is None:
+        return False
+    for conjunct in _flatten_and(on):
+        if isinstance(conjunct, exp.Paren):
+            conjunct = conjunct.this
+        if not isinstance(conjunct, exp.EQ):
+            continue
+        for side in (conjunct.this, conjunct.expression):
+            if (
+                not isinstance(side, exp.Column)
+                and peel_key_conversion(side) is None
+                and wraps_one_column(side) is not None
+            ):
+                return True
+    return False
+
+
+def measuring_key_template(side: exp.Expression, column: exp.Column) -> str | None:
+    """A conversion as a DuckDB-dialect template with ``{}`` where its column
+    goes, for a probe to apply to whatever reference it reads the column by.
+
+    ``None`` for a bare column. Every hard cast is made safe, so a value the
+    authored cast would reject is counted as a failed conversion rather than
+    failing the probe.
+    """
+
+    if side is column:
+        return None
+    copy = side.copy()
+    placeholder = "dex_key_placeholder"
+    for node in list(copy.find_all(exp.Column)):
+        if match_key(node) == match_key(column):
+            node.replace(exp.column(placeholder))
+    for cast in list(copy.find_all(exp.Cast)):
+        if isinstance(cast, exp.TryCast) or cast.args.get("safe"):
+            continue
+        safe = exp.TryCast(this=cast.this, to=cast.args.get("to"))
+        if cast is copy:
+            copy = safe
+        else:
+            cast.replace(safe)
+    if isinstance(copy, exp.ToNumber):
+        copy.set("safe", True)
+    rendered = copy.sql(dialect="duckdb").replace("{", "{{").replace("}", "}}")
+    return rendered.replace(placeholder, "{}")
+
+
+class NoSafeCastError(DexError, ValueError):
+    """The dialect has no cast that returns NULL instead of failing.
+
+    Control flow: every caller turns it into an ``unchecked`` record with
+    ``reason_code: no_safe_cast_on_connector``."""
+
+
+#: Dialects with no safe cast at all: a probe that has to count the values a
+#: cast rejects cannot be written there, so it is reported unchecked rather
+#: than run as a cast that fails on the first such value.
+NO_SAFE_CAST = frozenset({"postgres"})
+
+
+def dialect_safe_cast(node: exp.Expression, dialect: str) -> exp.Expression:
+    """``node`` (a ``TryCast``) as a cast that returns NULL on ``dialect``.
+
+    sqlglot renders a ``TryCast`` it did not parse from Snowflake as a plain
+    ``CAST`` there, and as a ``CAST`` to a ``Nullable`` type on ClickHouse, and
+    both throw on a value they cannot convert. That is a failed probe, and a
+    warehouse message quoting the value. Snowflake's ``TRY_CAST`` also takes
+    only text, so the input is cast to text first.
+    """
+
+    if not isinstance(node, exp.TryCast):
+        return node
+    if dialect in NO_SAFE_CAST:
+        raise NoSafeCastError(dialect)
+    to = node.args.get("to")
+    if dialect == "snowflake" and node.args.get("requires_string"):
+        return node  # parsed from Snowflake: already its own TRY_CAST
+    if dialect == "snowflake":
+        text = exp.Cast(this=node.this.copy(), to=exp.DataType.build("varchar"))
+        return exp.TryCast(this=text, to=to.copy(), requires_string=True)
+    if dialect == "clickhouse":
+        return exp.Anonymous(
+            this="accurateCastOrNull",
+            expressions=[node.this.copy(), exp.Literal.string(_clickhouse_type(to))],
+        )
+    return node
+
+
+def with_safe_casts(tree: exp.Expression, dialect: str) -> exp.Expression:
+    """Every ``TryCast`` in ``tree`` made safe on ``dialect`` (see
+    :func:`dialect_safe_cast`); raises :class:`NoSafeCastError` where none is."""
+
+    return tree.transform(lambda node: dialect_safe_cast(node, dialect))
+
+
+def _clickhouse_type(to: exp.Expression) -> str:
+    rendered = to.sql("clickhouse")
+    if rendered.startswith("Nullable(") and rendered.endswith(")"):
+        return rendered[len("Nullable(") : -1]
+    return rendered

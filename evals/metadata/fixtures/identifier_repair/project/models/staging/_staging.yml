@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: stg_products
+    description: One row per product still sold; retired products are left out.
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]
+  - name: stg_product_prices
+    description: One row per priced product, keyed by integer catalogue id.
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]

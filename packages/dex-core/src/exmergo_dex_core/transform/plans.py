@@ -113,6 +113,12 @@ class TransformPlan(BaseModel):
     # about the plan rather than part of it: the portable document and its
     # digest carry the edits alone, so recording a verdict moves no digest.
     comparisons: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Per model, the identifier conversions the plan adds and what each did to
+    # the model's entities when planned (#861): status, reason_code, column and
+    # the conversion as authored. Bookkeeping like `comparisons`, outside the
+    # digest, so a `--for-plan` build can carry an undeclared loss or an
+    # unchecked conversion into its completion obligations.
+    identifier_conversions: dict[str, list[dict[str, Any]]] | None = None
 
 
 def contained_key(rel_path: str, surface: list[str]) -> str:

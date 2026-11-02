@@ -736,7 +736,28 @@ def profile_findings(
                     )
                 )
 
+    # A key that mixes value shapes (#861) is already said in prose; it is
+    # restated here under a code a diagnostic can match, so `transform plan`
+    # can cite it beside a conversion of that column without parsing prose
+    # anywhere but here, next to the sentence's only author.
+    names = {col.name for col in dataset.columns}
+    for note in dataset.data_quality:
+        match = _MIXED_SHAPES.match(note)
+        if match is not None and match.group(1) in names:
+            findings.append(
+                ProfileFinding(
+                    column=match.group(1),
+                    code="mixed_identifier_shapes",
+                    severity="low",
+                    detail=note,
+                )
+            )
+
     return sorted(findings, key=lambda f: _FINDING_SEVERITY_RANK[f.severity])
+
+
+#: The sentence `explore.profile._heterogeneous_key_note` writes.
+_MIXED_SHAPES = re.compile(r"^(\S+) is a candidate key but mixes value shapes: ")
 
 
 def key_evidence(dataset: Dataset) -> list[KeyEvidence]:
@@ -1267,14 +1288,23 @@ def _is_clickhouse_supertype_refusal(adapter: Adapter, exc: Exception) -> bool:
     return adapter.dialect == "clickhouse" and "no supertype" in str(exc).lower()
 
 
-def _refusal_text(rel: Relationship, exc: Exception) -> str:
+def _refusal_text(rel: Relationship, exc: Exception, *, withhold: bool = False) -> str:
+    """Why an edge went unmeasured. ``withhold`` drops the warehouse's words,
+    for a probe that converts a key: a failed cast quotes the value (#861)."""
+
     edge = (
         f"{rel.from_dataset}.{rel.from_columns[0]} -> "
         f"{rel.to_dataset}.{rel.to_columns[0]}"
     )
+    said = (
+        f"{type(exc).__name__}; the warehouse's message is withheld because it "
+        "can quote a value"
+        if withhold
+        else str(exc)
+    )
     return (
         f"{edge} could not be probed: the warehouse refused the probe "
-        f"statement ({exc}); the edge stays unverified"
+        f"statement ({said}); the edge stays unverified"
     )
 
 
@@ -1339,6 +1369,13 @@ def _transpile_probe(sql: str, dialect: str) -> str:
         return sql
     import sqlglot
 
+    from .. import sql_shape
+
+    if "TRY_CAST" in sql.upper():
+        # A join's own key conversion (#861): made safe per dialect, since
+        # sqlglot renders a safe cast as a failing CAST on some of them.
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        return sql_shape.with_safe_casts(tree, dialect).sql(dialect=dialect)
     return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
 
 
@@ -1380,10 +1417,24 @@ class JoinCoverageCounts(NamedTuple):
     matched_rows: int
     eligible_keys: int
     matched_keys: int
+    #: Non-NULL child keys the join's own conversion turns into NULL (#861):
+    #: eligible, never matched, and counted apart. None where the join
+    #: converts no child key.
+    conversion_failed_rows: int | None = None
+    conversion_failed_keys: int | None = None
+
+
+#: Per relationship (by ``id``), the conversion each side applies to each key
+#: column before comparing: a DuckDB template with ``{}`` for the column, or
+#: None for the bare column (#861).
+KeyExprs = dict[int, tuple[tuple[str | None, ...], tuple[str | None, ...]]]
 
 
 def coverage_probe_sql(
-    batch: list[Relationship], *, key_cast: str | None = None
+    batch: list[Relationship],
+    *,
+    key_cast: str | None = None,
+    key_exprs: KeyExprs | None = None,
 ) -> str:
     """One aggregate statement measuring every edge of ``batch``'s coverage.
 
@@ -1399,10 +1450,18 @@ def coverage_probe_sql(
 
     Every subquery is an ungrouped aggregate over exactly one row, so they are
     cross-joined into one row. No value is projected anywhere.
+
+    ``key_exprs`` applies a join's own key conversion (``TRY_CAST(k AS INT)``)
+    on the side that writes it (#861). The NULL test stays on the raw key, so
+    a key the conversion fails on is eligible and unmatched, and is counted
+    apart as a failed conversion.
     """
 
     def _cast_key(expr: str) -> str:
         return expr if key_cast is None else f"CAST({expr} AS {key_cast})"
+
+    def _apply(template: str | None, expr: str) -> str:
+        return expr if template is None else template.format(expr)
 
     by_child: dict[str, list[tuple[int, Relationship]]] = {}
     for index, rel in enumerate(batch):
@@ -1416,14 +1475,23 @@ def coverage_probe_sql(
         for index, rel in edges:
             fks = [_quote_part(column) for column in rel.from_columns]
             keys = [_quote_part(column) for column in rel.to_columns]
+            from_exprs, to_exprs = (key_exprs or {}).get(id(rel), ((), ()))
+            from_exprs = tuple(from_exprs) or (None,) * len(fks)
+            to_exprs = tuple(to_exprs) or (None,) * len(keys)
             parent = _quote_identifier(rel.to_dataset)
             nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
             parent_keys = ", ".join(
-                f"{_cast_key(key)} AS pk{pair}" for pair, key in enumerate(keys)
+                f"{_cast_key(_apply(to_exprs[pair], key))} AS pk{pair}"
+                for pair, key in enumerate(keys)
             )
             predicate = " AND ".join(
-                f"d{index}.pk{pair} = {_cast_key(f'c.{fk}')}"
+                f"d{index}.pk{pair} = {_cast_key(_apply(from_exprs[pair], f'c.{fk}'))}"
                 for pair, fk in enumerate(fks)
+            )
+            failed = " OR ".join(
+                f"{_apply(template, f'c.{fk}')} IS NULL"
+                for fk, template in zip(fks, from_exprs, strict=False)
+                if template is not None
             )
             distinct_parent = (
                 f"(SELECT DISTINCT {parent_keys}, 1 AS dex_hit FROM {parent})"  # noqa: S608
@@ -1433,14 +1501,32 @@ def coverage_probe_sql(
                 f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS dex_cov_eligible_{index}, "
                 f"COUNT(CASE WHEN {nonnull} AND d{index}.dex_hit = 1 THEN 1 END) "
                 f"AS dex_cov_matched_{index}"
+                + (
+                    f", COUNT(CASE WHEN {nonnull} AND ({failed}) THEN 1 END) "
+                    f"AS dex_cov_failed_{index}"
+                    if failed
+                    else ""
+                )
             )
             joins.append(f"LEFT JOIN {distinct_parent} d{index} ON {predicate}")
             key_columns = ", ".join(f"c.{fk} AS k{pair}" for pair, fk in enumerate(fks))
+            failed_flag = (
+                f", CASE WHEN {failed} THEN 1 ELSE 0 END AS dex_failed"
+                if failed
+                else ""
+            )
             aggregates.append(
                 f"SELECT COUNT(*) AS dex_cov_keys_{index}, "  # noqa: S608
                 "COUNT(CASE WHEN h.dex_hit = 1 THEN 1 END) "
-                f"AS dex_cov_matched_keys_{index} "
-                f"FROM (SELECT DISTINCT {key_columns}, d{index}.dex_hit AS dex_hit "
+                f"AS dex_cov_matched_keys_{index}"
+                + (
+                    ", COUNT(CASE WHEN h.dex_failed = 1 THEN 1 END) "
+                    f"AS dex_cov_failed_keys_{index}"
+                    if failed
+                    else ""
+                )
+                + f" FROM (SELECT DISTINCT {key_columns}, d{index}.dex_hit AS dex_hit"  # noqa: S608
+                f"{failed_flag} "
                 f"FROM {child_sql} c LEFT JOIN {distinct_parent} d{index} "
                 f"ON {predicate} WHERE {nonnull}) h"
             )
@@ -1453,11 +1539,16 @@ def coverage_probe_sql(
     return f"SELECT * FROM {joined}"  # noqa: S608
 
 
-def coverage_statements(relationships: list[Relationship], dialect: str) -> list[str]:
+def coverage_statements(
+    relationships: list[Relationship],
+    dialect: str,
+    *,
+    key_exprs: KeyExprs | None = None,
+) -> list[str]:
     """The exact statements :func:`measure_coverage` runs, for pricing first."""
 
     return [
-        _transpile_probe(coverage_probe_sql(batch), dialect)
+        _transpile_probe(coverage_probe_sql(batch, key_exprs=key_exprs), dialect)
         for batch in probe_batches(probe_candidates(relationships))
     ]
 
@@ -1468,9 +1559,11 @@ def _run_coverage_batch(
     *,
     timeout_seconds: float,
     key_cast: str | None = None,
+    key_exprs: KeyExprs | None = None,
 ) -> list[tuple[Relationship, JoinCoverageCounts]]:
     sql = _transpile_probe(
-        coverage_probe_sql(batch, key_cast=key_cast), adapter.dialect
+        coverage_probe_sql(batch, key_cast=key_cast, key_exprs=key_exprs),
+        adapter.dialect,
     )
     result = adapter.run_query(
         sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
@@ -1482,6 +1575,9 @@ def _run_coverage_batch(
 
     def read(name: str) -> int:
         return int(values.get(name) or 0)
+
+    def maybe(name: str) -> int | None:
+        return int(values.get(name) or 0) if name in values else None
 
     measured = []
     for index, rel in enumerate(batch):
@@ -1497,6 +1593,8 @@ def _run_coverage_batch(
                     matched_rows=read(f"dex_cov_matched_{index}"),
                     eligible_keys=read(f"dex_cov_keys_{index}"),
                     matched_keys=read(f"dex_cov_matched_keys_{index}"),
+                    conversion_failed_rows=maybe(f"dex_cov_failed_{index}"),
+                    conversion_failed_keys=maybe(f"dex_cov_failed_keys_{index}"),
                 ),
             )
         )
@@ -1508,6 +1606,7 @@ def measure_coverage(
     relationships: list[Relationship],
     *,
     timeout_seconds: float = 30.0,
+    key_exprs: KeyExprs | None = None,
 ) -> tuple[
     list[tuple[Relationship, JoinCoverageCounts]], list[tuple[Relationship, str]]
 ]:
@@ -1524,7 +1623,9 @@ def measure_coverage(
     for batch in probe_batches(probe_candidates(relationships)):
         try:
             measured.extend(
-                _run_coverage_batch(adapter, batch, timeout_seconds=timeout_seconds)
+                _run_coverage_batch(
+                    adapter, batch, timeout_seconds=timeout_seconds, key_exprs=key_exprs
+                )
             )
             continue
         except WarehouseQueryError:
@@ -1532,12 +1633,24 @@ def measure_coverage(
         for rel in batch:
             try:
                 measured.extend(
-                    _run_coverage_batch(adapter, [rel], timeout_seconds=timeout_seconds)
+                    _run_coverage_batch(
+                        adapter,
+                        [rel],
+                        timeout_seconds=timeout_seconds,
+                        key_exprs=key_exprs,
+                    )
                 )
                 continue
             except WarehouseQueryError as exc:
                 if not _is_clickhouse_supertype_refusal(adapter, exc):
-                    refused.append((rel, _refusal_text(rel, exc)))
+                    refused.append(
+                        (
+                            rel,
+                            _refusal_text(
+                                rel, exc, withhold=id(rel) in (key_exprs or {})
+                            ),
+                        )
+                    )
                     continue
             try:
                 measured.extend(
@@ -1546,10 +1659,18 @@ def measure_coverage(
                         [rel],
                         timeout_seconds=timeout_seconds,
                         key_cast=_CLICKHOUSE_INT128,
+                        key_exprs=key_exprs,
                     )
                 )
             except WarehouseQueryError as cast_exc:
-                refused.append((rel, _refusal_text(rel, cast_exc)))
+                refused.append(
+                    (
+                        rel,
+                        _refusal_text(
+                            rel, cast_exc, withhold=id(rel) in (key_exprs or {})
+                        ),
+                    )
+                )
     return measured, refused
 
 

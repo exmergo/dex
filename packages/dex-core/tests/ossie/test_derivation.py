@@ -32,7 +32,9 @@ POPULATED = {
         "rule": "Paid and shipped orders",
         "filters": [{"column": "status", "includes": ["paid", "shipped"]}],
     },
-    "assumptions": [{"decision": "Refunds are separate", "evidence": "request"}],
+    "assumptions": [
+        {"decision": "Refunds are separate", "evidence": "request", "column": "status"}
+    ],
     "columns": {
         **MART["columns"],
         "order_total": {

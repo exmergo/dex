@@ -137,3 +137,87 @@ def plan_edit(tmp_path: Path):
         return payload
 
     return write
+
+
+# --- identifier conversions (#861) ---------------------------------------------
+#
+# Products keyed by text that mixes numeric-looking identifiers, a zero-padded
+# twin (`7` and `007`), opaque identifiers of a second scheme, two spellings of
+# one opaque identifier that only case separates, a hashed key on a retired
+# supplier that the model's own filter already excludes, and a NULL key. Prices
+# are keyed by integer, so the join between them is the one that breaks.
+PRODUCTS = [
+    ("7", "acme", "a@example.com", "anvil"),
+    ("007", "acme", "b@example.com", "anvil, boxed"),
+    ("12", "acme", "c@example.com", "rope"),
+    ("13", "acme", "d@example.com", "rocket"),
+    ("org_cedar", "cedar", "e@example.com", "plank"),
+    ("ORG_ELM", "elm", "f@example.com", "board"),
+    ("org_elm", "elm", "g@example.com", "board, oiled"),
+    ("f3a9c1d2e4", "retired", "h@example.com", "old stock"),
+    (None, "acme", "i@example.com", "unlabelled"),
+]
+PRICES = [(7, 10.0), (12, 3.5), (13, 99.0)]
+
+PRODUCTS_PATH = "models/marts/dim_products.sql"
+PRODUCTS_PRIOR = """{{ config(materialized='table') }}
+select p.product_id, p.product_name, p.email, l.price
+from {{ source('raw', 'raw_products') }} p
+left join {{ source('raw', 'product_prices') }} l on p.product_id = l.product_id
+where p.supplier <> 'retired'
+"""
+
+
+@pytest.fixture
+def products_project(tmp_path: Path, capsys) -> tuple[Path, Path]:
+    """A dbt project whose product dimension cannot join its integer-keyed
+    prices, over a real DuckDB warehouse with its cache built.
+
+    Returns ``(repo_root, warehouse)``.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "shop.duckdb"
+    conn = duckdb.connect(str(warehouse))
+    conn.execute(
+        "CREATE TABLE raw_products (product_id VARCHAR, supplier VARCHAR, "
+        "email VARCHAR, product_name VARCHAR)"
+    )
+    conn.executemany("INSERT INTO raw_products VALUES (?, ?, ?, ?)", PRODUCTS)
+    conn.execute("CREATE TABLE product_prices (product_id INTEGER, price DOUBLE)")
+    conn.executemany("INSERT INTO product_prices VALUES (?, ?)", PRICES)
+    conn.close()
+
+    project = tmp_path / "analytics"
+    (project / "models" / "marts").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (project / "profiles.yml").write_text(
+        "shop:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "marts" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    tables:\n"
+        "      - name: raw_products\n      - name: product_prices\n",
+        encoding="utf-8",
+    )
+    (project / PRODUCTS_PATH).write_text(PRODUCTS_PRIOR, encoding="utf-8")
+    rc = main(
+        [
+            "explore",
+            "map",
+            "--full",
+            "--connector",
+            "duckdb",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(tmp_path),
+        ]
+    )
+    capsys.readouterr()
+    assert rc == 0, "the fixture's exploration cache must build"
+    return tmp_path, warehouse

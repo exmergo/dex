@@ -227,6 +227,22 @@ class Assumption(_Strict):
     chosen: str | None = None
     evidence: Evidence | None = None
     detail: str | None = None
+    # The column the decision governs (#861), output or source. Optional, and
+    # the link a diagnostic reads to tell a recorded choice (excluding a second
+    # identifier scheme, merging `7` and `007`) from one nobody made.
+    column: str | None = None
+
+    @field_validator("column")
+    @classmethod
+    def _column_named(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError(
+                "`column` names the column this decision governs; leave it out "
+                "rather than empty"
+            )
+        return value.strip()
 
 
 class Declaration(_Strict):

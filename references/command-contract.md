@@ -229,7 +229,11 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      rewrites an existing model carries data.refactor_comparison_offer:
                                      per model the transform compare command and static_attribution
                                      (unattributed, unmeasured, none, attributed), and data.next names
-                                     the comparison before apply
+                                     the comparison before apply; data.identifier_conversions names
+                                     each cast/try_cast/lower/upper/trim the plan adds to an identifier
+                                     and, gated like row attribution, counts what it does to entities
+                                     (failed, merged, respelled, matched, prior identities lost), with
+                                     a status of lossless, declared, undeclared or unchecked (#861)
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind; once
                                      something is written, data.commit_trailer is the

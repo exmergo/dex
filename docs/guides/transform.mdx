@@ -68,6 +68,19 @@ only evidence a refactor kept its results, for example when the model's SQL
 calls a macro. A change meant to alter results needs no comparison. The verdict
 is recorded on the plan, and `transform apply` reports it.
 
+When the plan adds a cast or a `lower`, `upper` or `trim` to an identifier, such
+as a `try_cast(product_id as integer) is not null` that makes a broken join
+compile, it reports the conversion under `data.identifier_conversions`, with
+counts and their denominator. The counts show how many identifiers do not
+convert, how many collapse into one key (`7` and `007`), and how many the prior
+model held that the authored one does not, even when the row count is unchanged.
+A text identifier may be a second legitimate scheme rather than bad data, and
+Dex does not decide which. An `undeclared` conversion needs a decision: keep
+the other scheme (compare as text, normalize, use a bridge or a namespace), or
+record the exclusion as an assumption naming its `column`. On DuckDB the counts
+are free. Elsewhere they need `--attribute-rows` and are priced with row
+attribution.
+
 Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)
 when you need to construct the edits payload yourself.
 

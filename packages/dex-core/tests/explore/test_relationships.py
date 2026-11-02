@@ -2978,3 +2978,25 @@ def test_verify_at_75_percent_orphans_demotes_below_half_and_notes_why(
     assert rel["confidence"] < 0.5, "measured orphan rate demotes confidence below 0.5"
     assert any("75% of values have no match" in n for n in data["notes"])
     assert any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_a_key_that_mixes_value_shapes_is_restated_as_a_finding_code():
+    """`transform plan` cites a mixed-shape key beside a conversion of it
+    (#861), and reads the code rather than the sentence."""
+
+    note = (
+        "id is a candidate key but mixes value shapes: 90% numeric, 10% other; "
+        "casting to a number or comparing numerically will silently drop the "
+        "non-numeric group(s)"
+    )
+    ds = Dataset(
+        identifier="db.main.t",
+        row_count=100,
+        columns=[ColumnProfile(name="id", data_type="VARCHAR", null_fraction=0.0)],
+        data_quality=[note, "ghost is a candidate key but mixes value shapes: x"],
+    )
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
+    assert mixed.column == "id"
+    assert mixed.severity == "low"
+    assert mixed.detail == note
