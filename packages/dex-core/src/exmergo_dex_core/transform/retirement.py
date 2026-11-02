@@ -1,0 +1,859 @@
+"""Which behavior survives when a feature flag goes (#858).
+
+"Retire this feature" and "make it permanent" both remove a flag's spelling, so
+a reference search cannot tell them apart: a retirement that kept the enabled
+branch reports no remaining reads, builds, and still outputs the retired column.
+Row comparison cannot catch it either where the output table is empty.
+
+So the author states the outcome, in a contract on ``transform remove var``:
+which flag value's behavior survives and what each output must then hold. Dex
+never picks the branch, and never reads one off a default. It holds the proposal
+to what was stated, three times over:
+
+- at plan time, from compiled SQL alone (:func:`analyze`), against the baseline
+  compiled at the retained value and at the other one;
+- in ``transform compare``, whose baseline compiles at the retained value, so
+  ``equivalent`` means the proposal equals the chosen branch;
+- after a build, from the built relation's metadata
+  (:func:`verify_outputs`), which judges an empty table as well as a full one.
+
+A check that cannot run is ``unchecked`` with a ``reason_code``, never clean.
+"""
+
+# ruff: noqa: PERF401
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+import yaml
+from pydantic import Field, ValidationError, field_validator, model_validator
+
+from ..dbt_project import DbtProjectView, jinja_calls
+from ..semantic_declarations import Assumption, _Strict
+from .plans import EditKind, EditOp, PlanEdit
+
+if TYPE_CHECKING:
+    from ..engine import DexEngine
+
+MAX_READERS = 25
+
+
+class RetirementOutput(_Strict):
+    """What one model outputs once the flag is gone."""
+
+    expected: list[str] = Field(min_length=1)
+    removed: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _disjoint(self) -> RetirementOutput:
+        both = {c.lower() for c in self.expected} & {c.lower() for c in self.removed}
+        if both:
+            raise ValueError(
+                f"{', '.join(sorted(both))} cannot be both expected and removed"
+            )
+        return self
+
+
+class RetirementMetrics(_Strict):
+    retained: list[str] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+
+
+class RetirementContract(_Strict):
+    """The outcome the author states. Nothing here is inferred."""
+
+    behavior: Literal["retire", "permanent"]
+    #: The flag value whose behavior survives. Required, because a default says
+    #: what the project did and not what the request wants.
+    retained_value: bool | int | float | str | None
+    #: The owner-approved scope. Dex never edits an installed package, so the
+    #: one accepted value states what that means for this change.
+    packages: Literal["out_of_scope"] = "out_of_scope"
+    outputs: dict[str, RetirementOutput] = Field(min_length=1)
+    metrics: RetirementMetrics = Field(default_factory=RetirementMetrics)
+    assumptions: list[Assumption] = Field(default_factory=list)
+
+    @field_validator("retained_value", mode="before")
+    @classmethod
+    def _scalar(cls, value: Any) -> Any:
+        if isinstance(value, (list, dict)):
+            raise ValueError("retained_value is one scalar value of the flag")
+        return value
+
+
+def parse_contract(raw: Any) -> RetirementContract:
+    """The payload's ``retirement``, or a refusal naming what to fix."""
+
+    if isinstance(raw, dict) and "retained_value" not in raw:
+        raise ValueError(
+            "retirement needs retained_value: the flag value whose behavior "
+            "survives. Dex does not infer it, since a default does not say which "
+            "behavior the request keeps"
+        )
+    try:
+        return RetirementContract.model_validate(raw)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in error['loc']) or 'retirement'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise ValueError(
+            f"the retirement contract is not valid: {problems}. It takes behavior "
+            "(retire or permanent), retained_value, packages (out_of_scope), "
+            "outputs ({model: {expected: [...], removed: [...]}}), metrics "
+            "({retained: [...], removed: [...]}) and assumptions"
+        ) from exc
+
+
+def stored_form(variable: str, contract: RetirementContract) -> dict[str, Any]:
+    """What a stored plan and a plan document carry."""
+
+    return {"variable": variable, **contract.model_dump(mode="json")}
+
+
+def decisions(stored: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """The contract's assumptions, shaped as ``data.decisions`` entries."""
+
+    if not stored:
+        return []
+    return [
+        {
+            "retirement": stored.get("variable"),
+            "decision": entry.get("decision"),
+            "chosen": entry.get("chosen"),
+            "evidence": entry.get("evidence"),
+            **({"column": entry["column"]} if entry.get("column") else {}),
+        }
+        for entry in stored.get("assumptions") or []
+    ]
+
+
+# --- what the repository says about the flag ---------------------------------
+
+
+def _vars_block(view: DbtProjectView) -> dict[str, Any]:
+    source = view.files.get("dbt_project.yml")
+    if source is None:
+        return {}
+    try:
+        project = yaml.safe_load(source.content)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(project, dict):
+        return {}
+    block = project.get("vars")
+    return block if isinstance(block, dict) else {}
+
+
+def scoped_definitions(view: DbtProjectView, name: str) -> list[str]:
+    """The ``vars: {<scope>: {<name>: ...}}`` keys that set this flag.
+
+    ``yaml_blocks`` reads top-level vars only, so these are never in a removal's
+    spans. Each is left alone: a scope naming a package configures that package,
+    and one naming this project is the author's to delete in the payload.
+    """
+
+    return sorted(
+        str(scope)
+        for scope, value in _vars_block(view).items()
+        if isinstance(value, dict) and name in value
+    )
+
+
+def _project_name(view: DbtProjectView) -> str | None:
+    source = view.files.get("dbt_project.yml")
+    if source is None:
+        return None
+    try:
+        project = yaml.safe_load(source.content)
+    except yaml.YAMLError:
+        return None
+    return project.get("name") if isinstance(project, dict) else None
+
+
+def yaml_reads(files: Mapping[str, str], name: str) -> list[str]:
+    """``{{ var('x') }}`` written in YAML, where the reference index reads no var.
+
+    ``+enabled: "{{ var('x') }}"`` is a read like any other, and it survives a
+    retirement silently because no index form records it.
+    """
+
+    found = []
+    for path, content in sorted(files.items()):
+        if not path.endswith((".yml", ".yaml")):
+            continue
+        for call in jinja_calls(content):
+            if call.callee == "var" and call.args and call.args[0] == name:
+                found.append(f"{path}:{call.line}")
+    return found
+
+
+def is_already_complete(
+    view: DbtProjectView, name: str, edits: Iterable[PlanEdit]
+) -> bool:
+    """Nothing local names the flag, and the payload would change no file."""
+
+    from ..references import ReferenceIndex
+
+    for edit in edits:
+        existing = view.files.get(edit.path)
+        if edit.op is EditOp.DELETE:
+            if existing is not None:
+                return False
+        elif existing is None or existing.content != edit.new_content:
+            return False
+    index = ReferenceIndex(view, scan_packages=False)
+    if index.references_to(name, "var")[0] or index.definitions_of(name, "var"):
+        return False
+    if index.indeterminate_for("var"):
+        return False
+    if _project_name(view) in scoped_definitions(view, name):
+        return False
+    return not yaml_reads(
+        {path: source.content for path, source in view.files.items()}, name
+    )
+
+
+def package_scope(view: DbtProjectView, project: Path, name: str) -> dict[str, Any]:
+    """What sits outside this change: never edited, always reported."""
+
+    from ..references import ReferenceIndex
+
+    index = ReferenceIndex(view)
+    readers: list[dict[str, Any]] = []
+    for hit in index.references_to(name, "var")[0]:
+        if hit.package and hit.form == "var_call":
+            readers.append(
+                {
+                    "package": hit.package,
+                    "path": hit.path,
+                    "line": hit.line,
+                    "has_default": _has_default(project, hit.path, hit.line, name),
+                }
+            )
+    dynamic = [
+        {"package": hit.package, "path": hit.path, "line": hit.line}
+        for hit in index.indeterminate_for("var")
+        if hit.package
+    ]
+    defined = sorted(
+        {str(d.package) for d in index.definitions_of(name, "var") if d.package}
+    )
+    own = _project_name(view)
+    scoped = scoped_definitions(view, name)
+    report: dict[str, Any] = {
+        "owner_scope": "out_of_scope",
+        "readers": readers[:MAX_READERS],
+        "readers_elided": max(0, len(readers) - MAX_READERS),
+        "dynamic_readers": dynamic[:MAX_READERS],
+        "dynamic_readers_elided": max(0, len(dynamic) - MAX_READERS),
+        "defined_by": defined,
+        "scoped_definitions": [scope for scope in scoped if scope != own],
+    }
+    return report
+
+
+def _has_default(project: Path, path: str, line: int, name: str) -> bool | None:
+    """Whether a package's read carries a default; ``None`` where unread."""
+
+    try:
+        content = (project / path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    for call in jinja_calls(content):
+        if (
+            call.callee == "var"
+            and call.line == line
+            and call.args
+            and call.args[0] == name
+        ):
+            if len(call.args) > 1:
+                return True
+            # A keyword default is dropped from args, so the line decides.
+            lines = content.splitlines()
+            return line <= len(lines) and "default" in lines[line - 1]
+    return None
+
+
+def package_warnings(name: str, scope: Mapping[str, Any]) -> list[str]:
+    """The consequences for package models, which the owner scoped out."""
+
+    out = []
+    for reader in scope.get("readers") or []:
+        if reader.get("has_default") is False:
+            out.append(
+                f"{reader['path']}:{reader['line']} in package {reader['package']} "
+                f"reads var('{name}') with no default, so it stops compiling once "
+                "the definition goes. Installed packages are not edited: keep a "
+                f"`vars: {{{reader['package']}: {{{name}: ...}}}}` entry for it, or "
+                "disable that model from this project"
+            )
+    if scope.get("readers") or scope.get("defined_by"):
+        out.append(
+            f"package models that read '{name}' keep their own behavior and now "
+            "resolve it from their default or the package's own definition; "
+            "`data.retirement.package_scope` names them"
+        )
+    for reader in scope.get("dynamic_readers") or []:
+        out.append(
+            f"{reader['path']}:{reader['line']} in package {reader['package']} reads "
+            f"a var dex could not name, so it may or may not read '{name}'. "
+            "Installed packages are not edited: read that line, and if it reads "
+            "this flag, pin the value under a package-scoped `vars:` entry"
+        )
+    return out
+
+
+# --- plan time: compile each branch ------------------------------------------
+
+
+def _record(model: str) -> dict[str, Any]:
+    return {"model": model, "status": "satisfied", "checks": []}
+
+
+def _contradict(record: dict[str, Any], check: str, detail: str) -> None:
+    record["status"] = "contradicted"
+    record["finding"] = record.get("finding") or check
+    record["checks"].append({"check": check, "detail": detail})
+
+
+def _uncheck(record: dict[str, Any], code: str) -> None:
+    if record["status"] != "contradicted":
+        record["status"] = "unchecked"
+    record.setdefault("reason_code", code)
+
+
+def _project_after_edits(view: DbtProjectView, edits: list[PlanEdit]) -> DbtProjectView:
+    from .propagate import _project_after_edits as after
+
+    return after(view, edits)
+
+
+def analyze(
+    engine: DexEngine,
+    stored: Any,
+    project: Path,
+    view: DbtProjectView,
+    contract: RetirementContract,
+    variable: str,
+) -> dict[str, Any]:
+    """Hold the proposal to the contract from compiled SQL alone.
+
+    Free: dbt compiles in a throwaway copy, as ``transform compare`` does, and no
+    statement reads a row. So this catches the kept branch on an empty table.
+    """
+
+    edits = list(stored.edits)
+    sql_edits = [e for e in edits if e.kind is EditKind.MODEL_SQL]
+    written = {Path(e.path).stem for e in sql_edits if e.op is EditOp.UPSERT}
+    models = sorted(set(contract.outputs) | written)
+    connector = engine.connector or engine.config.connector
+    records = {model: _record(model) for model in models}
+
+    for model in sorted(written - set(contract.outputs)):
+        _uncheck(records[model], "no_declared_outputs")
+
+    boolean = isinstance(contract.retained_value, bool)
+    compiled: dict[str, dict[str, _Compiled]] = {}
+    failure: str | None = None
+    try:
+        compiled["retained"] = _compile_tree(
+            engine,
+            stored,
+            project,
+            view,
+            models,
+            connector,
+            vars_={variable: contract.retained_value},
+        )
+        if boolean:
+            compiled["other"] = _compile_tree(
+                engine,
+                stored,
+                project,
+                view,
+                models,
+                connector,
+                vars_={variable: not contract.retained_value},
+            )
+        compiled["proposed"] = _compile_tree(
+            engine, stored, project, view, models, connector, proposed=True
+        )
+    except Exception as exc:
+        failure = type(exc).__name__
+
+    if failure is None and not boolean:
+        for record in records.values():
+            record["other_branch"] = "non_boolean_flag"
+    if failure is not None:
+        for record in records.values():
+            _uncheck(record, "compile_unavailable")
+    else:
+        for model, record in records.items():
+            _judge(model, record, contract, compiled, connector)
+
+    after = _files_after(view, edits)
+    surviving, orphaned = _references_after(view, edits, contract, compiled)
+    for model, columns in surviving.items():
+        record = records.setdefault(model, _record(model))
+        for column, where in columns.items():
+            _contradict(
+                record,
+                "removed_column_still_read",
+                f"'{model}.{column}' is declared removed and is still read at "
+                f"{', '.join(where[:5])}",
+            )
+
+    metrics = metric_records(_index_after(view, edits), contract)
+    yaml_left = yaml_reads(after, variable)
+    after_view = _project_after_edits(view, edits)
+    own = _project_name(view)
+    definition_left = own in scoped_definitions(after_view, variable)
+    records_list = [records[m] for m in sorted(records)] + metrics
+    verdict = (
+        "contradicted"
+        if any(r["status"] == "contradicted" for r in records_list)
+        else "unchecked"
+        if any(r["status"] == "unchecked" for r in records_list)
+        else "satisfied"
+    )
+    return {
+        "status": "planned",
+        "verdict": verdict,
+        "models": [records[m] for m in sorted(records)],
+        "metrics": metrics,
+        "orphaned_models": orphaned,
+        "yaml_reads": yaml_left,
+        "project_scoped_definition_left": definition_left,
+    }
+
+
+class _Compiled:
+    def __init__(
+        self,
+        columns: list[str] | None,
+        reason: str | None,
+        reads: set[str],
+        sql: str,
+    ) -> None:
+        self.columns = columns
+        self.reason = reason
+        self.reads = reads
+        self.sql = sql
+
+
+def _compile_tree(
+    engine: DexEngine,
+    stored: Any,
+    project: Path,
+    view: DbtProjectView,
+    models: list[str],
+    connector: str | None,
+    *,
+    vars_: Mapping[str, Any] | None = None,
+    proposed: bool = False,
+) -> dict[str, _Compiled]:
+    """Compile ``models`` from one tree, inlining what the plan touches.
+
+    Touched models are ephemeral, as in ``transform compare``, so a star over a
+    model this plan rewrites resolves to this tree's columns rather than to a
+    dev relation built from an earlier one.
+    """
+
+    from ..adapters import get_dialect
+    from .mutation import EPHEMERAL_HEADER
+    from .refactor_compare import _shadow, _touched
+    from .select_list import resolve_select_list
+
+    target = engine.config.dbt_target or "dev"
+    dialect = get_dialect(connector) if connector else None
+    with _shadow(engine, project, target, connector or "") as shadow:
+        shadow.strip_run_hooks()
+        if proposed:
+            for edit in stored.edits:
+                if edit.op is EditOp.DELETE:
+                    shadow.remove(edit.path)
+                else:
+                    shadow.write(edit.path, edit.new_content or "")
+        for edit in _touched(stored):
+            if proposed:
+                content = edit.new_content if edit.op is EditOp.UPSERT else None
+            else:
+                source = view.files.get(edit.path)
+                content = source.content if source is not None else None
+            if content is None or not edit.path.endswith(".sql"):
+                continue
+            shadow.write(edit.path, content + "\n" + EPHEMERAL_HEADER + "\n")
+            shadow.strip_semantic_models(Path(edit.path).stem)
+        manifest = shadow.compile(" ".join(models), vars_=vars_)
+    out: dict[str, _Compiled] = {}
+    for uid, node in (manifest.get("nodes") or {}).items():
+        if not uid.startswith("model.") or node.get("name") not in models:
+            continue
+        sql = (node.get("compiled_code") or "").strip().rstrip(";")
+        read = resolve_select_list(sql, dialect=dialect) if sql else None
+        reads = {
+            parent.split(".")[-1]
+            for parent in (node.get("depends_on") or {}).get("nodes") or []
+        }
+        out[str(node["name"])] = _Compiled(
+            sorted(c.lower() for c in read.columns) if read and read.columns else None,
+            read.reason if read else "no compiled SQL",
+            reads,
+            sql,
+        )
+    return out
+
+
+def _judge(
+    model: str,
+    record: dict[str, Any],
+    contract: RetirementContract,
+    compiled: Mapping[str, Mapping[str, _Compiled]],
+    connector: str | None,
+) -> None:
+    proposed = compiled["proposed"].get(model)
+    retained = compiled["retained"].get(model)
+    other = compiled.get("other", {}).get(model)
+    if proposed is None:
+        declared = contract.outputs.get(model)
+        if declared is not None:
+            _contradict(
+                record,
+                "output_model_missing",
+                f"'{model}' has declared outputs and the proposal defines no such "
+                "model",
+            )
+        return
+    record["branches"] = {
+        "retained": retained.columns if retained else None,
+        "other": other.columns if other else None,
+        "proposed": proposed.columns,
+    }
+    if proposed.columns is None:
+        _uncheck(record, "unreadable_select")
+        record["reason"] = proposed.reason
+    else:
+        columns = set(proposed.columns)
+        if retained is not None and retained.columns is not None:
+            same = columns == set(retained.columns)
+            record["matches_retained"] = same
+            if not same:
+                kept = sorted(columns - set(retained.columns))
+                lost = sorted(set(retained.columns) - columns)
+                _contradict(
+                    record,
+                    "proposal_differs_from_retained_branch",
+                    f"with the flag at {contract.retained_value!r}, '{model}' outputs "
+                    "different columns than this proposal"
+                    + (f"; only the proposal has {', '.join(kept)}" if kept else "")
+                    + (f"; only the branch has {', '.join(lost)}" if lost else "")
+                    + ". Fix the SQL, or correct retained_value if the contract "
+                    "named the wrong branch",
+                )
+        elif retained is not None:
+            _uncheck(record, "unreadable_select")
+        declared = contract.outputs.get(model)
+        if declared is not None:
+            expected = {c.lower() for c in declared.expected}
+            removed = {c.lower() for c in declared.removed}
+            still = sorted(columns & removed)
+            missing = sorted(expected - columns)
+            extra = sorted(columns - expected - removed)
+            if still:
+                _contradict(
+                    record,
+                    "removed_output_present",
+                    f"'{model}' still outputs {', '.join(still)}, which the "
+                    "contract says goes",
+                )
+            if missing:
+                _contradict(
+                    record,
+                    "expected_output_missing",
+                    f"'{model}' no longer outputs {', '.join(missing)}, which the "
+                    "contract expects",
+                )
+            if extra:
+                _contradict(
+                    record,
+                    "unexpected_output",
+                    f"'{model}' outputs {', '.join(extra)}, which the contract "
+                    "neither expects nor removes",
+                )
+    if retained is not None and proposed.reads != retained.reads:
+        kept = sorted(proposed.reads - retained.reads)
+        lost = sorted(retained.reads - proposed.reads)
+        if kept:
+            _contradict(
+                record,
+                "reads_outside_retained_branch",
+                f"'{model}' still reads {', '.join(kept)}, which the retained "
+                "branch does not read. A join kept with no output column still "
+                "moves rows",
+            )
+        if lost:
+            _contradict(
+                record,
+                "dropped_retained_read",
+                f"'{model}' no longer reads {', '.join(lost)}, which the retained "
+                "branch reads",
+            )
+    unused = _unused_ctes(proposed.sql, connector)
+    if retained is not None:
+        unused -= _unused_ctes(retained.sql, connector)
+    if unused:
+        _contradict(
+            record,
+            "unused_cte",
+            f"'{model}' defines {', '.join(sorted(unused))} and never reads it; the "
+            "retained branch has no such leftover",
+        )
+
+
+def _unused_ctes(sql: str, connector: str | None) -> set[str]:
+    """CTEs nothing reads; dbt's own inlined ones are not the author's."""
+
+    import sqlglot
+    from sqlglot import exp
+
+    from ..adapters import get_dialect
+
+    if not sql:
+        return set()
+    try:
+        tree = sqlglot.parse_one(
+            sql, read=get_dialect(connector) if connector else None
+        )
+    except Exception:
+        return set()
+    defined = {
+        cte.alias
+        for cte in tree.find_all(exp.CTE)
+        if cte.alias and not cte.alias.startswith("__dbt__cte__")
+    }
+    read = {table.name for table in tree.find_all(exp.Table) if not table.db}
+    return defined - read
+
+
+def _files_after(view: DbtProjectView, edits: list[PlanEdit]) -> dict[str, str]:
+    from .propagate import _project_after_edits
+
+    return {
+        path: source.content
+        for path, source in _project_after_edits(view, edits).files.items()
+    }
+
+
+def _index_after(view: DbtProjectView, edits: list[PlanEdit]) -> Any:
+    from ..references import ReferenceIndex
+    from .propagate import _project_after_edits
+
+    return ReferenceIndex(_project_after_edits(view, edits), scan_packages=False)
+
+
+def _references_after(
+    view: DbtProjectView,
+    edits: list[PlanEdit],
+    contract: RetirementContract,
+    compiled: Mapping[str, Mapping[str, _Compiled]],
+) -> tuple[dict[str, dict[str, list[str]]], list[str]]:
+    """Removed columns something still reads, and models nothing reads any more."""
+
+    from .propagate import _READING_FORMS
+
+    index = _index_after(view, edits)
+    surviving: dict[str, dict[str, list[str]]] = {}
+    for model, declared in contract.outputs.items():
+        for column in declared.removed:
+            where = sorted(
+                f"{hit.path}:{hit.line}"
+                for hit in index.references_to(f"{model}.{column}", "column")[0]
+                if hit.form in _READING_FORMS["column"]
+                and hit.note != "same_name_elsewhere"
+                # The model's own SELECT is its output, which `outputs` judges.
+                and not (hit.form == "select_column" and Path(hit.path).stem == model)
+            )
+            if where:
+                surviving.setdefault(model, {})[column] = where
+
+    dropped: set[str] = set()
+    for model, proposed in (compiled.get("proposed") or {}).items():
+        before: set[str] = set()
+        for side in ("retained", "other"):
+            entry = (compiled.get(side) or {}).get(model)
+            if entry is not None:
+                before |= entry.reads
+        dropped |= before - proposed.reads
+    deleted = {Path(e.path).stem for e in edits if e.op is EditOp.DELETE}
+    orphaned = sorted(
+        name
+        for name in dropped - deleted
+        if index.definitions_of(name, "model")
+        and not [
+            hit
+            for hit in index.references_to(name, "model")[0]
+            if hit.form in ("ref_call", "python_ref")
+        ]
+    )
+    return surviving, orphaned
+
+
+def metric_records(index: Any, contract: RetirementContract) -> list[dict[str, Any]]:
+    """Each named metric against the definitions the project holds."""
+
+    records = []
+    for name, wanted in (
+        *((n, True) for n in contract.metrics.retained),
+        *((n, False) for n in contract.metrics.removed),
+    ):
+        present = bool(index.definitions_of(name, "metric"))
+        satisfied = present is wanted
+        record: dict[str, Any] = {
+            "model": name,
+            "metric": True,
+            "expected": "retained" if wanted else "removed",
+            "status": "satisfied" if satisfied else "contradicted",
+        }
+        if not satisfied:
+            record["finding"] = (
+                "retirement_metric_missing" if wanted else "retirement_metric_present"
+            )
+        records.append(record)
+    return records
+
+
+def plan_warnings(variable: str, analysis: Mapping[str, Any]) -> list[str]:
+    """One warning per contradiction, and one for everything not judged."""
+
+    out = []
+    for record in analysis.get("models") or []:
+        for check in record.get("checks") or []:
+            out.append(f"retirement of '{variable}': {check['detail']}")
+        if record.get("reason_code"):
+            out.append(
+                f"retirement of '{variable}': '{record['model']}' is not checked "
+                f"({record['reason_code']}), which is not clean"
+            )
+    for record in analysis.get("metrics") or []:
+        if record["status"] == "contradicted":
+            out.append(
+                f"retirement of '{variable}': metric '{record['model']}' is declared "
+                f"{record['expected']} and the proposal disagrees"
+            )
+    for where in analysis.get("yaml_reads") or []:
+        out.append(f"retirement of '{variable}': {where} still reads the flag")
+    if analysis.get("project_scoped_definition_left"):
+        out.append(
+            f"retirement of '{variable}': dbt_project.yml still sets it under this "
+            "project's own `vars:` scope, which `transform remove` does not edit; "
+            "remove that entry with a project_yml edit in this payload"
+        )
+    for model in analysis.get("orphaned_models") or []:
+        out.append(
+            f"retirement of '{variable}': nothing reads '{model}' any more; remove "
+            "it in this payload if the feature was its only reason to exist"
+        )
+    return out
+
+
+# --- after a build -----------------------------------------------------------
+
+
+def verify_outputs(
+    stored: Mapping[str, Any],
+    built: Mapping[str, str],
+    scope: set[str],
+    relations: Mapping[str, str],
+    live_identifiers: list[str],
+    adapter_once: Callable[[], Any],
+    index: Any,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """The built relations' columns against the contract.
+
+    From metadata, the read the column contract already makes, so it costs no
+    statement and judges an empty table the same as a full one. A model this run
+    did not build keeps an earlier run's relation, which proves nothing here.
+    """
+
+    from ..cache import match_identifier
+    from ..envelope import redact
+    from ..guards.cost_guard import CostGuardError
+    from ..maintain.drift import DriftFinding
+
+    contract = RetirementContract.model_validate(
+        {k: v for k, v in stored.items() if k != "variable"}
+    )
+    labels = {built[uid] for uid in scope}
+    findings: list[Any] = []
+    records: list[dict[str, Any]] = []
+    for model, declared in sorted(contract.outputs.items()):
+        record: dict[str, Any] = {"model": model, "status": "unchecked"}
+        records.append(record)
+        if model not in labels:
+            record["reason_code"] = "not_built"
+            continue
+        relation = relations.get(model)
+        if relation is None:
+            record["reason_code"] = "no_relation"
+            continue
+        matches = match_identifier(relation, live_identifiers)
+        if len(matches) != 1:
+            record["reason_code"] = "relation_not_found"
+            continue
+        try:
+            _meta, columns = adapter_once().table_metadata(matches[0])
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            record["reason_code"] = "metadata_unreadable"
+            record["reason"] = redact(type(exc).__name__)
+            continue
+        actual = {column.name.lower() for column in columns}
+        expected = {c.lower() for c in declared.expected}
+        removed = {c.lower() for c in declared.removed}
+        present = sorted(actual & removed)
+        extra = sorted(actual - expected - removed)
+        missing = sorted(expected - actual)
+        record["actual"] = sorted(actual)
+        record["status"] = "satisfied"
+        for code, names, what in (
+            ("retirement_output_present", present, "the contract removes"),
+            ("retirement_output_unexpected", extra, "the contract does not list"),
+        ):
+            if names:
+                record["status"] = "contradicted"
+                record["finding"] = record.get("finding") or code
+                findings.append(
+                    DriftFinding(
+                        axis="build",
+                        code=code,
+                        identifier=model,
+                        severity="high",
+                        detail=(
+                            f"'{model}' was built with {', '.join(names)}, which "
+                            f"{what}: the flag's other behavior survived"
+                        ),
+                        data={"model": model, "columns": names},
+                    )
+                )
+        if missing:
+            record["status"] = "contradicted"
+            record["finding"] = record.get("finding") or "retirement_output_missing"
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="retirement_output_missing",
+                    identifier=model,
+                    severity="high",
+                    detail=(
+                        f"'{model}' was built without {', '.join(missing)}, which "
+                        "the contract expects"
+                    ),
+                    data={"model": model, "columns": missing},
+                )
+            )
+    records.extend(metric_records(index, contract))
+    return findings, records

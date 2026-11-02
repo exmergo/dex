@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -877,10 +877,17 @@ class ShadowRun:
             raise DbtRunError("dbt wrote no manifest for the copied project")
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def compile(self, select: str) -> dict[str, Any]:
-        """Compile one selection in the copy and return the manifest dbt wrote."""
+    def compile(
+        self, select: str, *, vars_: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Compile one selection in the copy and return the manifest dbt wrote.
 
-        completed = self._invoke("compile", "--select", select)
+        ``vars_`` overrides project variables for this compile alone, which is
+        how a flag's branch is compiled without touching any file (#858).
+        """
+
+        extra = ("--vars", json.dumps(dict(vars_))) if vars_ else ()
+        completed = self._invoke("compile", "--select", select, *extra)
         if completed.returncode != 0:
             messages = _collect_messages(completed)
             raise DbtRunError(messages[0] if messages else "dbt compile failed")

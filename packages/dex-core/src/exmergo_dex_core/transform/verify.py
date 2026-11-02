@@ -85,6 +85,8 @@ class BuildVerification:
     #: Which built models had their declared columns compared (#1002); ``None``
     #: when the comparison never reached a model (see ``suppressed``).
     column_contract: dict[str, Any] | None = None
+    #: One record per output and metric a retirement contract names (#858).
+    retirement: list[dict] = field(default_factory=list)
     #: Findings ranked below :data:`MAX_FINDINGS` and left out of ``findings``,
     #: counted so a summary can say the list is not the whole answer.
     dropped: int = 0
@@ -107,6 +109,8 @@ class BuildVerification:
             payload["temporal_contracts"] = self.temporal_contracts
         if self.column_contract is not None:
             payload["column_contract"] = self.column_contract
+        if self.retirement:
+            payload["retirement"] = self.retirement
         return payload
 
 
@@ -205,6 +209,7 @@ def verify_build(
     summary: dict[str, Any],
     *,
     resolve_adapter: Callable[[], Adapter],
+    retirement: dict[str, Any] | None = None,
 ) -> BuildVerification:
     """Sweep the nodes this build ran, and report what it could not sweep.
 
@@ -265,6 +270,11 @@ def verify_build(
     reason = _column_contract(project_dir, summary, built, scope, adapter_once, result)
     if reason is not None:
         result.suppressed["column_contract"] = reason
+
+    if retirement:
+        _retirement_contract(
+            project_dir, retirement, built, scope, adapter_once, result
+        )
 
     reason = _row_population(engine, project_dir, summary, scope, adapter_once, result)
     if reason is not None:
@@ -328,6 +338,50 @@ def _judgeable(
         "run; the failures are tests or other nodes, reported under build status"
     )
     return {**summary, "success": True}, good
+
+
+def _retirement_contract(
+    project_dir: Path,
+    stored: dict[str, Any],
+    built: dict[str, str],
+    scope: set[str],
+    resolve_adapter: Callable[[], Adapter],
+    result: BuildVerification,
+) -> None:
+    """The built outputs against the plan's retirement contract (#858).
+
+    Metadata only, the read `_column_contract` makes. Every failure is a record
+    saying what was not judged, so a contract the sweep could not reach is
+    never read as one it passed.
+    """
+
+    from ..dbt_project import load as load_project
+    from ..errors import DexError
+    from ..guards.cost_guard import CostGuardError
+    from ..maintain import verify as verify_mod
+    from ..references import ReferenceIndex
+    from .retirement import verify_outputs
+
+    try:
+        relations = verify_mod.built_model_relations(project_dir, scope)
+        live = [meta.identifier for meta in resolve_adapter().list_objects()]
+        index = ReferenceIndex(load_project(project_dir), scan_packages=False)
+        findings, records = verify_outputs(
+            stored, built, scope, relations, live, resolve_adapter, index
+        )
+    except CostGuardError:
+        raise
+    except (DexError, ValueError, OSError) as exc:
+        result.suppressed["retirement"] = (
+            f"the retirement contract could not be read ({type(exc).__name__})"
+        )
+        result.retirement = [
+            {"model": str(model), "status": "unchecked", "reason_code": "unreadable"}
+            for model in stored.get("outputs") or {}
+        ]
+        return
+    result.findings.extend(findings)
+    result.retirement = records
 
 
 def _column_contract(

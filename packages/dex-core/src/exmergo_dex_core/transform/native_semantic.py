@@ -296,10 +296,12 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
         # first in the sequence: once applied, the tree no longer holds the
         # baseline and the plan cannot be compared (#1049).
         commands = " and ".join(f"`{m['command']}`" for m in offer["per_model"][:3])
-        step = (
-            f"if this change should keep the existing results, run {commands} "
-            f"before applying; {step}"
+        lead = (
+            "to check the proposal returns what the kept branch returns, run"
+            if getattr(result, "retirement", None)
+            else "if this change should keep the existing results, run"
         )
+        step = f"{lead} {commands} before applying; {step}"
     return {"next": step}
 
 
@@ -323,6 +325,23 @@ def edits_from_payload(
     return edits
 
 
+def removal_payload(edits_file: str | None) -> tuple[list[PlanEdit], Any]:
+    """``transform remove``'s payload: its edits and its raw ``retirement``.
+
+    The one reader of that key (#858). Every other command refuses it through
+    :func:`payload_from_file` rather than dropping it, because a contract nobody
+    read is a change that looks checked and was not.
+    """
+
+    edits, declarations, retirement = _payload_parts(edits_file, None)
+    if declarations is not None:
+        raise ValueError(
+            "this command does not take declarations; pass them to `transform "
+            "plan` or `semantic define|update|plan` instead"
+        )
+    return edits, retirement
+
+
 def payload_from_file(
     edits_file: str | None, default_kind: EditKind | None = None
 ) -> tuple[list[PlanEdit], list[Any] | None]:
@@ -340,8 +359,22 @@ def payload_from_file(
     :mod:`.declarations` is what knows its shape.
     """
 
+    edits, declarations, retirement = _payload_parts(edits_file, default_kind)
+    if retirement is not None:
+        raise ValueError(
+            "only `transform remove var` takes a retirement contract; this command "
+            "would drop it unread"
+        )
+    return edits, declarations
+
+
+def _payload_parts(
+    edits_file: str | None, default_kind: EditKind | None
+) -> tuple[list[PlanEdit], list[Any] | None, Any]:
+    """The one read of a payload, stdin included, split into its three keys."""
+
     if edits_file is None:
-        return [], None
+        return [], None, None
     raw = sys.stdin.read() if edits_file == "-" else read_payload_file(edits_file)
     try:
         payload = json.loads(raw)
@@ -351,7 +384,9 @@ def payload_from_file(
         raise ValueError('edits payload must be {"edits": [...]}')
     declarations = payload.get("declarations")
     entries = payload.get("edits")
-    if entries is None and declarations is not None:
+    if entries is None and (
+        declarations is not None or payload.get("retirement") is not None
+    ):
         entries = []
     if not isinstance(entries, list):
         raise ValueError('edits payload must be {"edits": [...]}')
@@ -386,7 +421,7 @@ def payload_from_file(
                 new_content=entry.get("content"),
             )
         )
-    return edits, declarations
+    return edits, declarations, payload.get("retirement")
 
 
 def read_payload_file(path: str) -> str:

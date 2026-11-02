@@ -14,6 +14,141 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.2] - 2026-11-02
+
+### Added
+
+- **`transform remove var` records and verifies which behavior survives a flag.**
+  "Retire this feature" and "make it permanent" both remove a variable's spelling,
+  so a search for the name cannot tell them apart. A `retirement` key in the
+  `--edits-file` payload now states the outcome: the flag value whose behavior
+  survives, the columns each output then holds, and the metrics that remain.
+  Dex never chooses the branch and never reads one off a default. The plan compiles
+  the baseline at each value and holds the proposal to the contract under
+  `data.retirement`, `transform compare` compiles its baseline at the retained value,
+  and `transform build --verify --for-plan` checks the built relations' columns under
+  `data.verification.retirement` and `data.completion.obligations`, which judges an
+  empty table too. Package readers are reported and never edited, a read-only
+  `var('x', true)` can be retired, and repeating a finished retirement is a no-op.
+  Commands without a contract behave as before, and existing plan digests do not move. ([#858](https://github.com/exmergo/dex/pull/858))
+- **A rewritten model's plan now points to `transform compare` before apply, and apply reports what it found.**
+  The plan's `data.refactor_comparison_offer` gives each rewritten model its own
+  command and `static_attribution`, which says whether row attribution established
+  anything (it cannot when the SQL calls a macro). `data.next` names the comparison
+  ahead of `transform apply`. Each verdict is recorded on the plan, and
+  `transform apply` and `transform build --for-plan` report it, or report
+  `not_compared`, without refusing anything. `transform compare` now returns
+  `inputs_unsynchronized` when the last build left a parent errored or skipped,
+  because both sides would read that parent's outdated relation. The shared
+  procedure tells agents to compare a change meant to keep results, and how to act
+  on each verdict.
+- **Join coverage is measured through a cast key.** `maintain verify` and
+  `transform build --verify` used to report a join such as
+  `try_cast(a.k as int) = b.k` as an unchecked `non_equality_join`. They now probe
+  it through the same conversion (a hard cast is measured as its safe form) and
+  record it under `key_conversion`. Keys the conversion fails on stay unmatched and
+  are counted as `conversion_failed_rows` and `conversion_failed_keys`. A key
+  rewritten by any other function is `unsupported_key_expression`. `explore profile`
+  also restates a candidate key mixing value shapes as the finding
+  `mixed_identifier_shapes` (#861).
+- **`transform build` leads its payload with a bounded `data.completion` summary.**
+  The summary comes first and stays under 4096 bytes, so a reader whose harness cuts
+  the output after a few kilobytes still sees whether the change was done. With
+  `--for-plan` it lists the required deliverables that were built, failed, skipped,
+  missing or stale, and what blocked each one. A skipped model is never counted as
+  built, even when dev still holds a relation from an earlier run. It also shows
+  which deliverables anything checked (`asserted` or `build_only`), what
+  verification ran, found and suppressed, and the declared obligations by status.
+  Without a plan, coverage is `unknown` rather than empty. It appears on
+  failed builds too, and Python callers get the same typed `BuildCompletion`.
+  `success`, `outcome` and every existing field are unchanged.
+- **`transform build` says who owns a failed prerequisite, and `--cold-deps` proves a
+  repair survives a reinstall.** `data.prerequisites` names each failed node's owner
+  (project or package), its relation to the named plan, the required models behind
+  it, and the repair routes dbt supports, including why an override does not apply
+  (a reader pinned with `ref('pkg', 'model')`, a versioned or Python model).
+  `--cold-deps` reinstalls packages into an isolated copy and builds from it, under
+  the usual dev-only and cost gates. `data.cold_verification` lists the pins and every
+  file the installed tree held that the reinstall did not reproduce, so an edit under
+  `dbt_packages/` shows up as lost. An ordinary build never reinstalls. The recipe is in
+  `skills/transform/references/prerequisite-repairs.md`.
+- **`transform plan` reports what an identifier conversion does to a model's
+  entities.** Each `cast`, safe cast (`try_cast`, `safe_cast`, `try_to_number`),
+  `lower`, `upper` or `trim` that a plan adds to an identifier column is listed under
+  `data.identifier_conversions`. It covers filters, joins and projections, on new and
+  edited models. Aggregate counts show how many distinct identifiers reach the
+  conversion, how many fail it (NULL keys counted apart), how many merge into one key
+  (`7` and `007`), how many change spelling, and how many still match across a join.
+  On an edited model, the prior and authored identity sets are compared too, so an
+  identity change shows even when the row count is unchanged. Each count states its
+  denominator. An intentional filter elsewhere in the model is respected. Status is
+  `lossless`, `declared`, `undeclared` (with a warning listing the
+  contract-compatible options) or `unchecked` with a `reason_code`. Assumptions
+  take an optional `column`, which is how a deliberate exclusion becomes
+  `declared`. The counts are free on DuckDB and priced with row attribution
+  elsewhere. No value is returned. An unsettled conversion on a required model
+  appears under `data.completion.obligations.identifier_conversions` on a
+  `--for-plan` build (#861).
+  With `--attribute-rows`, a plan for a new model can now spend on these counts, and a
+  cost-guard refusal is raised as it is for row attribution.
+- **`transform plan` warns when a model declaring `population.parent` is driven from
+  an unrelated relation, on a new model as well as an edited one.** The warning names
+  the driving relation, the parent and both fixes, under
+  `data.declarations.<model>.contradictions` (`check: population_parent`). A relation
+  in the parent's lineage, either direction, stays silent, as does a RIGHT, FULL or
+  CROSS join that keeps the parent's rows. A driver Dex cannot read is `unchecked`.
+  `population_contract` says whether a population is `prose` or `executable`, and
+  `data.completion.obligations.prose_population` names required models nothing can
+  check.
+
+### Changed
+
+- **`maintain reconcile` cuts a Cube view source whose includes all go.**
+  when a dropped column removes every member in a view source's `includes` list,
+  reconcile cuts that whole source entry from `cubes` rather than leaving
+  `includes: []`. if that removal empties all sources for the view, the proposal
+  is kept advisory with an explanation instead of writing a plan that would
+  leave an empty view. ([#1051](https://github.com/exmergo/dex/pull/1051))
+
+### Fixed
+
+- **keep the model file on a case-only rename apply.**
+  On a case-insensitive filesystem, `transform apply` treated the create half of a
+  case-only rename as already applied (the delete path resolved to the same file)
+  and then deleted that file, so the model disappeared. `write_edits` now detects
+  a create+delete pair that differs only by case and applies them as one rename
+  through a temporary sibling, so the create's spelling and content remain. ([#981](https://github.com/exmergo/dex/pull/981))
+- **`explore profile` no longer counts distinct values of a column whose type its
+  connector skips.**
+  A null-free `VARIANT`, `MAP`, `SUPER`, `GEOGRAPHY` or similar column reports no
+  distinct count, which reads the same as a column the catalog has no statistics
+  for, so dex sent it to the exact count. On a warehouse that cannot group the
+  type, one such column could fail the profile of its table, and with it
+  `explore map` and `explore relationships` (#925). Where the warehouse can count
+  it, as DuckDB and ClickHouse do, the profile reported the count and could offer
+  the column as a candidate key.
+
+  Such a column now reports no `distinct_count`, and its null fraction where the
+  connector measures one, and is no longer offered as a candidate key. A table
+  whose aggregate scan read no rows or was refused gets no exact count either.
+  Postgres views and unanalyzed tables are still measured, and a degraded column
+  no longer uses up the columns measured there.
+
+  This changes output you may store or compare. Once you profile again, a column
+  that only held a `candidate_keys` place through this count leaves it, and after
+  a new `maintain snapshot` `maintain check` stops watching it; declare the grain
+  to keep it watched. ([#1052](https://github.com/exmergo/dex/pull/1052))
+- `transform compare` names `transform build --select …` when a compare input has not been built, instead of pointing agents at raw `dbt run`. ([#1067](https://github.com/exmergo/dex/pull/1067))
+- **`transform plan` names `transform deps` when declared packages are missing.** dbt refuses to parse a project whose declared packages are not installed, and its message points at raw `dbt deps`; plan now runs the declared-package check first and refuses with the verb dex has. Planning installs nothing, because deps can reach the network.
+- **`transform plan` row attribution no longer copies a warehouse error into
+  `reason`.** A failed cast's error quotes the value it could not convert, so a
+  value from the data could reach the envelope. The reason now keeps the context
+  and the exception type (#861).
+  On BigQuery, a prior model that did not compile also made its dry-run pricing raise
+  out of the batch, so nothing was measured. Each statement is now priced on its own.
+- `semantic ossie|slayer|cube` refuse a `population.parent` that names nothing (or columns the layer does not expose), matching the dbt-route check (#1030).
+
+
 ## [1.17.1] - 2026-11-01
 
 ### Added

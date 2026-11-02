@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -306,10 +306,36 @@ def _compare(
         )
     )
 
+    # A retirement compares against the branch its contract keeps (#858), so
+    # `equivalent` means the proposal equals that branch. The parents' guard below
+    # still reads the project's current values: those are what its dev relations
+    # were built with.
+    retirement = stored.retirement or None
+    baseline_vars = (
+        {str(retirement["variable"]): retirement.get("retained_value")}
+        if retirement
+        else None
+    )
+    if baseline_vars:
+        identity["baseline_vars"] = baseline_vars
     try:
         baseline = _compile_baseline(
-            engine, stored, project, chosen, target, connector, through_ancestors
+            engine,
+            stored,
+            project,
+            chosen,
+            target,
+            connector,
+            through_ancestors,
+            vars_=baseline_vars,
         )
+        if baseline_vars and through_ancestors:
+            baseline = replace(
+                baseline,
+                parents=_compile_baseline(
+                    engine, stored, project, chosen, target, connector, True
+                ).parents,
+            )
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
     try:
@@ -587,6 +613,8 @@ def _compile_baseline(
     target: str,
     connector: str,
     through_ancestors: bool = False,
+    *,
+    vars_: Mapping[str, Any] | None = None,
 ) -> _Side:
     view = load_project(project)
     try:
@@ -602,7 +630,12 @@ def _compile_baseline(
             paths[edit.path] = existing.content
     with _shadow(engine, project, target, connector) as shadow:
         return _compile_side(
-            shadow, paths, model, "baseline_not_compilable", through_ancestors
+            shadow,
+            paths,
+            model,
+            "baseline_not_compilable",
+            through_ancestors,
+            vars_=vars_,
         )
 
 
@@ -654,6 +687,8 @@ def _compile_side(
     model: str,
     code: ReasonCode,
     through_ancestors: bool = False,
+    *,
+    vars_: Mapping[str, Any] | None = None,
 ) -> _Side:
     """Inline the given models and compile ``model`` in this copy of the project."""
 
@@ -666,7 +701,9 @@ def _compile_side(
         shadow.write(path, content + "\n" + EPHEMERAL_HEADER + "\n")
         shadow.strip_semantic_models(Path(path).stem)
     try:
-        manifest = shadow.compile(f"+{model}" if through_ancestors else model)
+        manifest = shadow.compile(
+            f"+{model}" if through_ancestors else model, vars_=vars_
+        )
     except DbtRunError as exc:
         raise _NotComparableError(code, _compile_detail(str(exc))) from exc
     matches = [
@@ -898,6 +935,7 @@ def _identity_fields(identity: dict[str, Any]) -> dict[str, Any]:
         "input_scope": identity.get("input_scope") or [],
         "key_columns": identity.get("key_columns"),
         "key_source": identity.get("key_source"),
+        "baseline_vars": identity.get("baseline_vars"),
     }
 
 
