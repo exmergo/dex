@@ -112,6 +112,41 @@ CACHE = DexCache(
     ],
 )
 
+# The shape from #1071: product_id holds one NULL, so the key walk cannot prove
+# it, while the PII-flagged email is unique and would draft as the grain.
+DIM_PRODUCTS = Dataset(
+    identifier="warehouse.main.dim_products",
+    columns=[
+        _col(
+            "product_id",
+            "integer",
+            null_fraction=0.05,
+            is_unique=True,
+            distinct_count_exact=True,
+        ),
+        _col(
+            "email",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+            pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+        ),
+    ],
+)
+DIM_USERS = Dataset(
+    identifier="warehouse.main.dim_users",
+    columns=[
+        _col(
+            "email",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+            pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+        ),
+        _key("user_id"),
+    ],
+)
+
 
 def _draft(sql: str, *, yml: str | None = None, cache: DexCache | None = CACHE):
     files = {"models/marts/fct.sql": sql}
@@ -1034,3 +1069,25 @@ def test_plan_does_not_name_union_cte_as_unprofiled_relation(shop, capsys):
     # Drafting should not report 'combined' as an unprofiled relation.
     assert not any("combined" in w for w in envelope.get("warnings", []))
     assert "fct_daily" in envelope["data"]["declarations"]
+
+
+def test_a_pii_flagged_key_is_not_silently_the_grain_when_a_plain_key_exists():
+    entry, _ = _draft(
+        "select email, user_id from {{ ref('dim_users') }}\n",
+        cache=DexCache(datasets=[DIM_USERS]),
+    )
+
+    grain = entry["drafted"]["grain"]
+    assert grain["value"] == ["user_id"]
+    assert "flagged as PII" not in grain["evidence"]
+
+
+def test_an_all_pii_grain_still_drafts_and_names_the_flag():
+    entry, _ = _draft(
+        "select product_id, email from {{ ref('dim_products') }}\n",
+        cache=DexCache(datasets=[DIM_PRODUCTS]),
+    )
+
+    grain = entry["drafted"]["grain"]
+    assert grain["value"] == ["email"]
+    assert "flagged as PII" in grain["evidence"]

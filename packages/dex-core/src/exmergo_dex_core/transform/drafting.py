@@ -446,8 +446,11 @@ class _Lineage:
 
         keys, evidence = self.keys(self.tree)
         if keys:
-            self.reading.grain = sorted(keys[0], key=self._output_order(outputs))
-            self.reading.grain_evidence = evidence
+            chosen, note = self._grain_choice(keys)
+            self.reading.grain = sorted(chosen, key=self._output_order(outputs))
+            self.reading.grain_evidence = (
+                evidence if note is None else f"{evidence}; {note}"
+            )
         else:
             self.reading.grain_withheld = evidence
 
@@ -749,6 +752,39 @@ class _Lineage:
                 "selected unchanged"
             )
         return carried, f"{base_evidence}, carried through unchanged"
+
+    def _grain_choice(
+        self, keys: list[frozenset[str]]
+    ) -> tuple[frozenset[str], str | None]:
+        """Which proven key drafts as the grain, and the note to append.
+
+        A candidate with no PII-flagged column wins over a flagged one, so a
+        profiled email never silently becomes the grain; when every proven
+        candidate is flagged, the first still drafts and the evidence names
+        the flag, so the proposal shows why it chose the column.
+        """
+
+        for key in keys:
+            if not self._pii_columns(key):
+                return key, None
+        flagged = ", ".join(sorted(self._pii_columns(keys[0])))
+        return keys[0], f"{flagged} is flagged as PII in the profile"
+
+    def _pii_columns(self, key: frozenset[str]) -> list[str]:
+        """The key's output columns whose origin profile carries a PII flag.
+
+        Columns with no readable origin or no profile count as unflagged, so
+        without a cache the draft degrades to the first proven key.
+        """
+        flagged: list[str] = []
+        for name in sorted(key):
+            origin = self.reading.origins.get(name.lower())
+            if origin is None:
+                continue
+            profile = _column(dataset_for(self.cache, origin.relation), origin.column)
+            if profile is not None and profile.pii is not None:
+                flagged.append(name)
+        return flagged
 
     def relation_keys(
         self, relation: Any, depth: int
