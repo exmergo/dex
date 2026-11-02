@@ -524,6 +524,27 @@ def test_an_install_path_outside_the_project_is_refused_untouched(
     assert not (project / "dev.duckdb").exists()
 
 
+def test_a_templated_install_path_is_refused_untouched(project, capsys, monkeypatch):
+    outside = project.parent / "rendered_pkgs"
+    (outside / "tiny_pkg").mkdir(parents=True)
+    kept = outside / "tiny_pkg" / "kept.sql"
+    kept.write_text("hand edit\n")
+    monkeypatch.setenv("DEX_TEST_PKGS", str(outside))
+    config = yaml.safe_load((project / "dbt_project.yml").read_text())
+    config["packages-install-path"] = "{{ env_var('DEX_TEST_PKGS') }}"
+    (project / "dbt_project.yml").write_text(yaml.safe_dump(config, sort_keys=False))
+
+    built = _build(capsys, "--cold-deps")
+
+    assert built["status"] == "error"
+    cold = built["data"]["cold_verification"]
+    assert cold["reinstalled"] is False
+    assert "templated" in cold["reason"]
+    assert kept.read_text() == "hand edit\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["tiny_pkg"]
+    assert not (project / "dev.duckdb").exists()
+
+
 def test_a_relative_local_package_keeps_the_lockfile_of_the_others(
     tmp_path, monkeypatch, capsys
 ):

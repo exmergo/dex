@@ -1304,13 +1304,23 @@ def packages_dir(project_dir: Path | str) -> Path:
     ``dbt_packages``. A templated value falls back to the default."""
 
     project = Path(project_dir)
-    configured = None
-    with contextlib.suppress(OSError, yaml.YAMLError, AttributeError):
-        parsed = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
-        configured = parsed.get("packages-install-path")
-    if not isinstance(configured, str) or not configured or "{{" in configured:
+    configured = _configured_install_path(project)
+    if not isinstance(configured, str) or not configured or _is_templated(configured):
         configured = "dbt_packages"
     return project / configured
+
+
+def _configured_install_path(project: Path) -> Any:
+    """``packages-install-path`` as written, before dbt renders it."""
+
+    with contextlib.suppress(OSError, yaml.YAMLError, AttributeError):
+        parsed = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+        return parsed.get("packages-install-path")
+    return None
+
+
+def _is_templated(value: Any) -> bool:
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
 def _keep_local_packages_reachable(shadow: Path, project: Path) -> bool:
@@ -1487,6 +1497,16 @@ def cold_checkout(
 
     project = Path(project_dir).resolve()
     with shadow_project(project, skip_packages=True) as shadow:
+        # dbt renders a templated path (`env_var()`) to somewhere only it can name,
+        # so nothing here can show that `dbt deps` would write inside the copy.
+        if _is_templated(_configured_install_path(shadow)):
+            reason = (
+                "packages-install-path is templated, so dex cannot show that a "
+                "reinstall stays isolated from the installed packages"
+            )
+            raise ColdReinstallError(
+                reason, {"ran": True, "reinstalled": False, "reason": reason}
+            )
         # An absolute or far-climbing packages-install-path names the same directory
         # from the copy as from the project, so `dbt deps` would write over it.
         if not Path(os.path.normpath(packages_dir(shadow))).is_relative_to(
