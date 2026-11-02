@@ -803,7 +803,14 @@ class _Lineage:
         if not proven:
             return [], f"{target} has no proven unique key in the cache"
         lowered = [frozenset(c.lower() for c in key) for key in proven]
-        return lowered, (f"{', '.join(proven[0])} is a proven unique key of {target}")
+        # The evidence cites every proven key, not just the first: the grain
+        # choice may prefer a later candidate (a PII-flagged first key, #1079),
+        # and the citation must name the key it proves.
+        shown = " + ".join(", ".join(key) for key in proven)
+        verb = (
+            "is a proven unique key" if len(proven) == 1 else "are proven unique keys"
+        )
+        return lowered, f"{shown} {verb} of {target}"
 
     def _equated(self, join: Any, joined_alias: str) -> frozenset[str]:
         """Joined-side columns the ON (or USING) requires equal to something."""
