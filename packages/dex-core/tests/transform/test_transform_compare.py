@@ -284,6 +284,10 @@ def test_a_parent_nobody_built_is_not_checked(project, tmp_path):
     result = engine.compare(plan_id)
     assert result.status == "not_checked"
     assert result.reason_code == "inputs_unsynchronized", result.detail
+    # #1058: name the exact build command with --select, not a bare transform build
+    # that agents then rewrite as raw `dbt run`.
+    assert "transform build --target dev --select" in result.detail, result.detail
+    assert "dbt run" not in result.detail
 
 
 def test_several_rewritten_models_need_a_choice(project):
