@@ -737,3 +737,32 @@ def test_an_included_cube_joining_a_proposed_one_is_held_back_with_it(
     assert any("dim_stores" in n for n in models["fct_orders"]["notes"])
     assert dim in models["fct_orders"]["next"]
     assert "plan_id" not in proposal
+
+
+def test_a_population_parent_that_names_nothing_is_refused(
+    tmp_path: Path, capsys, no_warehouse
+):
+    put(tmp_path, SHARED, SHARED_TEXT)
+    _configure(tmp_path, [SHARED])
+
+    rc, envelope = _cube_plan(
+        tmp_path,
+        capsys,
+        {
+            "declarations": [
+                {
+                    "model": "orders",
+                    "population": {
+                        "parent": {
+                            "model": "no_such_model",
+                            "key": {"order_id": "id"},
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    assert rc != 0
+    assert "no_such_model" in " ".join(envelope["errors"])
+    assert _stored_plans(tmp_path) == []

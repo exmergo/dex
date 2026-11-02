@@ -952,3 +952,19 @@ def _without_population(description: Any) -> str | None:
     if sep:
         return head
     return None if description.startswith("Population: ") else description
+
+
+def declaration_models(documents: Mapping[str, str]) -> dict[str, set[str]]:
+    """Each SLayer model in ``documents`` to the columns it exposes (#1030)."""
+
+    out: dict[str, set[str]] = {}
+    for entry in _parsed(documents).values():
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        cols: set[str] = set()
+        for column in entry.get("columns") or []:
+            if isinstance(column, dict) and isinstance(column.get("name"), str):
+                cols.add(column["name"].lower())
+        out[name.lower()] = cols
+    return out

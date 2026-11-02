@@ -168,6 +168,12 @@ def _annotate(
     for edit in edits:
         if edit.new_content is not None:
             documents[edit.path] = edit.new_content
+    surface = getattr(layer, "declaration_models", None)
+    if callable(surface):
+        from .native_population_parent import refuse_population_parents
+
+        refuse_population_parents(parsed, surface(documents), engine)
+
     result = layer.derive_semantic(
         SemanticDerivationRequest(
             mode="annotate",

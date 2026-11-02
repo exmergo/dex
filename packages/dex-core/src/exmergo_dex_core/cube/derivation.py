@@ -987,3 +987,25 @@ def _without_population(description: Any) -> str | None:
     if sep:
         return head
     return None if description.startswith("Population: ") else description
+
+
+def declaration_models(documents: Mapping[str, str]) -> dict[str, set[str]]:
+    """Each cube in ``documents`` to the members it exposes (#1030)."""
+
+    out: dict[str, set[str]] = {}
+    for text_body in documents.values():
+        try:
+            parsed = yaml.safe_load(text_body)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for cube in parsed.get("cubes") or []:
+            if not isinstance(cube, dict) or not isinstance(cube.get("name"), str):
+                continue
+            cols: set[str] = set()
+            for member in cube.get("dimensions") or []:
+                if isinstance(member, dict) and isinstance(member.get("name"), str):
+                    cols.add(member["name"].lower())
+            out[cube["name"].lower()] = cols
+    return out
