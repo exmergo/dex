@@ -745,7 +745,6 @@ class TestOssieDerivation(SemanticDerivationContract):
         )
 
 
-
 # --- population.parent on the native route (#1030) -----------------------------------
 
 

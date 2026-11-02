@@ -10,8 +10,12 @@ dbt model/seed/snapshot the project can resolve.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
+
+import yaml
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -91,14 +95,19 @@ def _dbt_parent_resolvable(
 
     Native-only installs and repositories without a dbt project return False
     without importing the dbt authoring surface beyond a cheap probe.
+
+    Parent *existence* (model SQL / seed / snapshot) must not depend on the
+    ``sql`` extra: ``transform.declarations`` imports the rewriter and sqlglot
+    at module import, so an ``[ossie]``-only install would otherwise treat every
+    real dbt parent as unresolved. Column parsing still needs sqlglot; when that
+    surface is absent, an existing parent is accepted the same way an
+    unparseable SELECT is.
     """
 
     if engine.repo_root is None:
         return False
     try:
         from ..dbt_project import DbtProjectError, load
-        from .declarations import _is_seed_or_snapshot, model_sql_path
-        from .plans import select_columns
     except ImportError:
         return False
 
@@ -109,10 +118,76 @@ def _dbt_parent_resolvable(
         return False
 
     files = {path: source.content for path, source in view.files.items()}
-    parent_sql = model_sql_path(files, view.model_paths, parent_model)
+    parent_sql = _model_sql_path(files, view.model_paths, parent_model)
     if parent_sql is not None:
-        produced = select_columns(files[parent_sql])
+        produced = _select_columns_if_available(files[parent_sql])
         if produced is None:
             return True
         return all(c.lower() in produced for c in parent_columns)
     return _is_seed_or_snapshot(files, view, parent_model)
+
+
+def _model_sql_path(
+    files: Mapping[str, str], model_paths: Iterable[str], model: str
+) -> str | None:
+    """The ``.sql`` file that defines ``model``, if the project has one.
+
+    Local copy of ``transform.declarations.model_sql_path`` so this module never
+    imports the rewriter (and sqlglot) just to resolve a parent name.
+    """
+
+    roots = [PurePosixPath(p) for p in model_paths]
+    for path in sorted(files):
+        candidate = PurePosixPath(path)
+        if candidate.suffix != ".sql" or candidate.stem != model:
+            continue
+        if any(root == candidate or root in candidate.parents for root in roots):
+            return path
+    return None
+
+
+def _is_seed_or_snapshot(files: Mapping[str, str], view: Any, name: str) -> bool:
+    """True when ``name`` is a seed CSV or a snapshot the project defines."""
+
+    seed_roots = [PurePosixPath(p) for p in view.seed_paths]
+    for path in files:
+        candidate = PurePosixPath(path)
+        if (
+            candidate.suffix == ".csv"
+            and candidate.stem == name
+            and any(root in candidate.parents for root in seed_roots)
+        ):
+            return True
+
+    roots = [PurePosixPath(p) for p in view.snapshot_paths]
+    block = re.compile(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}")
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if candidate.suffix == ".sql":
+            if any(r in candidate.parents for r in roots) and block.search(content):
+                return True
+        elif candidate.suffix in (".yml", ".yaml") and "snapshots" in content:
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError:
+                continue
+            entries = parsed.get("snapshots") if isinstance(parsed, dict) else None
+            if any(
+                isinstance(entry, dict) and entry.get("name") == name
+                for entry in (entries if isinstance(entries, list) else [])
+            ):
+                return True
+    return False
+
+
+def _select_columns_if_available(sql: str) -> set[str] | None:
+    """Outer SELECT column names, or ``None`` when sqlglot/parsing is unavailable."""
+
+    try:
+        from .plans import select_columns
+    except ImportError:
+        return None
+    try:
+        return select_columns(sql)
+    except ImportError:
+        return None

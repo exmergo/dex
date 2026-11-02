@@ -1127,7 +1127,6 @@ def _without_population(description: Any) -> str | None:
     return None if description.startswith("Population: ") else description
 
 
-
 def declaration_models(
     documents: Mapping[str, str], connector: str | None = None
 ) -> dict[str, set[str]]:

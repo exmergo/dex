@@ -585,7 +585,6 @@ def test_transform_declare_reports_the_companion_plan(
     assert proposal["plan_id"] in envelope["data"]["next"]
 
 
-
 def test_a_population_parent_that_names_nothing_is_refused(
     tmp_path: Path, capsys, no_storage_or_warehouse
 ):
