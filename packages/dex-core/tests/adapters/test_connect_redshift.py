@@ -6,6 +6,7 @@ client (charge) and the simulated server (statement_timeout)."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from exmergo_dex_core.connect import (
     resolve_redshift_connection,
 )
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -860,6 +862,26 @@ def test_escalation_skipped_when_budget_cannot_cover(fake_redshift_connection):
     assert fake_redshift_connection.data_statements == []
     notes = adapter.table_notes("dexdb.shop.customers")
     assert any("escalation skipped" in note for note in notes)
+
+
+def test_profile_never_counts_a_skipped_column_exactly(fake_redshift_connection):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    def null_free_rows(sql: str) -> FakeResult:
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(
+            rows=[{a: None if a[:3] in ("mn_", "mx_") else 100 for a in aliases}],
+            seconds=0.5,
+        )
+
+    fake_redshift_connection.row_resolver = null_free_rows
+    adapter = make_adapter(fake_redshift_connection)
+    columns = {c.name: c for c in profile(adapter, ["dexdb.shop.customers"])[0].columns}
+    assert columns["payload"].null_fraction == 0.0
+    assert columns["payload"].distinct_count is None
+    statements = [s.sql for s in fake_redshift_connection.data_statements]
+    assert 'COUNT(DISTINCT "payload")' not in " ".join(statements)
 
 
 def test_distinct_combination_counts_batch_into_one_guarded_statement(

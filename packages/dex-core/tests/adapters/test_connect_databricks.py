@@ -26,6 +26,7 @@ from exmergo_dex_core.adapters.databricks import (
 )
 from exmergo_dex_core.config import DatabricksTarget
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -483,6 +484,7 @@ def _aggregate_resolver(sql: str):
     for i in range(10):
         values[f"nn_{i}"] = 100
         values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"d_{i}"] = 100 if i == 0 else 40
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
     return [values]
@@ -592,6 +594,22 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_databricks)
         for note in adapter.table_notes("shop.core.customers")
     )
     assert data_statements(fake_databricks) == []
+
+
+def test_profile_never_counts_a_skipped_column_exactly(fake_databricks):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = _aggregate_resolver
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    columns = {c.name: c for c in profile(adapter, ["shop.core.events"])[0].columns}
+    for name in ("payload", "labels"):
+        assert columns[name].null_fraction == 0.0
+        assert columns[name].distinct_count is None
+    statements = [s.sql for s in data_statements(fake_databricks)]
+    assert "COUNT(DISTINCT `payload`)" not in " ".join(statements)
+    assert "COUNT(DISTINCT `labels`)" not in " ".join(statements)
 
 
 def test_distinct_combination_counts_batch_into_one_guarded_statement(

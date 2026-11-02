@@ -9,6 +9,8 @@ import pytest
 
 from exmergo_dex_core.adapters.duckdb import DuckDBAdapter, DuckDBReadOnlyError
 from exmergo_dex_core.connect import open_adapter
+from exmergo_dex_core.explore.profile import profile
+from exmergo_dex_core.explore.relationships import candidate_keys
 
 
 def test_capabilities_report_read_only(duckdb_file: Path):
@@ -188,3 +190,28 @@ def test_duckdb_in_scope_matches_attached_database(duckdb_file: Path):
         assert adapter.in_scope("other_warehouse.legacy") is False
     finally:
         adapter.close()
+
+
+def test_profile_never_counts_a_nested_column_exactly(tmp_path: Path):
+    """DuckDB can count a nested column, but the profile skips the type, so it
+    reports nulls only and cannot read as a key (#1050)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "nested.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE t AS SELECT i AS amount, {'a': i} AS s, [i] AS l, "
+        "map([i], [i]) AS m FROM range(50) r(i)"
+    )
+    conn.close()
+    adapter = DuckDBAdapter(path)
+    try:
+        identifier = next(o.identifier for o in adapter.list_objects())
+        dataset = profile(adapter, [identifier])[0]
+    finally:
+        adapter.close()
+    columns = {c.name: c for c in dataset.columns}
+    for name in ("s", "l", "m"):
+        assert columns[name].null_fraction == 0.0
+        assert columns[name].distinct_count is None
+    assert candidate_keys(dataset) == [["amount"]]
