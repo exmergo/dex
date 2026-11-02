@@ -232,6 +232,13 @@ class OssieSemanticLayer:
 
     # --- the derivation channel (#927, #500) ---------------------------------
 
+    def declaration_models(self, documents: dict[str, str]) -> dict[str, set[str]]:
+        """Datasets in ``documents`` and the columns/fields each exposes (#1030)."""
+
+        from .derivation import declaration_models as _models
+
+        return _models(documents, self.connector)
+
     def derive_semantic(self, request: Any) -> Any:
         """Declared marts as Ossie datasets; see :mod:`.derivation`.
 

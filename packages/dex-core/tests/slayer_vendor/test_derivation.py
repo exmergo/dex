@@ -583,3 +583,32 @@ def test_transform_declare_reports_the_companion_plan(
     proposal = envelope["data"]["semantic_proposal"]
     assert proposal["models"]["fct_orders"]["status"] == "included"
     assert proposal["plan_id"] in envelope["data"]["next"]
+
+
+def test_a_population_parent_that_names_nothing_is_refused(
+    tmp_path: Path, capsys, no_storage_or_warehouse
+):
+    put(tmp_path, CUSTOMERS, dump(customers(), comment="# authored\n"))
+    _configure(tmp_path, [CUSTOMERS])
+
+    rc, envelope = _slayer_plan(
+        tmp_path,
+        capsys,
+        {
+            "declarations": [
+                {
+                    "model": "customers",
+                    "population": {
+                        "parent": {
+                            "model": "no_such_model",
+                            "key": {"id": "id"},
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    assert rc != 0
+    assert "no_such_model" in " ".join(envelope["errors"])
+    assert _stored_plans(tmp_path) == []
