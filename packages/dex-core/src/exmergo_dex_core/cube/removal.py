@@ -384,7 +384,7 @@ def _view_changes(
     """The changes that apply includes/excludes or source cuts to one view."""
 
     sources = _child(node, "cubes")
-    listed = entry.get("cubes")
+    listed = _member(entry, "cubes")
     if sources is None or not isinstance(listed, list):
         return None
     changes: list[_Change] = []

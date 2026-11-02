@@ -1190,3 +1190,32 @@ def test_a_removal_cuts_a_view_source_written_with_capitalized_keys():
     )
 
     assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+
+
+def test_a_removal_cuts_a_view_source_under_capitalized_cubes():
+    """A view source under capitalized Cubes is recognized and cut."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    Cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    Cubes: []\n")
