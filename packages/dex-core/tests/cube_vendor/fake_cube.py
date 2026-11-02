@@ -134,6 +134,13 @@ def _template(sql: str | None) -> str | None:
     return "`" + sql.replace("{", "${") + "`"
 
 
+_CUBE_RELATIONSHIPS = {
+    "many_to_one": "belongsTo",
+    "one_to_many": "hasMany",
+    "one_to_one": "hasOne",
+}
+
+
 def meta_for(loaded: Any) -> dict[str, Any]:
     """``/v1/meta?extended=true`` for a loaded model, in Cube's own shape."""
 
@@ -161,6 +168,16 @@ def meta_for(loaded: Any) -> dict[str, Any]:
             "dimensions": [
                 member(cube.name, m) for m in cube.dimensions if not m.primary_key
             ],
+            "joins": [
+                {
+                    "name": join.reached_as,
+                    "sql": _template(join.sql),
+                    "relationship": _CUBE_RELATIONSHIPS.get(
+                        join.relationship, join.relationship
+                    ),
+                }
+                for join in cube.joins
+            ],
         }
         for cube in loaded.cubes
     ]
@@ -176,6 +193,7 @@ def meta_for(loaded: Any) -> dict[str, Any]:
                 "type": "view",
                 "measures": measures,
                 "dimensions": dimensions,
+                "joins": [],
             }
         )
     return {"cubes": cubes}

@@ -35,7 +35,7 @@ from typing import Any
 from ..cube_dialect import filter_refs, member_of, parse_where
 from ..errors import DexError
 from .model import MEASURE, Cube, Member
-from .validator import PREDEFINED_GRANULARITIES
+from .validator import PREDEFINED_GRANULARITIES, RELATIONSHIPS, canonical_key
 
 #: The connectors a Cube-rendered statement may run on in this release, each
 #: with the placeholder style Cube renders for it and the quote its identifiers
@@ -84,6 +84,8 @@ class Target:
     cube: str
     #: ``cube.member`` behind a view member, None for a cube member.
     alias_of: str | None = None
+    #: The view join path if from a view member, empty for a cube member.
+    join_path: tuple[str, ...] = ()
 
 
 @dataclass
@@ -111,7 +113,12 @@ def index(cubes: Sequence[Cube], views: Sequence[Any]) -> dict[str, Target]:
         for exposed in view.members:
             token = f"{view.name}.{exposed.name}"
             found[token] = Target(
-                token, exposed.kind, exposed.member, exposed.cube, exposed.source
+                token,
+                exposed.kind,
+                exposed.member,
+                exposed.cube,
+                exposed.source,
+                join_path=exposed.join_path,
             )
     return found
 
@@ -379,14 +386,22 @@ def check_renderer(
     means something else when a measure it reads changed. A referenced member
     Cube's API does not expose (a primary key, a ``public: false`` member) has
     nothing to compare against and is skipped; a named one must be served.
+    Every cube the query reaches has its joins compared as well: SQL and
+    canonical relationship.
     """
 
     served: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    served_joins: dict[tuple[str, str], Mapping[str, Any]] = {}
     for element in meta.get("cubes") or []:
+        element_name = element.get("name")
         for kind, key in (("measure", "measures"), ("dimension", "dimensions")):
             for entry in element.get(key) or []:
                 if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
                     served[entry["name"]] = (kind, entry)
+        if isinstance(element_name, str):
+            for entry in element.get("joins") or []:
+                if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
+                    served_joins[(element_name, entry["name"])] = entry
 
     def stale(token: str, why: str) -> StaleRendererError:
         return StaleRendererError(
@@ -429,6 +444,67 @@ def check_renderer(
                 )
             continue
         _compare(token, target.member, found, stale)
+
+    if cubes:
+        reached_cubes: dict[str, None] = {}
+        for token in (*tokens, *reached):
+            target = members.get(token)
+            if target is not None:
+                reached_cubes[target.cube] = None
+                if target.alias_of is not None:
+                    behind = members.get(target.alias_of)
+                    if behind is not None:
+                        reached_cubes[behind.cube] = None
+                if target.join_path:
+                    root = target.join_path[0]
+                    reached_cubes[root] = None
+                    curr = cubes.get(root)
+                    for segment in target.join_path[1:]:
+                        if curr is None:
+                            break
+                        join = curr.join_to(segment)
+                        if join is None:
+                            break
+                        reached_cubes[join.target] = None
+                        curr = cubes.get(join.target)
+        for cube_name in reached_cubes:
+            cube = cubes.get(cube_name)
+            if cube is None:
+                continue
+            for join in cube.joins:
+                join_name = join.reached_as
+                found_join = served_joins.get(
+                    (cube.name, join_name)
+                ) or served_joins.get((cube.name, join.target))
+                if found_join is None:
+                    raise stale(
+                        f"{cube.name} join to {join_name}",
+                        "is not in the server's /v1/meta",
+                    )
+                if "sql" not in found_join or found_join.get("sql") is None:
+                    raise stale(
+                        f"{cube.name} join to {join_name}",
+                        "has no SQL in the server's /v1/meta",
+                    )
+                if _norm(found_join.get("sql")) != _norm(join.sql):
+                    raise stale(
+                        f"{cube.name} join to {join_name}",
+                        "has different SQL there",
+                    )
+                raw_rel = found_join.get("relationship")
+                if raw_rel is None:
+                    raise stale(
+                        f"{cube.name} join to {join_name}",
+                        "has no relationship in the server's /v1/meta",
+                    )
+                canonical_served_rel = RELATIONSHIPS.get(
+                    canonical_key(str(raw_rel)), str(raw_rel)
+                )
+                if canonical_served_rel != join.relationship:
+                    raise stale(
+                        f"{cube.name} join to {join_name}",
+                        f"joins as {raw_rel} there and {join.relationship} here",
+                    )
 
 
 def referenced(
