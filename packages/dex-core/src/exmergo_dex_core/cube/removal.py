@@ -344,6 +344,28 @@ def _cube_changes(
     return changes
 
 
+def _source_path(item: Mapping[str, Any]) -> str | None:
+    """The join path of one view source, recognizing canonical join_path/joinPath."""
+
+    for k, v in item.items():
+        if canonical_key(str(k)) == "join_path" and v is not None:
+            return str(v)
+    return None
+
+
+def _source_includes(item: Mapping[str, Any]) -> set[str]:
+    """The member names explicitly included in one view source."""
+
+    raw = item.get("includes")
+    if not isinstance(raw, list):
+        return set()
+    return {
+        i.get("name") if isinstance(i, dict) else str(i)
+        for i in raw
+        if not isinstance(i, str) or i != "*"
+    }
+
+
 def _view_changes(
     text: str,
     node: yaml.MappingNode,
@@ -364,7 +386,7 @@ def _view_changes(
             (source_node, source)
             for source_node, source in zip(sources.value, listed, strict=True)
             if isinstance(source, dict)
-            and str(source.get("join_path")) == target["join_path"]
+            and _source_path(source) == target["join_path"]
             and source.get("alias") == target.get("alias")
         ]
         if len(matched) != 1 or not isinstance(matched[0][0], yaml.MappingNode):
@@ -381,16 +403,25 @@ def _view_changes(
         changes.extend(planned)
     removed = removal.get("removed_sources") or []
     if removed:
+        to_cut: list[dict[str, Any]] = []
+        for target in removed:
+            target_names = set(target.get("names") or [])
+            matched_sources = [
+                source
+                for source in listed
+                if isinstance(source, dict)
+                and _source_path(source) == target["join_path"]
+                and source.get("alias") == target.get("alias")
+                and (not target_names or _source_includes(source) == target_names)
+            ]
+            if len(matched_sources) != 1:
+                return None
+            to_cut.append(matched_sources[0])
 
         def source_selected(item: Any) -> bool:
-            if not isinstance(item, dict):
-                return False
-            for target in removed:
-                if str(item.get("join_path")) == target["join_path"] and item.get(
-                    "alias"
-                ) == target.get("alias"):
-                    return True
-            return False
+            """Whether this item is one of the matched sources to cut."""
+
+            return any(item is m for m in to_cut)
 
         planned = _cut(text, node, entry, "cubes", source_selected)
         if planned is None:

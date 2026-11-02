@@ -905,3 +905,98 @@ def test_a_removal_cuts_one_view_source_when_another_remains():
     raw = yaml.safe_load(edited)["views"][0]
     _view, findings = check_view(raw, "views.yml")
     assert not findings
+
+
+def test_a_removal_cuts_a_view_source_written_with_camel_case_join_path():
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - joinPath: orders\n"
+        "        includes: [revenue, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+
+
+def test_a_removal_disambiguates_sources_sharing_join_path_by_includes():
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count]\n"
+    )
+    raw = yaml.safe_load(edited)["views"][0]
+    _view, findings = check_view(raw, "views.yml")
+    assert not findings
+
+
+def test_a_removal_refuses_ambiguous_duplicate_sources():
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+    )
+
+    assert (
+        apply_removal(
+            text,
+            "views",
+            "sales",
+            {
+                "removed_sources": [
+                    {
+                        "join_path": "orders",
+                        "alias": None,
+                        "names": ["status"],
+                    }
+                ]
+            },
+        )
+        is None
+    )
