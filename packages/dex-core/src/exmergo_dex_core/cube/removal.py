@@ -191,6 +191,8 @@ def _held_back(removal: Mapping[str, Any]) -> bool:
 
 
 def _advisory(finding: DriftFinding, path: str) -> Proposal:
+    """The advisory proposal when a drift finding requires manual intervention."""
+
     removal = finding.data.get("removal") or {}
     name = finding.data.get("semantic_model")
     if removal.get("whole_model"):
@@ -200,18 +202,18 @@ def _advisory(finding: DriftFinding, path: str) -> Proposal:
             "reads it with `semantic cube update`; dex does neither, because a "
             "vanished table is as often a rename as a retirement"
         )
-    elif removal.get("empties_view"):
-        action = (
-            f"view '{name}' ({path}) would be left with no sources. "
-            "Add another source, or remove the view with `semantic cube update`; "
-            "dex does not drop a whole view on its own"
-        )
     elif removal.get("broken_sources"):
         action = (
             f"view '{name}' ({path}) has source(s) "
             f"{', '.join(removal['broken_sources'])} whose join path walks a join "
             "that goes. Re-route or remove them with `semantic cube update`; dex "
             "does not drop a view's source on its own"
+        )
+    elif removal.get("empties_view"):
+        action = (
+            f"view '{name}' ({path}) would be left with no sources. "
+            "Add another source, or remove the view with `semantic cube update`; "
+            "dex does not drop a whole view on its own"
         )
     elif removal.get("held_joins") and describe(removal) == "nothing":
         action = (
@@ -372,6 +374,8 @@ def _view_changes(
     entry: dict[str, Any],
     removal: Mapping[str, Any],
 ) -> list[_Change] | None:
+    """The changes that apply includes/excludes or source cuts to one view."""
+
     sources = _child(node, "cubes")
     listed = entry.get("cubes")
     if sources is None or not isinstance(listed, list):
@@ -382,18 +386,27 @@ def _view_changes(
     ]
     for key, target in wanted:
         names = set(target["names"])
+        target_source_names = (
+            set(target["source_names"]) if "source_names" in target else None
+        )
         matched = [
             (source_node, source)
             for source_node, source in zip(sources.value, listed, strict=True)
             if isinstance(source, dict)
             and _source_path(source) == target["join_path"]
             and source.get("alias") == target.get("alias")
+            and (
+                target_source_names is None
+                or _source_includes(source) == target_source_names
+            )
         ]
         if len(matched) != 1 or not isinstance(matched[0][0], yaml.MappingNode):
             return None
         source_node, source = matched[0]
 
         def selected(item: Any, names: set[str] = names) -> bool:
+            """Whether this item is one of the members named for removal."""
+
             name = item.get("name") if isinstance(item, dict) else item
             return name in names
 
@@ -403,20 +416,28 @@ def _view_changes(
         changes.extend(planned)
     removed = removal.get("removed_sources") or []
     if removed:
-        to_cut: list[dict[str, Any]] = []
+        counts: dict[tuple[str, Any, frozenset[str]], int] = {}
         for target in removed:
-            target_names = set(target.get("names") or [])
+            group_key = (
+                target["join_path"],
+                target.get("alias"),
+                frozenset(target.get("names") or []),
+            )
+            counts[group_key] = counts.get(group_key, 0) + 1
+
+        to_cut: list[dict[str, Any]] = []
+        for (join_path, alias, target_names), count in counts.items():
             matched_sources = [
                 source
                 for source in listed
                 if isinstance(source, dict)
-                and _source_path(source) == target["join_path"]
-                and source.get("alias") == target.get("alias")
+                and _source_path(source) == join_path
+                and source.get("alias") == alias
                 and (not target_names or _source_includes(source) == target_names)
             ]
-            if len(matched_sources) != 1:
+            if len(matched_sources) != count:
                 return None
-            to_cut.append(matched_sources[0])
+            to_cut.extend(matched_sources)
 
         def source_selected(item: Any) -> bool:
             """Whether this item is one of the matched sources to cut."""
@@ -431,6 +452,8 @@ def _view_changes(
 
 
 def _child(node: yaml.MappingNode, key: str) -> yaml.SequenceNode | None:
+    """Find the child sequence node matching a canonical key."""
+
     for key_node, value in node.value:
         if canonical_key(str(key_node.value)) == key and isinstance(
             value, yaml.SequenceNode
@@ -499,6 +522,8 @@ def _cut(
 def _proposal(
     finding: DriftFinding, kind: str, action: str, *, paths: list[str] | None = None
 ) -> Proposal:
+    """Construct a proposal for a schema drift finding."""
+
     from ..maintain.reconcile import Proposal
 
     return Proposal(

@@ -622,6 +622,8 @@ def test_a_file_with_a_key_cube_does_not_declare_is_advisory(repo: Path, capsys)
 
 
 def test_reconcile_view_left_with_no_sources_is_advisory(repo: Path, capsys):
+    """A view emptied of all sources produces an advisory proposal."""
+
     _write(
         repo,
         VIEWS_FILE,
@@ -652,6 +654,8 @@ def test_reconcile_view_left_with_no_sources_is_advisory(repo: Path, capsys):
 
 
 def test_reconcile_removes_emptied_view_source_when_another_remains(repo: Path, capsys):
+    """Removing one emptied source from a multi-source view applies mechanically."""
+
     _write(
         repo,
         VIEWS_FILE,
@@ -840,6 +844,8 @@ def test_a_removal_it_cannot_place_is_not_offered():
 
 
 def test_a_removal_cuts_a_view_source_whose_includes_all_go():
+    """A view source is cut when all its includes are dropped."""
+
     text = (
         "views:\n"
         "  - name: sales\n"
@@ -870,6 +876,8 @@ def test_a_removal_cuts_a_view_source_whose_includes_all_go():
 
 
 def test_a_removal_cuts_one_view_source_when_another_remains():
+    """Cutting one emptied view source leaves remaining sources intact."""
+
     text = (
         "views:\n"
         "  - name: sales\n"
@@ -908,6 +916,8 @@ def test_a_removal_cuts_one_view_source_when_another_remains():
 
 
 def test_a_removal_cuts_a_view_source_written_with_camel_case_join_path():
+    """A view source using camelCase joinPath is cut cleanly."""
+
     text = (
         "views:\n"
         "  - name: sales\n"
@@ -935,6 +945,8 @@ def test_a_removal_cuts_a_view_source_written_with_camel_case_join_path():
 
 
 def test_a_removal_disambiguates_sources_sharing_join_path_by_includes():
+    """Sources sharing join_path are disambiguated by their includes."""
+
     text = (
         "views:\n"
         "  - name: sales\n"
@@ -973,6 +985,8 @@ def test_a_removal_disambiguates_sources_sharing_join_path_by_includes():
 
 
 def test_a_removal_refuses_ambiguous_duplicate_sources():
+    """Refuse edit when duplicate sources cannot be disambiguated."""
+
     text = (
         "views:\n"
         "  - name: sales\n"
@@ -1000,3 +1014,104 @@ def test_a_removal_refuses_ambiguous_duplicate_sources():
         )
         is None
     )
+
+
+def test_a_removal_cuts_identical_duplicate_sources_when_target_count_matches():
+    """Identical duplicate sources are both cut when target count matches."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+        "      - join_path: orders\n"
+        "        includes: [status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "removed_sources": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["status"],
+                },
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["status"],
+                },
+            ]
+        },
+    )
+
+    assert edited == ("views:\n  - name: sales\n    cubes: []\n")
+
+
+def test_a_removal_disambiguates_partial_includes_by_source_names():
+    """Partial includes cuts use source_names to target the right source."""
+
+    text = (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue, status]\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count, status]\n"
+    )
+
+    edited = apply_removal(
+        text,
+        "views",
+        "sales",
+        {
+            "includes": [
+                {
+                    "join_path": "orders",
+                    "alias": None,
+                    "names": ["status"],
+                    "source_names": ["revenue", "status"],
+                }
+            ]
+        },
+    )
+
+    assert edited == (
+        "views:\n"
+        "  - name: sales\n"
+        "    cubes:\n"
+        "      - join_path: orders\n"
+        "        includes: [revenue]\n"
+        "      - join_path: orders\n"
+        "        includes: [order_count, status]\n"
+    )
+
+
+def test_advisory_retains_reroute_guidance_for_broken_source():
+    """Broken join paths retain re-route guidance even when empties_view is set."""
+
+    from exmergo_dex_core.cube.removal import _advisory
+    from exmergo_dex_core.maintain.drift import DriftFinding
+
+    finding = DriftFinding(
+        axis="schema",
+        code="declared_dependency_dropped",
+        identifier=None,
+        severity="medium",
+        detail="view 'sales' loses a source",
+        data={
+            "semantic_model": "sales",
+            "removal": {
+                "broken_sources": ["orders.customers"],
+                "empties_view": True,
+            },
+        },
+    )
+    proposal = _advisory(finding, "models/views.yml")
+    assert "whose join path walks a join that goes" in proposal.action
+    assert "Re-route or remove them" in proposal.action
