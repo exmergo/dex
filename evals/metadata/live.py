@@ -227,13 +227,27 @@ def _flags(command: str, start: int, quoted: list[tuple[int, int]]) -> list[str]
     flag inside quotes is data, not shell: ``transform plan "keep --cold-deps"``
     passes no flag, and ``--where "a; b"`` does not end the call. Global flags
     before the group (``dex --confirm transform build``) count too, since the
-    engine reads them the same way."""
+    engine reads them the same way. Two shell forms that look like separators
+    are not: a newline after a backslash continues the command, and the ``&`` of
+    a redirect (``2>&1``, ``>&``, ``&>``) belongs to the redirect."""
 
     def inside(position: int) -> bool:
         return any(begin <= position < stop for begin, stop in quoted)
 
+    def separates(position: int) -> bool:
+        char = command[position]
+        if char not in _SEPARATORS or inside(position):
+            return False
+        if char == "\n":
+            return command[position - 1 : position] != "\\"
+        if char == "&":
+            return command[position - 1 : position] != ">" and (
+                command[position + 1 : position + 2] != ">"
+            )
+        return True
+
     end = start
-    while end < len(command) and not (command[end] in _SEPARATORS and not inside(end)):
+    while end < len(command) and not separates(end):
         end += 1
     return list(
         dict.fromkeys(
