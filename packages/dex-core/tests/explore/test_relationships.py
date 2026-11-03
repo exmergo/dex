@@ -3001,6 +3001,7 @@ def test_a_key_that_mixes_value_shapes_is_restated_as_a_finding_code():
     assert mixed.severity == "low"
     assert mixed.detail == note
 
+
 def test_an_unproven_key_shape_note_is_restated_as_a_finding_code():
     """#1072: looks-like-a-key wording also yields mixed_identifier_shapes."""
 
@@ -3021,4 +3022,3 @@ def test_an_unproven_key_shape_note_is_restated_as_a_finding_code():
     (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
     assert mixed.column == "product_id"
     assert mixed.detail == note
-
