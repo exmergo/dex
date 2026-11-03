@@ -160,6 +160,17 @@ autovacuum's ANALYZE cadence. `json`, `jsonb`, arrays, `bytea`, `xml`,
 Tables above `postgres.max_full_profile_bytes` are profiled from a block
 sample (`TABLESAMPLE SYSTEM`), noted, with uniqueness not judged.
 
+**A cast key is measured through a guarded cast.** Postgres has no cast that
+returns NULL on failure, so where `transform plan` (identifier conversions) or
+`maintain verify` (join coverage) measures a key cast to `smallint`, `integer`
+or `bigint`, the probe casts the value only where its text is an integer in
+the type's range, and counts every other value as failed. The guard keeps
+every cast total, like the profiling probes, so it does not depend on the
+order Postgres evaluates a `CASE` in. A cast to any other type is reported
+`unchecked` with `reason_code: no_safe_cast_on_connector`.
+The guard reads the value as text, so a numeric, float or boolean source
+that Postgres would cast (`2.00`, `1e15`, `true`) also counts as failed.
+
 ## dbt builds
 
 `transform init` renders a `type: postgres` dev profile from the discovered

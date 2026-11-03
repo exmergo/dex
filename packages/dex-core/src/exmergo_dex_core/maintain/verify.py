@@ -2928,20 +2928,32 @@ def _null_checks(
 
 def _split_unsafe(pairs: list[tuple], dialect: str) -> tuple[list[tuple], list[tuple]]:
     """The pairs a probe can measure on ``dialect``, and those it cannot: a key
-    conversion that needs a safe cast where the dialect has none (#861)."""
+    conversion that needs a safe cast where the dialect has none and cannot
+    guard one either (#861, #1075)."""
+
+    import sqlglot
 
     from .. import sql_shape
 
     if dialect not in sql_shape.NO_SAFE_CAST:
         return pairs, []
+
+    def unsafe_template(template: str | None) -> bool:
+        if template is None or "TRY_CAST" not in template.upper():
+            return False
+        tree = sqlglot.parse_one(template.format("dex_key"), read="duckdb")
+        try:
+            sql_shape.with_safe_casts(tree, dialect)
+        except sql_shape.NoSafeCastError:
+            return True
+        return False
+
     keep: list[tuple] = []
     unsafe: list[tuple] = []
     for item in pairs:
         exprs = item[1].key_exprs()
         needs = exprs is not None and any(
-            "TRY_CAST" in (template or "").upper()
-            for side in exprs
-            for template in side
+            unsafe_template(template) for side in exprs for template in side
         )
         (unsafe if needs else keep).append(item)
     return keep, unsafe
