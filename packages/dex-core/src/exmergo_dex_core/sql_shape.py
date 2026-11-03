@@ -625,10 +625,59 @@ class NoSafeCastError(DexError, ValueError):
     ``reason_code: no_safe_cast_on_connector``."""
 
 
-#: Dialects with no safe cast at all: a probe that has to count the values a
-#: cast rejects cannot be written there, so it is reported unchecked rather
-#: than run as a cast that fails on the first such value.
+#: Dialects with no safe cast at all: a cast to a type :func:`_guarded_cast`
+#: covers is measured through that guard, and a probe that has to count the
+#: values any other cast rejects cannot be written there, so it is reported
+#: unchecked rather than run as a cast that fails on the first such value.
 NO_SAFE_CAST = frozenset({"postgres"})
+
+#: The integer types a guarded cast covers, with their ranges (#1075).
+_GUARDED_INTEGERS = {
+    exp.DataType.Type.SMALLINT: (-(2**15), 2**15 - 1),
+    exp.DataType.Type.INT: (-(2**31), 2**31 - 1),
+    exp.DataType.Type.BIGINT: (-(2**63), 2**63 - 1),
+}
+
+#: An integer as text: a sign, digits, surrounding whitespace. Leading zeros
+#: are free, and 19 significant digits is past BIGINT, so the NUMERIC cast the
+#: range test makes never meets a value too long for it. The whitespace is the
+#: ASCII set the integer and numeric parsers skip: ``[[:space:]]`` follows the
+#: locale and also matches Unicode spaces those parsers reject.
+_INTEGER_TEXT = r"^[ \t\n\r\v\f]*[+-]?0*[0-9]{1,19}[ \t\n\r\v\f]*$"
+
+
+def _guarded_cast(node: exp.TryCast, dialect: str) -> exp.Expression | None:
+    """``node`` as a cast whose argument is NULL wherever the value would not
+    convert, or None for a target type this does not cover.
+
+    Every CAST here is total, as in
+    :func:`~.adapters.base.type_contradiction_expressions`: its argument can
+    be converted on every row, so nothing depends on the engine evaluating a
+    CASE lazily (#307). The final cast reads the value as text, the form the
+    shape test checked, so a numeric, float or boolean source (``2.00``,
+    ``1e15``, ``true``) counts as failed even where Postgres would cast it. A
+    cast nested in its argument is made safe too, which the top-down rewrite
+    would not reach.
+    """
+
+    to = node.args.get("to")
+    bounds = _GUARDED_INTEGERS.get(to.this) if isinstance(to, exp.DataType) else None
+    if bounds is None:
+        return None
+    operand = with_safe_casts(node.this.copy(), dialect)
+    text = exp.Cast(this=operand, to=exp.DataType.build("text"))
+    # A nondeterministic collation rejects a regex, so the shape test reads C.
+    c_locale = exp.to_identifier("C", quoted=True)
+    c_text = exp.Collate(this=text.copy(), expression=c_locale)
+    shaped = exp.RegexpLike(this=c_text, expression=exp.Literal.string(_INTEGER_TEXT))
+    digits = exp.Case().when(shaped, text.copy()).else_(exp.Literal.string("0"))
+    in_range = exp.Between(
+        this=exp.Cast(this=digits, to=exp.DataType.build("numeric")),
+        low=exp.Literal.number(bounds[0]),
+        high=exp.Literal.number(bounds[1]),
+    )
+    value = exp.Case().when(exp.and_(shaped.copy(), in_range), text.copy())
+    return exp.Cast(this=value, to=to.copy())
 
 
 def dialect_safe_cast(node: exp.Expression, dialect: str) -> exp.Expression:
@@ -638,13 +687,18 @@ def dialect_safe_cast(node: exp.Expression, dialect: str) -> exp.Expression:
     ``CAST`` there, and as a ``CAST`` to a ``Nullable`` type on ClickHouse, and
     both throw on a value they cannot convert. That is a failed probe, and a
     warehouse message quoting the value. Snowflake's ``TRY_CAST`` also takes
-    only text, so the input is cast to text first.
+    only text, so the input is cast to text first. Postgres has no safe cast,
+    so an integer target is guarded (:func:`_guarded_cast`) and any other
+    raises :class:`NoSafeCastError`.
     """
 
     if not isinstance(node, exp.TryCast):
         return node
     if dialect in NO_SAFE_CAST:
-        raise NoSafeCastError(dialect)
+        guarded = _guarded_cast(node, dialect)
+        if guarded is None:
+            raise NoSafeCastError(dialect)
+        return guarded
     to = node.args.get("to")
     if dialect == "snowflake" and node.args.get("requires_string"):
         return node  # parsed from Snowflake: already its own TRY_CAST

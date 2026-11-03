@@ -81,7 +81,9 @@ See the cost-controls reference for the shared budget mechanism.
     `unsupported_expression` (a rewrite such as `regexp_replace` or a regex
     filter), `unsupported_scope` (a grouped, deduplicated or windowed scope, or
     a UNION branch, subquery or nested CTE, under `scope: "(unaligned)"`),
-    `no_safe_cast_on_connector` (Postgres has no cast that returns NULL),
+    `no_safe_cast_on_connector` (Postgres has no cast that returns NULL; a
+    cast to `smallint`, `integer` or `bigint` is measured through a guarded
+    cast instead),
     `unrenderable_sql`, `probe_refused`, `probe_failed`, `cap_reached` (4
     measurable conversions per model, 8 per plan).
   - What decides the status is what the conversion itself does: identifiers it

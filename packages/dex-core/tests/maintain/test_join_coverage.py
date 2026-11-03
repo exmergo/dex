@@ -887,18 +887,42 @@ def test_a_converted_key_probe_is_one_aggregate_select_on_every_dialect(dialect)
     )
     exprs = {id(rel): (("TRY_CAST(LOWER({}) AS INT)",), (None,))}
     if dialect == "postgres":
-        # No cast there returns NULL instead of failing: refused, not run.
+        # No cast there returns NULL instead of failing: a cast to a type the
+        # guard does not cover is refused, not run (#1075).
         from exmergo_dex_core.sql_shape import NoSafeCastError
 
+        dated = {id(rel): (("TRY_CAST({} AS DATE)",), (None,))}
         with pytest.raises(NoSafeCastError):
-            rel_mod.coverage_statements([rel], dialect, key_exprs=exprs)
-        return
+            rel_mod.coverage_statements([rel], dialect, key_exprs=dated)
     (statement,) = rel_mod.coverage_statements([rel], dialect, key_exprs=exprs)
     assert assert_select_only(statement, dialect=dialect)
     assert "dex_cov_failed_0" in statement.lower()
     # The safe form survives the dialect: sqlglot renders a TryCast it did not
-    # parse as a failing CAST on Snowflake and ClickHouse.
-    safe = {"bigquery": "SAFE_CAST(", "clickhouse": "accurateCastOrNull("}
+    # parse as a failing CAST on Snowflake and ClickHouse, and Postgres has no
+    # safe cast, so an integer cast is guarded by its shape and range there.
+    safe = {
+        "bigquery": "SAFE_CAST(",
+        "clickhouse": "accurateCastOrNull(",
+        "postgres": "BETWEEN -2147483648 AND 2147483647",
+    }
     assert safe.get(dialect, "TRY_CAST(") in statement
     if dialect == "snowflake":
         assert "TRY_CAST(CAST(" in statement
+
+
+def test_postgres_holds_back_only_the_casts_it_cannot_guard():
+    """On Postgres an integer key cast is measured through its guard, and a
+    cast to any other type is reported unchecked rather than run (#1075)."""
+
+    from types import SimpleNamespace
+
+    def pair(template):
+        return ("m", SimpleNamespace(key_exprs=lambda: ((template,), (None,))), None)
+
+    integer = pair("TRY_CAST(LOWER({}) AS BIGINT)")
+    dated = pair("TRY_CAST({} AS DATE)")
+    plain = pair(None)
+    keep, unsafe = verify_mod._split_unsafe([integer, dated, plain], "postgres")
+    assert keep == [integer, plain]
+    assert unsafe == [dated]
+    assert verify_mod._split_unsafe([dated], "duckdb") == ([dated], [])

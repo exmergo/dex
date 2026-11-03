@@ -485,22 +485,30 @@ def test_the_probes_are_aggregate_selects_on_every_dialect(dialect):
     prior = _tree("select product_id from db.s.raw")
     for index, _found in enumerate(ic.find_conversions(authored)):
         built = ic.conversion_probe(authored, index, dialect)
-        if dialect == "postgres":
-            # No cast there returns NULL instead of failing.
-            assert built.sql is None
-            assert built.code == "no_safe_cast_on_connector"
-            continue
         assert built.sql is not None, built
         assert assert_select_only(built.sql, dialect=dialect)
         assert "dex_raw" in built.sql
         # The hard cast is measured in its safe form, and it survives the
-        # dialect (sqlglot renders a fresh TryCast as CAST on some).
-        safe = {"bigquery": "SAFE_CAST(", "clickhouse": "accurateCastOrNull("}
+        # dialect (sqlglot renders a fresh TryCast as CAST on some). Postgres
+        # has none, so an integer cast is guarded by its shape and range.
+        safe = {
+            "bigquery": "SAFE_CAST(",
+            "clickhouse": "accurateCastOrNull(",
+            "postgres": "BETWEEN -2147483648 AND 2147483647",
+        }
         assert safe.get(dialect, "TRY_CAST(") in built.sql
         if dialect == "snowflake":
             assert "TRY_CAST(CAST(" in built.sql
     statement = ic.identity_probe(prior, authored, "product_id", dialect)
     assert assert_select_only(statement, dialect=dialect)
+
+
+def test_a_postgres_cast_it_cannot_guard_is_unchecked():
+    # Only the integer family is guarded on Postgres (#1075).
+    tree = _tree("select cast(k as date) as k from raw")
+    built = ic.conversion_probe(tree, 0, "postgres")
+    assert built.sql is None
+    assert built.code == "no_safe_cast_on_connector"
 
 
 def test_an_aggregating_scope_is_unchecked_rather_than_counted():

@@ -218,6 +218,107 @@ def test_from_relation_handles_non_select():
     assert sql_shape.from_relation(union) is None
 
 
+# --- a guarded cast where the dialect has no safe one (#1075) -----------------
+
+
+@pytest.mark.parametrize(
+    ("target", "low", "high"),
+    [
+        ("SMALLINT", -32768, 32767),
+        ("INT", -2147483648, 2147483647),
+        ("BIGINT", -9223372036854775808, 9223372036854775807),
+    ],
+)
+def test_a_postgres_integer_cast_is_guarded_by_shape_and_range(target, low, high):
+    sql = f"select try_cast(k as {target}) from t"  # noqa: S608
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    rendered = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="postgres")
+    assert "TRY_CAST" not in rendered
+    assert f"BETWEEN {low} AND {high}" in rendered
+    assert 'COLLATE "C" ~ \'' in rendered
+
+
+def test_a_cast_nested_in_a_guarded_one_is_guarded_too():
+    tree = sqlglot.parse_one(
+        "select try_cast(try_cast(k as bigint) as int) from t", read="duckdb"
+    )
+    rendered = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="postgres")
+    assert "CAST(k AS BIGINT)" not in rendered
+    assert "BETWEEN -9223372036854775808 AND 9223372036854775807" in rendered
+    dated = sqlglot.parse_one(
+        "select try_cast(try_cast(k as date) as int) from t", read="duckdb"
+    )
+    with pytest.raises(sql_shape.NoSafeCastError):
+        sql_shape.with_safe_casts(dated, "postgres")
+
+
+def test_a_postgres_cast_to_another_type_still_raises():
+    for target in ("DATE", "DECIMAL(10, 2)", "DOUBLE", "TINYINT"):
+        sql = f"select try_cast(k as {target}) from t"  # noqa: S608
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        with pytest.raises(sql_shape.NoSafeCastError):
+            sql_shape.with_safe_casts(tree, "postgres")
+
+
+def test_the_range_test_casts_a_total_argument():
+    """The NUMERIC cast inside the range test reads a CASE that falls back to
+    '0', so a value the shape test rejects never reaches it (#307)."""
+
+    tree = sqlglot.parse_one("select try_cast(k as int) from t", read="duckdb")
+    guarded = sql_shape.with_safe_casts(tree, "postgres")
+    (between,) = list(guarded.find_all(sqlglot.exp.Between))
+    inner = between.this
+    assert isinstance(inner, sqlglot.exp.Cast)
+    assert inner.args["to"].is_type("decimal")
+    assert isinstance(inner.this, sqlglot.exp.Case)
+    assert inner.this.args["default"] == sqlglot.exp.Literal.string("0")
+
+
+_SHARED_VALUES = [
+    ("7", 7),
+    (" -0042 ", -42),
+    ("99999999999999999999999", None),
+    ("12a", None),
+    ("1.5", None),
+    ("", None),
+    (None, None),
+]
+
+
+@pytest.mark.parametrize(
+    ("target", "low", "high"),
+    [
+        ("SMALLINT", -(2**15), 2**15 - 1),
+        ("INT", -(2**31), 2**31 - 1),
+        ("BIGINT", -(2**63), 2**63 - 1),
+    ],
+)
+def test_the_guarded_cast_returns_null_for_what_would_not_convert(target, low, high):
+    """Evaluated on DuckDB for the CASE and range logic: what the cast would
+    reject or overflow on is NULL, and every integer in range converts, up to
+    each bound and not one past it. DuckDB's regex classes are ASCII only,
+    unlike Postgres's locale-aware ones, so whitespace handling is proven by
+    the live Postgres integration suite."""
+
+    duckdb = pytest.importorskip("duckdb")
+    values = [
+        *_SHARED_VALUES,
+        (f"+{high}", high),
+        (str(low), low),
+        (str(high + 1), None),
+        (str(low - 1), None),
+    ]
+    sql = f"select try_cast(k as {target}) from t"  # noqa: S608
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    guarded = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="duckdb")
+    # Postgres NUMERIC has no precision limit; DuckDB's bare DECIMAL is (18, 3).
+    guarded = guarded.replace("AS DECIMAL)", "AS DECIMAL(38, 0))")
+    rows = ", ".join("(NULL)" if v is None else f"('{v}')" for v, _ in values)
+    sql = guarded.replace("FROM t", f"FROM (VALUES {rows}) AS t(k)")
+    got = [row[0] for row in duckdb.connect().execute(sql).fetchall()]
+    assert got == [expected for _, expected in values]
+
+
 def test_scope_identifiers_preserves_quoted_mixed_case_cte_names():
     """scope_identifiers retains original casing and quotes on cte identifiers."""
     sql = (

@@ -350,3 +350,91 @@ def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
     before = relations()
     assert_downstream_run(run_cli, capsys, root, 300)
     assert relations() == before
+
+
+def test_a_cast_key_is_measured_through_a_guard_live(pg_dsn):
+    """Postgres has no cast that returns NULL, so a key cast to an integer is
+    measured through a guard (#1075). Run as the probes `transform plan` and
+    `maintain verify` build: a value that is not an integer, one out of range
+    for `int`, and one padded with a Unicode space the integer parser rejects
+    each count as failed, and none fails the statement. ASCII whitespace,
+    which the parser skips, still converts."""
+
+    import psycopg
+    import sqlglot
+
+    from exmergo_dex_core.cache import Relationship, RelationshipKind
+    from exmergo_dex_core.explore import relationships as rel_mod
+    from exmergo_dex_core.transform import identifier_conversion as ic
+
+    def row(conn, sql: str) -> dict:
+        cursor = conn.execute(sql)
+        names = [c.name for c in cursor.description]
+        return dict(zip(names, cursor.fetchone(), strict=True))
+
+    def plan_probe(conn, relation: str) -> dict:
+        authored = sqlglot.parse_one(
+            f"select cast(code as int) as code_id from {relation}",  # noqa: S608
+            read="postgres",
+        )
+        built = ic.conversion_probe(authored, 0, "postgres")
+        assert built.sql is not None, built
+        return row(conn, built.sql)
+
+    em_space, no_break_space = "\u2003", "\u00a0"
+    with psycopg.connect(pg_dsn) as conn:
+        conn.execute("create temp table dex_codes (code text)")
+        values = ["1", " 7 ", "\t7", "x", "99999999999", f"{em_space}7"]
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                "insert into dex_codes values (%s)", [(v,) for v in values]
+            )
+        conn.execute("create temp table dex_ids (id int)")
+        conn.execute("insert into dex_ids values (1), (7)")
+
+        plan = plan_probe(conn, "pg_temp.dex_codes")
+        assert plan["input_rows"] == 6
+        assert plan["failed_rows"] == 3
+        assert plan["failed_entities"] == 3
+        assert plan["retained_entities"] == 3
+
+        rel = Relationship(
+            from_dataset="pg_temp.dex_codes",
+            from_columns=["code"],
+            to_dataset="pg_temp.dex_ids",
+            to_columns=["id"],
+            kind=RelationshipKind.DECLARED,
+        )
+        exprs = {id(rel): (("TRY_CAST({} AS INT)",), (None,))}
+        (statement,) = rel_mod.coverage_statements([rel], "postgres", key_exprs=exprs)
+        verify = row(conn, statement)
+        assert verify["dex_cov_eligible_0"] == 6
+        assert verify["dex_cov_matched_0"] == 3
+        assert verify["dex_cov_failed_0"] == 3
+        assert verify["dex_cov_failed_keys_0"] == 3
+
+        # An ICU collation counts more characters as space, the no-break
+        # space among them; the parser still rejects every one.
+        conn.execute('create temp table dex_icu_codes (code text collate "und-x-icu")')
+        icu_values = ["7", f"{no_break_space}7", f"7{em_space}"]
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                "insert into dex_icu_codes values (%s)", [(v,) for v in icu_values]
+            )
+        icu = plan_probe(conn, "pg_temp.dex_icu_codes")
+        assert icu["input_rows"] == 3
+        assert icu["failed_rows"] == 2
+
+        # Postgres refuses a regex under a nondeterministic collation, so the
+        # shape test reads the key as "C" and still runs.
+        conn.execute(
+            "create collation pg_temp.dex_ci (provider = icu,"
+            " locale = 'und-u-ks-level2', deterministic = false)"
+        )
+        conn.execute(
+            "create temp table dex_ci_codes (code text collate pg_temp.dex_ci)"
+        )
+        conn.execute("insert into dex_ci_codes values ('7'), ('x')")
+        ci = plan_probe(conn, "pg_temp.dex_ci_codes")
+        assert ci["input_rows"] == 2
+        assert ci["failed_rows"] == 1
