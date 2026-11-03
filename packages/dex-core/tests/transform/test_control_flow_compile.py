@@ -167,6 +167,36 @@ def test_compile_time_unsafe_query_is_refused(project, tmp_path, capsys, stateme
     assert not list((tmp_path / ".dex" / "plans").glob("*.json"))
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+    ],
+)
+def test_compile_time_nested_describe_is_refused_before_connection(
+    project, tmp_path, capsys, monkeypatch, statement
+):
+    # A minimal public planning fixture, separate from the parser-only repro.
+    from exmergo_dex_core.engine import DexEngine
+
+    def unexpected_adapter(*args, **kwargs):
+        pytest.fail("unsupported compile-time SQL must not open a warehouse")
+
+    monkeypatch.setattr(DexEngine, "_adapter", unexpected_adapter)
+    sql = (
+        "{% if execute %}{% do run_query("
+        + repr(statement)
+        + ") %}{% endif %} select 1 as id"
+    )
+    rc, out = _plan(tmp_path, capsys, sql)
+    assert rc == 1, out
+    assert out["reason"] == "guard"
+    assert "Describe" in " ".join(out["errors"])
+    assert "explore profile" in " ".join(out["errors"])
+    assert not list((tmp_path / ".dex" / "plans").glob("*.json"))
+
+
 def test_unsupported_adapter_introspection_is_refused(project, tmp_path, capsys):
     sql = (
         "{% if execute %}{% set r = adapter.get_columns_in_relation("

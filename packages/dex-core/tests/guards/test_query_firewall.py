@@ -5,11 +5,14 @@ is the point: the policy is static analysis."""
 from __future__ import annotations
 
 import pytest
+import sqlglot
 
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import QueryLimits
 from exmergo_dex_core.guards.query_firewall import (
     QueryRefusedError,
+    _query_outputs,
+    assert_query_shape,
     inspect_query,
 )
 
@@ -286,6 +289,73 @@ def test_pii_refusal_without_a_twin_still_refuses_cleanly(cache: DexCache):
 
 
 # --- refused: shape, resolution, and introspection -------------------------------
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+        "WITH unused AS (DESCRIBE SELECT 1 AS due_at) SELECT 1",
+        "SELECT * FROM ((DESCRIBE SELECT 1 AS due_at)) AS d",
+        "SELECT 1 UNION ALL (DESCRIBE SELECT 1 AS due_at)",
+        "SELECT (DESCRIBE SELECT 1 AS due_at)",
+        "SELECT COUNT((DESCRIBE SELECT 1 AS due_at))",
+    ],
+)
+def test_nested_introspection_is_refused_before_taint_analysis(sql, dialect, cache):
+    for inspect in (
+        lambda: assert_query_shape(sql, dialect=dialect),
+        lambda: inspect_query(sql, cache, LIMITS, dialect=dialect),
+    ):
+        with pytest.raises(QueryRefusedError, match="Describe") as exc:
+            inspect()
+        assert "explore profile" in str(exc.value)
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+        "SELECT 1 UNION ALL (DESCRIBE SELECT 1 AS due_at)",
+    ],
+)
+def test_taint_walker_defensively_refuses_unsupported_query_nodes(sql, dialect):
+    # Parse independently: an early shape refusal must not hide a walker crash.
+    tree = sqlglot.parse_one(sql, dialect=dialect)
+    with pytest.raises(QueryRefusedError, match="Describe"):
+        _query_outputs(tree, {}, {}, set(), dialect)
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH d AS (SELECT 1 AS due_at) SELECT due_at FROM d",
+        "SELECT * FROM ((SELECT 1 AS due_at)) AS d",
+        "SELECT 1 AS due_at UNION ALL SELECT 2 AS due_at",
+        "WITH d AS (SELECT ID FROM RAW_LISTINGS) SELECT ID FROM d",
+    ],
+)
+def test_supported_nested_queries_still_pass(sql, dialect, cache):
+    assert inspect_query(sql, cache, LIMITS, dialect=dialect).sql
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        ("WITH d AS (SELECT NAME FROM RAW_HOSTS) SELECT NAME FROM d", "PII-flagged"),
+        ("WITH d AS (DELETE FROM RAW_HOSTS RETURNING ID) SELECT * FROM d", "write/DDL"),
+        ("WITH d AS (SELECT query('SELECT 1')) SELECT * FROM d", "not permitted"),
+    ],
+)
+def test_nested_shapes_do_not_weaken_existing_refusals(sql, message, dialect, cache):
+    with pytest.raises(QueryRefusedError, match=message):
+        inspect_query(sql, cache, LIMITS, dialect=dialect)
 
 
 @pytest.mark.parametrize(
