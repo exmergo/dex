@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "rpt_subscription_activity"
+  ],
+  "prompt": "Build rpt_subscription_activity on dev, as models/marts/_marts.yml already declares it: for each subscription, when it was last active (last_activity_at) and how many activity events it has (activity_count)."
+}

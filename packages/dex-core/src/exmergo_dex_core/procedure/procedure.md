@@ -150,6 +150,19 @@ declares is `contract`.
   entities.
 - Test logic with `dex transform test --scaffold <model>` (dbt unit tests) and
   measure the tests with `dex transform test --mutate <model>`.
+- Repair the layer the request names, and settle which one before choosing a
+  remedy. "Modify our data" or "fix the source types" asks for an input change;
+  "make it build" or "adapt the project" asks for a project change; otherwise the
+  contract decides who owns the input (a seed the project loads, or a source a
+  loader owns), recorded as an assumption. A project change does not fulfil an
+  input request, and an input request authorizes no write Dex cannot make:
+  change a project seed through its CSV or `+column_types` and a build; for a
+  loader's source, write any migration as a reviewable file, say it was not run,
+  and report that part incomplete, never reaching for a raw database client. A
+  project request never changes the input. Check the requested postcondition on
+  the original relation (`explore profile` for types, aggregates for rows):
+  `--cold-deps` proves a project repair survives a reinstall, not that the data
+  changed.
 - Never edit installed packages (`dbt_packages/`) and never repair only in the
   warehouse: a reinstall or a reload undoes both. When a prerequisite blocks a
   deliverable, read `data.prerequisites` for its owner, its `plan_relation` and

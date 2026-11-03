@@ -120,8 +120,10 @@ class Session:
     #: procedure step such as "compare before apply" is graded on (#1049).
     dex_sequence: list[str] = field(default_factory=list)
     #: The same calls with what the transcript shows about each: ``label``,
-    #: ``plan`` (the literal id named, or ``None``) and, on a comparison,
-    #: ``verdict`` (see ``_compare_verdict``). A procedure step reads these.
+    #: ``plan`` (the literal id named, or ``None``), ``flags`` (the ``--flag``
+    #: names the call passed, without their dashes or values, see ``_flags``)
+    #: and, on a comparison, ``verdict`` (see ``_compare_verdict``). A procedure
+    #: step reads these.
     dex_calls: list[dict[str, Any]] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
@@ -215,6 +217,33 @@ def _is_quoted_data(
     return False
 
 
+_FLAG = re.compile(r"(?<![\w-])--([A-Za-z][\w-]*)")
+_SEPARATORS = ";&|\n"
+
+
+def _flags(command: str, start: int, quoted: list[tuple[int, int]]) -> list[str]:
+    """The ``--flags`` of the call starting at ``start``, up to the shell's next
+    command separator (``;``, ``&&``, ``||``, ``|``, a newline). A separator or a
+    flag inside quotes is data, not shell: ``transform plan "keep --cold-deps"``
+    passes no flag, and ``--where "a; b"`` does not end the call. Global flags
+    before the group (``dex --confirm transform build``) count too, since the
+    engine reads them the same way."""
+
+    def inside(position: int) -> bool:
+        return any(begin <= position < stop for begin, stop in quoted)
+
+    end = start
+    while end < len(command) and not (command[end] in _SEPARATORS and not inside(end)):
+        end += 1
+    return list(
+        dict.fromkeys(
+            match.group(1)
+            for match in _FLAG.finditer(command, start, end)
+            if not inside(match.start())
+        )
+    )
+
+
 # A literal plan id. `$PLAN`, a flag or a redirect names none this can read.
 _PLAN_ARGUMENT = re.compile(r"\s+(\w[\w.-]*)")
 _STATUS = re.compile(r'"status"\s*:\s*"(\w+)"')
@@ -297,6 +326,7 @@ def summarize(
                                         "label": label,
                                         "plan": plan.group(1) if plan else None,
                                         "verdict": None,
+                                        "flags": _flags(command, match.start(), quoted),
                                     },
                                 )
                             )

@@ -582,3 +582,102 @@ def test_a_failed_reinstall_names_the_required_deliverables(project, capsys):
 
     deliverables = built["data"]["completion"]["deliverables"]
     assert "pkg_task" in deliverables["missing"]["names"]
+
+
+def _undo_override(root: Path, capsys, *, keep_disable: bool, legacy_ts: str) -> dict:
+    config = yaml.safe_load((root / "dbt_project.yml").read_text())
+    if not keep_disable:
+        config.pop("models", None)
+    config["seeds"]["proj"]["raw_task"]["+column_types"]["legacy_ts"] = legacy_ts
+    payload = {
+        "edits": [
+            {"path": "models/pkg_task.sql", "kind": "model_sql", "op": "delete"},
+            {
+                "path": "dbt_project.yml",
+                "kind": "project_yml",
+                "content": yaml.safe_dump(config, sort_keys=False),
+            },
+        ]
+    }
+    edits = root / "undo.json"
+    edits.write_text(json.dumps(payload))
+    return _dex(
+        capsys,
+        "transform",
+        "plan",
+        "Repair the data instead",
+        "--edits-file",
+        str(edits),
+    )
+
+
+def test_an_override_gives_way_to_a_repair_of_the_projects_own_data(project, capsys):
+    # #1083: the request turned out to be about the data, which here is a seed
+    # the project owns. Deleting the override and re-enabling the package's model
+    # hands the name back to the package, so `rpt`'s ref does not dangle, and the
+    # seed retyped through `+column_types` reaches dev without a manual refresh.
+    _override(project, capsys)
+    assert _build(capsys)["status"] == "ok"
+    assert _column_type(project, "raw_task", "legacy_ts") == "INTEGER"
+
+    planned = _undo_override(project, capsys, keep_disable=False, legacy_ts="timestamp")
+    assert planned["status"] == "ok", planned["errors"]
+    applied = _dex(capsys, "transform", "apply", planned["data"]["plan_id"])
+    assert applied["status"] == "ok", applied["errors"]
+
+    built = _build(capsys, "--for-plan", planned["data"]["plan_id"])
+    assert built["status"] == "ok", built["errors"]
+    assert built["data"]["full_refresh"] == {"seeds": ["raw_task"], "success": True}
+    assert _column_type(project, "raw_task", "legacy_ts").startswith("TIMESTAMP")
+    statuses = {n["name"]: n["status"] for n in built["data"]["nodes"]}
+    assert statuses["pkg_task"] == "success"
+    assert [row[0] for row in _report_rows(project)] == [1, 2, 3]
+
+
+def test_deleting_an_override_whose_package_model_stays_disabled_is_refused(
+    project, capsys
+):
+    _override(project, capsys)
+    planned = _undo_override(project, capsys, keep_disable=True, legacy_ts="timestamp")
+    assert planned["status"] == "error"
+    assert "still references" in planned["errors"][0]
+    assert "pkg_task" in planned["errors"][0]
+
+
+@pytest.mark.parametrize(
+    ("models", "restored"),
+    [
+        (None, {"pkg_task": "tiny_pkg"}),
+        ({"tiny_pkg": {"staging": {"pkg_task": {"+enabled": False}}}}, {}),
+        # dbt reads the folder path: a model in staging/ is not configured here.
+        ({"tiny_pkg": {"pkg_task": {"+enabled": False}}}, {"pkg_task": "tiny_pkg"}),
+        ({"tiny_pkg": {"+enabled": False}}, {}),
+        ({"tiny_pkg": {"staging": {"enabled": False}}}, {}),
+        # The most specific level wins, as in dbt.
+        (
+            {"tiny_pkg": {"+enabled": False, "staging": {"+enabled": True}}},
+            {"pkg_task": "tiny_pkg"},
+        ),
+        ({"other": {"+enabled": False}}, {"pkg_task": "tiny_pkg"}),
+    ],
+    ids=[
+        "enabled",
+        "model-disabled",
+        "wrong-level",
+        "package-disabled",
+        "folder-disabled",
+        "re-enabled",
+        "other-package",
+    ],
+)
+def test_a_package_model_answers_a_deleted_name_only_where_enabled(
+    tmp_path, models, restored
+):
+    from exmergo_dex_core.transform.plans import _package_models_restored
+
+    staging = tmp_path / "dbt_packages/tiny/models/staging"
+    staging.mkdir(parents=True)
+    (tmp_path / "dbt_packages/tiny/dbt_project.yml").write_text("name: tiny_pkg\n")
+    (staging / "pkg_task.sql").write_text("select 1 as id\n")
+    project = yaml.safe_dump({"name": "proj", **({"models": models} if models else {})})
+    assert _package_models_restored(tmp_path, {"pkg_task", "rpt"}, project) == restored

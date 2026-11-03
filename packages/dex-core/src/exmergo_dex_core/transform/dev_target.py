@@ -430,13 +430,14 @@ def seed_relation_columns(
     repo_root: Path | str,
     config: DexConfig,
     connection: ConnectionSource | None = None,
-) -> Callable[[list[str]], dict[str, list[str]]] | None:
-    """A reader of relations' columns in the DuckDB file the dev target writes,
-    or ``None`` when that file does not exist yet.
+) -> Callable[[list[str]], dict[str, list[tuple[str, str]]]] | None:
+    """A reader of relations' columns, as ``(name, type)``, in the DuckDB file
+    the dev target writes, or ``None`` when that file does not exist yet.
 
-    It backs the build's seed check, which compares each seed's CSV header with
-    the table dbt would reload it into. A missing file holds no seed table, so
-    there is nothing to compare and no reason to ask dbt anything. The file is
+    It backs the build's seed check, which compares each seed's CSV header and
+    declared ``column_types`` with the table dbt would reload it into. A missing
+    file holds no seed table, so there is nothing to compare and no reason to ask
+    dbt anything. The file is
     the one the profile names, which a project may keep beside ``profiles.yml``
     rather than in the run directory. Each read opens it read-only and closes it
     before returning, because DuckDB lets one process write a file and dbt is
@@ -454,8 +455,8 @@ def seed_relation_columns(
     if database is None or not database.is_file():
         return None
 
-    def read(relations: list[str]) -> dict[str, list[str]]:
-        columns: dict[str, list[str]] = {}
+    def read(relations: list[str]) -> dict[str, list[tuple[str, str]]]:
+        columns: dict[str, list[tuple[str, str]]] = {}
         adapter = open_adapter(
             connector="duckdb",
             path=str(database),
@@ -469,7 +470,9 @@ def seed_relation_columns(
                 matched = match_identifier(strip_relation_quoting(relation), live)
                 if len(matched) == 1:
                     _meta, found = adapter.table_metadata(matched[0])
-                    columns[relation] = [column.name for column in found]
+                    columns[relation] = [
+                        (column.name, column.data_type) for column in found
+                    ]
         finally:
             adapter.close()
         return columns

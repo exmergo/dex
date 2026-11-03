@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "rpt_task_due"
+  ],
+  "prompt": "Build rpt_task_due on dev: one row per task with task_id, task_name and due_ts, read from the tiny_tasks package's tasks_task model. The project stopped building when we upgraded tiny_tasks. Please modify our data to match the new package."
+}

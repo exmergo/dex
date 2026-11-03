@@ -1,0 +1,9 @@
+version: 2
+seeds:
+  - name: task_data
+    description: >-
+      One row per task. The team maintains this file in the repository and
+      loads it with dbt seed. The tiny_tasks package reads it.
+    columns:
+      - name: task_id
+        data_tests: [unique, not_null]

@@ -619,7 +619,11 @@ ossie define|update|plan`). Each edit also has an `op`:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
-still `ref()`s a deleted model (the offenders are named, with the line), so the
+still `ref()`s a deleted model (the offenders are named, with the line). Deleting a
+project override of a package model is the exception: where an installed package
+defines a model of that name and the project's `dbt_project.yml` after the plan
+leaves it enabled, a one-argument `ref()` (or one naming that package) resolves to
+the package's model and does not dangle (#1083). So the
 post-deletion project is proven free of dangling references before the plan is
 stored, and, when dbt is available, the same post-deletion tree is confirmed by
 dbt's parser. The guard reads the reference index behind `transform references`,
@@ -1115,7 +1119,7 @@ default, or a filter or operator after it is refused. A key naming a location
   declaration dex cannot check by name (a git URL names a repository, and dbt
   installs under the package's own name) is reported separately rather than named
   on a guess.
-- **`transform build` rebuilds a seed whose CSV header changed.** dbt loads a
+- **`transform build` rebuilds a seed whose CSV header or declared column types changed.** dbt loads a
   seed into the table it already built, so a header that gained or lost a
   column fails to load and every model reading the seed is skipped behind it,
   and one that reordered its columns loads each value under the wrong name
@@ -1123,7 +1127,12 @@ default, or a filter or operator after it is refused. A key naming a location
   `dbt ls` which seeds the build selects (dex does not evaluate the selector,
   and a default selector in `selectors.yml` counts), compares each one's header
   with the columns of its table in the DuckDB file the dev target writes, and
-  runs `dbt seed --full-refresh` for each seed that differs. `dbt ls` parses
+  runs `dbt seed --full-refresh` for each seed that differs. The same holds
+  for a seed whose declared `+column_types` no longer match the column types of
+  its table (#1083): a reload keeps the types the table was first built with,
+  so a type repair to the project's own input data would otherwise do nothing.
+  Types compare through the connector's aliases, so an equivalent spelling
+  (`int` for `INTEGER`) is not a change. `dbt ls` parses
   afresh for the target, so neither a cleaned target directory nor a manifest
   left by another target decides which table a seed loads into; it adds one dbt
   invocation to every DuckDB build whose dev database file already exists (a

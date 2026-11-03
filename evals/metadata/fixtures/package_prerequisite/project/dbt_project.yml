@@ -1,0 +1,11 @@
+name: task_reporting
+version: "1.0.0"
+profile: task_reporting
+model-paths: ["models"]
+seed-paths: ["seeds"]
+models:
+  task_reporting:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
