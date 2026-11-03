@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 from pydantic import BaseModel, Field
 
 from ..adapters.base import Adapter, ColumnMeta, TableProbe, distinct_combination_sql
-from ..cache import Dataset, Relationship, match_identifier
+from ..cache import Dataset, Relationship, RelationshipKind, match_identifier
 from ..dbt_project import ProjectDefinitions
 from ..explore import relationships as rel_mod
 from .snapshot import SemanticLayer, SemanticModelDef, Snapshot, TransformLayer
@@ -75,6 +75,17 @@ _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 # not fire a finding against an exact current count. Retroactively re-measuring
 # the historical baseline is impossible, so deltas inside this band are gated.
 _APPROX_CARDINALITY_TOLERANCE = 0.02
+
+# A declared join the baseline holds no measurement of has no before to have
+# risen from, so it is held to a bound instead (#1095): at or above this orphan
+# fraction it is reported, and at or above the high mark it reads `high`. The
+# floor is `maintain verify`'s `join_orphans` floor and the fraction at which
+# `join_orphans_increased` turns high, so a legitimately sparse join is not
+# reported; the high mark is explore's `_ORPHAN_FINDING_THRESHOLD`, where a
+# declared join's probe is already reported as the project and the warehouse
+# disagreeing.
+_DECLARED_JOIN_ORPHANS_THRESHOLD = 0.2
+_DECLARED_JOIN_ORPHANS_HIGH = 0.5
 
 
 class DriftFinding(BaseModel):
@@ -899,6 +910,14 @@ class GrainPlan(NamedTuple):
     # them; read only for a key that lost uniqueness. Defaulted for the same
     # reason as above.
     widening_checks: list[tuple[Dataset, list[list[str]], int | None]] | None = None
+    # Joins the project or the semantic layer declares *now* that the baseline
+    # holds no measurement of (#1095): declared since the snapshot, re-declared
+    # on other columns, or pinned from a map that never verified them. Kept
+    # apart from `fanout_pairs` for the reason declared grains are kept apart
+    # from measured ones: with no before, the finding is the declaration
+    # against the data today, under its own code. Probed in the same batches
+    # as the fanout pairs. Defaulted for the same reason as above.
+    declared_join_checks: list[DeclaredJoinCheck] | None = None
 
     def scans(self) -> bool:
         """Whether the plan holds any statement that scans, and so is priced.
@@ -914,7 +933,42 @@ class GrainPlan(NamedTuple):
             or self.composite_checks
             or self.declared_composite_checks
             or self.join_cardinality_checks
+            or self.declared_join_checks
         )
+
+    def probed_joins(self) -> list[Relationship]:
+        """Every join the plan's overlap probes measure, in the order they run:
+        the baseline's measured joins, then the declared ones it has no
+        measurement of. The estimate and the run both read this, so they
+        batch, price and execute the same statements."""
+
+        return [live for _baseline, live in self.fanout_pairs] + [
+            check.relationship
+            for check in self.declared_join_checks or []
+            if check.measured_by is None
+        ]
+
+
+class DeclaredJoinCheck(NamedTuple):
+    """A join declared today, held to the absolute bound (#1095).
+
+    ``baseline`` says what the baseline holds for it: ``absent``, no edge with
+    these endpoints and column pairs (a join declared since the snapshot, or
+    re-declared on other columns); ``unmeasured``, such an edge with no orphan
+    fraction to compare with; or ``measured``, such an edge whose fraction was
+    already at or above the bound when the baseline was pinned, so the
+    relative comparison has accepted a declaration that never held as its
+    before. ``before`` is that fraction where there is one.
+
+    ``measured_by`` is the fanout pair's live copy where the plan already
+    re-runs the baseline edge: the check reads that probe rather than issuing a
+    second one for the same join.
+    """
+
+    relationship: Relationship
+    baseline: str
+    before: float | None = None
+    measured_by: Relationship | None = None
 
 
 class JoinCardinalityCheck(NamedTuple):
@@ -1097,6 +1151,23 @@ def grain_plan(
         to_columns, _ = describe(rel.to_dataset)
         if rel.from_columns[0] in from_columns and rel.to_columns[0] in to_columns:
             fanout_pairs.append((rel, rel.model_copy(deep=True)))
+    # The joins declared today, paired with the baseline's measurement where
+    # there is one, for the reason declared grains are surveyed against the
+    # current warehouse above: driven off the baseline alone, the check goes
+    # quiet on a join declared since the snapshot, which is exactly when a
+    # freshly declared join is most likely to be wrong (#1095). A paired join
+    # is already in `fanout_pairs` and judged against its before as it always
+    # was; only the unpaired ones are planned here.
+    declared_join_checks = _declared_join_checks(
+        definitions,
+        semantic,
+        snap,
+        sorted(current),
+        scope,
+        describe,
+        {_join_key(baseline): (baseline, live) for baseline, live in fanout_pairs},
+        notes,
+    )
     joins = [
         rel
         for rel in snap.warehouse.relationships
@@ -1158,6 +1229,7 @@ def grain_plan(
         cardinality_checks,
         joins,
         widening_checks,
+        declared_join_checks,
     )
 
 
@@ -1336,6 +1408,187 @@ def _join_cardinality_checks(
             + ", so their fanout was not checked; declare one (many_to_one, "
             "one_to_one, one_to_many or many_to_many) to have it verified"
         )
+    return checks
+
+
+def _join_key(rel: Relationship) -> tuple[str, str, frozenset[tuple[str, str]]]:
+    """A join's identity for pairing a declaration with the baseline: both
+    endpoints in direction, and the column pairs as a set, since the order the
+    pairs are written in is the project's spelling rather than part of the
+    join. Direction is kept because the orphan probe is directional: the same
+    two columns read the other way round are a different measurement."""
+
+    return (
+        rel.from_dataset.lower(),
+        rel.to_dataset.lower(),
+        frozenset(
+            (frm.lower(), to.lower())
+            for frm, to in zip(rel.from_columns, rel.to_columns, strict=False)
+        ),
+    )
+
+
+def _join_text(rel: Relationship) -> str:
+    """A join as a reader names it, every column pair included."""
+
+    if len(rel.from_columns) == 1:
+        return (
+            f"{rel.from_dataset}.{rel.from_columns[0]} -> "
+            f"{rel.to_dataset}.{rel.to_columns[0]}"
+        )
+    return (
+        f"{rel.from_dataset}({', '.join(rel.from_columns)}) -> "
+        f"{rel.to_dataset}({', '.join(rel.to_columns)})"
+    )
+
+
+def _current_declared_joins(
+    definitions: ProjectDefinitions | None,
+    semantic: SemanticLayer | None,
+    known: list[str],
+) -> tuple[list[Relationship], list[str]]:
+    """The joins declared today, resolved to warehouse identifiers, and the
+    declarations that did not resolve.
+
+    Read from the same two places the declared grains are: the project's
+    definitions (``relationships`` tests, native declared relationships, and
+    ``references:`` declarations, through the resolvers explore uses, so a join
+    that maps for ``explore map --use-project`` maps here), and a semantic
+    layer that captured its relationships. A ``many_to_many`` join states no
+    containment, so it gives an absolute bound nothing to hold it to and is
+    left out. One join reached through two channels is planned once.
+    """
+
+    joins: list[Relationship] = []
+    unresolved: list[str] = []
+    if definitions is not None:
+        for resolve in (
+            rel_mod.declared_relationships,
+            rel_mod.declaration_relationships,
+        ):
+            edges, edge_notes = resolve(definitions, known)
+            joins.extend(edges)
+            unresolved.extend(edge_notes)
+    if semantic is not None and semantic.relationships_and_keys_captured:
+        models = {sm.name: sm for sm in semantic.semantic_models}
+        for rel in semantic.relationships:
+            if not rel.column_pairs:
+                continue
+            if (
+                semantic.relationship_cardinality_captured
+                and rel.cardinality == "many_to_many"
+            ):
+                continue
+            ends = [
+                _matched_identifier(models[name], known) if name in models else []
+                for name in (rel.model, rel.to_model)
+            ]
+            if any(len(matches) != 1 for matches in ends):
+                unresolved.append(
+                    f"semantic join '{rel.name}' "
+                    + (
+                        "matches more than one object here"
+                        if any(len(matches) > 1 for matches in ends)
+                        else "references a relation not in this connection's inventory"
+                    )
+                )
+                continue
+            joins.append(
+                Relationship(
+                    from_dataset=ends[0][0],
+                    from_columns=[frm for frm, _to in rel.column_pairs],
+                    to_dataset=ends[1][0],
+                    to_columns=[to for _frm, to in rel.column_pairs],
+                    kind=RelationshipKind.DECLARED,
+                    confidence=1.0,
+                    declared_by=f"semantic join '{rel.name}'",
+                )
+            )
+    unique: dict[tuple, Relationship] = {}
+    for rel in joins:
+        unique.setdefault(_join_key(rel), rel)
+    return list(unique.values()), unresolved
+
+
+def _declared_join_checks(
+    definitions: ProjectDefinitions | None,
+    semantic: SemanticLayer | None,
+    snap: Snapshot,
+    known: list[str],
+    scope: set[str] | None,
+    describe,
+    paired: dict[tuple, tuple[Relationship, Relationship]],
+    notes: list[str],
+) -> list[DeclaredJoinCheck]:
+    """The declared joins to hold to an absolute bound (#1095): those the
+    baseline holds no measurement of, and those whose measurement already
+    cleared the bound when it was pinned.
+
+    ``paired`` maps each baseline join the plan already re-runs to its fanout
+    pair. A declaration the baseline measured under the bound stays judged
+    against its before alone. One measured at or above it is judged against
+    the bound too, reading the fanout pair's probe rather than a second one:
+    otherwise a join mis-declared before the snapshot is accepted as its own
+    before and never reported (the issue's step 4). Everything this cannot
+    survey is said in ``notes``, because an unchecked join is as silent as one
+    that holds.
+    """
+
+    declared, unresolved = _current_declared_joins(definitions, semantic, known)
+    if unresolved:
+        notes.append(
+            "declared join(s) that do not resolve to one warehouse object on "
+            "each side were not checked for orphans: " + "; ".join(unresolved)
+        )
+    baseline = {_join_key(rel): rel for rel in snap.warehouse.relationships}
+    checks: list[DeclaredJoinCheck] = []
+    for rel in declared:
+        key = _join_key(rel)
+        if scope is not None and not {rel.from_dataset, rel.to_dataset} & scope:
+            continue
+        if key in paired:
+            before_rel, live = paired[key]
+            before = before_rel.orphan_fraction
+            if before is not None and before >= _DECLARED_JOIN_ORPHANS_THRESHOLD:
+                checks.append(DeclaredJoinCheck(rel, "measured", before, live))
+            continue
+        # Matched without regard to case and rewritten to the warehouse's own
+        # spelling, as explore does before it probes (`adopt_profiled_spelling`):
+        # the probe quotes what it is given.
+        sides = []
+        missing: list[str] = []
+        for identifier, columns in (
+            (rel.from_dataset, rel.from_columns),
+            (rel.to_dataset, rel.to_columns),
+        ):
+            live = {name.lower(): name for name in describe(identifier)[0]}
+            sides.append([live.get(column.lower(), column) for column in columns])
+            missing += [
+                f"{identifier}.{column}"
+                for column in columns
+                if column.lower() not in live
+            ]
+        if missing:
+            notes.append(
+                f"the declared join {_join_text(rel)} names "
+                + ", ".join(missing)
+                + ", which the warehouse does not have, so its orphans were not "
+                "checked"
+            )
+            continue
+        rel.from_columns, rel.to_columns = sides
+        # A baseline edge the fanout pass did not re-run can still carry a
+        # fraction (its first column is spelled differently there), and then
+        # it was measured: the label says so rather than "unmeasured".
+        counterpart = baseline.get(key)
+        if counterpart is None:
+            checks.append(DeclaredJoinCheck(rel, "absent"))
+        elif counterpart.orphan_fraction is None:
+            checks.append(DeclaredJoinCheck(rel, "unmeasured"))
+        else:
+            checks.append(
+                DeclaredJoinCheck(rel, "measured", counterpart.orphan_fraction)
+            )
     return checks
 
 
@@ -1564,9 +1817,7 @@ def grain_estimate(
                 check.identifier, [check.columns], adapter.dialect
             )
         )
-    probes = rel_mod.probe_statements(
-        [live for _baseline, live in plan.fanout_pairs], adapter.dialect
-    )
+    probes = rel_mod.probe_statements(plan.probed_joins(), adapter.dialect)
     if probes:
         per_table["(join overlap probes)"] = sum(query_estimate(sql) for sql in probes)
     profile_estimate = getattr(adapter, "profile_estimate", None)
@@ -1666,6 +1917,12 @@ def grain_drift(
     before at all, because the combination comes from the project rather than
     from a measurement, so the honest reading of a failure is that the
     declaration is false rather than that anything changed.
+
+    The joins split the same way (#1095). ``join_orphans_increased`` compares a
+    baseline join's orphan fraction now with its fraction then.
+    ``declared_join_orphans`` is a join declared today that the baseline holds
+    no measurement of, held to ``_DECLARED_JOIN_ORPHANS_THRESHOLD`` instead,
+    since it has no before to have risen from.
 
     ``min_rows`` damps a uniqueness-regression finding to ``low`` below that row
     count (see :func:`_grain_severity`); it does not apply to
@@ -2005,8 +2262,9 @@ def grain_drift(
             )
         )
 
-    live = [copy for _baseline, copy in plan.fanout_pairs]
-    rel_mod.verify_relationships(adapter, live, timeout_seconds=timeout_seconds)
+    refused = rel_mod.verify_relationships(
+        adapter, plan.probed_joins(), timeout_seconds=timeout_seconds
+    )
     for baseline_rel, current_rel in plan.fanout_pairs:
         before = baseline_rel.orphan_fraction or 0.0
         after = current_rel.orphan_fraction
@@ -2031,6 +2289,7 @@ def grain_drift(
                 },
             )
         )
+    findings.extend(_declared_join_findings(plan, refused))
     aggregate_columns = getattr(adapter, "column_aggregates", None)
 
     def no_rows(dataset: Dataset) -> DriftFinding:
@@ -2139,6 +2398,93 @@ def grain_drift(
                 )
             )
 
+    return findings
+
+
+def _declared_join_findings(
+    plan: GrainPlan, refused: list[tuple[Relationship, str]]
+) -> list[DriftFinding]:
+    """``declared_join_orphans`` for each declared join the baseline holds no
+    measurement of and whose probe clears the bound (#1095).
+
+    A different code from ``join_orphans_increased`` for the reason
+    ``declared_grain_not_unique`` is a different code from
+    ``key_lost_uniqueness``: with no before, nothing is shown to have changed,
+    so the honest reading is that the declaration and the data disagree today.
+    What went unmeasured is noted on the plan rather than passed as clean.
+    """
+
+    refusals = {id(rel): text for rel, text in refused}
+    findings: list[DriftFinding] = []
+    for check in plan.declared_join_checks or []:
+        rel = check.relationship
+        measured = check.measured_by or rel
+        if id(measured) in refusals:
+            plan.notes.append(
+                "a declared join was not checked for orphans: " + refusals[id(measured)]
+            )
+            continue
+        fraction = measured.orphan_fraction
+        if fraction is None:
+            if measured.verified:
+                plan.notes.append(
+                    f"the declared join {_join_text(rel)} has no non-null keys on "
+                    f"{rel.from_dataset}, so it had no orphans to count"
+                )
+            continue
+        if fraction < _DECLARED_JOIN_ORPHANS_THRESHOLD:
+            continue
+        if (
+            check.measured_by is not None
+            and check.before is not None
+            and fraction > check.before
+        ):
+            continue  # `join_orphans_increased` already reports this join
+        if check.baseline == "absent":
+            before = "the baseline holds no such join"
+        elif check.before is None:
+            before = "the baseline holds this join with no orphan fraction to compare"
+        else:
+            before = (
+                f"the baseline already measured {check.before:.1%}, so the "
+                "declaration has not held since it was pinned"
+            )
+        findings.append(
+            DriftFinding(
+                axis="grain",
+                code="declared_join_orphans",
+                identifier=rel.from_dataset,
+                column=rel.from_columns[0],
+                severity=(
+                    "high" if fraction >= _DECLARED_JOIN_ORPHANS_HIGH else "medium"
+                ),
+                detail=(
+                    f"{_join_text(rel)} is declared, but {fraction:.1%} of its "
+                    "foreign keys have no match in the parent, at or above "
+                    f"{_DECLARED_JOIN_ORPHANS_THRESHOLD:.0%}; {before}, so this "
+                    "is the declaration against the data today rather than drift"
+                ),
+                data={
+                    "orphan_fraction": fraction,
+                    "threshold": _DECLARED_JOIN_ORPHANS_THRESHOLD,
+                    "baseline": check.baseline,
+                    **(
+                        {"orphan_fraction_baseline": check.before}
+                        if check.before is not None
+                        else {}
+                    ),
+                    "from_columns": list(rel.from_columns),
+                    "to_dataset": rel.to_dataset,
+                    "to_columns": list(rel.to_columns),
+                    **({"declared_by": rel.declared_by} if rel.declared_by else {}),
+                    **(
+                        {"declaration_sources": list(rel.declaration_sources)}
+                        if rel.declaration_sources
+                        else {}
+                    ),
+                },
+            )
+        )
     return findings
 
 

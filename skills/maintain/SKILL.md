@@ -316,6 +316,11 @@ is not described here.
   more. `declared_grain_not_unique` means nothing changed: the project declares a
   grain the data never had, so the fix is to the declaration (widen it, dedup
   upstream, or drop the claim), not to the data.
+- `join_orphans_increased` and `declared_join_orphans` split the same way. The
+  first is a baseline join that gained orphans. The second is a join declared
+  now and held to a fixed bound, because the baseline never measured it or
+  measured it already over the bound, so it says the declaration and the data
+  disagree today, not that anything changed.
 - On `maintain semantic`, read `unavailable` before hunting for an element kind.
   A native Ossie layer has no measures and no entities, so their absence is the
   format, not drift.

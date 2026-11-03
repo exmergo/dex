@@ -109,7 +109,13 @@ complete composite, never one column at a time. Aggregates only.
   from the count the axis already takes; that alone never lowers the severity,
   because a surrogate grain stays unique through a real duplicate.
 - Finding codes: `key_lost_uniqueness` (proven unique at baseline, not now),
-  `declared_grain_not_unique` (declared, never held), and
+  `declared_grain_not_unique` (declared, never held),
+  `join_orphans_increased` (a baseline join's orphan fraction rose),
+  `declared_join_orphans` (a join declared now, at 20% orphaned or more,
+  `high` from 50%, that the baseline never measured or measured at or above
+  that bound already; `data.baseline` is `absent`, `unmeasured` or
+  `measured`; the joins come from the project and from a native semantic
+  layer, not from a dbt layer's entities), and
   `join_cardinality_exceeded` (a join whose declared arity, SLayer's
   `cardinality` or Cube's `relationship`, does not hold: the side it says is
   unique is not).
