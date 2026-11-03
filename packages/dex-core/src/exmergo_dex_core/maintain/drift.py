@@ -1505,8 +1505,8 @@ def _current_declared_joins(
                 )
             )
     unique: dict[tuple, Relationship] = {}
-    for rel in joins:
-        unique.setdefault(_join_key(rel), rel)
+    for join in joins:
+        unique.setdefault(_join_key(join), join)
     return list(unique.values()), unresolved
 
 
@@ -1547,10 +1547,10 @@ def _declared_join_checks(
         if scope is not None and not {rel.from_dataset, rel.to_dataset} & scope:
             continue
         if key in paired:
-            before_rel, live = paired[key]
+            before_rel, fanout_live = paired[key]
             before = before_rel.orphan_fraction
             if before is not None and before >= _DECLARED_JOIN_ORPHANS_THRESHOLD:
-                checks.append(DeclaredJoinCheck(rel, "measured", before, live))
+                checks.append(DeclaredJoinCheck(rel, "measured", before, fanout_live))
             continue
         # Matched without regard to case and rewritten to the warehouse's own
         # spelling, as explore does before it probes (`adopt_profiled_spelling`):
