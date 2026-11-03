@@ -1017,6 +1017,32 @@ def test_declared_is_read_from_the_yaml_and_missing_names_the_rest():
     )
 
 
+def test_a_declared_grain_matching_a_proven_key_is_not_a_disagreement():
+    """A proven key the draft passed over still holds as a declaration (#1079).
+
+    email and user_id are both proven keys and the draft picks user_id because
+    email is flagged as PII; declaring [email] matches a proven key, so warning
+    that it disagrees with the drafted grain would contradict the contradiction
+    check, which already accepts it.
+    """
+    yml = """version: 2
+models:
+  - name: fct
+    config:
+      meta:
+        dex:
+          grain: [email]
+"""
+    entry, warnings = _draft(
+        "select email, user_id from {{ ref('dim_users') }}\n",
+        yml=yml,
+        cache=DexCache(datasets=[DIM_USERS]),
+    )
+
+    assert entry["drafted"]["grain"]["value"] == ["user_id"]
+    assert not any("declares grain" in w for w in warnings)
+
+
 def test_measure_warnings_group_only_columns_with_the_same_missing_fields():
     yml = """version: 2
 models:

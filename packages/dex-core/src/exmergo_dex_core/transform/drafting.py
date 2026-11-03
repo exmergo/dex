@@ -2164,7 +2164,23 @@ def _warnings(
     # that looks stale, so the generic disagreement would only repeat it.
     if (grain_declared := declared.get("grain")) and not grain_judged:
         grain = (drafted.get("grain") or {}).get("value")
-        if grain and sorted(c.lower() for c in grain_declared) != sorted(grain):
+        # The declaration is accepted against every proven key, not only the one
+        # the draft picked: the pick may pass over a proven key for its PII flag
+        # (#1079), and the contradiction check already reads the declaration that
+        # way, so warning here would send the two the opposite way.
+        proven = (
+            reading.proven_grains
+            if reading.proven_grains is not None
+            else ([grain] if grain else [])
+        )
+        if (
+            grain
+            and sorted(c.lower() for c in grain_declared) != sorted(grain)
+            and not any(
+                {c.lower() for c in key} == {c.lower() for c in grain_declared}
+                for key in proven
+            )
+        ):
             out.append(_grain_disagreement(model, grain_declared, grain))
     return out
 
