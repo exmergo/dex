@@ -3022,3 +3022,26 @@ def test_an_unproven_key_shape_note_is_restated_as_a_finding_code():
     (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
     assert mixed.column == "product_id"
     assert mixed.detail == note
+
+
+def test_mixed_identifier_shapes_preserves_whitespace_column_names():
+    """Column names with spaces still yield mixed_identifier_shapes (CR #1090)."""
+
+    note = (
+        "product line_id looks like a key but mixes value shapes: 40% numeric, "
+        "60% uuid; a cast to integer drops the uuids"
+    )
+    ds = Dataset(
+        identifier="db.main.orders",
+        row_count=10,
+        columns=[
+            ColumnProfile(
+                name="product line_id", data_type="VARCHAR", null_fraction=0.1
+            )
+        ],
+        data_quality=[note],
+    )
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
+    assert mixed.column == "product line_id"
+    assert mixed.detail == note

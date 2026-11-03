@@ -759,7 +759,7 @@ def profile_findings(
 #: The sentences `explore.profile._heterogeneous_key_note` writes
 # (proven candidate key, or id-shaped but unproven — #1072).
 _MIXED_SHAPES = re.compile(
-    r"^(\S+) (?:is a candidate key|looks like a key) but mixes value shapes: "
+    r"^(.+?) (?:is a candidate key|looks like a key) but mixes value shapes: "
 )
 
 
