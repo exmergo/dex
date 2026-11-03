@@ -1359,6 +1359,41 @@ def test_an_all_pii_grain_still_drafts_and_names_the_flag():
     assert "flagged as PII" in grain["evidence"]
 
 
+def test_a_pii_flag_under_a_configured_alias_is_still_seen():
+    """The profile can live under the model's alias, not its dbt name (#1079).
+
+    A DISTINCT proves the key from the statement alone, so the alias lookup in
+    the PII check is the one chance to read the flag.
+    """
+    users = Dataset(
+        identifier="warehouse.main.users_clean",
+        columns=[
+            _col(
+                "email",
+                null_fraction=0.0,
+                is_unique=True,
+                distinct_count_exact=True,
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+            ),
+            _key("user_id"),
+        ],
+    )
+    files = {
+        "models/marts/fct.sql": "select distinct email from {{ ref('stg_users') }}\n",
+        "models/staging/stg_users.sql": (
+            "{{ config(alias='users_clean') }}\n"
+            "select email, user_id from {{ source('raw', 'users') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct"], files, ["models"], DexCache(datasets=[users]), dialect="duckdb"
+    )
+
+    grain = drafts["fct"]["drafted"]["grain"]
+    assert grain["value"] == ["email"]
+    assert "flagged as PII" in grain["evidence"]
+
+
 def test_a_literal_alias_is_recognized_as_a_project_model():
     """A warehouse relation named by config(alias=…) maps back to the model."""
     from exmergo_dex_core.cache import (

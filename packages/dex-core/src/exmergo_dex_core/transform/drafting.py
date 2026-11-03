@@ -110,6 +110,11 @@ class _Reading:
     grain: list[str] | None = None
     grain_evidence: str | None = None
     grain_withheld: str | None = None
+    #: Every key the statement's output provably carries, not only the one the
+    #: grain preference picked. The contradiction check matches a declared
+    #: grain against this set, so an edit that strips a key of its proof still
+    #: contradicts a declaration resting on it (#1079).
+    proven_grains: list[list[str]] | None = None
     #: Columns the SQL filters or branches on, resolved to their upstream origin:
     #: (relation, column) -> the clauses that use it.
     used: dict[tuple[str, str], set[str]] = field(default_factory=dict)
@@ -185,7 +190,14 @@ def draft(
         if sql_path is None:
             continue
         declared = read_declared(files, model)
-        reading = read(files[sql_path], cache, dialect=dialect, vars=vars)
+        reading = read(
+            files[sql_path],
+            cache,
+            dialect=dialect,
+            vars=vars,
+            files=files,
+            model_paths=model_paths,
+        )
         drafted = _drafted(
             reading,
             cache,
@@ -397,7 +409,15 @@ def read(
     *,
     dialect: str,
     vars: Mapping[str, Any] | None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
 ) -> _Reading:
+    """Read one model's SQL statically.
+
+    ``files`` and ``model_paths`` let profile lookups resolve a relation to the
+    model's configured alias; readers without them still read everything that
+    needs no alias.
+    """
     reading = _Reading()
     try:
         from ..guards import dialect as dialect_guard
@@ -440,7 +460,9 @@ def read(
         )
         return reading
 
-    _Lineage(tree, relations, cache, reading).run()
+    _Lineage(
+        tree, relations, cache, reading, files=files, model_paths=model_paths
+    ).run()
     return reading
 
 
@@ -462,6 +484,8 @@ class _Lineage:
         relations: Mapping[str, str],
         cache: DexCache | None,
         reading: _Reading,
+        files: Mapping[str, str] | None = None,
+        model_paths: list[str] | None = None,
     ) -> None:
         from .. import sql_shape
 
@@ -470,6 +494,8 @@ class _Lineage:
         self.relations = relations
         self.cache = cache
         self.reading = reading
+        self.files = files or {}
+        self.model_paths = list(model_paths or [])
         self.ctes = {
             name: scope
             for name, scope in sql_shape.scopes(tree).items()
@@ -512,7 +538,9 @@ class _Lineage:
         keys, evidence = self.keys(self.tree)
         if keys:
             chosen, note = self._grain_choice(keys)
-            self.reading.grain = sorted(chosen, key=self._output_order(outputs))
+            order = self._output_order(outputs)
+            self.reading.grain = sorted(chosen, key=order)
+            self.reading.proven_grains = [sorted(key, key=order) for key in keys]
             self.reading.grain_evidence = (
                 evidence if note is None else f"{evidence}; {note}"
             )
@@ -959,14 +987,19 @@ class _Lineage:
         """The key's output columns whose origin profile carries a PII flag.
 
         Columns with no readable origin or no profile count as unflagged, so
-        without a cache the draft degrades to the first proven key.
+        without a cache the draft degrades to the first proven key. The origin
+        relation resolves through its model's configured alias, so a profile
+        stored under ``config(alias=…)`` still reads (#1079).
         """
         flagged: list[str] = []
         for name in sorted(key):
             origin = self.reading.origins.get(name.lower())
             if origin is None:
                 continue
-            profile = _column(dataset_for(self.cache, origin.relation), origin.column)
+            dataset = _dataset_for_model(
+                self.cache, origin.relation, self.files, self.model_paths
+            )
+            profile = _column(dataset, origin.column)
             if profile is not None and profile.pii is not None:
                 flagged.append(name)
         return flagged
