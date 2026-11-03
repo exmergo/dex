@@ -1097,8 +1097,8 @@ def _prior_for_renamed_output(
     projection = _projection_for(authored, authored_name)
     if projection is None:
         return None
-    sources = _source_columns(projection) & prior_out
-    if len(sources) != 1:
+    sources = _source_columns(projection)
+    if len(sources) != 1 or not sources <= prior_out:
         return None
     prior_name = next(iter(sources))
     authored_names = _outputs(authored) or set()
