@@ -1420,6 +1420,10 @@ def test_each_dex_call_records_its_flags():
             'R() { uv run --no-project --script /x/run.py "$@"; }; '
             "R transform build --cold-deps 2>&1 | head"
         ),
+        # A flag after a redirect or a line continuation is still the call's.
+        _bash("dex transform build --target dev 2>&1 --cold-deps | tail"),
+        _bash("dex transform build --target dev \\\n  --verify &> out.log --cold-deps"),
+        _bash("dex transform build --target dev & dex transform apply p3 --confirm"),
     ]
     calls = summarize(events, Session()).dex_calls
     assert [(c["label"], c["flags"]) for c in calls] == [
@@ -1428,6 +1432,11 @@ def test_each_dex_call_records_its_flags():
         ("transform apply", []),
         ("transform plan", ["edits-file"]),
         ("transform build", ["cold-deps"]),
+        ("transform build", ["target", "cold-deps"]),
+        ("transform build", ["target", "verify", "cold-deps"]),
+        # A lone `&` backgrounds the first call and starts the next.
+        ("transform build", ["target"]),
+        ("transform apply", ["confirm"]),
     ]
 
 
