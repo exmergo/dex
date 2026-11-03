@@ -59,8 +59,22 @@ def test_every_prefix_names_a_test_file_and_no_two_groups_share_one():
 
 
 def test_the_longest_prefix_decides():
-    assert ci_groups.group_of("tests/transform/test_mutation_command.py") == "mutation"
-    assert ci_groups.group_of("tests/transform/test_build.py") == "transform"
+    assert ci_groups.group_of("tests/transform/test_mutation_command.py") == "transform"
+    assert ci_groups.group_of("tests/transform/test_build.py") == "transform-build"
+    assert ci_groups.group_of("tests/transform/test_brand_new.py") == "transform"
+    assert ci_groups.group_of("tests/transform/test_retirement_build.py") == (
+        "transform-retirement"
+    )
+    assert ci_groups.group_of("tests/transform/test_retirement_plan.py") == (
+        "transform-contracts"
+    )
+
+
+@pytest.mark.parametrize("area", ["coverage", "equivalence", "downstream"])
+def test_real_mutation_cases_run_in_separate_groups(area):
+    assert ci_groups.group_of(f"tests/transform/test_mutation_{area}.py") == (
+        f"mutation-{area}"
+    )
 
 
 def test_every_group_has_test_files():
@@ -108,6 +122,7 @@ def test_every_group_writes_a_report_and_a_gate_verifies_them(jobs):
     name, job = _grouped_job(jobs)
     steps = json.dumps(job["steps"])
     assert "--ci-group-report" in steps
+    assert "--junitxml" in steps
     assert "upload-artifact" in steps
     gates = [
         gate

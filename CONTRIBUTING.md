@@ -48,12 +48,20 @@ Everything is deterministic and free: no cloud account is needed. The live
 cloud integration tests under `tests/integration/` collect as skipped with
 the enabling variables named in the skip reason.
 
-CI runs the same suite split into a few parallel groups by test file, defined in
+CI runs the same suite split into parallel groups by test file, defined in
 `tests/ci_groups.py`. A new test file needs nothing: it lands in the catch-all
 group until someone moves it. To reproduce one group locally, run
 `uv run pytest --ci-group <name>`. The `tests` check stays red unless the groups,
 between them, ran every collected test exactly once
 (`scripts/check_test_groups.py`).
+
+Transform groups cover builds, dependencies, artifact edits, retirement,
+refactors, contracts (including semantic authoring) and planning. Real dbt
+mutation cases run separately for coverage, equivalence and downstream routing;
+their command doubles stay with planning.
+Explore/maintain and packaging also have their own groups. Each job uploads
+JUnit test timings alongside the coverage report; use those to rebalance files
+when a group approaches five minutes including setup.
 
 To try a change by hand rather than through the suite, generate the demo
 warehouse in a scratch directory outside the checkout and drive the CLI against

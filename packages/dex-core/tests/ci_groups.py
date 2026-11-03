@@ -18,10 +18,11 @@ Rebalance by moving prefixes when one job becomes the long pole (each job
 prints its slowest tests). One prefix may not sit in two groups, which
 ``tests/test_ci_groups.py`` holds.
 
-Measured on 2026-10-30, as a share of the whole suite's time: the mutation
-tests ~38% (each runs dbt once per planted defect), the rest of transform ~26%
-(real `dbt parse`/`build` subprocesses), and everything else ~36%, of which the
-packaging tests' isolated installs are close to half.
+The 2026-11-03 CI run spent 18m30s in transform, 9m22s in mutation and
+6m24s in the catch-all. Real dbt subprocesses dominate transform and mutation;
+installing dependencies took seconds. Keep those acceptance tests intact and
+split by capability, with headroom for a five-minute job including setup.
+Every job uploads JUnit timings alongside its coverage report for rebalancing.
 """
 
 from __future__ import annotations
@@ -29,12 +30,52 @@ from __future__ import annotations
 CATCH_ALL = "rest"
 
 GROUPS: dict[str, tuple[str, ...]] = {
-    "mutation": ("tests/transform/test_mutation_command.py",),
+    "mutation-coverage": ("tests/transform/test_mutation_coverage.py",),
+    "mutation-equivalence": ("tests/transform/test_mutation_equivalence.py",),
+    "mutation-downstream": ("tests/transform/test_mutation_downstream.py",),
+    "transform-build": (
+        "tests/transform/test_build",
+        "tests/transform/test_previous_build",
+        "tests/transform/test_artifact_runtime",
+    ),
+    "transform-deps": (
+        "tests/transform/test_cold_deps.py",
+        "tests/transform/test_deps.py",
+        "tests/transform/test_guarded_deps.py",
+        "tests/transform/test_prerequisites.py",
+        "tests/transform/test_packages_install_path_readers.py",
+    ),
+    "transform-edits": (
+        "tests/transform/test_seed_",
+        "tests/transform/test_snapshot_edit.py",
+        "tests/transform/test_macro.py",
+        "tests/transform/test_analysis_edit.py",
+        "tests/transform/test_singular_test_edit.py",
+        "tests/transform/test_control_flow_compile.py",
+    ),
+    # Multi-build retirement cases run apart from both refactor comparisons and
+    # plan-only retirement contracts (assigned to contracts below).
+    "transform-retirement": ("tests/transform/test_retirement",),
+    "transform-refactor": (
+        "tests/transform/test_refactor",
+        "tests/transform/test_transform_compare.py",
+        "tests/transform/test_multiset_compare.py",
+    ),
+    "transform-contracts": (
+        "tests/transform/test_semantic",
+        "tests/transform/test_native_",
+        "tests/transform/test_parse.py",
+        "tests/transform/test_declar",
+        "tests/transform/test_contradictions.py",
+        "tests/transform/test_retirement_plan.py",
+    ),
+    # Planning, attribution, scaffolding and the fast mutation
+    # command doubles; also catches every new transform file by default.
     "transform": ("tests/transform/",),
-    # Everything else: the top-level files (packaging and the safety spine among
-    # them), explore, maintain, adapters, the semantic-layer vendors, guards,
-    # storage, demo, integration (skipped without credentials), and any
-    # directory added after this was written.
+    "explore-maintain": ("tests/explore/", "tests/maintain/", "tests/demo/"),
+    "packaging": ("tests/test_packaging.py",),
+    # Connectors, guards, storage, native semantic vendors, top-level contracts,
+    # integration (skipped without credentials), and any new test directory.
     CATCH_ALL: (),
 }
 
