@@ -1,0 +1,42 @@
+version: 2
+models:
+- name: rpt_subscription_activity
+  description: One row per subscription, with when it was last active and how many activity events it has.
+  config:
+    meta:
+      dex:
+        grain:
+        - subscription_id
+        population:
+          rule: One row per subscription.
+          parent:
+            model: stg_subscriptions
+            key:
+              subscription_id: subscription_id
+        assumptions:
+        - decision: Which relation drives the report
+          chosen: stg_subscriptions, with activity left-joined so a subscription with none counts zero
+          evidence: contract
+          detail: The declaration's population.parent is stg_subscriptions.
+  columns:
+  - name: subscription_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+  - name: last_activity_at
+    config:
+      meta:
+        dex:
+          role: time
+  - name: activity_count
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: sum
+          additivity: additive
+          unit: count

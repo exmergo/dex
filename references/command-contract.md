@@ -619,7 +619,11 @@ ossie define|update|plan`). Each edit also has an `op`:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
-still `ref()`s a deleted model (the offenders are named, with the line), so the
+still `ref()`s a deleted model (the offenders are named, with the line). Deleting a
+project override of a package model is the exception: where an installed package
+defines a model of that name and the project's `dbt_project.yml` after the plan
+leaves it enabled, a one-argument `ref()` (or one naming that package) resolves to
+the package's model and does not dangle (#1083). So the
 post-deletion project is proven free of dangling references before the plan is
 stored, and, when dbt is available, the same post-deletion tree is confirmed by
 dbt's parser. The guard reads the reference index behind `transform references`,
@@ -1054,7 +1058,7 @@ default, or a filter or operator after it is refused. A key naming a location
   a repair survives a reinstall: packages install into an isolated copy, the build
   runs from it, and `data.cold_verification` lists what the installed tree held
   that the reinstall did not reproduce. `data.prerequisites` names each failed
-  node's owner, plan relation and supported repairs. A missing dev DuckDB database is an
+  node's owner, plan relation, previous-run context and supported repairs. A missing dev DuckDB database is an
   actionable refusal when the project reads from sources (seed it first), and a
   warning otherwise. On failure the envelope's `errors[0]` carries the first
   real dbt message; the rest land in `warnings`, per-entry capped, deduplicated,
@@ -1092,6 +1096,28 @@ default, or a filter or operator after it is refused. A key naming a location
   block reads as "nothing required was built", which is the opposite of "nobody
   asked what was required".
 
+  `coverage.covered` means a requirement matched a node in run results, including
+  failed and skipped nodes; `missing` means it matched none. `built` lists the
+  requirements whose matched nodes all succeeded, and `not_built` lists the rest
+  (including missing requirements). These two lists partition `required`.
+  Older evidence documents without these fields still validate and expose them
+  as `null` (unavailable), not as a measured empty list. Outcome precedence and
+  artifact digests retain their existing meanings.
+
+  Each prerequisite's `previous_run` reports its status in the last available
+  build artifact from the same target and dbt runtime. Available evidence carries
+  `status`, `invocation_id`, `generated_at`, `selection`, `target`, `runtime` and
+  `run_results_sha256`. Unavailable evidence has `available: false` and a
+  `reason_code`: `no_previous_build`, `unreadable_previous_build`,
+  `incompatible_target`, `incompatible_runtime`, or `node_not_observed` (which
+  retains the run context). Completion blockers carry `previous_status` too.
+  This context never changes `plan_relation`: a different selection or source
+  tree may have produced it, and an earlier failure is not proof of causality.
+  Dex saves only statuses and run metadata in `dex_previous_build.json` beside
+  the resolved artifacts before pricing clears run results. Confirmation retries
+  reuse it; compile, seed, test and run results never replace it. Ordinary and
+  cold builds keep separate histories. No extra baseline build or scan runs.
+
   `selection.complete` is `null` for any selector using dbt's graph operators or
   method selectors. dex does not evaluate dbt's selector language, and a second
   implementation of it would disagree with dbt's own.
@@ -1115,7 +1141,7 @@ default, or a filter or operator after it is refused. A key naming a location
   declaration dex cannot check by name (a git URL names a repository, and dbt
   installs under the package's own name) is reported separately rather than named
   on a guess.
-- **`transform build` rebuilds a seed whose CSV header changed.** dbt loads a
+- **`transform build` rebuilds a seed whose CSV header or declared column types changed.** dbt loads a
   seed into the table it already built, so a header that gained or lost a
   column fails to load and every model reading the seed is skipped behind it,
   and one that reordered its columns loads each value under the wrong name
@@ -1123,7 +1149,20 @@ default, or a filter or operator after it is refused. A key naming a location
   `dbt ls` which seeds the build selects (dex does not evaluate the selector,
   and a default selector in `selectors.yml` counts), compares each one's header
   with the columns of its table in the DuckDB file the dev target writes, and
-  runs `dbt seed --full-refresh` for each seed that differs. `dbt ls` parses
+  runs `dbt seed --full-refresh` for each seed that differs. The same holds
+  for a seed whose declared `+column_types` no longer match the column types of
+  its table (#1083): a reload keeps the types the table was first built with,
+  so a type repair to the project's own input data would otherwise do nothing.
+  Types compare through the connector's aliases, so an equivalent spelling
+  (`int` for `INTEGER`) is not a change. Removing a previously applied type
+  declaration also rebuilds the selected seed, restoring CSV inference. Dex
+  remembers successful seed loads in `dex_seed_column_types.json` beside the
+  runtime's artifacts before pricing or `dbt ls` can replace the manifest.
+  Failed and unselected seeds do not update their entries; timestamps prevent
+  an older artifact from replacing a newer load. Ordinary and cold builds share
+  this record for their common dev seeds, independently of prerequisite history.
+  It adds no scan. Without an available applied contract, use `--full-refresh`
+  explicitly when removing a type declaration. `dbt ls` parses
   afresh for the target, so neither a cleaned target directory nor a manifest
   left by another target decides which table a seed loads into; it adds one dbt
   invocation to every DuckDB build whose dev database file already exists (a
@@ -1236,8 +1275,9 @@ default, or a filter or operator after it is refused. A key naming a location
 
   `data.verification.ran` is always present: a build that did not verify and a
   build that verified and found nothing are different answers, and only the
-  second means the models are clean. When it ran, the payload adds `scope` (the
-  models this build ran), `findings` and `finding_count` in the shape `maintain
+  second means the models are clean. When it ran, the payload adds `scope` (only
+  models with status `success` in this invocation), `scope_not_built` (the other
+  reported models), `findings` and `finding_count` in the shape `maintain
   verify` returns them, and `suppressed`, naming every finding class that did
   not run and why.
 
@@ -1245,8 +1285,8 @@ default, or a filter or operator after it is refused. A key naming a location
   verify`, in the build's `nodes`, and in the per-node estimate. A versioned
   model carries its version, `dim_customers.v2`, the latest one included, because
   two versions are two relations that share one `name` and either can fail, lose
-  rows, or go missing on its own. The sweep's scope is the exact nodes the build
-  ran, so a build of `dim_customers.v2` never judges `dim_customers.v1`. As in
+  rows, or go missing on its own. The sweep's scope names the successful models
+  from the exact nodes the build ran, so a build of `dim_customers.v2` never judges `dim_customers.v1`. As in
   dbt's `--select`, `maintain verify dim_customers` selects every version and
   `maintain verify dim_customers.v2` selects one.
 

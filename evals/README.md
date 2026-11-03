@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Ten fixture projects, written for this suite and derived from no benchmark task,
+Thirteen fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -148,17 +148,35 @@ with tasks phrased the way users ask:
 | `blocked_report` | `finish_team_activity`: add a column to a report behind forty staging models | a membership intermediate fails on a date stored as text, so a build skips the report while every staging model succeeds (#855): the intermediate repaired without dropping a member, the report rebuilt with the new column |
 | `protected_report` | `preserve_comments`: build a report whose explicit output contract includes protected text | the comments column and its type, values, NULLs and empty strings preserved without retrieving examples; a read refusal does not authorize redaction (#1084) |
 | `protected_report` | `redact_comments`: the user expressly requests typed NULL comments | the same schema and every report preserved, with comments redacted because the request requires it |
+| `package_prerequisite` | `adapt_project`: a report blocked by an upgraded package; the vendor-owned source cannot change, so adapt the project | the package model's coalesce of an all-NULL integer column fails. Graded: a durable project repair (the gate reinstalls packages, so an edit under `dbt_packages/` fails it), every task kept with a timestamp, the vendor's `raw.task_data` unchanged in the agent's own warehouse, and `transform build --cold-deps` after the last apply (#1057, #860) |
+| `package_prerequisite` | `data_repair_unavailable`: the same report, and "please modify our data to match the new package" | Dex cannot write a vendor-owned source. Either the report is built through the project, or it is left blocked (`blocked_reported`), and either way the data change is reported as not done: the final message names `task_data` and `due_at` and does not claim the source changed, and the source is untouched (no raw client bypassing the read-only guard) (#1083) |
+| `seeded_prerequisite` | `repair_seed_data`: the same request, where `task_data` is a seed the project owns | the data repaired through `+column_types` and a build: the seed relation's `due_at` is a timestamp both on the gate's build and in the agent's dev warehouse. A project override alone builds the report and fails (#1083) |
+| `seeded_prerequisite` | `preserve_seed_data`: leave the seed and its types alone and adapt the project | the seed's `due_at` still an integer in both places, the report built through a project repair, and `--cold-deps` after the last apply |
+| `subscription_activity` | `build_last_activity`: a report the project declares as one row per subscription (`population.parent`) | on the agent's data every subscription has one activity, so a report driven from the activity table passes every runtime check; only `transform plan`'s `population_parent` contradiction catches it (#1029). The gate grades on a holdout with a subscription that has no activity and one with two |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
 `task.json`, a `truth.json`, an optional `setup/` overlay (a fix task's broken
-starting state) and a `reference/` overlay (a correct answer).
+starting state) and a `reference/` overlay (a correct answer). Two optional parts
+serve the prerequisite tasks:
+
+- `warehouse.py` may define `grading_tables(seed)`, a holdout the build gate
+  grades on instead of the agent's data, pinned by its own digest. It exposes a
+  defect the agent's own data cannot show.
+- `packages/<name>/` is a dbt package. Each workspace serves it from its own git
+  repository beside the workspace (`<workspace>.packages/`), declares it in
+  `packages.yml` with an absolute `file://` URL and a revision, and installs it,
+  so the agent starts with a populated `dbt_packages/`. It is a git package rather
+  than `local:` because dbt links a local package, and an edit made through
+  `dbt_packages/` would then survive a reinstall. No network is needed.
 
 ### What each number means
 
 - **Build gate** (pass or fail, per task): a cold `dbt parse` and `dbt build` of
-  the result, in a fresh copy with no `target/`, on a freshly generated warehouse,
-  and no model with two YAML entries. A failure zeroes the task, because a
+  the result, in a fresh copy with no `target/` and no `dbt_packages/`, on a
+  freshly generated warehouse, and no model with two YAML entries. A project that
+  declares packages runs `dbt deps` first, so the gate is also a reinstall: a
+  repair made only under `dbt_packages/` does not survive it. A failure zeroes the task, because a
   declaration that breaks the parse costs more than every declaration it adds. It
   is not a threshold: the run exits 1 when any task fails it.
 - **Completeness** (0 to 1, per task): the share of required fields present on
@@ -172,6 +190,20 @@ starting state) and a `reference/` overlay (a correct answer).
 - **Checks** (0 to 1, per task): SQL over the built relation, such as "every
   account is present" or "shares sum to 1". They catch a right declaration on
   wrong SQL.
+- **Workspace** (pass or fail, only on tasks that have `workspace_checks`, `-`
+  otherwise): SQL over the warehouse the agent left in its own workspace. The
+  gate rebuilds the data from the generator, so this is the only place a change
+  the agent made to the data, or failed to make, can be seen: a vendor-owned
+  source written through a raw database client, or a seed repair that never
+  reached dev (#1083). A check marked `live_only` is skipped on a reference run,
+  which builds nothing there. A failure makes the CLI exit nonzero, as privacy
+  does.
+- **Report** (pass or fail, live runs only, on tasks that grade it): whether the
+  agent's final message reports the part of the request it could not do. It
+  must name the listed objects, state that the change to the source was not
+  performed, and contain no sentence claiming the source or the data now changed
+  without a negation. A deterministic, bounded heuristic over sentences, not a
+  judge of prose: a paraphrase it does not recognise reads as a miss.
 - **Attribution** (0 to 1, only on tasks that grade it, `-` otherwise): whether
   every assumption about the decision the task turns on carries the tier that
   actually settled it (#1026). It is graded apart from correctness and checks, so
@@ -188,13 +220,24 @@ starting state) and a `reference/` overlay (a correct answer).
   both calls name a plan the ids must match, and where either does not, no other
   apply may sit between them. `not_checked` and a comparison that never ran are
   not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
-  `build_after_apply` passes when a `transform build` follows the last apply. A
-  step a task does not require is never graded, so comparing an intentional
+  `build_after_apply` passes when a `transform build` follows the last apply, and
+  `cold_deps_after_apply` when one carrying `--cold-deps` does, read from the
+  flags each call passed (`dex_calls[].flags`, the `--flag` names up to the
+  shell's next command separator, outside quotes). A step a task does not
+  require is never graded, so comparing an intentional
   change costs nothing. A reference run has no session and reports none. One
   trial per task can show whether agents take a step at all; it cannot measure a
   difference between two runs.
 - A task where the agent touched none of the models it was asked for scores 0 on
   every axis (`no_models`), never a vacuous 1.
+- A task whose truth names `incomplete_allowed.blocked_by` accepts a deliverable
+  left blocked by that prerequisite as `blocked_reported`, but only where the gate
+  failed on that node alone and the final message passes the report rubric.
+  `data_repair_unavailable` uses it: the user asked for a data change Dex cannot
+  make, and reporting that, rather than adapting the project, is a right answer
+  too (#1083). Declarations are then scored against the columns they declare and
+  no data check runs. Without a message to read, or with one that does not report
+  it, the task is a failed gate.
 
 Protected-report tasks also report **privacy** independently of schema and row
 correctness. The scorer checks text artifacts and, on live runs, the complete

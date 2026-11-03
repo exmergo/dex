@@ -57,7 +57,9 @@
         "basis": [
           "macros/helper.sql: a macro_sql edit can affect any node, so it requires none in particular"
         ],
-        "undetermined": true
+        "undetermined": true,
+        "built": [],
+        "not_built": []
       }
     }
   }

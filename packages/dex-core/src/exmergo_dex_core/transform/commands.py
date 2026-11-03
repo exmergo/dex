@@ -3727,6 +3727,8 @@ def _unbuilt_evidence(
         coverage=BuildCoverage(
             required=required,
             missing=required,
+            built=[],
+            not_built=required,
             basis=basis,
             undetermined=undetermined,
         )
@@ -3838,6 +3840,7 @@ def _build_project(
     # another dbt runtime left incompatible refuses before anything is spent.
     policy = artifacts or config.transform.artifacts
     artifacts_dir = resolve_build_artifact_dir(project, policy)
+    seed_history_dir = artifacts_dir
     checkout = project
     if cold is not None:
         # Outside the copy so they outlive it, and apart from the ordinary build's,
@@ -3854,6 +3857,17 @@ def _build_project(
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
     paradigm = paradigm_for(connector, effective)
+    from .previous_build import preserve_previous_build
+
+    previous_run = preserve_previous_build(artifacts_dir, target)
+    from .seed_history import remember_seed_types
+
+    # Pricing replaces manifests; preserve applied seed contracts first. Both
+    # build modes write the same dev seeds, so this history lives outside cold/.
+    with contextlib.suppress(OSError, ValueError):
+        remember_seed_types(seed_history_dir, seed_history_dir, target)
+        if artifacts_dir != seed_history_dir:
+            remember_seed_types(artifacts_dir, seed_history_dir, target)
     dev_check = lambda: dev_target.check(  # noqa: E731
         project,
         target,
@@ -3877,6 +3891,7 @@ def _build_project(
             paradigm=paradigm,
             connector=connector,
             run_cwd=project,
+            seed_history_directory=seed_history_dir,
             dev_target_check=dev_check,
             dependencies=dependencies,
             approved_functions=frozenset(config.guards.approved_functions),
@@ -3929,6 +3944,7 @@ def _build_project(
                 artifacts_dir,
                 checkout,
                 cold_report,
+                previous_run=previous_run,
             ),
         )
 
@@ -3971,6 +3987,7 @@ def _build_project(
             paradigm=paradigm,
             connector=connector,
             run_cwd=project,
+            seed_history_directory=seed_history_dir,
             estimate=estimate,
             estimate_quality=estimate_quality_of(adapter, estimate, paradigm=paradigm),
             # The dev-target check already ran above; passing None keeps the
@@ -4080,7 +4097,13 @@ def _build_project(
         uncapped=bool(dev_target.missing_cap_references(project, target, connector)),
         engine=engine,
         completion_inputs=_completion_inputs(
-            engine, for_plan, for_plan_document, artifacts_dir, checkout, cold_report
+            engine,
+            for_plan,
+            for_plan_document,
+            artifacts_dir,
+            checkout,
+            cold_report,
+            previous_run=previous_run,
         ),
     )
 
@@ -5224,6 +5247,7 @@ def _attach_prerequisites(
             else None
         ),
         edits=inputs.get("edits"),
+        previous_run=inputs.get("previous_run"),
     )
     found.sort(
         key=lambda entry: (
@@ -5323,13 +5347,15 @@ def _completion_inputs(
     artifact_directory: Path | None,
     project: Path,
     cold_report: dict[str, Any] | None = None,
+    *,
+    previous_run: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """What the completion block reads beyond the result: the change it was
     asked to validate, the manifest's dependency edges (a skip's cause, a
     test's model), and the plan's recorded refactor comparisons. Each is
     best-effort; a missing one leaves its part of the block unnamed."""
 
-    inputs: dict[str, Any] = {"project": project}
+    inputs: dict[str, Any] = {"project": project, "previous_run": previous_run}
     if cold_report is not None:
         inputs["cold"] = cold_report
     if for_plan:

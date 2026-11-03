@@ -1,0 +1,10 @@
+name: subscription_reporting
+version: "1.0.0"
+profile: subscription_reporting
+model-paths: ["models"]
+models:
+  subscription_reporting:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

@@ -13,6 +13,7 @@ re-planning the same change is idempotent and yields the same id.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -794,6 +795,81 @@ def _append_scaffold_gitkeep_deletes(
         diffs.append(file_diff(keep_rel, content, None))
 
 
+def _package_models_restored(
+    root: Path, names: set[str], project_yml: str | None
+) -> dict[str, str]:
+    """The deleted names an installed package defines as a model that the
+    project's ``dbt_project.yml`` after the plan leaves enabled, by package.
+
+    Deleting a project override of a package model hands the name back to the
+    package, the reverse of the repair the #860 recipe describes (#1083 needs
+    it when a project adaptation gives way to repairing the data). A ref with no
+    package argument then resolves to the package's model, so it does not
+    dangle. dbt reads ``enabled`` from the most specific level of
+    ``models.<package>.<folder>...<model>``, and that is what is read here; a
+    package model disabled after the plan is not restored. Package SQL that
+    disables itself with ``config(enabled=false)`` is not read, which can only
+    leave a name restored that dbt then reports as missing at parse time.
+    """
+
+    if not names:
+        return {}
+    from .build import packages_dir
+
+    project_config: dict[str, Any] = {}
+    text = project_yml
+    if text is None:
+        with contextlib.suppress(OSError, UnicodeError):
+            text = (root / "dbt_project.yml").read_text(encoding="utf-8")
+    with contextlib.suppress(yaml.YAMLError, AttributeError, TypeError):
+        loaded = yaml.safe_load(text or "") or {}
+        if isinstance(loaded, dict) and isinstance(loaded.get("models"), dict):
+            project_config = loaded["models"]
+
+    def enabled(package: str, parts: list[str]) -> bool:
+        """Resolve package enablement from broad settings to the specific model."""
+
+        state = True
+        level: Any = project_config.get(package)
+        for part in [None, *parts]:
+            if part is not None:
+                level = level.get(part) if isinstance(level, dict) else None
+            if not isinstance(level, dict):
+                break
+            for key in ("+enabled", "enabled"):
+                if isinstance(level.get(key), bool):
+                    state = level[key]
+        return state
+
+    restored: dict[str, str] = {}
+    install = packages_dir(root)
+    if not install.is_dir():
+        return restored
+    for directory in sorted(p for p in install.iterdir() if p.is_dir()):
+        manifest: dict[str, Any] = {}
+        with contextlib.suppress(OSError, yaml.YAMLError):
+            loaded = yaml.safe_load(
+                (directory / "dbt_project.yml").read_text(encoding="utf-8")
+            )
+            manifest = loaded if isinstance(loaded, dict) else {}
+        package = (
+            manifest.get("name") if isinstance(manifest.get("name"), str) else None
+        )
+        package = package or directory.name
+        paths = manifest.get("model-paths") or ["models"]
+        for model_path in paths if isinstance(paths, list) else ["models"]:
+            base = directory / str(model_path)
+            if not base.is_dir():
+                continue
+            for sql in base.rglob("*"):
+                if sql.suffix not in (".sql", ".py") or sql.stem not in names:
+                    continue
+                folders = list(sql.relative_to(base).parent.parts)
+                if enabled(package, [*folders, sql.stem]):
+                    restored.setdefault(sql.stem, package)
+    return restored
+
+
 def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]:
     """Refuse a plan whose deletions would orphan a ``ref()``, atomically.
 
@@ -820,7 +896,11 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     because no edit the caller could make would make it resolvable.
 
     Packages are not scanned. The question is whether *this project* still points
-    at what it is deleting, and a package cannot be edited to fix it anyway.
+    at what it is deleting, and a package cannot be edited to fix it anyway. A
+    package does answer one case: deleting a project model that overrides a
+    package model of the same name, which the project leaves enabled after the
+    plan, hands the name back to the package, so a ref to it does not dangle
+    (see :func:`_package_models_restored`).
     """
 
     from ..dbt_project import SourceFile, node_files, node_name
@@ -873,11 +953,23 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     )
     index = ReferenceIndex(after, scan_packages=False)
 
+    restored = _package_models_restored(
+        root, deleted_models, surviving.get("dbt_project.yml")
+    )
     danglers: dict[str, list[str]] = {}
     for model in sorted(deleted_models):
         for kind in ("model", "seed", "snapshot"):
             for reference in index.references_to(model, kind)[0]:
                 if reference.form not in _BREAKS_ON_DELETE:
+                    continue
+                provider = restored.get(model)
+                if (
+                    kind == "model"
+                    and provider is not None
+                    and reference.qualifier in (None, provider)
+                ):
+                    # The project's override goes and the package's own model of
+                    # the same name, enabled after this plan, answers the ref.
                     continue
                 danglers.setdefault(reference.path, []).append(
                     f"{model} (line {reference.line}, {reference.form})"

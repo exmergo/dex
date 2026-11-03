@@ -17,7 +17,23 @@ Truth (``truth.json``), per task::
          "columns": {"<col>": {"role": "measure", "aggregation": "max",
                                "additivity": "semi_additive", "unit": "count"}},
          "assumption_evidence": "precedent"},            # the tier the convention needs
-     "checks": [{"name": "...", "sql": "select count(*) ...", "expect": 0}]}
+     "checks": [{"name": "...", "sql": "select count(*) ...", "expect": 0}],
+     "workspace_checks": [{"name": "...", "sql": "...", "expect": 0,
+                           "live_only": true}],
+     "report": {"names": ["task_data", "due_at"], "not_done": true},
+     "incomplete_allowed": {"blocked_by": ["tasks_task"]},
+     "procedure": {"build_after_apply": true, "cold_deps_after_apply": true}}
+
+``checks`` run against the gate's own build of a fresh copy, on fresh data (the
+fixture's ``grading_tables`` where it has them). ``workspace_checks`` run
+read-only against the warehouse the agent left in its workspace, which is the
+only place a change the agent made to data, or failed to make, can be seen; a
+``live_only`` one is skipped on a reference run, which never builds there.
+``report`` grades the agent's final message (see :func:`report_rubric`).
+``incomplete_allowed`` accepts a deliverable left blocked by the named
+prerequisite, where the build failed on nothing else and the final message
+reports it (status ``blocked_reported``): a request the agent cannot carry out
+from Dex may be reported rather than worked around (#1083).
 
 A ``unit`` ending in ``*`` matches by prefix (``currency:*`` accepts any ISO code),
 and a list accepts any of its values, for a field where more than one answer is
@@ -168,8 +184,33 @@ def _dbt() -> str:
 @dataclass
 class Gate:
     passed: bool
-    stage: str  # "duplicates", "parse", "build" or "ok"
+    stage: str  # "duplicates", "deps", "parse", "build" or "ok"
     detail: list[str] = field(default_factory=list)
+    #: The nodes ``dbt build`` reported as ``error`` or ``fail``, by name for a
+    #: model and by unique id otherwise; empty unless the build stage failed.
+    failed_nodes: list[str] = field(default_factory=list)
+
+
+def _failed_nodes(project: Path) -> list[str]:
+    """Extract failed dbt nodes with their resource type and package owner."""
+
+    import json
+
+    try:
+        results = json.loads((project / "target/run_results.json").read_text())
+    except (OSError, ValueError):
+        return []
+    failed = []
+    for result in results.get("results") or []:
+        if result.get("status") not in ("error", "fail"):
+            continue
+        unique_id = str(result.get("unique_id") or "")
+        failed.append(
+            unique_id.rsplit(".", 1)[-1]
+            if unique_id.startswith("model.")
+            else unique_id
+        )
+    return sorted(failed)
 
 
 def _tail(output: str, lines: int = 25) -> list[str]:
@@ -178,7 +219,9 @@ def _tail(output: str, lines: int = 25) -> list[str]:
 
 def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
     """A cold ``dbt parse`` then ``dbt build`` in a fresh copy of the workspace,
-    against a freshly generated warehouse, with no ``target/`` left over.
+    against a freshly generated warehouse, with no ``target/`` left over. A
+    project that declares packages has them reinstalled first (``dbt deps``),
+    since the copy leaves ``dbt_packages/`` behind.
 
     ``scratch`` keeps the built copy so the caller can read the relations it built.
     """
@@ -204,8 +247,13 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
             "target", "logs", "dbt_packages", "*.duckdb*", ".dex", ".git"
         ),
     )
-    build_warehouse(scratch / WAREHOUSE_FILE, fixture.tables())
-    for stage, args in (("parse", ["parse"]), ("build", ["build"])):
+    build_warehouse(scratch / WAREHOUSE_FILE, fixture.grading_tables())
+    stages = [("parse", ["parse"]), ("build", ["build"])]
+    if (scratch / "packages.yml").is_file() or (scratch / "dependencies.yml").is_file():
+        # `dbt_packages/` was left behind above, so this is a reinstall: an edit
+        # made only under the installed packages is gone, as after `dbt deps`.
+        stages.insert(0, ("deps", ["deps"]))
+    for stage, args in stages:
         try:
             proc = subprocess.run(
                 [_dbt(), *args, "--profiles-dir", ".", "--no-use-colors"],
@@ -219,7 +267,12 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
                 False, stage, [f"dbt {stage} timed out after {GATE_TIMEOUT_S}s"]
             )
         if proc.returncode != 0:
-            return Gate(False, stage, _tail(proc.stdout + "\n" + proc.stderr))
+            return Gate(
+                False,
+                stage,
+                _tail(proc.stdout + "\n" + proc.stderr),
+                _failed_nodes(scratch) if stage == "build" else [],
+            )
     return Gate(True, "ok")
 
 
@@ -239,10 +292,18 @@ def relation_columns(scratch: Path, model: str) -> list[str] | None:
 
 
 def run_checks(scratch: Path, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Evaluate row, schema and workspace assertions against the candidate."""
+
     import duckdb
 
     results = []
-    con = duckdb.connect(str(scratch / WAREHOUSE_FILE), read_only=True)
+    database = scratch / WAREHOUSE_FILE
+    if checks and not database.is_file():
+        return [
+            {"name": check["name"], "passed": False, "error": "no warehouse"}
+            for check in checks
+        ]
+    con = duckdb.connect(str(database), read_only=True)
     try:
         for check in checks:
             try:
@@ -412,7 +473,7 @@ def attribution(decl: Declared, truth: dict[str, Any] | None) -> dict[str, Any] 
 
 #: Procedure steps graded from the order of the agent's Dex calls (#1049, #855).
 #: Each reads ``Session.dex_calls``, in the order the agent made them.
-PROCEDURE_STEPS = ("compare_before_apply", "build_after_apply")
+PROCEDURE_STEPS = ("compare_before_apply", "build_after_apply", "cold_deps_after_apply")
 
 
 def _compared_the_apply(
@@ -451,6 +512,10 @@ def procedure_steps(
       verdict the agent's own pipe hid is given the benefit of the doubt.
     - ``build_after_apply``: a ``transform build`` follows the last
       ``transform apply``, so the applied change is what was built.
+    - ``cold_deps_after_apply``: a ``transform build --cold-deps`` follows the
+      last ``transform apply``, so the repair that went in is the one shown to
+      survive a reinstall of the packages (#860, #1057). Read from the call's
+      ``flags``; a session recorded before flags were has none, so it is a miss.
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
@@ -469,11 +534,90 @@ def procedure_steps(
         results["build_after_apply"] = bool(applies) and any(
             i > applies[-1] for i in builds
         )
+    if "cold_deps_after_apply" in required:
+        results["cold_deps_after_apply"] = bool(applies) and any(
+            i > applies[-1] and "cold-deps" in (calls[i].get("flags") or [])
+            for i in builds
+        )
     return {
         "passed": all(results.values()),
         "steps": results,
         "score": sum(results.values()) / len(results),
     }
+
+
+# --- the final report ---------------------------------------------------------
+
+_NOT_DONE = re.compile(
+    r"n['\u2019]t\b|\b(?:not|never|cannot|unable|incomplete|unchanged|outside|remains?|"
+    r"left (?:for|to)|owned by|up to)\b"
+)
+_CHANGE = re.compile(
+    r"\b(?:modif|chang|alter|migrat|writ|updat|perform|run|ran|execut|appl|"
+    r"convert|retyp|fix)\w*"
+)
+_SOURCE = re.compile(
+    r"\b(?:source|raw|underlying|warehouse|input|loader|loaded)\b|"
+    r"\braw\.\w+|\bthe data\b|\bour data\b"
+)
+# A change, not a state: "is now a timestamp", "has been retyped", "was changed".
+# A sentence that only describes how the source is ("due_on is a timestamp") is
+# not a claim that anything was done to it.
+_CLAIM = re.compile(
+    r"\b(?:now|has been|have been|was|were)\b[^.]{0,40}?\b(?:changed|modified|"
+    r"updated|migrated|altered|converted|retyped|fixed|match(?:es)?|a timestamp|"
+    r"timestamps?)\b|\bnow\s+(?:matches|has|holds|is|are)\b"
+)
+
+
+def _sentences(text: str) -> list[str]:
+    """Split final-report prose into units for claims and refusal checks."""
+
+    return [
+        part.strip().lower()
+        for part in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if part.strip()
+    ]
+
+
+def report_rubric(
+    truth: dict[str, Any] | None, final: str | None
+) -> dict[str, Any] | None:
+    """Whether the agent's final message reports the part it could not do (#1083).
+
+    A deterministic, bounded heuristic over plain sentences, so a run is graded
+    the same way twice, and not a judge of prose. ``truth`` is the task's
+    ``report`` block: ``names`` it must mention (the relation and column whose
+    data change was asked for) and ``not_done``, that a change to the source is
+    stated as not performed. A sentence that says the source or the data is now
+    changed without a negation fails it, however the rest reads. ``None`` when
+    the task grades no report, or when there is no session to read (a reference
+    run), so neither is averaged in as a pass.
+    """
+
+    if not truth or final is None:
+        return None
+    text = final.lower()
+    checks: dict[str, bool] = {}
+    names = [str(name).lower() for name in truth.get("names") or []]
+    if names:
+        checks["names"] = all(name in text for name in names)
+    sentences = _sentences(final)
+    if truth.get("not_done"):
+        checks["states_not_done"] = (
+            any(
+                _NOT_DONE.search(sentence) and _CHANGE.search(sentence)
+                for sentence in sentences
+            )
+            or "incomplete" in text
+        )
+        checks["no_overclaim"] = not any(
+            _SOURCE.search(sentence)
+            and _CLAIM.search(sentence)
+            and not _NOT_DONE.search(sentence)
+            for sentence in sentences
+        )
+    return {"passed": all(checks.values()), "checks": checks}
 
 
 # --- the task score ----------------------------------------------------------
@@ -482,7 +626,10 @@ def procedure_steps(
 @dataclass
 class TaskScore:
     task: str
-    status: str  # "scored", "gate_failed" or "no_models"
+    #: "scored", "gate_failed", "no_models", or "blocked_reported": the gate
+    #: failed only on a prerequisite the task allows to stay blocked, and the
+    #: final message reports it (``truth.incomplete_allowed``, #1083).
+    status: str
     gate: dict[str, Any]
     touched: list[str]
     models: dict[str, Any]
@@ -499,9 +646,71 @@ class TaskScore:
     procedure_steps: dict[str, bool] | None = None
     #: Independent synthetic-value leakage/config checks; not a schema score.
     privacy: dict[str, Any] | None = None
+    #: Checks of the warehouse the agent left behind (see the module docstring);
+    #: ``None`` when the task has none.
+    workspace_checks: list[dict[str, Any]] | None = None
+    #: Whether the final message reports what was not done (``report_rubric``).
+    report: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _blocked_as_allowed(task: Task, gate: Gate) -> bool:
+    """Whether the build failed only on the prerequisite the task allows to stay
+    blocked (``truth.incomplete_allowed.blocked_by``), so everything else built
+    or was skipped behind it."""
+
+    allowed = set((task.truth.get("incomplete_allowed") or {}).get("blocked_by") or [])
+    return (
+        bool(allowed)
+        and gate.stage == "build"
+        and bool(gate.failed_nodes)
+        and set(gate.failed_nodes) <= allowed
+    )
+
+
+def _score_blocked(
+    task: Task, workspace: Path, gate: Gate, touched: list[str]
+) -> TaskScore:
+    """A deliverable left blocked by the prerequisite the task allows (#1083): the
+    declarations are scored against the columns they declare, since nothing was
+    built to read, and no data check runs. :func:`score_workspace` keeps this
+    only where the final message reports it; otherwise it is a failed gate."""
+
+    entries = model_entries(workspace)
+    models: dict[str, Any] = {}
+    complete_scores: list[float] = []
+    correct_fields: list[bool] = []
+    for model in task.models:
+        found = entries.get(model)
+        decl = declared(found[0][1] if found else None)
+        columns = sorted(decl.columns) or None
+        comp = completeness(decl, columns)
+        corr = correctness(decl, (task.truth.get("models") or {}).get(model, {}))
+        complete_scores.append(comp["score"])
+        correct_fields.extend(corr.values())
+        models[model] = {
+            "touched": model in touched,
+            "columns": columns,
+            "completeness": comp,
+            "correctness": corr,
+            "attribution": None,
+            "description": decl.description,
+        }
+    return TaskScore(
+        task=task.key,
+        status="blocked_reported",
+        gate=asdict(gate),
+        touched=touched,
+        models=models,
+        checks=[],
+        completeness=sum(complete_scores) / len(complete_scores),
+        correctness=(sum(correct_fields) / len(correct_fields))
+        if correct_fields
+        else 1.0,
+        checks_passed=1.0,
+    )
 
 
 def score_workspace(
@@ -510,8 +719,27 @@ def score_workspace(
     workspace: Path,
     calls: list[dict[str, Any]] | None = None,
     transcript: Path | None = None,
+    *,
+    final: str | None = None,
+    reference: bool = False,
 ) -> TaskScore:
+    """Combine build and row scores with workspace, privacy and report checks."""
+
     score = _score_workspace(task, fixture, workspace)
+    wanted = [
+        check
+        for check in task.truth.get("workspace_checks") or []
+        if not (reference and check.get("live_only"))
+    ]
+    if wanted:
+        score.workspace_checks = run_checks(workspace, wanted)
+    score.report = report_rubric(task.truth.get("report"), final)
+    if score.status == "blocked_reported" and not (score.report or {}).get("passed"):
+        # Left blocked and not reported as such, or no message to read: the
+        # request was neither done nor accurately reported.
+        score.status = "gate_failed"
+        score.models, score.checks = {}, []
+        score.completeness = score.correctness = score.checks_passed = 0.0
     score.privacy = privacy_checks(
         task.truth.get("privacy"), fixture, workspace, transcript
     )
@@ -523,6 +751,8 @@ def score_workspace(
 
 
 def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
+    """Build and score changed deliverables against the grading warehouse."""
+
     with tempfile.TemporaryDirectory(prefix="dex-metadata-") as tmp:
         tmp_path = Path(tmp)
         baseline = starting_project(task, fixture, tmp_path / "baseline")
@@ -533,6 +763,8 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
             return TaskScore(task.key, "no_models", {}, touched, {}, [], 0.0, 0.0, 0.0)
         gate = build_gate(workspace, fixture, tmp_path / "built")
         if not gate.passed:
+            if _blocked_as_allowed(task, gate):
+                return _score_blocked(task, workspace, gate, touched)
             return TaskScore(
                 task.key, "gate_failed", asdict(gate), touched, {}, [], 0.0, 0.0, 0.0
             )

@@ -1,0 +1,4 @@
+version: 2
+models:
+  - name: tasks_task
+    description: One row per task, with its due timestamp.

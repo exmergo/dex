@@ -1,0 +1,7 @@
+version: 2
+models:
+  - name: task_data
+    description: The vendor's task data, read as delivered. The tiny_tasks package reads it.
+    columns:
+      - name: task_id
+        data_tests: [unique, not_null]

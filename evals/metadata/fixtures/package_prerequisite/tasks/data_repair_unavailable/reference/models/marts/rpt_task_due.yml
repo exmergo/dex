@@ -1,0 +1,36 @@
+version: 2
+models:
+- name: rpt_task_due
+  description: One row per task with the timestamp it is due, from the tiny_tasks package.
+  config:
+    meta:
+      dex:
+        grain:
+        - task_id
+        population:
+          rule: Every task the package models; nothing is filtered.
+        assumptions:
+        - decision: Whether the requested data change could be made
+          chosen: Not from this project; the report is built through a project override, and the source change is proposed in migrations/ and was not run
+          evidence: contract
+          detail: The source declares raw.task_data as delivered and owned by the ingestion vendor, and Dex is read-only against data.
+  columns:
+  - name: task_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+  - name: task_name
+    config:
+      meta:
+        dex:
+          role: attribute
+  - name: due_ts
+    description: The due_at timestamp where the source has one, otherwise due_on.
+    config:
+      meta:
+        dex:
+          role: time

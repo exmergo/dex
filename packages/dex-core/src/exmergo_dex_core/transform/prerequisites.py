@@ -19,7 +19,8 @@ macro, the project config or the packages can reach any node, so it is
 ``undetermined``, as is a build naming no plan, and so is a deletion or a schema
 YAML that changes more than the nodes it names (a ``sources:`` block).
 
-Read-only and connectionless: it reads a manifest dict and nothing else.
+Read-only and connectionless: it reads a manifest and optional historical context
+supplied by the caller. Earlier statuses never revise the graph's plan relation.
 """
 
 from __future__ import annotations
@@ -319,11 +320,14 @@ def diagnose(
     *,
     required: list[str] | None = None,
     edits: list[PlanEdit] | None = None,
+    previous_run: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """One entry per failed node: ``(unique_id, status, message)`` in, the owner,
-    the plan relation, what it blocks and the repair routes out."""
+    plan relation, historical context, what it blocks and repair routes out."""
 
     manifest = manifest or {}
+    from .previous_build import node_context
+
     # Unit tests live in their own section, and they fail like any other node.
     nodes = {**_section(manifest, "nodes"), **_section(manifest, "unit_tests")}
     macros = _section(manifest, "macros")
@@ -362,6 +366,7 @@ def diagnose(
             "owner": owner,
             "status": status,
             "plan_relation": _plan_relation(unique_id, graph, edited),
+            "previous_run": node_context(previous_run, unique_id),
             "blocks": blocks[:MAX_PREREQUISITES],
         }
         if owner == "package":

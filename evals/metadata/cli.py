@@ -30,10 +30,13 @@ from .score import score_workspace
 
 
 def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate scored tasks without treating ungraded checks as passes."""
+
     scored = [r["score"] for r in rows]
     n = len(scored) or 1
     gate_failed = [s["task"] for s in scored if s["status"] == "gate_failed"]
     no_models = [s["task"] for s in scored if s["status"] == "no_models"]
+    blocked = [s["task"] for s in scored if s["status"] == "blocked_reported"]
     costs = [
         r["session"]["cost_usd"]
         for r in rows
@@ -42,11 +45,14 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     attributed = [s["attribution"] for s in scored if s.get("attribution") is not None]
     procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
     private = [s for s in scored if s.get("privacy") is not None]
+    reported = [s["report"]["passed"] for s in scored if s.get("report") is not None]
     return {
         "tasks": len(scored),
         "build_gate_pass_rate": round(1 - len(gate_failed) / n, 4),
         "gate_failed": gate_failed,
         "no_models": no_models,
+        # Left blocked on the prerequisite the task allows, and reported (#1083).
+        "blocked_reported": blocked,
         "completeness": round(sum(s["completeness"] for s in scored) / n, 4),
         "correctness": round(sum(s["correctness"] for s in scored) / n, 4),
         "checks_passed": round(sum(s["checks_passed"] for s in scored) / n, 4),
@@ -64,13 +70,29 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if private
             else None
         ),
+        # The agent's own warehouse: a source changed that the task protects,
+        # or a requested change that never reached dev (#1083).
+        "workspace_failed": [
+            s["task"]
+            for s in scored
+            if any(not c["passed"] for c in s.get("workspace_checks") or [])
+        ],
+        "report": round(sum(reported) / len(reported), 4) if reported else None,
     }
 
 
+def _verdict(passed: bool) -> str:
+    """Render one boolean rubric result for the evaluation table."""
+
+    return "pass" if passed else "FAIL"
+
+
 def _print_table(report: dict[str, Any]) -> None:
+    """Print build, workspace, procedure and final-report scores per task."""
+
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
-        f"{'attrib':>7} {'proc':>5} {'privacy':>7}"
+        f"{'attrib':>7} {'proc':>5} {'privacy':>7} {'wspace':>6} {'report':>6}"
     )
     for row in report["results"]:
         s = row["score"]
@@ -91,6 +113,16 @@ def _print_table(report: dict[str, Any]) -> None:
                 f" {'pass' if s['privacy']['passed'] else 'FAIL':>7}"
                 if s.get("privacy") is not None
                 else f" {'-':>7}"
+            )
+            + (
+                f" {_verdict(all(c['passed'] for c in s['workspace_checks'])):>6}"
+                if s.get("workspace_checks")
+                else f" {'-':>6}"
+            )
+            + (
+                f" {'pass' if s['report']['passed'] else 'FAIL':>6}"
+                if s.get("report") is not None
+                else f" {'-':>6}"
             )
         )
     agg = report["aggregate"]
@@ -115,10 +147,18 @@ def _print_table(report: dict[str, Any]) -> None:
             if agg.get("privacy_pass_rate") is not None
             else ""
         )
+        + (
+            f"; workspace failed {len(agg['workspace_failed'])}"
+            if agg.get("workspace_failed")
+            else ""
+        )
+        + (f"; report {agg['report']:.2f}" if agg.get("report") is not None else "")
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the requested metadata evaluation mode and report its results."""
+
     parser = argparse.ArgumentParser(
         prog="evals metadata", description="Metadata-quality eval (#492)"
     )
@@ -233,6 +273,8 @@ def main(argv: list[str] | None = None) -> int:
             transcript=out / f"{task.key.replace('/', '__')}.transcript.jsonl"
             if live
             else None,
+            final=row["session"]["final"] if live else None,
+            reference=args.reference,
         ).to_dict()
         report["results"].append(row)
 
@@ -245,7 +287,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _print_table(report)
         print(f"report: {out / 'report.json'}")
-    if report["aggregate"]["gate_failed"] or report["aggregate"]["privacy_failed"]:
+    if (
+        report["aggregate"]["gate_failed"]
+        or report["aggregate"]["privacy_failed"]
+        or report["aggregate"]["workspace_failed"]
+    ):
         return 1
     if args.reference and any(
         r["score"]["status"] != "scored"

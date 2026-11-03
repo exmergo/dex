@@ -1,0 +1,36 @@
+version: 2
+models:
+- name: rpt_task_due
+  description: One row per task with the timestamp it is due, from the tiny_tasks package.
+  config:
+    meta:
+      dex:
+        grain:
+        - task_id
+        population:
+          rule: Every task the package models; nothing is filtered.
+        assumptions:
+        - decision: Where to repair the package's type mismatch
+          chosen: A project override of tasks_task that casts due_at through text, with the package's model disabled
+          evidence: request
+          detail: The request asks to leave the seed and its types as they are and adapt the project.
+  columns:
+  - name: task_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+  - name: task_name
+    config:
+      meta:
+        dex:
+          role: attribute
+  - name: due_ts
+    description: The due_at timestamp where the source has one, otherwise due_on.
+    config:
+      meta:
+        dex:
+          role: time

@@ -263,8 +263,13 @@ Runs `dbt build` against a dev target, with a cost preflight first.
   an isolated copy and builds from it, to prove a repair survives. See
   [prerequisite-repairs.md](prerequisite-repairs.md).
 - On DuckDB, a seed whose CSV header no longer matches its table in the dev
-  target (a column added, dropped or reordered) is rebuilt with
+  target (a column added, dropped or reordered), or whose declared
+  `+column_types` no longer match the table's column types, is rebuilt with
   `dbt seed --full-refresh` before the build, only when the build selects it.
+  Without it, a reload keeps the type the table was first built with.
+  Removing a previously applied type declaration restores CSV inference with
+  the same refresh. Successful-load history survives pricing, narrow selections
+  and cold builds; use `--full-refresh` explicitly if that history is unavailable.
   `data.full_refresh` names it and a warning says why, so no `dbt seed` step
   is needed by hand.
 - Each node in `data.nodes` carries dbt's `unique_id` beside a readable `name`.

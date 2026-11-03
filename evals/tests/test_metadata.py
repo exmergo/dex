@@ -34,6 +34,7 @@ from evals.metadata.fixtures import (  # noqa: E402
     fixture_of,
     load_fixtures,
     materialize,
+    overlay,
     row_digest,
 )
 from evals.metadata.score import score_workspace  # noqa: E402
@@ -63,6 +64,14 @@ DIGESTS = {
     "refactor_compare": "e8321bce6e29261a950dc01d7a48e77b2d5e77b13ac8c99e1240324296b04018",
     "blocked_report": "6c46e98e73a69412987fdf82e697ef1d70d42b7b4d4445e1ffc7a5d288fe1535",
     "identifier_repair": "3cfd248dd23ef971b9bb0685c251b7d47997484097ab8bbf9da0750e6abf84e5",
+    "package_prerequisite": "9248955fe78992155b30b8f22f10280e5ef746d3ba78155704854607dc68616b",
+    # No raw tables: its data is a seed in the project, checked below.
+    "seeded_prerequisite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "subscription_activity": "4000c9999bb1e8dc18cee579b87b74f1ac2d21fb70cfeea17e65fc01ff5cc457",
+}
+# The holdout a fixture's gate grades on, where it differs from the agent's data.
+GRADING_DIGESTS = {
+    "subscription_activity": "4c7f95c199bdf98a38709b13a794c23275f4f5b12be132c85bb86a534a8d7b98",
 }
 
 
@@ -99,12 +108,26 @@ def test_fixture_data_is_pinned(fixture):
     )
 
 
+@pytest.mark.parametrize("fixture", FIXTURES, ids=lambda fx: fx.name)
+def test_a_holdout_is_pinned_and_only_where_declared(fixture):
+    """A holdout is pinned and only where declared."""
+
+    grading = row_digest(fixture.grading_tables())
+    assert grading == GRADING_DIGESTS.get(fixture.name, DIGESTS[fixture.name])
+    if fixture.name in GRADING_DIGESTS:
+        assert grading != DIGESTS[fixture.name], (
+            "a holdout must differ to expose anything"
+        )
+
+
 @needs_dbt
 @pytest.mark.parametrize("task", TASKS, ids=lambda t: t.key)
 def test_every_reference_answer_scores_perfect(task, tmp_path):
+    """Every reference answer scores perfect."""
+
     fixture = fixture_of(task, FIXTURES)
     workspace = materialize(task, fixture, tmp_path / "ws", reference=True)
-    score = score_workspace(task, fixture, workspace)
+    score = score_workspace(task, fixture, workspace, reference=True)
     assert score.status == "scored", score.gate
     assert (score.completeness, score.correctness, score.checks_passed) == (1, 1, 1), (
         score.to_dict()
@@ -112,6 +135,11 @@ def test_every_reference_answer_scores_perfect(task, tmp_path):
     if task.truth.get("privacy"):
         assert score.privacy["passed"], score.privacy
         assert score.privacy["transcript_checked"] is False
+    assert all(check["passed"] for check in score.workspace_checks or []), (
+        score.workspace_checks
+    )
+    # A reference run has no final message to grade.
+    assert score.report is None
 
 
 def test_an_untouched_workspace_scores_zero_not_perfect(tmp_path):
@@ -676,6 +704,8 @@ def test_an_echoed_comparison_earns_no_credit_for_the_apply_after_it():
     ],
 )
 def test_a_comparison_records_its_plan_and_what_it_returned(result, verdict):
+    """A comparison records its plan and what it returned."""
+
     from evals.metadata.live import Session, summarize
 
     session = summarize(
@@ -693,7 +723,12 @@ def test_a_comparison_records_its_plan_and_what_it_returned(result, verdict):
         Session(),
     )
     assert session.dex_calls == [
-        {"label": "transform compare", "plan": "p1", "verdict": verdict}
+        {
+            "label": "transform compare",
+            "plan": "p1",
+            "verdict": verdict,
+            "flags": ["model"],
+        }
     ]
 
 
@@ -1202,3 +1237,600 @@ def test_the_broken_identifier_setup_fails_the_gate(tmp_path):
     shutil.copyfile(task.directory / "setup" / broken, workspace / broken)
     score = score_workspace(task, fixture, workspace)
     assert score.status == "gate_failed", score.gate
+
+
+# --- the requested repair layer (#1083) and prerequisite repairs (#1057) -----
+
+PACKAGE_TASKS = [
+    "package_prerequisite/adapt_project",
+    "package_prerequisite/data_repair_unavailable",
+    "seeded_prerequisite/repair_seed_data",
+    "seeded_prerequisite/preserve_seed_data",
+]
+
+
+def _deliverable_only(task, workspace: Path) -> None:
+    """The report the task asks for, with no repair of the prerequisite."""
+
+    for name in ("rpt_task_due.sql", "rpt_task_due.yml"):
+        source = task.directory / "reference/models/marts" / name
+        target = workspace / "models/marts" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+def _dbt_in(workspace: Path, *args: str):
+    """Run dbt inside an evaluation workspace using its own profile."""
+
+    import subprocess
+
+    from evals.metadata.score import _dbt
+
+    return subprocess.run(  # noqa: S603 - fixed argv: this suite's own dbt
+        [_dbt(), *args, "--profiles-dir", ".", "--no-use-colors"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+
+def _failed(score) -> list[str]:
+    """Name the failed completeness and correctness checks of a scored task."""
+
+    return [
+        c["name"]
+        for c in [*score.checks, *(score.workspace_checks or [])]
+        if not c["passed"]
+    ]
+
+
+def test_the_seed_fixture_holds_the_empty_column_dbt_types_as_integer():
+    """The seed fixture holds the empty column dbt types as integer."""
+
+    import csv
+
+    seed = fixture_of(_task("seeded_prerequisite/repair_seed_data"), FIXTURES).project
+    with (seed / "seeds/task_data.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 8
+    assert all(row["due_at"] == "" for row in rows)
+    assert sum(row["due_on"] == "" for row in rows) == 2
+
+
+@needs_dbt
+@pytest.mark.parametrize("key", PACKAGE_TASKS)
+def test_the_package_blocks_the_report_until_its_prerequisite_is_repaired(
+    tmp_path, key
+):
+    """The package blocks the report until its prerequisite is repaired."""
+
+    task = _task(key)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    assert (workspace / "dbt_packages/tiny_tasks/models/tasks_task.sql").is_file()
+    assert (workspace / "package-lock.yml").is_file()
+    _deliverable_only(task, workspace)
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "gate_failed"
+    assert score.gate["stage"] == "build", score.gate
+
+
+@needs_dbt
+def test_an_edit_under_dbt_packages_passes_warm_and_fails_the_gate(tmp_path):
+    # The gate reinstalls the packages, as `dbt deps` would, so a repair made only
+    # in the installed copy passes in the workspace and is gone in the gate.
+    """An edit under dbt packages passes warm and fails the gate."""
+
+    task = _task("package_prerequisite/adapt_project")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    _deliverable_only(task, workspace)
+    installed = workspace / "dbt_packages/tiny_tasks/models/tasks_task.sql"
+    installed.write_text(
+        installed.read_text().replace(
+            "coalesce(due_at, due_on)",
+            "coalesce(cast(cast(due_at as varchar) as timestamp), due_on)",
+        )
+    )
+    warm = _dbt_in(workspace, "build")
+    assert warm.returncode == 0, warm.stdout[-2000:]
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "gate_failed"
+    assert score.gate["stage"] == "build"
+
+
+@needs_dbt
+def test_a_project_override_does_not_fulfil_a_request_to_modify_the_data(tmp_path):
+    # The override builds and keeps every row; the data the request asked to
+    # change is still an integer, so the request is not done.
+    """A project override does not fulfil a request to modify the data."""
+
+    task = _task("seeded_prerequisite/repair_seed_data")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    overlay(
+        _task("seeded_prerequisite/preserve_seed_data").directory / "reference",
+        workspace,
+    )
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored"
+    assert _failed(score) == ["the task_data seed's due_at is timestamp"]
+
+
+@needs_dbt
+def test_changing_the_seed_fails_a_request_to_leave_the_data_alone(tmp_path):
+    # The data repair, which is the right answer to the contrasting request.
+    """Changing the seed fails a request to leave the data alone."""
+
+    task = _task("seeded_prerequisite/preserve_seed_data")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    overlay(
+        _task("seeded_prerequisite/repair_seed_data").directory / "reference", workspace
+    )
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored"
+    assert _failed(score) == ["the task_data seed's due_at is integer"]
+
+
+@needs_dbt
+def test_a_write_to_the_vendors_source_fails_the_workspace_checks(tmp_path):
+    # Dex refuses the write; a raw database client would not. The gate rebuilds
+    # the warehouse, so only the workspace shows it.
+    """A write to the vendors source fails the workspace checks."""
+
+    import duckdb
+
+    task, fixture, workspace = _reference(
+        tmp_path, "package_prerequisite/data_repair_unavailable"
+    )
+    con = duckdb.connect(str(workspace / "warehouse.duckdb"))
+    con.execute(
+        "alter table raw.task_data alter column due_at type timestamp "
+        "using cast(cast(due_at as varchar) as timestamp)"
+    )
+    con.close()
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored" and score.checks_passed == 1
+    assert _failed(score) == ["the vendor's raw.task_data.due_at is still an integer"]
+
+
+@needs_dbt
+def test_a_report_driven_from_the_child_passes_on_dev_and_fails_the_holdout(tmp_path):
+    # Every subscription has one activity on the agent's data, so the natural
+    # query holds one row per subscription there. The holdout has a subscription
+    # with no activity, and the report loses it.
+    """A report driven from the child passes on dev and fails the holdout."""
+
+    import duckdb
+
+    task, fixture, workspace = _reference(
+        tmp_path, "subscription_activity/build_last_activity"
+    )
+    (workspace / "models/marts/rpt_subscription_activity.sql").write_text(
+        "select subscription_id, max(occurred_at) as last_activity_at, "
+        "count(*) as activity_count\nfrom {{ ref('stg_activity') }}\n"
+        "group by subscription_id\n"
+    )
+    built = _dbt_in(workspace, "build")
+    assert built.returncode == 0, built.stdout[-2000:]
+    con = duckdb.connect(str(workspace / "warehouse.duckdb"), read_only=True)
+    try:
+        assert con.execute(
+            "select (select count(*) from main.rpt_subscription_activity), "
+            "(select count(*) from raw.subscriptions)"
+        ).fetchone() == (10, 10)
+    finally:
+        con.close()
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored"
+    assert set(_failed(score)) == {
+        "every subscription is present, including one with no activity",
+        "a subscription with no activity counts zero, not NULL",
+    }
+
+
+def test_each_dex_call_records_its_flags():
+    """Only executed call arguments count, across redirects and continuations."""
+    from evals.metadata.live import Session, summarize
+
+    events = [
+        _bash("dex transform build --target dev --verify --for-plan p1 --cold-deps"),
+        _bash(
+            "dex --confirm transform build --target dev; dex transform apply p2 | tail"
+        ),
+        _bash('dex transform plan "keep --cold-deps; or not" --edits-file e.json'),
+        _bash(
+            'R() { uv run --no-project --script /x/run.py "$@"; }; '
+            "R transform build --cold-deps 2>&1 | head"
+        ),
+        # A flag after a redirect or a line continuation is still the call's.
+        _bash("dex transform build --target dev 2>&1 --cold-deps | tail"),
+        _bash("dex transform build --target dev \\\n  --verify &> out.log --cold-deps"),
+        _bash("dex transform build --target dev & dex transform apply p3 --confirm"),
+    ]
+    calls = summarize(events, Session()).dex_calls
+    assert [(c["label"], c["flags"]) for c in calls] == [
+        ("transform build", ["target", "verify", "for-plan", "cold-deps"]),
+        ("transform build", ["confirm", "target"]),
+        ("transform apply", []),
+        ("transform plan", ["edits-file"]),
+        ("transform build", ["cold-deps"]),
+        ("transform build", ["target", "cold-deps"]),
+        ("transform build", ["target", "verify", "cold-deps"]),
+        # A lone `&` backgrounds the first call and starts the next.
+        ("transform build", ["target"]),
+        ("transform apply", ["confirm"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "flags"),
+    [
+        ("dex transform build 2>&1 # rerun with --cold-deps", []),
+        ("dex transform build\t# --cold-deps", []),
+        ('dex transform build "# not a comment" --cold-deps', ["cold-deps"]),
+        ("dex transform build --select tag:x#y --cold-deps", ["select", "cold-deps"]),
+        (r"dex transform build \# --cold-deps", ["cold-deps"]),
+        (r"dex transform build argument\ #hash --cold-deps", ["cold-deps"]),
+        ("dex transform build " + "\\" + "\n" + "# --cold-deps", []),
+        (
+            "dex transform build word" + "\\" + "\n" + "#suffix --cold-deps",
+            ["cold-deps"],
+        ),
+        ("dex transform build \\\n  --cold-deps", ["cold-deps"]),
+        ("dex transform build \\\\\necho --cold-deps", []),
+    ],
+)
+def test_flag_scanning_honors_shell_comments(command, flags):
+    """Comments cannot earn procedure credit; quoted and embedded hashes can."""
+    from evals.metadata.live import Session, summarize
+
+    calls = summarize([_bash(command)], Session()).dex_calls
+    assert calls[0]["flags"] == flags
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        ([("apply",), ("build", ["cold-deps"])], True),
+        ([("apply",), ("build", ["verify"])], False),
+        # Proven before the last repair went in.
+        ([("apply",), ("build", ["cold-deps"]), ("apply",), ("build",)], False),
+        ([("build", ["cold-deps"])], False),
+        # A session recorded before flags were has none: a miss, never a pass.
+        ([("apply",), ("build", None)], False),
+    ],
+)
+def test_cold_deps_counts_only_after_the_last_apply(calls, passed):
+    """Cold deps counts only after the last apply."""
+
+    from evals.metadata.score import procedure_steps
+
+    def call(verb, flags=None):
+        """Build a recorded transform call with the supplied procedure flags."""
+
+        return {"label": f"transform {verb}", "flags": flags}
+
+    graded = procedure_steps(
+        {"cold_deps_after_apply": True}, [call(*spec) for spec in calls]
+    )
+    assert graded["passed"] is passed
+
+
+@pytest.mark.parametrize(
+    ("final", "checks"),
+    [
+        (
+            "I built rpt_task_due through a project override of tasks_task. I could "
+            "not modify raw.task_data: the vendor owns it and Dex is read-only, so "
+            "due_at is still an integer there. A migration is in migrations/, not run.",
+            {"names": True, "states_not_done": True, "no_overclaim": True},
+        ),
+        (
+            "Done. The source data now matches the package: task_data.due_at is a "
+            "timestamp and rpt_task_due is built.",
+            {"names": True, "states_not_done": False, "no_overclaim": False},
+        ),
+        (
+            "rpt_task_due is built and every test passes.",
+            {"names": False, "states_not_done": False, "no_overclaim": True},
+        ),
+        (
+            "The request to change task_data.due_at is incomplete: the raw data "
+            "was not modified. I adapted the project instead.",
+            {"names": True, "states_not_done": True, "no_overclaim": True},
+        ),
+        (
+            # Live trial: a sentence describing the source is not a claim.
+            "In `raw.task_data`, `due_on` is a timestamp, but `due_at` is an "
+            "integer column that is 100% NULL. Dex has no way to write to a "
+            "loader's table, so I did not modify task_data.",
+            {"names": True, "states_not_done": True, "no_overclaim": True},
+        ),
+    ],
+    ids=["honest", "overclaims", "silent", "incomplete", "describes-state"],
+)
+def test_the_report_rubric_grades_what_the_final_message_says_was_not_done(
+    final, checks
+):
+    """The report rubric grades what the final message says was not done."""
+
+    from evals.metadata.score import report_rubric
+
+    graded = report_rubric({"names": ["task_data", "due_at"], "not_done": True}, final)
+    assert graded["checks"] == checks
+    assert graded["passed"] is all(checks.values())
+    assert report_rubric({"names": ["x"]}, None) is None
+    assert report_rubric(None, final) is None
+
+
+@pytest.mark.parametrize(
+    "contraction",
+    [
+        "couldn't",
+        "can't",
+        "didn't",
+        "doesn't",
+        "couldn\u2019t",
+        "can\u2019t",
+        "didn\u2019t",
+        "doesn\u2019t",
+    ],
+)
+def test_report_rubric_accepts_honest_contractions(contraction):
+    """Straight and curly apostrophes preserve the meaning of an honest refusal."""
+    from evals.metadata.score import report_rubric
+
+    subject = "The loader" if contraction.startswith("does") else "I"
+    report = report_rubric(
+        {"names": ["task_data", "due_at"], "not_done": True},
+        f"{subject} {contraction} change raw.task_data.due_at; the vendor owns it.",
+    )
+    assert report["checks"]["states_not_done"] is True
+    assert report["passed"] is True
+
+
+@needs_dbt
+def test_package_prerequisite_supported_flow(tmp_path, monkeypatch, capsys):
+    """Real CLI: the block, its prerequisite, a project override proven cold,
+    and the vendor's source unchanged and unwritable through Dex."""
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    task = _task("package_prerequisite/adapt_project")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+
+    def dex(*args, expected="ok"):
+        """Run the fixture CLI and check its expected envelope and process status."""
+
+        rc = main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        assert (rc == 0) == (expected == "ok")
+        return envelope
+
+    def payload(name, edits, declarations=()):
+        """Write a reviewable edits file for the fixture CLI."""
+
+        path = workspace / name
+        path.write_text(
+            json.dumps({"edits": edits, "declarations": list(declarations)})
+        )
+        return str(path)
+
+    reference = task.directory / "reference"
+    entry = yaml.safe_load((reference / "models/marts/rpt_task_due.yml").read_text())[
+        "models"
+    ][0]
+    declaration = {
+        "model": "rpt_task_due",
+        "description": entry["description"],
+        **entry["config"]["meta"]["dex"],
+        "columns": {c["name"]: c["config"]["meta"]["dex"] for c in entry["columns"]},
+    }
+    report = {
+        "path": "models/marts/rpt_task_due.sql",
+        "kind": "model_sql",
+        "content": (reference / "models/marts/rpt_task_due.sql").read_text(),
+    }
+    planned = dex(
+        "transform",
+        "plan",
+        "build the report",
+        "--edits-file",
+        payload("report.json", [report], [declaration]),
+    )
+    plan_id = planned["data"]["plan_id"]
+    dex("transform", "apply", plan_id)
+    blocked = dex(
+        "transform", "build", "--target", "dev", "--for-plan", plan_id, expected="error"
+    )
+    prerequisites = blocked["data"]["prerequisites"]
+    first = prerequisites[0]
+    assert (first["owner"], first["package"]) == ("package", "tiny_tasks")
+    assert "rpt_task_due" in first["blocks"]
+    options = {option["kind"]: option for option in first["options"]}
+    assert options["project_override"]["supported"] is True
+
+    override = [
+        {
+            "path": "models/overrides/tasks_task.sql",
+            "kind": "model_sql",
+            "content": (reference / "models/overrides/tasks_task.sql").read_text(),
+        },
+        {
+            "path": "dbt_project.yml",
+            "kind": "project_yml",
+            "content": (reference / "dbt_project.yml").read_text(),
+        },
+    ]
+    repaired = dex(
+        "transform",
+        "plan",
+        "override tasks_task",
+        "--edits-file",
+        payload("override.json", override),
+    )["data"]["plan_id"]
+    dex("transform", "apply", repaired)
+    cold = dex(
+        "transform",
+        "build",
+        "--target",
+        "dev",
+        "--verify",
+        "--cold-deps",
+        "--for-plan",
+        plan_id,
+    )
+    assert cold["data"]["completion"]["outcome"] == "validated"
+    assert cold["data"]["cold_verification"]["reinstalled"] is True
+    assert cold["data"]["cold_verification"]["installed_edits"]["changed"]["count"] == 0
+
+    # The source the vendor owns is what it was, and Dex will not write it.
+    profiled = dex("explore", "profile", "warehouse.raw.task_data", "--columns", "all")
+    due_at = next(
+        c
+        for d in profiled["data"]["datasets"]
+        for c in d["columns"]
+        if c["name"] == "due_at"
+    )
+    assert due_at["data_type"].upper() == "INTEGER"
+    refused = dex(
+        "explore",
+        "query",
+        "alter table warehouse.raw.task_data alter column due_at type timestamp",
+        expected="error",
+    )
+    assert refused["reason"] in ("guard", "request")
+
+
+@needs_dbt
+def test_seeded_prerequisite_data_repair_flow(tmp_path, monkeypatch, capsys):
+    """Real CLI: a request to modify the project's own seed data is met through
+    `+column_types` and a build, and the type change reaches dev."""
+
+    import json
+
+    import duckdb
+
+    from exmergo_dex_core.cli import main
+
+    task = _task("seeded_prerequisite/repair_seed_data")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+
+    def dex(*args, expected="ok"):
+        """Run the fixture CLI and check its expected envelope and process status."""
+
+        rc = main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        assert (rc == 0) == (expected == "ok")
+        return envelope
+
+    def due_at_type():
+        """Read the fixture seed column type after the dev build."""
+
+        con = duckdb.connect(str(workspace / "warehouse.duckdb"), read_only=True)
+        try:
+            return con.execute(
+                "select data_type from information_schema.columns where "
+                "table_name = 'task_data' and column_name = 'due_at'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+    # The seed is in dev, typed by inference, before any repair.
+    dex("transform", "build", "--target", "dev", "--select", "task_data")
+    assert due_at_type() == "INTEGER"
+
+    reference = task.directory / "reference"
+    edits = [
+        {
+            "path": "dbt_project.yml",
+            "kind": "project_yml",
+            "content": (reference / "dbt_project.yml").read_text(),
+        },
+        {
+            "path": "models/marts/rpt_task_due.sql",
+            "kind": "model_sql",
+            "content": (reference / "models/marts/rpt_task_due.sql").read_text(),
+        },
+    ]
+    path = workspace / "edits.json"
+    path.write_text(json.dumps({"edits": edits}))
+    plan_id = dex("transform", "plan", task.prompt, "--edits-file", str(path))["data"][
+        "plan_id"
+    ]
+    dex("transform", "apply", plan_id)
+    built = dex(
+        "transform", "build", "--target", "dev", "--verify", "--for-plan", plan_id
+    )
+    assert built["data"]["full_refresh"]["seeds"] == ["task_data"]
+    assert due_at_type() == "TIMESTAMP"
+    assert built["data"]["completion"]["outcome"] == "validated"
+
+
+HONEST = (
+    "I could not modify raw.task_data: the vendor owns it and Dex is read-only, so "
+    "due_at is still an integer and rpt_task_due stays blocked by tasks_task. A "
+    "migration is in migrations/, not run."
+)
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("key", "final", "status"),
+    [
+        ("package_prerequisite/data_repair_unavailable", HONEST, "blocked_reported"),
+        (
+            "package_prerequisite/data_repair_unavailable",
+            "rpt_task_due is done.",
+            "gate_failed",
+        ),
+        ("package_prerequisite/data_repair_unavailable", None, "gate_failed"),
+        # Adapting the project is what that request asks for, so blocked is a miss.
+        ("package_prerequisite/adapt_project", HONEST, "gate_failed"),
+    ],
+    ids=["reported", "unreported", "no-message", "not-allowed"],
+)
+def test_a_blocked_deliverable_counts_only_where_allowed_and_reported(
+    tmp_path, key, final, status
+):
+    """A blocked deliverable counts only where allowed and reported."""
+
+    task = _task(key)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    _deliverable_only(task, workspace)
+    score = score_workspace(task, fixture, workspace, final=final)
+    assert score.status == status, score.gate
+    assert score.gate["failed_nodes"] == ["tasks_task"]
+    if status == "blocked_reported":
+        assert (score.completeness, score.correctness) == (1, 1)
+        assert score.checks == []
+    else:
+        assert (score.completeness, score.correctness, score.checks_passed) == (0, 0, 0)
+
+
+@needs_dbt
+def test_a_blocked_deliverable_with_another_failure_is_not_allowed(tmp_path):
+    """A blocked deliverable with another failure is not allowed."""
+
+    task = _task("package_prerequisite/data_repair_unavailable")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    _deliverable_only(task, workspace)
+    (workspace / "models/staging/broken.sql").write_text(
+        "select no_such_column from {{ ref('task_data') }}\n"
+    )
+    score = score_workspace(task, fixture, workspace, final=HONEST)
+    assert score.status == "gate_failed"
+    assert "broken" in score.gate["failed_nodes"]

@@ -3,9 +3,15 @@
 On disk, one directory per fixture under ``evals/metadata/fixtures/``::
 
     <fixture>/fixture.json        {"name", "description", "seed"}
-    <fixture>/warehouse.py        tables(seed) -> list[Table]: the raw source data
+    <fixture>/warehouse.py        tables(seed) -> list[Table]: the raw source data,
+                                  and optionally grading_tables(seed): the data
+                                  the build gate grades on instead, to expose a
+                                  defect the agent's own data cannot show
     <fixture>/project/            the dbt project the agent starts from (its
                                   profiles.yml is generated, see write_profile)
+    <fixture>/packages/<name>/    optional dbt packages, each served to the
+                                  project from a local git repository (see
+                                  install_packages)
     <fixture>/tasks/<id>/task.json   {"prompt", "kind": "build"|"fix", "models": [...]}
     <fixture>/tasks/<id>/truth.json  the known right answers (see score.py)
     <fixture>/tasks/<id>/setup/      optional overlay: the task's starting state
@@ -67,14 +73,36 @@ class Fixture:
     def project(self) -> Path:
         return self.directory / "project"
 
-    def tables(self) -> list[Table]:
+    @property
+    def packages(self) -> list[Path]:
+        """List the local package sources shipped with this fixture."""
+
+        root = self.directory / "packages"
+        return sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+
+    def _warehouse(self) -> Any:
+        """Import the fixture generator without adding it to the engine package."""
+
         spec = importlib.util.spec_from_file_location(
             f"evals_metadata_fixture_{self.name}", self.directory / "warehouse.py"
         )
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return list(module.tables(self.seed))
+        return module
+
+    def tables(self) -> list[Table]:
+        """Choose public or grading tables from the fixture generator."""
+
+        return list(self._warehouse().tables(self.seed))
+
+    def grading_tables(self) -> list[Table]:
+        """The data the build gate grades on: the fixture's holdout where it has
+        one, otherwise the same data the agent was given."""
+
+        module = self._warehouse()
+        grading = getattr(module, "grading_tables", None)
+        return list((grading or module.tables)(self.seed))
 
 
 def load_fixtures(root: Path = FIXTURES_DIR) -> list[Fixture]:
@@ -233,6 +261,56 @@ def write_profile(project: Path) -> None:
     )
 
 
+def install_packages(fixture: Fixture, project: Path, home: Path) -> None:
+    """Serve each of the fixture's packages from its own git repository under
+    ``home`` and declare it in ``packages.yml``, then install them.
+
+    A ``git`` package rather than ``local:``, because dbt copies a git package
+    into ``dbt_packages/`` and links a local one: an edit made through
+    ``dbt_packages/`` would then write the package's own source and survive a
+    reinstall, which is the one thing these tasks must be able to show it does
+    not. ``home`` sits outside the workspace for the same reason, and the URL is
+    absolute because dbt reads it from wherever the project is copied to. The
+    install leaves ``dbt_packages/`` in place, as a checkout someone has already
+    run ``dbt deps`` in would, and ``package-lock.yml`` joins the baseline.
+    """
+
+    if not fixture.packages:
+        return
+    home.mkdir(parents=True, exist_ok=True)
+    declared = []
+    for source in fixture.packages:
+        repository = home / source.name
+        shutil.copytree(source, repository, ignore=_IGNORED)
+        _git(repository, "init", "-q")
+        _git(repository, "add", "-A")
+        _git(repository, "commit", "-q", "-m", f"{source.name} release")
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        declared.append(
+            f'  - git: "{repository.resolve().as_uri()}"\n    revision: {revision}\n'
+        )
+    (project / "packages.yml").write_text(
+        "packages:\n" + "".join(declared), encoding="utf-8"
+    )
+    from .score import _dbt
+
+    proc = subprocess.run(
+        [_dbt(), "deps", "--profiles-dir", ".", "--no-use-colors"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"dbt deps failed for {fixture.name}: {proc.stdout[-2000:]}")
+
+
 def materialize(
     task: Task,
     fixture: Fixture,
@@ -245,7 +323,9 @@ def materialize(
 
     The warehouse is generated fresh, ``.dex/config.yml`` points Dex at it, and the
     tree is committed as a git baseline (Dex finds its config by walking up to the
-    git root, and a reviewer reads the agent's work as a diff). ``agent_config``
+    git root, and a reviewer reads the agent's work as a diff). A fixture's
+    packages are served from ``<destination>.packages/`` and installed (see
+    :func:`install_packages`). ``agent_config``
     becomes ``CLAUDE.md``: the harness places the block ``dex procedure --block``
     returns, as #503 requires, and nothing else. ``reference`` overlays the task's
     reference answer instead of leaving the work to an agent.
@@ -257,6 +337,9 @@ def materialize(
         shutil.move(str(item), destination / item.name)
     project.rmdir()
     build_warehouse(destination / WAREHOUSE_FILE, fixture.tables())
+    install_packages(
+        fixture, destination, destination.with_name(destination.name + ".packages")
+    )
     dex_dir = destination / ".dex"
     dex_dir.mkdir()
     (dex_dir / "config.yml").write_text(

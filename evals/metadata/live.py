@@ -120,8 +120,10 @@ class Session:
     #: procedure step such as "compare before apply" is graded on (#1049).
     dex_sequence: list[str] = field(default_factory=list)
     #: The same calls with what the transcript shows about each: ``label``,
-    #: ``plan`` (the literal id named, or ``None``) and, on a comparison,
-    #: ``verdict`` (see ``_compare_verdict``). A procedure step reads these.
+    #: ``plan`` (the literal id named, or ``None``), ``flags`` (the ``--flag``
+    #: names the call passed, without their dashes or values, see ``_flags``)
+    #: and, on a comparison, ``verdict`` (see ``_compare_verdict``). A procedure
+    #: step reads these.
     dex_calls: list[dict[str, Any]] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
@@ -215,6 +217,68 @@ def _is_quoted_data(
     return False
 
 
+_FLAG = re.compile(r"(?<![\w-])--([A-Za-z][\w-]*)")
+_SEPARATORS = ";&|\n"
+
+
+def _flags(command: str, start: int, quoted: list[tuple[int, int]]) -> list[str]:
+    """The ``--flags`` of the call starting at ``start``, up to the shell's next
+    command separator (``;``, ``&&``, ``||``, ``|``, a newline). A separator or a
+    flag inside quotes is data, not shell: ``transform plan "keep --cold-deps"``
+    passes no flag, and ``--where "a; b"`` does not end the call. Global flags
+    before the group (``dex --confirm transform build``) count too, since the
+    engine reads them the same way. Two shell forms that look like separators
+    are not: a newline after a backslash continues the command, and the ``&`` of
+    a redirect (``2>&1``, ``>&``, ``&>``) belongs to the redirect. An unquoted
+    shell comment ends the scan; a hash inside a word or quotes does not."""
+
+    def inside(position: int) -> bool:
+        """Identify quoted data that cannot end the shell call."""
+        return any(begin <= position < stop for begin, stop in quoted)
+
+    def escaped(position: int) -> bool:
+        """An odd run of preceding backslashes escapes a shell character."""
+        begin = position
+        while begin > 0 and command[begin - 1] == "\\":
+            begin -= 1
+        return (position - begin) % 2 == 1
+
+    def separates(position: int) -> bool:
+        """End the call at shell operators and comments, honoring escapes."""
+        char = command[position]
+        if inside(position):
+            return False
+        if char == "#":
+            before = position - 1
+            # Backslash-newline disappears before the shell identifies words.
+            while before > 0 and command[before] == "\n" and escaped(before):
+                before -= 2
+            previous = command[before : before + 1] if before >= 0 else ""
+            return before < 0 or (
+                (previous.isspace() or previous in ";&|()<>") and not escaped(before)
+            )
+        if char not in _SEPARATORS:
+            return False
+        if char == "\n":
+            return not escaped(position)
+        if char == "&":
+            return command[position - 1 : position] != ">" and (
+                command[position + 1 : position + 2] != ">"
+            )
+        return True
+
+    end = start
+    while end < len(command) and not separates(end):
+        end += 1
+    return list(
+        dict.fromkeys(
+            match.group(1)
+            for match in _FLAG.finditer(command, start, end)
+            if not inside(match.start())
+        )
+    )
+
+
 # A literal plan id. `$PLAN`, a flag or a redirect names none this can read.
 _PLAN_ARGUMENT = re.compile(r"\s+(\w[\w.-]*)")
 _STATUS = re.compile(r'"status"\s*:\s*"(\w+)"')
@@ -248,6 +312,8 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
 def summarize(
     events: list[dict[str, Any]], session: Session, plugin_dir: Path = REPO
 ) -> Session:
+    """Extract executed Dex calls, their flags and results from agent events."""
+
     skills: list[str] = []
     commands: dict[str, int] = {}
     sequence: list[str] = []
@@ -297,6 +363,7 @@ def summarize(
                                         "label": label,
                                         "plan": plan.group(1) if plan else None,
                                         "verdict": None,
+                                        "flags": _flags(command, match.start(), quoted),
                                     },
                                 )
                             )

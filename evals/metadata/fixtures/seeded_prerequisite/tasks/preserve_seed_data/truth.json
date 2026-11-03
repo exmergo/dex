@@ -1,0 +1,64 @@
+{
+  "models": {
+    "rpt_task_due": {
+      "grain": [
+        "task_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "task_id": {
+          "role": "key"
+        },
+        "due_ts": {
+          "role": [
+            "time",
+            "attribute",
+            "dimension"
+          ]
+        },
+        "task_name": {
+          "role": [
+            "attribute",
+            "dimension"
+          ]
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "the task_data seed's due_at is integer",
+      "expect": 1,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'task_data' and column_name = 'due_at' and data_type = 'INTEGER'"
+    },
+    {
+      "name": "every task is in the report",
+      "expect": 8,
+      "sql": "select count(*) from main.rpt_task_due"
+    },
+    {
+      "name": "due_ts is a timestamp",
+      "expect": 1,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_task_due' and column_name = 'due_ts' and data_type like 'TIMESTAMP%'"
+    },
+    {
+      "name": "due_ts keeps the due date of every task",
+      "expect": 0,
+      "sql": "select count(*) from main.rpt_task_due r join main.task_data s using (task_id) where r.due_ts is distinct from s.due_on"
+    }
+  ],
+  "workspace_checks": [
+    {
+      "name": "on dev, the task_data seed's due_at is still an integer",
+      "expect": 1,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'task_data' and column_name = 'due_at' and data_type = 'INTEGER'",
+      "live_only": true
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true,
+    "cold_deps_after_apply": true
+  }
+}

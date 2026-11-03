@@ -129,7 +129,11 @@ class PlanDrift(BaseModel):
 
 
 class BuildCoverage(BaseModel):
-    """Which of the nodes this change required were actually built.
+    """Which requirements appeared in run results, and which actually built.
+
+    ``covered`` includes failed and skipped nodes for compatibility. ``built``
+    and ``not_built`` partition requirements by successful execution; ``None``
+    means an older producer did not measure that partition.
 
     ``basis`` says how the requirement was derived, because the derivation is not
     uniform: a model edit names its own node, a schema.yml names the nodes it
@@ -144,11 +148,32 @@ class BuildCoverage(BaseModel):
     required: list[str] = Field(default_factory=list)
     covered: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
+    built: list[str] | None = None
+    not_built: list[str] | None = None
     basis: list[str] = Field(default_factory=list)
     #: True when at least one edit could not derive a buildable requirement and
     #: ``required`` is therefore empty. Hosts must not read an empty required list
     #: as "nothing to check" / validated.
     undetermined: bool = False
+
+    @model_validator(mode="after")
+    def _validate_partition(self) -> BuildCoverage:
+        """Reject execution partitions that do not cover the requirements once."""
+
+        if self.built is None and self.not_built is None:
+            return self
+        if self.built is None or self.not_built is None:
+            raise ValueError("built and not_built must be supplied together")
+        built, not_built = set(self.built), set(self.not_built)
+        if (
+            len(built) != len(self.built)
+            or len(not_built) != len(self.not_built)
+            or built & not_built
+            or built | not_built != set(self.required)
+            or not built <= set(self.covered)
+        ):
+            raise ValueError("built and not_built must partition required nodes")
+        return self
 
 
 class BuildDigests(BaseModel):
@@ -745,6 +770,7 @@ def build_evidence(
     # every version) or by the file it is defined in (`dim_customers_v2.sql`),
     # and each of those did build this node.
     answers: set[str] = set()
+    unsuccessful_answers: set[str] = set()
     generated: list[str] = []
     errors: list[dict[str, str]] = []
     for result in results:
@@ -771,13 +797,16 @@ def build_evidence(
             ),
         )
         nodes.append(built)
-        answers.add(built.name)
+        node_answers = {built.name}
         if isinstance(node.get("name"), str):
-            answers.add(node["name"])
+            node_answers.add(node["name"])
         if node.get("resource_type") == "model" and isinstance(
             node.get("original_file_path"), str
         ):
-            answers.add(node_name(node["original_file_path"]))
+            node_answers.add(node_name(node["original_file_path"]))
+        answers.update(node_answers)
+        if status.lower() != "success":
+            unsuccessful_answers.update(node_answers)
         if status.lower() in FAILED_STATUSES:
             errors.append({"node": built.name, "message": built.message or status})
         elif built.relation and built.resource_type in {"model", "snapshot", "seed"}:
@@ -798,10 +827,13 @@ def build_evidence(
         drift = plan_drift(edits, root)
         required, basis, undetermined = required_nodes(edits, root)
         covered = [name for name in required if name in answers]
+        successful = [name for name in covered if name not in unsuccessful_answers]
         coverage = BuildCoverage(
             required=required,
             covered=covered,
             missing=[name for name in required if name not in answers],
+            built=successful,
+            not_built=[name for name in required if name not in successful],
             basis=basis,
             undetermined=undetermined,
         )

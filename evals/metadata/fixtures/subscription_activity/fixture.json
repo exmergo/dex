@@ -1,0 +1,5 @@
+{
+  "name": "subscription_activity",
+  "seed": 1029,
+  "description": "A report the project already declares as one row per subscription (population.parent: stg_subscriptions). On the agent's data every subscription has exactly one activity, so a report driven from the activity table passes every runtime check, including the measured parent population. Only the plan-time population_parent contradiction catches it; the gate grades on holdout data where a subscription has no activity and another has two."
+}
