@@ -32,6 +32,7 @@ import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_core import to_jsonable_python
 
+from .budget import effective_session_ceiling
 from .config import CONFIG_FILE, SEMANTIC_ENVIRONMENT, DexConfig
 from .diffs import file_diff
 from .envelope import redact, secret_like
@@ -420,6 +421,17 @@ class ConfigDocument:
                 else row
                 for row in rows
             ]
+        ceiling_in_force, ceiling_source = effective_session_ceiling(
+            config.budget.session_ceiling
+        )
+        if ceiling_source == "environment":
+            rows.append(
+                ConfigSetting(
+                    key="budget.session_ceiling_in_force",
+                    value=ceiling_in_force,
+                    source="environment",
+                )
+            )
         if target is None:
             return rows
         selected = [

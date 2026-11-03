@@ -340,6 +340,7 @@ def new_cost_gate(
         # The ceiling in force, not the file's: a host's cap (#787) is folded in
         # here, the one place a gate is built, so every billed command sees it.
         session_ceiling=config.session_ceiling_in_force,
+        configured_session_ceiling=config.budget.session_ceiling,
         session_spent=lambda: store.spend_since(
             utc_day_start(), field=field, connector=connector
         ),
