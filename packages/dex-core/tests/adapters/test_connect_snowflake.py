@@ -933,6 +933,38 @@ def test_sharing_a_warehouse_when_another_command_suspends_mid_run(
     assert any("resumed DEX_WH" in n for n in notes)
 
 
+def test_a_resume_caused_by_another_session_charges_no_resume_minimum(
+    fake_sf_connection,
+):
+    """When resumed_on moves but resumed_at is outside every statement window of
+    this command, another session woke the warehouse, so no resume minimum is
+    charged to this command (#938)."""
+
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    fake_sf_connection.warehouses[0].resumed_on = "2026-01-01T00:00:00-08:00"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)  # Statement 1 at t = 0 .. 1
+
+    # Another session woke the warehouse at t = 60, far from both statements.
+    from fakes.snowflake import _iso
+
+    fake_sf_connection.warehouses[0].resumed_on = _iso(
+        fake_sf_connection.clock.EPOCH + 60.0
+    )
+    fake_sf_connection.clock.now += 120.0  # t = 121
+
+    _one_query(adapter)  # Statement 2 at t = 121 .. 122
+    billed, notes = _settled(adapter)
+    # Warehouse was already running; no resume minimum from this command.
+    assert billed == pytest.approx(132.0)
+    assert not any("resumed DEX_WH" in n for n in notes)
+    assert any("DEX_WH was already running" in n for n in notes)
+
+
 def test_capabilities_recommend_a_short_auto_suspend_without_changing_it(tail_600):
     caps = make_adapter(tail_600).capabilities()
     assert caps["budget"]["warehouse"]["suspend_after_command"] == {

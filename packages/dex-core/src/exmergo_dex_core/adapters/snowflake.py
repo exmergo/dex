@@ -753,14 +753,17 @@ class _WarehouseUptime:
             return False
         before_on = before.get("resumed_on")
         after_on = after.get("resumed_on")
-        return bool(after_on and before_on != after_on)
+        if not (after_on and before_on != after_on):
+            return False
+        return self._resume_statement_index(after) is not None
 
-    def _resume_statement_index(self, after: dict | None) -> int:
+    def _resume_statement_index(self, after: dict | None) -> int | None:
         """The index in ``self._statements`` of the statement that woke the
-        warehouse mid-command (#938)."""
+        warehouse mid-command, or ``None`` when the resume was not caused by
+        any of this command's statements (#938)."""
 
         if not self._statements:
-            return 0
+            return None
         resumed_at = (after or {}).get("resumed_at")
         if resumed_at is not None:
             resumed_mono = resumed_at - self._wall_offset
@@ -776,10 +779,7 @@ class _WarehouseUptime:
                     matching,
                     key=lambda i: abs(self._statements[i][0] - resumed_mono),
                 )
-            return min(
-                range(len(self._statements)),
-                key=lambda i: abs(self._statements[i][0] - resumed_mono),
-            )
+            return None
         return 1 if len(self._statements) > 1 else 0
 
     def _owed(
@@ -800,30 +800,33 @@ class _WarehouseUptime:
 
         if not self._found_suspended() and self._resumed_on_moved(after):
             k = self._resume_statement_index(after)
-            resume_start = self._statements[k][0]
-            recorded_before = sum(s[2] for s in self._statements[:k])
-            recorded_from_k = sum(s[2] for s in self._statements[k:])
-            prior_span = (
-                (self._statements[k - 1][1] - self._first_start)
-                if k > 0 and self._first_start is not None
-                else 0.0
-            )
-            prior_overhead = max(prior_span - recorded_before, 0.0)
-            if cycle:
-                prior = self._prior_claim()
-                if prior is not None and k > 0:
-                    prior_end = self._wall(self._statements[k - 1][1])
-                    claimed_until = float(prior["last_statement_end"]) + float(
-                        prior.get("auto_suspend") or 0
-                    )
-                    prior_extends = prior_end - claimed_until - recorded_before
-                    prior_overhead = max(min(prior_overhead, prior_extends), 0.0)
-            cycle_span = (
-                (self._last_end - resume_start) if self._last_end is not None else 0.0
-            )
-            cycle_uptime = max(cycle_span + tail, _RESUME_MINIMUM_SECONDS)
-            cycle_overhead = max(cycle_uptime - recorded_from_k, 0.0)
-            return prior_overhead + cycle_overhead
+            if k is not None:
+                resume_start = self._statements[k][0]
+                recorded_before = sum(s[2] for s in self._statements[:k])
+                recorded_from_k = sum(s[2] for s in self._statements[k:])
+                prior_span = (
+                    (self._statements[k - 1][1] - self._first_start)
+                    if k > 0 and self._first_start is not None
+                    else 0.0
+                )
+                prior_overhead = max(prior_span - recorded_before, 0.0)
+                if cycle:
+                    prior = self._prior_claim()
+                    if prior is not None and k > 0:
+                        prior_end = self._wall(self._statements[k - 1][1])
+                        claimed_until = float(prior["last_statement_end"]) + float(
+                            prior.get("auto_suspend") or 0
+                        )
+                        prior_extends = prior_end - claimed_until - recorded_before
+                        prior_overhead = max(min(prior_overhead, prior_extends), 0.0)
+                cycle_span = (
+                    (self._last_end - resume_start)
+                    if self._last_end is not None
+                    else 0.0
+                )
+                cycle_uptime = max(cycle_span + tail, _RESUME_MINIMUM_SECONDS)
+                cycle_overhead = max(cycle_uptime - recorded_from_k, 0.0)
+                return prior_overhead + cycle_overhead
 
         span = 0.0
         if self._first_start is not None and self._last_end is not None:
