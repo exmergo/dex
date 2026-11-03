@@ -965,6 +965,26 @@ def test_heterogeneous_key_note_absent_without_aggregate():
     assert _heterogeneous_key_note("id", None) is None
 
 
+def test_heterogeneous_key_note_wording_follows_proven_key_flag():
+    """#1072: unproven id-shaped columns use looks-like-a-key wording."""
+
+    from exmergo_dex_core.explore.profile import _heterogeneous_key_note
+
+    agg = _aggregate(
+        numeric_string_fraction=0.9,
+        hex_string_fraction=0.1,
+        hex_string_min_length=32,
+        hex_string_max_length=32,
+    )
+    proven = _heterogeneous_key_note("id", agg, proven_key=True)
+    unproven = _heterogeneous_key_note("product_id", agg, proven_key=False)
+    assert proven is not None and "is a candidate key but mixes value shapes" in proven
+    assert (
+        unproven is not None and "looks like a key but mixes value shapes" in unproven
+    )
+    assert "is a candidate key" not in unproven
+
+
 @pytest.mark.parametrize(
     ("col_name", "agg_kwargs", "composite_members", "expected"),
     [
@@ -1034,6 +1054,48 @@ def test_heterogeneous_key_end_to_end_real_duckdb(tmp_path: Path):
     # "a mixed comment" repeats) both stay silent.
     assert "uid" not in notes
     assert "comments" not in notes
+
+
+def test_an_unproven_id_shaped_column_that_mixes_shapes_is_noted_real_duckdb(
+    tmp_path: Path,
+):
+    """#1072: a nullable product_id mixing numeric and prefixed schemes still
+    gets the shape note, restated as mixed_identifier_shapes for plan evidence.
+    """
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+    from exmergo_dex_core.explore.relationships import profile_findings
+
+    db_path = tmp_path / "unproven_mixed_id.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE products (product_id VARCHAR, name VARCHAR)")
+    rows = [(str(i), f"n{i}") for i in range(1, 8)]
+    rows += [("org_cedar", "cedar"), ("ORG_ELM", "elm"), (None, "nullkey")]
+    conn.executemany("INSERT INTO products VALUES (?, ?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["unproven_mixed_id.main.products"])
+    finally:
+        adapter.close()
+
+    product = next(c for c in dataset.columns if c.name == "product_id")
+    assert product.is_unique is False
+    assert product.null_fraction and product.null_fraction > 0
+    notes = " ".join(dataset.data_quality)
+    assert "product_id looks like a key but mixes value shapes" in notes
+    assert "numeric" in notes and "other" in notes
+    (mixed,) = [
+        f
+        for f in profile_findings(dataset, high_null_fraction=0.95)
+        if f.code == "mixed_identifier_shapes"
+    ]
+    assert mixed.column == "product_id"
+    assert mixed.detail.startswith("product_id looks like a key but mixes value shapes")
 
 
 _CAST_CLAUSE = "casting to a number or comparing numerically"
