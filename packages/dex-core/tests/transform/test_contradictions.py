@@ -17,7 +17,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+from exmergo_dex_core.cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    PIICategory,
+    PIIFlag,
+)
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.contradictions import pair_rows, warnings
 from exmergo_dex_core.transform.drafting import draft
@@ -344,6 +350,65 @@ def test_a_grain_the_sql_cannot_establish_is_unchecked_only_when_touched():
     assert _found(
         EXCLUDING, EXCLUDING.replace("amount", "amount * 2 as amount"), prior_yml=rule
     ) == ([], [])
+
+
+CUSTOMERS_KEYED = Dataset(
+    identifier="warehouse.main.stg_customers",
+    columns=[
+        ColumnProfile(
+            name="email",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+            pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+        ),
+        ColumnProfile(
+            name="user_id",
+            data_type="integer",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+        ),
+    ],
+)
+CUSTOMERS_SQL = "select email, user_id from {{ ref('stg_customers') }}\n"
+
+
+def test_a_declared_grain_the_sql_proves_but_the_draft_does_not_pick_is_silent():
+    """The draft prefers the non-PII key, the declaration names the flagged one.
+
+    The SQL still proves the declared grain, so the new declaration is not a
+    contradiction (#1079): the verdict matches it against every proven key,
+    not only the one the draft picked.
+    """
+    assert _found(
+        CUSTOMERS_SQL,
+        CUSTOMERS_SQL,
+        yml=_yml(grain=["email"]),
+        cache=DexCache(datasets=[CUSTOMERS_KEYED]),
+    ) == ([], [])
+
+
+def test_wrapping_a_declared_grain_column_still_contradicts_when_another_key_remains():
+    """`lower(email) as email` strips the declared key of its proof.
+
+    user_id stays proven and the draft still reads at [user_id], so the
+    chosen grain alone would hide the edit; the proven-key set catches it
+    (#1079).
+    """
+    [found], _ = _found(
+        CUSTOMERS_SQL,
+        "select lower(email) as email, user_id from {{ ref('stg_customers') }}\n",
+        prior_yml=_yml(grain=["email"]),
+        cache=DexCache(datasets=[CUSTOMERS_KEYED]),
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "sql",
+    )
+    assert found["authored"].startswith("[user_id]")
 
 
 # --- additivity -------------------------------------------------------------------

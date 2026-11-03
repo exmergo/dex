@@ -110,6 +110,11 @@ class _Reading:
     grain: list[str] | None = None
     grain_evidence: str | None = None
     grain_withheld: str | None = None
+    #: Every key the statement's output provably carries, not only the one the
+    #: grain preference picked. The contradiction check matches a declared
+    #: grain against this set, so an edit that strips a key of its proof still
+    #: contradicts a declaration resting on it (#1079).
+    proven_grains: list[list[str]] | None = None
     #: Columns the SQL filters or branches on, resolved to their upstream origin:
     #: (relation, column) -> the clauses that use it.
     used: dict[tuple[str, str], set[str]] = field(default_factory=dict)
@@ -185,7 +190,14 @@ def draft(
         if sql_path is None:
             continue
         declared = read_declared(files, model)
-        reading = read(files[sql_path], cache, dialect=dialect, vars=vars)
+        reading = read(
+            files[sql_path],
+            cache,
+            dialect=dialect,
+            vars=vars,
+            files=files,
+            model_paths=model_paths,
+        )
         drafted = _drafted(
             reading,
             cache,
@@ -397,7 +409,15 @@ def read(
     *,
     dialect: str,
     vars: Mapping[str, Any] | None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
 ) -> _Reading:
+    """Read one model's SQL statically.
+
+    ``files`` and ``model_paths`` let profile lookups resolve a relation to the
+    model's configured alias; readers without them still read everything that
+    needs no alias.
+    """
     reading = _Reading()
     try:
         from ..guards import dialect as dialect_guard
@@ -440,7 +460,9 @@ def read(
         )
         return reading
 
-    _Lineage(tree, relations, cache, reading).run()
+    _Lineage(
+        tree, relations, cache, reading, files=files, model_paths=model_paths
+    ).run()
     return reading
 
 
@@ -462,6 +484,8 @@ class _Lineage:
         relations: Mapping[str, str],
         cache: DexCache | None,
         reading: _Reading,
+        files: Mapping[str, str] | None = None,
+        model_paths: list[str] | None = None,
     ) -> None:
         from .. import sql_shape
 
@@ -470,6 +494,8 @@ class _Lineage:
         self.relations = relations
         self.cache = cache
         self.reading = reading
+        self.files = files or {}
+        self.model_paths = list(model_paths or [])
         self.ctes = {
             name: scope
             for name, scope in sql_shape.scopes(tree).items()
@@ -511,8 +537,13 @@ class _Lineage:
 
         keys, evidence = self.keys(self.tree)
         if keys:
-            self.reading.grain = sorted(keys[0], key=self._output_order(outputs))
-            self.reading.grain_evidence = evidence
+            chosen, note = self._grain_choice(keys)
+            order = self._output_order(outputs)
+            self.reading.grain = sorted(chosen, key=order)
+            self.reading.proven_grains = [sorted(key, key=order) for key in keys]
+            self.reading.grain_evidence = (
+                evidence if note is None else f"{evidence}; {note}"
+            )
         else:
             self.reading.grain_withheld = evidence
 
@@ -935,6 +966,44 @@ class _Lineage:
             return carried, base_evidence
         return carried, f"{base_evidence}, carried through unchanged"
 
+    def _grain_choice(
+        self, keys: list[frozenset[str]]
+    ) -> tuple[frozenset[str], str | None]:
+        """Which proven key drafts as the grain, and the note to append.
+
+        A candidate with no PII-flagged column wins over a flagged one, so a
+        profiled email never silently becomes the grain; when every proven
+        candidate is flagged, the first still drafts and the evidence names
+        the flag, so the proposal shows why it chose the column.
+        """
+
+        for key in keys:
+            if not self._pii_columns(key):
+                return key, None
+        flagged = ", ".join(sorted(self._pii_columns(keys[0])))
+        return keys[0], f"{flagged} is flagged as PII in the profile"
+
+    def _pii_columns(self, key: frozenset[str]) -> list[str]:
+        """The key's output columns whose origin profile carries a PII flag.
+
+        Columns with no readable origin or no profile count as unflagged, so
+        without a cache the draft degrades to the first proven key. The origin
+        relation resolves through its model's configured alias, so a profile
+        stored under ``config(alias=…)`` still reads (#1079).
+        """
+        flagged: list[str] = []
+        for name in sorted(key):
+            origin = self.reading.origins.get(name.lower())
+            if origin is None:
+                continue
+            dataset = _dataset_for_model(
+                self.cache, origin.relation, self.files, self.model_paths
+            )
+            profile = _column(dataset, origin.column)
+            if profile is not None and profile.pii is not None:
+                flagged.append(name)
+        return flagged
+
     def relation_keys(
         self, relation: Any, depth: int
     ) -> tuple[list[frozenset[str]], str]:
@@ -952,7 +1021,14 @@ class _Lineage:
         if not proven:
             return [], f"{target} has no proven unique key in the cache"
         lowered = [frozenset(c.lower() for c in key) for key in proven]
-        return lowered, (f"{', '.join(proven[0])} is a proven unique key of {target}")
+        # The evidence cites every proven key, not just the first: the grain
+        # choice may prefer a later candidate (a PII-flagged first key, #1079),
+        # and the citation must name the key it proves.
+        shown = " + ".join(", ".join(key) for key in proven)
+        verb = (
+            "is a proven unique key" if len(proven) == 1 else "are proven unique keys"
+        )
+        return lowered, f"{shown} {verb} of {target}"
 
     def _equated(self, join: Any, joined_alias: str) -> frozenset[str]:
         """Joined-side columns the ON (or USING) requires equal to something."""
@@ -2088,7 +2164,23 @@ def _warnings(
     # that looks stale, so the generic disagreement would only repeat it.
     if (grain_declared := declared.get("grain")) and not grain_judged:
         grain = (drafted.get("grain") or {}).get("value")
-        if grain and sorted(c.lower() for c in grain_declared) != sorted(grain):
+        # The declaration is accepted against every proven key, not only the one
+        # the draft picked: the pick may pass over a proven key for its PII flag
+        # (#1079), and the contradiction check already reads the declaration that
+        # way, so warning here would send the two the opposite way.
+        proven = (
+            reading.proven_grains
+            if reading.proven_grains is not None
+            else ([grain] if grain else [])
+        )
+        if (
+            grain
+            and sorted(c.lower() for c in grain_declared) != sorted(grain)
+            and not any(
+                {c.lower() for c in key} == {c.lower() for c in grain_declared}
+                for key in proven
+            )
+        ):
             out.append(_grain_disagreement(model, grain_declared, grain))
     return out
 

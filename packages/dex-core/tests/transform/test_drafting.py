@@ -112,6 +112,41 @@ CACHE = DexCache(
     ],
 )
 
+# The shape from #1071: product_id holds one NULL, so the key walk cannot prove
+# it, while the PII-flagged email is unique and would draft as the grain.
+DIM_PRODUCTS = Dataset(
+    identifier="warehouse.main.dim_products",
+    columns=[
+        _col(
+            "product_id",
+            "integer",
+            null_fraction=0.05,
+            is_unique=True,
+            distinct_count_exact=True,
+        ),
+        _col(
+            "email",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+            pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+        ),
+    ],
+)
+DIM_USERS = Dataset(
+    identifier="warehouse.main.dim_users",
+    columns=[
+        _col(
+            "email",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+            pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+        ),
+        _key("user_id"),
+    ],
+)
+
 
 def _draft(sql: str, *, yml: str | None = None, cache: DexCache | None = CACHE):
     files = {"models/marts/fct.sql": sql}
@@ -982,6 +1017,32 @@ def test_declared_is_read_from_the_yaml_and_missing_names_the_rest():
     )
 
 
+def test_a_declared_grain_matching_a_proven_key_is_not_a_disagreement():
+    """A proven key the draft passed over still holds as a declaration (#1079).
+
+    email and user_id are both proven keys and the draft picks user_id because
+    email is flagged as PII; declaring [email] matches a proven key, so warning
+    that it disagrees with the drafted grain would contradict the contradiction
+    check, which already accepts it.
+    """
+    yml = """version: 2
+models:
+  - name: fct
+    config:
+      meta:
+        dex:
+          grain: [email]
+"""
+    entry, warnings = _draft(
+        "select email, user_id from {{ ref('dim_users') }}\n",
+        yml=yml,
+        cache=DexCache(datasets=[DIM_USERS]),
+    )
+
+    assert entry["drafted"]["grain"]["value"] == ["user_id"]
+    assert not any("declares grain" in w for w in warnings)
+
+
 def test_measure_warnings_group_only_columns_with_the_same_missing_fields():
     yml = """version: 2
 models:
@@ -1300,6 +1361,63 @@ def test_plan_does_not_name_union_cte_as_unprofiled_relation(shop, capsys):
     # Drafting should not report 'combined' as an unprofiled relation.
     assert not any("combined" in w for w in envelope.get("warnings", []))
     assert "fct_daily" in envelope["data"]["declarations"]
+
+
+def test_a_pii_flagged_key_is_not_silently_the_grain_when_a_plain_key_exists():
+    entry, _ = _draft(
+        "select email, user_id from {{ ref('dim_users') }}\n",
+        cache=DexCache(datasets=[DIM_USERS]),
+    )
+
+    grain = entry["drafted"]["grain"]
+    assert grain["value"] == ["user_id"]
+    assert "flagged as PII" not in grain["evidence"]
+
+
+def test_an_all_pii_grain_still_drafts_and_names_the_flag():
+    entry, _ = _draft(
+        "select product_id, email from {{ ref('dim_products') }}\n",
+        cache=DexCache(datasets=[DIM_PRODUCTS]),
+    )
+
+    grain = entry["drafted"]["grain"]
+    assert grain["value"] == ["email"]
+    assert "flagged as PII" in grain["evidence"]
+
+
+def test_a_pii_flag_under_a_configured_alias_is_still_seen():
+    """The profile can live under the model's alias, not its dbt name (#1079).
+
+    A DISTINCT proves the key from the statement alone, so the alias lookup in
+    the PII check is the one chance to read the flag.
+    """
+    users = Dataset(
+        identifier="warehouse.main.users_clean",
+        columns=[
+            _col(
+                "email",
+                null_fraction=0.0,
+                is_unique=True,
+                distinct_count_exact=True,
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+            ),
+            _key("user_id"),
+        ],
+    )
+    files = {
+        "models/marts/fct.sql": "select distinct email from {{ ref('stg_users') }}\n",
+        "models/staging/stg_users.sql": (
+            "{{ config(alias='users_clean') }}\n"
+            "select email, user_id from {{ source('raw', 'users') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct"], files, ["models"], DexCache(datasets=[users]), dialect="duckdb"
+    )
+
+    grain = drafts["fct"]["drafted"]["grain"]
+    assert grain["value"] == ["email"]
+    assert "flagged as PII" in grain["evidence"]
 
 
 def test_a_literal_alias_is_recognized_as_a_project_model():

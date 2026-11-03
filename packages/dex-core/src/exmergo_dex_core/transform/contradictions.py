@@ -627,8 +627,16 @@ def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
 def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
     produced = reading.produced
     dropped = [g for g in grain if produced is not None and g not in produced]
+    # The declared grain is matched against every proven key, not only the one
+    # the draft picked: the pick may prefer a column the declaration does not
+    # name (a PII-flagged first key, #1079), and an edit that strips the
+    # declared key of its proof must still contradict while another key remains.
+    proven = reading.proven_grains
+    if proven is None:
+        proven = [reading.grain] if reading.grain else []
     signature = (
         tuple(sorted(reading.grain or ())),
+        tuple(sorted(tuple(sorted(key)) for key in proven)),
         tuple(dropped),
         reading.grain_withheld,
     )
@@ -640,7 +648,7 @@ def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
         )
     if reading.grain:
         said = f"[{', '.join(reading.grain)}]"
-        if set(reading.grain) == set(grain):
+        if any(set(key) == set(grain) for key in proven):
             return _Verdict("holds", said=said, signature=signature)
         return _Verdict(
             "contradicted",
