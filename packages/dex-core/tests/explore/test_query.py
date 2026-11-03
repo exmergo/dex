@@ -68,6 +68,38 @@ def _log_entries(repo: Path) -> list[dict]:
 # --- the cache gate --------------------------------------------------------------
 
 
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+    ],
+)
+def test_nested_describe_is_a_guard_refusal_without_opening_a_warehouse(
+    tmp_path, capsys, monkeypatch, dialect, sql
+):
+    from exmergo_dex_core.engine import DexEngine
+
+    def unexpected_adapter(*args, **kwargs):
+        pytest.fail("unsupported nested statements must not open a warehouse")
+
+    monkeypatch.setattr(DexEngine, "_adapter", unexpected_adapter)
+    save_config(
+        DexConfig(connector=dialect, bigquery={"project": "test-project"}),
+        tmp_path,
+    )
+    payload = _run(
+        ["--repo-root", str(tmp_path), "explore", "query", sql],
+        capsys,
+        expect_error=True,
+    )
+    assert payload["reason"] == "guard"
+    assert "Describe" in payload["errors"][0]
+    assert "explore profile" in payload["errors"][0]
+    assert _log_entries(tmp_path)[-1]["decision"] == "refused"
+
+
 def test_query_without_cache_is_refused_with_the_fix(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):

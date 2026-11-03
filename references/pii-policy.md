@@ -61,6 +61,14 @@ This section is the only place in the repository that states the number.
 
 ## The firewall rule
 
+Agent-authored queries must be SELECTs or supported set operations. Query
+bodies in CTEs, subqueries and set-operation branches follow the same rule.
+Nested metadata statements such as `DESCRIBE` are refused before connection
+discovery, profiling or execution, including in scalar expressions and unused
+CTEs. The typed refusal names the unsupported shape and points to
+`explore inventory` or `explore profile` for introspection. This also applies
+to compile-time queries run through `transform plan`.
+
 Output may carry values only from profiled columns whose flag is absent or below
 the threshold. Every value path from a blocking column must pass through a
 measuring aggregate (COUNT, APPROX_COUNT_DISTINCT, AVG, SUM, STDDEV, and the
