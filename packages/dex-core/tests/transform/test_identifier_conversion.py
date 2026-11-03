@@ -517,6 +517,47 @@ def test_an_aggregating_scope_is_unchecked_rather_than_counted():
     assert built.sql is None and built.code == "unsupported_scope"
 
 
+def test_a_conversion_inside_a_quoted_mixed_case_cte_preserves_the_name():
+    """a quoted mixed-case cte name is re-emitted with quotes and casing."""
+    authored = _tree(
+        'with "Orders_Clean" as ('
+        "    select lower(order_id) as id from raw_orders"
+        ') select id from "Orders_Clean"'
+    )
+    for dialect in ("postgres", "snowflake", "duckdb"):
+        built = ic.conversion_probe(authored, 0, dialect)
+        assert built.sql is not None
+        assert 'FROM "Orders_Clean"' in built.sql
+        assert "FROM orders_clean" not in built.sql
+
+
+def test_a_filter_conversion_inside_a_quoted_mixed_case_cte_preserves_the_name():
+    """filter conversion inside a quoted mixed-case cte preserves quotes."""
+    authored = _tree(
+        'with "Orders_Clean" as ('
+        "    select order_id from raw_orders where lower(order_id) <> 'retired'"
+        ') select order_id from "Orders_Clean"'
+    )
+    for dialect in ("postgres", "snowflake", "duckdb"):
+        built = ic.conversion_probe(authored, 0, dialect)
+        assert built.sql is not None
+        assert 'FROM "Orders_Clean"' in built.sql
+        assert "FROM orders_clean" not in built.sql
+
+
+def test_a_cast_conversion_inside_a_quoted_mixed_case_cte_preserves_the_name():
+    """cast conversion inside a quoted mixed-case cte preserves quotes."""
+    authored = _tree(
+        'with "Orders_Clean" as ('
+        "    select cast(order_id as varchar) as id from raw_orders"
+        ') select id from "Orders_Clean"'
+    )
+    built = ic.conversion_probe(authored, 0, "snowflake")
+    assert built.sql is not None
+    assert 'FROM "Orders_Clean"' in built.sql
+    assert "FROM orders_clean" not in built.sql
+
+
 # --- a metered connector -----------------------------------------------------------
 
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter  # noqa: E402

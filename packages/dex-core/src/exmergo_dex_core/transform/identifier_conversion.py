@@ -177,6 +177,7 @@ class _Found:
     #: Why an unsupported entry cannot be measured: a rewrite dex does not
     #: measure, or a scope it cannot align (a UNION, a subquery).
     code: str = "unsupported_expression"
+    scope_ident: exp.Identifier | None = None
 
     def signature(self) -> tuple[str, str, str]:
         return (self.scope, self.site, sql_shape.match_key(self.node))
@@ -248,7 +249,9 @@ def find_conversions(tree: exp.Expression) -> list[_Found]:
     """
 
     found: list[_Found] = []
+    scope_idents = sql_shape.scope_identifiers(tree)
     for scope, body in sql_shape.scopes(tree).items():
+        scope_ident = scope_idents.get(scope)
         selects = [body] if isinstance(body, exp.Select) else []
         for select in selects:
             for node in list(select.walk()):
@@ -279,6 +282,7 @@ def find_conversions(tree: exp.Expression) -> list[_Found]:
                         steps,
                         output=output,
                         partner=_partner(node) if site == "join" else None,
+                        scope_ident=scope_ident,
                     )
                 )
             found.extend(_unsupported(scope, select, found))
@@ -670,10 +674,13 @@ def conversion_probe(
         if main:
             inner_sql = select.sql(dialect=dialect)
         else:
+            ident = (
+                target.scope_ident.copy()
+                if target.scope_ident is not None
+                else exp.to_identifier(target.scope)
+            )
             inner_sql = (
-                exp.select("dex_raw", "dex_conv")
-                .from_(exp.to_identifier(target.scope))
-                .sql(dialect=dialect)
+                exp.select("dex_raw", "dex_conv").from_(ident).sql(dialect=dialect)
             )
         where = (
             "with the scope's other filters applied and the conversion's own "

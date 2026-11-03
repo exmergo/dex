@@ -317,3 +317,20 @@ def test_the_guarded_cast_returns_null_for_what_would_not_convert(target, low, h
     sql = guarded.replace("FROM t", f"FROM (VALUES {rows}) AS t(k)")
     got = [row[0] for row in duckdb.connect().execute(sql).fetchall()]
     assert got == [expected for _, expected in values]
+
+
+def test_scope_identifiers_preserves_quoted_mixed_case_cte_names():
+    """scope_identifiers retains original casing and quotes on cte identifiers."""
+    sql = (
+        'with "Orders_Clean" as (select 1 as id), '
+        "raw as (select 2 as id) "
+        'select * from "Orders_Clean"'
+    )
+    tree = _parse(sql)
+    idents = sql_shape.scope_identifiers(tree)
+    assert idents["orders_clean"].this == "Orders_Clean"
+    assert idents["orders_clean"].quoted is True
+    assert idents["raw"].this == "raw"
+    assert not idents["raw"].quoted
+    assert sql_shape.scope_identifier(tree, "orders_clean").this == "Orders_Clean"
+    assert sql_shape.scope_identifier(tree, "orders_clean").quoted is True

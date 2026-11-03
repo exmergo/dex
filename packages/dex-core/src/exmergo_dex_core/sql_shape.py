@@ -98,6 +98,33 @@ def scopes(tree: exp.Expression) -> dict[str, exp.Expression]:
     return found
 
 
+def scope_identifiers(tree: exp.Expression) -> dict[str, exp.Identifier]:
+    """The original identifier node for each scope in ``tree``, keyed in lowercase.
+
+    Top-level CTEs carry their written identifier, with quotes preserved; the
+    final select carries ``MAIN_SCOPE``.
+    """
+
+    found: dict[str, exp.Identifier] = {}
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    if with_clause is not None:
+        for cte in with_clause.expressions:
+            alias = cte.args.get("alias")
+            if alias is not None and isinstance(alias.this, exp.Identifier):
+                ident = alias.this.copy()
+            else:
+                ident = exp.to_identifier(cte.alias_or_name)
+            found[cte.alias_or_name.lower()] = ident
+    found[MAIN_SCOPE] = exp.to_identifier(MAIN_SCOPE)
+    return found
+
+
+def scope_identifier(tree: exp.Expression, scope: str) -> exp.Identifier:
+    """The written identifier of ``scope`` in ``tree``, preserving quotes."""
+
+    return scope_identifiers(tree).get(scope, exp.to_identifier(scope))
+
+
 def predicates(select: exp.Select, key: str) -> list[exp.Expression]:
     """A WHERE/HAVING/QUALIFY condition flattened across its top-level ANDs.
 

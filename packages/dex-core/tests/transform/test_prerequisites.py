@@ -248,6 +248,51 @@ def test_a_dispatching_macro_is_named_and_a_plain_one_is_not():
     assert option["macros"] == ["pkg.fix"]
 
 
+def test_a_nested_dispatching_macro_is_found_transitively():
+    """A plain wrapper that depends on a dispatching package macro still
+    supports macro_dispatch (#1063)."""
+    manifest = _manifest()
+    manifest["nodes"][PKG]["depends_on"]["macros"] = ["macro.pkg.wrapper"]
+    manifest["macros"] = {
+        "macro.pkg.wrapper": {
+            "name": "wrapper",
+            "package_name": "pkg",
+            "macro_sql": "{{ pkg.dispatching() }}",
+            "depends_on": {"macros": ["macro.pkg.dispatching"]},
+        },
+        "macro.pkg.dispatching": {
+            "name": "dispatching",
+            "package_name": "pkg",
+            "macro_sql": "{{ return(adapter.dispatch('dispatching', 'pkg')()) }}",
+        },
+    }
+    option = _option(_one(manifest), "macro_dispatch")
+    assert option["supported"] is True
+    assert option["macros"] == ["pkg.dispatching"]
+
+
+def test_a_macro_dependency_cycle_does_not_hang():
+    """Cycle through depends_on.macros must terminate (#1063)."""
+    manifest = _manifest()
+    manifest["nodes"][PKG]["depends_on"]["macros"] = ["macro.pkg.a"]
+    manifest["macros"] = {
+        "macro.pkg.a": {
+            "name": "a",
+            "package_name": "pkg",
+            "macro_sql": "{{ pkg.b() }}",
+            "depends_on": {"macros": ["macro.pkg.b"]},
+        },
+        "macro.pkg.b": {
+            "name": "b",
+            "package_name": "pkg",
+            "macro_sql": "{{ pkg.a() }}",
+            "depends_on": {"macros": ["macro.pkg.a"]},
+        },
+    }
+    option = _option(_one(manifest), "macro_dispatch")
+    assert option["supported"] is False
+
+
 def test_dbt_utils_counts_as_a_package_and_an_adapter_does_not():
     manifest = _manifest()
     manifest["nodes"][PKG]["depends_on"]["macros"] = [
