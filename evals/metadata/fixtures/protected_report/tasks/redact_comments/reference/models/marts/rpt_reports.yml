@@ -1,0 +1,38 @@
+version: 2
+models:
+- name: rpt_reports
+  description: One row per source report with explicitly redacted comments.
+  config:
+    meta:
+      contains_pii: true
+      dex:
+        grain:
+        - report_id
+        population:
+          rule: Every source report; no filtering or deduplication.
+          parent:
+            model: stg_reports
+            key:
+              report_id: report_id
+        assumptions:
+        - decision: Treatment of protected comments
+          chosen: Replace every comment with a typed NULL
+          evidence: request
+          detail: The requested output contract explicitly specifies this treatment.
+  columns:
+  - name: report_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+  - name: comments
+    description: Protected free text; validate without retrieving examples.
+    config:
+      meta:
+        contains_pii: true
+        pii_category: free_text
+        dex:
+          role: attribute

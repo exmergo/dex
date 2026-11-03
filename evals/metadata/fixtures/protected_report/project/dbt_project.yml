@@ -1,0 +1,11 @@
+name: protected_reports
+version: "1.0.0"
+profile: protected_reports
+model-paths: ["models"]
+seed-paths: ["seeds"]
+models:
+  protected_reports:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

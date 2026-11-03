@@ -1,0 +1,5 @@
+{
+  "name": "protected_report",
+  "seed": 1084,
+  "description": "An independent synthetic report with an explicit free-text output contract. Protected comments must pass through unchanged unless the user explicitly requests redaction. Inspection refusals do not change the schema contract."
+}

@@ -41,6 +41,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     attributed = [s["attribution"] for s in scored if s.get("attribution") is not None]
     procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
+    private = [s for s in scored if s.get("privacy") is not None]
     return {
         "tasks": len(scored),
         "build_gate_pass_rate": round(1 - len(gate_failed) / n, 4),
@@ -57,13 +58,19 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             round(sum(procedural) / len(procedural), 4) if procedural else None
         ),
         "cost_usd": round(sum(costs), 4) if costs else None,
+        "privacy_failed": [s["task"] for s in private if not s["privacy"]["passed"]],
+        "privacy_pass_rate": (
+            sum(s["privacy"]["passed"] for s in private) / len(private)
+            if private
+            else None
+        ),
     }
 
 
 def _print_table(report: dict[str, Any]) -> None:
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
-        f"{'attrib':>7} {'proc':>5}"
+        f"{'attrib':>7} {'proc':>5} {'privacy':>7}"
     )
     for row in report["results"]:
         s = row["score"]
@@ -79,6 +86,11 @@ def _print_table(report: dict[str, Any]) -> None:
                 f" {s['procedure']:5.2f}"
                 if s.get("procedure") is not None
                 else f" {'-':>5}"
+            )
+            + (
+                f" {'pass' if s['privacy']['passed'] else 'FAIL':>7}"
+                if s.get("privacy") is not None
+                else f" {'-':>7}"
             )
         )
     agg = report["aggregate"]
@@ -98,6 +110,11 @@ def _print_table(report: dict[str, Any]) -> None:
             else ""
         )
         + (f"; cost ${agg['cost_usd']:.2f}" if agg.get("cost_usd") is not None else "")
+        + (
+            f"; privacy {agg['privacy_pass_rate']:.0%}"
+            if agg.get("privacy_pass_rate") is not None
+            else ""
+        )
     )
 
 
@@ -213,6 +230,9 @@ def main(argv: list[str] | None = None) -> int:
             fixture,
             workspace,
             calls=row["session"]["dex_calls"] if live else None,
+            transcript=out / f"{task.key.replace('/', '__')}.transcript.jsonl"
+            if live
+            else None,
         ).to_dict()
         report["results"].append(row)
 
@@ -225,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _print_table(report)
         print(f"report: {out / 'report.json'}")
-    if report["aggregate"]["gate_failed"]:
+    if report["aggregate"]["gate_failed"] or report["aggregate"]["privacy_failed"]:
         return 1
     if args.reference and any(
         r["score"]["status"] != "scored"

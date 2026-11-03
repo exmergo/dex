@@ -78,6 +78,28 @@ information for the user, not an error to fix.
 
 Unnested JSON and array outputs inherit the source column's flags.
 
+## Protected values and transformation columns
+
+A refusal to return protected values to an agent does not instruct it to remove,
+redact or replace a column in a user's transformation. When the requested or
+existing output contract includes that field, preserve its authorized pass-through
+through the normal `transform plan` and `transform apply` path where supported,
+then build on dev with verification. Validate column presence and types through
+metadata and use only permitted aggregate evidence for row checks. There is no
+need to retrieve an example of the protected value.
+
+Intentional removal or redaction requires an applicable user instruction or
+contract. Do not invent either as a workaround for an inspection restriction,
+and keep protected examples out of assumptions, tests, logs and explanations.
+Only a human may clear a PII flag.
+
+Permission belongs to the command and operation being performed. A supported
+model pass-through does not authorize exporting the field as a seed: the seed
+header gate still applies because seed values enter the repository. If a
+transformation itself is prohibited or unsupported, report that limitation
+accurately and leave the guard in place. Never bypass a privacy or dev-target
+guard or infer permission from another command's success.
+
 ## The stricter surface
 
 Where a command's result *is* the values rather than an aggregate those values

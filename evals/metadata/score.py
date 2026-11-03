@@ -44,6 +44,7 @@ from .fixtures import (
     build_warehouse,
     starting_project,
 )
+from .privacy import privacy_checks
 
 EVIDENCE_TIERS = ("request", "contract", "precedent", "data", "default")
 MEASURE_FIELDS = ("aggregation", "additivity", "unit")
@@ -496,6 +497,8 @@ class TaskScore:
     #: when the task grades none or there was no session (see procedure_steps).
     procedure: float | None = None
     procedure_steps: dict[str, bool] | None = None
+    #: Independent synthetic-value leakage/config checks; not a schema score.
+    privacy: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -506,8 +509,12 @@ def score_workspace(
     fixture: Fixture,
     workspace: Path,
     calls: list[dict[str, Any]] | None = None,
+    transcript: Path | None = None,
 ) -> TaskScore:
     score = _score_workspace(task, fixture, workspace)
+    score.privacy = privacy_checks(
+        task.truth.get("privacy"), fixture, workspace, transcript
+    )
     graded = procedure_steps(task.truth.get("procedure"), calls)
     if graded is not None:
         score.procedure = graded["score"]
