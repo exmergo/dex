@@ -300,6 +300,8 @@ class _WarehouseUptime:
         record_claim: Callable[[dict], None] | None = None,
         role: str | None = None,
     ):
+        """Track warehouse uptime and overhead across one command's statements."""
+
         self._read_state = read_state
         #: The session's role, for advice that names the grant to run.
         self._role = role
@@ -316,6 +318,7 @@ class _WarehouseUptime:
         self._first_start: float | None = None
         self._first_end: float | None = None
         self._last_end: float | None = None
+        self._statements: list[tuple[float, float, float]] = []
         self._recorded = 0.0
         self._admitted = False
         self._charged = False
@@ -354,6 +357,7 @@ class _WarehouseUptime:
             return
         end = self._clock()
         start = end - max(float(span or 0.0), seconds)
+        self._statements.append((start, end, seconds))
         if self._first_start is None:
             self._first_start, self._first_end = start, end
         else:
@@ -555,7 +559,7 @@ class _WarehouseUptime:
         # while it resumes for another session's query, which is then the one
         # leaving it idle.
         busy = after is not None and (after["running"] > 0 or after["queued"] > 0)
-        resumed = self._found_suspended()
+        resumed = self._found_suspended() or self._resumed_on_moved(after)
         outcome = self._suspend() if self._may_suspend(after) else None
         notes: list[str] = []
         if outcome == "suspended":
@@ -571,11 +575,12 @@ class _WarehouseUptime:
             )
         else:
             tail = 0.0 if busy or auto_suspend is None else float(auto_suspend)
-            overhead = self._owed(tail=tail, resumed=resumed)
+            overhead = self._owed(tail=tail, resumed=resumed, after=after)
             joined = (
                 not resumed
                 and self._prior_claim() is not None
-                and overhead < self._owed(tail=tail, resumed=resumed, cycle=False)
+                and overhead
+                < self._owed(tail=tail, resumed=resumed, cycle=False, after=after)
             )
             start = (
                 f"This command resumed {name}, which bills at least "
@@ -726,13 +731,103 @@ class _WarehouseUptime:
         return max(matching, key=lambda claim: claim["last_statement_end"])
 
     def _wall(self, monotonic: float) -> float:
+        """Convert a monotonic clock timestamp into epoch wall seconds."""
+
         return monotonic + self._wall_offset
 
     def _found_suspended(self) -> bool:
+        """Whether this command found the warehouse suspended initially."""
+
         before = self.before
         return before is None or before["state"] != "STARTED"
 
-    def _owed(self, *, tail: float, resumed: bool, cycle: bool = True) -> float:
+    def _resumed_on_moved(self, after: dict | None) -> bool:
+        """Whether the warehouse resumed during this command even though this
+        command did not find it suspended initially: its ``resumed_on`` moved
+        since the command started (#938)."""
+
+        before = self.before
+        if before is None or after is None:
+            return False
+        if before.get("state") != "STARTED":
+            return False
+        before_on = before.get("resumed_on")
+        after_on = after.get("resumed_on")
+        if not (after_on and before_on != after_on):
+            return False
+        return self._resume_statement_index(after) is not None
+
+    def _resume_statement_index(self, after: dict | None) -> int | None:
+        """The index in ``self._statements`` of the statement that woke the
+        warehouse mid-command, or ``None`` when the resume was not caused by
+        any of this command's statements (#938)."""
+
+        if not self._statements:
+            return None
+        resumed_at = (after or {}).get("resumed_at")
+        if resumed_at is not None:
+            resumed_mono = resumed_at - self._wall_offset
+            matching = [
+                i
+                for i, (start, end, _) in enumerate(self._statements)
+                if start - self._RESUME_SKEW_SECONDS
+                <= resumed_mono
+                <= end + self._RESUME_SKEW_SECONDS
+            ]
+            if matching:
+                return min(
+                    matching,
+                    key=lambda i: abs(self._statements[i][0] - resumed_mono),
+                )
+            return None
+        return 1 if len(self._statements) > 1 else 0
+
+    def _owed(
+        self,
+        *,
+        tail: float,
+        resumed: bool,
+        cycle: bool = True,
+        after: dict | None = None,
+    ) -> float:
+        """The warehouse seconds owed beyond statement time already recorded.
+
+        When the warehouse resumed mid-command (its ``resumed_on`` moved since
+        dex started even though dex found it started), the resume floor is
+        measured from the statement that resumed it, and statements before that
+        resume owe their own span (#938).
+        """
+
+        if not self._found_suspended() and self._resumed_on_moved(after):
+            k = self._resume_statement_index(after)
+            if k is not None:
+                resume_start = self._statements[k][0]
+                recorded_before = sum(s[2] for s in self._statements[:k])
+                recorded_from_k = sum(s[2] for s in self._statements[k:])
+                prior_span = (
+                    (self._statements[k - 1][1] - self._first_start)
+                    if k > 0 and self._first_start is not None
+                    else 0.0
+                )
+                prior_overhead = max(prior_span - recorded_before, 0.0)
+                if cycle:
+                    prior = self._prior_claim()
+                    if prior is not None and k > 0:
+                        prior_end = self._wall(self._statements[k - 1][1])
+                        claimed_until = float(prior["last_statement_end"]) + float(
+                            prior.get("auto_suspend") or 0
+                        )
+                        prior_extends = prior_end - claimed_until - recorded_before
+                        prior_overhead = max(min(prior_overhead, prior_extends), 0.0)
+                cycle_span = (
+                    (self._last_end - resume_start)
+                    if self._last_end is not None
+                    else 0.0
+                )
+                cycle_uptime = max(cycle_span + tail, _RESUME_MINIMUM_SECONDS)
+                cycle_overhead = max(cycle_uptime - recorded_from_k, 0.0)
+                return prior_overhead + cycle_overhead
+
         span = 0.0
         if self._first_start is not None and self._last_end is not None:
             span = self._last_end - self._first_start

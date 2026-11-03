@@ -871,6 +871,100 @@ def test_a_new_resume_cycle_ignores_the_previous_cycles_claim(tail_600):
     assert _settled(second)[0] == pytest.approx(601.0)
 
 
+def test_a_command_resumed_mid_run_bills_the_resume_minimum_from_that_statement(
+    fake_sf_connection,
+):
+    """When another command suspends the warehouse mid-run, this command's next
+    statement wakes it and bills at least 60 seconds of uptime from that second
+    resume (#938)."""
+
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    fake_sf_connection.warehouses[0].resumed_on = "2026-01-01T00:00:00-08:00"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)
+
+    # Another command suspends the warehouse between statements.
+    fake_sf_connection.warehouses[0].state = "SUSPENDED"
+    fake_sf_connection.clock.now += 5.0
+
+    _one_query(adapter)
+    billed, notes = _settled(adapter)
+    # Statement 1 (1.0s) + statement 2 resume cycle (max(1.0 + 10, 60) = 60.0s).
+    assert billed == pytest.approx(61.0)
+    assert any("resumed DEX_WH" in n for n in notes)
+
+
+def test_sharing_a_warehouse_when_another_command_suspends_mid_run(
+    fake_sf_connection,
+):
+    """Two Dex commands share a warehouse: command A resumes it and suspends it
+    when done. Command B found it running, but runs statement 2 after A suspended
+    it. Command B resumes it and settles at least 60 seconds of uptime from that
+    second statement (#938)."""
+
+    entries: list[dict] = []
+    fake_sf_connection.warehouses[0].state = "SUSPENDED"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    a = _ledgered(fake_sf_connection, entries, suspend=True, ceiling=1200.0)
+    _one_query(a)  # A resumes the warehouse at t = 0 .. 1
+
+    # B starts while the warehouse is running.
+    b = _ledgered(fake_sf_connection, entries, ceiling=1200.0)
+    assert b.warehouse_uptime.before["state"] == "STARTED"
+    _one_query(b)  # B statement 1 at t = 1 .. 2
+
+    # A finishes and suspends the warehouse.
+    _settled(a)
+    assert fake_sf_connection.warehouses[0].state == "SUSPENDED"
+
+    fake_sf_connection.clock.now += 3.0
+    _one_query(b)  # B statement 2 wakes it at t = 5 .. 6
+    billed, notes = _settled(b)
+    # B statement 1 is 1.0s.
+    # B statement 2 resumes the warehouse: floor is 60.0s.
+    assert billed == pytest.approx(61.0)
+    assert any("resumed DEX_WH" in n for n in notes)
+
+
+def test_a_resume_caused_by_another_session_charges_no_resume_minimum(
+    fake_sf_connection,
+):
+    """When resumed_on moves but resumed_at is outside every statement window of
+    this command, another session woke the warehouse, so no resume minimum is
+    charged to this command (#938)."""
+
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    fake_sf_connection.warehouses[0].resumed_on = "2026-01-01T00:00:00-08:00"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)  # Statement 1 at t = 0 .. 1
+
+    # Another session woke the warehouse at t = 60, far from both statements.
+    from fakes.snowflake import _iso
+
+    fake_sf_connection.warehouses[0].resumed_on = _iso(
+        fake_sf_connection.clock.EPOCH + 60.0
+    )
+    fake_sf_connection.clock.now += 120.0  # t = 121
+
+    _one_query(adapter)  # Statement 2 at t = 121 .. 122
+    billed, notes = _settled(adapter)
+    # Warehouse was already running; no resume minimum from this command.
+    assert billed == pytest.approx(132.0)
+    assert not any("resumed DEX_WH" in n for n in notes)
+    assert any("DEX_WH was already running" in n for n in notes)
+
+
 def test_capabilities_recommend_a_short_auto_suspend_without_changing_it(tail_600):
     caps = make_adapter(tail_600).capabilities()
     assert caps["budget"]["warehouse"]["suspend_after_command"] == {
