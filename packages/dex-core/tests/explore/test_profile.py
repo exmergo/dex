@@ -980,8 +980,7 @@ def test_heterogeneous_key_note_wording_follows_proven_key_flag():
     unproven = _heterogeneous_key_note("product_id", agg, proven_key=False)
     assert proven is not None and "is a candidate key but mixes value shapes" in proven
     assert (
-        unproven is not None
-        and "looks like a key but mixes value shapes" in unproven
+        unproven is not None and "looks like a key but mixes value shapes" in unproven
     )
     assert "is a candidate key" not in unproven
 
@@ -1091,7 +1090,8 @@ def test_an_unproven_id_shaped_column_that_mixes_shapes_is_noted_real_duckdb(
     assert "product_id looks like a key but mixes value shapes" in notes
     assert "numeric" in notes and "other" in notes
     (mixed,) = [
-        f for f in profile_findings(dataset, high_null_fraction=0.95)
+        f
+        for f in profile_findings(dataset, high_null_fraction=0.95)
         if f.code == "mixed_identifier_shapes"
     ]
     assert mixed.column == "product_id"

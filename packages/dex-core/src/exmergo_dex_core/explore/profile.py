@@ -755,11 +755,7 @@ def _heterogeneous_key_note(
             "a join or filter written for one shape will silently miss the "
             "other group(s)"
         )
-    role = (
-        "is a candidate key but"
-        if proven_key
-        else "looks like a key but"
-    )
+    role = "is a candidate key but" if proven_key else "looks like a key but"
     return f"{col_name} {role} mixes value shapes: {parts}; {consequence}"
 
 
