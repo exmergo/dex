@@ -238,8 +238,17 @@ def _override_option(
 def _dispatch_option(
     node: Mapping[str, Any], macros: Mapping[str, Any], root: str | None
 ) -> dict[str, Any]:
-    dispatching = []
-    for macro_id in (node.get("depends_on") or {}).get("macros") or []:
+    # Walk depends_on.macros transitively: a plain wrapper that calls a
+    # dispatching package macro still supports the macro_dispatch repair
+    # (issue #1063). Cycle guard via seen set.
+    dispatching: list[str] = []
+    seen: set[str] = set()
+    stack = list((node.get("depends_on") or {}).get("macros") or [])
+    while stack:
+        macro_id = stack.pop()
+        if macro_id in seen:
+            continue
+        seen.add(macro_id)
         macro = macros.get(macro_id)
         if not isinstance(macro, Mapping):
             continue
@@ -248,6 +257,11 @@ def _dispatch_option(
             continue
         if "adapter.dispatch" in str(macro.get("macro_sql") or ""):
             dispatching.append(f"{package}.{macro.get('name')}")
+        stack.extend(
+            nested
+            for nested in (macro.get("depends_on") or {}).get("macros") or []
+            if nested not in seen
+        )
     if not dispatching:
         return {
             "kind": "macro_dispatch",
