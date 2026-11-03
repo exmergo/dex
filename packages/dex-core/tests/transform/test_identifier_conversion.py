@@ -304,6 +304,75 @@ def test_identity_change_is_detected_when_the_row_count_is_unchanged(
     assert any("identities in `product_id` are gone" in w for w in envelope["warnings"])
 
 
+def test_identity_comparison_follows_a_cast_that_renames_the_key(
+    products_project, capsys
+):
+    """A repair that casts and renames the key still gets an identity comparison.
+
+    Prior exposes `product_id`; authored emits `product_key` from that column.
+    The record names both, and the counts match the same-name cast case.
+    """
+
+    repo, warehouse = products_project
+    prior = (
+        _HEAD + "select p.product_id, p.product_name\n"
+        f"from {_SRC} p\nwhere p.supplier <> 'retired'\n"
+    )
+    (repo / "analytics" / PRODUCTS_PATH).write_text(prior, encoding="utf-8")
+    authored = (
+        _HEAD
+        + "select cast(try_cast(p.product_id as integer) as varchar) as product_key, "
+        "p.product_name\n"
+        f"from {_SRC} p\nwhere p.supplier <> 'retired'\n"
+    )
+    envelope = _plan(repo, warehouse, authored, capsys)
+    found = _at(envelope, "projection")
+    assert found["output_column"] == "product_key"
+    identity = found["identity"]
+    assert identity["column"] == "product_key"
+    assert identity["prior_column"] == "product_id"
+    assert identity["prior_rows"] == identity["authored_rows"] == 8
+    assert identity["prior_entities"] == 7
+    assert identity["authored_entities"] == 3
+    assert identity["kept"] == 3
+    assert identity["lost"] == 4
+    assert identity["gained"] == 0
+    assert identity["identity_changed"] is True
+
+
+def test_identity_stays_unchecked_when_two_outputs_share_one_source_column(
+    products_project, capsys
+):
+    """Two authored outputs from the same prior key stay `no_shared_key_column`.
+
+    Neither name matches the prior; both `product_key` and `product_key_alt`
+    read `product_id`, so the rename mapping is ambiguous.
+    """
+
+    repo, warehouse = products_project
+    prior = (
+        _HEAD + "select p.product_id, p.product_name\n"
+        f"from {_SRC} p\nwhere p.supplier <> 'retired'\n"
+    )
+    (repo / "analytics" / PRODUCTS_PATH).write_text(prior, encoding="utf-8")
+    authored = (
+        _HEAD
+        + "select cast(try_cast(p.product_id as integer) as varchar) as product_key, "
+        "cast(try_cast(p.product_id as integer) as varchar) as product_key_alt, "
+        "p.product_name\n"
+        f"from {_SRC} p\nwhere p.supplier <> 'retired'\n"
+    )
+    envelope = _plan(repo, warehouse, authored, capsys)
+    projections = [c for c in _conversions(envelope) if c["site"] == "projection"]
+    assert {c["output_column"] for c in projections} == {
+        "product_key",
+        "product_key_alt",
+    }
+    for found in projections:
+        assert found.get("identity") is None
+        assert found.get("identity_reason_code") == "no_shared_key_column"
+
+
 def test_a_conversion_the_prior_already_had_is_not_reported_again(
     products_project, capsys
 ):
