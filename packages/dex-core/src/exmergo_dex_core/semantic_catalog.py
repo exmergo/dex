@@ -284,6 +284,26 @@ class MetricInfo:
     vendor_params: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class CompiledOnly:
+    """A definition the layer holds that only the vendor's compiler can read.
+
+    Some formats are only effective once compiled: a Cube YAML file is rendered
+    as Jinja first, a JS model needs Node, and ``extends`` is resolved by the
+    compiler. dex reads none of that statically, and translating a guess out of
+    it would be a catalog claiming definitions nobody reviewed in that shape. So
+    such a definition is named here instead, as part of the layer whose contents
+    this catalog does not carry, and never as an absent one.
+
+    ``element`` is the cube or view within the file where only that element is
+    compiled-only (``extends``), and ``None`` where the whole file is.
+    """
+
+    file: str
+    reason: str
+    element: str | None = None
+
+
 @dataclass
 class SemanticCatalogView:
     """A semantic layer as a read catalog, from whatever holds it.
@@ -317,6 +337,11 @@ class SemanticCatalogView:
 
     ``notes`` is how a format says what it could not supply, the way
     ``ProjectDefinitions.notes`` and ``SemanticLayer.notes`` do.
+
+    ``compiled_only`` names the definitions the layer holds that the reader
+    cannot translate without the vendor's compiler (see :class:`CompiledOnly`).
+    Serialized only when non-empty, and survives every narrowing, because it is
+    a statement about the layer rather than about the elements in view.
     """
 
     semantic_models: list[SemanticModelInfo] = field(default_factory=list)
@@ -328,6 +353,7 @@ class SemanticCatalogView:
     notes: list[str] = field(default_factory=list)
     physical_columns: dict[str, tuple[str, str]] = field(default_factory=dict)
     computed_columns: dict[str, tuple[str, str]] = field(default_factory=dict)
+    compiled_only: list[CompiledOnly] = field(default_factory=list)
 
     def narrowed_to(self, metrics: list[str]) -> tuple[SemanticCatalogView, list[str]]:
         """This catalog narrowed to the metrics named, as ``(catalog, unknown)``.
@@ -355,12 +381,15 @@ class SemanticCatalogView:
         unknown = [name for name in wanted if name not in by_name]
         kept_metrics = [by_name[name] for name in wanted if name in by_name]
 
-        kept_measures = {
-            name for m in kept_metrics for name in (m.input_measures or [])
-        }
         kept_models = {name for m in kept_metrics for name in (m.semantic_models or [])}
         kept_dimensions = {name for m in kept_metrics for name in m.dimensions}
-        measures = [m for m in self.measures if m.name in kept_measures]
+        read = {
+            id(found)
+            for metric in kept_metrics
+            for name in (metric.input_measures or ())
+            if (found := self.measure_for(metric, name)) is not None
+        }
+        measures = [m for m in self.measures if id(m) in read]
         dimensions = [d for d in self.dimensions if d.name in kept_dimensions]
         kept_models.update(m.semantic_model for m in measures if m.semantic_model)
         kept_models.update(d.semantic_model for d in dimensions if d.semantic_model)
@@ -382,6 +411,25 @@ class SemanticCatalogView:
             ),
             unknown,
         )
+
+    def measure_for(self, metric: MetricInfo, name: str) -> MeasureInfo | None:
+        """The measure ``name`` that ``metric`` reads, or None.
+
+        A measure name is unique across a MetricFlow layer, and only within its
+        semantic model in a format that scopes measures to their model (two Cube
+        cubes can each declare ``count``). So a name that more than one model
+        declares resolves through the semantic models the metric names, and is
+        None where that still leaves more than one: picking one would read the
+        other model's measure as this metric's.
+        """
+
+        if name not in (metric.input_measures or ()):
+            return None
+        found = [m for m in self.measures if m.name == name]
+        if len(found) > 1:
+            owners = set(metric.semantic_models or ())
+            found = [m for m in found if m.semantic_model in owners]
+        return found[0] if len(found) == 1 else None
 
     def matching(self, terms: list[str]) -> tuple[SemanticCatalogView, list[str]]:
         """This catalog narrowed to what the search terms touch, as
@@ -735,7 +783,6 @@ def time_axis_tokens(view: SemanticCatalogView, metrics: list[str]) -> list[str]
     """
 
     by_metric = {metric.name: metric for metric in view.metrics}
-    by_measure = {measure.name: measure for measure in view.measures}
     by_model = {model.name: model for model in view.semantic_models}
 
     def declaration(model_name: str | None, definition: str | None) -> str | None:
@@ -760,7 +807,7 @@ def time_axis_tokens(view: SemanticCatalogView, metrics: list[str]) -> list[str]
         if metric.input_measures:
             axes = []
             for measure_name in metric.input_measures:
-                measure = by_measure.get(measure_name)
+                measure = view.measure_for(metric, measure_name)
                 if measure is None:
                     return None
                 axes.append((measure.semantic_model, measure.agg_time_dimension))

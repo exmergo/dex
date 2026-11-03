@@ -1,0 +1,478 @@
+{
+ "cubes": [
+  {
+   "name": "customers",
+   "type": "cube",
+   "title": "Customers",
+   "isVisible": true,
+   "public": true,
+   "connectedComponent": 1,
+   "measures": [
+    {
+     "name": "customers.count",
+     "title": "Customers Count",
+     "shortTitle": "Count",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "count",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true
+    }
+   ],
+   "dimensions": [
+    {
+     "name": "customers.email",
+     "title": "Customers Email",
+     "type": "string",
+     "shortTitle": "Email",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "sql": "`email`"
+    },
+    {
+     "name": "customers.city",
+     "title": "Customers City",
+     "type": "string",
+     "shortTitle": "City",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "sql": "`city`"
+    },
+    {
+     "name": "customers.created_at",
+     "title": "Customers Created at",
+     "type": "time",
+     "shortTitle": "Created at",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "sql": "`created_at`"
+    }
+   ],
+   "segments": [],
+   "hierarchies": [],
+   "folders": [],
+   "nestedFolders": [],
+   "fileName": "cubes/customers.yml",
+   "joins": [],
+   "preAggregations": []
+  },
+  {
+   "name": "order_items",
+   "type": "cube",
+   "title": "Order Items",
+   "isVisible": true,
+   "public": true,
+   "connectedComponent": 1,
+   "measures": [
+    {
+     "name": "order_items.units",
+     "title": "Order Items Units",
+     "shortTitle": "Units",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "sum",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true,
+     "sql": "`quantity`"
+    },
+    {
+     "name": "order_items.line_revenue",
+     "title": "Order Items Line Revenue",
+     "shortTitle": "Line Revenue",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "sum",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true,
+     "sql": "`${CUBE}.quantity * ${CUBE}.unit_price`"
+    }
+   ],
+   "dimensions": [],
+   "segments": [],
+   "hierarchies": [],
+   "folders": [],
+   "nestedFolders": [],
+   "fileName": "cubes/order_items.yml",
+   "joins": [
+    {
+     "name": "orders",
+     "sql": "`${CUBE}.order_id = ${orders}.id`",
+     "relationship": "belongsTo"
+    },
+    {
+     "name": "products",
+     "sql": "`${CUBE}.product_id = ${products}.id`",
+     "relationship": "belongsTo"
+    }
+   ],
+   "preAggregations": []
+  },
+  {
+   "name": "products",
+   "type": "cube",
+   "title": "Products",
+   "isVisible": true,
+   "public": true,
+   "connectedComponent": 1,
+   "measures": [
+    {
+     "name": "products.count",
+     "title": "Products Count",
+     "shortTitle": "Count",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "count",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true
+    }
+   ],
+   "dimensions": [
+    {
+     "name": "products.category",
+     "title": "Products Category",
+     "type": "string",
+     "shortTitle": "Category",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "sql": "`category`"
+    }
+   ],
+   "segments": [],
+   "hierarchies": [],
+   "folders": [],
+   "nestedFolders": [],
+   "fileName": "cubes/order_items.yml",
+   "joins": [],
+   "preAggregations": []
+  },
+  {
+   "name": "orders",
+   "type": "cube",
+   "title": "Orders",
+   "isVisible": true,
+   "public": true,
+   "description": "One row per order.",
+   "connectedComponent": 1,
+   "measures": [
+    {
+     "name": "orders.count",
+     "title": "Orders Count",
+     "shortTitle": "Count",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "count",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true
+    },
+    {
+     "name": "orders.revenue",
+     "title": "Orders Revenue",
+     "shortTitle": "Revenue",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "sum",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true,
+     "sql": "`total`"
+    },
+    {
+     "name": "orders.paid_revenue",
+     "title": "Orders Paid Revenue",
+     "shortTitle": "Paid Revenue",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "sum",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true,
+     "sql": "`total`",
+     "filters": [
+      {
+       "sql": "`${CUBE}.status = 'paid'`"
+      }
+     ]
+    },
+    {
+     "name": "orders.average_order",
+     "title": "Orders Average Order",
+     "shortTitle": "Average Order",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "avg",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true,
+     "sql": "`total`"
+    },
+    {
+     "name": "orders.revenue_7d",
+     "title": "Orders Revenue7 D",
+     "shortTitle": "Revenue7 D",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": true,
+     "cumulative": true,
+     "type": "number",
+     "aggType": "sum",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "isVisible": true,
+     "public": true,
+     "sql": "`total`"
+    }
+   ],
+   "dimensions": [
+    {
+     "name": "orders.status",
+     "title": "Orders Status",
+     "type": "string",
+     "shortTitle": "Status",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "sql": "`status`"
+    },
+    {
+     "name": "orders.total",
+     "title": "Orders Total",
+     "type": "number",
+     "shortTitle": "Total",
+     "suggestFilterValues": true,
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "sql": "`total`"
+    },
+    {
+     "name": "orders.ordered_at",
+     "title": "Orders Ordered at",
+     "type": "time",
+     "shortTitle": "Ordered at",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "granularities": [
+      {
+       "name": "fiscal_year",
+       "title": "Fiscal Year",
+       "interval": "1 year",
+       "offset": "3 months"
+      }
+     ],
+     "sql": "`ordered_at`"
+    }
+   ],
+   "segments": [],
+   "hierarchies": [],
+   "folders": [],
+   "nestedFolders": [],
+   "fileName": "cubes/orders.yml",
+   "joins": [
+    {
+     "name": "customers",
+     "sql": "`${CUBE}.customer_id = ${customers}.id`",
+     "relationship": "belongsTo"
+    }
+   ],
+   "preAggregations": []
+  },
+  {
+   "name": "order_facts",
+   "type": "view",
+   "title": "Order Facts",
+   "isVisible": true,
+   "public": true,
+   "measures": [
+    {
+     "name": "order_facts.revenue",
+     "title": "Order Facts Revenue",
+     "shortTitle": "Revenue",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "sum",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "aliasMember": "orders.revenue",
+     "isVisible": true,
+     "public": true
+    },
+    {
+     "name": "order_facts.count",
+     "title": "Order Facts Count",
+     "shortTitle": "Count",
+     "formatDescription": {
+      "name": "number",
+      "specifier": ",.2~f"
+     },
+     "cumulativeTotal": false,
+     "cumulative": false,
+     "type": "number",
+     "aggType": "count",
+     "drillMembers": [],
+     "drillMembersGrouped": {
+      "measures": [],
+      "dimensions": []
+     },
+     "aliasMember": "orders.count",
+     "isVisible": true,
+     "public": true
+    }
+   ],
+   "dimensions": [
+    {
+     "name": "order_facts.status",
+     "title": "Order Facts Status",
+     "type": "string",
+     "shortTitle": "Status",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "aliasMember": "orders.status"
+    },
+    {
+     "name": "order_facts.ordered_at",
+     "title": "Order Facts Ordered at",
+     "type": "time",
+     "shortTitle": "Ordered at",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "aliasMember": "orders.ordered_at",
+     "granularities": [
+      {
+       "name": "fiscal_year",
+       "title": "Fiscal Year",
+       "interval": "1 year",
+       "offset": "3 months"
+      }
+     ]
+    },
+    {
+     "name": "order_facts.customers_city",
+     "title": "Order Facts Customers City",
+     "type": "string",
+     "shortTitle": "Customers City",
+     "suggestFilterValues": true,
+     "isVisible": true,
+     "public": true,
+     "primaryKey": false,
+     "aliasMember": "customers.city"
+    }
+   ],
+   "segments": [],
+   "hierarchies": [],
+   "folders": [],
+   "nestedFolders": [],
+   "fileName": "views/order_facts.yml",
+   "joins": [],
+   "preAggregations": []
+  }
+ ]
+}

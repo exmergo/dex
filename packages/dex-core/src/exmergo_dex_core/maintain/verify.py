@@ -40,11 +40,11 @@ bounded metadata) alone.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..cache import match_identifier
+from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
 from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
@@ -73,6 +73,13 @@ _ROW_LOSS_HIGH_FRACTION = 0.50
 # A model that more than doubles its driving parent is not a join picking up a
 # few extra matches; the key it joins on is wrong.
 _ROW_FANOUT_HIGH_FACTOR = 2.0
+
+# Said once when a fan-out with no readable key is capped, and dropped again
+# when a proven grain caps it further: one finding states one cap.
+_UNREAD_KEY_CAP = (
+    " (severity capped at medium: with no join key to read, dex cannot tell an "
+    "intended expansion from a wrong key)"
+)
 
 # Materializations whose row count is not a function of this run's parent, so
 # comparing the two says nothing. An incremental model holds whatever previous
@@ -113,18 +120,59 @@ def compile_check(project_dir: Path) -> tuple[DriftFinding | None, list[str]]:
     return finding, []
 
 
+def _artifact(project_dir: Path, name: str) -> Path:
+    """``name`` in the directory holding the manifest this sweep reads.
+
+    The manifest and the run results are read from one directory, the newest
+    one on disk (issue #1014): after a Dex build that is Dex's own artifact
+    directory, after the user's own dbt run it is the project's target path, and
+    a run results file is never paired with another run's manifest.
+    """
+
+    from ..transform.artifact_runtime import readable_artifact_dir
+
+    return readable_artifact_dir(project_dir) / name
+
+
 def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
-    path = project_dir / "target" / "manifest.json"
+    path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8")).get("nodes", {})
 
 
 def _run_results(project_dir: Path) -> list[dict] | None:
-    path = project_dir / "target" / "run_results.json"
+    from ..transform.artifact_runtime import pinned_invocation_id
+
+    path = _artifact(project_dir, "run_results.json")
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8")).get("results", [])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    # A build's own sweep reads only its own invocation's results; another
+    # run's passing tests must not vouch for this build's rows.
+    expected = pinned_invocation_id()
+    written = (document.get("metadata") or {}).get("invocation_id")
+    if expected is not None and written is not None and str(written) != expected:
+        return None
+    return document.get("results", [])
+
+
+def read_manifest_target(project_dir: Path) -> str | None:
+    """The target dbt compiled the manifest against, from its manifest.json."""
+
+    path = _artifact(project_dir, "manifest.json")
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            target_name = metadata.get("target_name")
+            if isinstance(target_name, str) and target_name:
+                return target_name
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    return None
 
 
 def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[str]]:
@@ -238,7 +286,12 @@ def missing_relation_findings(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     already_reported: set[str],
-) -> list[DriftFinding]:
+    *,
+    dev_scope: str | None = None,
+    judged_namespace: str | None = None,
+    manifest_target: str | None = None,
+    reads_dev_target: bool = False,
+) -> tuple[list[DriftFinding], list[str]]:
     """Manifest models with no corresponding relation in the warehouse.
 
     ``already_reported`` names models a build-status finding already
@@ -247,14 +300,59 @@ def missing_relation_findings(
     same thing about the same node in two places). ``model_relations`` holds
     models only: a source's own "declared but absent" case belongs to the
     schema axis, which already reports dangling sources against a baseline.
+
+    When ``reads_dev_target`` is False, models whose relations resolve into
+    the dev namespace (or outside the judged namespace when the manifest was
+    compiled against dev) are reported as unchecked in notes with a pointer
+    to ``maintain verify --target dev``, rather than as high-severity
+    ``no_relation`` findings (#715).
     """
 
     findings: list[DriftFinding] = []
+    unchecked: list[str] = []
+    judged_schemas = (
+        {s.strip().lower() for s in judged_namespace.split(",")}
+        if judged_namespace
+        else set()
+    )
+
     for name, relation in sorted(model_relations.items()):
         if name in already_reported:
             continue
         if match_identifier(relation, live_identifiers):
             continue
+
+        if not reads_dev_target:
+            clean_rel = strip_relation_quoting(relation).lower()
+            rel_parts = clean_rel.split(".")
+            rel_ns = clean_rel.rsplit(".", 1)[0] if len(rel_parts) > 1 else ""
+            rel_schema = rel_parts[-2] if len(rel_parts) > 1 else ""
+            is_dev = False
+
+            if dev_scope and (
+                dev_scope.lower() in clean_rel
+                or rel_schema == dev_scope.lower().split(".")[-1]
+                or rel_ns == dev_scope.lower()
+            ):
+                is_dev = True
+            elif manifest_target == "dev":
+                in_judged = (
+                    rel_ns in judged_schemas
+                    or rel_schema in judged_schemas
+                    or any(clean_rel.startswith(js + ".") for js in judged_schemas)
+                )
+                if not in_judged:
+                    is_dev = True
+            elif (
+                live_identifiers
+                and relation_verdict(relation, live_identifiers) == "foreign"
+            ):
+                is_dev = True
+
+            if is_dev:
+                unchecked.append(name)
+                continue
+
         findings.append(
             DriftFinding(
                 axis="build",
@@ -268,7 +366,17 @@ def missing_relation_findings(
                 data={"relation_name": relation},
             )
         )
-    return findings
+
+    notes: list[str] = []
+    if unchecked:
+        target_hint = "maintain verify --target dev"
+        models_str = ", ".join(sorted(unchecked))
+        notes.append(
+            f"the relation check was not run for {models_str}: relation resolves into "
+            "the dev namespace, which is outside the read scope; re-run with "
+            f"`{target_hint}` to verify dev models"
+        )
+    return findings, notes
 
 
 # --- column contract: a built relation against its declared schema.yml ---------
@@ -287,11 +395,11 @@ def column_contract_plan(
     command needs a build to have produced already for its other two finding
     classes. ``scope`` narrows which models are even considered, so a model
     outside it is neither checked nor counted toward the undeclared total,
-    the same rule :func:`row_population_plan` follows. Compared lowercase on
-    both sides: the caller here is `maintain verify`'s own ``objects``
-    argument, already lowered before it reaches this function, and a model
-    name is conventionally lowercase already, so this never narrows past
-    what an exact-case match would.
+    the same rule :func:`row_population_plan` follows. It holds unique ids, which
+    is what a build has and what keeps two versions of one model apart, or
+    lowered labels, which is what `maintain verify`'s own ``objects`` argument
+    has: a model name is conventionally lowercase already, so this never narrows
+    past what an exact-case match would.
 
     Returns ``(declared_by_model, undeclared_count, notes)``. A model with no
     ``columns:`` entry contributes to the count and nothing to the mapping:
@@ -321,7 +429,7 @@ def column_contract_plan(
         if not (isinstance(node.get("name"), str) and node["name"]):
             continue
         name = manifest_node_label(uid, node)
-        if scope is not None and name.lower() not in scope:
+        if scope is not None and uid not in scope and name.lower() not in scope:
             continue
         columns = node.get("columns")
         if not isinstance(columns, dict) or not columns:
@@ -339,6 +447,38 @@ def column_contract_plan(
     return declared_by_model, undeclared, []
 
 
+@dataclass
+class ColumnContractCheck:
+    """What the column-contract comparison found, and which models it reached.
+
+    ``unchecked`` maps a model to why it was not compared: ``no_relation``,
+    ``relation_not_found`` or ``metadata_unreadable``. A caller reporting
+    coverage needs these apart from ``checked``, because no findings over no
+    comparison is not a clean contract.
+    """
+
+    findings: list[DriftFinding] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    checked: list[str] = field(default_factory=list)
+    unchecked: dict[str, str] = field(default_factory=dict)
+
+
+def built_model_relations(project_dir: Path, scope: set[str]) -> dict[str, str]:
+    """Each in-scope model's label to its relation, from the compiled manifest.
+
+    ``scope`` holds unique ids. An ephemeral model has no relation and no entry.
+    """
+
+    return {
+        manifest_node_label(uid, node): strip_relation_quoting(node["relation_name"])
+        for uid, node in (_manifest_nodes(project_dir) or {}).items()
+        if uid in scope
+        and isinstance(node, dict)
+        and isinstance(node.get("relation_name"), str)
+        and node["relation_name"]
+    }
+
+
 def column_contract_findings(
     adapter,
     declared_by_model: dict[str, dict[str, str | None]],
@@ -346,6 +486,21 @@ def column_contract_findings(
     live_identifiers: list[str],
     undeclared: int,
 ) -> tuple[list[DriftFinding], list[str]]:
+    """:func:`column_contract_check`, as findings and notes alone."""
+
+    check = column_contract_check(
+        adapter, declared_by_model, model_relations, live_identifiers, undeclared
+    )
+    return check.findings, check.notes
+
+
+def column_contract_check(
+    adapter,
+    declared_by_model: dict[str, dict[str, str | None]],
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    undeclared: int,
+) -> ColumnContractCheck:
     """A built relation's actual columns against what its schema.yml declares,
     in both directions, plus a type check where a type is declared (#230).
 
@@ -367,26 +522,55 @@ def column_contract_findings(
     already explains the missing-entirely case, so naming it again here
     would only be additive if the model resolved ambiguously, which is worth
     knowing about but does not deserve its own high-severity finding.
+
+    A relation whose metadata cannot be read is named and the rest still
+    compared. A cost-guard refusal is re-raised: it is the caller's own limit
+    rather than a gap in this check.
     """
 
     from ..dbt_project import column_contract_divergence
+    from ..envelope import redact
+    from ..guards.cost_guard import CostGuardError
 
-    findings: list[DriftFinding] = []
+    check = ColumnContractCheck()
+    findings = check.findings
     unchecked: list[str] = []
+    unreadable: list[str] = []
     for model, declared in sorted(declared_by_model.items()):
         relation = model_relations.get(model)
         if relation is None:
+            check.unchecked[model] = "no_relation"
             continue
         matches = match_identifier(relation, live_identifiers)
         if len(matches) != 1:
             unchecked.append(model)
+            check.unchecked[model] = "relation_not_found"
             continue
 
         declared_lower = {name.lower(): dtype for name, dtype in declared.items()}
-        _meta, columns = adapter.table_metadata(matches[0])
+        try:
+            _meta, columns = adapter.table_metadata(matches[0])
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            unreadable.append(
+                redact(
+                    f"the column contract was not checked for {model}: its "
+                    f"metadata could not be read ({type(exc).__name__}: {exc})"
+                )
+            )
+            check.unchecked[model] = "metadata_unreadable"
+            continue
+        check.checked.append(model)
         actual_lower = {column.name.lower(): column.data_type for column in columns}
+        try:
+            connector = getattr(adapter, "name", None) or getattr(
+                adapter, "dialect", None
+            )
+        except Exception:
+            connector = None
         missing, extra, mismatched = column_contract_divergence(
-            declared_lower, actual_lower
+            declared_lower, actual_lower, connector=connector
         )
 
         if missing:
@@ -446,7 +630,8 @@ def column_contract_findings(
                 )
             )
 
-    notes: list[str] = []
+    notes = check.notes
+    notes.extend(unreadable)
     if unchecked:
         notes.append(
             "the column contract was not checked for "
@@ -458,7 +643,7 @@ def column_contract_findings(
             f"{undeclared} model(s) considered declare no columns in "
             "schema.yml, so the column contract was not checked for them"
         )
-    return findings, notes
+    return check
 
 
 # --- grain: a built relation against its intended one-row-per-entity key -------
@@ -607,11 +792,14 @@ def _declared_grain_findings(
     identifier: str,
     candidates: list[GrainCandidate],
     min_rows: int,
+    proven: dict[str, dict] | None = None,
 ) -> tuple[list[DriftFinding], str | None, list[str]]:
     """Check every declared candidate for one model. Returns ``(findings,
-    unchecked_reason, unresolved)``: ``unchecked_reason`` is None when every
-    candidate was measured, ``"scan"`` when a candidate could not be measured
-    at all (a metered adapter declining an unaffordable scan, per
+    unchecked_reason, unresolved)``, and records in ``proven`` the first
+    candidate the scans showed unique (see :func:`damp_fanout`).
+    ``unchecked_reason`` is None when every candidate was measured, ``"scan"``
+    when a candidate could not be measured at all (a metered adapter declining
+    an unaffordable scan, per
     :meth:`Adapter.distinct_combination_counts`'s own contract), and
     ``"no_count"`` when the scans ran but no exact row count was available
     to compare them against. Either non-None value is a caveat for the
@@ -710,6 +898,7 @@ def _declared_grain_findings(
         if distinct is None:
             continue
         if distinct >= row_count:
+            _record_proven(proven, model, c)
             continue
         findings.append(
             _grain_broken_finding(
@@ -728,6 +917,7 @@ def _declared_grain_findings(
         if distinct is None:
             continue
         if distinct >= row_count:
+            _record_proven(proven, model, c)
             continue
         findings.append(
             _grain_broken_finding(
@@ -742,6 +932,15 @@ def _declared_grain_findings(
         )
 
     return findings, ("scan" if scan_failed else None), unresolved
+
+
+def _record_proven(
+    proven: dict[str, dict] | None, model: str, candidate: GrainCandidate
+) -> None:
+    if proven is not None:
+        proven.setdefault(
+            model, {"columns": list(candidate.columns), "source": candidate.source}
+        )
 
 
 def _heuristic_candidate(adapter, model: str, identifier: str, min_rows: int):
@@ -850,9 +1049,14 @@ def grain_findings(
     all_models: set[str],
     *,
     min_rows: int = 100,
+    proven: dict[str, dict] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """A built relation's grain against what the project declares (or, absent
     any declaration, a free naming guess), for every selected model (#229).
+
+    ``proven`` collects, per model, the declared grain the scans showed unique
+    (#841). Only a declaration counts: the naming guess is never recorded,
+    because a guess proven unique says nothing about what the model intends.
 
     A declared source (unique test, composite, or primary entity) is checked
     directly with an exact scan: the declaration itself is the justification
@@ -899,7 +1103,7 @@ def grain_findings(
             candidates = declared.get(model)
             if candidates:
                 model_findings, unchecked_reason, missing = _declared_grain_findings(
-                    adapter, model, identifier, candidates, min_rows
+                    adapter, model, identifier, candidates, min_rows, proven
                 )
                 findings.extend(model_findings)
                 if unchecked_reason == "scan":
@@ -984,7 +1188,7 @@ class RowPopulationCheck:
     parent: str
     parent_relation: str
     joins: tuple[str, ...] = ()
-    join_keys: tuple[str, ...] = ()
+    keys_by_join: tuple[tuple[str, ...], ...] = ()
     reducers: tuple[str, ...] = ()
     multiplies: bool = False
 
@@ -994,9 +1198,30 @@ class RowPopulationCheck:
 
         return (self.relation.lower(), self.parent_relation.lower())
 
+    @property
+    def join_keys(self) -> tuple[str, ...]:
+        """Every join's equality keys, in join order."""
+
+        return tuple(key for keys in self.keys_by_join for key in keys)
+
+    def describe_joins(self) -> str:
+        """Each join beside its own keys: a key read off one join is never
+        shown next to another join's label (#841)."""
+
+        return " or the ".join(
+            f"{label} on {', '.join(keys)}"
+            if keys
+            else f"{label} (dex could not read the join key)"
+            for label, keys in zip(
+                self.joins,
+                self.keys_by_join or ((),) * len(self.joins),
+                strict=True,
+            )
+        )
+
 
 def _manifest_sources(project_dir: Path) -> dict[str, dict]:
-    path = project_dir / "target" / "manifest.json"
+    path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return {}
     return json.loads(path.read_text(encoding="utf-8")).get("sources", {})
@@ -1234,6 +1459,7 @@ def row_population_plan(
     dialect: str,
     *,
     scope: set[str] | None = None,
+    recomputed: Collection[str] = (),
 ) -> tuple[list[RowPopulationCheck], list[str], list[str]]:
     """Line every buildable model up against the relation it is built from.
 
@@ -1253,6 +1479,13 @@ def row_population_plan(
     never asked about reads as a gap in the answer it did ask for. Ids rather
     than names, because two versions of one model share a name and a build
     that ran one of them did not run the other.
+
+    ``recomputed`` names, by label, the incremental models this run rebuilt from
+    their parents with ``--full-refresh``, which is the one time an incremental
+    model's row count is a function of its parent's. Only a build knows that, so
+    a caller with no build behind it leaves it empty. A microbatch model stays
+    skipped even so: it rebuilds only from its own ``begin``, so what it holds is
+    still not its whole parent, and nothing in its SQL would say so.
     """
 
     import sqlglot
@@ -1298,6 +1531,7 @@ def row_population_plan(
     uncompiled: list[str] = []
     informational: list[str] = []
     incremental: list[str] = []
+    microbatch: list[str] = []
     generated: list[str] = []
     unfollowable: list[str] = []
     for uid, node in nodes.items():
@@ -1324,11 +1558,24 @@ def row_population_plan(
         )
         if materialized == "ephemeral":
             continue
+        # Ahead of the compiled-SQL check, because dbt's manifest holds no compiled
+        # SQL for a microbatch model however often it built: asking for a compile
+        # would send the caller after an answer that would not change.
+        if materialized in _UNCOMPARABLE_MATERIALIZATIONS:
+            # A label can repeat across packages, and one copy's own setting
+            # decides whether dbt rebuilt that copy.
+            if name not in recomputed or (
+                isinstance(config, dict) and config.get("full_refresh") is False
+            ):
+                incremental.append(name)
+                continue
+            if isinstance(config, dict) and (
+                config.get("incremental_strategy") == "microbatch"
+            ):
+                microbatch.append(name)
+                continue
         if not (isinstance(code, str) and code.strip()):
             uncompiled.append(name)
-            continue
-        if materialized in _UNCOMPARABLE_MATERIALIZATIONS:
-            incremental.append(name)
             continue
 
         try:
@@ -1363,10 +1610,8 @@ def row_population_plan(
                     )
                     for join in found_joins
                 ),
-                join_keys=tuple(
-                    key
-                    for join in found_joins
-                    for key in sql_shape.equality_columns(join.on)
+                keys_by_join=tuple(
+                    tuple(sql_shape.equality_columns(join.on)) for join in found_joins
                 ),
                 reducers=tuple(dict.fromkeys(reducers)),
                 multiplies=multiplies,
@@ -1383,6 +1628,12 @@ def row_population_plan(
             f"row population was not compared for {', '.join(sorted(incremental))}: "
             "an incremental model holds what previous runs loaded into it, so its "
             "row count is not a function of its parent's"
+        )
+    if microbatch:
+        notes.append(
+            f"row population was not compared for {', '.join(sorted(microbatch))}: "
+            "a full refresh rebuilds a microbatch model only from its `begin`, so "
+            "its row count is not a function of its whole parent's"
         )
     if generated:
         generated_note = "row population was not compared for " + ", ".join(
@@ -1491,24 +1742,27 @@ def row_population_findings(
 
         if check.multiplies or not check.joins:
             continue
-        key = (
-            f" on {', '.join(check.join_keys)}"
-            if check.join_keys
-            else " (dex could not read the join key)"
-        )
+        severity = "high" if rows >= parent_rows * _ROW_FANOUT_HIGH_FACTOR else "medium"
+        cap = ""
+        # A join with no key dex can read is usually a range or inequality join,
+        # and those expand on purpose as often as by mistake (#841). Without a
+        # key there is nothing to call wrong, so the size of the expansion alone
+        # never ranks it with a wrong key.
+        if not check.join_keys:
+            data["join_key_read"] = False
+            if severity == "high":
+                severity = "medium"
+                data["severity_cap_applied"] = "join_key_unread"
+                cap = _UNREAD_KEY_CAP
         findings.append(
             DriftFinding(
                 axis="row_population",
                 code="row_fanout",
                 identifier=check.model,
-                severity=(
-                    "high"
-                    if rows >= parent_rows * _ROW_FANOUT_HIGH_FACTOR
-                    else "medium"
-                ),
+                severity=severity,
                 detail=(
-                    f"'{check.model}' has {against}: the {check.joins[0]}{key} "
-                    "matches more than one row per parent row"
+                    f"'{check.model}' has {against}: the {check.describe_joins()} "
+                    f"matches more than one row per parent row{cap}"
                 ),
                 exact=exact,
                 data=data,
@@ -1530,6 +1784,118 @@ def row_population_findings(
             "counting it was not free)"
         )
     return findings, notes
+
+
+def damp_fanout(
+    findings: list[DriftFinding], proven: dict[str, dict]
+) -> list[DriftFinding]:
+    """Cap a ``row_fanout`` at low on a model whose declared grain this run
+    proved unique (#841).
+
+    A model that holds more rows than its driving parent and is still unique on
+    the grain it declares is holding the rows it says it holds: the expansion
+    is what the model is for (anchors times windows, a date spine times
+    entities), not a key matching twice. Only a declaration counts, never the
+    naming guess, and the finding stays listed rather than dropped, the way
+    ``grain_min_rows`` damps a grain finding, so a reader still sees the counts
+    and a gate on high or medium no longer needs an allowlist where a later,
+    real fan-out could hide. A fan-out on a model whose grain broke is left
+    alone, even where another of its declared grains held: the
+    ``grain_broken`` beside it is the duplicate it explains.
+    """
+
+    broken = {f.identifier for f in findings if f.code == "grain_broken"}
+    damped: list[DriftFinding] = []
+    for finding in findings:
+        grain = proven.get(finding.identifier or "")
+        if (
+            finding.code != "row_fanout"
+            or grain is None
+            or finding.identifier in broken
+            or finding.severity == "low"
+        ):
+            damped.append(finding)
+            continue
+        columns = ", ".join(grain["columns"])
+        damped.append(
+            finding.model_copy(
+                update={
+                    "severity": "low",
+                    "detail": (
+                        f"{finding.detail.replace(_UNREAD_KEY_CAP, '')} "
+                        "(severity capped at low: the declared "
+                        f"grain [{columns}] is proven unique, so the extra rows are "
+                        "the grain the model declares rather than duplicates)"
+                    ),
+                    "data": {
+                        **finding.data,
+                        "grain_proven": {
+                            "columns": list(grain["columns"]),
+                            "source": grain["source"],
+                        },
+                        "severity_cap_applied": "grain_proven",
+                    },
+                }
+            )
+        )
+    return damped
+
+
+def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
+    """The grains the last run's own uniqueness tests proved, per model label.
+
+    A ``unique`` or ``unique_combination_of_columns`` test that passed in
+    ``run_results.json`` proved its columns unique on the relation that run
+    built, which is the relation a build's verification judges. Read only by a
+    build, whose run results are this run's; a standalone sweep measures the
+    grain itself, since the last run may be older than the relation.
+
+    A test scoped by a ``where`` or ``limit`` config checked a subset of the
+    rows and proves nothing about the relation, so it is not read; and a model
+    one of whose uniqueness tests failed or warned has no proven grain, whatever
+    its others say, since that result is the duplicate a fan-out explains.
+    """
+
+    from ..dbt_project import manifest_node_label
+
+    nodes = _manifest_nodes(project_dir) or {}
+    results = _run_results(project_dir) or []
+    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    proven: dict[str, dict] = {}
+    unproven: set[str] = set()
+    for unique_id in sorted(status):
+        node = nodes.get(unique_id)
+        if not isinstance(node, dict) or node.get("resource_type") != "test":
+            continue
+        meta = node.get("test_metadata")
+        attached = node.get("attached_node")
+        if not isinstance(meta, dict) or not isinstance(attached, str):
+            continue
+        test_config = node.get("config")
+        if isinstance(test_config, dict) and (
+            test_config.get("where") or test_config.get("limit") is not None
+        ):
+            continue
+        raw_kwargs = meta.get("kwargs")
+        kwargs = raw_kwargs if isinstance(raw_kwargs, dict) else {}
+        if meta.get("name") == "unique" and isinstance(kwargs.get("column_name"), str):
+            columns, source = [kwargs["column_name"]], "unique_test"
+        elif meta.get("name") == "unique_combination_of_columns" and isinstance(
+            kwargs.get("combination_of_columns"), list
+        ):
+            columns = [str(c) for c in kwargs["combination_of_columns"]]
+            source = "unique_test_composite"
+        else:
+            continue
+        parent = nodes.get(attached)
+        model = manifest_node_label(
+            attached, parent if isinstance(parent, dict) else None
+        )
+        if status[unique_id] in _FAILURE_STATUSES | _WARNING_STATUSES:
+            unproven.add(model)
+        elif status[unique_id] == "pass":
+            proven.setdefault(model, {"columns": columns, "source": source})
+    return {model: grain for model, grain in proven.items() if model not in unproven}
 
 
 # --- join contract: a model's own joins against measured value overlap ---------
@@ -1578,6 +1944,39 @@ class JoinCandidate:
     to_relation: str
     to_columns: tuple[str, ...]
     side: str
+    #: The join as the model writes it (``left join subscriptions on ...``), so
+    #: a coverage record names the join a reader can find in the SQL (#857).
+    #: Not part of equality: two candidates are the same join by their keys.
+    label: str = field(default="", compare=False)
+    #: Per key column, the conversion the join applies to it before comparing
+    #: (``TRY_CAST({} AS INT)``), or None for a bare column (#861). Empty when
+    #: neither side converts anything, which is every join written before this.
+    from_keys: tuple[str | None, ...] = ()
+    to_keys: tuple[str | None, ...] = ()
+
+    def key_exprs(self) -> tuple[tuple[str | None, ...], tuple[str | None, ...]] | None:
+        """The conversion templates applied to each side's keys, or None where the join
+        compares its keys as they are (#861).
+        """
+        if not any(self.from_keys) and not any(self.to_keys):
+            return None
+        return self.from_keys, self.to_keys
+
+
+@dataclass(frozen=True)
+class JoinSkip:
+    """A join the contract saw and could not measure, and why (#857).
+
+    ``code`` is stable for a caller to branch on; ``reason`` is the prose. The
+    string form is the warning line the axis has always emitted, so a reader
+    of ``warnings`` alone still learns of every skip."""
+
+    join: str
+    code: str
+    reason: str
+
+    def __str__(self) -> str:
+        return f"{self.join}: {self.reason}" if self.join else self.reason
 
 
 def _scope_relations(select, sql_shape) -> dict[str, object]:
@@ -1756,10 +2155,10 @@ def _join_equality_pairs(join, in_scope_relations: list, sql_shape):
     text alone, so guessing the original FROM relation the way an earlier
     version of this function did is exactly the bug this guards against.
 
-    Returns ``(pairs, skip_reason)``: ``skip_reason`` is ``None`` with empty
+    Returns ``(pairs, skip)``: ``skip`` is ``None`` with empty
     ``pairs`` for a join that carries neither (a CROSS JOIN, an UNNEST --
     not a candidate for this check at all, not something to note either),
-    and a prose reason with empty ``pairs`` for one that carries a real
+    and a ``(code, reason)`` pair with empty ``pairs`` for one that carries a real
     condition this could not turn into a composite key (see
     :func:`~..sql_shape.conjunctive_equality_pairs` for why "some of the
     equalities, dropping the rest" is never an acceptable partial answer).
@@ -1776,20 +2175,82 @@ def _join_equality_pairs(join, in_scope_relations: list, sql_shape):
                 "which one carries the column cannot be determined from the "
                 "SQL text alone"
             )
-            return [], reason
+            return [], ("ambiguous_using", reason)
         (from_relation,) = in_scope_relations
         from_alias = from_relation.alias_or_name
         to_alias = join.relation.alias_or_name
         return [
-            (exp.column(col, table=from_alias), exp.column(col, table=to_alias))
+            (
+                exp.column(col, table=from_alias),
+                exp.column(col, table=to_alias),
+                None,
+                None,
+            )
             for col in join.using
         ], None
     if join.on is None:
         return [], None  # a CROSS JOIN/UNNEST: not this check's business
-    pairs = sql_shape.conjunctive_equality_pairs(join.on)
-    if pairs is None:
-        return [], "no conjunctive column-to-column equality"
-    return pairs, None
+    plain = sql_shape.conjunctive_equality_pairs(join.on)
+    if plain is not None:
+        return [(left, right, None, None) for left, right in plain], None
+    # A key compared through a cast or a lexical normalization (#861) is still
+    # a key: the probe applies the same conversion, and counts the values it
+    # fails on apart, rather than leaving the join unchecked.
+    converted = sql_shape.conjunctive_conversion_pairs(join.on)
+    if converted is not None:
+        return [
+            (
+                left,
+                right,
+                sql_shape.measuring_key_template(left_side, left),
+                sql_shape.measuring_key_template(right_side, right),
+            )
+            for left, right, left_side, right_side in converted
+        ], None
+    if _pairs_keys_and_filters(join.on):
+        # `on o.customer_id = c.customer_id and o.status <> 'cancelled'`:
+        # the keys are there, but the filter beside them narrows which rows
+        # can match. A probe of the keys alone counts the rows that filter
+        # excludes as matches, so a parent whose only matches are excluded
+        # (every order cancelled) would read as covered when it is not.
+        return [], (
+            "key_and_filter_condition",
+            "its condition filters as well as pairing keys (a conjunct "
+            "that is not a column-to-column equality), and an overlap "
+            "probe on the keys alone would count the rows that filter "
+            "excludes as matches, hiding the rows left with none",
+        )
+    if sql_shape.rewrites_a_key(join.on):
+        return [], (
+            "unsupported_key_expression",
+            "a key is rewritten by an expression dex does not measure (only "
+            "casts and lower, upper and trim are), so its coverage cannot be "
+            "probed",
+        )
+    return [], ("non_equality_join", "no conjunctive column-to-column equality")
+
+
+def _pairs_keys_and_filters(on) -> bool:
+    """Whether an ON's top-level conjuncts include a column-to-column equality
+    beside something else, as opposed to holding no key equality at all."""
+
+    from sqlglot import expressions as exp
+
+    stack, conjuncts = [on], []
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.And):
+            stack.extend((node.this, node.expression))
+        elif isinstance(node, exp.Paren):
+            stack.append(node.this)
+        else:
+            conjuncts.append(node)
+    return any(
+        isinstance(c, exp.EQ)
+        and isinstance(c.this, exp.Column)
+        and isinstance(c.expression, exp.Column)
+        for c in conjuncts
+    )
 
 
 def _select_branches(tree, sql_shape) -> list:
@@ -1809,7 +2270,7 @@ def _select_branches(tree, sql_shape) -> list:
     return sql_shape.select_branches(tree)
 
 
-def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
+def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
     """Every equality join reachable from a model's compiled SQL (#228),
     both sides resolved past their CTE aliases to the physical relation and
     column each reads.
@@ -1873,7 +2334,7 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
         else {}
     )
     candidates: list[JoinCandidate] = []
-    skipped: list[str] = []
+    skipped: list[JoinSkip] = []
     visited_ctes: set[str] = set()
     queue: list = list(branches)
 
@@ -1907,11 +2368,9 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
             alias_map[join_alias] = join.relation
             _enqueue(join.relation)
 
-            pairs, skip_reason = _join_equality_pairs(
-                join, in_scope_relations, sql_shape
-            )
-            if skip_reason is not None:
-                skipped.append(f"{join.label}: {skip_reason}")
+            pairs, skip = _join_equality_pairs(join, in_scope_relations, sql_shape)
+            if skip is not None:
+                skipped.append(JoinSkip(join.label, *skip))
                 continue
             if not pairs:
                 continue  # a CROSS JOIN/UNNEST: not this check's business
@@ -1919,14 +2378,21 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
             # Grouped by (from relation, to relation): every equality pair
             # between the same two relations is one composite key, not one
             # candidate per pair (see JoinCandidate's own docstring).
-            grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            grouped: dict[
+                tuple[str, str], list[tuple[str, str, str | None, str | None]]
+            ] = {}
             unresolved = False
-            for left, right in pairs:
+            unresolved_code = "unresolved_column"
+            for left, right, left_tpl, right_tpl in pairs:
                 left_relation = alias_map.get((left.table or "").lower())
                 right_relation = alias_map.get((right.table or "").lower())
                 if left_relation is None or right_relation is None:
                     unresolved = True
                     break
+                for relation in (left_relation, right_relation):
+                    shape = _cte_shape(relation, cte_scopes, sql_shape)
+                    if shape is not None:
+                        unresolved_code = shape
                 left_resolved = _resolve_join_column(
                     left_relation, left.name, cte_scopes, sql_shape
                 )
@@ -1939,16 +2405,18 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
                 left_table, left_col = left_resolved
                 right_table, right_col = right_resolved
                 if (left.table or "").lower() == join_alias:
-                    to_table, to_col = left_table, left_col
-                    from_table, from_col = right_table, right_col
+                    to_table, to_col, to_tpl = left_table, left_col, left_tpl
+                    from_table, from_col, from_tpl = right_table, right_col, right_tpl
                 elif (right.table or "").lower() == join_alias:
-                    to_table, to_col = right_table, right_col
-                    from_table, from_col = left_table, left_col
+                    to_table, to_col, to_tpl = right_table, right_col, right_tpl
+                    from_table, from_col, from_tpl = left_table, left_col, left_tpl
                 else:
                     unresolved = True
                     break
                 from_name, to_name = _table_name(from_table), _table_name(to_table)
-                grouped.setdefault((from_name, to_name), []).append((from_col, to_col))
+                grouped.setdefault((from_name, to_name), []).append(
+                    (from_col, to_col, from_tpl, to_tpl)
+                )
             if unresolved:
                 # Any unresolvable component drops the whole join, not just
                 # that pair: a composite key probed on only the pairs that
@@ -1956,14 +2424,24 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
                 # itself asks, and can read a genuinely broken join as
                 # healthy (#228's own review).
                 skipped.append(
-                    f"{join.label}: a join column could not be resolved to a "
-                    "physical relation and column"
+                    JoinSkip(
+                        join.label,
+                        unresolved_code,
+                        _UNRESOLVED_REASONS.get(
+                            unresolved_code,
+                            "a join column could not be resolved to a physical "
+                            "relation and column",
+                        ),
+                    )
                 )
                 continue
             for (from_name, to_name), column_pairs in grouped.items():
-                from_cols = tuple(c for c, _ in column_pairs)
-                to_cols = tuple(c for _, c in column_pairs)
-                if from_name == to_name and from_cols == to_cols:
+                from_cols = tuple(c for c, _t, _f, _g in column_pairs)
+                to_cols = tuple(c for _c, c, _f, _g in column_pairs)
+                from_keys = tuple(f for _c, _t, f, _g in column_pairs)
+                to_keys = tuple(g for _c, _t, _f, g in column_pairs)
+                converts = any(from_keys) or any(to_keys)
+                if from_name == to_name and from_cols == to_cols and not converts:
                     # The literal same key read twice off the same relation
                     # (t.col = t.col): every row matches itself, always --
                     # nothing to orphan-check. A self-join on *different*
@@ -1978,100 +2456,380 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:
                         to_relation=to_name,
                         to_columns=to_cols,
                         side=join.side,
+                        label=join.label,
+                        from_keys=from_keys if converts else (),
+                        to_keys=to_keys if converts else (),
                     )
                 )
 
     return candidates, skipped
 
 
-def join_contract_plan(
+#: Why a join's columns did not resolve, by the shape of the CTE it reads.
+_UNRESOLVED_REASONS = {
+    "set_operation_cte": (
+        "a join column is read through a CTE whose body is a UNION or another "
+        "set operation, which is not a warehouse relation and has no single "
+        "physical column to probe"
+    ),
+    "filtered_cte": (
+        "a join column is read through a CTE that filters, groups or limits its "
+        "rows, so probing the physical relation underneath would measure rows "
+        "the model never joins"
+    ),
+}
+
+
+def _cte_shape(relation, cte_scopes: dict, sql_shape) -> str | None:
+    """Why a join side that names a CTE cannot be probed physically, if the
+    CTE's own shape is the reason: a set operation (#840: never mistaken for
+    a warehouse table) or a scope that reduces rows. First hop only; a deeper
+    hop that fails reads as ``unresolved_column``."""
+
+    from sqlglot import expressions as exp
+
+    name = _cte_name(relation, cte_scopes)
+    if name is None:
+        return None
+    body = cte_scopes[name]
+    if not isinstance(body, exp.Select):
+        return "set_operation_cte"
+    if sql_shape.reducing_clauses(body):
+        return "filtered_cte"
+    return None
+
+
+@dataclass
+class ModelJoinContext:
+    """What a model's own SQL and declaration say about its joins (#857).
+
+    ``lineage`` maps each output column (lowered) to the physical relation and
+    column it reads, as far as the compiled SQL lets that be followed; a
+    computed column has no entry. ``columns`` is each output column's declared
+    ``config.meta.dex`` (lowered keys). ``parents`` maps every project node
+    name (lowered) to its relation, so a ``references`` can be lined up with
+    the relation a join reads.
+    """
+
+    relation: str | None = None
+    lineage: dict[str, tuple[str, str]] = field(default_factory=dict)
+    columns: dict[str, dict] = field(default_factory=dict)
+    parents: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class JoinContractPlan:
+    """Every selected model's equality joins, the joins that could not be
+    turned into a probe (with a typed reason), and what the model declares."""
+
+    candidates: dict[str, list[JoinCandidate]] = field(default_factory=dict)
+    skips: dict[str, list[JoinSkip]] = field(default_factory=dict)
+    context: dict[str, ModelJoinContext] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+def plan_join_contract(
     project_dir: Path, dialect: str, *, scope: set[str] | None = None
-) -> tuple[dict[str, list[JoinCandidate]], list[str]]:
+) -> JoinContractPlan:
     """Every selected model's own equality joins, read from its compiled SQL
-    (#228). Free: parses artifacts already on disk, opens no connection.
+    (#228, #857). Free: parses artifacts already on disk, opens no connection.
 
-    ``dialect`` is the connector's own dialect, the same parameter
-    :func:`row_population_plan` already takes for the same reason: compiled
-    SQL is written in the project's actual warehouse's dialect, and parsing
-    it as DuckDB regardless would misread dialect-specific syntax on every
-    other connector -- silently wrong candidates at best, a parse failure
-    that drops the model's joins entirely at worst.
+    ``dialect`` is the connector's own: compiled SQL is written in the project's
+    warehouse dialect, and parsing it as DuckDB regardless would misread
+    dialect-specific syntax on every other connector.
 
-    ``scope`` is compared lowercase, the same convention
-    :func:`column_contract_plan` and :func:`grain_plan` follow.
+    ``scope`` holds model unique ids or lowered names, the convention
+    :func:`row_population_plan` follows, so a build (ids) and a `maintain
+    verify` call (names) narrow this the same way.
 
-    Returns ``(candidates, notes)``. A model absent from ``candidates``
-    either declares no joins at all, or every join it writes was skipped
-    (named in ``notes``, prefixed by the model); the caller cannot tell
-    those apart from this return alone, which is fine, since neither is a
-    finding -- only a measured orphan fraction is.
+    Compiled SQL that does not parse is a typed skip (``unparseable_sql``), not
+    a silent absence: its joins are an obligation nothing checked.
     """
 
     from .. import sql_shape
+    from ..guards.pii_meta import entry_meta
 
     nodes = _manifest_nodes(project_dir)
     if nodes is None:
-        return (
-            {},
-            [
+        return JoinContractPlan(
+            notes=[
                 "no compiled manifest found; run `dbt compile` or `dbt build` "
                 "for join-contract findings"
-            ],
+            ]
         )
 
     import sqlglot
 
-    by_model: dict[str, list[JoinCandidate]] = {}
-    notes: list[str] = []
+    parents: dict[str, str] = {}
     for node in nodes.values():
+        if (
+            isinstance(node, dict)
+            and node.get("resource_type") in ("model", "seed", "snapshot")
+            and isinstance(node.get("name"), str)
+            and isinstance(node.get("relation_name"), str)
+            and node["relation_name"]
+        ):
+            parents.setdefault(
+                node["name"].lower(), strip_relation_quoting(node["relation_name"])
+            )
+
+    plan = JoinContractPlan()
+    for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
             continue
         name = node.get("name")
         if not (isinstance(name, str) and name):
             continue
-        if scope is not None and name.lower() not in scope:
+        if scope is not None and uid not in scope and name.lower() not in scope:
             continue
         sql = node.get("compiled_code")
         if not isinstance(sql, str) or not sql.strip():
             continue
         try:
             tree = sqlglot.parse_one(sql, read=dialect)
-        except Exception:  # noqa: S112 -- unparseable compiled SQL, not our defect
+        except Exception:  # unparseable compiled SQL, not our defect
+            plan.skips[name] = [
+                JoinSkip(
+                    "",
+                    "unparseable_sql",
+                    "the compiled SQL could not be parsed (a macro or dynamic SQL "
+                    "dex cannot read), so none of its joins were checked",
+                )
+            ]
             continue
         candidates, skipped = _model_joins(tree, sql_shape)
         if candidates:
-            by_model[name] = candidates
-        notes.extend(f"{name}: {reason}" for reason in skipped)
-    return by_model, notes
+            plan.candidates[name] = candidates
+        if skipped:
+            plan.skips[name] = skipped
+        if candidates or skipped:
+            relation = node.get("relation_name")
+            declared: dict[str, dict] = {}
+            columns = node.get("columns")
+            for key, column in columns.items() if isinstance(columns, dict) else []:
+                if not isinstance(column, dict):
+                    continue
+                dex = entry_meta(column).get("dex")
+                column_name = column.get("name") or key
+                if isinstance(dex, dict) and isinstance(column_name, str):
+                    declared[column_name.lower()] = dex
+            plan.context[name] = ModelJoinContext(
+                relation=strip_relation_quoting(relation)
+                if isinstance(relation, str) and relation
+                else None,
+                lineage=_output_lineage(tree, sql_shape),
+                columns=declared,
+                parents=parents,
+            )
+    return plan
+
+
+def join_contract_plan(
+    project_dir: Path, dialect: str, *, scope: set[str] | None = None
+) -> tuple[dict[str, list[JoinCandidate]], list[str]]:
+    """``(candidates, notes)``: :func:`plan_join_contract`'s candidates, with
+    every typed skip rendered as the ``model: join: reason`` line the axis has
+    always emitted."""
+
+    plan = plan_join_contract(project_dir, dialect, scope=scope)
+    notes = list(plan.notes)
+    notes.extend(
+        f"{model}: {skip}" for model, skips in plan.skips.items() for skip in skips
+    )
+    return plan.candidates, notes
+
+
+def _output_lineage(tree, sql_shape, depth: int = 0) -> dict[str, tuple[str, str]]:
+    """Each output column (lowered) mapped to the physical ``(relation, column)``
+    it reads, through the CTE chain, where the SQL lets it be followed.
+
+    A computed column (``coalesce(x, 0)``, an aggregate) has no entry: it is not
+    a value the join supplies unchanged, so it is not judged as one. The common
+    dbt closing ``select * from final`` follows the star into ``final``.
+    """
+
+    from sqlglot import expressions as exp
+
+    if depth > 8 or not isinstance(tree, exp.Select):
+        return {}
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    root = tree if depth == 0 else None
+    cte_scopes = (
+        {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        if with_clause is not None
+        else {}
+    )
+    return _select_lineage(tree, cte_scopes, sql_shape, depth, root)
+
+
+def _select_lineage(select, cte_scopes, sql_shape, depth, root) -> dict:
+    from sqlglot import expressions as exp
+
+    if depth > 8:
+        return {}
+    scope_relations = _scope_relations(select, sql_shape)
+    lineage: dict[str, tuple[str, str]] = {}
+    for proj in select.expressions:
+        if isinstance(proj, exp.Star) and len(scope_relations) == 1:
+            (only,) = scope_relations.values()
+            cte = _cte_name(only, cte_scopes)
+            if cte is not None and isinstance(cte_scopes[cte], exp.Select):
+                lineage.update(
+                    _select_lineage(
+                        cte_scopes[cte], cte_scopes, sql_shape, depth + 1, root
+                    )
+                )
+            continue
+        if isinstance(proj, exp.Alias):
+            name, inner = proj.alias, proj.this
+        elif isinstance(proj, exp.Column):
+            name, inner = proj.name, proj
+        else:
+            continue
+        if not isinstance(inner, exp.Column) or not name:
+            continue
+        source = _qualified_source(inner, scope_relations)
+        if source is None:
+            continue
+        resolved = _resolve_join_column(source, inner.name, cte_scopes, sql_shape)
+        if resolved is None:
+            continue
+        table, column = resolved
+        lineage[name.lower()] = (_table_name(table), column)
+    return lineage
+
+
+def _same_relation(a: str, b: str) -> bool:
+    """Whether two dotted relation names are one relation, compared on as many
+    trailing parts as both carry (a compiled SQL name may be fully qualified
+    where the manifest's is too, or not)."""
+
+    left = [p for p in a.lower().replace('"', "").replace("`", "").split(".") if p]
+    right = [p for p in b.lower().replace('"', "").replace("`", "").split(".") if p]
+    n = min(len(left), len(right))
+    return n > 0 and left[-n:] == right[-n:]
+
+
+def _never_null(meta: dict | None) -> bool:
+    rule = (meta or {}).get("null_rule")
+    return isinstance(rule, str) and rule.strip().lower() == "never"
+
+
+def _null_allowed(meta: dict | None) -> bool:
+    rule = (meta or {}).get("null_rule")
+    return isinstance(rule, str) and bool(rule.strip()) and not _never_null(meta)
+
+
+@dataclass(frozen=True)
+class JoinPolicy:
+    """What a model's declaration says about one of its joins (#857)."""
+
+    #: The join's columns the model passes through unchanged.
+    derived: tuple[str, ...]
+    #: The output columns that carry the driving key.
+    driving: tuple[str, ...]
+    #: Why every eligible driving row must match, or None when nothing says so.
+    required_by: str | None
+    #: Every column the join supplies is declared as allowed to be NULL.
+    declared_optional: bool
+    #: NULL driving keys count as unmatched rather than ineligible.
+    null_keys_unmatched_by: str | None
+
+
+def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinPolicy:
+    """Read a join's obligation from the model's declaration, never from data.
+
+    A join is required when the model declares a column it supplies
+    ``null_rule: never`` on a LEFT join (an unmatched row would put a NULL
+    there), or declares the column carrying its driving key a ``foreign_key``
+    whose ``references`` names the joined relation (every key must exist in the
+    parent). NULL driving keys count against coverage only when the column
+    carrying them is declared ``null_rule: never``.
+    """
+
+    if ctx is None:
+        return JoinPolicy((), (), None, False, None)
+    from_columns = {c.lower() for c in candidate.from_columns}
+    derived = tuple(
+        sorted(
+            col
+            for col, (relation, _c) in ctx.lineage.items()
+            if _same_relation(relation, candidate.to_relation)
+        )
+    )
+    driving = tuple(
+        sorted(
+            col
+            for col, (relation, column) in ctx.lineage.items()
+            if _same_relation(relation, candidate.from_relation)
+            and column.lower() in from_columns
+        )
+    )
+    left = candidate.side.split(" ")[0] == "left" if candidate.side else False
+    required_by = None
+    if left:
+        never = [c for c in derived if _never_null(ctx.columns.get(c))]
+        if never:
+            required_by = (
+                f"{never[0]} comes from the joined relation and is declared "
+                "null_rule: never"
+            )
+    if required_by is None:
+        for col in driving:
+            meta = ctx.columns.get(col) or {}
+            target = meta.get("references")
+            if meta.get("role") != "foreign_key" or not isinstance(target, str):
+                continue
+            parent = ctx.parents.get(target.rpartition(".")[0].lower())
+            if parent is not None and _same_relation(parent, candidate.to_relation):
+                required_by = f"{col} is declared a foreign_key referencing {target}"
+                break
+    declared_optional = bool(derived) and all(
+        _null_allowed(ctx.columns.get(c)) for c in derived
+    )
+    counted = next((c for c in driving if _never_null(ctx.columns.get(c))), None)
+    return JoinPolicy(
+        derived,
+        driving,
+        required_by,
+        declared_optional,
+        f"{counted} is declared null_rule: never" if counted else None,
+    )
 
 
 def _resolve_join_relationships(
     candidates_by_model: dict[str, list[JoinCandidate]],
     model_relations: dict[str, str],
-    live_identifiers: list[str],
+    live_identifiers: list[str] | None,
 ):
-    """Every candidate turned into a :class:`~..cache.Relationship`, both
-    sides resolved to exactly one live identifier. Pure and adapter-free:
-    ``live_identifiers`` is already-read metadata, matching every other
-    resolution step in this module. Returns ``(pairs, unresolved)``, where
-    ``pairs`` keeps each relationship's owning model alongside it (a
-    ``Relationship`` itself carries no model name) and ``unresolved`` names
-    the models a join could not be resolved for."""
+    """Every candidate turned into a :class:`~..cache.Relationship`, both sides
+    resolved to exactly one live identifier (or taken as written when
+    ``live_identifiers`` is ``None``, at pricing time before a build). Pure and
+    adapter-free. Returns ``(pairs, unresolved)``: ``pairs`` keeps each
+    relationship's model and candidate beside it, and ``unresolved`` is the
+    ``(model, candidate)`` pairs that matched no single live identifier."""
 
     from ..cache import Relationship, RelationshipKind
 
-    pairs: list[tuple[str, Relationship]] = []
-    unresolved: list[str] = []
+    pairs: list[tuple[str, JoinCandidate, Relationship]] = []
+    unresolved: list[tuple[str, JoinCandidate]] = []
     for model, candidates in candidates_by_model.items():
         for candidate in candidates:
-            from_matches = match_identifier(candidate.from_relation, live_identifiers)
-            to_matches = match_identifier(candidate.to_relation, live_identifiers)
+            if live_identifiers is None:
+                from_matches = [candidate.from_relation]
+                to_matches = [candidate.to_relation]
+            else:
+                from_matches = match_identifier(
+                    candidate.from_relation, live_identifiers
+                )
+                to_matches = match_identifier(candidate.to_relation, live_identifiers)
             if len(from_matches) != 1 or len(to_matches) != 1:
-                unresolved.append(model)
+                unresolved.append((model, candidate))
                 continue
             pairs.append(
                 (
                     model,
+                    candidate,
                     Relationship(
                         from_dataset=from_matches[0],
                         from_columns=list(candidate.from_columns),
@@ -2084,17 +2842,128 @@ def _resolve_join_relationships(
     return pairs, unresolved
 
 
-def join_probe_cost(adapter, relationships: list) -> tuple[float, int]:
-    """``(estimate, probe_count)`` for measuring every relationship here dex
-    has not yet measured, without running the probe.
+@dataclass
+class _NullCheck:
+    """One model's statement counting the non-NULLs of the columns its joins
+    supply, on the relation it built (#857)."""
 
-    Pure pricing, split out from :func:`join_contract_findings` so a caller
-    combining this estimate with another axis's own (row population's row
-    counts, in `maintain/commands.py`'s shared handshake) can price both
-    before asking once, rather than each axis asking on its own and
-    ``VerifyResult.pending_offer`` -- one slot -- silently keeping only
-    whichever asked last.
+    model: str
+    identifier: str
+    #: (lowered output column, the relation's spelling of it)
+    columns: list[tuple[str, str]]
+    sql: str
+
+
+def _null_checks(
+    adapter,
+    plan: JoinContractPlan,
+    live_identifiers: list[str] | None,
+) -> tuple[list[_NullCheck], list[str]]:
+    """The NULL-count statements for every model whose joins supply columns.
+
+    Column spellings come from the built relation's metadata where it can be
+    listed (a warehouse may have folded the case), and as the SQL wrote them
+    before the build has run. Aggregate-only: ``COUNT(column)`` per column.
     """
+
+    from ..explore.relationships import _quote_identifier, _quote_part, _transpile_probe
+    from ..guards.cost_guard import CostGuardError
+    from ..guards.sql_guard import assert_select_only
+
+    checks: list[_NullCheck] = []
+    notes: list[str] = []
+    for model, candidates in plan.candidates.items():
+        ctx = plan.context.get(model)
+        if ctx is None or ctx.relation is None:
+            continue
+        derived = sorted(
+            {c for cand in candidates for c in join_policy(cand, ctx).derived}
+        )
+        if not derived:
+            continue
+        if live_identifiers is None:
+            identifier = ctx.relation
+            spelled = [(c, c) for c in derived]
+        else:
+            matches = match_identifier(ctx.relation, live_identifiers)
+            if len(matches) != 1:
+                notes.append(
+                    f"{model}: the columns its joins supply were not NULL-checked: "
+                    f"no single relation in the warehouse matched {ctx.relation}"
+                )
+                continue
+            identifier = matches[0]
+            try:
+                _meta, columns = adapter.table_metadata(identifier)
+            except CostGuardError:
+                raise
+            except Exception as exc:  # a metadata read is a note
+                notes.append(
+                    f"{model}: the columns its joins supply were not NULL-checked: "
+                    f"the relation's columns could not be read ({type(exc).__name__})"
+                )
+                continue
+            live = {c.name.lower(): c.name for c in columns}
+            spelled = [(c, live[c]) for c in derived if c in live]
+        if not spelled:
+            continue
+        counts = ", ".join(
+            f"COUNT({_quote_part(name)}) AS dex_nn_{i}"
+            for i, (_c, name) in enumerate(spelled)
+        )
+        relation = _quote_identifier(identifier)
+        sql = f"SELECT COUNT(*) AS dex_rows, {counts} FROM {relation}"  # noqa: S608
+        checks.append(
+            _NullCheck(
+                model,
+                identifier,
+                spelled,
+                assert_select_only(
+                    _transpile_probe(sql, adapter.dialect), dialect=adapter.dialect
+                ),
+            )
+        )
+    return checks, notes
+
+
+def _split_unsafe(pairs: list[tuple], dialect: str) -> tuple[list[tuple], list[tuple]]:
+    """The pairs a probe can measure on ``dialect``, and those it cannot: a key
+    conversion that needs a safe cast where the dialect has none (#861)."""
+
+    from .. import sql_shape
+
+    if dialect not in sql_shape.NO_SAFE_CAST:
+        return pairs, []
+    keep: list[tuple] = []
+    unsafe: list[tuple] = []
+    for item in pairs:
+        exprs = item[1].key_exprs()
+        needs = exprs is not None and any(
+            "TRY_CAST" in (template or "").upper()
+            for side in exprs
+            for template in side
+        )
+        (unsafe if needs else keep).append(item)
+    return keep, unsafe
+
+
+def _key_exprs(pairs) -> dict[int, tuple]:
+    """The conversions each probed relationship applies to its keys (#861),
+    by the relationship's identity, which is what the probe batches carry."""
+
+    return {
+        id(rel): exprs
+        for _m, candidate, rel in pairs
+        if (exprs := candidate.key_exprs()) is not None
+    }
+
+
+def join_probe_cost(
+    adapter, relationships: list, key_exprs: dict | None = None
+) -> tuple[float, int]:
+    """``(estimate, probe_count)`` for measuring every relationship's coverage,
+    without running it. Pure pricing, split out so a caller combining this axis
+    with another can price both before asking once."""
 
     from .. import command_args
     from ..explore import relationships as rel_mod
@@ -2105,34 +2974,64 @@ def join_probe_cost(adapter, relationships: list) -> tuple[float, int]:
     estimator = getattr(adapter, "query_estimate", None)
     if estimator is None:
         return 0.0, len(to_probe)
-    statements = rel_mod.probe_statements(relationships, adapter.dialect)
+    statements = rel_mod.coverage_statements(
+        relationships, adapter.dialect, key_exprs=key_exprs
+    )
     return sum(estimator(stmt) for stmt in statements), len(to_probe)
+
+
+def _statements_cost(adapter, statements: list[str]) -> float:
+    from .. import command_args
+
+    if not statements or command_args.cost_gate(adapter) is None:
+        return 0.0
+    estimator = getattr(adapter, "query_estimate", None)
+    if estimator is None:
+        return 0.0
+    return float(sum(estimator(sql) for sql in statements))
 
 
 def join_contract_cost(
     project_dir: Path,
     adapter,
     model_relations: dict[str, str],
-    live_identifiers: list[str],
+    live_identifiers: list[str] | None,
     *,
     scope: set[str] | None = None,
 ) -> tuple[float, int]:
-    """``(estimate, probe_count)`` for #228's whole axis, end to end but
-    without running anything: the plan (parse every selected model's
-    compiled SQL), the resolution (each join's relations against the live
-    warehouse), and the pricing (:func:`join_probe_cost`), composed into one
-    call. Exists so `maintain/commands.py`'s combined handshake can price
-    this axis lazily, alongside row population's own estimate, before either
-    axis asks once -- see that handshake's own docstring.
-    """
+    """``(estimate, statement_count)`` for the whole axis, end to end without
+    running anything: the plan, the resolution against the warehouse, the
+    coverage probes and the NULL counts. Exists so a combined handshake (or a
+    build's upfront estimate, with ``live_identifiers`` ``None``) can price this
+    axis beside the others before anything asks."""
 
-    candidates, _plan_notes = join_contract_plan(
-        project_dir, adapter.dialect, scope=scope
-    )
+    plan = plan_join_contract(project_dir, adapter.dialect, scope=scope)
     pairs, _unresolved = _resolve_join_relationships(
-        candidates, model_relations, live_identifiers
+        plan.candidates, model_relations, live_identifiers
     )
-    return join_probe_cost(adapter, [rel for _model, rel in pairs])
+    pairs, _unsafe = _split_unsafe(pairs, adapter.dialect)
+    relationships = [rel for _m, _c, rel in pairs]
+    exprs = _key_exprs(pairs)
+    estimate, _joins = join_probe_cost(adapter, relationships, exprs)
+    checks, _notes = (
+        _null_checks(adapter, plan, live_identifiers) if pairs else ([], [])
+    )
+    estimate += _statements_cost(adapter, [c.sql for c in checks])
+    return estimate, _statement_count(adapter, relationships, checks, exprs)
+
+
+def _statement_count(
+    adapter, relationships: list, checks: list, key_exprs: dict | None = None
+) -> int:
+    """How many statements the axis would issue: the batched coverage probes
+    and one NULL count per model, which is what a handshake states it buys."""
+
+    from ..explore import relationships as rel_mod
+
+    probes = rel_mod.coverage_statements(
+        relationships, adapter.dialect, key_exprs=key_exprs
+    )
+    return len(probes) + len(checks) if probes else 0
 
 
 def _standalone_join_handshake(adapter) -> Callable[[float, int], object | None]:
@@ -2151,12 +3050,505 @@ def _standalone_join_handshake(adapter) -> Callable[[float, int], object | None]
             per_table={"(join overlap probes)": estimate},
             axes=["join_contract"],
             notes=[
-                f"the estimate buys {probe_count} join overlap probe(s), which "
-                "is what a broken or sparse join is judged from"
+                f"the estimate buys {probe_count} join coverage statement(s), "
+                "which is what a broken, sparse or unmatched join is judged from"
             ],
         )
 
     return ask
+
+
+@dataclass
+class JoinContractResult:
+    """The join contract's answer (#857): findings for contradictions, and one
+    record per join for everything else, so a satisfied join, an unmatched
+    obligation and an empty input are each visible rather than absent."""
+
+    findings: list[DriftFinding] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    offer: object | None = None
+    records: list[dict] = field(default_factory=list)
+
+
+def _skip_record(model: str, skip: JoinSkip, **extra) -> dict:
+    return {
+        "model": model,
+        "join": skip.join or None,
+        "status": "unchecked",
+        "reason_code": skip.code,
+        "reason": skip.reason,
+        **extra,
+    }
+
+
+def _candidate_record(model: str, candidate: JoinCandidate, policy: JoinPolicy) -> dict:
+    """The join coverage record's declared half: the join, its sides and what the
+    declaration says about it, plus any key conversion.
+    """
+    return {
+        "model": model,
+        "join": candidate.label or None,
+        "side": candidate.side,
+        "from_relation": candidate.from_relation,
+        "from_columns": list(candidate.from_columns),
+        "to_relation": candidate.to_relation,
+        "to_columns": list(candidate.to_columns),
+        "declared": {
+            "required": policy.required_by is not None,
+            "required_by": policy.required_by,
+            "optional": policy.declared_optional,
+            "null_keys": "unmatched" if policy.null_keys_unmatched_by else "excluded",
+            "null_keys_by": policy.null_keys_unmatched_by,
+            "derived_columns": list(policy.derived),
+        },
+        **(
+            {"key_conversion": _key_conversion(candidate)}
+            if candidate.key_exprs() is not None
+            else {}
+        ),
+    }
+
+
+def _key_conversion(candidate: JoinCandidate) -> dict:
+    """The conversions a join applies to its keys, as the probe applied them
+    (a hard cast measured as its safe form), per side (#861)."""
+
+    def side(columns, templates):
+        """Each column rendered through its side's conversion template, if any."""
+        return [
+            template.format(column) if template else column
+            for column, template in zip(columns, templates, strict=False)
+        ]
+
+    return {
+        "from": side(candidate.from_columns, candidate.from_keys),
+        "to": side(candidate.to_columns, candidate.to_keys),
+    }
+
+
+def join_coverage(
+    adapter,
+    plan: JoinContractPlan,
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    *,
+    timeout_seconds: float = 30.0,
+    handshake: Callable[[float, int], object | None] | None = None,
+    baseline: dict[str, tuple[str | None, dict[str, float | None]]] | None = None,
+) -> JoinContractResult:
+    """A model's own joins measured for coverage against real data (#228, #857).
+
+    Each supported equality join gets one record: what the model declares about
+    it (:func:`join_policy`), what the coverage probe measured (rows and
+    distinct keys, NULL keys apart), and a ``status`` of ``satisfied``,
+    ``contradicted``, ``not_applicable`` (nothing eligible: an empty input has
+    no coverage, which is not full coverage) or ``unchecked`` with a
+    ``reason_code``. Findings, aggregate counts only:
+
+    - ``join_no_match`` (high): a nonempty eligible population matched nothing.
+      No threshold: zero is zero. ``low`` where the model declares every column
+      the join supplies as allowed to be NULL.
+    - ``join_orphans`` / ``join_zero_overlap``: some unmatched rows. Where the
+      declaration makes the join required, any unmatched row contradicts it
+      (``threshold_source: contract``). Otherwise the default thresholds apply
+      (``threshold_source: default``, stated in ``data``), and on a LEFT join
+      unmatched rows are the optional relationship a LEFT join writes: recorded
+      as evidence, with ``join_orphans`` withheld and ``join_zero_overlap``
+      ranked medium.
+    - ``join_field_all_null`` (high): a column the join supplies, declared
+      ``null_rule: never``, is NULL on every row of the built relation.
+      ``join_field_newly_null`` (medium): one with no declared rule that is
+      NULL on every row now, where the exploration cache profiled the same
+      relation with values in it.
+    """
+
+    from ..explore import relationships as rel_mod
+
+    result = JoinContractResult(notes=list(plan.notes))
+    for model, skips in plan.skips.items():
+        for skip in skips:
+            result.notes.append(f"{model}: {skip}")
+            result.records.append(_skip_record(model, skip))
+
+    pairs, unresolved = _resolve_join_relationships(
+        plan.candidates, model_relations, live_identifiers
+    )
+    for model, candidate in unresolved:
+        policy = join_policy(candidate, plan.context.get(model))
+        result.records.append(
+            {
+                **_candidate_record(model, candidate, policy),
+                "status": "unchecked",
+                "reason_code": "relation_not_found",
+                "reason": "a joined relation did not match exactly one relation in "
+                "the warehouse",
+            }
+        )
+    pairs, unsafe = _split_unsafe(pairs, getattr(adapter, "dialect", ""))
+    for model, candidate, _rel in unsafe:
+        policy = join_policy(candidate, plan.context.get(model))
+        result.records.append(
+            {
+                **_candidate_record(model, candidate, policy),
+                "status": "unchecked",
+                "reason_code": "no_safe_cast_on_connector",
+                "reason": "the join converts its key with a cast, and this "
+                "connector has no cast that returns NULL instead of failing, so "
+                "the values it rejects cannot be counted",
+            }
+        )
+    if unresolved:
+        result.notes.append(
+            "the join contract was not checked for "
+            + ", ".join(sorted({m for m, _c in unresolved}))
+            + ": a joined relation did not match exactly one live identifier"
+        )
+    if not pairs:
+        return result
+
+    relationships = [rel for _m, _c, rel in pairs]
+    exprs = _key_exprs(pairs)
+    checks, check_notes = _null_checks(adapter, plan, live_identifiers)
+    result.notes.extend(check_notes)
+    estimate, probe_count = join_probe_cost(adapter, relationships, exprs)
+    estimate += _statements_cost(adapter, [c.sql for c in checks])
+    statement_count = _statement_count(adapter, relationships, checks, exprs)
+    if statement_count == 0:
+        return result
+
+    ask = handshake if handshake is not None else _standalone_join_handshake(adapter)
+    offer = ask(estimate, statement_count)
+    if offer is not None:
+        result.notes.append(
+            f"the join contract was not measured: {probe_count} join(s) need a "
+            "coverage probe, offered above"
+        )
+        for model, candidate, _rel in pairs:
+            policy = join_policy(candidate, plan.context.get(model))
+            result.records.append(
+                {
+                    **_candidate_record(model, candidate, policy),
+                    "status": "unchecked",
+                    "reason_code": "scan_offered",
+                    "reason": "measuring it is a scan, offered above",
+                }
+            )
+        result.offer = offer
+        return result
+
+    # Only a join that converts a key passes the conversions, so the call is
+    # the one every other join has always made.
+    measured, refused = rel_mod.measure_coverage(
+        adapter,
+        relationships,
+        timeout_seconds=timeout_seconds,
+        **({"key_exprs": exprs} if exprs else {}),
+    )
+    counts_of = {id(rel): counts for rel, counts in measured}
+    refused_of = {id(rel): text for rel, text in refused}
+
+    nulls = _run_null_checks(adapter, checks, timeout_seconds, result)
+
+    for model, candidate, rel in pairs:
+        ctx = plan.context.get(model)
+        policy = join_policy(candidate, ctx)
+        record = _candidate_record(model, candidate, policy)
+        counts = counts_of.get(id(rel))
+        if counts is None:
+            reason = refused_of.get(id(rel), "the coverage probe returned no row")
+            record.update(
+                status="unchecked", reason_code="probe_refused", reason=reason
+            )
+            result.notes.append(f"{model}: {reason}")
+            result.records.append(record)
+            continue
+        finding = _judge_coverage(model, candidate, rel, counts, policy, record)
+        if finding is not None:
+            result.findings.append(finding)
+        _judge_derived_nulls(
+            model, candidate, policy, ctx, nulls.get(model), record, result, baseline
+        )
+        result.records.append(record)
+    return result
+
+
+def _run_null_checks(adapter, checks, timeout_seconds, result) -> dict:
+    from ..guards.cost_guard import CostGuardError
+
+    out: dict[str, tuple[str, int, dict[str, int]]] = {}
+    for check in checks:
+        try:
+            answer = adapter.run_query(
+                check.sql, max_rows=1, timeout_seconds=timeout_seconds
+            )
+        except CostGuardError:
+            raise
+        except Exception as exc:  # one refused count is a note
+            result.notes.append(
+                f"{check.model}: the columns its joins supply were not NULL-checked: "
+                f"the warehouse refused the statement ({type(exc).__name__})"
+            )
+            continue
+        row = {
+            str(k).lower(): v
+            for k, v in zip(answer.columns, answer.cells[0], strict=True)
+        }
+        out[check.model] = (
+            check.identifier,
+            int(row.get("dex_rows") or 0),
+            {
+                column: int(row.get(f"dex_nn_{i}") or 0)
+                for i, (column, _spelled) in enumerate(check.columns)
+            },
+        )
+    return out
+
+
+def _judge_coverage(
+    model: str,
+    candidate: JoinCandidate,
+    rel,
+    counts,
+    policy: JoinPolicy,
+    record: dict,
+) -> DriftFinding | None:
+    """Fill ``record`` with the measured counts and verdict; return the finding
+    a contradiction earns, or ``None``."""
+
+    counted = policy.null_keys_unmatched_by is not None
+    eligible_rows = counts.eligible_rows + (counts.null_key_rows if counted else 0)
+    matched_rows = counts.matched_rows
+    unmatched_rows = eligible_rows - matched_rows
+    eligible_keys, matched_keys = counts.eligible_keys, counts.matched_keys
+    coverage_rows = round(matched_rows / eligible_rows, 4) if eligible_rows else None
+    coverage_keys = round(matched_keys / eligible_keys, 4) if eligible_keys else None
+    required = policy.required_by is not None
+    left = candidate.side.split(" ")[0] == "left" if candidate.side else False
+    threshold_source = "contract" if required else "default"
+    record["measured"] = {
+        "rows": counts.rows,
+        "null_key_rows": counts.null_key_rows,
+        "eligible_rows": eligible_rows,
+        "matched_rows": matched_rows,
+        "unmatched_rows": unmatched_rows,
+        "eligible_keys": eligible_keys,
+        "matched_keys": matched_keys,
+        "unmatched_keys": eligible_keys - matched_keys,
+    }
+    if getattr(counts, "conversion_failed_rows", None) is not None:
+        # Non-NULL keys the join's conversion turns into NULL: they stay in the
+        # eligible population as unmatched, and are counted apart so a reader
+        # can tell a failed cast from a missing parent (#861).
+        record["measured"]["conversion_failed_rows"] = counts.conversion_failed_rows
+        record["measured"]["conversion_failed_keys"] = counts.conversion_failed_keys
+    record["coverage"] = {"rows": coverage_rows, "keys": coverage_keys}
+    record["threshold_source"] = threshold_source
+    record["thresholds"] = (
+        {"unmatched_rows": 0}
+        if required
+        else {
+            "join_zero_overlap": _JOIN_ZERO_OVERLAP_THRESHOLD,
+            "join_orphans": _JOIN_ORPHANS_THRESHOLD,
+        }
+    )
+    if eligible_rows == 0:
+        record.update(
+            status="not_applicable",
+            reason_code="empty_input" if counts.rows == 0 else "all_keys_null",
+            reason=(
+                f"{rel.from_dataset} has no rows, so the join has no coverage to "
+                "judge (undefined, not complete)"
+                if counts.rows == 0
+                else f"every {rel.from_dataset} row has a NULL key, and the "
+                "declaration does not count NULL keys, so nothing is eligible"
+            ),
+        )
+        return None
+
+    orphan_fraction = round(unmatched_rows / eligible_rows, 4)
+    from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in rel.from_columns)
+    to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in rel.to_columns)
+    measured = (
+        f"{unmatched_rows} of {eligible_rows} eligible {rel.from_dataset} row(s) "
+        f"({orphan_fraction:.0%}) and {eligible_keys - matched_keys} of "
+        f"{eligible_keys} distinct key(s) have no match in {rel.to_dataset}"
+    )
+    if counts.null_key_rows:
+        measured += f"; {counts.null_key_rows} row(s) with a NULL key are " + (
+            "counted as unmatched" if counted else "excluded"
+        )
+    data = {
+        "model": model,
+        "join": candidate.label or None,
+        "side": candidate.side,
+        "from_relation": rel.from_dataset,
+        "from_columns": list(rel.from_columns),
+        "to_relation": rel.to_dataset,
+        "to_columns": list(rel.to_columns),
+        "orphan_fraction": orphan_fraction,
+        **record["measured"],
+        "coverage_rows": coverage_rows,
+        "coverage_keys": coverage_keys,
+        "threshold_source": threshold_source,
+        "required_by": policy.required_by,
+    }
+
+    if matched_rows == 0:
+        code = "join_no_match"
+        severity = "low" if policy.declared_optional and not required else "high"
+        detail = (
+            f"'{model}' joins ({from_key}) to ({to_key}), and none of its "
+            f"{eligible_rows} eligible row(s) ({eligible_keys} distinct key(s)) "
+            f"match: every column the join supplies is NULL or every row is "
+            "dropped. The keys share no value; check the join columns and the "
+            "relation the model is driven from"
+        )
+        if policy.declared_optional and not required:
+            data["declared_optional"] = True
+    elif required and unmatched_rows > 0:
+        code = (
+            "join_zero_overlap"
+            if orphan_fraction >= _JOIN_ZERO_OVERLAP_THRESHOLD
+            else "join_orphans"
+        )
+        severity = "high"
+        detail = (
+            f"'{model}' joins ({from_key}) to ({to_key}) and requires every "
+            f"eligible row to match ({policy.required_by}), but {measured}"
+        )
+        data["threshold"] = 0
+    elif orphan_fraction >= _JOIN_ZERO_OVERLAP_THRESHOLD:
+        code = "join_zero_overlap"
+        severity = "medium" if left else "high"
+        detail = (
+            f"'{model}' joins ({from_key}) to ({to_key}), but {measured}, at or "
+            f"above the default {_JOIN_ZERO_OVERLAP_THRESHOLD:.0%}"
+            + (
+                "; a LEFT join keeps those rows with NULLs, which nothing in the "
+                "declaration rules out"
+                if left
+                else ""
+            )
+        )
+        data["threshold"] = _JOIN_ZERO_OVERLAP_THRESHOLD
+    elif orphan_fraction >= _JOIN_ORPHANS_THRESHOLD and not left:
+        code, severity = "join_orphans", "medium"
+        detail = (
+            f"'{model}' joins ({from_key}) to ({to_key}), but {measured}, at or "
+            f"above the default {_JOIN_ORPHANS_THRESHOLD:.0%}"
+        )
+        data["threshold"] = _JOIN_ORPHANS_THRESHOLD
+    else:
+        record["status"] = "satisfied"
+        if left and unmatched_rows:
+            record["optional_unmatched"] = True
+        return None
+
+    record["status"] = "contradicted"
+    record["finding"] = code
+    return DriftFinding(
+        axis="join_contract",
+        code=code,
+        identifier=model,
+        column=rel.from_columns[0] if len(rel.from_columns) == 1 else None,
+        severity=severity,
+        detail=detail,
+        data=data,
+    )
+
+
+def _judge_derived_nulls(
+    model: str,
+    candidate: JoinCandidate,
+    policy: JoinPolicy,
+    ctx: ModelJoinContext | None,
+    measured: tuple[str, int, dict[str, int]] | None,
+    record: dict,
+    result: JoinContractResult,
+    baseline: dict[str, tuple[str | None, dict[str, float | None]]] | None,
+) -> None:
+    """Columns the join supplies that are NULL on every row of the built model.
+
+    A finding only where something says the column should hold values: its
+    declared ``null_rule: never``, or a cached profile of the same relation
+    that saw values in it. Otherwise the column is listed on the record and
+    left there, since an optional field that is empty is not by itself a defect.
+    """
+
+    if measured is None or not policy.derived:
+        return
+    identifier, rows, non_null = measured
+    if rows == 0:
+        return
+    empty = [c for c in policy.derived if non_null.get(c) == 0]
+    if not empty:
+        return
+    record["derived_columns_all_null"] = empty
+    profile = None
+    profiled_at = None
+    if baseline:
+        keys = match_identifier(identifier, list(baseline))
+        if len(keys) == 1:
+            profiled_at, profile = baseline[keys[0]]
+    record["null_baseline"] = "cache" if profile is not None else "none"
+    already = {
+        (f.identifier, f.column)
+        for f in result.findings
+        if f.code in ("join_field_all_null", "join_field_newly_null")
+    }
+    for column in empty:
+        if (model, column) in already:
+            continue
+        meta = (ctx.columns.get(column) if ctx else None) or {}
+        data = {
+            "model": model,
+            "column": column,
+            "join": candidate.label or None,
+            "to_relation": candidate.to_relation,
+            "rows": rows,
+            "coverage_rows": (record.get("coverage") or {}).get("rows"),
+        }
+        if _never_null(meta):
+            result.findings.append(
+                DriftFinding(
+                    axis="join_contract",
+                    code="join_field_all_null",
+                    identifier=model,
+                    column=column,
+                    severity="high",
+                    detail=(
+                        f"'{model}.{column}' is declared null_rule: never and comes "
+                        f"from {candidate.to_relation}, but it is NULL on all {rows} "
+                        "row(s): the join supplying it matched nothing the model "
+                        "kept. See the join's coverage record for the counts"
+                    ),
+                    data=data,
+                )
+            )
+            continue
+        before = (profile or {}).get(column)
+        if before is not None and before < 1:
+            result.findings.append(
+                DriftFinding(
+                    axis="join_contract",
+                    code="join_field_newly_null",
+                    identifier=model,
+                    column=column,
+                    severity="medium",
+                    detail=(
+                        f"'{model}.{column}' comes from {candidate.to_relation} and "
+                        f"is NULL on all {rows} row(s) now, where the last profile "
+                        f"of {identifier} found {1 - before:.0%} of it filled: the "
+                        "join supplying it stopped matching"
+                    ),
+                    data={
+                        **data,
+                        "baseline": "cache",
+                        "baseline_null_fraction": before,
+                        "baseline_profiled_at": profiled_at,
+                    },
+                )
+            )
 
 
 def join_contract_findings(
@@ -2168,100 +3560,18 @@ def join_contract_findings(
     timeout_seconds: float = 30.0,
     handshake: Callable[[float, int], object | None] | None = None,
 ) -> tuple[list[DriftFinding], list[str], object | None]:
-    """A model's own joins measured against real value overlap (#228).
+    """``(findings, notes, offer)`` for candidates with no declaration context:
+    :func:`join_coverage` over a plan holding only ``candidates_by_model``."""
 
-    Reuses the exact probe `explore relationships --verify` already runs
-    (:func:`~..explore.relationships.verify_relationships`) rather than
-    authoring a second one: the question is identical (how many of this
-    side's non-null keys have no match on the other side), only the source
-    of the join differs (the project wrote this one; that command infers or
-    reads a declaration). Aggregate counts only, by that function's own
-    contract -- no key value ever leaves the engine.
-
-    A join at or above `_JOIN_ZERO_OVERLAP_THRESHOLD` orphan fraction is
-    `join_zero_overlap` (``high``): the join predicate connects to almost
-    nothing on the other side, which is the most damaging and least visible
-    defect this sweep can catch. One from `_JOIN_ORPHANS_THRESHOLD` up to
-    that is `join_orphans` (``medium``): real, measured orphans -- a left
-    join whose right side is legitimately sparse lands here, reported at its
-    fraction rather than characterized as broken. Below `_JOIN_ORPHANS_
-    THRESHOLD` a join is healthy and reports nothing.
-
-    Returns ``(findings, notes, offer)``. ``offer`` is non-``None`` only when
-    ``handshake`` deferred the probe; the caller folds it into
-    ``VerifyResult.pending_offer`` the same way row population's own scan
-    already does.
-    """
-
-    from ..explore import relationships as rel_mod
-
-    pairs, unresolved = _resolve_join_relationships(
-        candidates_by_model, model_relations, live_identifiers
+    result = join_coverage(
+        adapter,
+        JoinContractPlan(candidates=candidates_by_model),
+        model_relations,
+        live_identifiers,
+        timeout_seconds=timeout_seconds,
+        handshake=handshake,
     )
-    notes: list[str] = []
-    if unresolved:
-        notes.append(
-            "the join contract was not checked for "
-            + ", ".join(sorted(set(unresolved)))
-            + ": a joined relation did not match exactly one live identifier"
-        )
-    if not pairs:
-        return [], notes, None
-
-    relationships = [rel for _model, rel in pairs]
-    estimate, probe_count = join_probe_cost(adapter, relationships)
-    if probe_count == 0:
-        return [], notes, None
-
-    ask = handshake if handshake is not None else _standalone_join_handshake(adapter)
-    offer = ask(estimate, probe_count)
-    if offer is not None:
-        notes.append(
-            f"the join contract was not measured: {probe_count} join(s) need "
-            "an overlap probe, offered above"
-        )
-        return [], notes, offer
-
-    rel_mod.verify_relationships(
-        adapter, relationships, timeout_seconds=timeout_seconds
-    )
-
-    findings: list[DriftFinding] = []
-    for model, rel in pairs:
-        if not rel.verified or rel.orphan_fraction is None:
-            continue
-        fraction = rel.orphan_fraction
-        if fraction >= _JOIN_ZERO_OVERLAP_THRESHOLD:
-            code, severity = "join_zero_overlap", "high"
-        elif fraction >= _JOIN_ORPHANS_THRESHOLD:
-            code, severity = "join_orphans", "medium"
-        else:
-            continue
-        from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in rel.from_columns)
-        to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in rel.to_columns)
-        findings.append(
-            DriftFinding(
-                axis="join_contract",
-                code=code,
-                identifier=model,
-                column=rel.from_columns[0] if len(rel.from_columns) == 1 else None,
-                severity=severity,
-                detail=(
-                    f"'{model}' joins ({from_key}) to ({to_key}), but "
-                    f"{fraction:.0%} of {rel.from_dataset} rows have no match "
-                    f"in {rel.to_dataset}"
-                ),
-                data={
-                    "model": model,
-                    "from_relation": rel.from_dataset,
-                    "from_columns": list(rel.from_columns),
-                    "to_relation": rel.to_dataset,
-                    "to_columns": list(rel.to_columns),
-                    "orphan_fraction": fraction,
-                },
-            )
-        )
-    return findings, notes, None
+    return result.findings, result.notes, result.offer
 
 
 # --- getting the counts the comparison needs -----------------------------------

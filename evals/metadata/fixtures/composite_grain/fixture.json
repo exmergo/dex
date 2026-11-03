@@ -1,0 +1,5 @@
+{
+  "name": "composite_grain",
+  "seed": 4924,
+  "description": "Daily stock snapshots per store and SKU. A store-day rollup has a two-column grain, a stock balance that does not add across days, and a distinct count that does not add at all."
+}

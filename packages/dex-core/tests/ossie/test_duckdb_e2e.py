@@ -266,3 +266,73 @@ def test_verify_confirms_the_declared_joins_against_real_overlap(
     )
     assert composite["verified"] is True
     assert composite["orphan_fraction"] == 0.0
+
+
+def test_verify_probes_the_columns_behind_renamed_fields(tmp_path: Path, capsys):
+    """Keys and relationship columns name fields (#956): a join on the field
+    `customer_id`, defined as `o_custkey`, is a probe of `o_custkey`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(str(tmp_path / "demo.duckdb"))
+    conn.execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 10), (2, 20), (3, 10)")
+    conn.execute("CREATE TABLE customers (c_custkey INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (10), (20)")
+    conn.close()
+    write(
+        tmp_path,
+        "renamed.ossie.yaml",
+        document(
+            model(
+                "renamed",
+                dataset(
+                    "orders",
+                    "demo.main.orders",
+                    field("order_id", "o_orderkey"),
+                    field("customer_id", "o_custkey"),
+                    primary_key=["order_id"],
+                ),
+                dataset(
+                    "customers",
+                    "demo.main.customers",
+                    field("id", "c_custkey"),
+                    primary_key=["id"],
+                ),
+                relationships=[
+                    {
+                        "name": "orders_to_customers",
+                        "from": "orders",
+                        "to": "customers",
+                        "from_columns": ["customer_id"],
+                        "to_columns": ["id"],
+                    }
+                ],
+            )
+        ),
+    )
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            duckdb={"path": "demo.duckdb"},
+            semantic={"vendor": "ossie", "ossie": {"files": ["renamed.ossie.yaml"]}},
+        ),
+        tmp_path,
+    )
+
+    data = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--verify",
+            "--repo-root",
+            str(tmp_path),
+        ],
+        capsys,
+    )["data"]
+
+    (declared,) = [r for r in data["relationships"] if r["kind"] == "declared"]
+    assert declared["from_columns"] == ["o_custkey"]
+    assert declared["to_columns"] == ["c_custkey"]
+    assert declared["verified"] is True
+    assert declared["orphan_fraction"] == 0.0

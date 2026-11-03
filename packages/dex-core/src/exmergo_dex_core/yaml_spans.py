@@ -83,3 +83,18 @@ def with_leading_comments(content: str, start: int) -> int:
             break
         line_start = moved = above
     return moved
+
+
+def sequence_item_span(content: str, item_start: int) -> tuple[int, int] | None:
+    """Where one block-sequence item starts and stops, dash line to last line.
+
+    ``item_start`` is where the item's node begins (PyYAML's ``start_mark``).
+    Only an item whose dash opens its own line: anything else shares a line with
+    something that is not being removed, so ``None``.
+    """
+
+    line_start = content.rfind("\n", 0, item_start) + 1
+    lead = content[line_start:item_start]
+    if lead.strip() != "-" or lead.rstrip().count("-") != 1:
+        return None
+    return line_start, block_end(content, line_start, indent_of(content, line_start))

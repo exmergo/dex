@@ -224,7 +224,7 @@ def test_a_contradictory_semantic_block_is_refused_rather_than_resolved():
 
 def test_a_semantic_vendor_or_deployment_dex_does_not_ship_is_refused():
     with pytest.raises(ValueError, match=r"semantic\.vendor"):
-        SemanticConfig(vendor="cube")
+        SemanticConfig(vendor="lookml")
     with pytest.raises(ValueError, match=r"semantic\.deployment"):
         SemanticConfig(deployment="dbt_core")
     with pytest.raises(ValueError, match=r"semantic\.backend"):

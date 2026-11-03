@@ -253,6 +253,22 @@ def parse_relation(connector: str, identifier: str) -> tuple[str, ...] | None:
     return tuple(parts)
 
 
+def fold_identifier(connector: str | None, name: str) -> str:
+    """An unquoted identifier part spelled the way ``connector`` resolves it.
+
+    The single-part companion to :func:`normalize_relation`: an authored
+    unquoted ``customer_id`` is the column ``CUSTOMER_ID`` on Snowflake and
+    ``customer_id`` on Postgres, so a layer that names a column unquoted names
+    the column the warehouse folded it to. An unknown or absent connector, or one
+    that keeps case, returns the name as written.
+    """
+
+    rule = _RELATION_RULES.get(connector or "")
+    if rule is None or rule.fold is None:
+        return name
+    return name.upper() if rule.fold == "upper" else name.lower()
+
+
 def normalize_relation(connector: str, identifier: str) -> str | None:
     """``identifier`` spelled the way ``connector`` resolves it, or None.
 

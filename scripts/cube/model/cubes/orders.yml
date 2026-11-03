@@ -1,0 +1,50 @@
+# The dogfood and integration model for #913: Cube renders, dex executes.
+# Every cube sits on the schema scripts/postgres_seed.sql seeds (`app`), and the
+# DuckDB fixture in tests/cube_vendor mirrors those tables, so one model is read
+# by the unit tests, the live integration tests and scripts/setup_cube_dev.sh.
+cubes:
+  - name: orders
+    sql_table: app.orders
+    title: Orders
+    description: One row per order.
+    joins:
+      - name: customers
+        sql: "{CUBE}.customer_id = {customers}.id"
+        relationship: many_to_one
+    dimensions:
+      - name: id
+        sql: id
+        type: number
+        primary_key: true
+      - name: status
+        sql: status
+        type: string
+      - name: total
+        sql: total
+        type: number
+      - name: ordered_at
+        sql: ordered_at
+        type: time
+        granularities:
+          - name: fiscal_year
+            interval: 1 year
+            offset: 3 months
+    measures:
+      - name: count
+        type: count
+      - name: revenue
+        sql: total
+        type: sum
+      - name: paid_revenue
+        sql: total
+        type: sum
+        filters:
+          - sql: "{CUBE}.status = 'paid'"
+      - name: average_order
+        sql: total
+        type: avg
+      - name: revenue_7d
+        sql: total
+        type: sum
+        rolling_window:
+          trailing: 7 day

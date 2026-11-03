@@ -1,0 +1,13 @@
+version: 2
+models:
+  - name: account_event_rate
+    description: One row per account that had at least one event in the window. Accounts with no events are out of scope for this mart.
+    config:
+      meta:
+        dex:
+          grain: [account_id]
+          population:
+            rule: Accounts with at least one event in the window; accounts with no events are excluded.
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]

@@ -279,6 +279,11 @@ def utc_day_start() -> str:
     )
 
 
+UPTIME_LINE = "(warehouse uptime)"
+"""The line of a per-table estimate that carries a warehouse's uptime overhead
+(Snowflake's resume minimum and idle tail): one line, added once per command by
+the handshake that shows the estimate, never folded into a statement's price."""
+
 LEDGER_ENTRY_KINDS = ("reservation", "settlement", "release")
 """Every kind a ledger row may declare, and there are no others.
 
@@ -299,6 +304,7 @@ def ledger_row(
     estimate: float | None = None,
     job_id: str | None = None,
     statement_sha256: str | None = None,
+    warehouse_claim: dict | None = None,
 ) -> dict:
     """One row of the spend ledger, in the one shape every row has.
 
@@ -320,6 +326,12 @@ def ledger_row(
     ``amount`` is signed: a release is a reservation with the sign flipped, and
     the three kinds net to actual spend precisely because nothing clamps it.
 
+    ``warehouse_claim`` is what one command claimed of a compute-time
+    warehouse's current resume cycle (its name, ``resumed_on``, the epoch end of
+    the command's last statement, its AUTO_SUSPEND and what a suspend did), on
+    a zero-amount settlement row. The next command that finds the warehouse in
+    the same cycle reads it back to charge only what it adds (issue #664).
+
     Raises on a kind outside :data:`LEDGER_ENTRY_KINDS`. Every call site passes a
     literal, so this can only fire on a writer being added, which is the moment
     the vocabulary needs defending.
@@ -340,6 +352,7 @@ def ledger_row(
         "estimate": estimate,
         "job_id": job_id,
         "statement_sha256": statement_sha256,
+        "warehouse_claim": warehouse_claim,
     }
 
 
@@ -1026,6 +1039,7 @@ class CostGate:
         estimate: float | None = None,
         job_id: str | None = None,
         statement_sha256: str | None = None,
+        warehouse_claim: dict | None = None,
     ) -> None:
         """Write one row and charge it to this gate's own running total.
 
@@ -1047,6 +1061,7 @@ class CostGate:
                 estimate=estimate,
                 job_id=job_id,
                 statement_sha256=statement_sha256,
+                warehouse_claim=warehouse_claim,
             )
         )
         self._ledger_written += amount
@@ -1625,6 +1640,36 @@ class CostGate:
             if statement
             else None,
         )
+
+    def record_claim(self, claim: dict) -> None:
+        """Ledger what this command claimed of a warehouse's resume cycle, as a
+        zero-amount settlement row in its own reservation group (see
+        :func:`ledger_row`). Zero, because what the claim cost is already
+        booked by the overhead row beside it; the row exists to be read back."""
+
+        self._append(
+            "settlement", 0.0, estimate=self._command_estimate, warehouse_claim=claim
+        )
+
+    def warehouse_claims(self) -> list[dict]:
+        """Every warehouse claim in this connector's recent ledger, oldest
+        first, for the uptime model to find the cycle it joins. Empty when the
+        store keeps no readable history, which leaves the model charging a
+        full tail: the safe direction."""
+
+        if self._history is None:
+            return []
+        try:
+            entries = self._history()
+        except Exception:
+            return []
+        return [
+            entry["warehouse_claim"]
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("connector") == self.connector
+            and isinstance(entry.get("warehouse_claim"), dict)
+        ]
 
     def settle(self) -> None:
         """Release the unspent hold and re-read the day, once per command.

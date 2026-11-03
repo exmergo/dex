@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+from exmergo_dex_core.guards.cost_guard import UPTIME_LINE
 from exmergo_dex_core.storage import FilesystemStore
 
 from .conftest import SF_MAX_SECONDS, assert_ok
@@ -228,6 +229,13 @@ def test_flatten_of_a_parsed_json_literal_runs_live(
     assert [row[0] for row in envelope["data"]["cells"]] == ["a", "b"]
 
 
+def _statement_lines(envelope: dict) -> dict[str, float]:
+    """An estimate's per-table lines, without the warehouse's uptime overhead."""
+
+    lines = envelope["data"]["per_table_seconds"]
+    return {line: secs for line, secs in lines.items() if line != UPTIME_LINE}
+
+
 def test_scope_bounds_the_estimate_to_the_named_schema(
     tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
 ):
@@ -249,15 +257,16 @@ def test_scope_bounds_the_estimate_to_the_named_schema(
     )
     assert rc == 0, scoped
     assert scoped["status"] == "needs_confirmation"
-    per_table = scoped["data"]["per_table_seconds"]
+    per_table = _statement_lines(scoped)
     assert {ident.split(".")[1] for ident in per_table} == {"TPCH_SF1"}
     assert len(per_table) == 8
 
     rc, unscoped = run_cli(["--repo-root", root, "explore", "map"], capsys)
     assert rc == 0, unscoped
     # The whole point: scoping is worth orders of magnitude, and before this was
-    # honored both calls returned the same estimate.
-    assert scoped["cost"]["estimate"] < unscoped["cost"]["estimate"] / 1000
+    # honored both calls returned the same estimate. Compared without the uptime
+    # line, a fixed overhead both quotes carry whatever the scope.
+    assert sum(per_table.values()) < sum(_statement_lines(unscoped).values()) / 1000
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
 
 

@@ -178,6 +178,62 @@ def test_validate_model_sql_drops_jinja_config_header(header: str, gap: str):
 
 
 @pytest.mark.parametrize(
+    "header",
+    [
+        "{{ config(materialized='view') }}",
+        "{{- config(materialized='view') -}}",
+        "{{ config(materialized='view', post_hook=\"select (1)\") }}",
+        "{{ config(tags=['a', 'b'], materialized='view') }}",
+    ],
+    ids=["plain", "whitespace-control", "parens-in-string", "list-argument"],
+)
+def test_validate_model_sql_drops_inline_config_header_on_same_line(header: str):
+    """#1003: Inline config() headers followed by SQL on the same line pass
+    validation.
+    """
+    sql = f"{header} select a from source\n"  # noqa: S608
+    assert validate_edit(_model_sql(sql)) == []
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "/* leading comment */ ",
+        "-- line comment\n",
+        "{# jinja comment #} ",
+    ],
+    ids=["block-comment", "line-comment", "jinja-comment"],
+)
+def test_validate_model_sql_drops_inline_config_with_leading_comments(prefix: str):
+    """#1003: Inline config() with preceding comments passes validation."""
+    sql = f"{prefix}{{{{ config(materialized='view') }}}} select 1 as id\n"
+    assert validate_edit(_model_sql(sql)) == []
+
+
+def test_validate_model_sql_drops_multiple_leading_config_headers():
+    """#1003: Multiple leading config() headers pass validation."""
+    sql = "{{ config(materialized='view') }} {{ config(tags=['a']) }} select 1 as id\n"
+    assert validate_edit(_model_sql(sql)) == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "{{ config(materialized='view') }} drop table accounts;",
+        "{{ config(materialized='view') }} select 1 as a; select 2 as b;",
+        "{{ generate_model() }} select 1 as id",
+    ],
+    ids=["ddl", "multi-statement", "non-config-jinja-prefix"],
+)
+def test_validate_model_sql_refuses_invalid_sql_following_config(sql: str):
+    """#1003: Non-SELECT, multi-statement, or unparseable SQL after config()
+    still refuses.
+    """
+    with pytest.raises(EditValidationError):
+        validate_edit(_model_sql(sql))
+
+
+@pytest.mark.parametrize(
     "comment",
     [
         "-- SELECT is only mentioned in this comment",

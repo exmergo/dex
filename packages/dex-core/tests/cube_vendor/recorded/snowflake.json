@@ -1,0 +1,650 @@
+{
+ "average": {
+  "query": {
+   "dimensions": [
+    "orders.status"
+   ],
+   "limit": 3,
+   "measures": [
+    "orders.average_order"
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__average_order": "orders.average_order",
+     "orders__status": "orders.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.average_order",
+     "orders.status"
+    ],
+    "order": {
+     "orders.average_order": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"orders__status\", avg(\"orders\".total) \"orders__average_order\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  2  DESC\nLIMIT 3",
+     []
+    ]
+   }
+  }
+ },
+ "by_grain_flag": {
+  "query": {
+   "limit": 51,
+   "measures": [
+    "orders.count"
+   ],
+   "timeDimensions": [
+    {
+     "dimension": "orders.ordered_at",
+     "granularity": "quarter"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__count": "orders.count",
+     "orders__ordered_at_quarter": "orders.ordered_at.quarter"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.count",
+     "orders.id",
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.ordered_at": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT date_trunc('QUARTER', CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz) \"orders__ordered_at_quarter\", count(\"orders\".id) \"orders__count\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  1  ASC\nLIMIT 51",
+     []
+    ],
+    "timeDimensionAlias": "orders__ordered_at_quarter",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
+ "by_month": {
+  "query": {
+   "limit": 51,
+   "measures": [
+    "orders.revenue"
+   ],
+   "order": [
+    [
+     "orders.ordered_at",
+     "asc"
+    ]
+   ],
+   "timeDimensions": [
+    {
+     "dimension": "orders.ordered_at",
+     "granularity": "month"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__ordered_at_month": "orders.ordered_at.month",
+     "orders__revenue": "orders.revenue"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.revenue",
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.ordered_at": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT date_trunc('MONTH', CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz) \"orders__ordered_at_month\", sum(\"orders\".total) \"orders__revenue\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  1  ASC\nLIMIT 51",
+     []
+    ],
+    "timeDimensionAlias": "orders__ordered_at_month",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
+ "by_status": {
+  "query": {
+   "dimensions": [
+    "orders.status"
+   ],
+   "limit": 51,
+   "measures": [
+    "orders.revenue",
+    "orders.count"
+   ],
+   "order": [
+    [
+     "orders.revenue",
+     "desc"
+    ]
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__count": "orders.count",
+     "orders__revenue": "orders.revenue",
+     "orders__status": "orders.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.revenue",
+     "orders.count",
+     "orders.id",
+     "orders.status"
+    ],
+    "order": {
+     "orders.revenue": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"orders__status\", sum(\"orders\".total) \"orders__revenue\", count(\"orders\".id) \"orders__count\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  2  DESC\nLIMIT 51",
+     []
+    ]
+   }
+  }
+ },
+ "filtered": {
+  "query": {
+   "dimensions": [
+    "orders.status"
+   ],
+   "filters": [
+    {
+     "or": [
+      {
+       "member": "orders.status",
+       "operator": "equals",
+       "values": [
+        "paid"
+       ]
+      },
+      {
+       "member": "orders.status",
+       "operator": "equals",
+       "values": [
+        "shipped"
+       ]
+      }
+     ]
+    }
+   ],
+   "limit": 51,
+   "measures": [
+    "orders.count",
+    "orders.paid_revenue"
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__count": "orders.count",
+     "orders__paid_revenue": "orders.paid_revenue",
+     "orders__status": "orders.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.count",
+     "orders.id",
+     "orders.paid_revenue",
+     "orders.status"
+    ],
+    "order": {
+     "orders.count": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"orders__status\", count(\"orders\".id) \"orders__count\", sum(CASE WHEN (\"orders\".status = 'paid') THEN \"orders\".total END) \"orders__paid_revenue\" \nFROM  app.orders  AS \"orders\"\nWHERE ((\"orders\".status = ?) OR (\"orders\".status = ?))\nGROUP BY 1\nORDER BY  2  DESC\nLIMIT 51",
+     [
+      "paid",
+      "shipped"
+     ]
+    ]
+   }
+  }
+ },
+ "fiscal_year": {
+  "query": {
+   "limit": 51,
+   "measures": [
+    "orders.revenue"
+   ],
+   "timeDimensions": [
+    {
+     "dimension": "orders.ordered_at",
+     "granularity": "fiscal_year"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__ordered_at_fiscal_year": "orders.ordered_at.fiscal_year",
+     "orders__revenue": "orders.revenue"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.revenue",
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.ordered_at": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT date_trunc('YEAR', CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz - interval '3 months') + interval '3 months' \"orders__ordered_at_fiscal_year\", sum(\"orders\".total) \"orders__revenue\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  1  ASC\nLIMIT 51",
+     []
+    ],
+    "timeDimensionAlias": "orders__ordered_at_fiscal_year",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
+ "golden": {
+  "query": {
+   "dimensions": [
+    "orders.status"
+   ],
+   "filters": [
+    {
+     "member": "orders.status",
+     "operator": "equals",
+     "values": [
+      "paid",
+      "shipped"
+     ]
+    },
+    {
+     "member": "orders.revenue",
+     "operator": "gt",
+     "values": [
+      "1"
+     ]
+    }
+   ],
+   "limit": 10,
+   "measures": [
+    "orders.revenue",
+    "orders.count"
+   ],
+   "order": [
+    [
+     "orders.revenue",
+     "desc"
+    ]
+   ],
+   "timeDimensions": [
+    {
+     "dateRange": [
+      "2026-01-01",
+      "2026-03-31"
+     ],
+     "dimension": "orders.ordered_at",
+     "granularity": "month"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__count": "orders.count",
+     "orders__ordered_at_month": "orders.ordered_at.month",
+     "orders__revenue": "orders.revenue",
+     "orders__status": "orders.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.revenue",
+     "orders.count",
+     "orders.id",
+     "orders.status",
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.revenue": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"orders__status\", date_trunc('MONTH', CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz) \"orders__ordered_at_month\", sum(\"orders\".total) \"orders__revenue\", count(\"orders\".id) \"orders__count\" \nFROM  app.orders  AS \"orders\"\nWHERE (\"orders\".ordered_at >= ?::timestamp_tz AND \"orders\".ordered_at <= ?::timestamp_tz) AND (\"orders\".status IN (?, ?))\nGROUP BY 1, 2\nHAVING (sum(\"orders\".total) > ?)\nORDER BY  3  DESC\nLIMIT 10",
+     [
+      "2026-01-01T00:00:00.000Z",
+      "2026-03-31T23:59:59.999Z",
+      "paid",
+      "shipped",
+      "1"
+     ]
+    ],
+    "timeDimensionAlias": "orders__ordered_at_month",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
+ "having": {
+  "query": {
+   "dimensions": [
+    "orders.status"
+   ],
+   "filters": [
+    {
+     "member": "orders.count",
+     "operator": "gt",
+     "values": [
+      "2"
+     ]
+    }
+   ],
+   "limit": 51,
+   "measures": [
+    "orders.count"
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__count": "orders.count",
+     "orders__status": "orders.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.count",
+     "orders.id",
+     "orders.status"
+    ],
+    "order": {
+     "orders.count": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"orders__status\", count(\"orders\".id) \"orders__count\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nHAVING (count(\"orders\".id) > ?)\nORDER BY  2  DESC\nLIMIT 51",
+     [
+      "2"
+     ]
+    ]
+   }
+  }
+ },
+ "rolling": {
+  "query": {
+   "limit": 51,
+   "measures": [
+    "orders.revenue_7d"
+   ],
+   "timeDimensions": [
+    {
+     "dateRange": [
+      "2026-01-01",
+      "2026-01-10"
+     ],
+     "dimension": "orders.ordered_at",
+     "granularity": "day"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__ordered_at_day": "orders.ordered_at.day",
+     "orders__revenue_7d": "orders.revenue_7d"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.revenue_7d",
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.ordered_at": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     " WITH \ntime_series AS (  SELECT series_date AS \"date_from\",\n  DATEADD(MILLISECOND, -1, DATEADD(day, 1, series_date)) AS \"date_to\"\n  FROM (SELECT DATEADD(day, series_index.value::int, '2026-01-01T00:00:00.000'::timestamp_ntz) AS series_date\n  FROM TABLE(FLATTEN(input => ARRAY_GENERATE_RANGE(0, DATEDIFF(day, '2026-01-01T00:00:00.000'::timestamp_ntz, '2026-01-10T23:59:59.999'::timestamp_ntz) + 1))) AS series_index) AS series\n  WHERE series_date <= '2026-01-10T23:59:59.999'::timestamp_ntz),\ncte_0 AS (  SELECT date_trunc('DAY', CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz) \"orders__ordered_at_day\", sum(\"orders\".total) \"orders__revenue_7d\" \n  FROM  app.orders  AS \"orders\"\n  WHERE (CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz >= ?::timestamp_tz AND CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz <= ?::timestamp_tz)\n  GROUP BY 1\n  ORDER BY  1  ASC),\ncte_1 AS (  SELECT \"time_series\".\"date_from\" \"orders__ordered_at_day\", sum(\"rolling_source\".\"orders__revenue_7d\") \"orders__revenue_7d\" \n  FROM  time_series  AS \"time_series\"\n  LEFT JOIN  cte_0  AS \"rolling_source\" ON \"rolling_source\".\"orders__ordered_at_day\" > \"time_series\".\"date_to\" - interval '7 day' AND \"rolling_source\".\"orders__ordered_at_day\" <= \"time_series\".\"date_to\"\n  GROUP BY 1\n  ORDER BY  1  ASC)\nSELECT \"fk_aggregate\".\"orders__ordered_at_day\" \"orders__ordered_at_day\", \"fk_aggregate\".\"orders__revenue_7d\" \"orders__revenue_7d\" \nFROM  cte_1  AS \"fk_aggregate\"\nORDER BY  1  ASC\nLIMIT 51",
+     [
+      "2025-12-25T00:00:00.000",
+      "2026-01-11T23:59:58.999"
+     ]
+    ],
+    "timeDimensionAlias": "orders__ordered_at_day",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
+ "two_hops": {
+  "query": {
+   "dimensions": [
+    "products.category",
+    "orders.status"
+   ],
+   "limit": 51,
+   "measures": [
+    "order_items.units",
+    "order_items.line_revenue"
+   ],
+   "order": [
+    [
+     "products.category",
+     "asc"
+    ],
+    [
+     "orders.status",
+     "asc"
+    ]
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "order_items__line_revenue": "order_items.line_revenue",
+     "order_items__units": "order_items.units",
+     "orders__status": "orders.status",
+     "products__category": "products.category"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "order_items.units",
+     "order_items.line_revenue",
+     "products.category",
+     "orders.status"
+    ],
+    "order": {
+     "orders.status": "asc",
+     "products.category": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"products\".category \"products__category\", \"orders\".status \"orders__status\", sum(\"order_items\".quantity) \"order_items__units\", sum(\"order_items\".quantity * \"order_items\".unit_price) \"order_items__line_revenue\" \nFROM  app.order_items  AS \"order_items\"\nLEFT JOIN  app.products  AS \"products\" ON \"order_items\".product_id = \"products\".id\nLEFT JOIN  app.orders  AS \"orders\" ON \"order_items\".order_id = \"orders\".id\nGROUP BY 1, 2\nORDER BY  1  ASC,  2  ASC\nLIMIT 51",
+     []
+    ]
+   }
+  }
+ },
+ "values_month": {
+  "query": {
+   "limit": 51,
+   "timeDimensions": [
+    {
+     "dimension": "orders.ordered_at",
+     "granularity": "month"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__ordered_at_month": "orders.ordered_at.month"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.ordered_at": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT date_trunc('MONTH', CONVERT_TIMEZONE('UTC', \"orders\".ordered_at::timestamp_tz)::timestamp_ntz) \"orders__ordered_at_month\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  1  ASC\nLIMIT 51",
+     []
+    ],
+    "timeDimensionAlias": "orders__ordered_at_month",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
+ "values_scoped": {
+  "query": {
+   "dimensions": [
+    "products.category"
+   ],
+   "limit": 51,
+   "measures": [
+    "order_items.units"
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "order_items__units": "order_items.units",
+     "products__category": "products.category"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "order_items.units",
+     "products.category"
+    ],
+    "order": {
+     "order_items.units": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"products\".category \"products__category\", sum(\"order_items\".quantity) \"order_items__units\" \nFROM  app.order_items  AS \"order_items\"\nLEFT JOIN  app.products  AS \"products\" ON \"order_items\".product_id = \"products\".id\nGROUP BY 1\nORDER BY  2  DESC\nLIMIT 51",
+     []
+    ]
+   }
+  }
+ },
+ "values_status": {
+  "query": {
+   "dimensions": [
+    "orders.status"
+   ],
+   "limit": 51,
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__status": "orders.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.status"
+    ],
+    "order": {
+     "orders.status": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"orders__status\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  1  ASC\nLIMIT 51",
+     []
+    ]
+   }
+  }
+ },
+ "view": {
+  "query": {
+   "dimensions": [
+    "order_facts.status"
+   ],
+   "limit": 51,
+   "measures": [
+    "order_facts.revenue"
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "order_facts__revenue": "order_facts.revenue",
+     "order_facts__status": "order_facts.status"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "order_facts.revenue",
+     "orders.revenue",
+     "order_facts.status",
+     "orders.status"
+    ],
+    "order": {
+     "order_facts.revenue": "desc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT \"orders\".status \"order_facts__status\", sum(\"orders\".total) \"order_facts__revenue\" \nFROM  app.orders  AS \"orders\"\nGROUP BY 1\nORDER BY  2  DESC\nLIMIT 51",
+     []
+    ]
+   }
+  }
+ }
+}

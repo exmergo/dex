@@ -898,6 +898,128 @@ def test_sub_threshold_flag_flows_through_the_unnest_as_a_warning(
     assert any("HINT" in warning for warning in inspected.warnings)
 
 
+# --- FROM-clause VALUES: literal rows, no cache needed ----------------------------
+
+
+VALUES_ALLOWED = [
+    (
+        "duckdb",
+        "SELECT ID, w.window_days FROM RAW_HOSTS "
+        "CROSS JOIN (VALUES (7), (28)) AS w (window_days)",
+    ),
+    (
+        "postgres",
+        "SELECT h.ID, w.window_days FROM RAW_HOSTS h, "
+        "(VALUES (7), (28)) AS w (window_days) WHERE w.window_days > 7",
+    ),
+    (
+        "snowflake",
+        "SELECT ID, n, label FROM RAW_HOSTS "
+        "CROSS JOIN (VALUES (7, 'week'), (28, 'month')) AS w (n, label)",
+    ),
+    ("duckdb", "SELECT w.* FROM RAW_HOSTS, (VALUES (7), (28)) AS w (window_days)"),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (-1, NULL, TRUE, 'x')) AS w (v, a, b, c)",
+    ),
+    ("duckdb", "SELECT w.v FROM RAW_HOSTS, (VALUES (-(1))) AS w (v)"),
+    (
+        "clickhouse",
+        "SELECT w.n FROM RAW_HOSTS, "
+        "(VALUES (7, 'week'), (28, 'month')) AS w (n, label)",
+    ),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql"), VALUES_ALLOWED)
+def test_values_source_allowed(dialect: str, sql: str, json_cache: DexCache):
+    inspected = inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert inspected.tables == ["db.main.RAW_HOSTS"]
+    assert not inspected.warnings
+
+
+VALUES_REFUSED = [
+    # A VALUES list with unnamed columns would resolve by a dialect's positional
+    # default; the firewall will not guess names.
+    ("duckdb", "SELECT * FROM RAW_HOSTS, (VALUES (7), (28)) AS w", "name its columns"),
+    ("duckdb", "SELECT * FROM RAW_HOSTS, (VALUES (7), (28))", "name its columns"),
+    # A row that reads a column or a subquery is a side door around resolution.
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (PROFILE)) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, "
+        "(VALUES ((SELECT PROFILE FROM RAW_HOSTS))) AS w (v)",
+        "must be plain literals",
+    ),
+    # Constant expressions are not literals either.
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (1 + 1)) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (UPPER('a'))) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (-'x')) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (DATE '2020-01-01')) AS w (v)",
+        "must be plain literals",
+    ),
+    # Only a one-element tuple is unwrapped: a column cannot ride in a second slot.
+    (
+        "clickhouse",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES ((1, PROFILE))) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "clickhouse",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (1 + 1)) AS w (v)",
+        "must be plain literals",
+    ),
+    # Its columns are the only names it has: a stray column is still unknown.
+    (
+        "duckdb",
+        "SELECT w.nope FROM RAW_HOSTS, (VALUES (7)) AS w (window_days)",
+        "does not exist",
+    ),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql", "fragment"), VALUES_REFUSED)
+def test_values_source_refused(
+    dialect: str, sql: str, fragment: str, json_cache: DexCache
+):
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert fragment.lower() in str(excinfo.value).lower()
+
+
+def test_values_source_does_not_launder_a_flagged_column(json_cache: DexCache):
+    """Joining a VALUES list changes nothing about what the tables carry: a
+    flagged column projected beside it is still refused as itself."""
+
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(
+            "SELECT PROFILE, w.window_days FROM RAW_HOSTS, "
+            "(VALUES (7)) AS w (window_days)",
+            json_cache,
+            LIMITS,
+            dialect="duckdb",
+        )
+    assert "PROFILE" in str(excinfo.value)
+
+
 # --- what a statement reads, ahead of the guard ----------------------------------
 
 

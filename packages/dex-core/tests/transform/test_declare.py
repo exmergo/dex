@@ -357,6 +357,46 @@ def test_an_unprofiled_input_keeps_the_drafter_s_reason():
     assert "no exploration cache yet" in outcome.skipped[0]["detail"]
 
 
+def test_an_input_no_command_can_profile_is_stated_without_a_command():
+    """#893: a name matching several profiled relations has no command that
+    helps, so the skip states why instead of naming one that fails."""
+
+    reason = (
+        "it matches 2 relations in the cache (shop.dbt_dev.stg_orders, "
+        "shop.public.stg_orders), and a ref() is read by name, so no profile run "
+        "can settle which one it means"
+    )
+    draft = _draft(
+        inputs=[{"relation": "stg_orders", "profiled": False, "reason": reason}]
+    )
+    outcome = _propose(_shop(), {"fct_orders": draft}, models=["fct_orders"])
+    (skipped,) = outcome.skipped
+    assert skipped["reason"] == "unprofiled_inputs"
+    assert skipped["commands"] == []
+    assert skipped["detail"] == f"nothing was drafted from stg_orders: {reason}"
+
+
+def test_a_dev_only_input_is_skipped_with_the_dev_target_command():
+    command = "explore profile SHOP.DBT_DEV.stg_orders --target dev"
+    draft = _draft(
+        inputs=[
+            {
+                "relation": "stg_orders",
+                "profiled": False,
+                "reason": (
+                    "the cache has not profiled it, and its dev build in "
+                    "SHOP.DBT_DEV is outside the source allowlist"
+                ),
+                "command": command,
+            }
+        ]
+    )
+    outcome = _propose(_shop(), {"fct_orders": draft}, models=["fct_orders"])
+    (skipped,) = outcome.skipped
+    assert skipped["commands"] == [command]
+    assert skipped["detail"].endswith(f"Run `{command}` and declare again")
+
+
 def test_a_model_dex_cannot_read_is_skipped_not_guessed():
     outcome = _propose(_shop(), {}, models=["fct_orders"])
     assert outcome.skipped[0]["reason"] == "sql_unreadable"

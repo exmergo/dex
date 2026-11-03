@@ -1,0 +1,8 @@
+version: 2
+models:
+  - name: customer_lifetime_value
+    description: One row per customer with the value of the orders they kept.
+  - name: region_revenue
+    description: Revenue by customer region.
+  - name: monthly_orders
+    description: Orders and revenue by month.

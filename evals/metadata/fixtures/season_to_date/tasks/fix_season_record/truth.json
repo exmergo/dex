@@ -1,0 +1,35 @@
+{
+  "models": {
+    "team_season_record": {
+      "grain": [
+        "season",
+        "team_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "wins": {
+          "role": "measure",
+          "unit": "count"
+        },
+        "losses": {
+          "role": "measure",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every team keeps every season, the unfinished one included",
+      "expect": 24,
+      "sql": "select count(*) from main.team_season_record"
+    },
+    {
+      "name": "wins and losses are the season-to-date record",
+      "expect": 0,
+      "sql": "select count(*) from main.team_season_record r full outer join (select season, team_id, max(wins_to_date) as wins, max(losses_to_date) as losses from raw.standings group by 1, 2) e using (season, team_id) where r.wins is distinct from e.wins or r.losses is distinct from e.losses"
+    }
+  ]
+}

@@ -39,18 +39,39 @@ MODES = ("define", "update", "plan")
 
 
 def semantic_native(
-    engine: DexEngine, vendor: str, intent: str, edits: list[PlanEdit], *, mode: str
+    engine: DexEngine,
+    vendor: str,
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    mode: str,
+    declarations: list[Any] | None = None,
 ) -> PlanResult:
     """Author the configured vendor's native documents without involving dbt.
 
     ``vendor`` is the one the caller named, as ``semantic <vendor>`` spells it,
     and it has to be the configured one. Validation belongs to the layer, so
     nothing here knows what any vendor's documents look like.
+
+    ``declarations`` (#927) are rendered into the definitions they name by the
+    layer's own :class:`~..semantic_source.SemanticDerivationSource`, in
+    ``annotate`` mode, before the layer validates the result: each names a model
+    the payload's edits or the layer already define, and the declaration wins
+    field by field. A layer that does not implement the hook refuses them, so a
+    declaration is never dropped while the plan reads as declared.
     """
 
     if mode not in MODES:
         raise ValueError(f"unknown semantic {vendor} mode '{mode}'")
     require_configured_vendor(engine, vendor)
+    annotated_notes: list[str] = []
+    if declarations is not None:
+        edits, annotated_notes = _annotate(engine, vendor, edits, declarations)
+        if not edits:
+            raise ValueError(
+                f"semantic {vendor} {mode}: the documents already state every "
+                "declared fact, so there is nothing to plan"
+            )
     if not edits:
         raise ValueError(
             f"semantic {vendor} {mode} needs content: pass --edits-file <path|-> "
@@ -93,11 +114,99 @@ def semantic_native(
             stored.plan_id
         ),
         diffs=diffs,
-        notes=validation.notes,
+        notes=[*annotated_notes, *validation.notes],
         warnings=[*plan_warnings, *validation.warnings],
         defined=validation.defined,
         updated=validation.updated,
+        # Omitted rather than empty, so a layer that never reports one keeps the
+        # envelope it had.
+        unchanged=validation.unchanged or None,
     )
+
+
+def _annotate(
+    engine: DexEngine, vendor: str, edits: list[PlanEdit], entries: list[Any]
+) -> tuple[list[PlanEdit], list[str]]:
+    """``edits`` with each declaration rendered into the document it names.
+
+    Refuses, storing nothing, when the layer cannot carry declarations or a
+    declaration names a model no document defines.
+    """
+
+    from ..semantic_declarations import declared_shape, parse_declarations
+    from ..semantic_source import (
+        SemanticDeclaration,
+        SemanticDerivationRequest,
+        SemanticDerivationSource,
+    )
+
+    layer = engine.semantic_catalog_source()
+    if not isinstance(layer, SemanticDerivationSource) or not isinstance(
+        layer, SemanticEditTarget
+    ):
+        raise ValueError(
+            f"`semantic {vendor}` does not take declarations yet: the {vendor} "
+            "layer does not implement the derivation hook "
+            "(SemanticDerivationSource), so a declaration would be dropped while "
+            "the plan reads as declared. Author the facts in the documents "
+            "themselves, or pass only edits"
+        )
+    parsed = parse_declarations(entries)
+    if not parsed:
+        return edits, []
+    with_history = [d.model for d in parsed if d.history is not None]
+    if with_history:
+        raise ValueError(
+            f"`semantic {vendor}` does not take a `history` declaration "
+            f"({', '.join(with_history)}): a temporal contract is verified against "
+            "a dbt snapshot, and no native layer can carry or check one. Declare it "
+            "on the dbt model through `transform plan`, or leave it out"
+        )
+    documents = {
+        path: entry.content for path, entry in layer.semantic_edit_view().files.items()
+    }
+    for edit in edits:
+        if edit.new_content is not None:
+            documents[edit.path] = edit.new_content
+    surface = getattr(layer, "declaration_models", None)
+    if callable(surface):
+        from .native_population_parent import refuse_population_parents
+
+        refuse_population_parents(parsed, surface(documents), engine)
+
+    result = layer.derive_semantic(
+        SemanticDerivationRequest(
+            mode="annotate",
+            declarations=tuple(
+                SemanticDeclaration(model=d.model, declared=declared_shape(d))
+                for d in parsed
+            ),
+            documents=documents,
+            cache=readable_cache(engine.store),
+            connector=engine.connector or engine.config.connector,
+        )
+    )
+    refused = [
+        f"{name}: {definition.reason or definition.status}"
+        for name, definition in result.definitions.items()
+        if definition.status in ("failed", "unsupported")
+    ]
+    if refused:
+        raise ValueError(
+            f"declarations the {vendor} layer cannot carry, so no plan was stored: "
+            + "; ".join(refused)
+            + ". A declaration on this route annotates a model the payload or the "
+            "layer already defines"
+        )
+    by_path = {e.path: e for e in result.edits}
+    merged = [by_path.pop(e.path, e) for e in edits] + list(by_path.values())
+    notes: list[str] = []
+    for name, definition in result.definitions.items():
+        if definition.not_carried:
+            listed = "; ".join(f"{k} ({v})" for k, v in definition.not_carried.items())
+            notes.append(f"{name}: declared but not carried: {listed}")
+        notes.extend(f"{name}: {note}" for note in definition.notes)
+    return merged, notes
 
 
 def require_configured_vendor(engine: DexEngine, vendor: str) -> None:
@@ -153,15 +262,17 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
     try:
         # Before the payload, so a mismatch is refused without reading a file.
         require_configured_vendor(engine, vendor)
+        edits, declarations = payload_from_file(
+            getattr(args, "edits_file", None),
+            default_kind=EditKind.SEMANTIC_DOCUMENT,
+        )
         result = semantic_native(
             engine,
             vendor,
             getattr(args, "argument", None) or "",
-            edits_from_payload(
-                getattr(args, "edits_file", None),
-                default_kind=EditKind.SEMANTIC_DOCUMENT,
-            ),
+            edits,
             mode=args.mode,
+            declarations=declarations,
         )
         return to_envelope(result, hints=plan_hint(result))
     except (DexError, ValueError) as exc:
@@ -169,7 +280,29 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
 
 
 def plan_hint(result: PlanResult) -> dict[str, str]:
-    return {"next": f"review the diffs, then `transform apply {result.plan_id}`"}
+    companion = (getattr(result, "semantic_proposal", None) or {}).get("plan_id")
+    if companion:
+        # Named both explicitly: a bare `transform apply` takes the latest
+        # unapplied plan, which is the companion, and would leave the mart.
+        step = (
+            f"review the diffs, then `transform apply {result.plan_id}` and "
+            f"`transform apply {companion}` (the derived semantic models)"
+        )
+    else:
+        step = f"review the diffs, then `transform apply {result.plan_id}`"
+    offer = getattr(result, "refactor_comparison_offer", None) or {}
+    if offer.get("per_model"):
+        # The comparison comes first in the sentence because it has to come
+        # first in the sequence: once applied, the tree no longer holds the
+        # baseline and the plan cannot be compared (#1049).
+        commands = " and ".join(f"`{m['command']}`" for m in offer["per_model"][:3])
+        lead = (
+            "to check the proposal returns what the kept branch returns, run"
+            if getattr(result, "retirement", None)
+            else "if this change should keep the existing results, run"
+        )
+        step = f"{lead} {commands} before applying; {step}"
+    return {"next": step}
 
 
 def edits_from_payload(
@@ -192,6 +325,23 @@ def edits_from_payload(
     return edits
 
 
+def removal_payload(edits_file: str | None) -> tuple[list[PlanEdit], Any]:
+    """``transform remove``'s payload: its edits and its raw ``retirement``.
+
+    The one reader of that key (#858). Every other command refuses it through
+    :func:`payload_from_file` rather than dropping it, because a contract nobody
+    read is a change that looks checked and was not.
+    """
+
+    edits, declarations, retirement = _payload_parts(edits_file, None)
+    if declarations is not None:
+        raise ValueError(
+            "this command does not take declarations; pass them to `transform "
+            "plan` or `semantic define|update|plan` instead"
+        )
+    return edits, retirement
+
+
 def payload_from_file(
     edits_file: str | None, default_kind: EditKind | None = None
 ) -> tuple[list[PlanEdit], list[Any] | None]:
@@ -209,8 +359,22 @@ def payload_from_file(
     :mod:`.declarations` is what knows its shape.
     """
 
+    edits, declarations, retirement = _payload_parts(edits_file, default_kind)
+    if retirement is not None:
+        raise ValueError(
+            "only `transform remove var` takes a retirement contract; this command "
+            "would drop it unread"
+        )
+    return edits, declarations
+
+
+def _payload_parts(
+    edits_file: str | None, default_kind: EditKind | None
+) -> tuple[list[PlanEdit], list[Any] | None, Any]:
+    """The one read of a payload, stdin included, split into its three keys."""
+
     if edits_file is None:
-        return [], None
+        return [], None, None
     raw = sys.stdin.read() if edits_file == "-" else read_payload_file(edits_file)
     try:
         payload = json.loads(raw)
@@ -220,7 +384,9 @@ def payload_from_file(
         raise ValueError('edits payload must be {"edits": [...]}')
     declarations = payload.get("declarations")
     entries = payload.get("edits")
-    if entries is None and declarations is not None:
+    if entries is None and (
+        declarations is not None or payload.get("retirement") is not None
+    ):
         entries = []
     if not isinstance(entries, list):
         raise ValueError('edits payload must be {"edits": [...]}')
@@ -255,7 +421,7 @@ def payload_from_file(
                 new_content=entry.get("content"),
             )
         )
-    return edits, declarations
+    return edits, declarations, payload.get("retirement")
 
 
 def read_payload_file(path: str) -> str:

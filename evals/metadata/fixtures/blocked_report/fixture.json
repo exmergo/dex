@@ -1,0 +1,5 @@
+{
+  "name": "blocked_report",
+  "seed": 855,
+  "description": "A team activity report behind forty event staging models. A membership intermediate fails on a date stored as text, so a build skips the report while every staging model succeeds and an older report relation can survive in dev. The report is not done until it is rebuilt, and the repair must keep every member."
+}

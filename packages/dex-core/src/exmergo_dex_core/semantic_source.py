@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from .errors import ConfigurationError, DexError
 
@@ -45,7 +45,13 @@ if TYPE_CHECKING:
     from .transform.plans import PlanEdit
 
 __all__ = [
+    "DeclaredReference",
+    "DerivedDefinition",
     "SemanticCatalogSource",
+    "SemanticDeclaration",
+    "SemanticDerivationRequest",
+    "SemanticDerivationResult",
+    "SemanticDerivationSource",
     "SemanticSchemaSource",
     "SemanticSnapshotSource",
     "SemanticSourceContext",
@@ -181,6 +187,181 @@ class SemanticSchemaSource(Protocol):
 
     def handles_finding(self, finding: DriftFinding) -> bool:
         """Whether ``finding`` is one :meth:`schema_reconcile` answers for."""
+        ...
+
+
+# --- the derivation capability (#927) ------------------------------------------------
+
+#: ``derive`` writes a new definition for a declared model the layer does not
+#: cover yet (a dbt mart under ``transform.marts_paths``); ``annotate`` renders a
+#: declaration into a definition the layer, or the payload beside it, already
+#: holds (``semantic <vendor> plan`` with ``declarations``).
+DerivationMode = Literal["derive", "annotate"]
+
+#: Per declared model. ``unsupported`` is a mode the vendor does not do, said
+#: per model rather than raised, so a caller always gets one row per model.
+DerivationStatus = Literal[
+    "included", "proposed", "failed", "unvalidated", "skipped", "unsupported"
+]
+
+
+@dataclass(frozen=True)
+class DeclaredReference:
+    """A ``foreign_key`` column's ``references``, resolved as far as the repo can.
+
+    ``parent_identifier`` is the parent's table name as the warehouse spells it
+    (a dbt alias, or the last part of its compiled relation), which is how a layer
+    that names tables rather than dbt models finds the definition sitting on the
+    parent. ``parent_relation`` is the compiled relation where a manifest says
+    it, and ``None`` otherwise.
+    """
+
+    column: str
+    parent_model: str
+    parent_column: str | None = None
+    parent_identifier: str | None = None
+    parent_relation: str | None = None
+
+
+@dataclass(frozen=True)
+class SemanticDeclaration:
+    """One declared model, in the declaration's own vendor-neutral shape.
+
+    ``declared`` is exactly what ``transform.drafting.read_declared`` reads back
+    from a model's YAML (``description``, ``grain``, ``population``,
+    ``assumptions`` and per-column ``role``, ``description``, ``references``,
+    ``null_rule``, ``aggregation``, ``additivity``, ``unit``), and the native
+    route hands over the same shape. ``column_types`` is ``(kind, granularity)``
+    per column with ``kind`` one of ``date``, ``timestamp``, ``other`` or
+    ``None``; ``data_types`` is the warehouse type where the SQL casts it or the
+    cache profiled it. Both come from what is free to read: never a connection.
+    """
+
+    model: str
+    declared: Mapping[str, Any]
+    column_types: Mapping[str, tuple[str | None, str | None]] = field(
+        default_factory=dict
+    )
+    data_types: Mapping[str, str] = field(default_factory=dict)
+    identifier: str | None = None
+    relation: str | None = None
+    #: Where ``relation`` came from, said in the derivation's own notes.
+    relation_source: str | None = None
+    references: tuple[DeclaredReference, ...] = ()
+    #: The model's SQL file, relative to the dbt project, for placement.
+    source_path: str | None = None
+
+
+@dataclass(frozen=True)
+class SemanticDerivationRequest:
+    """Everything a derivation reads, so a derivation reads nothing else.
+
+    A batch rather than one declaration: a layer that keeps several definitions
+    in one document splices them all into it once, and a layer validated by a
+    subprocess (dbt's parse) runs it once for the plan rather than once per
+    model. ``documents`` is the layer's surface as the plan would leave it (the
+    files on disk with the payload's own edits laid over them), keyed as the
+    vendor's write surface keys them. ``cache`` is the exploration cache, read
+    only; ``connector`` is a dialect name, never an adapter.
+    """
+
+    mode: DerivationMode
+    declarations: tuple[SemanticDeclaration, ...]
+    documents: Mapping[str, str] = field(default_factory=dict)
+    #: Each dbt model to the table name it builds, where known.
+    project_identifiers: Mapping[str, str] = field(default_factory=dict)
+    cache: Any = None
+    connector: str | None = None
+
+
+@dataclass
+class DerivedDefinition:
+    """What a derivation did with one declared model. One per model, always.
+
+    ``carried`` names each declaration field that reached the vendor's document
+    (``grain``, ``population``, ``columns.amount.unit``); ``not_carried`` names
+    each one that did not, with why, so a declared fact a vendor has no place for
+    is said rather than dropped.
+    """
+
+    model: str
+    status: DerivationStatus = "proposed"
+    #: The vendor's own name for the definition.
+    name: str | None = None
+    path: str | None = None
+    content: str | None = None
+    reason: str | None = None
+    carried: list[str] = field(default_factory=list)
+    not_carried: dict[str, str] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+    validation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    next: str | None = None
+
+
+@dataclass
+class SemanticDerivationResult:
+    """A derivation's answer for a whole request.
+
+    ``edit_target`` says which plan ``edits`` belong to: ``project`` edits are
+    the plan's own edits with the derived ones spliced in (a layer that lives in
+    the transformation project, as MetricFlow's does), ``semantic`` edits are
+    only the included definitions' documents on the layer's own surface, which
+    the caller stores as a plan of their own through the layer's authoring
+    route. ``proposal`` is the envelope body for ``data.semantic_proposal``.
+    ``gate`` is a validation of exactly ``edits`` the caller may stand in for its
+    own (dbt's parse), or ``None``.
+    """
+
+    vendor: str
+    edit_target: Literal["project", "semantic"]
+    edits: list[PlanEdit] = field(default_factory=list)
+    definitions: dict[str, DerivedDefinition] = field(default_factory=dict)
+    proposal: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+    gate: dict[str, Any] | None = None
+
+
+@runtime_checkable
+class SemanticDerivationSource(Protocol):
+    """A semantic layer that can carry model declarations (#491) into itself.
+
+    A fourth capability beside the other three, and as declinable: a layer that
+    does not implement it is named in the plan's warnings and nothing is derived.
+    It is the one seam every vendor's derivation sits behind, so `transform plan`,
+    `transform declare` and `semantic <vendor> plan` never branch on a vendor.
+
+    The contract every implementation keeps (and
+    :class:`~.semantic_source_conformance.SemanticDerivationContract` checks):
+
+    - **Pure over the request.** It reads nothing beyond the request and its own
+      configured documents, and opens no warehouse connection and no vendor
+      server.
+    - **One** :class:`DerivedDefinition` **per declared model**, whatever
+      happened to it.
+    - **Never overwrite, never rename.** A definition the layer already holds
+      for a model is ``skipped`` in ``derive`` mode; a name another definition
+      holds is ``failed``.
+    - **A population is metadata, never a filter.** The derived definition sits
+      on the model itself, whose SQL already enforces its population, so a filter
+      would apply the rule twice and diverge silently the day the two disagree.
+      It is carried in the vendor's metadata and description, or named in
+      ``not_carried``.
+    - **A mode it does not do is** ``unsupported`` **per model**, not an
+      exception.
+
+    Every vendor fits the same request: MetricFlow splices semantic models into
+    the project's YAML and validates with dbt's parse; SLayer writes one model
+    file per declared model; Ossie (#500) splices a dataset into a configured
+    multi-dataset document and carries metadata in ``ai_context``; Cube (#911)
+    writes one cube file per declared model and joins through
+    ``DeclaredReference.parent_identifier``.
+    """
+
+    def derive_semantic(
+        self, request: SemanticDerivationRequest
+    ) -> SemanticDerivationResult:
+        """Render the request's declarations into this layer's documents."""
         ...
 
 

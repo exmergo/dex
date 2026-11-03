@@ -1,5 +1,8 @@
 # Methodology: making sense of a warehouse without enumerating it
 
+Start with [Explore a warehouse](https://docs.exmergo.com/dex/guides/explore) for the workflow.
+This reference explains how Dex selects tables and measures their structure.
+
 dex explores the way an analytics engineer does: it ranks what matters, drills in
 selectively, builds understanding from aggregates rather than rows, infers how
 tables relate, and persists a draft map. The guiding constraint is sense-making,

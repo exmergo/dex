@@ -15,6 +15,37 @@ driver and bytes-scanned pricing, so it would be a separate connector.
 Install with the `[trino]` extra, which brings the `trino` client and
 `dbt-trino`.
 
+## Databases through configured catalogs
+
+Dex connects to your Trino deployment and reads the sources its catalogs expose.
+Configure each source in Trino first, then include its catalog or schema in
+`trino.catalogs`. These databases have official Trino connectors:
+
+| Database | Trino connector |
+| --- | --- |
+| MySQL | [MySQL](https://trino.io/docs/current/connector/mysql.html) |
+| Microsoft SQL Server | [SQL Server](https://trino.io/docs/current/connector/sqlserver.html) |
+| MongoDB | [MongoDB](https://trino.io/docs/current/connector/mongodb.html) |
+| MariaDB | [MariaDB](https://trino.io/docs/current/connector/mariadb.html) |
+| Elasticsearch | [Elasticsearch](https://trino.io/docs/current/connector/elasticsearch.html) |
+| Oracle | [Oracle](https://trino.io/docs/current/connector/oracle.html) |
+| Redis | [Redis](https://trino.io/docs/current/connector/redis.html) |
+| Cassandra | [Cassandra](https://trino.io/docs/current/connector/cassandra.html) |
+
+See [Trino's connector catalog](https://trino.io/docs/current/connector.html)
+for other sources, including Iceberg, Hive, and Delta Lake.
+
+Use `connector: trino` and the Trino credentials under Authentication below
+in Dex. Trino manages the underlying database connections. Access and available
+operations depend on your Trino version, catalog configuration, type mappings,
+and permissions. The [Dex integration suite](#testing) covers the catalogs named
+there; it does not exercise every upstream connector.
+
+For [dbt builds](#dbt-builds), the dev catalog must support the required writes.
+Sources can live in other catalogs, with types converted in staging where the
+dev catalog requires it. The supported Trino deployments and their cost model
+are described under [Deployment](#deployment).
+
 ## Authentication: discover, don't ask
 
 The engine discovers a connection at runtime and never prompts for or persists a

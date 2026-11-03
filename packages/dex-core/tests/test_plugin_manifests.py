@@ -99,3 +99,19 @@ def test_codex_listing_has_bundled_square_icons():
         width, height = struct.unpack(">II", data[16:24])
         assert 48 <= width == height <= 4096
         assert len(data) <= 50 * 1024, "catalog icons must fit within 50 KB"
+
+
+TERMS_URL = "https://www.exmergo.com/terms/dex"
+PRIVACY_URL = "https://www.exmergo.com/privacy/dex"
+
+
+def test_the_directory_listings_carry_the_same_legal_links():
+    """Anthropic's directory reads `privacyPolicyUrl` and `termsOfServiceUrl` from
+    the Claude manifest, and Codex reads the same links from `interface` with a
+    capitalised `URL`. A listing submitted with one stale link is rejected, or
+    worse, accepted pointing at the wrong page."""
+
+    loaded = manifests()
+    claude, codex = loaded[CLAUDE], loaded[CODEX]["interface"]
+    assert claude["privacyPolicyUrl"] == codex["privacyPolicyURL"] == PRIVACY_URL
+    assert claude["termsOfServiceUrl"] == codex["termsOfServiceURL"] == TERMS_URL

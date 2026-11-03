@@ -13,9 +13,7 @@ command runs against that engine and hands back a result the shim wraps in an
 envelope. Dogfooding the API this way is what stops the two surfaces drifting.
 
 ``connect test``, the ``explore`` group, the authoring surface (``transform``,
-``semantic``), and the ``maintain`` group are live. ``viz preview`` returns a
-valid envelope with status ``not_implemented`` until the Viz integration lands,
-so the contract, the wrappers, and the eval harness stay exercisable.
+``semantic``), and the ``maintain`` group are live.
 """
 
 from __future__ import annotations
@@ -86,6 +84,8 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # plan per call, repo-and-cache only.
         "declare",
         "test",
+        # Whether a stored plan keeps a model's results (#856).
+        "compare",
         # The host boundary (#441): a plan a second process can carry and check,
         # what that plan depends on, what its edits actually contain, and what
         # the warehouse will enforce on the build that validates it. Every one is
@@ -115,7 +115,6 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # (#224), unlike every other maintain subcommand above.
         "verify",
     ],
-    "viz": ["preview"],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
     # and a file that cannot build one is exactly when these are needed.
@@ -125,6 +124,11 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     # that creates a data file, which is why it lives on its own path (see
     # `demo/warehouse.py`) rather than anywhere near a connector.
     "demo": [],
+    # procedure: the agent procedure (#502), the one text every SKILL.md and
+    # AGENTS.md carries between markers. No subcommands, and routed in `main`
+    # before an engine is built, like `config`: an agent with only the package,
+    # or a harness with no project yet, must be able to get it.
+    "procedure": [],
 }
 
 
@@ -271,10 +275,11 @@ _GROUP_HELP: dict[str, str] = {
     "transform": "author and refactor dbt models, tests, and the semantic layer",
     "semantic": "define dbt or native semantic layers as reviewable diffs",
     "maintain": "detect drift against the last snapshot and propose the fix",
-    "viz": "preview the semantic layer (not yet implemented)",
     "config": "read, check and change .dex/config.yml, as reviewable diffs",
     "demo": "create a seeded local DuckDB warehouse to try dex against "
     "(no credentials, no network)",
+    "procedure": "print the agent procedure, or the block to paste into "
+    "CLAUDE.md / AGENTS.md (no connection)",
 }
 
 #: (group, subcommand) -> (summary, description). The summary is the one line
@@ -404,6 +409,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "--downstream also counts the tests of the models that read it. "
         "Mutation runs dbt on the dev target and is billed on metered connectors.",
     ),
+    ("transform", "compare"): (
+        "compare a model before and after a stored plan",
+        "Compile the model with and without the plan, then compare output "
+        "columns and the exact row multiset on the same dev inputs. Returns "
+        "counts, never rows. equivalent holds for the compared inputs only. "
+        "Scans go through --confirm --budget on metered connectors.",
+    ),
     ("transform", "export"): (
         "export a stored plan as a portable, digested document",
         "Print one stored plan as a document another checkout can verify and "
@@ -452,6 +464,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "configures, with SLayer's own model, then store a plan. Needs the "
         "[slayer] extra. Repo-only.",
     ),
+    ("semantic", "cube"): (
+        "plan whole-file edits to the configured Cube model files",
+        "Validate whole plain-YAML Cube model files at the paths "
+        "semantic.cube.files configures, with dex's port of Cube's model rules, "
+        "then store a plan. Needs the [cube] extra. No Cube server, no "
+        "warehouse. Repo-only.",
+    ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
         "Pin the current map and fingerprint the project layers as the "
@@ -494,10 +513,6 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "Check build status, column contracts, row population, grain and join "
         "contracts against the built relations. Mostly free metadata; view row "
         "counts and join probes are offered with an estimate.",
-    ),
-    ("viz", "preview"): (
-        "preview the semantic layer (not yet implemented)",
-        "Not yet implemented: returns a not_implemented envelope.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -601,6 +616,20 @@ def _build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="DuckDB file to create, refused if it exists "
                 "(default: dex_demo.duckdb)",
+            )
+        if group == "procedure":
+            gp.add_argument(
+                "--block",
+                action="store_true",
+                help="also return data.block, ready to paste into CLAUDE.md or "
+                "AGENTS.md",
+            )
+            gp.add_argument(
+                "--check",
+                action="append",
+                metavar="FILE",
+                default=None,
+                help="report whether FILE carries the current procedure (repeatable)",
             )
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
@@ -934,6 +963,17 @@ def _build_parser() -> argparse.ArgumentParser:
                             "(billed)"
                         ),
                     )
+                    # A model whose only build is the dev one lives where dex
+                    # does not read (#893); this reads it for one command, as
+                    # `maintain verify --target dev` does.
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "also read this dbt dev target's namespace; "
+                            "prod-looking targets are refused"
+                        ),
+                    )
                     # Default summarizes each dataset's columns to the ones that
                     # carry a finding (#288); --columns all restores the full list.
                     sp.add_argument(
@@ -1126,6 +1166,24 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="refuse missing dbt packages instead of installing them",
                     )
+                    # Explicit because it may reach the network: an ordinary build
+                    # never reinstalls what is already there (#860).
+                    sp.add_argument(
+                        "--cold-deps",
+                        action="store_true",
+                        default=False,
+                        help="reinstall packages in an isolated copy and build from it",
+                    )
+                    # dbt's own flag, for the one case an incremental build
+                    # cannot handle: its logic changed, and the rows the old
+                    # logic wrote stay until the model is rebuilt (#1015).
+                    sp.add_argument(
+                        "--full-refresh",
+                        action="store_true",
+                        default=False,
+                        help="rebuild selected incremental models after their "
+                        "logic changed",
+                    )
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is
                     # each of these used", which is the shape of a rename. `--kind`
@@ -1252,6 +1310,45 @@ def _build_parser() -> argparse.ArgumentParser:
                         "--intent",
                         default=None,
                         help="one line saying what the plan is for",
+                    )
+                if group == "transform" and name == "compare":
+                    sp.add_argument(
+                        "plan_id",
+                        nargs="?",
+                        default=None,
+                        help="stored plan id; defaults to the latest unapplied plan",
+                    )
+                    sp.add_argument(
+                        "--model",
+                        default=None,
+                        metavar="MODEL",
+                        help="the model whose results should not change",
+                    )
+                    sp.add_argument(
+                        "--map",
+                        action="append",
+                        default=None,
+                        metavar="OLD=NEW",
+                        help="a baseline output column the plan renames (repeatable)",
+                    )
+                    sp.add_argument(
+                        "--key",
+                        action="append",
+                        default=None,
+                        metavar="COLUMN",
+                        help="baseline key column, repeatable; default: declared grain",
+                    )
+                    sp.add_argument(
+                        "--accept-type",
+                        action="append",
+                        default=None,
+                        metavar="COLUMN",
+                        help="baseline column whose type may change in its family",
+                    )
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help="dbt dev target to read; prod-looking targets are refused",
                     )
                 if group == "transform" and name == "test":
                     # Two modes, and they are opposites: `--scaffold` writes a
@@ -1396,6 +1493,15 @@ def _build_parser() -> argparse.ArgumentParser:
                             "dbt selector to verify (default: the whole project)"
                             if name == "verify"
                             else "object to check (default: the whole project)"
+                        ),
+                    )
+                if group == "maintain" and name == "verify":
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "dbt dev target to verify against; "
+                            "prod-looking targets are refused"
                         ),
                     )
                 if group == "maintain" and name == "reconcile":
@@ -1560,6 +1666,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "place"): "cmd_place",
         ("transform", "declare"): "cmd_declare",
         ("transform", "test"): "cmd_test",
+        ("transform", "compare"): "cmd_compare",
         ("transform", "export"): "cmd_export",
         ("transform", "ground"): "cmd_ground",
         ("transform", "classify"): "cmd_classify",
@@ -1731,6 +1838,13 @@ def main(argv: list[str] | None = None) -> int:
 
             require_allowed(result_mode, _command_label(args))
             envelope = cmd_config(args)
+        elif args.group == "procedure":
+            # No engine either: the procedure is package data, and it must reach
+            # an agent before any project, config or connector exists (#502).
+            from .procedure.commands import cmd_procedure
+
+            require_allowed(result_mode, _command_label(args))
+            envelope = cmd_procedure(args)
         else:
             # One engine per process, built from the resolved repo root. The default
             # backend is what lets the subcommands stay stateless across invocations:

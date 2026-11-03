@@ -210,6 +210,48 @@ def name_only_note(refs: list[str]) -> list[str]:
     ]
 
 
+def sub_threshold_note(
+    refs: list[str],
+    *,
+    meta_lookup: Callable[[str], Any] | None = None,
+    aliases: Mapping[str, list[str]] | None = None,
+) -> list[str]:
+    """Warnings for dimensions cleared with a sub-threshold PII flag.
+
+    ``explore query`` surfaces these through the query firewall. The semantic
+    path screens at the request and never reaches that firewall, so a clearance
+    that carries ``category`` and ``confidence`` must be named here or the
+    envelope stays silent.
+    """
+
+    if meta_lookup is None or not refs:
+        return []
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        for target in (aliases or {}).get(ref) or [ref]:
+            meta = meta_lookup(target)
+            if not isinstance(meta, dict) or not _meta_clears(meta):
+                continue
+            category = meta.get("category")
+            confidence = meta.get("confidence")
+            if category is None or confidence is None:
+                continue
+            label = ref
+            if label in seen:
+                continue
+            seen.add(label)
+            warnings.append(
+                f"{label} is PII-flagged at confidence {confidence:g}, below the "
+                f"{PII_BLOCK_CONFIDENCE:g} block threshold, so the projection ran. "
+                "If its values are personal data, drop the column; if it is "
+                "reviewed as not PII, record a pii_overrides entry in "
+                ".dex/config.yml."
+            )
+            break
+    return warnings
+
+
 def screen_values_request(
     dimension: str, *, meta_lookup: Callable[[str], Any] | None = None
 ) -> list[str]:

@@ -1,8 +1,10 @@
-"""The Ossie dialect enum, partitioned once.
+"""Ossie dialects, partitioned once.
 
-Ossie's `Dialect` enum mixes SQL dialects with expression languages that are not
-SQL at all, and the distinction is load-bearing here in a way it is not for a
-format that only stores expressions. dex *reads* an expression twice: to decide
+Ossie's `Dialect` is a free-form string: any non-empty token is valid, and
+`OSSIE_SQL_2026` is the one dialect the specification defines. The tokens mix
+SQL dialects with expression languages that are not SQL at all, and the
+distinction is load-bearing here in a way it is not for a format that only
+stores expressions. dex *reads* an expression twice: to decide
 whether a field resolves to a physical column, and to check that it parses. Both
 readings are meaningless against MDX, and worse than meaningless against MAQL,
 where a bare token that looks like a column identifier means something else
@@ -12,9 +14,11 @@ So the partition lives in one module, shared by the validator and the catalog.
 Two copies of it would eventually disagree, and the way they would disagree is
 that one of them claims a physical column from a language dex cannot read.
 
-Upstream's own `validation/validate.py` maintains the same partition, with the
-same three non-SQL members. That is deliberate: dex ports upstream's judgment
-about what a valid document is rather than forming its own.
+Upstream's own `validation/validate.py` maintains the same partition: the SQL
+dialects sqlglot parses, the registered non-SQL languages, and everything else,
+which is opaque. That is deliberate: dex ports upstream's judgment about what a
+valid document is rather than forming its own. dex reads only the SQL members;
+any other token, registered or not, is preserved verbatim and never read.
 """
 
 from __future__ import annotations
@@ -23,22 +27,45 @@ from collections.abc import Mapping, Sequence
 
 __all__ = [
     "NON_SQL_DIALECTS",
+    "OSSIE_SQL",
     "PORTABLE_DIALECT",
     "SQL_DIALECTS",
     "connector_dialect",
+    "declared_expressions",
     "select_expression",
     "sqlglot_dialect",
 ]
 
-#: Ossie dialects dex may parse as SQL, and so may read a column out of.
-SQL_DIALECTS: tuple[str, ...] = ("ANSI_SQL", "SNOWFLAKE", "DATABRICKS", "BIGQUERY")
+#: The one dialect the Ossie specification defines: its portable SQL expression
+#: language. An expression's top-level `sql` is written in it.
+OSSIE_SQL = "OSSIE_SQL_2026"
 
-#: Ossie dialects that are not SQL. Preserved verbatim, never parsed, never a
-#: source of a physical column claim, and never reported as validated.
-NON_SQL_DIALECTS: tuple[str, ...] = ("MDX", "TABLEAU", "MAQL")
+#: Ossie dialects dex may parse as SQL, and so may read a column out of. Every
+#: other token is opaque: preserved verbatim, never parsed, never a source of a
+#: physical column claim, and never reported as validated.
+SQL_DIALECTS: tuple[str, ...] = (
+    OSSIE_SQL,
+    "ANSI_SQL",
+    "SNOWFLAKE",
+    "DATABRICKS",
+    "BIGQUERY",
+)
 
-#: The dialect an expression falls back to when nothing more specific applies.
-PORTABLE_DIALECT = "ANSI_SQL"
+#: The non-SQL languages upstream's dialect registry (`extensions/dialects.md`)
+#: names. Listed so a note can call them by what they are; an unregistered token
+#: is treated exactly the same way, because `Dialect` is an open string.
+NON_SQL_DIALECTS: tuple[str, ...] = (
+    "MDX",
+    "TABLEAU",
+    "MAQL",
+    "SIGMA",
+    "THOUGHTSPOT",
+    "DAX",
+    "HOLISTICS_AQL",
+)
+
+#: The portable dialect ahead of which nothing but the connector's own ranks.
+PORTABLE_DIALECT = OSSIE_SQL
 
 # The Ossie dialect token a dex connector corresponds to. Five of dex's eight
 # connectors have no token in Ossie's enum, and they are absent here rather than
@@ -54,6 +81,7 @@ _CONNECTOR_DIALECTS: Mapping[str, str] = {
 # Ossie dialect -> sqlglot dialect, matching upstream's own map. `None` is
 # sqlglot's dialect-agnostic default rather than "skip": ANSI_SQL *is* parsed.
 _SQLGLOT_DIALECTS: Mapping[str, str | None] = {
+    OSSIE_SQL: None,
     "ANSI_SQL": None,
     "SNOWFLAKE": "snowflake",
     "DATABRICKS": "databricks",
@@ -70,7 +98,8 @@ def connector_dialect(connector: str | None) -> str | None:
 def sqlglot_dialect(dialect: str) -> str | None:
     """The sqlglot dialect for an Ossie SQL dialect.
 
-    ``None`` means sqlglot's default, which is what `ANSI_SQL` parses as. Only
+    ``None`` means sqlglot's default, which is what `OSSIE_SQL_2026` and
+    `ANSI_SQL` parse as, as upstream's validator parses them. Only
     call this for a member of :data:`SQL_DIALECTS`; a non-SQL language has no
     answer here and asking for one is the bug this module exists to prevent.
     """
@@ -94,17 +123,19 @@ def select_expression(
     catalog that varies between runs cannot be cached or compared. The chain:
 
     1. the active connector's own Ossie dialect, where it has one;
-    2. the portable dialect;
-    3. the first declared SQL dialect, in the document's own order.
+    2. `OSSIE_SQL_2026`, from the top-level `sql` first, since upstream makes
+       it authoritative over an `OSSIE_SQL_2026` dialect entry;
+    3. `ANSI_SQL`;
+    4. the first other declared SQL dialect, in the document's own order.
 
     It never falls through to a non-SQL language. A fallback that could select
     MDX would hand a physical-column reader a string it cannot read, and the
     reader would either fail or, worse, succeed on a token that looks like an
     identifier and means something else.
 
-    Step 2 is a list rather than a single name on purpose. The expression-language
-    document is at Proposed Final and proposes a new default dialect, so when that
-    lands it is prepended to ``_PORTABLE_CHAIN`` and nothing else here moves.
+    ``declared`` carries the top-level `sql` under `OSSIE_SQL_2026`, so a
+    document that states only `sql:` reads exactly as one stating an
+    `OSSIE_SQL_2026` dialect entry.
     """
 
     declared = _declared(expression)
@@ -120,26 +151,33 @@ def select_expression(
     return None, None, declared
 
 
-# The portable step of the selection chain, ordered most to least preferred. One
-# member today; the slot ahead of it is reserved for the portable dialect the
-# expression-language document proposes.
-_PORTABLE_CHAIN: tuple[str, ...] = (PORTABLE_DIALECT,)
+# The portable steps of the selection chain, ordered most to least preferred.
+_PORTABLE_CHAIN: tuple[str, ...] = (OSSIE_SQL, "ANSI_SQL")
+
+
+def declared_expressions(expression: object) -> dict[str, str]:
+    """Every ``dialect -> expression`` pair an expression object states.
+
+    The top-level `sql` comes first, as `OSSIE_SQL_2026`, and outranks an
+    `OSSIE_SQL_2026` entry in `dialects`; the rest follow in the document's own
+    order. Shape-guarded rather than trusting, because the catalog reads
+    documents the validator has already judged *and* the declarations channel
+    may not raise, so this has to survive being handed something malformed.
+    """
+
+    return _declared(expression)
 
 
 def _declared(expression: object) -> dict[str, str]:
-    """Every ``dialect -> expression`` pair, in the document's own order.
-
-    Shape-guarded rather than trusting, because the catalog reads documents the
-    validator has already judged *and* the declarations channel may not
-    raise, so this has to survive being handed something malformed.
-    """
-
     if not isinstance(expression, dict):
         return {}
+    found: dict[str, str] = {}
+    sql = expression.get("sql")
+    if isinstance(sql, str) and sql:
+        found[OSSIE_SQL] = sql
     dialects = expression.get("dialects")
     if not isinstance(dialects, Sequence) or isinstance(dialects, str | bytes):
-        return {}
-    found: dict[str, str] = {}
+        return found
     for entry in dialects:
         if not isinstance(entry, dict):
             continue

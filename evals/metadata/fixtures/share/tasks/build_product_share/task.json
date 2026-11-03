@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "product_region_share"
+  ],
+  "prompt": "Build a mart model `product_region_share` in models/marts with one row per region and product, with `region`, `product_id`, `product_name`, `revenue` (that product's sales in the region) and `share_of_region` (the product's revenue as a share of the region's total revenue). Build it on dev when you are done."
+}

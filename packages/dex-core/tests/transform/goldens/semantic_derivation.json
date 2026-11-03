@@ -1,0 +1,706 @@
+{
+  "authored_model_skipped": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": null,
+          "reason": "fct_orders already has a semantic model ('orders' in models/semantic/semantic.yml); an authored definition is not overwritten or duplicated",
+          "semantic_model": "fct_orders",
+          "status": "skipped"
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": []
+  },
+  "composite_grain": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [
+            "the grain is composite (order_id, customer_id), so no single column is the primary entity and none was guessed. MetricFlow needs one for any dimension or measure: add `primary_entity: <name>` naming what one row is, then pass the definition to `semantic plan --definitions-file`"
+          ],
+          "not_carried": {
+            "columns.customer_id.references": "not derived; the notes and limitations say why",
+            "columns.customer_id.role": "not derived; the notes and limitations say why",
+            "columns.order_id.role": "not derived; the notes and limitations say why",
+            "grain": "composite: MetricFlow's primary entity is one column, and none was guessed"
+          },
+          "notes": [
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it, or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": null,
+          "reason": "the grain is composite (order_id, customer_id), so no single column is the primary entity and none was guessed. MetricFlow needs one for any dimension or measure: add `primary_entity: <name>` naming what one row is, then pass the definition to `semantic plan --definitions-file`",
+          "semantic_model": "fct_orders",
+          "status": "failed"
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model for 'fct_orders' was derived and not offered (failed): the grain is composite (order_id, customer_id), so no single column is the primary entity and none was guessed. MetricFlow needs one for any dimension or measure: add `primary_entity: <name>` naming what one row is, then pass the definition to `semantic plan --definitions-file`"
+    ]
+  },
+  "dbt_unavailable": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "unvalidated",
+          "validation": {
+            "parse": {
+              "detail": "dbt is not installed",
+              "result": "not_run"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model for 'fct_orders' was derived and not offered (unvalidated): parse: dbt is not installed"
+    ]
+  },
+  "layer_included": {
+    "semantic_files": {
+      "models/semantic/semantic.yml": "# Hand-written semantic layer; this comment stays.\nsemantic_models:\n  - name: customers\n    model: ref('stg_customers')\n    entities:\n      - name: customer\n        type: primary\n        expr: id\n\n  - name: fct_orders\n    description: One row per order.\n    model: ref('fct_orders')\n    defaults:\n      agg_time_dimension: ordered_at\n    entities:\n      - name: order\n        type: primary\n        expr: order_id\n      - name: customer\n        type: foreign\n        expr: customer_id\n    dimensions:\n      - name: status\n        type: categorical\n        description: Lifecycle status.\n      - name: ordered_at\n        type: time\n        type_params:\n          time_granularity: day\n    measures:\n      - name: order_total\n        agg: sum\n        expr: order_total\n      - name: balance\n        agg: sum\n        expr: balance\n        non_additive_dimension:\n          name: ordered_at\n          window_choice: max\n"
+    },
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "included",
+          "validation": {
+            "parse": {
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model 'fct_orders' was derived from the declaration and added to this plan in models/semantic/semantic.yml; see data.semantic_proposal"
+    ]
+  },
+  "layer_without_spine": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [
+        {
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "kind": "semantic_model",
+          "path": "models/semantic/semantic.yml"
+        }
+      ],
+      "mode": "proposed",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "proposed",
+          "validation": {
+            "parse": {
+              "detail": "parsed with a throwaway time spine in the copy only; the project has none",
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "next": "save this object as a file and pass it to `semantic plan --definitions-file <file>` to add it as a reviewable plan, once the project has a time spine; author the metrics on its measures there too",
+      "notes": [
+        "the project has no dbt semantic layer and no MetricFlow time spine (a day-grain date model with a `time_spine:` config), which dbt needs before it parses any semantic model; nothing was added to the plan. Adopting one is the project owner's choice"
+      ],
+      "time_spine": "missing",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "dbt parse skipped: the project declares semantic models and no time spine, which dbt refuses to parse whatever this plan changes"
+    ]
+  },
+  "measure_name_collision": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": null,
+          "reason": "already declared elsewhere in the semantic layer: measure 'order_total'. Measure names are global in MetricFlow, so rename the column or the existing definition; dex does not rename either",
+          "semantic_model": "fct_orders",
+          "status": "failed"
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model for 'fct_orders' was derived and not offered (failed): already declared elsewhere in the semantic layer: measure 'order_total'. Measure names are global in MetricFlow, so rename the column or the existing definition; dex does not rename either"
+    ]
+  },
+  "no_layer_proposed": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [
+        {
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "kind": "semantic_model",
+          "path": "models/marts/fct_orders_semantic.yml"
+        }
+      ],
+      "mode": "proposed",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/marts/fct_orders_semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "proposed",
+          "validation": {
+            "parse": {
+              "detail": "parsed with a throwaway time spine in the copy only; the project has none",
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "next": "save this object as a file and pass it to `semantic plan --definitions-file <file>` to add it as a reviewable plan, once the project has a time spine; author the metrics on its measures there too",
+      "notes": [
+        "the project has no dbt semantic layer and no MetricFlow time spine (a day-grain date model with a `time_spine:` config), which dbt needs before it parses any semantic model; nothing was added to the plan. Adopting one is the project owner's choice"
+      ],
+      "time_spine": "missing",
+      "vendor": "dbt"
+    },
+    "warnings": []
+  },
+  "parse_fails": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "failed",
+          "validation": {
+            "parse": {
+              "detail": "Parsing Error: a derived element collides",
+              "result": "failed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model for 'fct_orders' was derived and not offered (failed): parse: Parsing Error: a derived element collides"
+    ]
+  },
+  "population_carried": {
+    "semantic_files": {
+      "models/semantic/semantic.yml": "# Hand-written semantic layer; this comment stays.\nsemantic_models:\n  - name: customers\n    model: ref('stg_customers')\n    entities:\n      - name: customer\n        type: primary\n        expr: id\n\n  - name: fct_orders\n    description: 'One row per order. Population: Paid and shipped orders, test accounts removed; status is one of ''paid'' or ''shipped''.'\n    model: ref('fct_orders')\n    defaults:\n      agg_time_dimension: ordered_at\n    entities:\n      - name: order\n        type: primary\n        expr: order_id\n      - name: customer\n        type: foreign\n        expr: customer_id\n    dimensions:\n      - name: status\n        type: categorical\n        description: Lifecycle status.\n        config:\n          meta:\n            dex:\n              null_rule: never\n      - name: ordered_at\n        type: time\n        type_params:\n          time_granularity: day\n    measures:\n      - name: order_total\n        agg: sum\n        expr: order_total\n        config:\n          meta:\n            dex:\n              unit: currency:EUR\n      - name: balance\n        agg: sum\n        expr: balance\n        non_additive_dimension:\n          name: ordered_at\n          window_choice: max\n    config:\n      meta:\n        dex:\n          population:\n            rule: Paid and shipped orders, test accounts removed\n            filters:\n              - column: status\n                includes:\n                  - paid\n                  - shipped\n          assumptions:\n            - decision: what counts as an order\n              chosen: paid or shipped\n              evidence: request\n"
+    },
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "population",
+            "assumptions",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.status.null_rule",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.order_total.unit",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: 'One row per order. Population: Paid and shipped orders, test accounts removed; status is one of ''paid'' or ''shipped''.'\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n    config:\n      meta:\n        dex:\n          null_rule: never\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n    config:\n      meta:\n        dex:\n          unit: currency:EUR\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\nconfig:\n  meta:\n    dex:\n      population:\n        rule: Paid and shipped orders, test accounts removed\n        filters:\n          - column: status\n            includes:\n              - paid\n              - shipped\n      assumptions:\n        - decision: what counts as an order\n          chosen: paid or shipped\n          evidence: request\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "included",
+          "validation": {
+            "parse": {
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model 'fct_orders' was derived from the declaration and added to this plan in models/semantic/semantic.yml; see data.semantic_proposal"
+    ]
+  },
+  "semantic_plan_included": {
+    "semantic_files": {
+      "models/semantic/semantic.yml": "# Hand-written semantic layer; this comment stays.\nsemantic_models:\n  - name: customers\n    model: ref('stg_customers')\n    entities:\n      - name: customer\n        type: primary\n        expr: id\n\n  - name: fct_orders\n    description: One row per order.\n    model: ref('fct_orders')\n    defaults:\n      agg_time_dimension: ordered_at\n    entities:\n      - name: order\n        type: primary\n        expr: order_id\n      - name: customer\n        type: foreign\n        expr: customer_id\n    dimensions:\n      - name: status\n        type: categorical\n        description: Lifecycle status.\n      - name: ordered_at\n        type: time\n        type_params:\n          time_granularity: day\n    measures:\n      - name: order_total\n        agg: sum\n        expr: order_total\n      - name: balance\n        agg: sum\n        expr: balance\n        non_additive_dimension:\n          name: ordered_at\n          window_choice: max\n# reviewed\n"
+    },
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "included",
+          "validation": {
+            "parse": {
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model 'fct_orders' was derived from the declaration and added to this plan in models/semantic/semantic.yml; see data.semantic_proposal"
+    ]
+  },
+  "two_marts_included_in_one_file": {
+    "semantic_files": {
+      "models/semantic/semantic.yml": "# Hand-written semantic layer; this comment stays.\nsemantic_models:\n  - name: customers\n    model: ref('stg_customers')\n    entities:\n      - name: customer\n        type: primary\n        expr: id\n\n  - name: dim_customers\n    description: One row per customer.\n    model: ref('dim_customers')\n    entities:\n      - name: customer\n        type: primary\n        expr: customer_id\n    dimensions:\n      - name: region\n        type: categorical\n\n  - name: fct_orders\n    description: One row per order.\n    model: ref('fct_orders')\n    defaults:\n      agg_time_dimension: ordered_at\n    entities:\n      - name: order\n        type: primary\n        expr: order_id\n      - name: customer\n        type: foreign\n        expr: customer_id\n    dimensions:\n      - name: status\n        type: categorical\n        description: Lifecycle status.\n      - name: ordered_at\n        type: time\n        type_params:\n          time_granularity: day\n    measures:\n      - name: order_total\n        agg: sum\n        expr: order_total\n      - name: balance\n        agg: sum\n        expr: balance\n        non_additive_dimension:\n          name: ordered_at\n          window_choice: max\n"
+    },
+    "semantic_proposal": {
+      "definitions": [],
+      "mode": "included",
+      "models": {
+        "dim_customers": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.customer_id.role",
+            "columns.region.role"
+          ],
+          "content": "name: dim_customers\ndescription: One row per customer.\nmodel: ref('dim_customers')\nentities:\n  - name: customer\n    type: primary\n    expr: customer_id\ndimensions:\n  - name: region\n    type: categorical\n",
+          "limitations": [
+            "order_count: MetricFlow aggregates a measure over a time dimension, and the declaration names no time column, so it is not derived"
+          ],
+          "not_carried": {
+            "columns.customer_id.description": "MetricFlow's schema has no description field for an entity",
+            "columns.order_count.aggregation": "not derived; the notes and limitations say why",
+            "columns.order_count.role": "not derived; the notes and limitations say why"
+          },
+          "notes": [
+            "key column descriptions are not carried onto entities: MetricFlow's schema has no description field for an entity",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "dim_customers",
+          "status": "included",
+          "validation": {
+            "parse": {
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        },
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.customer_id.references",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.aggregation",
+            "columns.balance.additivity"
+          ],
+          "content": "name: fct_orders\ndescription: One row per order.\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n    description: Lifecycle status.\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n  - name: balance\n    agg: sum\n    expr: balance\n    non_additive_dimension:\n      name: ordered_at\n      window_choice: max\n",
+          "limitations": [],
+          "not_carried": {},
+          "notes": [
+            "customer_id: entity 'customer' joins semantic model 'customers'",
+            "balance: semi_additive, so it is not added across ordered_at; each period reports its last value (window_choice: max). Confirm that is what the column means. When the value runs per entity (a balance per account, a running total per customer), add `window_groupings` naming it (here perhaps: customer), or the last day's rows are summed across every entity; the declaration does not say which, so none was guessed",
+            "metrics are not derived: a measure is what a column holds, a metric is a business definition, and that stays the author's"
+          ],
+          "path": "models/semantic/semantic.yml",
+          "semantic_model": "fct_orders",
+          "status": "included",
+          "validation": {
+            "parse": {
+              "result": "passed"
+            },
+            "references": {
+              "result": "passed"
+            },
+            "schema": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "notes": [],
+      "time_spine": "present",
+      "vendor": "dbt"
+    },
+    "warnings": [
+      "semantic model 'dim_customers' was derived from the declaration and added to this plan in models/semantic/semantic.yml; see data.semantic_proposal",
+      "semantic model 'fct_orders' was derived from the declaration and added to this plan in models/semantic/semantic.yml; see data.semantic_proposal"
+    ]
+  },
+  "vendor_ossie": {
+    "semantic_files": {},
+    "semantic_proposal": {
+      "definitions": {
+        "edits": [
+          {
+            "content": "version: 0.2.0.dev0\nname: fct_orders\ndatasets:\n  - name: fct_orders\n    source: fct_orders\n    primary_key:\n      - order_id\n    description: One row per order.\n    fields:\n      - name: order_id\n        expression:\n          sql: order_id\n        ai_context:\n          dex:\n            role: key\n      - name: customer_id\n        expression:\n          sql: customer_id\n        ai_context:\n          dex:\n            role: foreign_key\n            references: stg_customers.id\n      - name: status\n        expression:\n          sql: status\n        description: Lifecycle status.\n        ai_context:\n          dex:\n            role: dimension\n      - name: ordered_at\n        expression:\n          sql: ordered_at\n        datatype: Date\n        dimension:\n          is_time: true\n        ai_context:\n          dex:\n            role: time\n      - name: order_total\n        expression:\n          sql: order_total\n        ai_context:\n          dex:\n            additivity: additive\n            role: measure\n      - name: balance\n        expression:\n          sql: balance\n        ai_context:\n          dex:\n            additivity: semi_additive\n            role: measure\n    metrics:\n      - name: order_total_sum\n        expression:\n          sql: SUM(order_total)\n",
+            "kind": "semantic_document",
+            "path": "semantic/fct_orders.ossie.yaml"
+          }
+        ]
+      },
+      "mode": "proposed",
+      "models": {
+        "fct_orders": {
+          "carried": [
+            "description",
+            "grain",
+            "columns.order_id.role",
+            "columns.customer_id.role",
+            "columns.status.role",
+            "columns.status.description",
+            "columns.ordered_at.role",
+            "columns.order_total.role",
+            "columns.order_total.aggregation",
+            "columns.order_total.additivity",
+            "columns.balance.role",
+            "columns.balance.additivity"
+          ],
+          "content": "version: 0.2.0.dev0\nname: fct_orders\ndatasets:\n  - name: fct_orders\n    source: fct_orders\n    primary_key:\n      - order_id\n    description: One row per order.\n    fields:\n      - name: order_id\n        expression:\n          sql: order_id\n        ai_context:\n          dex:\n            role: key\n      - name: customer_id\n        expression:\n          sql: customer_id\n        ai_context:\n          dex:\n            role: foreign_key\n            references: stg_customers.id\n      - name: status\n        expression:\n          sql: status\n        description: Lifecycle status.\n        ai_context:\n          dex:\n            role: dimension\n      - name: ordered_at\n        expression:\n          sql: ordered_at\n        datatype: Date\n        dimension:\n          is_time: true\n        ai_context:\n          dex:\n            role: time\n      - name: order_total\n        expression:\n          sql: order_total\n        ai_context:\n          dex:\n            additivity: additive\n            role: measure\n      - name: balance\n        expression:\n          sql: balance\n        ai_context:\n          dex:\n            additivity: semi_additive\n            role: measure\n    metrics:\n      - name: order_total_sum\n        expression:\n          sql: SUM(order_total)\n",
+          "dataset": "fct_orders",
+          "limitations": [
+            "source is the bare table name 'fct_orders': no dataset sits on another of this project's models and there is no compiled manifest, so the source is not one relation dex can address, and none of its fields links a physical column. Qualify it before relying on it",
+            "balance: semi_additive, and an Ossie metric has no way to sum across entities but not across time; which expression stands for it is the author's call, so no metric is derived"
+          ],
+          "next": "semantic/fct_orders.ossie.yaml is not under semantic.ossie.files, the documents dex may write: run `dex config set semantic.ossie.files '[semantic/orders.ossie.yaml, semantic/fct_orders.ossie.yaml]'`, then pass data.semantic_proposal.definitions as the edits file to `semantic ossie define`",
+          "not_carried": {
+            "columns.balance.aggregation": "semi_additive, and an Ossie metric has no way to sum across entities but not across time; which expression stands for it is the author's call",
+            "columns.customer_id.references": "the dataset is derived as a document of its own, and a relationship joins datasets of one model only"
+          },
+          "notes": [
+            "no configured Ossie document could be read to hold it, so it is derived as a document of its own",
+            "metrics beyond declared measures are not derived: a dataset metric is what a column's declared aggregation states, anything more is a business definition, and that stays the author's"
+          ],
+          "path": "semantic/fct_orders.ossie.yaml",
+          "status": "proposed",
+          "validation": {
+            "catalog": {
+              "result": "passed"
+            },
+            "ossie": {
+              "result": "passed"
+            }
+          }
+        }
+      },
+      "next": "semantic/fct_orders.ossie.yaml is not under semantic.ossie.files, the documents dex may write: run `dex config set semantic.ossie.files '[semantic/orders.ossie.yaml, semantic/fct_orders.ossie.yaml]'`, then pass data.semantic_proposal.definitions as the edits file to `semantic ossie define`",
+      "notes": [],
+      "vendor": "ossie"
+    },
+    "warnings": []
+  }
+}

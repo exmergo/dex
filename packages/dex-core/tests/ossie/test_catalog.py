@@ -206,6 +206,58 @@ def test_a_source_is_normalized_the_way_the_connector_folds_it(tmp_path: Path):
         assert catalog.semantic_models[0].relation == expected
 
 
+def test_snowflake_columns_keys_and_joins_are_folded_the_way_snowflake_resolves_them(
+    tmp_path: Path,
+):
+    """An unquoted column is the column the warehouse folded it to: reading it
+    as written made every Ossie column look gone from a Snowflake table (#923)."""
+
+    write(
+        tmp_path,
+        "case.ossie.yaml",
+        document(
+            model(
+                "m",
+                dataset(
+                    "orders",
+                    "demo.main.orders",
+                    field("order_id"),
+                    field("nick", '"Nick"'),
+                    field("customer", "customer_id"),
+                    primary_key=["order_id"],
+                ),
+                dataset(
+                    "customers",
+                    "demo.main.customers",
+                    field("customer_key"),
+                    primary_key=["customer_key"],
+                ),
+                relationships=[
+                    {
+                        "name": "orders_to_customers",
+                        "from": "orders",
+                        "to": "customers",
+                        "from_columns": ["customer"],
+                        "to_columns": ["customer_key"],
+                    }
+                ],
+            )
+        ),
+    )
+
+    layer = build(tmp_path, "case.ossie.yaml", connector="snowflake")
+    rows = {d.name: d for d in layer.semantic_catalog().dimensions}
+    assert rows["orders__order_id"].column == "ORDER_ID"
+    assert rows["orders__nick"].column is None
+
+    declared = layer.declared_definitions()
+    assert {k.column for k in declared.declared_keys} == {"ORDER_ID", "CUSTOMER_KEY"}
+    (join,) = declared.foreign_keys
+    assert (join.column, join.to_column) == ("CUSTOMER_ID", "CUSTOMER_KEY")
+    (relationship,) = declared.declared_relationships
+    assert relationship.column_pairs == [("CUSTOMER_ID", "CUSTOMER_KEY")]
+
+
 # --- dimensions ------------------------------------------------------------
 
 
@@ -440,34 +492,96 @@ def test_a_composite_relationship_preserves_every_ordered_pair(declared):
     assert composite.source == "ossie"
 
 
-def test_relationship_columns_need_not_be_declared_fields(tmp_path: Path):
-    """Upstream requires only non-empty arrays, and a valid document routinely
-    names a physical foreign key that no field entry declares."""
+def test_relationship_columns_resolve_through_their_fields(tmp_path: Path):
+    """Upstream's Name Resolution: `from_columns` and `to_columns` name fields,
+    and a join reaches the warehouse through each field's own expression."""
 
     write(
         tmp_path,
-        "undeclared.ossie.yaml",
+        "renamed.ossie.yaml",
         document(
             model(
                 "m",
-                dataset("child", "demo.main.child", field("x"), primary_key=["x"]),
-                dataset("parent", "demo.main.parent", field("y"), primary_key=["y"]),
+                dataset(
+                    "child",
+                    "demo.main.child",
+                    field("x"),
+                    field("parent_id", "parent_fk"),
+                    primary_key=["x"],
+                ),
+                dataset(
+                    "parent", "demo.main.parent", field("id", "y"), primary_key=["id"]
+                ),
                 relationships=[
                     {
                         "name": "r",
                         "from": "child",
                         "to": "parent",
-                        "from_columns": ["parent_fk"],
-                        "to_columns": ["y"],
+                        "from_columns": ["parent_id"],
+                        "to_columns": ["id"],
                     }
                 ],
             )
         ),
     )
 
-    declared = build(tmp_path, "undeclared.ossie.yaml").declared_definitions()
+    declared = build(tmp_path, "renamed.ossie.yaml").declared_definitions()
 
-    assert declared.foreign_keys[0].column == "parent_fk"
+    assert (declared.foreign_keys[0].column, declared.foreign_keys[0].to_column) == (
+        "parent_fk",
+        "y",
+    )
+    assert declared.declared_relationships[0].column_pairs == [("parent_fk", "y")]
+    assert [(k.model, k.column) for k in declared.declared_keys] == [
+        ("m.child", "x"),
+        ("m.parent", "y"),
+    ]
+
+
+def test_a_key_or_relationship_on_a_computed_field_is_opaque_as_a_whole(
+    tmp_path: Path,
+):
+    """Any member without a column makes the whole declaration unverifiable.
+
+    A composite probed on part of its tuple is a join the author never declared,
+    so nothing is emitted and a note names the field that links nothing.
+    """
+
+    write(
+        tmp_path,
+        "computed.ossie.yaml",
+        document(
+            model(
+                "m",
+                dataset(
+                    "child",
+                    "demo.main.child",
+                    field("a"),
+                    field("b", "upper(b)"),
+                    unique_keys=[["a", "b"]],
+                ),
+                dataset("parent", "demo.main.parent", field("a"), field("b")),
+                relationships=[
+                    {
+                        "name": "r",
+                        "from": "child",
+                        "to": "parent",
+                        "from_columns": ["a", "b"],
+                        "to_columns": ["a", "b"],
+                    }
+                ],
+            )
+        ),
+    )
+
+    declared = build(tmp_path, "computed.ossie.yaml").declared_definitions()
+
+    assert declared.declared_composite_keys == []
+    assert declared.declared_relationships == []
+    assert declared.foreign_keys == []
+    notes = " ".join(declared.notes)
+    assert "declares a unique key on a, b, and b links no physical column" in notes
+    assert "relationship 'r' joins on child.b, which links no physical column" in notes
 
 
 def test_built_relation_names_stays_empty_and_says_so(declared):

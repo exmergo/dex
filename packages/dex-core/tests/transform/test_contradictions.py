@@ -600,3 +600,287 @@ def test_on_a_billed_connector_it_is_named_and_measured_only_on_request(
     assert "row_delta" not in found
     [warning] = [w for w in envelope.warnings if "population.filters" in w]
     assert "--attribute-rows" in warning
+
+
+# --- population parent (#1029) -----------------------------------------------------
+
+STG_SUBS = "select subscription_id, created_at from {{ source('raw', 'subs') }}\n"
+STG_ACTIVITY = "select subscription_id, at from {{ source('raw', 'activity') }}\n"
+FROM_ACTIVITY = (
+    "select s.subscription_id, s.created_at\n"
+    "from {{ ref('stg_activity') }} a\n"
+    "left join {{ ref('stg_subscriptions') }} s "
+    "on a.subscription_id = s.subscription_id\n"
+)
+FROM_PARENT = (
+    "select s.subscription_id, s.created_at\n"
+    "from {{ ref('stg_subscriptions') }} s\n"
+    "left join {{ ref('stg_activity') }} a "
+    "on a.subscription_id = s.subscription_id\n"
+)
+PROJECT_FILES = {
+    "dbt_project.yml": "name: p\nversion: '1'\nmodel-paths: [models]\n",
+    "models/stg_subscriptions.sql": STG_SUBS,
+    "models/stg_activity.sql": STG_ACTIVITY,
+    "models/int_subscriptions_enriched.sql": (
+        "select * from {{ ref('stg_subscriptions') }}\n"
+    ),
+}
+
+
+def _parent_yml(parent: str = "stg_subscriptions", **population) -> str:
+    return yaml.safe_dump(
+        {
+            "version": 2,
+            "models": [
+                {
+                    "name": "rpt",
+                    "config": {
+                        "meta": {
+                            "dex": {
+                                "population": {
+                                    "parent": {
+                                        "model": parent,
+                                        "key": {"subscription_id": "subscription_id"},
+                                    },
+                                    **population,
+                                }
+                            }
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+
+def _parent_draft(
+    tmp_path: Path,
+    sql: str,
+    *,
+    prior_sql: str | None = None,
+    yml: str | None = None,
+    prior_yml: str | None = None,
+    others: dict[str, str] | None = None,
+) -> dict:
+    from exmergo_dex_core.dbt_project import load as load_project
+    from exmergo_dex_core.references import ReferenceIndex
+
+    base = {**PROJECT_FILES, **(others or {})}
+    files = {**base, "models/rpt.sql": sql, "models/rpt.yml": yml or _parent_yml()}
+    for path, content in files.items():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    prior = dict(base)
+    if prior_sql is not None:
+        prior["models/rpt.sql"] = prior_sql
+        prior["models/rpt.yml"] = prior_yml or yml or _parent_yml()
+    drafts, draft_warnings = draft(
+        ["rpt"],
+        files,
+        ["models"],
+        None,
+        dialect="duckdb",
+        prior=prior,
+        index=lambda: ReferenceIndex(load_project(tmp_path), scan_packages=False),
+    )
+    assert not any("could not check 'rpt'" in w for w in draft_warnings), draft_warnings
+    return drafts["rpt"]
+
+
+def _parent_rows(entry: dict) -> list[dict]:
+    return [
+        c
+        for c in entry.get("contradictions") or []
+        if c["check"] == "population_parent"
+    ]
+
+
+def test_a_new_model_driven_from_another_relation_warns_naming_both(tmp_path):
+    [found] = _parent_rows(_parent_draft(tmp_path, FROM_ACTIVITY))
+
+    assert found["status"] == "contradicted"
+    assert found["parent"] == "stg_subscriptions"
+    assert found["authored"] == "stg_activity"
+    assert found["stale"] == "either"
+    assert found["created"] is True
+    [warning] = warnings("rpt", [found])
+    assert "stg_activity" in warning
+    assert "stg_subscriptions" in warning
+    assert "this plan writes both" in warning
+    assert "Drive the model from" in warning
+    assert "correct the declared parent" in warning
+
+
+def test_an_edit_that_swaps_the_driver_blames_the_sql(tmp_path):
+    [found] = _parent_rows(
+        _parent_draft(tmp_path, FROM_ACTIVITY, prior_sql=FROM_PARENT)
+    )
+
+    assert found["status"] == "contradicted"
+    assert found["stale"] == "sql"
+    assert found["preexisting"] is False
+    assert "created" not in found
+
+
+def test_an_untouched_disagreement_stays_silent(tmp_path):
+    assert not _parent_rows(
+        _parent_draft(tmp_path, FROM_ACTIVITY, prior_sql=FROM_ACTIVITY)
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(FROM_PARENT, id="direct"),
+        pytest.param(
+            "with subs as (select * from {{ ref('stg_subscriptions') }}),\n"
+            "final as (select subscription_id from subs)\nselect * from final\n",
+            id="cte-chain",
+        ),
+        pytest.param(
+            "select * from (select * from {{ ref('stg_subscriptions') }}) s\n",
+            id="subquery",
+        ),
+        pytest.param(
+            "select * from {{ ref('int_subscriptions_enriched') }}\n",
+            id="derived-model",
+        ),
+        pytest.param(
+            "select * from {{ source('raw', 'subs') }}\n", id="the-parents-source"
+        ),
+        pytest.param(
+            "select s.subscription_id from {{ ref('stg_activity') }} a\n"
+            "right join {{ ref('stg_subscriptions') }} s using (subscription_id)\n",
+            id="right-join",
+        ),
+        pytest.param(
+            "select s.subscription_id from {{ ref('stg_activity') }} a\n"
+            "full join {{ ref('stg_subscriptions') }} s using (subscription_id)\n",
+            id="full-join",
+        ),
+        pytest.param(
+            "select s.subscription_id, d.day from {{ ref('dates') }} d\n"
+            "cross join {{ ref('stg_subscriptions') }} s\n",
+            id="spine-cross-join",
+        ),
+    ],
+)
+def test_a_legitimate_driver_is_silent(tmp_path, sql):
+    others = {"models/dates.sql": "select current_date as day\n"}
+    assert not _parent_rows(_parent_draft(tmp_path, sql, others=others))
+
+
+def test_a_snapshot_of_the_parent_counts_as_derived(tmp_path):
+    snapshot = (
+        "{% snapshot subs_snapshot %}\n"
+        "{{ config(unique_key='subscription_id', strategy='check', "
+        "check_cols='all') }}\n"
+        "select * from {{ ref('stg_subscriptions') }}\n"
+        "{% endsnapshot %}\n"
+    )
+    entry = _parent_draft(
+        tmp_path,
+        "select * from {{ ref('subs_snapshot') }}\n",
+        others={"snapshots/subs_snapshot.sql": snapshot},
+    )
+    assert not _parent_rows(entry)
+
+
+@pytest.mark.parametrize(
+    ("sql", "fragment"),
+    [
+        pytest.param("{{ some_macro() }}\n", "some_macro", id="macro"),
+        pytest.param(
+            "{% if target.name == 'dev' %}select 1 as id"
+            "{% else %}select 2 as id{% endif %}\n",
+            "statement block",
+            id="jinja-if",
+        ),
+        pytest.param(
+            "select subscription_id from {{ ref('stg_activity') }}\n"
+            "union all\nselect subscription_id from {{ ref('stg_activity') }}\n",
+            "set operation",
+            id="union",
+        ),
+        pytest.param(
+            "select * from {{ ref(var('which')) }}\n", "relation name", id="ref-var"
+        ),
+        pytest.param(
+            "select * from analytics.raw_activity\n", "literal name", id="literal"
+        ),
+    ],
+)
+def test_a_driver_that_cannot_be_read_is_unchecked(tmp_path, sql, fragment):
+    [found] = _parent_rows(_parent_draft(tmp_path, sql))
+
+    assert found["status"] == "unchecked"
+    assert fragment in found["reason"]
+    assert "stale" not in found
+
+
+def test_a_macro_in_the_drivers_lineage_is_unchecked_not_a_false_alarm(tmp_path):
+    entry = _parent_draft(
+        tmp_path,
+        "select * from {{ ref('int_opaque') }}\n",
+        others={"models/int_opaque.sql": "{{ union_of_everything() }}\n"},
+    )
+    [found] = _parent_rows(entry)
+    assert found["status"] == "unchecked"
+    assert "union_of_everything" in found["reason"]
+
+
+def test_a_package_driver_is_unchecked(tmp_path):
+    [found] = _parent_rows(
+        _parent_draft(tmp_path, "select * from {{ ref('pkg', 'pkg_model') }}\n")
+    )
+    assert found["status"] == "unchecked"
+    assert "pkg_model" in found["reason"]
+
+
+def test_a_new_model_with_no_parent_carries_no_key(tmp_path):
+    yml = yaml.safe_dump(
+        {
+            "version": 2,
+            "models": [
+                {
+                    "name": "rpt",
+                    "config": {
+                        "meta": {"dex": {"population": {"rule": "All of them"}}}
+                    },
+                }
+            ],
+        }
+    )
+    entry = _parent_draft(tmp_path, FROM_ACTIVITY, yml=yml)
+
+    assert "contradictions" not in entry
+    assert entry["population_contract"] == "prose"
+
+
+def test_a_declared_parent_is_an_executable_contract(tmp_path):
+    entry = _parent_draft(tmp_path, FROM_PARENT)
+    assert entry["population_contract"] == "executable"
+    assert "contradictions" not in entry
+
+
+def test_changing_only_the_parent_blames_the_declaration(tmp_path):
+    [found] = _parent_rows(
+        _parent_draft(
+            tmp_path,
+            FROM_ACTIVITY,
+            prior_sql=FROM_ACTIVITY,
+            yml=_parent_yml(),
+            prior_yml=_parent_yml("stg_activity"),
+        )
+    )
+    assert found["stale"] == "declaration"
+
+
+def test_an_unrelated_source_driver_warns(tmp_path):
+    [found] = _parent_rows(
+        _parent_draft(tmp_path, "select * from {{ source('raw', 'activity') }}\n")
+    )
+    assert found["status"] == "contradicted"
+    assert found["authored"] == "activity"

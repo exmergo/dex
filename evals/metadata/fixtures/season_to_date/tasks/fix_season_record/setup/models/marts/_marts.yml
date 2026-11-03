@@ -1,0 +1,4 @@
+version: 2
+models:
+  - name: team_season_record
+    description: Each team's record for each season.

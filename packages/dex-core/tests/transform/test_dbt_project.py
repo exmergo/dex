@@ -1214,3 +1214,97 @@ def test_model_file_matches_the_name_with_its_case(tmp_path: Path):
     assert model_file(view, "Stg_One") == "models/Stg_One.sql"
     with pytest.raises(RequestError):
         model_file(view, "stg_one")
+
+
+def test_write_edits_case_only_rename_keeps_the_model(
+    dbt_project_dir: Path, monkeypatch
+):
+    """On a case-insensitive filesystem, create+delete of the same path spelling
+    must not delete the model (#981). Simulated on Linux by casefolding path ops
+    under the project root.
+    """
+
+    staging = dbt_project_dir / "models" / "staging"
+    old_path = staging / "stg_ORDERS.sql"
+    content = "select 1 as id\n"
+    old_path.write_text(content, encoding="utf-8")
+
+    real_is_file = Path.is_file
+    real_read_text = Path.read_text
+    real_unlink = Path.unlink
+    real_replace = Path.replace
+    real_exists = Path.exists
+
+    root = dbt_project_dir.resolve()
+
+    def _ci_resolve(path: Path) -> Path:
+        # Use unpatched helpers so the monkeypatch cannot recurse into itself.
+        resolved = path if path.is_absolute() else (dbt_project_dir / path)
+        try:
+            resolved = resolved.resolve()
+        except OSError:
+            return path
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return path
+        if real_exists(resolved):
+            return resolved
+        parent = resolved.parent
+        if not real_exists(parent):
+            return path
+        wanted = resolved.name.casefold()
+        try:
+            children = list(parent.iterdir())
+        except OSError:
+            return path
+        for child in children:
+            if child.name.casefold() == wanted and real_exists(child):
+                return child
+        return path
+
+    def is_file(self):  # type: ignore[no-untyped-def]
+        return real_is_file(_ci_resolve(self))
+
+    def exists(self):  # type: ignore[no-untyped-def]
+        return real_exists(_ci_resolve(self))
+
+    def read_text(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return real_read_text(_ci_resolve(self), *args, **kwargs)
+
+    def unlink(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return real_unlink(_ci_resolve(self), *args, **kwargs)
+
+    def replace(self, target):  # type: ignore[no-untyped-def]
+        return real_replace(_ci_resolve(self), target)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "exists", exists)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    result = write_edits(
+        [
+            Edit(
+                path="models/staging/stg_ORDERS.sql",
+                new_content=None,
+                old_content_hash=content_hash(content),
+                op=EditOp.DELETE,
+            ),
+            Edit(
+                path="models/staging/stg_orders.sql",
+                new_content=content,
+                old_content_hash=None,
+            ),
+        ],
+        dbt_project_dir,
+    )
+
+    assert result.conflicts == []
+    assert "models/staging/stg_orders.sql" in result.written
+    # Exactly one model file remains, with the create's spelling when the FS
+    # is case-sensitive under the simulation's final replace.
+    remaining = sorted(p.name for p in staging.glob("stg_*rders.sql"))
+    assert remaining == ["stg_orders.sql"]
+    assert (staging / "stg_orders.sql").read_text(encoding="utf-8") == content

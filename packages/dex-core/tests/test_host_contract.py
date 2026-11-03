@@ -30,11 +30,10 @@ def test_every_exported_name_resolves_and_the_two_lists_agree():
     """Same assertion the package root makes about itself, for the same reason:
     a name in one list and not the other is a name nobody can import."""
 
-    # Sorted the way the package root sorts its own: an ALL-CAPS constant first,
-    # then classes, then functions, which is what `sorted` gives on ASCII.
-    assert host.__all__ == sorted(
-        host.__all__, key=lambda n: (n != "PLAN_DOCUMENT_SCHEMA_VERSION", n)
-    )
+    # Sorted the way the package root sorts its own (ruff's RUF022): ALL-CAPS
+    # constants first, then classes, then functions, which is what `sorted`
+    # gives on ASCII once the constants are lifted out.
+    assert host.__all__ == sorted(host.__all__, key=lambda n: (not n.isupper(), n))
     assert set(host.__all__) - {"conformance_vectors"} == set(host._EXPORTS)
     for name in host.__all__:
         assert getattr(host, name) is not None, name

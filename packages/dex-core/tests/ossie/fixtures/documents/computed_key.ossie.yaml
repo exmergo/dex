@@ -1,0 +1,29 @@
+# A key and a relationship on a computed field. The field is declared, so the
+# document is valid, but it links no physical column: the key and the
+# relationship stay declared and are never verified or probed.
+version: "0.2.0.dev0"
+name: computed
+datasets:
+  - name: orders
+    source: demo.main.orders
+    primary_key: [order_ref]
+    fields:
+      - name: order_ref
+        expression:
+          sql: tenant_id || '-' || order_id
+      - name: customer_id
+        expression:
+          sql: customer_id
+  - name: customers
+    source: demo.main.customers
+    primary_key: [customer_key]
+    fields:
+      - name: customer_key
+        expression:
+          sql: upper(customer_id)
+relationships:
+  - name: orders_to_customers
+    from: orders
+    to: customers
+    from_columns: [customer_id]
+    to_columns: [customer_key]

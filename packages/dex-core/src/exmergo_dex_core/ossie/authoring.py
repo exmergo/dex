@@ -230,11 +230,10 @@ def _target(root: Path, name: str) -> Path:
 
 
 def _model_names(document: LoadedDocument) -> set[str]:
-    return {
-        model["name"]
-        for model in document.data.get("semantic_model") or []
-        if isinstance(model, dict) and isinstance(model.get("name"), str)
-    }
+    """The model a document is: one document, one model, named at the root."""
+
+    name = document.data.get("name")
+    return {name} if isinstance(name, str) else set()
 
 
 def _model_names_from_text(name: str, content: str) -> set[str]:
@@ -246,6 +245,11 @@ def _model_names_from_text(name: str, content: str) -> set[str]:
         return set()
     if not isinstance(parsed, dict):
         return set()
+    if isinstance(parsed.get("name"), str):
+        return {parsed["name"]}
+    # A document still in the earlier wrapped shape is refused when read, but
+    # its models keep their names here, so migrating it by hand through
+    # `semantic ossie update` classifies them as updated rather than as new.
     return {
         model["name"]
         for model in parsed.get("semantic_model") or []

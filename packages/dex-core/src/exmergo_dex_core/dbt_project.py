@@ -51,10 +51,9 @@ from .project_definitions import (
     DeclaredCompositeKey,
     DeclaredForeignKey,
     DeclaredKey,
-    DeclaredPopulation,
-    DeclaredPopulationFilter,
     ModelDeclaration,
     ProjectDefinitions,
+    read_population,
 )
 from .semantic_catalog import (
     DIMENSIONS_PER_DECLARATION,
@@ -72,11 +71,36 @@ from .semantic_catalog import (
     merge_element_fields,
     qualified_dimension,
 )
+from .semantic_declarations import catalog_description
 
 PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
+# Where dbt writes by default. Readers go through :func:`manifest_file` and
+# :func:`semantic_manifest_file`, which honor the project's target path and
+# Dex's own isolated artifact directory (issue #1014); these name the default
+# for messages and for callers that predate them.
 MANIFEST_PATH = Path("target") / "manifest.json"
 SEMANTIC_MANIFEST_PATH = Path("target") / "semantic_manifest.json"
+
+
+def manifest_file(project: Path | str) -> Path:
+    """The ``manifest.json`` to read: the newest of Dex's and the project's.
+
+    See :func:`~.transform.artifact_runtime.readable_artifact`.
+    """
+
+    from .transform.artifact_runtime import readable_artifact
+
+    return readable_artifact(project, "manifest.json")
+
+
+def semantic_manifest_file(project: Path | str) -> Path:
+    """The ``semantic_manifest.json`` to read, chosen as :func:`manifest_file`."""
+
+    from .transform.artifact_runtime import readable_artifact
+
+    return readable_artifact(project, "semantic_manifest.json")
+
 
 # The ref()/source() call shapes as they appear in model SQL, schema YAML test
 # arguments, and semantic-model `model:` fields. Shared by every reader that
@@ -310,14 +334,12 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
             )
 
     manifest: dict[str, Any] | None = None
-    manifest_file = root / MANIFEST_PATH
-    if manifest_file.is_file():
+    compiled = manifest_file(root)
+    if compiled.is_file():
         try:
-            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            manifest = json.loads(compiled.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise DbtProjectError(
-                f"corrupt manifest at {manifest_file}: {exc}"
-            ) from exc
+            raise DbtProjectError(f"corrupt manifest at {compiled}: {exc}") from exc
 
     return DbtProjectView(
         root=str(root),
@@ -595,10 +617,17 @@ def write_edits(
     Any conflict with ``confirmed=False`` writes nothing and surfaces the
     divergence as diffs of current content against the plan's proposal. With
     ``confirmed=True`` the conflicts are overridden explicitly.
+
+    A create and a delete whose paths differ only by case (#981) are one rename
+    on a case-insensitive filesystem: the create would otherwise read as already
+    applied against the file the delete then removes. Those two edits are kept
+    together and written through a temporary name so the model file survives.
     """
 
     root = Path(project_dir)
     view = load(project_dir)
+
+    case_renames = _case_only_renames(edits)
 
     staged: list[tuple[Path, Edit, str | None]] = []
     conflicts: list[Conflict] = []
@@ -617,10 +646,29 @@ def write_edits(
             edit.op is EditOp.UPSERT
             and current is not None
             and current == edit.new_content
+            and _casefold_path(edit.path) not in case_renames
         ):
-            # Already applied (e.g. a re-run): a no-op, not a conflict.
+            # Already applied (e.g. a re-run): a no-op, not a conflict. A
+            # case-only rename's create looks identical on a case-insensitive
+            # filesystem, so that pair is not skipped here.
             continue
-        if current_hash != edit.old_content_hash:
+        pair = case_renames.get(_casefold_path(edit.path))
+        is_rename_create = (
+            pair is not None
+            and edit.op is EditOp.UPSERT
+            and edit.old_content_hash is None
+            and current_hash in (None, pair[0].old_content_hash)
+        )
+        if (
+            edit.op is EditOp.UPSERT
+            and current is not None
+            and current == edit.new_content
+            and not is_rename_create
+        ):
+            continue
+        if current_hash != edit.old_content_hash and not is_rename_create:
+            # A case-only rename's create resolves to the file being renamed on a
+            # case-insensitive filesystem; that is not a human conflict (#981).
             conflicts.append(
                 Conflict(
                     path=edit.path,
@@ -636,13 +684,79 @@ def write_edits(
         return ApplyResult(written=[], diffs=diffs, conflicts=conflicts)
 
     written: list[str] = []
+    handled_keys: set[str] = set()
+    staged_by_path = {
+        edit.path: (target_path, edit, current) for target_path, edit, current in staged
+    }
     for target_path, edit, _current in staged:
+        key = _casefold_path(edit.path)
+        if key in handled_keys:
+            continue
+        pair = case_renames.get(key)
+        if (
+            pair is not None
+            and pair[0].path in staged_by_path
+            and pair[1].path in staged_by_path
+        ):
+            delete_edit, create_edit = pair
+            delete_path = staged_by_path[delete_edit.path][0]
+            create_path = staged_by_path[create_edit.path][0]
+            _apply_case_only_rename(
+                delete_path, create_path, create_edit.new_content or ""
+            )
+            written.append(create_edit.path)
+            handled_keys.add(key)
+            continue
         if edit.op is EditOp.DELETE:
             target_path.unlink(missing_ok=True)
         else:
             write_project_file(target_path, edit.new_content)
         written.append(edit.path)
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
+
+
+def _casefold_path(path: str) -> str:
+    return Path(path).as_posix().casefold()
+
+
+def _case_only_renames(edits: list[Edit]) -> dict[str, tuple[Edit, Edit]]:
+    """Casefold key → (delete, create) when both appear with different spellings."""
+
+    deletes: dict[str, Edit] = {}
+    creates: dict[str, Edit] = {}
+    for edit in edits:
+        key = _casefold_path(edit.path)
+        if edit.op is EditOp.DELETE:
+            deletes[key] = edit
+        elif edit.op is EditOp.UPSERT and edit.old_content_hash is None:
+            creates[key] = edit
+    out: dict[str, tuple[Edit, Edit]] = {}
+    for key, delete in deletes.items():
+        create = creates.get(key)
+        if create is not None and delete.path != create.path:
+            out[key] = (delete, create)
+    return out
+
+
+def _apply_case_only_rename(
+    delete_path: Path, create_path: Path, new_content: str
+) -> None:
+    """Rename through a temporary sibling so a case-only change sticks (#981)."""
+
+    parent = delete_path.parent
+    tmp_path = parent / (delete_path.name + ".__dex_case_rename__")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    # Move the existing inode aside first. On a case-insensitive filesystem
+    # delete_path and create_path name the same file; replace through a temp so
+    # the final spelling is the create's.
+    source = delete_path if delete_path.exists() else create_path
+    if source.exists():
+        source.replace(tmp_path)
+    write_project_file(tmp_path, new_content)
+    if create_path.exists() and create_path.resolve() != tmp_path.resolve():
+        create_path.unlink()
+    tmp_path.replace(create_path)
 
 
 def contained_path(root: Path, rel_path: str, view: DbtProjectView) -> Path:
@@ -1324,25 +1438,408 @@ def strip_relation_quoting(relation: str) -> str:
     return ".".join(part for part in parts if part)
 
 
+_BIGQUERY_TYPE_ALIASES: dict[str, str] = {
+    "int64": "INT64",
+    "integer": "INT64",
+    "int": "INT64",
+    "smallint": "INT64",
+    "bigint": "INT64",
+    "tinyint": "INT64",
+    "byteint": "INT64",
+    "float64": "FLOAT64",
+    "float": "FLOAT64",
+    "numeric": "NUMERIC",
+    "decimal": "NUMERIC",
+    "bignumeric": "BIGNUMERIC",
+    "bigdecimal": "BIGNUMERIC",
+    "bool": "BOOL",
+    "boolean": "BOOL",
+    "string": "STRING",
+    "varchar": "STRING",
+    "text": "STRING",
+    "timestamp": "TIMESTAMP",
+    "datetime": "DATETIME",
+    "date": "DATE",
+    "time": "TIME",
+    "bytes": "BYTES",
+    "record": "STRUCT",
+    "struct": "STRUCT",
+}
+
+_DUCKDB_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "int4": "INTEGER",
+    "signed": "INTEGER",
+    "bigint": "BIGINT",
+    "int8": "BIGINT",
+    "long": "BIGINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "short": "SMALLINT",
+    "tinyint": "TINYINT",
+    "int1": "TINYINT",
+    "hugeint": "HUGEINT",
+    "uinteger": "UINTEGER",
+    "uint4": "UINTEGER",
+    "ubigint": "UBIGINT",
+    "uint8": "UBIGINT",
+    "usmallint": "USMALLINT",
+    "uint2": "USMALLINT",
+    "utinyint": "UTINYINT",
+    "uint1": "UTINYINT",
+    "uhugeint": "UHUGEINT",
+    "varchar": "VARCHAR",
+    "char": "VARCHAR",
+    "bpchar": "VARCHAR",
+    "text": "VARCHAR",
+    "string": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "logical": "BOOLEAN",
+    "float": "FLOAT",
+    "float4": "FLOAT",
+    "real": "FLOAT",
+    "double": "DOUBLE",
+    "float8": "DOUBLE",
+    "decimal": "DECIMAL",
+    "numeric": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "datetime": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamptz": "TIMESTAMPTZ",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "time without time zone": "TIME",
+    "timetz": "TIMETZ",
+    "time with time zone": "TIMETZ",
+    "blob": "BLOB",
+    "bytea": "BLOB",
+    "binary": "BLOB",
+    "varbinary": "BLOB",
+}
+
+_POSTGRES_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "int4": "INTEGER",
+    "bigint": "BIGINT",
+    "int8": "BIGINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "varchar": "VARCHAR",
+    "character varying": "VARCHAR",
+    "text": "VARCHAR",
+    "char": "CHARACTER",
+    "character": "CHARACTER",
+    "bpchar": "CHARACTER",
+    "string": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "double precision": "DOUBLE PRECISION",
+    "float8": "DOUBLE PRECISION",
+    "float": "DOUBLE PRECISION",
+    "real": "REAL",
+    "float4": "REAL",
+    "numeric": "NUMERIC",
+    "decimal": "NUMERIC",
+    "timestamp": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamptz": "TIMESTAMPTZ",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "time without time zone": "TIME",
+    "timetz": "TIMETZ",
+    "time with time zone": "TIMETZ",
+    "bytea": "BYTEA",
+}
+
+_SNOWFLAKE_TYPE_ALIASES: dict[str, str] = {
+    "number": "NUMBER",
+    "decimal": "NUMBER",
+    "numeric": "NUMBER",
+    "int": "NUMBER",
+    "integer": "NUMBER",
+    "bigint": "NUMBER",
+    "smallint": "NUMBER",
+    "tinyint": "NUMBER",
+    "byteint": "NUMBER",
+    "fixed": "NUMBER",
+    "varchar": "VARCHAR",
+    "string": "VARCHAR",
+    "text": "VARCHAR",
+    "char": "VARCHAR",
+    "character": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "float": "FLOAT",
+    "float4": "FLOAT",
+    "float8": "FLOAT",
+    "double": "FLOAT",
+    "double precision": "FLOAT",
+    "real": "FLOAT",
+    "timestamp": "TIMESTAMP_NTZ",
+    "datetime": "TIMESTAMP_NTZ",
+    "timestamp_ntz": "TIMESTAMP_NTZ",
+    "timestamp without time zone": "TIMESTAMP_NTZ",
+    "timestamptz": "TIMESTAMP_TZ",
+    "timestamp_tz": "TIMESTAMP_TZ",
+    "timestamp with time zone": "TIMESTAMP_TZ",
+    "timestamp_ltz": "TIMESTAMP_LTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "binary": "BINARY",
+    "varbinary": "BINARY",
+}
+
+_CLICKHOUSE_TYPE_ALIASES: dict[str, str] = {
+    "int8": "INT8",
+    "tinyint": "INT8",
+    "int16": "INT16",
+    "smallint": "INT16",
+    "int32": "INT32",
+    "int": "INT32",
+    "integer": "INT32",
+    "int64": "INT64",
+    "bigint": "INT64",
+    "uint8": "UINT8",
+    "uint16": "UINT16",
+    "uint32": "UINT32",
+    "uint64": "UINT64",
+    "string": "STRING",
+    "text": "STRING",
+    "varchar": "STRING",
+    "char": "STRING",
+    "bool": "BOOL",
+    "boolean": "BOOL",
+    "float32": "FLOAT32",
+    "float": "FLOAT32",
+    "real": "FLOAT32",
+    "float64": "FLOAT64",
+    "double": "FLOAT64",
+    "double precision": "FLOAT64",
+    "decimal": "DECIMAL",
+    "datetime": "DATETIME",
+    "datetime64": "DATETIME64",
+    "date": "DATE",
+    "date32": "DATE32",
+}
+
+_DATABRICKS_TYPE_ALIASES: dict[str, str] = {
+    "int": "INT",
+    "integer": "INT",
+    "bigint": "BIGINT",
+    "long": "BIGINT",
+    "smallint": "SMALLINT",
+    "short": "SMALLINT",
+    "tinyint": "TINYINT",
+    "byte": "TINYINT",
+    "string": "STRING",
+    "text": "STRING",
+    "varchar": "STRING",
+    "char": "STRING",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "float": "FLOAT",
+    "real": "FLOAT",
+    "double": "DOUBLE",
+    "decimal": "DECIMAL",
+    "dec": "DECIMAL",
+    "numeric": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "timestamp_ntz": "TIMESTAMP_NTZ",
+    "date": "DATE",
+}
+
+_TRINO_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "bigint": "BIGINT",
+    "smallint": "SMALLINT",
+    "tinyint": "TINYINT",
+    "varchar": "VARCHAR",
+    "char": "VARCHAR",
+    "string": "VARCHAR",
+    "text": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "double": "DOUBLE",
+    "real": "REAL",
+    "decimal": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp with time zone": "TIMESTAMP WITH TIME ZONE",
+    "date": "DATE",
+    "time": "TIME",
+}
+
+_GENERIC_TYPE_ALIASES: dict[str, str] = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "int4": "INTEGER",
+    "signed": "INTEGER",
+    "bigint": "BIGINT",
+    "int8": "BIGINT",
+    "long": "BIGINT",
+    "smallint": "SMALLINT",
+    "int2": "SMALLINT",
+    "short": "SMALLINT",
+    "tinyint": "TINYINT",
+    "int1": "TINYINT",
+    "varchar": "VARCHAR",
+    "character varying": "VARCHAR",
+    "text": "VARCHAR",
+    "string": "VARCHAR",
+    "char": "VARCHAR",
+    "character": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "logical": "BOOLEAN",
+    "double": "DOUBLE",
+    "double precision": "DOUBLE",
+    "float8": "DOUBLE",
+    "float": "FLOAT",
+    "float4": "FLOAT",
+    "real": "FLOAT",
+    "decimal": "DECIMAL",
+    "numeric": "DECIMAL",
+    "timestamp": "TIMESTAMP",
+    "datetime": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp_ntz": "TIMESTAMP",
+    "timestamptz": "TIMESTAMPTZ",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "timestamp_tz": "TIMESTAMPTZ",
+    "date": "DATE",
+    "time": "TIME",
+    "time without time zone": "TIME",
+    "timetz": "TIMETZ",
+    "time with time zone": "TIMETZ",
+}
+
+_CONNECTOR_TYPE_ALIASES: dict[str, dict[str, str]] = {
+    "bigquery": _BIGQUERY_TYPE_ALIASES,
+    "duckdb": _DUCKDB_TYPE_ALIASES,
+    "postgres": _POSTGRES_TYPE_ALIASES,
+    "redshift": _POSTGRES_TYPE_ALIASES,
+    "snowflake": _SNOWFLAKE_TYPE_ALIASES,
+    "clickhouse": _CLICKHOUSE_TYPE_ALIASES,
+    "databricks": _DATABRICKS_TYPE_ALIASES,
+    "trino": _TRINO_TYPE_ALIASES,
+}
+
+
+def _normalize_base_type(base: str, connector: str | None = None) -> str | None:
+    lowered = base.lower().strip()
+    if connector:
+        mapping = _CONNECTOR_TYPE_ALIASES.get(connector.lower().strip())
+        if mapping and lowered in mapping:
+            return mapping[lowered]
+    return _GENERIC_TYPE_ALIASES.get(lowered)
+
+
+def _split_type_and_params(type_str: str) -> tuple[str, str | None]:
+    """Split a data type into base name and normalized parameters.
+
+    Examples:
+        'VARCHAR(10)' -> ('VARCHAR', '10')
+        'decimal( 10, 2 )' -> ('DECIMAL', '10,2')
+        'TIMESTAMP(6) WITH TIME ZONE' -> ('TIMESTAMP WITH TIME ZONE', '6')
+        'ARRAY<INT64>' -> ('ARRAY<INT64>', None)
+    """
+    clean = type_str.strip()
+    if clean.upper().startswith("ARRAY<") and clean.endswith(">"):
+        return clean, None
+
+    match = re.search(r"\(([^)]*)\)", clean)
+    if not match:
+        return re.sub(r"\s+", " ", clean).strip().upper(), None
+
+    params = re.sub(r"\s+", "", match.group(1))
+    base = clean[: match.start()] + clean[match.end() :]
+    base = re.sub(r"\s+", " ", base).strip().upper()
+    return base, params
+
+
+def types_equal(
+    declared: str | None,
+    actual: str | None,
+    connector: str | None = None,
+) -> bool:
+    """Whether declared and actual data types are equivalent (#1033).
+
+    Normalizes connector-specific aliases across integer, string, float/numeric,
+    boolean, and temporal type families.
+
+    Parameterized types (such as `VARCHAR(10)` against `VARCHAR`) are treated as
+    compatible when one side omits parameters, accommodating engines (such as
+    DuckDB or Snowflake) that do not report length/scale in metadata reflection.
+    When both sides specify parameters, the parameters must match (normalizing
+    whitespace).
+
+    A type Dex cannot normalize falls back to case-insensitive exact string
+    match and is not silently assumed to pass.
+    """
+    if declared is None or actual is None:
+        return True
+
+    dec_clean = declared.strip()
+    act_clean = actual.strip()
+    if dec_clean.lower() == act_clean.lower():
+        return True
+
+    if (
+        dec_clean.upper().startswith("ARRAY<")
+        and dec_clean.endswith(">")
+        and act_clean.upper().startswith("ARRAY<")
+        and act_clean.endswith(">")
+    ):
+        return types_equal(dec_clean[6:-1], act_clean[6:-1], connector=connector)
+
+    base_dec, params_dec = _split_type_and_params(dec_clean)
+    base_act, params_act = _split_type_and_params(act_clean)
+
+    norm_dec = _normalize_base_type(base_dec, connector)
+    norm_act = _normalize_base_type(base_act, connector)
+
+    if norm_dec is None or norm_act is None:
+        return False
+
+    if norm_dec != norm_act:
+        return False
+
+    if params_dec is not None and params_act is not None:
+        return params_dec == params_act
+
+    # One side specified parameters and the other was unparameterized:
+    # Deliberately treated as compatible (e.g. varchar(10) against VARCHAR).
+    return True
+
+
 def column_contract_divergence(
-    declared: dict[str, str | None], actual: dict[str, str | None]
+    declared: dict[str, str | None],
+    actual: dict[str, str | None],
+    connector: str | None = None,
 ) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
     """A declared column contract against what actually exists, in both
     directions, plus type mismatches where both sides state one.
 
     Shared between `transform plan`'s authored-SELECT-list comparison
-    (#214) and `maintain verify`'s built-relation comparison (#230): both
-    reduce to the same set math over a model's declared and actual columns,
-    and only differ in where each side's names and types come from.
+    (#214) and `maintain verify`'s built-relation comparison (#230, #1033):
+    both reduce to the same set math over a model's declared and actual
+    columns, and only differ in where each side's names and types come from.
 
     ``declared``/``actual`` are column name (already lowercased by the
     caller) -> its type, or ``None`` where the caller has no type for that
-    side -- a plan-time SELECT list names no types at all, so #214's caller
+    side: a plan-time SELECT list names no types at all, so #214's caller
     never passes one. Returns ``(missing, extra, mismatched)``: names in
     ``declared`` and not ``actual``, names in ``actual`` and not
     ``declared``, and ``(name, declared_type, actual_type)`` for a name both
-    sides state with a type that disagrees. A name whose type is absent on
-    either side is not a mismatch: absence is not evidence of a difference.
+    sides state with a type that disagrees under the connector's type
+    aliases (#1033). A name whose type is absent on either side is not a
+    mismatch: absence is not evidence of a difference.
     """
 
     missing = sorted(set(declared) - set(actual))
@@ -1353,7 +1850,7 @@ def column_contract_divergence(
         if (
             declared_type
             and actual_type
-            and declared_type.lower() != actual_type.lower()
+            and not types_equal(declared_type, actual_type, connector=connector)
         ):
             mismatched.append((name, declared_type, actual_type))
     return missing, extra, mismatched
@@ -1380,7 +1877,7 @@ def declared_meaning(
 
     dex = entry_meta(entry).get("dex")
     dex = dex if isinstance(dex, dict) else {}
-    population = _declared_population(dex.get("population"))
+    population = read_population(dex.get("population"))
 
     columns: dict[str, DeclaredColumnMeaning] = {}
     raw = entry.get("columns") if isinstance(entry, dict) else None
@@ -1419,37 +1916,6 @@ def declared_meaning(
         columns=columns,
         source=source,
     )
-
-
-def _declared_population(raw: Any) -> DeclaredPopulation | None:
-    if not isinstance(raw, dict):
-        return None
-    rule = raw.get("rule") if isinstance(raw.get("rule"), str) else None
-    filters: list[DeclaredPopulationFilter] = []
-    entries = raw.get("filters")
-    for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict) or not isinstance(entry.get("column"), str):
-            continue
-        includes = _scalar_values(entry.get("includes"))
-        excludes = _scalar_values(entry.get("excludes"))
-        if includes or excludes:
-            filters.append(
-                DeclaredPopulationFilter(
-                    column=entry["column"], includes=includes, excludes=excludes
-                )
-            )
-    if not (rule and rule.strip()) and not filters:
-        return None
-    return DeclaredPopulation(
-        rule=rule if rule and rule.strip() else None, filters=filters
-    )
-
-
-def _scalar_values(raw: Any) -> list[str | int | float | bool] | None:
-    if not isinstance(raw, list):
-        return None
-    kept = [value for value in raw if isinstance(value, str | int | float | bool)]
-    return kept or None
 
 
 def _parse_relation_ref(value: Any) -> str | None:
@@ -1796,7 +2262,7 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
 
 
 def _read_semantic_manifest(project: Path) -> tuple[dict[str, Any], str] | None:
-    return _read_semantic_manifest_file(project, SEMANTIC_MANIFEST_PATH)
+    return _read_semantic_manifest_file(project, semantic_manifest_file(project))
 
 
 @dataclass
@@ -1848,6 +2314,8 @@ def semantic_catalog(
     declares it rather than letting a short list read as the whole layer.
     """
 
+    from .guards.pii_meta import entry_meta
+
     read = _read_semantic_manifest(project)
     if read is None:
         raise DbtProjectError(
@@ -1884,6 +2352,7 @@ def semantic_catalog(
     # backends should not find one of them silent.
     words_by_definition: dict[tuple[str, str], dict[str, Any]] = {}
     custom_grains = _custom_granularities(manifest)
+    found: list[str] = []
 
     for entry in manifest.get("semantic_models") or []:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -2021,7 +2490,11 @@ def semantic_catalog(
             SemanticModelInfo(
                 name=model_name,
                 label=entry.get("label"),
-                description=entry.get("description"),
+                # Dex's generated population sentence is repository prose, not a
+                # screened result; the native catalogs omit it the same way.
+                description=catalog_description(
+                    entry.get("description"), entry_meta(entry), found
+                ),
                 model_ref=node_relation.get("alias")
                 or _parse_relation_ref(str(entry.get("model", ""))),
                 agg_time_dimension=agg_time,
@@ -2106,7 +2579,7 @@ def semantic_catalog(
         dimension_scope=(
             DIMENSIONS_PER_QUERYABLE_PATH if resolved else DIMENSIONS_PER_DECLARATION
         ),
-        notes=_catalog_notes(metrics),
+        notes=[*found, *_catalog_notes(metrics)],
         physical_columns=physical,
         # A token both maps resolve belongs to the column, which is the stronger
         # evidence: a bare name two models share can be a column on one of them.

@@ -414,7 +414,7 @@ def test_the_connector_reaches_the_semantic_layer(repo: Path):
 def test_several_documents_are_read_as_one_layer(tmp_path: Path):
     write(tmp_path, "one.ossie.yaml", reference_document())
     second = document(model("logistics", *[]))
-    second["semantic_model"][0]["datasets"] = [
+    second["datasets"] = [
         {
             "name": "shipments",
             "source": "demo.main.shipments",

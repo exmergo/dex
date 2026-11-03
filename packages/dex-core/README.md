@@ -109,6 +109,7 @@ Additional capabilities have their own extras:
 | `semantic-api` | Hosted dbt Cloud Semantic Layer discovery and queries |
 | `ossie` | Reading, validating, authoring, and maintaining native Apache Ossie documents |
 | `slayer` | SLayer model files, validated against one pinned SLayer release |
+| `cube` | Reading and authoring plain-YAML Cube model files, with no Node and no Cube server |
 | `cluster` | Bounded k-means exploration with `explore cluster` |
 | `all` | Every connector and optional capability above; a substantially larger install |
 
@@ -264,8 +265,8 @@ Other useful entry points:
 - `transform references <name>` finds uses across SQL, YAML, macros, and packages,
   reporting any limits to its analysis.
 - `transform rename`, `remove`, and `place` turn refactors into stored plans.
-- `semantic define|update|plan` authors dbt semantic YAML; `semantic ossie` and
-  `semantic slayer` author native documents. Apply all of them with
+- `semantic define|update|plan` authors dbt semantic YAML; `semantic ossie`,
+  `semantic slayer` and `semantic cube` author native documents. Apply all of them with
   `transform apply`.
 
 [Transform reference](https://docs.exmergo.com/dex/cli/transform) ·
@@ -304,6 +305,7 @@ Choose the layer in `.dex/config.yml` using `semantic.vendor` and
 | dbt Cloud | `vendor: dbt`, `deployment: dbt_cloud` | Reads and queries the hosted Semantic Layer API; dbt Cloud owns execution |
 | Apache Ossie | `vendor: ossie`, `deployment: local` | Reads native repository documents; catalog, authoring, and drift checks, with no query runtime |
 | SLayer | `vendor: slayer`, `deployment: local` | Reads configured model files; SLayer renders SQL and Dex executes it through its connector and cost guard |
+| Cube | `vendor: cube`, `deployment: local` | Reads and authors configured plain-YAML model files statically; catalog, authoring, and drift checks, with no query runtime yet |
 
 Discover the catalog before choosing a metric or filter. On a dbt layer, for
 example, with a declared `revenue` metric:
@@ -406,12 +408,14 @@ A hosted dbt Cloud token has its own provider:
 from exmergo_dex_core import DexConfig, DexEngine, SemanticSource
 
 # host, environment_id, and token_for_user come from your application.
-config = DexConfig(semantic={
-    "vendor": "dbt",
-    "deployment": "dbt_cloud",
-    "host": host,
-    "environment_id": environment_id,
-})
+config = DexConfig(
+    semantic={
+        "vendor": "dbt",
+        "deployment": "dbt_cloud",
+        "host": host,
+        "environment_id": environment_id,
+    }
+)
 
 with DexEngine(
     config=config,
@@ -537,4 +541,7 @@ or join the [community](https://www.exmergo.com/discord). To contribute, see
 and the [code of conduct](https://github.com/exmergo/dex/blob/main/CODE_OF_CONDUCT.md).
 
 Apache-2.0. See the [license](https://github.com/exmergo/dex/blob/main/LICENSE)
-and [NOTICE](https://github.com/exmergo/dex/blob/main/NOTICE).
+and [NOTICE](https://github.com/exmergo/dex/blob/main/NOTICE). Exmergo's
+distribution, documentation, support, and trademarks are covered by the
+[terms of service](https://www.exmergo.com/terms/dex), and Dex sends Exmergo
+nothing, as the [privacy policy](https://www.exmergo.com/privacy/dex) explains.

@@ -256,6 +256,21 @@ def test_a_vendor_change_compares_no_definitions(repo: Path, capsys):
 # --- grain drift ------------------------------------------------------------------
 
 
+def test_a_widened_categorical_column_is_caught(repo: Path, capsys):
+    """A SLayer model names its table, not a dbt model, and is re-counted (#912)."""
+
+    assert _cli(repo, capsys, "explore", "map")["_exit"] == 0
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "INSERT INTO customers VALUES (4, 'west')")
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    assert payload["_exit"] == 0, payload
+    finding = _finding(payload, "dimension_cardinality_changed", column="region")
+    assert finding["data"]["semantic_model"] == "customers"
+    assert finding["data"]["distinct_after"] == 4
+
+
 def test_a_declared_primary_key_that_lost_uniqueness_is_caught(repo: Path, capsys):
     _cli(repo, capsys, "maintain", "snapshot")
     _sql(repo, "INSERT INTO orders VALUES (4, 2, 1.0, 'paid', '2026-01-05')")

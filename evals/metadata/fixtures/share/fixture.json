@@ -1,0 +1,5 @@
+{
+  "name": "share",
+  "seed": 4923,
+  "description": "Regional product sales. A product's share of its region's revenue is a fraction (0 to 1) that sums to 1 within a region and must never be summed across regions."
+}

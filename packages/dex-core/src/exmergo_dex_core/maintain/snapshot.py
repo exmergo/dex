@@ -309,6 +309,24 @@ class RelationshipDef(BaseModel):
     cardinality: str | None = None
 
 
+class OpaqueDef(BaseModel):
+    """A definition only the vendor's compiler can read, fingerprinted by bytes.
+
+    Some formats hold definitions dex reads no structure out of (a Cube JS
+    model, a Jinja-templated file, an ``extends``). They are still part of the
+    layer, so the fingerprint records them by their content: a change is then
+    reported as a change, never read as nothing having moved, and never
+    compared structurally either. ``name`` identifies the definition (a file,
+    or ``file: element`` where only one element is opaque); ``reason`` says why
+    dex does not read it.
+    """
+
+    name: str
+    path: str
+    reason: str
+    content_sha256: str
+
+
 class SemanticLayerSnapshot(BaseModel):
     """The semantic layer's fingerprint: every named definition the project holds.
 
@@ -356,6 +374,11 @@ class SemanticLayerSnapshot(BaseModel):
     vendor: str | None = None
     vendor_release: str | None = None
     format_version: str | None = None
+    #: Definitions recorded by their bytes alone, and whether this layer records
+    #: them: a baseline pinned before they were captured carries the list empty,
+    #: which must not read as every one of them being new (#912).
+    opaque_definitions: list[OpaqueDef] = Field(default_factory=list)
+    opaque_captured: bool = False
     notes: list[str] = Field(default_factory=list)
 
 

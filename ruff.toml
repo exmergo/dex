@@ -28,6 +28,12 @@ select = [
 ignore = ["UP042"]
 
 [lint.per-file-ignores]
+# The metadata-quality eval (#492) is test tooling: it shells out to git, dbt and
+# the claude CLI with fixed argv (S603, S607), builds fixture tables whose names
+# come from its own committed generators (S608), seeds data deterministically
+# with `random` on purpose (S311), and asserts its own invariants (S101).
+"evals/metadata/**" = ["S101", "S311", "S603", "S607", "S608"]
+"evals/tests/test_metadata.py" = ["S101", "E501"]
 # Tests: assert is the pytest idiom (S101), and the safety-spine tests
 # deliberately assert that *any* exception is raised on a refused write (B017).
 "packages/dex-core/tests/**" = ["S101", "B017"]

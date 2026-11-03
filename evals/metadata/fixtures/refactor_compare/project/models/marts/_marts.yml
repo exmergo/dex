@@ -1,0 +1,32 @@
+version: 2
+models:
+  - name: account_user_summary
+    description: One row per account, with how many users it has and how many of them have a display name.
+    config:
+      meta:
+        dex:
+          grain: [account_id]
+          population:
+            rule: Every account, including accounts with no users.
+          assumptions:
+            - decision: Which accounts are in
+              chosen: every account, with zero counts where it has no users
+              evidence: request
+    columns:
+      - name: account_id
+        tests: [unique, not_null]
+        config:
+          meta:
+            dex: {role: key}
+      - name: account_name
+        config:
+          meta:
+            dex: {role: attribute}
+      - name: user_count
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, additivity: additive, unit: count}
+      - name: named_users
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, additivity: additive, unit: count}

@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "account_ticket_summary"
+  ],
+  "prompt": "Build a mart model `account_ticket_summary` in models/marts with one row per account: `account_id`, `account_name`, `ticket_count` (how many tickets the account has opened) and `last_ticket_opened_on` (the open date of its most recent ticket). Build it on dev when you are done."
+}

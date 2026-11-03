@@ -1,0 +1,29 @@
+# Fields named differently from the columns they expose. Keys and relationship
+# columns name fields, so dex has to resolve each through its field's
+# expression to reach the column a probe reads (upstream's Name Resolution).
+version: "0.2.0.dev0"
+name: renamed
+datasets:
+  - name: orders
+    source: demo.main.orders
+    primary_key: [order_id]
+    fields:
+      - name: order_id
+        expression:
+          sql: o_orderkey
+      - name: customer_id
+        expression:
+          sql: o_custkey
+  - name: customers
+    source: demo.main.customers
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          sql: c_custkey
+relationships:
+  - name: orders_to_customers
+    from: orders
+    to: customers
+    from_columns: [customer_id]
+    to_columns: [id]

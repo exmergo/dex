@@ -476,13 +476,60 @@ def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Pa
     assert mapped["data"]["pii_column_count"] == 6
 
 
+def test_control_flow_compilation_runs_from_the_installed_wheel(
+    wheel: str, tmp_path: Path
+):
+    """The compiler child and its dbt/agate dependencies must ship in [duckdb]."""
+
+    done = _run_isolated(
+        wheel,
+        r'''
+import contextlib
+import io
+import json
+from pathlib import Path
+from exmergo_dex_core.cli import main
+
+def run(*args):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        rc = main(list(args))
+    envelope = json.loads(output.getvalue())
+    assert rc == 0, envelope
+    return envelope["data"]
+
+run("demo")
+run("explore", "map")
+run("transform", "init", "analytics")
+sql = """{% if execute %}
+{% set counts = run_query('select count(*) as n from orders') %}
+{% else %}{% set counts = none %}{% endif %}
+{% for i in [1, 2] %}
+select {{ i }} as id, {% if execute %}{{ counts.rows[0][0] }}{% else %}0{% endif %} as n
+{% if not loop.last %} union all {% endif %}
+{% endfor %}
+"""
+Path("edits.json").write_text(json.dumps({"edits": [{
+    "path": "models/control_flow.sql", "kind": "model_sql", "content": sql,
+}]}))
+planned = run("transform", "plan", "installed compiler", "--edits-file", "edits.json")
+run("transform", "apply", planned["plan_id"])
+assert Path("analytics/models/control_flow.sql").read_text() == sql
+built = run("transform", "build", "--target", "dev")
+assert built["outcome"] == "validated", built
+''',
+        extras=["duckdb"],
+        cwd=tmp_path,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
     """`dex` is a console script the wheel declares, and every agent wrapper
     invokes it expecting exactly one JSON envelope on stdout and nothing else.
 
-    `viz preview` is the command to prove that with: it is scaffolded against
-    the contract but not yet implemented, so it returns a real envelope without
-    needing a warehouse, a config, or a credential.
+    `procedure` returns the packaged agent instructions without needing a
+    warehouse, a config, or a credential.
     """
 
     import json
@@ -496,8 +543,7 @@ def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
             "--with",
             wheel,
             "dex",
-            "viz",
-            "preview",
+            "procedure",
         ],
         capture_output=True,
         text=True,
@@ -505,8 +551,9 @@ def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
     assert done.returncode == 0, done.stderr
     assert done.stdout.count("\n") == 1, "exactly one line on stdout"
     envelope = json.loads(done.stdout)
-    assert envelope["status"] == "not_implemented"
-    assert envelope["data"]["command"] == "viz preview"
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["text"].startswith("## Procedure")
+    assert envelope["data"]["digest"]
 
 
 def test_the_wheel_ships_the_typed_marker(wheel: str):
@@ -547,6 +594,18 @@ def test_the_wheel_ships_the_host_conformance_vectors(wheel: str):
         "the package has the reader and none of the fixtures"
     )
     assert any(n.endswith("plan-valid.json") for n in vectors), sorted(vectors)[:10]
+
+
+def test_the_wheel_ships_the_agent_procedure(wheel: str):
+    """`dex procedure` reads its text from package data (#502). A wheel without
+    it would answer every agent with a FileNotFoundError, and the PyPI install
+    is exactly the surface that has no SKILL.md to fall back on."""
+
+    import zipfile
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    assert "exmergo_dex_core/procedure/procedure.md" in names
 
 
 def test_the_host_boundary_is_reachable_on_a_bare_install(wheel: str):
@@ -1434,23 +1493,22 @@ def test_selecting_ossie_without_its_extra_refuses_by_name(wheel: str):
 # import probe cannot see it.
 
 OSSIE_DOCUMENT = """version: "0.2.0.dev0"
-semantic_model:
-  - name: shop
-    datasets:
-      - name: orders
-        source: demo.main.orders
-        primary_key: [order_id]
-        fields:
-          - name: order_id
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_id
-          - name: net_total
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: order_total - discount
+name: shop
+datasets:
+  - name: orders
+    source: demo.main.orders
+    primary_key: [order_id]
+    fields:
+      - name: order_id
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_id
+      - name: net_total
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: order_total - discount
 """
 
 OSSIE_CONFIG = """connector: duckdb
@@ -1487,7 +1545,8 @@ def test_a_base_install_imports_no_reader_and_no_optional_dependency(wheel: str)
         "watched = ('jsonschema', 'sqlglot', 'dbt', 'metricflow', 'slayer')\n"
         "print(sorted({m.split('.')[0] for m in sys.modules "
         "if m.startswith(watched)}))\n"
-        "assert 'exmergo_dex_core.ossie' not in sys.modules\n",
+        "assert 'exmergo_dex_core.ossie' not in sys.modules\n"
+        "assert 'exmergo_dex_core.cube' not in sys.modules\n",
     )
 
     assert done.returncode == 0, done.stderr
@@ -1776,6 +1835,101 @@ def test_the_slayer_extra_installs_the_pinned_release_inside_the_dialect_bounds(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "SlayerSemanticLayer"
+
+
+# --- the Cube install boundary, from an actual wheel ---------------------------
+#
+# `[cube]` is the dialect engine and nothing Cube ships: the reader is dex's own.
+# A base install refuses `vendor: cube` by name without importing sqlglot, and
+# still validates the configuration; the extra catalogs a layer with no server.
+
+CUBE_CONFIG = """connector: duckdb
+semantic:
+  vendor: cube
+  cube:
+    files:
+      - model/orders.yml
+"""
+
+CUBE_MODEL = """cubes:
+  - name: orders
+    sql_table: demo.main.orders
+    dimensions:
+      - name: order_id
+        sql: "{CUBE}.order_id"
+        type: number
+        primary_key: true
+    measures:
+      - name: order_count
+        type: count
+"""
+
+
+def _cube_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "cube_repo"
+    (root / ".dex").mkdir(parents=True)
+    (root / "model").mkdir()
+    (root / ".dex" / "config.yml").write_text(CUBE_CONFIG, encoding="utf-8")
+    (root / "model" / "orders.yml").write_text(CUBE_MODEL, encoding="utf-8")
+    return root
+
+
+def test_a_base_install_refuses_cube_by_name_and_imports_no_dialect_engine(
+    wheel: str, tmp_path: Path
+):
+    root = _cube_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import sys\n"
+        "from exmergo_dex_core import CubeDependencyError, DexEngine\n"
+        "from exmergo_dex_core.envelope import Reason, reason_for\n"
+        f"engine = DexEngine.from_repo({str(root)!r})\n"
+        "assert engine.config.semantic.cube.files\n"
+        "try:\n"
+        "    engine.semantic_catalog_source()\n"
+        "except CubeDependencyError as exc:\n"
+        "    assert 'exmergo-dex-core[cube]' in str(exc), exc\n"
+        "    assert reason_for(exc) is Reason.PREREQUISITE\n"
+        "    print('refused')\n"
+        "assert 'sqlglot' not in sys.modules\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "refused"
+
+
+def test_config_validate_reads_a_cube_block_on_a_base_install(
+    wheel: str, tmp_path: Path
+):
+    root = _cube_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'config', 'validate'], "
+        "capture_output=True, text=True).stdout\n"
+        "print(json.loads(out)['status'])\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
+def test_the_cube_extra_catalogs_a_layer_with_no_server(wheel: str, tmp_path: Path):
+    root = _cube_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'explore', 'semantic', 'list'], "
+        "capture_output=True, text=True).stdout\n"
+        "data = json.loads(out)['data']\n"
+        "print(data['vendor'], [m['name'] for m in data['metrics']])\n",
+        extras=["cube"],
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "cube ['orders.order_count']"
 
 
 def test_the_bundled_source_builds_at_the_pinned_release(tmp_path: Path):

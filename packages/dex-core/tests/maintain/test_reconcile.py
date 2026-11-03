@@ -3,12 +3,68 @@ applied through `transform apply`, never written by reconcile itself."""
 
 from __future__ import annotations
 
+import pytest
+
 
 def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for proposal in payload["data"]["proposals"]:
         grouped.setdefault(proposal["axis"], []).append(proposal)
     return grouped
+
+
+def test_cardinality_contraction_advice_does_not_invent_a_new_value():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison.page",
+        detail="dimension 'page' narrowed: ~80 -> 77 distinct values",
+        exact=False,
+        data={"distinct_before": 80, "distinct_after": 77},
+    )
+
+    action = _advisory(finding).action
+    assert "missing categories" in action
+    assert "new categorical value" not in action
+    assert "approximate" in action
+
+
+def test_cardinality_expansion_advice_does_not_claim_a_specific_new_value():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison.page",
+        detail="dimension 'page' expanded: 77 -> 80 distinct values",
+        data={"distinct_before": 77, "distinct_after": 80},
+    )
+
+    action = _advisory(finding).action
+    assert "additional categories" in action
+    assert "new categorical value" not in action
+    assert "approximate" not in action
+
+
+def test_cardinality_advice_without_counts_stays_neutral():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        detail="cardinality changed",
+        data={},
+    )
+
+    action = _advisory(finding).action
+    assert "population changed" in action
+    assert "missing categories" not in action
+    assert "additional categories" not in action
 
 
 _INTENDED_CHURN = (
@@ -1091,3 +1147,39 @@ def test_a_declaration_spelled_in_another_case_is_still_the_column(maintain_repo
 
     assert payload["data"]["mechanical_count"] == 1
     assert "-      - name: STATUS" in _diff(payload, _STG_YML)["unified"]
+
+
+@pytest.mark.parametrize(
+    ("vendor", "command"),
+    [
+        ("dbt", "semantic update"),
+        (None, "semantic update"),
+        ("ossie", "semantic ossie update"),
+        ("slayer", "semantic slayer update"),
+        ("cube", "semantic cube update"),
+    ],
+)
+def test_dangling_reference_names_the_vendor_authoring_command(vendor, command):
+    """#974: name the vendor's own authoring command, not dbt's."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dangling_reference",
+        identifier="orders.revenue",
+        detail="metric references a measure that is gone",
+    )
+    action = _advisory(finding, semantic_vendor=vendor).action
+    assert f"`{command}`" in action
+    if command != "semantic update":
+        assert "`semantic update`" not in action
+    assert "restore the model/column it references" in action
+
+
+def test_semantic_update_command_helper():
+    from exmergo_dex_core.maintain.reconcile import _semantic_update_command
+
+    assert _semantic_update_command("dbt") == "semantic update"
+    assert _semantic_update_command("OSSIE") == "semantic ossie update"
+    assert _semantic_update_command(None) == "semantic update"

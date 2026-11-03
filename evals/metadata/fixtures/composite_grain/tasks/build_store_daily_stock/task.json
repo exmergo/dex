@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "store_daily_stock"
+  ],
+  "prompt": "Build a mart model `store_daily_stock` in models/marts with one row per store per day: `store_id`, `snapshot_date`, `units_on_hand` (total units across all SKUs) and `skus_in_stock` (how many SKUs have at least one unit). Build it on dev when you are done."
+}

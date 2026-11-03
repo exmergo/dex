@@ -176,8 +176,8 @@ def probe_sql(identifier: str, candidate: CumulativeCandidate) -> str:
     """Aggregate-only SQL (DuckDB-flavored; transpiled per dialect by
     :func:`probe_statements`) computing, for every measure in one pass, the
     fraction of within-entity consecutive observations where the value
-    decreased. Never projects a measure's own value: each is only compared,
-    inside a ``CASE WHEN``, to its own lag."""
+    decreased, ignoring ties. Never projects a measure's own value: each is
+    only compared, inside a ``CASE WHEN``, to its own lag."""
 
     table = _quote_identifier(identifier)
     entity = _quote_part(candidate.entity)
@@ -194,7 +194,7 @@ def probe_sql(identifier: str, candidate: CumulativeCandidate) -> str:
         )
         counts.append(
             f"COUNT(CASE WHEN {prev} IS NOT NULL AND {cur} IS NOT NULL "
-            f"THEN 1 END) AS obs_{i}, "
+            f"AND {cur} != {prev} THEN 1 END) AS obs_{i}, "
             f"COUNT(CASE WHEN {prev} IS NOT NULL AND {cur} IS NOT NULL "
             f"AND {cur} < {prev} THEN 1 END) AS dec_{i}"
         )

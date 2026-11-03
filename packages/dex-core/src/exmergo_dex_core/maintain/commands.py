@@ -869,11 +869,11 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
         row_count = numbers.get("row_population", (0.0, 0))[1]
         join_count = numbers.get("join_contract", (0.0, 0))[1]
         facts_count = numbers.get("declared_facts", (0.0, 0))[1]
-        bought = f"{row_count} row count(s) and {join_count} join overlap probe(s)"
+        bought = f"{row_count} row count(s) and {join_count} join coverage statement(s)"
         judged = "row loss, fanout, and a broken or sparse join"
         if facts_count:
             bought = (
-                f"{row_count} row count(s), {join_count} join overlap probe(s) "
+                f"{row_count} row count(s), {join_count} join coverage statement(s) "
                 f"and {facts_count} declared-fact check(s)"
             )
             judged = (
@@ -909,7 +909,12 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
     return asker("row_population"), asker("join_contract"), asker("declared_facts")
 
 
-def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
+def verify(
+    engine: DexEngine,
+    objects: list[str] | None = None,
+    *,
+    target: str | None = None,
+) -> VerifyResult:
     """Is the project correct right now, with no baseline required (#224).
 
     Six finding classes. Build-status gaps (#225) read the compiled manifest
@@ -951,9 +956,24 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     seam: missing relations and grain. Checks that specifically read dbt's
     ``target/`` artifacts are suppressed by name rather than preventing those
     portable checks from running.
+
+    ``target`` is dev-target only (#715): passing ``target='dev'`` reads the dev
+    namespace for the length of the command, judging models built into dev
+    without editing the source allowlist. Prod-looking targets are refused.
     """
 
     from pathlib import Path
+
+    reads_dev_target = False
+    effective_target = target
+    if target is not None:
+        from ..transform.build import assert_dev_target
+
+        assert_dev_target(target, engine.config.dbt_target)
+        reads_dev_target = True
+
+    manifest_target: str | None = None
+    judged_namespace: str | None = None
 
     project, project_reason = _read_project(engine)
     if project is None:
@@ -970,6 +990,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "compile": reason,
             },
             warnings=[f"maintain verify could not read the project format: {reason}"],
+            target=effective_target,
         )
 
     definitions = project.definitions()
@@ -1006,6 +1027,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             f"{artifact_reason}"
         )
     if project_dir is not None:
+        manifest_target = verify_mod.read_manifest_target(project_dir)
         compile_finding, compile_notes = verify_mod.compile_check(project_dir)
         if compile_finding is not None:
             findings.append(compile_finding)
@@ -1026,6 +1048,8 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                     "grain and join-contract findings suppressed: the project "
                     "does not compile, so its manifest cannot be trusted"
                 ],
+                target=effective_target,
+                manifest_target=manifest_target,
             )
             return result
 
@@ -1049,6 +1073,9 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     cost = None
     adapter = None
     offer = None
+    join_coverage: list[dict] | None = None
+    parent_population: list[dict] | None = None
+    temporal_contracts: list[dict] | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
@@ -1071,7 +1098,10 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 if label.split(".", 1)[0].lower() in wanted
             }
         try:
-            adapter = engine._adapter("maintain verify")
+            if reads_dev_target:
+                adapter = engine._adapter("maintain verify", reads_dev_target=True)
+            else:
+                adapter = engine._adapter("maintain verify")
         except DexError as exc:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
             suppressed["grain"] = f"warehouse unreachable: {exc}"
@@ -1086,11 +1116,65 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             cost = command_args.preflight_cost(adapter)
             live = adapter.list_objects()
             already = {f.identifier for f in findings if f.identifier}
-            findings.extend(
-                verify_mod.missing_relation_findings(
-                    model_relations, [o.identifier for o in live], already
+            from .. import connect
+
+            dev_scope = (
+                connect.dev_target_scope(
+                    adapter.name, getattr(engine.config, adapter.name, None)
                 )
+                if adapter is not None
+                else None
             )
+            live_namespaces = sorted(
+                {o.identifier.rsplit(".", 1)[0] for o in live if "." in o.identifier}
+            )
+            if reads_dev_target:
+                judged_namespace = dev_scope or (
+                    ", ".join(live_namespaces) if live_namespaces else "dev"
+                )
+            else:
+                adapter_target = getattr(adapter, "target", None)
+                target_schemas = getattr(adapter_target, "schemas", None)
+                judged_namespace = (
+                    ", ".join(live_namespaces)
+                    if live_namespaces
+                    else (
+                        ", ".join(target_schemas)
+                        if target_schemas is not None
+                        else None
+                    )
+                ) or None
+
+            relation_findings, relation_notes = verify_mod.missing_relation_findings(
+                model_relations,
+                [o.identifier for o in live],
+                already,
+                dev_scope=dev_scope,
+                judged_namespace=judged_namespace,
+                manifest_target=manifest_target,
+                reads_dev_target=reads_dev_target,
+            )
+            findings.extend(relation_findings)
+            notes.extend(relation_notes)
+            if (
+                not reads_dev_target
+                and model_relations
+                and not relation_findings
+                and relation_notes
+            ):
+                target_hint = "maintain verify --target dev"
+                ns_desc = f" ({judged_namespace})" if judged_namespace else ""
+                dev_desc = dev_scope or "dev"
+                suppressed["no_relation"] = (
+                    f"manifest relations resolve into the dev namespace ({dev_desc}), "
+                    f"which is outside the judged namespace{ns_desc}; "
+                    f"re-run with `{target_hint}` to verify dev models"
+                )
+                warnings.append(
+                    f"maintain verify judged namespace '{judged_namespace or 'prod'}'; "
+                    "all models resolve into the dev namespace, re-run with "
+                    f"`{target_hint}`"
+                )
             # A declared grain is counted with the other declared facts, in the
             # one priced statement per relation; the grain axis keeps every
             # other source, and the models no compiled manifest could carry.
@@ -1099,6 +1183,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 if project_dir is not None
                 else ([], [])
             )
+            proven_grains: dict[str, dict] = {}
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1106,6 +1191,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 live,
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
+                proven=proven_grains,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1154,7 +1240,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 warnings.extend(row_warnings)
                 if row_reason is not None:
                     suppressed["row_population"] = row_reason
-                join_findings, join_warnings, join_reason, join_offer = _join_contract(
+                join = _join_contract(
                     engine,
                     project_dir,
                     adapter,
@@ -1163,10 +1249,16 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                     scope=wanted,
                     handshake=join_ask,
                 )
-                findings.extend(join_findings)
-                warnings.extend(join_warnings)
-                if join_reason is not None:
-                    suppressed["join_contract"] = join_reason
+                findings.extend(join.findings)
+                warnings.extend(join.notes)
+                join_coverage = join.records
+                join_offer = join.offer
+                if not join.records:
+                    suppressed["join_contract"] = (
+                        join.notes[0]
+                        if join.notes
+                        else "no model in scope writes an equality join"
+                    )
                 facts = facts_mod.findings(
                     adapter,
                     prepared,
@@ -1177,6 +1269,13 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 )
                 findings.extend(facts.findings)
                 warnings.extend(facts_plan_notes + facts.notes)
+                parent_population = facts.parent_coverage
+                temporal_contracts = facts.temporal_contracts
+                # Every grain is judged by now, so a fan-out on a model whose
+                # declared grain held is ranked as the expansion it is (#841).
+                findings = verify_mod.damp_fanout(
+                    findings, {**proven_grains, **facts.proven_grains}
+                )
                 # No manifest is the more specific reason than "nothing declared".
                 for finding_class, reason in facts.suppressed.items():
                     suppressed[finding_class] = (
@@ -1189,11 +1288,19 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     if wanted:
         findings = [f for f in findings if (f.identifier or "").lower() in wanted]
 
+    if wanted and join_coverage is not None:
+        join_coverage = [r for r in join_coverage if r["model"].lower() in wanted]
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
         notes=notes,
         warnings=warnings,
+        target=effective_target,
+        judged_namespace=judged_namespace,
+        manifest_target=manifest_target,
+        join_coverage=join_coverage,
+        parent_population=parent_population,
+        temporal_contracts=temporal_contracts,
     )
     if cost is not None:
         result.cost = cost
@@ -1250,6 +1357,7 @@ def _grain_contract(
     *,
     scope=None,
     counted_elsewhere: set[str] | None = None,
+    proven: dict[str, dict] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1287,6 +1395,7 @@ def _grain_contract(
         model_relations,
         [o.identifier for o in live],
         scoped_models,
+        proven=proven,
     )
     return findings, notes, None
 
@@ -1300,7 +1409,7 @@ def _join_contract(
     *,
     scope=None,
     handshake=None,
-):
+) -> verify_mod.JoinContractResult:
     """The join-contract half of `maintain verify`, end to end (#228).
 
     Has a cost decision, unlike column contract or grain beside it: the
@@ -1313,18 +1422,38 @@ def _join_contract(
     the first in ``VerifyResult.pending_offer``.
     """
 
-    candidates, plan_notes = verify_mod.join_contract_plan(
-        project_dir, adapter.dialect, scope=scope
-    )
-    findings, finding_notes, offer = verify_mod.join_contract_findings(
+    plan = verify_mod.plan_join_contract(project_dir, adapter.dialect, scope=scope)
+    return verify_mod.join_coverage(
         adapter,
-        candidates,
+        plan,
         model_relations,
         [o.identifier for o in live],
         timeout_seconds=engine.config.query.timeout_seconds,
         handshake=handshake,
+        baseline=null_baseline(engine),
     )
-    return findings, plan_notes + finding_notes, None, offer
+
+
+def null_baseline(engine: DexEngine) -> dict[str, tuple[str | None, dict]] | None:
+    """Each cached profile's per-column NULL fractions, keyed by identifier: the
+    comparable baseline a column the join supplies is judged newly NULL against
+    (#857). ``None`` when there is no readable cache, which leaves such a column
+    listed on its join's record rather than reported."""
+
+    try:
+        cache = engine.store.load_cache()
+    except Exception:  # an unreadable cache is no baseline
+        return None
+    if cache is None:
+        return None
+    return {
+        dataset.identifier: (
+            dataset.profiled_at,
+            {c.name.lower(): c.null_fraction for c in dataset.columns},
+        )
+        for dataset in cache.datasets
+        if dataset.profiled_at and dataset.columns
+    }
 
 
 def _row_population(
@@ -1390,7 +1519,13 @@ def _row_population(
 
 
 def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return to_envelope(verify(engine, getattr(args, "objects", None)))
+    return to_envelope(
+        verify(
+            engine,
+            getattr(args, "objects", None),
+            target=getattr(args, "target", None),
+        )
+    )
 
 
 def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
@@ -1647,6 +1782,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         return result
 
     probes = drift_mod.run_batched_probes(adapter, batched)
+    planned_notes = len(plan.notes)
     grain_findings = drift_mod.grain_drift(
         adapter,
         plan,
@@ -1654,6 +1790,8 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         min_rows=config.maintain.grain_min_rows,
         probes=probes,
     )
+    # What the run itself could not judge, said after the plan's own notes.
+    warnings.extend(plan.notes[planned_notes:])
     semantic_findings = semantic_findings + _semantic_scope(
         drift_mod.cardinality_drift(adapter, checks, current_semantic, probes),
         scope_names,
@@ -1738,6 +1876,10 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     project, no_project = _read_project(engine)
     editable = project if isinstance(project, EditableProject) else None
     view = None
+    # A semantic vendor answers for the schema findings it produced itself,
+    # because only it knows how to take a column out of its own document and
+    # what else goes with it. Everything else takes the project's route.
+    semantic_source, _ = _semantic_schema_source(engine)
     if no_project is not None:
         # Its own sentence rather than the write-tier one below: a format that
         # could not be built declined nothing, and telling someone their format
@@ -1779,7 +1921,19 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         try:
             view = editable.load()
         except (ProjectError, ValueError) as exc:
-            raise ProjectError(f"reconcile edits a project: {exc}") from exc
+            # A repository whose only layer is a semantic one (#912) still has
+            # that layer's own findings to reconcile, through its own route;
+            # only the project's half has nowhere to land.
+            if not any(
+                semantic_source is not None and semantic_source.handles_finding(f)
+                for f in findings
+            ):
+                raise ProjectError(f"reconcile edits a project: {exc}") from exc
+            warnings.append(
+                f"no transformation project to edit ({exc}), so every proposal "
+                "for it below is advisory; the semantic layer's own findings are "
+                "planned through its own route"
+            )
 
     # Hoisted rather than inlined into the call: this load can now refuse, and a
     # refusal raised from inside an argument list reads as though `build` did it.
@@ -1794,10 +1948,6 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # Ossie already covers via a declared composite is not suggested as if
     # nothing declared it.
     definitions = _composed_definitions(engine, project)
-    # A semantic vendor answers for the schema findings it produced itself,
-    # because only it knows how to take a column out of its own document and
-    # what else goes with it. Everything else takes the project's route.
-    semantic_source, _ = _semantic_schema_source(engine)
     semantic_findings = [
         f
         for f in findings

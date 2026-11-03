@@ -12,6 +12,7 @@ only opener, so credential discovery and the cost gate have exactly one seam.
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +23,7 @@ from .config import CONFIG_FILE
 from .envelope import Cost
 from .guards.cost_guard import (
     SUGGESTED_SESSION_CEILING_MULTIPLE,
+    UPTIME_LINE,
     ConfirmationRequiredError,
     CostGate,
     OverCeilingError,
@@ -211,6 +213,35 @@ def upper_bound_notes(
     ]
 
 
+def with_uptime(
+    adapter: Adapter, estimate: float, per_table: dict[str, float] | None
+) -> tuple[float, dict[str, float] | None, Any]:
+    """Add the warehouse's uptime overhead to an estimate a handshake is about
+    to show, once per command (issues #656, #936).
+
+    The overhead (Snowflake's resume minimum and idle tail) belongs to the
+    command, not to any statement, so the estimators leave it out and the two
+    handshakes add it here: whichever priced phase the caller actually sees
+    carries it, and a phase priced and then discarded cannot take it. A caller
+    that already broke it out as :data:`UPTIME_LINE` (a build, mutation
+    coverage) is left as it is. Returns the estimate, the breakdown, and the
+    uptime model to :meth:`admit` once the gate has admitted the estimate, or
+    ``None`` on a connector that bills no uptime.
+    """
+
+    uptime = getattr(adapter, "warehouse_uptime", None)
+    if uptime is None:
+        return estimate, per_table, None
+    if per_table is not None and UPTIME_LINE in per_table:
+        return estimate, per_table, uptime
+    overhead = uptime.quote()
+    if overhead <= 0:
+        return estimate, per_table, uptime
+    if per_table is not None:
+        per_table = {UPTIME_LINE: overhead, **per_table}
+    return estimate + overhead, per_table, uptime
+
+
 def billed_handshake(
     command: str,
     adapter: Adapter,
@@ -244,6 +275,7 @@ def billed_handshake(
     gate = cost_gate(adapter)
     if gate is None:
         return
+    estimate, per_table, uptime = with_uptime(adapter, estimate, per_table)
     # What a connector can say about the composition of the estimate it just
     # priced, asked once and used by both refusals below. Only this handshake
     # asks: it is the one whose estimate the connector's profile pricing built,
@@ -336,6 +368,8 @@ def billed_handshake(
             cost=exc.cost, data=data, warnings=gate.warnings()
         )
         raise
+    if uptime is not None:
+        uptime.admit()
 
 
 def confirmation_request(
@@ -367,13 +401,52 @@ def confirmation_request(
     return None
 
 
+def _render_phase_hint(
+    hint: Callable[..., str],
+    cost: float,
+    paradigm: str,
+    budget: int,
+    *,
+    confirmed: bool,
+) -> str:
+    """Format a phase checkpoint hint, passing ``confirmed`` if the hint accepts it."""
+
+    try:
+        sig = inspect.signature(hint)
+        if "confirmed" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            return hint(cost, paradigm, budget, confirmed=confirmed)
+        if any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+        ):
+            return hint(cost, paradigm, budget)
+        positional_count = sum(
+            1
+            for p in sig.parameters.values()
+            if p.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
+        if positional_count >= 4:
+            return hint(cost, paradigm, budget, confirmed)
+        return hint(cost, paradigm, budget)
+    except (ValueError, TypeError):
+        try:
+            return hint(cost, paradigm, budget, confirmed=confirmed)
+        except TypeError:
+            return hint(cost, paradigm, budget)
+
+
 def phase_handshake(
     command: str,
     adapter: Adapter,
     estimate: float,
     *,
     phase: str,
-    hint: Callable[[float, str, int], str],
+    hint: Callable[..., str],
     per_table_key: str | None = None,
     extra: dict[str, Any] | None = None,
     notes: list[str] | None = None,
@@ -404,10 +477,12 @@ def phase_handshake(
     gate = cost_gate(adapter)
     if gate is None or skip:
         return None
+    phase_lines = {per_table_key: estimate} if per_table_key else None
+    estimate, phase_lines, uptime = with_uptime(adapter, estimate, phase_lines)
     try:
         gate.preflight_phase(estimate)
     except ConfirmationRequiredError as exc:
-        per_table = {per_table_key: estimate} if per_table_key else None
+        per_table = phase_lines if per_table_key else None
         describe = getattr(adapter, "describe_estimate", None)
         if describe is not None:
             data = {"command": command, **describe(estimate, per_table)}
@@ -423,8 +498,12 @@ def phase_handshake(
             {
                 "phase": phase,
                 **(extra or {}),
-                "hint": hint(
-                    estimate, gate.paradigm.value, math.ceil(exc.cost.estimate)
+                "hint": _render_phase_hint(
+                    hint,
+                    estimate,
+                    gate.paradigm.value,
+                    math.ceil(exc.cost.estimate),
+                    confirmed=gate.confirmed,
                 ),
             }
         )
@@ -447,6 +526,8 @@ def phase_handshake(
         if extra_notes:
             data["notes"] = [*data.get("notes", []), *extra_notes]
         return ConfirmationRequest(cost=exc.cost, data=data)
+    if uptime is not None:
+        uptime.admit()
     return None
 
 
@@ -466,6 +547,22 @@ def verify_handshake(
     ``pending_confirmation``, because ``--verify`` is work it was asked for.
     """
 
+    def hint(cost: float, paradigm: str, budget: int, confirmed: bool = True) -> str:
+        condition = (
+            "beyond what remains of the confirmed budget"
+            if confirmed
+            else "and needs confirming"
+        )
+        re_run_note = " (a re-run re-profiles first)" if confirmed else ""
+        return (
+            f"found {candidate_count} candidate relationship(s) across "
+            f"{object_count} object(s); verifying them all is estimated "
+            f"at {cost:.0f} {paradigm} {condition}. Profiles and unverified "
+            "relationships are already saved to the exploration cache; "
+            f"re-run the same command with --confirm --budget {budget} "
+            f"to profile and verify in one pass{re_run_note}"
+        )
+
     return phase_handshake(
         command,
         adapter,
@@ -476,15 +573,7 @@ def verify_handshake(
         per_table_key="(join overlap probes)",
         extra={"candidate_count": candidate_count, "object_count": object_count},
         skip=candidate_count == 0,
-        hint=lambda cost, paradigm, budget: (
-            f"found {candidate_count} candidate relationship(s) across "
-            f"{object_count} object(s); verifying them all is estimated "
-            f"at {cost:.0f} {paradigm} beyond what "
-            "remains of the confirmed budget. Profiles and unverified "
-            "relationships are already saved to the exploration cache; "
-            f"re-run the same command with --confirm --budget {budget} "
-            "to profile and verify in one pass (a re-run re-profiles first)"
-        ),
+        hint=hint,
     )
 
 
@@ -510,6 +599,23 @@ def overlap_handshake(
     capped slice of it.
     """
 
+    def hint(cost: float, paradigm: str, budget: int, confirmed: bool = True) -> str:
+        condition = (
+            "beyond what remains of the confirmed budget"
+            if confirmed
+            else "and needs confirming"
+        )
+        re_run_note = " (a re-run re-profiles first)" if confirmed else ""
+        return (
+            f"found {candidate_count} unmatched key-shaped column "
+            f"pair(s) across {object_count} object(s) to probe for "
+            f"value overlap; probing them all is estimated at "
+            f"{cost:.0f} {paradigm} {condition}. Relationships found so "
+            "far are already saved to the exploration cache; re-run "
+            f"the same command with --confirm --budget {budget} to "
+            f"profile, infer, and sweep in one pass{re_run_note}"
+        )
+
     return phase_handshake(
         command,
         adapter,
@@ -523,17 +629,7 @@ def overlap_handshake(
             "elided": elided,
         },
         skip=candidate_count == 0,
-        hint=lambda cost, paradigm, budget: (
-            f"found {candidate_count} unmatched key-shaped column "
-            f"pair(s) across {object_count} object(s) to probe for "
-            f"value overlap; probing them all is estimated at "
-            f"{cost:.0f} {paradigm} beyond what "
-            "remains of the confirmed budget. Relationships found so "
-            "far are already saved to the exploration cache; re-run "
-            f"the same command with --confirm --budget {budget} to "
-            "profile, infer, and sweep in one pass (a re-run re-profiles "
-            "first)"
-        ),
+        hint=hint,
     )
 
 
@@ -549,6 +645,23 @@ def cumulative_handshake(
     can only be priced once profiling has found an entity/temporal pair to
     test."""
 
+    def hint(cost: float, paradigm: str, budget: int, confirmed: bool = True) -> str:
+        condition = (
+            "beyond what remains of the confirmed budget"
+            if confirmed
+            else "and needs confirming"
+        )
+        re_run_note = " (a re-run re-profiles first)" if confirmed else ""
+        return (
+            f"found {candidate_count} entity/temporal candidate(s) "
+            f"across {object_count} object(s); checking them all for "
+            f"cumulative measures is estimated at {cost:.0f} "
+            f"{paradigm} {condition}. Profiles are already saved to the "
+            "exploration cache; re-run the same command with "
+            f"--confirm --budget {budget} to "
+            f"profile and check in one pass{re_run_note}"
+        )
+
     return phase_handshake(
         command,
         adapter,
@@ -557,17 +670,7 @@ def cumulative_handshake(
         per_table_key="(cumulative-measure probes)",
         extra={"candidate_count": candidate_count, "object_count": object_count},
         skip=candidate_count == 0,
-        hint=lambda cost, paradigm, budget: (
-            f"found {candidate_count} entity/temporal candidate(s) "
-            f"across {object_count} object(s); checking them all for "
-            f"cumulative measures is estimated at {cost:.0f} "
-            f"{paradigm} beyond what remains of the "
-            "confirmed budget. Profiles are already saved to the "
-            "exploration cache; re-run the same command with "
-            f"--confirm --budget {budget} to "
-            "profile and check in one pass (a re-run re-profiles "
-            "first)"
-        ),
+        hint=hint,
     )
 
 
@@ -585,20 +688,27 @@ def sample_handshake(
     per-table breakdown: one statement over one object is not a breakdown.
     """
 
+    def hint(cost: float, paradigm: str, budget: int, confirmed: bool = True) -> str:
+        condition = (
+            "beyond what remains of the confirmed budget"
+            if confirmed
+            else "and needs confirming"
+        )
+        return (
+            "the profile this command needed is done and saved; the "
+            f"sample scan is estimated at {cost:.0f} "
+            f"{paradigm} {condition}. Re-run with --confirm --budget {budget}; "
+            "the cached profile is reused, so the re-run pays for the "
+            "sample alone"
+        )
+
     return phase_handshake(
         command,
         adapter,
         estimate,
         phase="sample",
         notes=notes,
-        hint=lambda cost, paradigm, budget: (
-            "the profile this command needed is done and saved; the "
-            f"sample scan is estimated at {cost:.0f} "
-            f"{paradigm} beyond what remains of the confirmed "
-            f"budget. Re-run with --confirm --budget {budget}; "
-            "the cached profile is reused, so the re-run pays for the "
-            "sample alone"
-        ),
+        hint=hint,
     )
 
 

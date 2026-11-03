@@ -49,7 +49,8 @@
 # admin `snow` connection; the default connection is used otherwise.
 #
 # Overrides via environment: DEX_CI_REPO (owner/name),
-# DEX_CI_CREDIT_QUOTA (monthly credits before the monitor suspends, default 5),
+# DEX_CI_CREDIT_QUOTA (monthly credits before the monitor suspends, default 15;
+# applies only when the monitor is created, so change an existing one with ALTER),
 # DEX_CI_STATEMENT_TIMEOUT (warehouse-level seconds, default 600).
 
 set -euo pipefail
@@ -62,7 +63,7 @@ if [[ -z "$ACCOUNT" ]]; then
 fi
 
 REPO="${DEX_CI_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
-CREDIT_QUOTA="${DEX_CI_CREDIT_QUOTA:-5}"
+CREDIT_QUOTA="${DEX_CI_CREDIT_QUOTA:-15}"
 STATEMENT_TIMEOUT="${DEX_CI_STATEMENT_TIMEOUT:-600}"
 WAREHOUSE="DEX_CI_WH"
 MONITOR="DEX_CI_MONITOR"
@@ -86,7 +87,7 @@ echo "== dex Snowflake setup =="
 echo "   account:     ${ACCOUNT}"
 echo "   repository:  ${REPO}"
 echo "   warehouse:   ${WAREHOUSE} (X-Small, auto-suspend 60s, timeout ${STATEMENT_TIMEOUT}s)"
-echo "   monitor:     ${MONITOR} (${CREDIT_QUOTA} credits/month, suspends)"
+echo "   monitor:     ${MONITOR} (${CREDIT_QUOTA} credits/month if created, suspends; an existing monitor keeps its quota)"
 echo "   database:    ${DATABASE} (transient, retention 0)"
 echo "   role:        ${ROLE}"
 echo "   ci user:     ${CI_USER} (WIF: GitHub OIDC, env ${GH_ENV})"
@@ -234,4 +235,5 @@ echo "== Done. Verify with:"
 echo "   snow connection test -c ${DEV_CONN_NAME}"
 echo "   snow sql -c ${DEV_CONN_NAME} -q \"SELECT COUNT(*) FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.ORDERS\""
 echo "== The second query resumes ${WAREHOUSE}; it auto-suspends after 60s and"
-echo "   ${MONITOR} suspends it for the month at ${CREDIT_QUOTA} credits."
+echo "   ${MONITOR} suspends it for the month at its quota (${CREDIT_QUOTA} credits if"
+echo "   this run created it; an existing monitor keeps its own, see SHOW RESOURCE MONITORS)."

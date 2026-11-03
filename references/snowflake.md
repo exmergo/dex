@@ -52,6 +52,7 @@ snowflake:
   dev_schema: DBT_DEV            # default DBT_DEV
   max_full_profile_bytes: null   # opt-in SAMPLE threshold for huge tables
   credit_price_usd: null         # your contract price; set it to see dollars
+  suspend_after_command: false   # suspend the warehouse after a command that woke it (needs OPERATE)
 budget:
   ceiling: 300                   # per-command warehouse-seconds; --budget overrides
   session_ceiling: 3600          # cumulative seconds per UTC day
@@ -66,7 +67,11 @@ monitor as the hard monthly backstop). Auto-suspend matters as much as size:
 every billed command that leaves the warehouse idle is charged the idle time
 until it suspends (see **Warehouse uptime** below), and Snowflake's default
 for a new warehouse is 600 seconds, which bills a two-second query for ten
-minutes.
+minutes. Where the warehouse is shared and its `AUTO_SUSPEND` cannot be
+lowered, `suspend_after_command: true` gets the same effect per command (see
+**Suspending after a command** below). `connect test` recommends one or the
+other whenever `AUTO_SUSPEND` is longer than 60 seconds and neither is in
+place; dex never changes `AUTO_SUSPEND` itself.
 
 ## Scoping a command
 
@@ -226,9 +231,20 @@ The rules that decide the figure:
 
 - **The last user pays the tail.** A command that finishes while other queries
   are still running or queued on the warehouse is charged no tail; one that
-  leaves it idle is charged all of it. Commands run within one tail of each
-  other each claim it, so their sum can overstate one shared warehouse cycle,
-  which is the direction a cost guard may round.
+  leaves it idle is charged all of it.
+- **A tail is paid once per resume cycle.** Each command records what it
+  claimed of the warehouse's current resume cycle (the warehouse, its
+  `resumed_on`, when its last statement ended, its `AUTO_SUSPEND`) as a
+  zero-amount settlement row carrying `warehouse_claim` in the spend ledger. A
+  command that then finds the warehouse still running in the same cycle is
+  charged only what it adds to that claim: the gap since the previous
+  command's last statement plus its own span, rather than a second tail. Ten
+  commands half a minute apart settle about one tail between them, as the
+  warehouse bills, instead of ten. The rule only lowers a charge, never past
+  the command's own statement time, and never raises one past statement time
+  plus one tail, so a warehouse other users keep running cannot make dex claim
+  their uptime. The estimate quotes by the same rule. A store without readable
+  ledger history charges the full tail, the safe direction.
 - **A command that never woke the warehouse owes no uptime.** Snowflake answers
   a result-cache hit or a count served from metadata without resuming it.
 - **`AUTO_SUSPEND` off means unbounded.** The warehouse bills until someone
@@ -243,8 +259,65 @@ The rules that decide the figure:
   reports hourly buckets that mix in other users, lags up to three hours, and is
   readable only with ACCOUNTADMIN or MONITOR USAGE.
 
-The estimate carries its credit translation; the handshake itself is in
-[`cost-controls.md`](cost-controls.md).
+The overhead belongs to the command, not to any statement, so it is quoted once
+per command as its own `(warehouse uptime)` line, by whichever handshake shows
+the caller an estimate first, and a phase whose budget cannot cover it asks
+rather than running. Where the idle tail is most of the estimate, a note states
+the command's own work, what `AUTO_SUSPEND` makes it bill, and what a 60-second
+`AUTO_SUSPEND` or a suspend would bring it to. The estimate carries its credit
+translation; the handshake itself is in [`cost-controls.md`](cost-controls.md).
+
+### Suspending after a command
+
+`snowflake.suspend_after_command: true` (off by default) has dex suspend the
+pinned warehouse at the end of a command, so the command bills its statement
+time floored at Snowflake's 60-second resume minimum instead of the whole
+`AUTO_SUSPEND` tail. On a warehouse at the 600-second default that is roughly a
+tenth of the per-command bill. It is opt-in because, unlike the session
+parameters dex sets, it acts on a warehouse other workloads may share, and dex
+only suspends one it can show was its own to suspend:
+
+- **The command woke it.** It found the warehouse suspended, and the
+  warehouse's `resumed_on` moved during the command's first statement, so the
+  resume was this command's and not another session's.
+- **Nothing else is using it.** `SHOW WAREHOUSES` shows nothing running or
+  queued once the command's last statement is done. A warehouse that was
+  already running when the command started is never suspended, whoever was
+  using it.
+- **It wakes on its own.** `AUTO_RESUME` is on, so the next query anyone sends
+  resumes it. A warehouse with `AUTO_RESUME = FALSE` is never suspended, since
+  every query after the suspend would fail until someone resumed it by hand.
+- **It is the pinned warehouse.** The statement is rendered by one typed
+  adapter method that can only produce `ALTER WAREHOUSE "<pinned warehouse>"
+  SUSPEND`, refusing when `SHOW WAREHOUSES` spells the warehouse differently
+  from the pin. No agent-authored SQL reaches it, and the query firewall goes
+  on refusing every `ALTER`. Suspending stops compute and touches no data,
+  schema or file, and Snowflake lets running statements finish first.
+
+It needs `OPERATE` on the warehouse:
+
+```sql
+GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE DEX_ROLE;
+```
+
+Without the grant the suspend is refused, the command completes and warns with
+the grant to add, and it settles the tail as before. The warnings about the
+tail print their commands ready to copy, with the warehouse and the session's
+own role filled in (the role comes from the login response, so reading it runs
+no statement). While the setting is off, `connect test` prints the `dex config
+set` that turns it on and the grant, so adopting it is two copied commands. An
+estimate's note names only what is missing: the `dex config set` while the
+setting is off, and the grant once a suspend has been refused for lacking it.
+dex cannot test the grant without suspending something, so the quote counts on
+a suspend only once one has worked: the first command after the setting is
+turned on is quoted the tail, with a note saying why, and is settled at what
+the suspend did; later ones are quoted the resume minimum, until a refusal is
+recorded. `connect test` reports
+`budget.warehouse.suspend_after_command` (`enabled`, `last_outcome`) and lists
+`OPERATE` under `required_grants` while the setting is on. If the grant is
+revoked after a suspend has worked, one command is quoted the resume minimum
+and settled at the tail before the refusal it records puts the tail back in
+the quote.
 
 ## Read-only, enforced in depth
 
@@ -252,7 +325,9 @@ The estimate carries its credit translation; the handshake itself is in
   dialect through one execution door (DML, DDL, `COPY INTO`, `CALL`,
   `ALTER`, and multi-statement forms all refuse).
 - The adapter issues no mutating statements: SHOW commands, SELECTs, and
-  session parameters only.
+  session parameters only, plus `ALTER WAREHOUSE "<pinned warehouse>"
+  SUSPEND` where `snowflake.suspend_after_command` opts in, which stops compute
+  and changes no data. The safety spine pins that set.
 - The documented grant shape is a least-privilege role: USAGE on the pinned
   warehouse, read (or `IMPORTED PRIVILEGES`) on source databases, and write
   only on the dedicated dev database (`scripts/setup_snowflake_ci.sh` creates

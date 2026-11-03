@@ -141,6 +141,8 @@ _OID_TYPE_NAMES = {
     1700: "numeric",
     2950: "uuid",
     3802: "super",
+    # What SUPER reports on a live workgroup. The driver names no constant for it.
+    4000: "super",
 }
 
 _ESTIMATE_QUALITY_NOTE = (
@@ -582,6 +584,19 @@ class RedshiftAdapter:
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this Redshift scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            db, _, schema = token.partition(".")
+            if db != self._current_database().lower():
+                return False
+        else:
+            schema = token
+        if not self.target.schemas:
+            return True
+        return schema in {s.lower() for s in self._schema_scope()}
 
     def _resolve_schemas(self) -> list[str]:
         visible = self._schemas()
@@ -1195,6 +1210,23 @@ class RedshiftAdapter:
 
     # --- execution (the single billed door) --------------------------------------
 
+    #: A ``LIMIT 0`` still runs on the cluster, and on Serverless wakes it at its
+    #: 60-second minimum, so a comparison prices before it reads a schema here.
+    describe_query_free = False
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        _rows, labels, types = self._run_rows(
+            f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
+            fetch_rows=1,
+        )
+        return [
+            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
+            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+        ]
+
     def run_query(
         self,
         sql: str,
@@ -1263,6 +1295,17 @@ class RedshiftAdapter:
         types = [self._description_type(d) for d in cursor.description]
         return rows, labels, types
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def _billed_cursor(self, timeout_seconds: float | None = None) -> tuple[Any, bool]:
         """A cursor prepared for spend: the session prepared once, and the
         server-side statement timeout wound down to what remains of the
@@ -1273,6 +1316,9 @@ class RedshiftAdapter:
         remaining = self.cost_gate.statement_cap(unit="compute-second")
         self._ensure_session()
         cursor = self._conn.cursor()
+        if getattr(self, "_utc_session", False):
+            # dex-built session statement, a constant.
+            cursor.execute("SET timezone = 'UTC'")
         timeout_ms: int | None = None
         budget_bound = False
         if remaining is not None:

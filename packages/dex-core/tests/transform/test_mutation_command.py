@@ -787,6 +787,9 @@ class _UptimeStandIn:
     def quote(self) -> float:
         return self.pending()
 
+    def admit(self) -> None:
+        pass
+
     def observe(self, seconds: float, *, span: float | None = None) -> None:
         self.observed.append((seconds, span))
 
