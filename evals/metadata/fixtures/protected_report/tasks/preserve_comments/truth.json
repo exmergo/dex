@@ -1,0 +1,56 @@
+{
+  "models": {
+    "rpt_reports": {
+      "grain": [
+        "report_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "report_id": {
+          "role": "key"
+        },
+        "comments": {
+          "role": "attribute"
+        }
+      },
+      "assumption_evidence": "request"
+    }
+  },
+  "checks": [
+    {
+      "name": "exactly the contracted two columns",
+      "expect": 2,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_reports'"
+    },
+    {
+      "name": "column names and types are preserved",
+      "expect": 2,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_reports' and ((column_name = 'report_id' and data_type = 'INTEGER') or (column_name = 'comments' and data_type = 'VARCHAR'))"
+    },
+    {
+      "name": "every report remains",
+      "expect": 12,
+      "sql": "select count(*) from main.rpt_reports"
+    },
+    {
+      "name": "report keys are unchanged",
+      "expect": 0,
+      "sql": "select count(*) from raw.reports s full outer join main.rpt_reports r using (report_id) where s.report_id is null or r.report_id is null"
+    },
+    {
+      "name": "comments follow the requested treatment",
+      "expect": 0,
+      "sql": "select count(*) from raw.reports s join main.rpt_reports r using (report_id) where r.comments is distinct from s.comments"
+    }
+  ],
+  "privacy": {
+    "columns": [
+      "raw.reports.comments"
+    ]
+  },
+  "procedure": {
+    "build_after_apply": true
+  }
+}
