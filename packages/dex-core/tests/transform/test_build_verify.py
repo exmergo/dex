@@ -1255,6 +1255,8 @@ def test_a_build_failed_only_by_its_tests_still_judges_the_models_it_built(
     result = _sweep(tmp_path, summary, _StubAdapter([]))
     assert "did not complete" not in result.suppressed.get("join_contract", "")
     assert "did not complete" not in result.suppressed.get("parent_population", "")
+    assert result.scope == ["rpt_subscriptions"]
+    assert result.scope_not_built == []
 
 
 def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
@@ -1270,6 +1272,32 @@ def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
     assert any("subscriptions failed or were skipped" in w for w in result.warnings), (
         result.warnings
     )
+    assert result.payload()["scope"] == ["rpt_subscriptions"]
+    assert result.payload()["scope_not_built"] == ["subscriptions"]
+
+
+@pytest.mark.parametrize("status", ["error", "skipped", "unknown", "runtime error"])
+def test_scope_reports_only_successful_models(tmp_path: Path, status: str):
+    summary = _summary(
+        [_node("model.p.good"), _node("model.p.other", status=status)],
+        success=False,
+    )
+    result = _sweep(tmp_path, summary)
+    assert result.payload()["scope"] == ["good"]
+    assert result.payload()["scope_not_built"] == ["other"]
+    assert built_models(summary) == {"model.p.good": "good", "model.p.other": "other"}
+
+
+def test_scope_is_empty_when_no_model_built(tmp_path: Path):
+    result = _sweep(
+        tmp_path,
+        _summary(
+            [_node("model.p.failed", "error"), _node("model.p.skipped", "skipped")],
+            success=False,
+        ),
+    )
+    assert result.scope == []
+    assert result.scope_not_built == ["failed", "skipped"]
 
 
 def test_a_build_holds_a_status_history_to_its_declared_policy(tmp_path: Path):

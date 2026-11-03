@@ -281,6 +281,26 @@ semantic YAML requires the dbt model its semantic model sits on. It is absent
 rather than empty when no plan was named, because an empty coverage block reads
 as "nothing required was built", which is the opposite of "nobody asked".
 
+`coverage.covered` records presence in run results, including failed and skipped
+nodes. Use `coverage.built` and `coverage.not_built` for successful execution:
+they partition `required`, and missing nodes belong to `not_built`. A requirement
+matching multiple versions is built only if every matched version succeeded.
+Legacy documents omit this partition and deserialize it as `null`; outcome
+recomputation and the artifact digests are unchanged.
+
+With verification enabled, `verification.scope` lists successful models only;
+`scope_not_built` names the other reported models. A model may be in scope even
+when a test failed. Scope describes execution; `suppressed` still names checks
+that could not run.
+
+`result.prerequisites[].previous_run` adds the previous status and invocation
+context, or `available: false` with a reason code. Completion blockers include
+`previous_status` when known. Dex preserves this context before pricing compiles,
+including across confirmation retries, without running a baseline build. It is
+the last available build artifact for that target/runtime, with separate cold
+history, and may describe a different selection or source tree. It never changes
+`plan_relation` or establishes that the plan caused a failure.
+
 `selection.complete` is `null` for a selector using dbt's graph operators or
 method selectors. dex does not evaluate dbt's selector language, and a second
 implementation of it would disagree with dbt's.

@@ -1058,7 +1058,7 @@ default, or a filter or operator after it is refused. A key naming a location
   a repair survives a reinstall: packages install into an isolated copy, the build
   runs from it, and `data.cold_verification` lists what the installed tree held
   that the reinstall did not reproduce. `data.prerequisites` names each failed
-  node's owner, plan relation and supported repairs. A missing dev DuckDB database is an
+  node's owner, plan relation, previous-run context and supported repairs. A missing dev DuckDB database is an
   actionable refusal when the project reads from sources (seed it first), and a
   warning otherwise. On failure the envelope's `errors[0]` carries the first
   real dbt message; the rest land in `warnings`, per-entry capped, deduplicated,
@@ -1095,6 +1095,28 @@ default, or a filter or operator after it is refused. A key naming a location
   coverage and the key is absent rather than empty, because an empty coverage
   block reads as "nothing required was built", which is the opposite of "nobody
   asked what was required".
+
+  `coverage.covered` means a requirement matched a node in run results, including
+  failed and skipped nodes; `missing` means it matched none. `built` lists the
+  requirements whose matched nodes all succeeded, and `not_built` lists the rest
+  (including missing requirements). These two lists partition `required`.
+  Older evidence documents without these fields still validate and expose them
+  as `null` (unavailable), not as a measured empty list. Outcome precedence and
+  artifact digests retain their existing meanings.
+
+  Each prerequisite's `previous_run` reports its status in the last available
+  build artifact from the same target and dbt runtime. Available evidence carries
+  `status`, `invocation_id`, `generated_at`, `selection`, `target`, `runtime` and
+  `run_results_sha256`. Unavailable evidence has `available: false` and a
+  `reason_code`: `no_previous_build`, `unreadable_previous_build`,
+  `incompatible_target`, `incompatible_runtime`, or `node_not_observed` (which
+  retains the run context). Completion blockers carry `previous_status` too.
+  This context never changes `plan_relation`: a different selection or source
+  tree may have produced it, and an earlier failure is not proof of causality.
+  Dex saves only statuses and run metadata in `dex_previous_build.json` beside
+  the resolved artifacts before pricing clears run results. Confirmation retries
+  reuse it; compile, seed, test and run results never replace it. Ordinary and
+  cold builds keep separate histories. No extra baseline build or scan runs.
 
   `selection.complete` is `null` for any selector using dbt's graph operators or
   method selectors. dex does not evaluate dbt's selector language, and a second
@@ -1245,8 +1267,9 @@ default, or a filter or operator after it is refused. A key naming a location
 
   `data.verification.ran` is always present: a build that did not verify and a
   build that verified and found nothing are different answers, and only the
-  second means the models are clean. When it ran, the payload adds `scope` (the
-  models this build ran), `findings` and `finding_count` in the shape `maintain
+  second means the models are clean. When it ran, the payload adds `scope` (only
+  models with status `success` in this invocation), `scope_not_built` (the other
+  reported models), `findings` and `finding_count` in the shape `maintain
   verify` returns them, and `suppressed`, naming every finding class that did
   not run and why.
 
@@ -1254,8 +1277,8 @@ default, or a filter or operator after it is refused. A key naming a location
   verify`, in the build's `nodes`, and in the per-node estimate. A versioned
   model carries its version, `dim_customers.v2`, the latest one included, because
   two versions are two relations that share one `name` and either can fail, lose
-  rows, or go missing on its own. The sweep's scope is the exact nodes the build
-  ran, so a build of `dim_customers.v2` never judges `dim_customers.v1`. As in
+  rows, or go missing on its own. The sweep's scope names the successful models
+  from the exact nodes the build ran, so a build of `dim_customers.v2` never judges `dim_customers.v1`. As in
   dbt's `--select`, `maintain verify dim_customers` selects every version and
   `maintain verify dim_customers.v2` selects one.
 

@@ -160,6 +160,7 @@ class Blocker(BaseModel):
     owner: str | None = None
     package: str | None = None
     plan_relation: str | None = None
+    previous_status: str | None = None
     message: str | None = None
 
 
@@ -479,6 +480,9 @@ def _blockers(
             owner=diagnosed.get(n.unique_id, {}).get("owner"),
             package=diagnosed.get(n.unique_id, {}).get("package"),
             plan_relation=diagnosed.get(n.unique_id, {}).get("plan_relation"),
+            previous_status=(
+                diagnosed.get(n.unique_id, {}).get("previous_run", {}).get("status")
+            ),
             message=(n.message[:_MESSAGE] if n.message else None),
         )
         for n in failed

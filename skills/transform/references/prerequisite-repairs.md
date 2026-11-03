@@ -38,7 +38,7 @@ dex transform build --target dev --verify --for-plan <plan-id>
   this run, whatever it holds.
 - `data.prerequisites[]` has one entry per failed node: `node`, `owner`
   (`project` or `package`), `package`, `path`, `message`, `blocks` (the required
-  models behind it), `plan_relation` and `options`.
+  models behind it), `plan_relation`, `previous_run` and `options`.
 
 `plan_relation` separates a failure you inherited from one you may have caused:
 
@@ -51,6 +51,19 @@ dex transform build --target dev --verify --for-plan <plan-id>
 
 Only `independent` is a claim. Dex holds no baseline run, so `edited` and
 `downstream_of_edit` say the plan could be the cause, not that it is.
+
+`previous_run` reports an earlier status, invocation ID, timestamp and selection,
+or `available: false` with a reason code. A previous failure is useful historical
+context, but the earlier run may have used another selection or source tree.
+Keep `plan_relation` as reported; this evidence is not a baseline comparison.
+The context survives pricing and confirmation retries without another build.
+Ordinary and cold runs have separate histories. `completion.blockers` carries
+`previous_status` when known.
+
+On a verified build, `verification.scope` names successful models and
+`scope_not_built` names failed, skipped or otherwise unsuccessful models.
+`evidence.coverage.covered` includes those unsuccessful nodes when they appear in
+run results; use `built` and `not_built` to distinguish successful execution.
 
 ## 2. Choose a route `options` supports
 
@@ -87,8 +100,8 @@ where the project can keep it:
 - a seed: `+column_types` in `dbt_project.yml`. A seed already built in dev keeps
   its old types on a plain reload; on DuckDB `transform build` notices the change
   and rebuilds the seed with `dbt seed --full-refresh`, and elsewhere build with
-  `--full-refresh`. Check the type with `explore profile <dev namespace>.<seed>
-  --target dev`;
+  `--full-refresh`. Check the type with
+  `explore profile <dev namespace>.<seed> --target dev`;
 - a model, your own or an override: an explicit cast to the intended type, valid on
   your warehouse. BigQuery refuses a cast from an integer to a timestamp, so an
   all-NULL integer column goes through a string first:

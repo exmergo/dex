@@ -73,6 +73,49 @@ def node(name: str, status: str = "success", **extra) -> dict:
     return {"unique_id": f"model.dex_test.{name}", "status": status, **extra}
 
 
+@pytest.mark.parametrize("status", ["success", "error", "failed", "skipped", "unknown"])
+def test_coverage_distinguishes_observation_from_execution(project, edits, status):
+    from exmergo_dex_core import host
+
+    write_run_results(project, [node("mart", status), node("other")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.coverage.covered == ["mart"]
+    assert evidence.coverage.missing == []
+    assert evidence.coverage.built == (["mart"] if status == "success" else [])
+    assert evidence.coverage.not_built == ([] if status == "success" else ["mart"])
+    assert host.recompute_outcome(evidence.data()) == evidence.outcome
+    assert host.verify_build_evidence(evidence.data()).outcome == evidence.outcome
+    legacy = evidence.data()
+    del legacy["coverage"]["built"]
+    del legacy["coverage"]["not_built"]
+    assert host.verify_build_evidence(legacy).coverage.built is None
+    assert host.verify_build_evidence(legacy).digests == evidence.digests
+
+
+def test_missing_requirement_is_not_built(project, edits):
+    write_run_results(project, [node("other")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.coverage.built == []
+    assert evidence.coverage.not_built == ["mart"]
+    assert evidence.coverage.missing == ["mart"]
+
+
+@pytest.mark.parametrize(
+    "partition",
+    [
+        {"built": ["mart"], "not_built": ["mart"]},
+        {"built": [], "not_built": []},
+        {"built": ["mart", "mart"], "not_built": []},
+        {"built": ["mart"]},
+    ],
+)
+def test_coverage_refuses_an_inconsistent_partition(partition):
+    from exmergo_dex_core.transform.evidence import BuildCoverage
+
+    with pytest.raises(ValueError):
+        BuildCoverage(required=["mart"], covered=["mart"], **partition)
+
+
 @pytest.fixture
 def project(dbt_project_dir: Path) -> Path:
     (dbt_project_dir / "models" / "staging" / "mart.sql").write_text(
@@ -433,9 +476,39 @@ def test_a_versioned_model_answers_to_every_name_dbt_selects_it_by(dbt_project_d
         assert evidence.selection.matched == ["dim_customers.v2"]
         assert evidence.selection.complete is True, select
         assert evidence.coverage.missing == [], select
+        assert evidence.coverage.built == ["dim_customers_v2"], select
+        assert evidence.coverage.not_built == [], select
 
     missed = build_evidence(dbt_project_dir, target="dev", select="dim_customers.v1")
     assert missed.selection.unmatched == ["dim_customers.v1"]
+
+
+def test_unversioned_requirement_needs_every_matched_version_to_succeed(project):
+    write_manifest_nodes(
+        project,
+        {
+            f"model.dex_test.mart.v{v}": {
+                "name": "mart",
+                "resource_type": "model",
+                "version": v,
+            }
+            for v in (1, 2)
+        },
+    )
+    write_run_results(
+        project,
+        [
+            {"unique_id": "model.dex_test.mart.v1", "status": "success"},
+            {"unique_id": "model.dex_test.mart.v2", "status": "skipped"},
+        ],
+    )
+    edit = PlanEdit(
+        path="models/staging/mart.yml", kind=EditKind.SCHEMA_YML, new_content=SCHEMA
+    )
+    coverage = build_evidence(project, target="dev", edits=[edit]).coverage
+    assert coverage.covered == ["mart"]
+    assert coverage.built == []
+    assert coverage.not_built == ["mart"]
 
 
 def test_a_metric_only_edit_requires_the_model_behind_its_measure(project):

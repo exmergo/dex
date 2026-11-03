@@ -71,6 +71,7 @@ class BuildVerification:
     reason: str | None = None
     findings: list[DriftFinding] = field(default_factory=list)
     scope: list[str] = field(default_factory=list)
+    scope_not_built: list[str] = field(default_factory=list)
     suppressed: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -97,6 +98,7 @@ class BuildVerification:
         payload: dict[str, Any] = {
             "ran": True,
             "scope": self.scope,
+            "scope_not_built": self.scope_not_built,
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
@@ -236,7 +238,18 @@ def verify_build(
 
     built = built_models(summary)
     scope = set(built)
-    result = BuildVerification(ran=True, scope=sorted(built.values()))
+    successful = {
+        str(node.get("unique_id") or "")
+        for node in summary.get("nodes") or []
+        if str(node.get("status") or "").lower() == "success"
+    }
+    result = BuildVerification(
+        ran=True,
+        scope=sorted(label for uid, label in built.items() if uid in successful),
+        scope_not_built=sorted(
+            label for uid, label in built.items() if uid not in successful
+        ),
+    )
 
     # Both halves below need the adapter, and only the first may open it: a
     # second open would rebuild the gate holding this command's reservation.
