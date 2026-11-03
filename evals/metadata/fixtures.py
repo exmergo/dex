@@ -75,10 +75,14 @@ class Fixture:
 
     @property
     def packages(self) -> list[Path]:
+        """List the local package sources shipped with this fixture."""
+
         root = self.directory / "packages"
         return sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
 
     def _warehouse(self) -> Any:
+        """Import the fixture generator without adding it to the engine package."""
+
         spec = importlib.util.spec_from_file_location(
             f"evals_metadata_fixture_{self.name}", self.directory / "warehouse.py"
         )
@@ -88,6 +92,8 @@ class Fixture:
         return module
 
     def tables(self) -> list[Table]:
+        """Choose public or grading tables from the fixture generator."""
+
         return list(self._warehouse().tables(self.seed))
 
     def grading_tables(self) -> list[Table]:

@@ -148,6 +148,7 @@ def build(
     relation_columns: RelationColumns | None = None,
     full_refresh: bool = False,
     run_cwd: Path | None = None,
+    seed_history_directory: Path | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -294,6 +295,16 @@ def build(
     # always means "this invocation wrote nothing", never "an old invocation's
     # results carried over". The shared directory is left untouched when this
     # runtime was isolated away from it.
+    from .seed_history import remember_seed_types
+
+    seed_history_directory = seed_history_directory or artifacts
+    prior_seed_types: dict[str, dict[str, str]] = {}
+    try:
+        prior_seed_types = remember_seed_types(
+            artifacts, seed_history_directory, target
+        )
+    except (OSError, ValueError) as exc:
+        target_warnings = [*target_warnings, f"could not read seed type history: {exc}"]
     clear_run_results(artifacts)
 
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
@@ -310,7 +321,13 @@ def build(
     if relation_columns is not None and not full_refresh:
         try:
             stale = _seeds_to_refresh(
-                project, artifacts, flags, select, run, relation_columns
+                project,
+                artifacts,
+                flags,
+                select,
+                run,
+                relation_columns,
+                prior_seed_types=prior_seed_types,
             )
         except Exception as exc:
             # Reported, never raised: a check that cannot read the dev target
@@ -349,6 +366,13 @@ def build(
         seeded = _summarize(
             project, target, run(seed_argv), artifact_directory=artifacts
         )
+        try:
+            remember_seed_types(artifacts, seed_history_directory, target)
+        except (OSError, ValueError) as exc:
+            target_warnings = [
+                *target_warnings,
+                f"could not save seed type history: {exc}",
+            ]
         refreshed = [node["name"] for node in seeded["nodes"]]
         if not seeded["success"]:
             seeded["full_refresh"] = {
@@ -369,6 +393,10 @@ def build(
         log_file=log_file,
         label_root=run_cwd if detached else None,
     )
+    try:
+        remember_seed_types(artifacts, seed_history_directory, target)
+    except (OSError, ValueError) as exc:
+        target_warnings = [*target_warnings, f"could not save seed type history: {exc}"]
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
     if full_refresh:
@@ -422,6 +450,8 @@ RelationColumns = Callable[[list[str]], dict[str, list[Any]]]
 
 
 def _column_name_and_type(column: Any) -> tuple[str, str | None]:
+    """Read a column name with an optional metadata type."""
+
     if isinstance(column, (tuple, list)):
         name, data_type = column[0], column[1] if len(column) > 1 else None
         return str(name), str(data_type) if data_type else None
@@ -432,6 +462,8 @@ def stale_seeds(
     manifest_path: Path,
     project: Path,
     relation_columns: RelationColumns,
+    *,
+    prior_seed_types: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """The seeds whose CSV header or declared column types no longer match the
     relation they load into, as ``unique_id`` to manifest node. Each node
@@ -447,7 +479,9 @@ def stale_seeds(
     case-insensitively, since a warehouse may fold them, and in order; types
     compare through :func:`types_equal`, so an equivalent spelling is not a
     change, and only where the reader reports one. A seed whose relation does not
-    exist yet is not stale: dbt creates it.
+    exist yet is not stale: dbt creates it. ``prior_seed_types`` records the last
+    successful load, so deleting a type declaration also triggers a refresh and
+    restores CSV inference. A missing history entry makes no removal claim.
     """
 
     nodes: dict[str, Any] = {}
@@ -482,6 +516,14 @@ def stale_seeds(
             stale[unique_id] = {**node, "dex_stale_reason": "header"}
             continue
         declared = (node.get("config") or {}).get("column_types") or {}
+        from .seed_history import column_types
+
+        removed = set((prior_seed_types or {}).get(unique_id, {})) - set(
+            column_types(node.get("config") or {})
+        )
+        if removed:
+            stale[unique_id] = {**node, "dex_stale_reason": "column_types"}
+            continue
         live_types = {name.lower(): data_type for name, data_type in live_columns}
         if isinstance(declared, dict) and any(
             isinstance(declared_type, str)
@@ -502,6 +544,8 @@ def _seeds_to_refresh(
     select: str | None,
     run: Runner,
     relation_columns: RelationColumns,
+    *,
+    prior_seed_types: dict[str, dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """The manifest node of each stale seed this build selects.
 
@@ -527,7 +571,12 @@ def _seeds_to_refresh(
                 listed.add(json.loads(event["data"]["msg"])["unique_id"])
     if not listed:
         return []
-    stale = stale_seeds(artifact_paths(artifacts).manifest, project, relation_columns)
+    stale = stale_seeds(
+        artifact_paths(artifacts).manifest,
+        project,
+        relation_columns,
+        prior_seed_types=prior_seed_types,
+    )
     return [stale[unique_id] for unique_id in sorted(stale) if unique_id in listed]
 
 

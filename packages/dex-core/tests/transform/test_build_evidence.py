@@ -75,6 +75,8 @@ def node(name: str, status: str = "success", **extra) -> dict:
 
 @pytest.mark.parametrize("status", ["success", "error", "failed", "skipped", "unknown"])
 def test_coverage_distinguishes_observation_from_execution(project, edits, status):
+    """Coverage distinguishes observation from execution."""
+
     from exmergo_dex_core import host
 
     write_run_results(project, [node("mart", status), node("other")])
@@ -93,6 +95,8 @@ def test_coverage_distinguishes_observation_from_execution(project, edits, statu
 
 
 def test_missing_requirement_is_not_built(project, edits):
+    """Missing requirement is not built."""
+
     write_run_results(project, [node("other")])
     evidence = build_evidence(project, target="dev", edits=edits)
     assert evidence.coverage.built == []
@@ -110,6 +114,8 @@ def test_missing_requirement_is_not_built(project, edits):
     ],
 )
 def test_coverage_refuses_an_inconsistent_partition(partition):
+    """Coverage refuses an inconsistent partition."""
+
     from exmergo_dex_core.transform.evidence import BuildCoverage
 
     with pytest.raises(ValueError):
@@ -484,6 +490,8 @@ def test_a_versioned_model_answers_to_every_name_dbt_selects_it_by(dbt_project_d
 
 
 def test_unversioned_requirement_needs_every_matched_version_to_succeed(project):
+    """Unversioned requirement needs every matched version to succeed."""
+
     write_manifest_nodes(
         project,
         {

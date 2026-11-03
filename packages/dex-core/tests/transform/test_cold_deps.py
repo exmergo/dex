@@ -585,6 +585,8 @@ def test_a_failed_reinstall_names_the_required_deliverables(project, capsys):
 
 
 def _undo_override(root: Path, capsys, *, keep_disable: bool, legacy_ts: str) -> dict:
+    """Plan removal of the project override while choosing package enablement."""
+
     config = yaml.safe_load((root / "dbt_project.yml").read_text())
     if not keep_disable:
         config.pop("models", None)
@@ -616,6 +618,8 @@ def test_an_override_gives_way_to_a_repair_of_the_projects_own_data(project, cap
     # the project owns. Deleting the override and re-enabling the package's model
     # hands the name back to the package, so `rpt`'s ref does not dangle, and the
     # seed retyped through `+column_types` reaches dev without a manual refresh.
+    """An override gives way to a repair of the projects own data."""
+
     _override(project, capsys)
     assert _build(capsys)["status"] == "ok"
     assert _column_type(project, "raw_task", "legacy_ts") == "INTEGER"
@@ -637,11 +641,34 @@ def test_an_override_gives_way_to_a_repair_of_the_projects_own_data(project, cap
 def test_deleting_an_override_whose_package_model_stays_disabled_is_refused(
     project, capsys
 ):
+    """Deleting an override whose package model stays disabled is refused."""
+
     _override(project, capsys)
     planned = _undo_override(project, capsys, keep_disable=True, legacy_ts="timestamp")
     assert planned["status"] == "error"
     assert "still references" in planned["errors"][0]
     assert "pkg_task" in planned["errors"][0]
+
+
+@pytest.mark.parametrize(
+    ("qualifier", "status"),
+    [
+        ("proj", "error"),
+        ("tiny_pkg", "ok"),
+    ],
+)
+def test_restored_package_must_match_a_qualified_reference(
+    project, capsys, qualifier, status
+):
+    """A package cannot replace a ref explicitly pinned to the root project."""
+    _override(project, capsys)
+    (project / "models/rpt.sql").write_text(
+        "select id, created_ts from {{ ref('" + qualifier + "', 'pkg_task') }}\n"  # noqa: S608 - fixed test qualifiers
+    )
+    planned = _undo_override(project, capsys, keep_disable=False, legacy_ts="timestamp")
+    assert planned["status"] == status, planned.get("errors")
+    if status == "error":
+        assert "still references" in planned["errors"][0]
 
 
 @pytest.mark.parametrize(
@@ -673,6 +700,8 @@ def test_deleting_an_override_whose_package_model_stays_disabled_is_refused(
 def test_a_package_model_answers_a_deleted_name_only_where_enabled(
     tmp_path, models, restored
 ):
+    """A package model answers a deleted name only where enabled."""
+
     from exmergo_dex_core.transform.plans import _package_models_restored
 
     staging = tmp_path / "dbt_packages/tiny/models/staging"

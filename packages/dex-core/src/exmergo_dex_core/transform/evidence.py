@@ -158,6 +158,8 @@ class BuildCoverage(BaseModel):
 
     @model_validator(mode="after")
     def _validate_partition(self) -> BuildCoverage:
+        """Reject execution partitions that do not cover the requirements once."""
+
         if self.built is None and self.not_built is None:
             return self
         if self.built is None or self.not_built is None:

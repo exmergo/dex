@@ -17,6 +17,8 @@ PLANS = ("starter", "team", "business")
 
 
 def _tables(seed: int, *, holdout: bool) -> list[Table]:
+    """Generate subscription populations, including grading-only edge cases."""
+
     start = datetime(2024, 2, 1, 8) + timedelta(hours=seed % 5)
     count = 12 if holdout else 10
     subscriptions = [
@@ -55,8 +57,12 @@ def _tables(seed: int, *, holdout: bool) -> list[Table]:
 
 
 def tables(seed: int) -> list[Table]:
+    """Generate the seeded warehouse tables used by this evaluation fixture."""
+
     return _tables(seed, holdout=False)
 
 
 def grading_tables(seed: int) -> list[Table]:
+    """Provide the held-out population used to grade subscription reports."""
+
     return _tables(seed, holdout=True)

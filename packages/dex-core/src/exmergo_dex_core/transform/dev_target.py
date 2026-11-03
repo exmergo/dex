@@ -456,6 +456,8 @@ def seed_relation_columns(
         return None
 
     def read(relations: list[str]) -> dict[str, list[tuple[str, str]]]:
+        """Read dev relation names and types through the guarded DuckDB adapter."""
+
         columns: dict[str, list[tuple[str, str]]] = {}
         adapter = open_adapter(
             connector="duckdb",

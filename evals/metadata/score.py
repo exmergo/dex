@@ -192,6 +192,8 @@ class Gate:
 
 
 def _failed_nodes(project: Path) -> list[str]:
+    """Extract failed dbt nodes with their resource type and package owner."""
+
     import json
 
     try:
@@ -290,6 +292,8 @@ def relation_columns(scratch: Path, model: str) -> list[str] | None:
 
 
 def run_checks(scratch: Path, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Evaluate row, schema and workspace assertions against the candidate."""
+
     import duckdb
 
     results = []
@@ -545,7 +549,7 @@ def procedure_steps(
 # --- the final report ---------------------------------------------------------
 
 _NOT_DONE = re.compile(
-    r"\b(?:not|n't|never|cannot|unable|incomplete|unchanged|outside|remains?|"
+    r"n['\u2019]t\b|\b(?:not|never|cannot|unable|incomplete|unchanged|outside|remains?|"
     r"left (?:for|to)|owned by|up to)\b"
 )
 _CHANGE = re.compile(
@@ -567,6 +571,8 @@ _CLAIM = re.compile(
 
 
 def _sentences(text: str) -> list[str]:
+    """Split final-report prose into units for claims and refusal checks."""
+
     return [
         part.strip().lower()
         for part in re.split(r"(?<=[.!?])\s+|\n+", text)
@@ -717,6 +723,8 @@ def score_workspace(
     final: str | None = None,
     reference: bool = False,
 ) -> TaskScore:
+    """Combine build and row scores with workspace, privacy and report checks."""
+
     score = _score_workspace(task, fixture, workspace)
     wanted = [
         check
@@ -743,6 +751,8 @@ def score_workspace(
 
 
 def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore:
+    """Build and score changed deliverables against the grading warehouse."""
+
     with tempfile.TemporaryDirectory(prefix="dex-metadata-") as tmp:
         tmp_path = Path(tmp)
         baseline = starting_project(task, fixture, tmp_path / "baseline")

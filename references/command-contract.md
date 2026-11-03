@@ -1154,7 +1154,15 @@ default, or a filter or operator after it is refused. A key naming a location
   its table (#1083): a reload keeps the types the table was first built with,
   so a type repair to the project's own input data would otherwise do nothing.
   Types compare through the connector's aliases, so an equivalent spelling
-  (`int` for `INTEGER`) is not a change. `dbt ls` parses
+  (`int` for `INTEGER`) is not a change. Removing a previously applied type
+  declaration also rebuilds the selected seed, restoring CSV inference. Dex
+  remembers successful seed loads in `dex_seed_column_types.json` beside the
+  runtime's artifacts before pricing or `dbt ls` can replace the manifest.
+  Failed and unselected seeds do not update their entries; timestamps prevent
+  an older artifact from replacing a newer load. Ordinary and cold builds share
+  this record for their common dev seeds, independently of prerequisite history.
+  It adds no scan. Without an available applied contract, use `--full-refresh`
+  explicitly when removing a type declaration. `dbt ls` parses
   afresh for the target, so neither a cleaned target directory nor a manifest
   left by another target decides which table a seed loads into; it adds one dbt
   invocation to every DuckDB build whose dev database file already exists (a

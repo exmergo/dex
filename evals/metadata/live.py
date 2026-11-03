@@ -229,17 +229,38 @@ def _flags(command: str, start: int, quoted: list[tuple[int, int]]) -> list[str]
     before the group (``dex --confirm transform build``) count too, since the
     engine reads them the same way. Two shell forms that look like separators
     are not: a newline after a backslash continues the command, and the ``&`` of
-    a redirect (``2>&1``, ``>&``, ``&>``) belongs to the redirect."""
+    a redirect (``2>&1``, ``>&``, ``&>``) belongs to the redirect. An unquoted
+    shell comment ends the scan; a hash inside a word or quotes does not."""
 
     def inside(position: int) -> bool:
+        """Identify quoted data that cannot end the shell call."""
         return any(begin <= position < stop for begin, stop in quoted)
 
+    def escaped(position: int) -> bool:
+        """An odd run of preceding backslashes escapes a shell character."""
+        begin = position
+        while begin > 0 and command[begin - 1] == "\\":
+            begin -= 1
+        return (position - begin) % 2 == 1
+
     def separates(position: int) -> bool:
+        """End the call at shell operators and comments, honoring escapes."""
         char = command[position]
-        if char not in _SEPARATORS or inside(position):
+        if inside(position):
+            return False
+        if char == "#":
+            before = position - 1
+            # Backslash-newline disappears before the shell identifies words.
+            while before > 0 and command[before] == "\n" and escaped(before):
+                before -= 2
+            previous = command[before : before + 1] if before >= 0 else ""
+            return before < 0 or (
+                (previous.isspace() or previous in ";&|()<>") and not escaped(before)
+            )
+        if char not in _SEPARATORS:
             return False
         if char == "\n":
-            return command[position - 1 : position] != "\\"
+            return not escaped(position)
         if char == "&":
             return command[position - 1 : position] != ">" and (
                 command[position + 1 : position + 2] != ">"
@@ -291,6 +312,8 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
 def summarize(
     events: list[dict[str, Any]], session: Session, plugin_dir: Path = REPO
 ) -> Session:
+    """Extract executed Dex calls, their flags and results from agent events."""
+
     skills: list[str] = []
     commands: dict[str, int] = {}
     sequence: list[str] = []

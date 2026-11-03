@@ -8,6 +8,8 @@ from exmergo_dex_core.cli import main
 
 
 def test_repeated_failures_and_a_new_regression(dbt_project_dir, tmp_path, capsys):
+    """Repeated failures and a new regression."""
+
     pytest.importorskip("dbt.adapters.duckdb")
     prerequisite = dbt_project_dir / "models" / "prerequisite.sql"
     broken = "{{ config(materialized='table') }}\nselect cast('bad' as integer) as id\n"
@@ -17,6 +19,8 @@ def test_repeated_failures_and_a_new_regression(dbt_project_dir, tmp_path, capsy
     )
 
     def build():
+        """Run the real dev build and return the CLI envelope for the assertions."""
+
         main(
             [
                 "--repo-root",

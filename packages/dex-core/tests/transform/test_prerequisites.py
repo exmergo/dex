@@ -358,6 +358,8 @@ def _many_failures(count: int) -> list[BuildNode]:
 
 
 def test_new_fields_stay_inside_the_budget():
+    """New fields stay inside the budget."""
+
     nodes = _many_failures(40)
     prerequisites = [
         {

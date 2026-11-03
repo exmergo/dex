@@ -827,6 +827,8 @@ def _package_models_restored(
             project_config = loaded["models"]
 
     def enabled(package: str, parts: list[str]) -> bool:
+        """Resolve package enablement from broad settings to the specific model."""
+
         state = True
         level: Any = project_config.get(package)
         for part in [None, *parts]:
@@ -964,7 +966,7 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
                 if (
                     kind == "model"
                     and provider is not None
-                    and reference.package in (None, provider)
+                    and reference.qualifier in (None, provider)
                 ):
                     # The project's override goes and the package's own model of
                     # the same name, enabled after this plan, answers the ref.

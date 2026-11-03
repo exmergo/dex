@@ -3840,6 +3840,7 @@ def _build_project(
     # another dbt runtime left incompatible refuses before anything is spent.
     policy = artifacts or config.transform.artifacts
     artifacts_dir = resolve_build_artifact_dir(project, policy)
+    seed_history_dir = artifacts_dir
     checkout = project
     if cold is not None:
         # Outside the copy so they outlive it, and apart from the ordinary build's,
@@ -3859,6 +3860,14 @@ def _build_project(
     from .previous_build import preserve_previous_build
 
     previous_run = preserve_previous_build(artifacts_dir, target)
+    from .seed_history import remember_seed_types
+
+    # Pricing replaces manifests; preserve applied seed contracts first. Both
+    # build modes write the same dev seeds, so this history lives outside cold/.
+    with contextlib.suppress(OSError, ValueError):
+        remember_seed_types(seed_history_dir, seed_history_dir, target)
+        if artifacts_dir != seed_history_dir:
+            remember_seed_types(artifacts_dir, seed_history_dir, target)
     dev_check = lambda: dev_target.check(  # noqa: E731
         project,
         target,
@@ -3882,6 +3891,7 @@ def _build_project(
             paradigm=paradigm,
             connector=connector,
             run_cwd=project,
+            seed_history_directory=seed_history_dir,
             dev_target_check=dev_check,
             dependencies=dependencies,
             approved_functions=frozenset(config.guards.approved_functions),
@@ -3977,6 +3987,7 @@ def _build_project(
             paradigm=paradigm,
             connector=connector,
             run_cwd=project,
+            seed_history_directory=seed_history_dir,
             estimate=estimate,
             estimate_quality=estimate_quality_of(adapter, estimate, paradigm=paradigm),
             # The dev-target check already ran above; passing None keeps the

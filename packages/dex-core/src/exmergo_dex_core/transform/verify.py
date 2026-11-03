@@ -93,6 +93,8 @@ class BuildVerification:
     dropped: int = 0
 
     def payload(self) -> dict[str, Any]:
+        """Serialize the measured build checks and their explicit suppressions."""
+
         if not self.ran:
             return {"ran": False, "reason": self.reason}
         payload: dict[str, Any] = {

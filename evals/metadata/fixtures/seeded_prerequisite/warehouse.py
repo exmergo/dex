@@ -6,4 +6,6 @@ from evals.metadata.fixtures import Table
 
 
 def tables(seed: int) -> list[Table]:
+    """Generate the seeded warehouse tables used by this evaluation fixture."""
+
     return []

@@ -656,10 +656,14 @@ def test_a_seed_whose_declared_column_type_changed_is_rebuilt(
     # entry added after the first build is ignored and the column keeps the
     # type inferred from the CSV. That is the one route by which a project can
     # change its own input data's type (issue #1083), and it did nothing.
+    """A seed whose declared column type changed is rebuilt."""
+
     duckdb = pytest.importorskip("duckdb")
     build = ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"]
 
     def due_at_type() -> str:
+        """Read the fixture seed column type after the dev build."""
+
         con = duckdb.connect(str(tmp_path / "dev.duckdb"), read_only=True)
         try:
             return con.execute(
@@ -689,8 +693,22 @@ def test_a_seed_whose_declared_column_type_changed_is_rebuilt(
     assert rc == 0, envelope["errors"]
     assert "full_refresh" not in envelope["data"]
 
+    # A narrow build must not forget the seed's applied declaration.
+    rc, envelope = _run([*build, "--select", "stg_customers"], capsys)
+    assert rc == 0, envelope["errors"]
+    _plan_and_apply(tmp_path, capsys, "restore CSV type inference", *_due_dates(None))
+    rc, envelope = _run(build, capsys)
+    assert rc == 0, envelope["errors"]
+    assert envelope["data"]["full_refresh"]["seeds"] == ["task_data"]
+    assert due_at_type() == "INTEGER"
+    rc, envelope = _run(build, capsys)
+    assert rc == 0, envelope["errors"]
+    assert "full_refresh" not in envelope["data"]
+
 
 def _typed_seed_manifest(project: Path, column_types: dict) -> str:
+    """Give the fixture seed the declared column types under test."""
+
     uid = _a_seed_the_last_manifest_names(project)
     manifest = dex_target(project) / "manifest.json"
     document = json.loads(manifest.read_text())
@@ -721,6 +739,8 @@ def _typed_seed_manifest(project: Path, column_types: dict) -> str:
 def test_a_declared_column_type_is_stale_only_when_it_differs(
     dbt_project_dir: Path, column_types: dict, live: list, stale: bool
 ):
+    """A declared column type is stale only when it differs."""
+
     import importlib
 
     build_module = importlib.import_module("exmergo_dex_core.transform.build")

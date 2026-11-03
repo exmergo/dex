@@ -1260,6 +1260,8 @@ def test_a_build_failed_only_by_its_tests_still_judges_the_models_it_built(
 
 
 def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
+    """A model that failed is left out and named."""
+
     _repro_manifest(tmp_path)
     summary = _summary(
         [
@@ -1278,6 +1280,8 @@ def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
 
 @pytest.mark.parametrize("status", ["error", "skipped", "unknown", "runtime error"])
 def test_scope_reports_only_successful_models(tmp_path: Path, status: str):
+    """Scope reports only successful models."""
+
     summary = _summary(
         [_node("model.p.good"), _node("model.p.other", status=status)],
         success=False,
@@ -1289,6 +1293,8 @@ def test_scope_reports_only_successful_models(tmp_path: Path, status: str):
 
 
 def test_scope_is_empty_when_no_model_built(tmp_path: Path):
+    """Scope is empty when no model built."""
+
     result = _sweep(
         tmp_path,
         _summary(

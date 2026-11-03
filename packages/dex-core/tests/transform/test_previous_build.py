@@ -14,6 +14,8 @@ from exmergo_dex_core.transform.previous_build import (
 
 
 def _results(root, *, status="error", which="build", target="dev", version=None):
+    """Write build artifacts with sentinels that saved history must withhold."""
+
     document = {
         "metadata": {
             "invocation_id": "earlier",
@@ -40,6 +42,8 @@ def _results(root, *, status="error", which="build", target="dev", version=None)
 
 @pytest.mark.parametrize("status", ["success", "error", "skipped", "unknown"])
 def test_previous_node_status_is_observation_only(tmp_path, status):
+    """Previous node status is observation only."""
+
     _results(tmp_path, status=status)
     previous = preserve_previous_build(tmp_path, "dev")
     context = node_context(previous, "model.p.upstream")
@@ -66,6 +70,8 @@ def test_previous_node_status_is_observation_only(tmp_path, status):
 
 @pytest.mark.parametrize("which", ["compile", "seed", "test", "run"])
 def test_pricing_and_other_commands_never_replace_saved_build(tmp_path, which):
+    """Pricing and other commands never replace saved build."""
+
     _results(tmp_path)
     first = preserve_previous_build(tmp_path, "dev")
     _results(tmp_path, status="success", which=which)
@@ -76,6 +82,8 @@ def test_pricing_and_other_commands_never_replace_saved_build(tmp_path, which):
 
 @pytest.mark.parametrize("current", [False, True])
 def test_corrupt_history_is_explicitly_unknown(tmp_path, current):
+    """Corrupt history is explicitly unknown."""
+
     (tmp_path / ("run_results.json" if current else SNAPSHOT)).write_text("{bad")
     assert preserve_previous_build(tmp_path, "dev") == {
         "available": False,
@@ -84,6 +92,8 @@ def test_corrupt_history_is_explicitly_unknown(tmp_path, current):
 
 
 def test_missing_history_and_unselected_nodes_are_unknown(tmp_path):
+    """Missing history and unselected nodes are unknown."""
+
     assert (
         preserve_previous_build(tmp_path, "dev")["reason_code"] == "no_previous_build"
     )
@@ -102,11 +112,15 @@ def test_missing_history_and_unselected_nodes_are_unknown(tmp_path):
     ],
 )
 def test_incompatible_history_is_not_used(tmp_path, options, reason):
+    """Incompatible history is not used."""
+
     _results(tmp_path, **options)
     assert preserve_previous_build(tmp_path, "dev")["reason_code"] == reason
 
 
 def test_cold_and_ordinary_history_are_separate(tmp_path):
+    """Cold and ordinary history are separate."""
+
     cold = tmp_path / "cold"
     cold.mkdir()
     _results(tmp_path, status="success")

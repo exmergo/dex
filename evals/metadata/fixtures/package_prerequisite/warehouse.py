@@ -16,6 +16,8 @@ NAMES = ("plan", "draft", "review", "revise", "approve", "publish", "archive", "
 
 
 def tables(seed: int) -> list[Table]:
+    """Generate the seeded warehouse tables used by this evaluation fixture."""
+
     start = datetime(2024, 1, 1, 9) + timedelta(days=seed % 7)
     rows = []
     for task_id, name in enumerate(NAMES, start=1):

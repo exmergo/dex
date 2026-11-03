@@ -30,6 +30,8 @@ from .score import score_workspace
 
 
 def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate scored tasks without treating ungraded checks as passes."""
+
     scored = [r["score"] for r in rows]
     n = len(scored) or 1
     gate_failed = [s["task"] for s in scored if s["status"] == "gate_failed"]
@@ -80,10 +82,14 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _verdict(passed: bool) -> str:
+    """Render one boolean rubric result for the evaluation table."""
+
     return "pass" if passed else "FAIL"
 
 
 def _print_table(report: dict[str, Any]) -> None:
+    """Print build, workspace, procedure and final-report scores per task."""
+
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
         f"{'attrib':>7} {'proc':>5} {'privacy':>7} {'wspace':>6} {'report':>6}"
@@ -151,6 +157,8 @@ def _print_table(report: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the requested metadata evaluation mode and report its results."""
+
     parser = argparse.ArgumentParser(
         prog="evals metadata", description="Metadata-quality eval (#492)"
     )
