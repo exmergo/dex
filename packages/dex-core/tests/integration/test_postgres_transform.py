@@ -424,3 +424,17 @@ def test_a_cast_key_is_measured_through_a_guard_live(pg_dsn):
         icu = plan_probe(conn, "pg_temp.dex_icu_codes")
         assert icu["input_rows"] == 3
         assert icu["failed_rows"] == 2
+
+        # Postgres refuses a regex under a nondeterministic collation, so the
+        # shape test reads the key as "C" and still runs.
+        conn.execute(
+            "create collation pg_temp.dex_ci (provider = icu,"
+            " locale = 'und-u-ks-level2', deterministic = false)"
+        )
+        conn.execute(
+            "create temp table dex_ci_codes (code text collate pg_temp.dex_ci)"
+        )
+        conn.execute("insert into dex_ci_codes values ('7'), ('x')")
+        ci = plan_probe(conn, "pg_temp.dex_ci_codes")
+        assert ci["input_rows"] == 2
+        assert ci["failed_rows"] == 1

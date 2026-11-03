@@ -235,7 +235,7 @@ def test_a_postgres_integer_cast_is_guarded_by_shape_and_range(target, low, high
     rendered = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="postgres")
     assert "TRY_CAST" not in rendered
     assert f"BETWEEN {low} AND {high}" in rendered
-    assert "~ '" in rendered
+    assert 'COLLATE "C" ~ \'' in rendered
 
 
 def test_a_cast_nested_in_a_guarded_one_is_guarded_too():

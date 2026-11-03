@@ -666,7 +666,10 @@ def _guarded_cast(node: exp.TryCast, dialect: str) -> exp.Expression | None:
         return None
     operand = with_safe_casts(node.this.copy(), dialect)
     text = exp.Cast(this=operand, to=exp.DataType.build("text"))
-    shaped = exp.RegexpLike(this=text, expression=exp.Literal.string(_INTEGER_TEXT))
+    # A nondeterministic collation rejects a regex, so the shape test reads C.
+    c_locale = exp.to_identifier("C", quoted=True)
+    c_text = exp.Collate(this=text.copy(), expression=c_locale)
+    shaped = exp.RegexpLike(this=c_text, expression=exp.Literal.string(_INTEGER_TEXT))
     digits = exp.Case().when(shaped, text.copy()).else_(exp.Literal.string("0"))
     in_range = exp.Between(
         this=exp.Cast(this=digits, to=exp.DataType.build("numeric")),
