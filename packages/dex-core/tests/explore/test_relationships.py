@@ -3000,3 +3000,25 @@ def test_a_key_that_mixes_value_shapes_is_restated_as_a_finding_code():
     assert mixed.column == "id"
     assert mixed.severity == "low"
     assert mixed.detail == note
+
+def test_an_unproven_key_shape_note_is_restated_as_a_finding_code():
+    """#1072: looks-like-a-key wording also yields mixed_identifier_shapes."""
+
+    note = (
+        "product_id looks like a key but mixes value shapes: 78% numeric, "
+        "22% other; casting to a number or comparing numerically will silently "
+        "drop the non-numeric group(s)"
+    )
+    ds = Dataset(
+        identifier="db.main.products",
+        row_count=10,
+        columns=[
+            ColumnProfile(name="product_id", data_type="VARCHAR", null_fraction=0.1)
+        ],
+        data_quality=[note],
+    )
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
+    assert mixed.column == "product_id"
+    assert mixed.detail == note
+

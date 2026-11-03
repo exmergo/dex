@@ -703,13 +703,22 @@ def _hex_shape_label(agg: ColumnAggregate) -> str:
     return f"hexadecimal ({lo}-{hi} characters, mixed length)"
 
 
-def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str | None:
-    """A candidate-key column that mixes two or more value shapes (numeric,
+def _heterogeneous_key_note(
+    col_name: str,
+    agg: ColumnAggregate | None,
+    *,
+    proven_key: bool = True,
+) -> str | None:
+    """A key-shaped column that mixes two or more value shapes (numeric,
     UUID, hex of at least the length floor, or an unclassified remainder) in
     a meaningful share each -- the shape that survives a partial migration or
     a merged upstream, where a downstream cast, join, or filter silently
     drops the group it was not written for. Fractions and a length-derived
     shape label only; never a value.
+
+    Proven candidate keys keep the historical wording; id-shaped columns that
+    are not proven unique (#1072) use ``looks like a key`` so a repair of a
+    nullable or non-unique identifier still carries profile evidence.
 
     The consequence named follows the groups reported, not the raw
     fractions: the cast warning only when numeric is one of them, since with
@@ -746,9 +755,12 @@ def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str |
             "a join or filter written for one shape will silently miss the "
             "other group(s)"
         )
-    return (
-        f"{col_name} is a candidate key but mixes value shapes: {parts}; {consequence}"
+    role = (
+        "is a candidate key but"
+        if proven_key
+        else "looks like a key but"
     )
+    return f"{col_name} {role} mixes value shapes: {parts}; {consequence}"
 
 
 def _boolean_shaped_flag_note(
@@ -1035,6 +1047,8 @@ def profile(
         if notes_for is not None:
             data_quality.extend(notes_for(identifier))
 
+        from .relationships import is_id_shaped
+
         for col in columns:
             agg = aggregates.get(col.name)
             pii = _refine_confidence(
@@ -1047,8 +1061,11 @@ def profile(
                 data_quality.extend(
                     _type_contradiction_notes(col.name, col.data_type, agg)
                 )
-                if _is_candidate_key(col.name, agg, composite_members):
-                    key_note = _heterogeneous_key_note(col.name, agg)
+                proven_key = _is_candidate_key(col.name, agg, composite_members)
+                if proven_key or is_id_shaped(col.name):
+                    key_note = _heterogeneous_key_note(
+                        col.name, agg, proven_key=proven_key
+                    )
                     if key_note is not None:
                         data_quality.append(key_note)
                 flag_note = _boolean_shaped_flag_note(
