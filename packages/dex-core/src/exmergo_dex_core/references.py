@@ -1298,27 +1298,35 @@ class ReferenceIndex:
         declared = any(
             (root / name).is_file() for name in ("packages.yml", "dependencies.yml")
         )
-        packages_dir = root / "dbt_packages"
-        if declared and not packages_dir.is_dir():
+        from .transform.build import packages_dir as resolve_packages_dir
+
+        install_root = resolve_packages_dir(root)
+        try:
+            install_rel = install_root.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            # Absolute / outside-project install path: keep a stable label.
+            install_rel = install_root.name or "dbt_packages"
+        if declared and not install_root.is_dir():
             self.limits.append(
                 "packages are declared but not installed, so package contents "
                 "were not scanned; run `transform deps` first"
             )
             return
-        if not packages_dir.is_dir():
+        if not install_root.is_dir():
             return
-        for entry in sorted(packages_dir.iterdir()):
+        for entry in sorted(install_root.iterdir()):
             if not (entry / "dbt_project.yml").is_file():
                 continue
+            prefix = f"{install_rel}/{entry.name}/"
             try:
                 self._scan(
                     load_project(entry),
                     package=entry.name,
-                    prefix=f"dbt_packages/{entry.name}/",
+                    prefix=prefix,
                 )
             except Exception:
                 self.limits.append(f"package '{entry.name}' could not be read")
-                self.unread.append(f"dbt_packages/{entry.name}/")
+                self.unread.append(prefix)
 
 
 class _ScalarLines:
