@@ -315,7 +315,7 @@ def test_a_failed_build_suppresses_row_population_and_says_why(tmp_path: Path):
     )
     result = _sweep(
         tmp_path,
-        _summary([_node("model.shop.fct_orders")], success=False),
+        _summary([_node("model.shop.fct_orders", status="error")], success=False),
     )
     assert "did not complete" in result.suppressed["row_population"]
     assert any(f.code == "node_failed" for f in result.findings)
@@ -889,7 +889,13 @@ def test_a_build_checks_what_its_models_declare(tmp_path: Path):
     finally:
         adapter.close()
     codes = sorted(f.code for f in result.findings)
-    assert codes == ["grain_broken", "population_contradicted", "unit_out_of_range"]
+    # The manifest declares fewer columns than the relation has (#1002).
+    assert codes == [
+        "column_undeclared",
+        "grain_broken",
+        "population_contradicted",
+        "unit_out_of_range",
+    ]
     population = next(f for f in result.findings if f.code == "population_contradicted")
     assert population.data["contradicting_rows"] == 3
     grain = next(f for f in result.findings if f.code == "grain_broken")
@@ -902,7 +908,9 @@ def test_a_build_checks_what_its_models_declare(tmp_path: Path):
 
 def test_a_failed_build_suppresses_the_declared_facts_and_says_why(tmp_path: Path):
     _declared_manifest(tmp_path)
-    result = _sweep(tmp_path, _summary([_node("model.p.fct_orders")], success=False))
+    result = _sweep(
+        tmp_path, _summary([_node("model.p.fct_orders", status="error")], success=False)
+    )
     for finding_class in ("grain", "unit", "additivity", "population"):
         assert "did not complete" in result.suppressed[finding_class]
 
@@ -970,3 +978,629 @@ def test_declared_facts_that_do_not_fit_come_back_as_an_offer():
     assert offer.data["per_table_bytes"] == {"(declared facts)": 50_000.0}
     assert offer.data["statement_count"] == 2
     assert "--verify --confirm --budget" in offer.data["hint"]
+
+
+# --- #841: a build's own passing uniqueness test speaks for its fan-out ------------
+
+
+def _fanned_project(project: Path, test_status: str) -> tuple[dict, _StubAdapter]:
+    nodes = {
+        "model.shop.fct_lines": {
+            "name": "fct_lines",
+            "resource_type": "model",
+            "relation_name": '"warehouse"."dbt_dev"."fct_lines"',
+            "compiled_code": (
+                'select o.id, i.sku from "warehouse"."raw"."orders" o '
+                'inner join "warehouse"."raw"."items" i on o.id = i.order_id'
+            ),
+            "config": {"materialized": "table"},
+        },
+        "test.shop.unique_fct_lines_line_id.1a2b": {
+            "resource_type": "test",
+            "attached_node": "model.shop.fct_lines",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": "line_id"}},
+        },
+    }
+    _artifacts(
+        project,
+        nodes=nodes,
+        results=[
+            {"unique_id": "model.shop.fct_lines", "status": "success"},
+            {
+                "unique_id": "test.shop.unique_fct_lines_line_id.1a2b",
+                "status": test_status,
+            },
+        ],
+    )
+    summary = _summary(
+        [
+            _node("model.shop.fct_lines"),
+            _node("test.shop.unique_fct_lines_line_id.1a2b", status=test_status),
+        ]
+    )
+    adapter = _StubAdapter(
+        [
+            _Meta("warehouse.raw.orders"),
+            _Meta("warehouse.raw.items"),
+            _Meta("warehouse.dbt_dev.fct_lines"),
+        ],
+        counts={"warehouse.dbt_dev.fct_lines": 500, "warehouse.raw.orders": 100},
+    )
+    return summary, adapter
+
+
+def test_a_passing_unique_test_caps_the_build_s_fanout_at_low(tmp_path: Path):
+    summary, adapter = _fanned_project(tmp_path, "pass")
+    result = _sweep(tmp_path, summary, adapter)
+    (finding,) = [f for f in result.findings if f.code == "row_fanout"]
+    assert finding.severity == "low"
+    assert finding.data["grain_proven"] == {
+        "columns": ["line_id"],
+        "source": "unique_test",
+    }
+
+
+def test_a_failing_unique_test_proves_nothing(tmp_path: Path):
+    summary, adapter = _fanned_project(tmp_path, "fail")
+    result = _sweep(tmp_path, summary, adapter)
+    (finding,) = [f for f in result.findings if f.code == "row_fanout"]
+    assert finding.severity == "high"
+    assert "grain_proven" not in finding.data
+
+
+def _uniqueness_artifacts(project: Path, tests: dict[str, tuple[str, dict]]) -> None:
+    nodes: dict = {"model.shop.fct": {"name": "fct", "resource_type": "model"}}
+    for column, (_status, config) in tests.items():
+        nodes[f"test.shop.unique_fct_{column}"] = {
+            "resource_type": "test",
+            "attached_node": "model.shop.fct",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": column}},
+            "config": config,
+        }
+    _artifacts(
+        project,
+        nodes=nodes,
+        results=[
+            {"unique_id": f"test.shop.unique_fct_{column}", "status": status}
+            for column, (status, _config) in tests.items()
+        ],
+    )
+
+
+@pytest.mark.parametrize("config", [{"where": "is_current"}, {"limit": 10}])
+def test_a_scoped_unique_test_proves_no_grain(tmp_path: Path, config: dict):
+    from exmergo_dex_core.maintain.verify import passed_grain_tests
+
+    _uniqueness_artifacts(tmp_path, {"id": ("pass", config)})
+    assert passed_grain_tests(tmp_path) == {}
+
+
+def test_a_failing_unique_test_unproves_a_passing_one(tmp_path: Path):
+    from exmergo_dex_core.maintain.verify import passed_grain_tests
+
+    _uniqueness_artifacts(
+        tmp_path, {"id": ("pass", {}), "line_id": ("warn", {"where": None})}
+    )
+    assert passed_grain_tests(tmp_path) == {}
+    _uniqueness_artifacts(tmp_path, {"id": ("pass", {}), "line_id": ("skipped", {})})
+    assert passed_grain_tests(tmp_path) == {
+        "fct": {"columns": ["id"], "source": "unique_test"}
+    }
+
+
+# --- join coverage and parent population on the build path (#857) ---------------
+
+_REPRO_SQL = (
+    'select s.subscription_id, s.created_at from "wh"."dbt_dev"."activity" a '
+    'left join "wh"."dbt_dev"."subscriptions" s '
+    "on a.subscription_id = s.subscription_id"
+)
+
+
+def _repro_manifest(project: Path) -> None:
+    _artifacts(
+        project,
+        nodes={
+            "model.p.subscriptions": {
+                "name": "subscriptions",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."subscriptions"',
+                "compiled_code": 'select * from "wh"."raw"."subscriptions"',
+            },
+            "model.p.rpt_subscriptions": {
+                "name": "rpt_subscriptions",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."rpt_subscriptions"',
+                "compiled_code": _REPRO_SQL,
+                "config": {
+                    "materialized": "table",
+                    "meta": {
+                        "dex": {
+                            "population": {
+                                "parent": {
+                                    "model": "subscriptions",
+                                    "key": {"subscription_id": "subscription_id"},
+                                }
+                            }
+                        }
+                    },
+                },
+                "columns": {
+                    "created_at": {
+                        "name": "created_at",
+                        "config": {"meta": {"dex": {"null_rule": "never"}}},
+                    }
+                },
+            },
+        },
+        results=[{"unique_id": "model.p.rpt_subscriptions", "status": "success"}],
+    )
+
+
+def test_a_build_measures_its_joins_and_its_declared_parent(tmp_path: Path):
+    """The issue's reproduction through the build sweep, on real relations: a
+    green build, every subscription column NULL, the join matching nothing, and
+    all three subscriptions missing from a model declared one row each."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.subscriptions AS SELECT * FROM (VALUES "
+        "('sub_elm', TIMESTAMP '2026-01-01'), ('sub_oak', TIMESTAMP '2026-01-02'), "
+        "('sub_pine', TIMESTAMP '2026-01-03')) t(subscription_id, created_at)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.activity AS SELECT * FROM (VALUES "
+        "(1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')) t(activity_id, subscription_id)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_subscriptions AS " + _REPRO_SQL.replace('"wh".', "")
+    )
+    conn.close()
+    _repro_manifest(tmp_path)
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_subscriptions")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    codes = {f.code: f for f in result.findings}
+    assert codes["join_no_match"].severity == "high"
+    assert codes["join_field_all_null"].column == "created_at"
+    assert codes["parent_population_missing"].data["missing_parents"] == 3
+    assert "join_contract" not in result.suppressed
+    payload = result.payload()
+    (record,) = payload["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["measured"]["eligible_rows"] == 4
+    (parent,) = payload["parent_population"]
+    assert parent["status"] == "contradicted"
+
+
+def test_a_failed_build_suppresses_the_join_contract_and_says_why(tmp_path: Path):
+    _repro_manifest(tmp_path)
+    result = _sweep(
+        tmp_path,
+        _summary([_node("model.p.rpt_subscriptions", status="error")], success=False),
+    )
+    assert "did not complete" in result.suppressed["join_contract"]
+    assert "join_coverage" not in result.payload()
+
+
+def test_join_coverage_is_priced_with_the_build(tmp_path: Path):
+    from exmergo_dex_core.transform.verify import price_join_contract
+
+    _repro_manifest(tmp_path)
+    adapter = _Estimator()
+    adapter.cost_gate = object()
+    price, notes = price_join_contract(
+        adapter, tmp_path, scope={"model.p.rpt_subscriptions"}
+    )
+    assert notes == []
+    # One coverage probe and one NULL count on the model.
+    assert price == 2048.0
+    assert len(adapter.sql) == 2
+    assert all(sql.upper().startswith("SELECT") for sql in adapter.sql)
+
+
+def test_join_coverage_that_does_not_fit_comes_back_as_an_offer():
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.transform.verify import _join_handshake
+
+    class _Adapter:
+        name = "bigquery"
+        dialect = "bigquery"
+        paradigm = Paradigm.BYTES_SCANNED
+        cost_gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=1_000.0,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=True,
+            connector="bigquery",
+            command="transform build",
+        )
+
+    offer = _join_handshake(_Adapter())(50_000.0, 2)
+    assert offer is not None
+    assert offer.data["phase"] == "join_contract"
+    assert offer.data["per_table_bytes"] == {"(join overlap probes)": 50_000.0}
+    assert offer.data["statement_count"] == 2
+
+
+def test_a_build_failed_only_by_its_tests_still_judges_the_models_it_built(
+    tmp_path: Path,
+):
+    """A declaration's `not_null` or `relationships` test failing makes dbt
+    report the build as failed, and that is exactly when the row checks matter
+    (#857): every model built in this run, so each one is judged."""
+
+    _repro_manifest(tmp_path)
+    summary = _summary(
+        [
+            _node("model.p.rpt_subscriptions"),
+            _node("test.p.not_null_rpt_subscriptions_created_at.1a2b", status="fail"),
+        ],
+        success=False,
+    )
+    result = _sweep(tmp_path, summary, _StubAdapter([]))
+    assert "did not complete" not in result.suppressed.get("join_contract", "")
+    assert "did not complete" not in result.suppressed.get("parent_population", "")
+
+
+def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
+    _repro_manifest(tmp_path)
+    summary = _summary(
+        [
+            _node("model.p.rpt_subscriptions"),
+            _node("model.p.subscriptions", status="error"),
+        ],
+        success=False,
+    )
+    result = _sweep(tmp_path, summary, _StubAdapter([]))
+    assert any("subscriptions failed or were skipped" in w for w in result.warnings), (
+        result.warnings
+    )
+
+
+def test_a_build_holds_a_status_history_to_its_declared_policy(tmp_path: Path):
+    """The build path reports a temporal contract, keeping the snapshot's own
+    success apart from the history claim that is still wrong (#1027)."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "create table hosts_snapshot as select * from (values "
+        "(1, true, timestamp '2026-01-01')) t(host_id, is_super, dbt_valid_from)"
+    )
+    # A first observation at the target, counted as a change it never made.
+    conn.execute("create table host_history as select 1 as host_id, 1 as changes")
+    conn.close()
+    _artifacts(
+        tmp_path,
+        nodes={
+            "snapshot.p.hosts_snapshot": {
+                "name": "hosts_snapshot",
+                "resource_type": "snapshot",
+                "relation_name": '"wh"."main"."hosts_snapshot"',
+                "config": {"strategy": "check"},
+            },
+            "model.p.host_history": {
+                "name": "host_history",
+                "resource_type": "model",
+                "relation_name": '"wh"."main"."host_history"',
+                "compiled_code": 'select * from "wh"."main"."hosts_snapshot"',
+                "depends_on": {"nodes": ["snapshot.p.hosts_snapshot"]},
+                "config": {
+                    "materialized": "table",
+                    "meta": {
+                        "dex": {
+                            "history": {
+                                "snapshot": "hosts_snapshot",
+                                "entity": {"host_id": "host_id"},
+                                "status": {"column": "is_super", "target": True},
+                                "initial_observation": "baseline",
+                                "null_status": "ignore",
+                                "measures": {"transition_count": "changes"},
+                            }
+                        }
+                    },
+                },
+                "columns": {},
+            },
+        },
+        results=[
+            {"unique_id": "snapshot.p.hosts_snapshot", "status": "success"},
+            {"unique_id": "model.p.host_history", "status": "success"},
+        ],
+    )
+
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.host_history")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    assert "temporal_transition_count_mismatch" in {f.code for f in result.findings}
+    (record,) = result.payload()["temporal_contracts"]
+    assert record["status"] == "contradicted"
+    assert record["snapshot_execution"]["status"] == "success"
+
+
+# --- what a full refresh just recomputed is comparable (#1020) ----------------------
+
+
+def _incremental(
+    project: Path,
+    sql: str,
+    *,
+    counts: dict[str, int],
+    full_refresh: dict | None,
+    status: str = "success",
+    config: dict | None = None,
+):
+    """A built incremental model over a parent, judged on the given counts."""
+
+    uid = "model.p.events"
+    _artifacts(
+        project,
+        nodes={
+            uid: {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.events",
+                "config": {"materialized": "incremental", **(config or {})},
+                "compiled_code": sql,
+            },
+            "model.p.stg_events": {
+                "name": "stg_events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg_events",
+                "config": {"materialized": "table"},
+                "compiled_code": "select * from wh.raw.events",
+            },
+            "model.p.dim": {
+                "name": "dim",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.dim",
+                "config": {"materialized": "table"},
+                "compiled_code": "select * from wh.raw.dim",
+            },
+        },
+        results=[{"unique_id": uid, "status": status}],
+    )
+    summary = _summary([_node(uid, status)], success=status == "success")
+    if full_refresh is not None:
+        summary["full_refresh"] = full_refresh
+    relations = {f"wh.dbt_dev.{name}": rows for name, rows in counts.items()}
+    adapter = _StubAdapter([_Meta(r, rows) for r, rows in relations.items()], relations)
+    return _sweep(project, summary, adapter)
+
+
+_LOSES = (
+    "select e.id from wh.dbt_dev.stg_events e join wh.dbt_dev.dim d on e.dim_id = d.id"
+)
+_REFRESHED = {"requested": True, "models": ["events"], "seeds": [], "not_refreshed": []}
+
+
+def _codes(result) -> set[str]:
+    return {finding.code for finding in result.findings}
+
+
+def test_a_full_refresh_reports_row_loss_on_the_incremental_model_it_rebuilt(
+    tmp_path: Path,
+):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+    )
+    assert "row_loss" in _codes(result)
+    assert not any("incremental" in w for w in result.warnings)
+
+
+def test_a_full_refresh_reports_fanout_on_the_incremental_model_it_rebuilt(
+    tmp_path: Path,
+):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 500, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+    )
+    assert "row_fanout" in _codes(result)
+
+
+def test_a_filter_in_the_rebuilt_model_still_explains_a_shortfall(tmp_path: Path):
+    result = _incremental(
+        tmp_path,
+        _LOSES + " where e.id > 5",
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+    )
+    assert "row_loss" not in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "full_refresh",
+    [
+        None,
+        # The stale-seed step writes this key too, and rebuilt no model.
+        {"seeds": ["countries"], "success": True},
+        # `full_refresh: false` made dbt ignore the flag.
+        {"requested": True, "models": [], "seeds": [], "not_refreshed": ["events"]},
+        # Rebuilt, but a different model.
+        {"requested": True, "models": ["other"], "seeds": [], "not_refreshed": []},
+    ],
+)
+def test_an_incremental_model_not_rebuilt_is_still_skipped(tmp_path, full_refresh):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=full_refresh,
+    )
+    assert "row_loss" not in _codes(result)
+    assert any(
+        "holds what previous runs loaded" in w and "events" in w
+        for w in result.warnings
+    )
+
+
+def test_a_copy_whose_own_setting_ignores_the_flag_keeps_the_skip(tmp_path: Path):
+    """The label can be in the rebuilt list on behalf of another package's copy."""
+
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+        config={"full_refresh": False},
+    )
+    assert "row_loss" not in _codes(result)
+    assert any(
+        "holds what previous runs loaded" in w and "events" in w
+        for w in result.warnings
+    )
+
+
+def test_a_rebuilt_model_is_compared_with_a_parent_outside_the_manifest(tmp_path: Path):
+    """Quoted names and a raw parent, with the model's verdict stated whole."""
+
+    uid = "model.shop.fct_events"
+    _artifacts(
+        tmp_path,
+        nodes={
+            uid: {
+                "name": "fct_events",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_events"',
+                "compiled_code": 'select * from "warehouse"."raw"."events"',
+                "config": {"materialized": "incremental"},
+            },
+        },
+        results=[],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_events"), _Meta("warehouse.raw.events")],
+        counts={"warehouse.dbt_dev.fct_events": 10, "warehouse.raw.events": 100},
+    )
+    summary = _summary([_node(uid)])
+    summary["full_refresh"] = {**_REFRESHED, "models": ["fct_events"]}
+
+    result = _sweep(tmp_path, summary, adapter)
+    assert result.scope == ["fct_events"]
+    assert "row_population" not in result.suppressed
+    assert [(f.code, f.identifier) for f in result.findings] == [
+        ("row_loss", "fct_events")
+    ]
+
+
+def test_a_rebuilt_model_that_failed_is_not_judged(tmp_path: Path):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+        status="error",
+    )
+    assert not {"row_loss", "row_fanout"} & _codes(result)
+    assert "row_population" in result.suppressed
+
+
+def test_a_rebuilt_microbatch_model_stays_skipped_and_says_why(tmp_path: Path):
+    result = _incremental(
+        tmp_path,
+        _LOSES,
+        counts={"events": 10, "stg_events": 100, "dim": 5},
+        full_refresh=_REFRESHED,
+        config={"incremental_strategy": "microbatch"},
+    )
+    assert "row_loss" not in _codes(result)
+    assert any("microbatch" in w and "events" in w for w in result.warnings)
+
+
+def test_a_microbatch_model_with_no_compiled_sql_is_not_sent_to_compile(tmp_path: Path):
+    """dbt's manifest holds no compiled SQL for a microbatch model, even after a
+    build that succeeded, so the skip has to be named ahead of that check."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.events": {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.events",
+                "config": {
+                    "materialized": "incremental",
+                    "incremental_strategy": "microbatch",
+                },
+                "compiled_code": None,
+            }
+        },
+        results=[],
+    )
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["events"]
+    )
+    assert checks == []
+    assert len(notes) == 1 and "microbatch" in notes[0] and "compile" not in notes[0]
+
+
+def test_a_rebuilt_models_view_parent_is_priced_with_the_build(tmp_path: Path):
+    """The count of a view parent is a scan, and without this the caller would
+    confirm a number that leaves it out and be asked again after the build."""
+
+    from exmergo_dex_core.transform.verify import price_verification
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.stg_events": {
+                "name": "stg_events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg_events",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.events",
+            },
+            "model.p.events": {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.events",
+                "config": {"materialized": "incremental"},
+                "compiled_code": "select * from wh.dbt_dev.stg_events",
+            },
+        },
+        results=[],
+    )
+    scope = {"model.p.events"}
+
+    adapter = _Estimator()
+    assert price_verification(adapter, tmp_path, scope=scope) == (0.0, [])
+    assert adapter.sql == []
+
+    adapter = _Estimator()
+    price, _ = price_verification(adapter, tmp_path, scope=scope, recomputed=["events"])
+    assert price == 1024.0
+    assert "stg_events" in adapter.sql[0]

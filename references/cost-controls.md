@@ -47,6 +47,18 @@ populated `cost.estimate` on an `ok` still means settled preflight for work that
 ran, and `needs_confirmation` stays reserved for work the caller asked for and
 has not authorized.
 
+### Queries discovered during model compilation
+
+`transform plan` compiles Jinja control-flow models against the dev target in a
+throwaway project. Compile-time SELECTs use Dex's own read-only query path;
+compilation opens no direct dbt warehouse handle. The first discovered query and
+any required profiles are quoted before spending. Because a later macro query
+may depend on an earlier result, the estimate covers only work discovered so
+far and is marked approximate. Later queries extend the same reservation and
+share the command and daily ceilings. A refusal stores no plan and reports any
+completed spend. Re-running compilation may repeat its queries. DuckDB needs no
+spend handshake.
+
 ### Unattended sessions
 
 Spending authority comes from the person running a session, or from the limits
@@ -143,6 +155,7 @@ parses to a stable schema and no reader has to interpret an absent key.
 | `estimate` | the whole-command preflight figure the settlement was admitted on. `null` on the other two kinds, and on a settlement whose pricing degraded to no estimate at all |
 | `job_id` | the warehouse's identifier for the job, where it has one |
 | `statement_sha256` | a hash of the statement. Never its text, never a value. `null` on a settlement for spend no single statement produced, such as a build's dbt run or Snowflake's warehouse uptime |
+| `warehouse_claim` | what a Snowflake command claimed of the warehouse's current resume cycle: `warehouse`, `resumed_on`, `last_statement_end` (epoch seconds), `auto_suspend`, and `suspend` (what `snowflake.suspend_after_command` did: `suspended`, `refused_grant`, `already_suspended`, `failed`, or `null` when nothing was attempted). On a zero-amount settlement, so it changes no total; the next command in the same cycle reads it back to charge only what it adds rather than a second idle tail. `null` on every other row |
 
 **Settled spend is the `entry == "settlement"` filter**, summed over one
 connector's unit. That is not the same number as `session_spent_today` whenever

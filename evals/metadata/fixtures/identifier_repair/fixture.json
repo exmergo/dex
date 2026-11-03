@@ -1,0 +1,5 @@
+{
+  "name": "identifier_repair",
+  "seed": 8610,
+  "description": "A product catalogue keyed by text: integer-looking ids, one zero-padded id that is a different product from its unpadded twin, and opaque ids from a second, legitimate scheme. Prices are keyed by integer, so the product dimension's join to them breaks. A repair that keeps only castable ids, or casts both to one integer, builds and loses or merges products."
+}

@@ -1,0 +1,43 @@
+{
+  "models": {
+    "store_daily_stock": {
+      "grain": [
+        "store_id",
+        "snapshot_date"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "units_on_hand": {
+          "role": "measure",
+          "additivity": "semi_additive",
+          "unit": "count"
+        },
+        "skus_in_stock": {
+          "role": "measure",
+          "additivity": "non_additive",
+          "unit": "count"
+        },
+        "snapshot_date": {
+          "role": [
+            "time",
+            "key"
+          ]
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "one row per store per day",
+      "expect": 150,
+      "sql": "select count(*) from main.store_daily_stock"
+    },
+    {
+      "name": "totals match the snapshots",
+      "expect": 0,
+      "sql": "select count(*) from main.store_daily_stock d full outer join (select store_id, snapshot_date, sum(units_on_hand) as units_on_hand, count(distinct case when units_on_hand > 0 then sku end) as skus_in_stock from raw.stock_levels group by 1, 2) e using (store_id, snapshot_date) where d.units_on_hand is distinct from e.units_on_hand or d.skus_in_stock is distinct from e.skus_in_stock"
+    }
+  ]
+}

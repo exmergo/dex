@@ -1068,3 +1068,53 @@ def test_a_verified_build_shares_the_gates_reservation_id_for_one_ratio():
         pytest.approx(100.0 / 400.0),
         pytest.approx(200.0 / 400.0),
     ]
+
+
+# --- claims on a warehouse's resume cycle (#664) ----------------------------------
+
+
+def test_every_ledger_row_carries_a_warehouse_claim_key():
+    """Every key on every row, null where it does not apply: the claim key is no
+    exception, so a reader parsing the ledger as a table sees one schema."""
+
+    from exmergo_dex_core.guards.cost_guard import ledger_row
+
+    row = ledger_row(
+        connector="snowflake",
+        command="explore query",
+        entry="reservation",
+        field="billed_seconds",
+        amount=10.0,
+    )
+    assert "warehouse_claim" in row and row["warehouse_claim"] is None
+
+
+def test_a_claim_is_a_zero_settlement_in_the_commands_group():
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger, history=lambda: list(ledger.entries))
+    gate.preflight_command(300.0)
+    claim = {
+        "warehouse": "DEX_WH",
+        "resumed_on": "2026-10-29T12:00:00.000-07:00",
+        "last_statement_end": 1_800_000_000.0,
+        "auto_suspend": 600,
+        "suspend": None,
+    }
+    gate.record_claim(claim)
+    row = ledger.entries[-1]
+    assert row["entry"] == "settlement"
+    assert row["billed_bytes"] == 0.0
+    assert row["warehouse_claim"] == claim
+    assert row["reservation_id"] == ledger.entries[0]["reservation_id"]
+    assert gate.billed == 0.0
+    assert gate.warehouse_claims() == [claim]
+
+
+def test_claims_read_back_as_nothing_without_a_readable_history():
+    ledger = _Ledger()
+    assert _ledger_gate(ledger).warehouse_claims() == []
+
+    def broken() -> list[dict]:
+        raise OSError("ledger unreadable")
+
+    assert _ledger_gate(ledger, history=broken).warehouse_claims() == []

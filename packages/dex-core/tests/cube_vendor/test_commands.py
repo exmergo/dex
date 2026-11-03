@@ -3,8 +3,8 @@
 `explore semantic list` reads the layer with no Cube server and no warehouse
 connection. `explore relationships|map --use-project` carry Cube's joins and
 primary keys at confidence 1.0 on a real DuckDB warehouse. `maintain snapshot`
-fingerprints the layer. Querying is refused by name until the governed path
-lands, with a PII dimension refused as PII first.
+fingerprints the layer. A query asks a Cube server to render it, after the PII
+gate: the governed path itself is `test_query.py`.
 """
 
 from __future__ import annotations
@@ -138,17 +138,16 @@ def test_a_layer_of_only_unreadable_files_is_refused_with_the_files_named(
     assert "model/broken.yml" in envelope["errors"][0]
 
 
-# --- querying is refused by name, PII first ------------------------------------------
+# --- values: PII first, then the renderer ---------------------------------------------
 
 
-def test_a_cube_query_is_refused_by_name(layer, capsys, no_network):
-    rc, envelope = _run(capsys, layer, "explore", "semantic", "query", "orders.revenue")
+def test_cube_values_refuse_a_pii_dimension_before_asking_cube(
+    tmp_path, capsys, monkeypatch
+):
+    from exmergo_dex_core.cube.loader import load_files
 
-    assert rc != 0
-    assert "Cube has no SQL renderer outside a Cube server" in envelope["errors"][0]
+    from .fake_cube import FakeCube, meta_for
 
-
-def test_cube_values_refuse_a_pii_dimension_as_pii_first(tmp_path, capsys, no_network):
     people = cube(
         "people",
         dimensions=[
@@ -157,15 +156,21 @@ def test_cube_values_refuse_a_pii_dimension_as_pii_first(tmp_path, capsys, no_ne
         ],
     )
     root = repo(tmp_path, people)
+    server = FakeCube(meta=meta_for(load_files(root, ["model/people.yml"])))
+    server.recordings = {}
+    server.install(monkeypatch)
 
     rc, pii = _run(capsys, root, "explore", "semantic", "values", "people.email")
-    rc_other, other = _run(capsys, root, "explore", "semantic", "values", "people.team")
     _, unknown = _run(capsys, root, "explore", "semantic", "values", "people.tem")
 
     assert rc != 0 and pii["reason"] == "guard"
     assert "PII" in pii["errors"][0]
-    assert rc_other != 0 and "Cube has no SQL renderer" in other["errors"][0]
     assert "people.tem" in unknown["errors"][0]
+    assert server.calls == []
+
+    _, other = _run(capsys, root, "explore", "semantic", "values", "people.team")
+    assert other["errors"][0].startswith("could not resolve the values of people.team")
+    assert server.paths == ["/cubejs-api/v1/meta", "/cubejs-api/v1/sql"]
 
 
 def test_the_engine_resolves_the_cube_layer_and_has_no_hosted_override(tmp_path):

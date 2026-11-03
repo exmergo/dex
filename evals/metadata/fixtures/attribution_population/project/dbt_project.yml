@@ -1,0 +1,11 @@
+name: activity
+version: "1.0.0"
+profile: activity
+model-paths: ["models"]
+
+models:
+  activity:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

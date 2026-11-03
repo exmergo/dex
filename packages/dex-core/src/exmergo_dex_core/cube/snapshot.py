@@ -18,19 +18,29 @@ a physical column is decided once, whichever channel asks.
 snake_case, so respelling ``sqlTable`` as ``sql_table`` is not a change and
 ``meta`` is excluded: it is free-form and carries nothing a definition means.
 
-A compiled-only file or element is not fingerprinted here: its definitions are
-only Cube's compiler's to read, and the fingerprint says so in its notes rather
-than leaving them to read as absent.
+**Compiled-only definitions** (a ``.js`` model, a Jinja-templated file, a cube
+or view with ``extends``) are only Cube's compiler's to read, so nothing
+structural is fingerprinted out of them. Each is recorded by its content instead
+(:class:`..maintain.snapshot.OpaqueDef`): a whole file by its bytes, an
+``extends`` element by its own parsed body, so editing a sibling cube in the
+same file does not mark it changed. A change is then reported as a change
+(``compiled_only_changed``), and the fingerprint's notes say on every read that
+these were compared by content only, so a layer holding one never reads clean.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import yaml
 
 from ..maintain.snapshot import (
     MetricDef,
+    OpaqueDef,
     RelationshipDef,
     SemanticLayerSnapshot,
     SemanticModelDef,
@@ -46,18 +56,34 @@ __all__ = ["semantic_layer"]
 
 
 def semantic_layer(
-    loaded: LoadResult, resolved: catalog_mod.Resolution
+    loaded: LoadResult,
+    resolved: catalog_mod.Resolution,
+    repo_root: Path | str | None = None,
 ) -> SemanticLayerSnapshot:
-    """Fingerprint the semantic layer from the validated set."""
+    """Fingerprint the semantic layer from the validated set.
+
+    ``repo_root`` is where the compiled-only files are read from to hash them;
+    without one they are named in the notes and not recorded.
+    """
 
     notes = loaded.notes()
+    opaque = _opaque(loaded, repo_root) if repo_root is not None else []
     if loaded.compiled_only:
+        names = ", ".join(o.name for o in opaque) or ", ".join(
+            c.file for c in loaded.compiled_only
+        )
         notes.append(
-            "compiled-only Cube definitions are not fingerprinted structurally, so "
-            "a change inside them is not detected by this baseline"
+            f"compiled-only Cube definitions ({names}) are compared by their "
+            "content alone, never structurally: a change inside one is reported "
+            "as changed, and what changed is not read"
         )
     if loaded.empty:
-        return SemanticLayerSnapshot(**_provenance(), notes=notes)
+        return SemanticLayerSnapshot(
+            **_provenance(),
+            opaque_definitions=opaque,
+            opaque_captured=repo_root is not None,
+            notes=notes,
+        )
 
     relations = {
         cube.name: relation
@@ -104,9 +130,52 @@ def semantic_layer(
         relationships=relationships,
         relationships_and_keys_captured=True,
         relationship_cardinality_captured=True,
+        opaque_definitions=opaque,
+        opaque_captured=repo_root is not None,
         **_provenance(),
         notes=notes,
     )
+
+
+_ELEMENT = re.compile(r"^(cubes|views)\['(.*)'\]$")
+
+
+def _opaque(loaded: LoadResult, repo_root: Path | str) -> list[OpaqueDef]:
+    """Every compiled-only definition, hashed by its content."""
+
+    found: list[OpaqueDef] = []
+    for item in loaded.compiled_only:
+        try:
+            raw = (Path(repo_root) / item.file).read_bytes()
+        except OSError:
+            continue
+        name = item.file
+        digest = hashlib.sha256(raw).hexdigest()
+        match = _ELEMENT.match(item.element or "")
+        if match:
+            name = f"{item.file}: {item.element}"
+            digest = _hash(_element(raw, match.group(1), match.group(2)))
+        found.append(
+            OpaqueDef(
+                name=name, path=item.file, reason=item.reason, content_sha256=digest
+            )
+        )
+    return found
+
+
+def _element(raw: bytes, section: str, name: str) -> Any:
+    """One element's parsed body out of a file, or the whole file's bytes as
+    text where it cannot be found, which still detects a change."""
+
+    try:
+        body = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return raw.decode("utf-8", "replace")
+    listed = body.get(section) if isinstance(body, dict) else None
+    for entry in listed if isinstance(listed, list) else []:
+        if isinstance(entry, dict) and str(entry.get("name")) == name:
+            return entry
+    return raw.decode("utf-8", "replace")
 
 
 def _provenance() -> dict[str, Any]:

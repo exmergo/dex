@@ -1,0 +1,44 @@
+{
+  "models": {
+    "dim_products": {
+      "grain": [
+        "product_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "product_id": {
+          "role": "key"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every product still sold is present",
+      "expect": 37,
+      "sql": "select count(*) from main.dim_products"
+    },
+    {
+      "name": "opaque identifiers are kept",
+      "expect": 6,
+      "sql": "select count(*) from main.dim_products where cast(product_id as varchar) like 'org_%'"
+    },
+    {
+      "name": "007 and 7 stay two products",
+      "expect": 37,
+      "sql": "select count(distinct cast(product_id as varchar)) from main.dim_products"
+    },
+    {
+      "name": "the retired product stays excluded",
+      "expect": 0,
+      "sql": "select count(*) from main.dim_products where supplier = 'retired'"
+    },
+    {
+      "name": "every integer catalogue id is priced",
+      "expect": 30,
+      "sql": "select count(*) from main.dim_products where price is not null and cast(product_id as varchar) in (select cast(product_id as varchar) from raw.product_prices)"
+    }
+  ]
+}

@@ -394,6 +394,7 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         from .guards.query_firewall import QueryRefusedError
         from .guards.sql_guard import NotSelectOnlyError
         from .results import BudgetExhaustedError
+        from .transform.artifact_runtime import ArtifactCollisionError
         from .transform.build import DbtRunError, ProdTargetRefusedError
         from .transform.commands import BuildFailedError, DbtParseError
         from .transform.plans import PlanError
@@ -423,6 +424,8 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         (QueryRefusedError, Reason.GUARD),
         (NotSelectOnlyError, Reason.GUARD),
         (ProdTargetRefusedError, Reason.GUARD),
+        # Another dbt runtime's artifacts: a safety refusal that deletes nothing.
+        (ArtifactCollisionError, Reason.GUARD),
         (ConnectorError, Reason.CONNECTION),
         (CredentialDiscoveryError, Reason.CONFIGURATION),  # will not appear on a retry
         (ConfigurationError, Reason.CONFIGURATION),

@@ -150,6 +150,9 @@ class FakeBigQueryClient:
         # server-side maximum_bytes_billed backstop reachable. result_error is
         # raised at result() on executed jobs (e.g. a TimeoutError).
         self.dry_run_underestimate: float = 1.0
+        # A statement BigQuery would refuse to compile: a dry run fails at
+        # query(), as the real client's does, for SQL this returns an error for.
+        self.dry_run_error: Callable[[str], Exception | None] | None = None
         self.result_error: Exception | None = None
 
     # --- metadata surface (free API calls) ------------------------------------
@@ -223,6 +226,8 @@ class FakeBigQueryClient:
         total_bytes = self._bytes_for(sql)
 
         if dry_run:
+            if self.dry_run_error is not None and (failure := self.dry_run_error(sql)):
+                raise failure
             return FakeQueryJob(
                 job_id=job_id,
                 total_bytes=int(total_bytes * self.dry_run_underestimate),

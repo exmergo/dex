@@ -83,6 +83,10 @@ _EXPORTS = {
     "recompute_outcome": "transform.evidence",
     "required_nodes": "transform.evidence",
     "verify_build_evidence": "transform.evidence",
+    # What a build established, bounded to lead its payload (#855).
+    "BuildCompletion": "transform.completion",
+    "COMPLETION_BUDGET_BYTES": "transform.completion",
+    "summarize_completion": "transform.completion",
     # What a guarded build may install and may run.
     "DeclaredPackage": "transform.build",
     "DependencyPolicy": "transform.build",
@@ -154,6 +158,11 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         classify_content,
         classify_edit,
     )
+    from ..transform.completion import (
+        COMPLETION_BUDGET_BYTES,
+        BuildCompletion,
+        summarize_completion,
+    )
     from ..transform.evidence import (
         BuildCoverage,
         BuildDigests,
@@ -204,11 +213,13 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
 #: contract without executing anything. `tests/test_host_contract.py` asserts the
 #: two stay in step and that every name resolves.
 __all__ = [
+    "COMPLETION_BUDGET_BYTES",
     "PLAN_DOCUMENT_SCHEMA_VERSION",
     "AmbiguousReference",
     "ArtifactClass",
     "ArtifactClassification",
     "ArtifactSignal",
+    "BuildCompletion",
     "BuildCoverage",
     "BuildDigests",
     "BuildEvidence",
@@ -268,6 +279,7 @@ __all__ = [
     "recompute_outcome",
     "required_nodes",
     "source_digest",
+    "summarize_completion",
     "unverifiable_packages",
     "verify_build_evidence",
     "verify_plan_document",

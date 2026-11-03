@@ -462,6 +462,7 @@ def transform_drift(
 #: cannot tell how much it matters.
 _DECLARATION_WEIGHT = {
     "population": "high",
+    "history": "high",
     "grain": "high",
     "additivity": "high",
     "unit": "high",
@@ -932,7 +933,9 @@ class JoinCardinalityCheck(NamedTuple):
     side_model: str
     identifier: str
     columns: list[str]
-    row_count: int
+    #: None is unknown (no free row count on this connector), not zero: the
+    #: scan that measures the join supplies the count, as for a key check.
+    row_count: int | None
 
 
 def grain_plan(
@@ -990,18 +993,21 @@ def grain_plan(
         # A composite grain contributes nothing to the single-column set: its
         # members are not individually unique, and checking them one at a time
         # would fabricate key_lost_uniqueness findings on every run.
+        # The baseline's grain can be the project's claim rather than a
+        # measurement (a declared primary key is reported as the grain whether
+        # or not it held). One measurement already refuted never lost anything:
+        # it is left to the declared survey below, as a declaration to fix.
+        refuted = {c.name for c in dataset.columns if c.is_unique is False}
         keys = sorted(
             {key[0] for key in dataset.candidate_keys if len(key) == 1}
             | (
-                set(dataset.grain)
+                set(dataset.grain) - refuted
                 if dataset.grain and len(dataset.grain) == 1
                 else set()
             )
         )
         composites: list[list[str]] = []
-        for combo in [k for k in dataset.candidate_keys if len(k) > 1] + (
-            [dataset.grain] if dataset.grain and len(dataset.grain) > 1 else []
-        ):
+        for combo in [k for k in dataset.candidate_keys if len(k) > 1]:
             if list(combo) not in composites:
                 composites.append(list(combo))
         if not keys and not composites:
@@ -1309,7 +1315,7 @@ def _join_cardinality_checks(
                     f"{identifier} no longer has, so its fanout was not verified"
                 )
                 continue
-            if not row_count:
+            if row_count == 0:
                 continue
             checks.append(
                 JoinCardinalityCheck(
@@ -1609,6 +1615,17 @@ def _combination_counts(
     }
 
 
+def _uncounted(notes: list[str], identifier: str) -> None:
+    """Name a table whose keys went unjudged for want of a row count, once."""
+
+    note = (
+        f"nothing counted {identifier}'s rows, so the uniqueness of its keys was "
+        "not verified"
+    )
+    if note not in notes:
+        notes.append(note)
+
+
 def _grain_severity(row_count: int, min_rows: int) -> tuple[str, dict, str]:
     """A lost-uniqueness finding's severity, damped below ``min_rows`` (#280).
 
@@ -1731,7 +1748,10 @@ def grain_drift(
         if live_meta.row_count is not None:
             row_count = live_meta.row_count
         if row_count is None:
-            continue  # nothing counted the table, so uniqueness cannot be judged
+            # Nothing counted the table, so uniqueness cannot be judged; said,
+            # because a skipped check reads the same as one that held.
+            _uncounted(plan.notes, dataset.identifier)
+            continue
         for key in keys:
             count = distinct.get(key)
             if count is None or count >= row_count:
@@ -1842,7 +1862,10 @@ def grain_drift(
         if live_meta.row_count is not None:
             row_count = live_meta.row_count
         if row_count is None:
-            continue  # nothing counted the table, so uniqueness cannot be judged
+            # Nothing counted the table, so uniqueness cannot be judged; said,
+            # because a skipped check reads the same as one that held.
+            _uncounted(plan.notes, dataset.identifier)
+            continue
         for combo in combos:
             count = counts.get(tuple(combo))
             if count is None or count >= row_count:
@@ -1890,7 +1913,10 @@ def grain_drift(
         if live_meta.row_count is not None:
             row_count = live_meta.row_count
         if row_count is None:
-            continue  # nothing counted the table, so uniqueness cannot be judged
+            # Nothing counted the table, so uniqueness cannot be judged; said,
+            # because a skipped check reads the same as one that held.
+            _uncounted(plan.notes, dataset.identifier)
+            continue
         for combo in combos:
             count = counts.get(tuple(combo))
             if count is None or count >= row_count:
@@ -1937,6 +1963,13 @@ def grain_drift(
         live_meta, _ = adapter.table_metadata(check.identifier)
         if live_meta.row_count is not None:
             row_count = live_meta.row_count
+        if row_count is None:
+            plan.notes.append(
+                f"join '{check.relationship}' is declared {check.cardinality}, "
+                f"and nothing counted {check.identifier}'s rows, so its fanout "
+                "was not verified"
+            )
+            continue
         if count is None or count >= row_count:
             continue
         members = ", ".join(check.columns)
@@ -2169,6 +2202,16 @@ def semantic_free_drift(
         base_defs.update({("relationship", r.name): r for r in baseline.relationships})
         cur_defs.update({("relationship", r.name): r for r in current.relationships})
 
+    # Opaque definitions are compared by their bytes only, and only where both
+    # sides recorded them (#912), for the reason relationships are above.
+    if baseline.opaque_captured and current.opaque_captured and not vendor_changed:
+        base_defs.update(
+            {("compiled_only", o.name): o for o in baseline.opaque_definitions}
+        )
+        cur_defs.update(
+            {("compiled_only", o.name): o for o in current.opaque_definitions}
+        )
+
     for kind, name in sorted(cur_defs.keys() - base_defs.keys()):
         findings.append(
             DriftFinding(
@@ -2194,12 +2237,34 @@ def semantic_free_drift(
             break
         if base_defs[key].content_sha256 != cur_defs[key].content_sha256:
             kind, name = key
+            if kind == "compiled_only":
+                findings.append(
+                    DriftFinding(
+                        axis="semantic",
+                        code="compiled_only_changed",
+                        severity="medium",
+                        detail=(
+                            f"compiled-only definition '{name}' changed since "
+                            f"the baseline ({cur_defs[key].reason}), and dex "
+                            "reads no structure out of it, so what changed is "
+                            "not known"
+                        ),
+                        data={
+                            "kind": kind,
+                            "name": name,
+                            "path": cur_defs[key].path,
+                            "reason": cur_defs[key].reason,
+                        },
+                    )
+                )
+                continue
             path = cur_defs[key].path
             # annotate_impacts only fills warehouse findings with a physical
             # identifier; semantic definition_changed has none, so set the
             # impact here (#889). A changed metric always includes itself and
             # transitive dependents via input_metrics. A changed semantic model
             # impacts every metric that draws on its measures.
+            identifier = None
             if kind == "metric":
                 impacted_metrics = _metrics_from_metric(current, name)
             elif kind == "semantic_model":
@@ -2207,12 +2272,21 @@ def semantic_free_drift(
                 impacted_metrics = (
                     _metrics_from_measures(current, set(sm.measures)) if sm else []
                 )
+                # A model that states its own relation names the table it sits
+                # on, so the change can be traced to it (#912). One reached
+                # through `model_ref` is the project's to trace, not this.
+                if sm is not None and sm.relation and not sm.model_ref:
+                    matched = _matched_identifier(
+                        sm, [d.identifier for d in current_datasets]
+                    )
+                    identifier = matched[0] if len(matched) == 1 else None
             else:
                 impacted_metrics = []
             findings.append(
                 DriftFinding(
                     axis="semantic",
                     code="definition_changed",
+                    identifier=identifier,
                     severity="low",
                     detail=(
                         f"the definition of {kind.replace('_', ' ')} '{name}' "
@@ -2482,7 +2556,10 @@ def cardinality_plan(
 ) -> list[CardinalityCheck]:
     """Which categorical dimension columns have a cardinality baseline to diff:
     the current semantic definitions intersected with the snapshot's distinct
-    counts. Only counts are ever compared; no dimension value is read.
+    counts. Only counts are ever compared; no dimension value is read. A
+    semantic model is matched to its table by whichever of ``model_ref`` and
+    ``relation`` it states, so a layer that sits straight on warehouse
+    relations (SLayer, Cube) is checked as well as a dbt one.
 
     ``scope`` (lowered name tokens) filters *before* estimation/execution, so a
     narrowed scan is priced and billed for less, not just reported as less: a
@@ -2498,9 +2575,9 @@ def cardinality_plan(
     snap_by_id = {d.identifier: d for d in snap.warehouse.datasets}
     identifiers = list(snap_by_id)
     for sm in current_semantic.semantic_models:
-        if not sm.model_ref:
-            continue
-        matches = match_identifier(sm.model_ref, identifiers)
+        # A layer with no build step names its relation directly (#409), and
+        # its dimensions widen underneath its metrics just the same (#912).
+        matches = _matched_identifier(sm, identifiers)
         if len(matches) != 1:
             continue
         identifier = matches[0]

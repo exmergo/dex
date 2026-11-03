@@ -346,6 +346,8 @@ Documentation = "https://docs.exmergo.com/dex"
 Repository = "https://github.com/exmergo/dex"
 Changelog = "https://github.com/exmergo/dex/blob/main/CHANGELOG.md"
 Issues = "https://github.com/exmergo/dex/issues"
+"Privacy Policy" = "https://www.exmergo.com/privacy/dex"
+"Terms of Service" = "https://www.exmergo.com/terms/dex"
 
 # The uv that resolves this project must trust the CA bundle certifi now ships:
 # uv vendors its own roots, and 0.13.4 is the first release without the emSign
@@ -371,7 +373,7 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # This package lives in a subdirectory; the repository .git is two levels up.
 root = "../.."
-fallback_version = "1.16.4"
+fallback_version = "1.17.2"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -394,6 +396,7 @@ markers = [
   "clickhouse_cloud: narrow ClickHouse Cloud integration tests (protected credentials required)",
   "trino: Trino-specific integration tests (the keyless local container)",
   "trino_iceberg: narrow Trino integration tests against the Glue and S3 Iceberg catalog (protected credentials required)",
+  "cube: governed Cube queries against a live render-only Cube Core (scripts/setup_cube_dev.sh)",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]
 

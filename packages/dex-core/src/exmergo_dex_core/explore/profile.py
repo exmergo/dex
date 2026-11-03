@@ -1112,11 +1112,14 @@ def _escalate_near_unique(
 
     A second pass covers columns the catalog says nothing about at all
     (Postgres views and tables nobody has analyzed report no planner
-    statistics, so their distinct counts arrive as None): a null-free column
-    with no count is exactly a column that could prove as a single-column
-    key, and leaving it unmeasured is what used to leave the grain unknown
-    and the candidate keys empty. Those columns have no approximation to
-    rank by, so id-shaped names go first and the rest follow scan order.
+    statistics, so their adapter sets ``distinct_count_missing``): a null-free
+    column with no count is exactly a column that could prove as a
+    single-column key, and leaving it unmeasured is what used to leave the
+    grain unknown and the candidate keys empty. Those columns have no
+    approximation to rank by, so id-shaped names go first and the rest follow
+    scan order. A column of a type the adapter skips reports no count either
+    and is never sent, since one the warehouse cannot group would fail the
+    whole statement (#1050).
 
     Bounded: at most ``_EXACT_DISTINCT_CAP`` columns per table across both
     passes (the near-unique pass wins the slots first), all in one batched
@@ -1143,7 +1146,7 @@ def _escalate_near_unique(
         if agg.distinct_count_exact:
             continue
         if agg.distinct_count is None:
-            if agg.null_fraction in (0.0, None):
+            if agg.distinct_count_missing and agg.null_fraction in (0.0, None):
                 catalog_blind.append(agg.name)
             continue
         non_null = _non_null(agg)

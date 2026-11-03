@@ -58,6 +58,8 @@ from slayer.engine.schema_drift import (
 
 from ..cache import match_identifier
 from ..maintain.drift import DriftFinding
+from ..semantic_types import NUMERIC, TEXT, UNPLACEABLE
+from ..semantic_types import spelled as spelled_type
 from . import catalog as catalog_mod
 
 if TYPE_CHECKING:
@@ -65,56 +67,6 @@ if TYPE_CHECKING:
     from .loader import LoadedModel, LoadResult
 
 __all__ = ["data_type", "declared_schema_drift"]
-
-# Spellings that are containers, documents, or bytes: SLayer either stores them
-# opaquely or reads them as text depending on the driver, so no bucket here is
-# one dex could stand behind.
-_UNPLACEABLE = (
-    "STRUCT",
-    "ARRAY",
-    "MAP",
-    "LIST",
-    "UNION",
-    "JSON",
-    "VARIANT",
-    "OBJECT",
-    "GEOGRAPHY",
-    "GEOMETRY",
-    "INTERVAL",
-    "BLOB",
-    "BYTEA",
-    "BINARY",
-    "VARBINARY",
-    "BYTES",
-    "RECORD",
-)
-_NUMERIC = (
-    "DECIMAL",
-    "NUMERIC",
-    "NUMBER",
-    "BIGNUMERIC",
-    "BIGDECIMAL",
-    "FIXED",
-    "FLOAT",
-    "DOUBLE",
-    "REAL",
-    "MONEY",
-    "SMALLMONEY",
-)
-_TEXT = (
-    "VARCHAR",
-    "CHAR",
-    "TEXT",
-    "STRING",
-    "NVARCHAR",
-    "NCHAR",
-    "NTEXT",
-    "UUID",
-    "CHARACTER",
-    "BPCHAR",
-    "CITEXT",
-    "ENUM",
-)
 
 
 def data_type(raw: str | None) -> DataType | None:
@@ -126,8 +78,8 @@ def data_type(raw: str | None) -> DataType | None:
     rule, and a guess would turn every unfamiliar spelling into a finding.
     """
 
-    spelled = (raw or "").upper().split("(")[0].strip()
-    if not spelled or spelled.endswith("[]") or spelled.startswith(_UNPLACEABLE):
+    spelled = spelled_type(raw)
+    if not spelled or spelled.endswith("[]") or spelled.startswith(UNPLACEABLE):
         return None
     if spelled in ("BOOLEAN", "BOOL", "BIT", "LOGICAL"):
         return DataType.BOOLEAN
@@ -137,9 +89,9 @@ def data_type(raw: str | None) -> DataType | None:
         return DataType.TIMESTAMP
     if "INT" in spelled:
         return DataType.INT
-    if spelled.startswith(_NUMERIC):
+    if spelled.startswith(NUMERIC):
         return DataType.DOUBLE
-    if spelled.startswith(_TEXT):
+    if spelled.startswith(TEXT):
         return DataType.TEXT
     return None
 

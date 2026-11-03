@@ -1,0 +1,32 @@
+version: 2
+models:
+  - name: rpt_team_activity
+    description: One row per team, with its members and the events it logged.
+    config:
+      meta:
+        dex:
+          grain: [team_id]
+          population:
+            rule: Every team, including teams with no members or events.
+          assumptions:
+            - decision: Which teams are in
+              chosen: every team, with zero counts where it has none
+              evidence: request
+    columns:
+      - name: team_id
+        tests: [unique, not_null]
+        config:
+          meta:
+            dex: {role: key}
+      - name: team_name
+        config:
+          meta:
+            dex: {role: attribute}
+      - name: member_count
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, additivity: additive, unit: count}
+      - name: event_count
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, additivity: additive, unit: count}

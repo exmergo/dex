@@ -15,6 +15,8 @@ from exmergo_dex_core.errors import WarehouseQueryError
 from exmergo_dex_core.maintain import verify as verify_mod
 from exmergo_dex_core.maintain.verify import (
     build_status_findings,
+    built_model_relations,
+    column_contract_check,
     column_contract_findings,
     column_contract_plan,
     compile_check,
@@ -262,8 +264,14 @@ def test_a_model_in_dev_namespace_missing_with_target_dev_is_reported():
 class _ColumnAdapter:
     """Just ``table_metadata``, keyed by identifier."""
 
-    def __init__(self, columns_by_identifier: dict[str, list[tuple[str, str]]]):
+    def __init__(
+        self,
+        columns_by_identifier: dict[str, list[tuple[str, str]]],
+        name: str = "duckdb",
+    ):
         self._columns = columns_by_identifier
+        self.name = name
+        self.dialect = name
 
     def table_metadata(self, identifier: str):
         cols = [
@@ -376,6 +384,106 @@ def test_a_matching_contract_reports_nothing():
         undeclared=0,
     )
     assert findings == []
+
+
+def test_bigquery_type_aliases_do_not_report_mismatch():
+    """#1033: BigQuery equivalent types (such as canonical int64 vs reported
+    INTEGER) are treated as matching rather than column_type_mismatch."""
+    from exmergo_dex_core.dbt_project import column_contract_divergence, types_equal
+
+    adapter = _ColumnAdapter(
+        {
+            "project.dataset.m": [
+                ("id", "INTEGER"),
+                ("is_active", "BOOLEAN"),
+                ("score", "FLOAT"),
+                ("title", "STRING"),
+                ("tags", "ARRAY<INTEGER>"),
+            ]
+        },
+        name="bigquery",
+    )
+    findings, notes = column_contract_findings(
+        adapter,
+        declared_by_model={
+            "m": {
+                "id": "int64",
+                "is_active": "bool",
+                "score": "float64",
+                "title": "string",
+                "tags": "ARRAY<INT64>",
+            }
+        },
+        model_relations={"m": "project.dataset.m"},
+        live_identifiers=["project.dataset.m"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert findings == []
+
+    # Also int vs INTEGER
+    assert types_equal("int", "INTEGER", connector="bigquery")
+
+    # Real mismatch is still reported
+    _missing, _extra, mismatched = column_contract_divergence(
+        {"id": "string"},
+        {"id": "INTEGER"},
+        connector="bigquery",
+    )
+    assert mismatched == [("id", "string", "INTEGER")]
+
+
+def test_duckdb_type_aliases_and_parameterized_types_match():
+    """#1033: DuckDB equivalent types and parameterized varchar(10) vs VARCHAR
+    match."""
+    from exmergo_dex_core.dbt_project import column_contract_divergence
+
+    adapter = _ColumnAdapter(
+        {
+            "db.main.m": [
+                ("id", "INTEGER"),
+                ("name", "VARCHAR"),
+                ("active", "BOOLEAN"),
+                ("amount", "DECIMAL(10,2)"),
+            ]
+        },
+        name="duckdb",
+    )
+    findings, notes = column_contract_findings(
+        adapter,
+        declared_by_model={
+            "m": {
+                "id": "int",
+                "name": "varchar(10)",
+                "active": "bool",
+                "amount": "decimal( 10, 2 )",
+            }
+        },
+        model_relations={"m": "db.main.m"},
+        live_identifiers=["db.main.m"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert findings == []
+
+    # Real mismatch is still reported
+    _missing, _extra, mismatched = column_contract_divergence(
+        {"id": "bigint", "name": "varchar(20)"},
+        {"id": "INTEGER", "name": "varchar(10)"},
+        connector="duckdb",
+    )
+    assert ("id", "bigint", "INTEGER") in mismatched
+    assert ("name", "varchar(20)", "varchar(10)") in mismatched
+
+
+def test_unnormalizable_type_falls_back_to_exact_match():
+    """#1033: Types Dex cannot normalize fall back to exact match and do not
+    silently pass."""
+    from exmergo_dex_core.dbt_project import types_equal
+
+    assert types_equal("CUSTOM_UDT", "custom_udt", connector="duckdb")
+    assert not types_equal("CUSTOM_UDT_A", "CUSTOM_UDT_B", connector="duckdb")
+    assert not types_equal("CUSTOM_UDT(10)", "CUSTOM_UDT", connector="duckdb")
 
 
 def test_undeclared_models_are_named_once_at_the_summary_level_not_per_model():
@@ -1424,6 +1532,8 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "unit",
         "additivity",
         "population",
+        "parent_population",
+        "temporal",
     }
 
 
@@ -1621,6 +1731,205 @@ def test_a_model_that_fans_out_is_reported_with_its_join_key(tmp_path: Path):
     assert findings[0].data["join_keys"] == ["o.order_id = i.order_id"]
 
 
+# --- #841: fan-out that is the model's purpose -----------------------------------
+
+_ANCHORED = (
+    "with anchors as (select date_day as anchor_date "
+    'from "wh"."main"."metricflow_time_spine"), '
+    'daily as (select * from "wh"."main"."fct_daily") '
+    "select anchors.anchor_date, daily.page from anchors inner join daily "
+    "on daily.data_date >= anchors.anchor_date - 14 "
+    "and daily.data_date < anchors.anchor_date"
+)
+
+
+def test_a_join_with_no_readable_key_caps_its_fanout_at_medium(tmp_path: Path):
+    """#841: a range join expands on purpose as often as by mistake, and with
+    no key there is nothing to call wrong, so size alone never ranks it high."""
+
+    checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
+    findings, _ = _judge(
+        checks,
+        {"metricflow_time_spine": 2557, "fct_daily": 900, "fct_comparison": 19096},
+    )
+    assert [f.code for f in findings] == ["row_fanout"]
+    finding = findings[0]
+    assert finding.severity == "medium"
+    assert finding.data["join_key_read"] is False
+    assert finding.data["severity_cap_applied"] == "join_key_unread"
+    assert "dex could not read the join key" in finding.detail
+    assert "severity capped at medium" in finding.detail
+
+
+def test_a_fanout_inside_the_medium_band_with_no_key_says_no_cap(tmp_path: Path):
+    checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
+    findings, _ = _judge(
+        checks,
+        {"metricflow_time_spine": 100, "fct_daily": 900, "fct_comparison": 150},
+    )
+    assert findings[0].severity == "medium"
+    assert findings[0].data["join_key_read"] is False
+    assert "severity_cap_applied" not in findings[0].data
+
+
+def test_each_join_is_shown_beside_its_own_keys(tmp_path: Path):
+    """A key read off the second join was shown next to the first join's label
+    (#841): each join now carries the keys its own ON clause holds."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "fct",
+                'select o.id from "wh"."main"."stg_orders" o '
+                'inner join "wh"."main"."spine" s on o.ordered_at >= s.day '
+                'left join "wh"."main"."stg_items" i on o.id = i.order_id',
+            )
+        },
+    )
+    assert checks[0].keys_by_join == ((), ("o.id = i.order_id",))
+    findings, _ = _judge(
+        checks, {"stg_orders": 100, "spine": 10, "stg_items": 300, "fct": 400}
+    )
+    detail = findings[0].detail
+    assert (
+        "inner join to 'wh.main.spine' (dex could not read the join key) or the "
+        "left join to 'wh.main.stg_items' on o.id = i.order_id"
+    ) in detail
+    # One join's key is readable, so the size of the expansion still ranks it.
+    assert findings[0].severity == "high"
+    assert "join_key_read" not in findings[0].data
+
+
+def _fanout(severity: str = "high", code: str = "row_fanout", model: str = "fct"):
+    from exmergo_dex_core.maintain.drift import DriftFinding
+
+    return DriftFinding(
+        axis="row_population",
+        code=code,
+        identifier=model,
+        severity=severity,
+        detail=f"'{model}' has 400 rows against its driving parent",
+        data={"row_count": 400},
+    )
+
+
+def test_a_proven_declared_grain_caps_a_fanout_at_low():
+    """#841: the extra rows are the grain the model declares, proven unique on
+    this run, so the finding stays listed but stops ranking with a wrong key."""
+
+    proven = {"fct": {"columns": ["comparison_key"], "source": "declaration"}}
+    (finding,) = verify_mod.damp_fanout([_fanout()], proven)
+    assert finding.severity == "low"
+    assert finding.data["grain_proven"] == {
+        "columns": ["comparison_key"],
+        "source": "declaration",
+    }
+    assert finding.data["severity_cap_applied"] == "grain_proven"
+    assert finding.data["row_count"] == 400
+    assert "[comparison_key] is proven unique" in finding.detail
+
+
+def test_damping_leaves_other_models_and_other_codes_alone():
+    proven = {"fct": {"columns": ["id"], "source": "unique_test"}}
+    findings = [
+        _fanout(model="other"),
+        _fanout(code="row_loss"),
+        _fanout(severity="low"),
+    ]
+    assert verify_mod.damp_fanout(findings, proven) == findings
+
+
+def test_damping_skips_a_model_whose_other_grain_broke():
+    """One declared grain held and another broke: the duplicate the broken one
+    found is what the fan-out explains, so it keeps its rank."""
+
+    proven = {"fct": {"columns": ["id"], "source": "unique_test"}}
+    broken = _fanout(code="grain_broken")
+    findings = [_fanout(), broken]
+    assert verify_mod.damp_fanout(findings, proven) == findings
+
+
+def test_a_declared_grain_that_holds_is_recorded_as_proven():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200, "db.main.b": 200},
+        columns={"db.main.a": ["id"], "db.main.b": ["id"]},
+        exact={"db.main.a": {"id": 200}, "db.main.b": {"id": 199}},
+    )
+    proven: dict = {}
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+            "b": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+        },
+        {"a": "db.main.a", "b": "db.main.b"},
+        ["db.main.a", "db.main.b"],
+        {"a", "b"},
+        proven=proven,
+    )
+    assert proven == {"a": {"columns": ["id"], "source": "unique_test"}}
+    assert [f.identifier for f in findings] == ["b"]
+
+
+def test_a_naming_guess_is_never_recorded_as_proven():
+    """Only a declaration says what one row is; an id-shaped column that
+    happens to be unique says nothing about the model's intent."""
+
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 200}},
+        approx={"db.main.a": {"id": (200, 0.0)}},
+    )
+    proven: dict = {}
+    verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}, proven=proven
+    )
+    assert proven == {}
+
+
+def test_a_passing_uniqueness_test_proves_its_model_s_grain(tmp_path: Path):
+    """A build's own passing `unique` test proved the grain on the relation
+    that build wrote; a failing one proved nothing."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.a": {"name": "a", "resource_type": "model"},
+            "model.p.b": {"name": "b", "resource_type": "model"},
+            "model.p.c": {"name": "c", "resource_type": "model"},
+            "test.p.unique_a_id.1": {
+                "resource_type": "test",
+                "attached_node": "model.p.a",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.unique_b_id.2": {
+                "resource_type": "test",
+                "attached_node": "model.p.b",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.combo_c.3": {
+                "resource_type": "test",
+                "attached_node": "model.p.c",
+                "test_metadata": {
+                    "name": "unique_combination_of_columns",
+                    "kwargs": {"combination_of_columns": ["day", "page"]},
+                },
+            },
+        },
+        results=[
+            {"unique_id": "test.p.unique_a_id.1", "status": "pass"},
+            {"unique_id": "test.p.unique_b_id.2", "status": "fail"},
+            {"unique_id": "test.p.combo_c.3", "status": "pass"},
+        ],
+    )
+    assert verify_mod.passed_grain_tests(tmp_path) == {
+        "a": {"columns": ["id"], "source": "unique_test"},
+        "c": {"columns": ["day", "page"], "source": "unique_test_composite"},
+    }
+
+
 def test_a_union_is_not_mistaken_for_fanout(tmp_path: Path):
     """A set operation has more rows than either side by construction, and no
     single driving parent to compare against, so it is declared rather than
@@ -1715,6 +2024,69 @@ def test_an_incremental_model_is_skipped_and_the_note_says_why(tmp_path: Path):
     )
     assert checks == []
     assert "incremental" in notes[0] and "events" in notes[0]
+
+
+def test_only_a_model_this_run_recomputed_passes_the_incremental_skip(tmp_path: Path):
+    """`maintain verify` passes nothing here, so on its own it stays unchanged."""
+
+    target = tmp_path / "target"
+    target.mkdir()
+    incremental = {"materialized": "incremental"}
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "m.1": _model(
+                        "rebuilt",
+                        'select * from "wh"."main"."raw"',
+                        config=incremental,
+                    ),
+                    "m.2": _model(
+                        "kept", 'select * from "wh"."main"."raw"', config=incremental
+                    ),
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["rebuilt"]
+    )
+    assert [c.model for c in checks] == ["rebuilt"]
+    assert len(notes) == 1 and "kept" in notes[0] and "rebuilt" not in notes[0]
+
+    checks, notes, _ = verify_mod.row_population_plan(tmp_path, "duckdb")
+    assert checks == []
+    assert "kept" in notes[0] and "rebuilt" in notes[0]
+
+
+def test_a_same_named_copy_dbt_did_not_rebuild_keeps_the_skip(tmp_path: Path):
+    """The label is in the list because another package's copy was rebuilt."""
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.pkg.events": _model(
+                        "events",
+                        'select * from "wh"."main"."raw"',
+                        config={"materialized": "incremental", "full_refresh": False},
+                    )
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["events"]
+    )
+    assert checks == []
+    assert "events" in notes[0]
 
 
 def test_an_ephemeral_model_contributes_nothing(tmp_path: Path):
@@ -1914,6 +2286,111 @@ def test_verify_reports_row_loss_end_to_end(
     assert "row_population" not in payload["data"]["suppressed"]
 
 
+def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
+    """#841's shape on a real warehouse: Monday anchors off a date spine,
+    range-joined to a daily fact, one row per anchor x day x page."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 100) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_daily AS SELECT DATE '2024-01-01' + i::INTEGER AS "
+        "data_date, p AS page FROM range(0, 100) t(i), (VALUES ('a'), ('b')) v(p)"
+    )
+    sql = (
+        "with anchors as (select date_day as anchor_date from "
+        '"warehouse"."main"."metricflow_time_spine" where dayofweek(date_day) = 1), '
+        'daily as (select * from "warehouse"."main"."fct_daily") '
+        "select anchors.anchor_date || '|' || daily.data_date || '|' || daily.page "
+        "as comparison_key, anchors.anchor_date, daily.data_date, daily.page "
+        "from anchors inner join daily "
+        "on daily.data_date >= anchors.anchor_date - 14 "
+        "and daily.data_date < anchors.anchor_date"
+    )
+    built = f"{sql} union all ({sql} limit 5)" if duplicate else sql
+    maintain_repo.sql(f"CREATE TABLE fct_comparison AS {built}")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.fct_comparison": {
+                "name": "fct_comparison",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_comparison"',
+                "compiled_code": sql,
+                "config": {"meta": {"dex": {"grain": ["comparison_key"]}}},
+            },
+            "model.maintain_test.fct_order_lines": {
+                "name": "fct_order_lines",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_order_lines"',
+                "compiled_code": (
+                    'select o.order_id from "warehouse"."main"."orders" o '
+                    'inner join "warehouse"."main"."orders" p '
+                    "on o.customer_id = p.customer_id"
+                ),
+            },
+        },
+        results=[],
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_order_lines AS SELECT o.order_id FROM orders o "
+        "JOIN orders p ON o.customer_id = p.customer_id"
+    )
+
+
+def test_verify_ranks_an_intended_expansion_low_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#841 end to end: the anchored comparison's declared grain is counted
+    unique, so its fan-out stays listed at low; a fan-out on a wrong key in the
+    same sweep, with no grain to speak for it, still ranks high."""
+
+    _anchored_comparison(maintain_repo)
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    fanouts = {
+        f["identifier"]: f
+        for f in payload["data"]["findings"]
+        if f["code"] == "row_fanout"
+    }
+    comparison = fanouts["fct_comparison"]
+    assert comparison["severity"] == "low"
+    assert comparison["data"]["grain_proven"] == {
+        "columns": ["comparison_key"],
+        "source": "declaration",
+    }
+    assert comparison["data"]["join_key_read"] is False
+    # One finding states one cap: the grain's replaces the unread key's.
+    assert comparison["detail"].count("severity capped") == 1
+    assert "severity capped at low" in comparison["detail"]
+    assert (
+        comparison["data"]["driving_parent"] == "warehouse.main.metricflow_time_spine"
+    )
+    assert fanouts["fct_order_lines"]["severity"] == "high"
+    assert not [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_comparison"
+    ]
+
+
+def test_verify_leaves_a_fanout_undamped_when_its_grain_broke(
+    maintain_repo, _assume_the_project_compiles
+):
+    _anchored_comparison(maintain_repo, duplicate=True)
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    by_code = {
+        f["code"]: f
+        for f in payload["data"]["findings"]
+        if f["identifier"] == "fct_comparison"
+    }
+    assert by_code["grain_broken"]["data"]["duplicate_count"] == 5
+    assert by_code["row_fanout"]["severity"] == "medium"
+    assert "grain_proven" not in by_code["row_fanout"]["data"]
+
+
 def test_verify_names_generated_sql_in_notes(
     maintain_repo, _assume_the_project_compiles
 ):
@@ -2078,7 +2555,27 @@ def test_a_range_join_is_skipped_and_stated():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "no conjunctive column-to-column equality" in skipped[0]
+    assert "no conjunctive column-to-column equality" in str(skipped[0])
+
+
+def test_a_join_that_filters_beside_its_keys_says_so_rather_than_no_key():
+    """`left join orders o on o.customer_id = c.id and o.status <> 'x'` has a
+    key; the skip is right (a probe of the key alone would count the orders the
+    filter excludes as matches, hiding customers left with none), and the reason
+    must not claim there is no key."""
+
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select c.id from "wh"."main"."customers" c '
+            'left join "wh"."main"."orders" o '
+            "on o.customer_id = c.id and o.status <> 'cancelled'"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "filters as well as pairing keys" in str(skipped[0])
+    assert "no conjunctive" not in str(skipped[0])
 
 
 def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
@@ -2096,7 +2593,7 @@ def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "no conjunctive column-to-column equality" in skipped[0]
+    assert "no conjunctive column-to-column equality" in str(skipped[0])
 
 
 def test_a_cte_renamed_column_resolves_to_the_physical_one():
@@ -2128,7 +2625,7 @@ def test_a_cte_computed_column_is_unresolvable_and_skipped():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert "could not be resolved" in str(skipped[0])
 
 
 def test_a_select_star_cte_passes_the_column_through_unchanged():
@@ -2202,7 +2699,7 @@ def test_a_chained_using_join_with_two_relations_in_scope_is_skipped():
     assert len(candidates) == 1
     assert candidates[0].to_relation == "wh.main.customers"
     assert len(skipped) == 1
-    assert "more than one relation already in scope" in skipped[0]
+    assert "more than one relation already in scope" in str(skipped[0])
 
 
 def test_a_cte_column_projected_from_a_joined_relation_resolves_correctly():
@@ -2244,7 +2741,7 @@ def test_one_unresolvable_composite_component_skips_the_whole_join():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert "could not be resolved" in str(skipped[0])
 
 
 def test_a_join_inside_an_inline_subquery_is_still_visited():
@@ -2354,7 +2851,7 @@ def test_a_column_read_through_a_union_cte_is_unresolvable():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert skipped[0].code == "set_operation_cte"
 
 
 def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
@@ -2373,7 +2870,7 @@ def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert skipped[0].code == "filtered_cte"
 
 
 def test_a_cross_join_is_silently_excluded():
@@ -2536,21 +3033,37 @@ class _FreeAdapter:
     dialect = "duckdb"
 
 
-def _fake_verify_relationships(fractions_by_from_column: dict[str, float]):
-    """A stand-in for `explore.relationships.verify_relationships` that sets
-    ``verified``/``orphan_fraction`` from a lookup keyed by the driving
-    column, instead of running the real probe SQL: #228's own logic (the
-    threshold grading, the finding shape, the handshake wiring) is what
-    these tests check, not the probe `explore relationships --verify`
-    already owns and already tests."""
+def _fake_measure_coverage(fractions_by_from_column: dict[str, float]):
+    """A stand-in for `explore.relationships.measure_coverage` that reports
+    100 eligible rows over 10 distinct keys per join, unmatched in the given
+    fraction, keyed by the driving column, instead of running the real probe
+    SQL: the grading, the finding shape and the handshake wiring are what
+    these tests check; the probe has tests of its own."""
 
-    def verify(adapter, relationships, *, timeout_seconds=30.0, progress=None):
+    from exmergo_dex_core.explore.relationships import JoinCoverageCounts
+
+    def measure(adapter, relationships, *, timeout_seconds=30.0):
+        measured = []
         for rel in relationships:
             fraction = fractions_by_from_column.get(rel.from_columns[0])
-            rel.verified = fraction is not None
-            rel.orphan_fraction = fraction
+            if fraction is None:
+                continue
+            measured.append(
+                (
+                    rel,
+                    JoinCoverageCounts(
+                        rows=100,
+                        null_key_rows=0,
+                        eligible_rows=100,
+                        matched_rows=round(100 * (1 - fraction)),
+                        eligible_keys=10,
+                        matched_keys=round(10 * (1 - fraction)),
+                    ),
+                )
+            )
+        return measured, []
 
-    return verify
+    return measure
 
 
 def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
@@ -2558,8 +3071,8 @@ def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.95}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.95}),
     )
     candidates = {
         "fct_orders": [
@@ -2591,8 +3104,8 @@ def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.3}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.3}),
     )
     candidates = {
         "fct_orders": [
@@ -2601,7 +3114,7 @@ def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
                 from_columns=("customer_id",),
                 to_relation="b",
                 to_columns=("id",),
-                side="left",
+                side="inner",
             )
         ]
     }
@@ -2618,8 +3131,8 @@ def test_a_healthy_join_reports_nothing(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.01}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.01}),
     )
     candidates = {
         "fct_orders": [
@@ -2665,8 +3178,8 @@ def test_the_handshake_defers_when_supplied(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.95}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.95}),
     )
     candidates = {
         "fct_orders": [
@@ -2834,7 +3347,7 @@ def _join_node(name: str, sql: str) -> dict:
     }
 
 
-def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
+def test_verify_reports_disjoint_keys_as_join_no_match_end_to_end(
     maintain_repo, _assume_the_project_compiles
 ):
     """#228's first acceptance bullet: a model joining two relations with
@@ -2857,9 +3370,13 @@ def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
     rc, payload = maintain_repo.dex("maintain", "verify")
     assert rc == 0 and payload["status"] == "ok", payload
     findings = payload["data"]["findings"]
-    assert findings[0]["code"] == "join_zero_overlap"
+    assert findings[0]["code"] == "join_no_match"
     assert findings[0]["severity"] == "high"
     assert findings[0]["data"]["orphan_fraction"] == 1.0
+    assert findings[0]["data"]["matched_rows"] == 0
+    (record,) = payload["data"]["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["coverage"] == {"rows": 0.0, "keys": 0.0}
 
 
 def test_verify_reports_nothing_for_a_healthy_join_end_to_end(
@@ -2915,13 +3432,45 @@ def test_verify_reports_sparse_orphans_as_join_orphans_not_broken_end_to_end(
     )
     rc, payload = maintain_repo.dex("maintain", "verify")
     assert rc == 0 and payload["status"] == "ok", payload
+    # A LEFT join keeps its unmatched rows, and nothing in the declaration
+    # says they must match: evidence on the record, not a finding (#857).
+    assert not any(
+        f["code"].startswith("join_") for f in payload["data"]["findings"]
+    ), payload["data"]["findings"]
+    (record,) = payload["data"]["join_coverage"]
+    assert record["status"] == "satisfied"
+    assert record["optional_unmatched"] is True
+    assert 0.1 < record["coverage"]["rows"] < 0.8
+
+
+def test_verify_reports_sparse_orphans_on_an_inner_join_as_join_orphans(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The same sparse right side behind an inner join drops the unmatched
+    rows, which is reported at its measured fraction against the stated
+    default threshold, and not characterized as broken."""
+
+    maintain_repo.sql("DELETE FROM customers WHERE id <= 10")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id, c.name from "warehouse"."main"."stg_orders" o '
+                'inner join "warehouse"."main"."customers" c '
+                "on o.customer_id = c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
     findings = [f for f in payload["data"]["findings"] if f["code"] == "join_orphans"]
     assert len(findings) == 1
     assert findings[0]["severity"] == "medium"
     assert 0.2 <= findings[0]["data"]["orphan_fraction"] < 0.9
-    assert not any(
-        f["code"] == "join_zero_overlap" for f in payload["data"]["findings"]
-    )
+    assert findings[0]["data"]["threshold_source"] == "default"
+    assert findings[0]["data"]["threshold"] == 0.2
 
 
 def test_verify_states_a_skipped_non_equality_join_end_to_end(
@@ -3577,3 +4126,90 @@ def test_verify_suppression_when_model_is_driven_by_union_cte(
     assert "it is driven by a set operation, so it has no single parent" in suppressed
     warnings = payload.get("warnings", [])
     assert not any("nothing built at combined" in w for w in warnings)
+
+
+# --- column contract from a build: scope by id, per-model failure (#1002) ------
+
+
+def test_the_column_contract_plan_scopes_by_unique_id_and_keeps_versions_apart(
+    tmp_path: Path,
+):
+    v1 = {**_node_with_columns("m", {"id": None}), "version": 1}
+    v2 = {**_node_with_columns("m", {"id": None, "x": None}), "version": 2}
+    _write_artifacts(
+        tmp_path,
+        {
+            "model.p.m.v1": v1,
+            "model.p.m.v2": v2,
+            "model.p.other": _node_with_columns("other", {"id": None}),
+            "model.p.bare": {"name": "bare", "resource_type": "model"},
+        },
+        [],
+    )
+    declared, undeclared, _ = column_contract_plan(tmp_path, scope={"model.p.m.v2"})
+    assert declared == {"m.v2": {"id": None, "x": None}}
+    assert undeclared == 0
+    declared, _, _ = column_contract_plan(tmp_path, scope={"other"})
+    assert set(declared) == {"other"}
+
+
+def test_built_model_relations_omit_an_ephemeral_model_and_out_of_scope_ones(
+    tmp_path: Path,
+):
+    _write_artifacts(
+        tmp_path,
+        {
+            "model.p.a": {"name": "a", "relation_name": '"db"."main"."a"'},
+            "model.p.b": {"name": "b", "relation_name": '"db"."main"."b"'},
+            "model.p.e": {"name": "e", "relation_name": None},
+        },
+        [],
+    )
+    assert built_model_relations(tmp_path, {"model.p.a", "model.p.e"}) == {
+        "a": "db.main.a"
+    }
+
+
+class _UnreadableAdapter(_ColumnAdapter):
+    def __init__(self, columns, failing: BaseException):
+        super().__init__(columns)
+        self._failing = failing
+
+    def table_metadata(self, identifier: str):
+        if identifier == "db.main.bad":
+            raise self._failing
+        return super().table_metadata(identifier)
+
+
+def test_one_unreadable_relation_does_not_lose_the_others():
+    check = column_contract_check(
+        _UnreadableAdapter(
+            {"db.main.good": [("id", "INTEGER"), ("x", "INTEGER")]},
+            RuntimeError("boom"),
+        ),
+        {"bad": {"id": None}, "good": {"id": None}, "gone": {"id": None}, "eph": {}},
+        {"bad": "db.main.bad", "good": "db.main.good", "gone": "db.main.gone"},
+        ["db.main.bad", "db.main.good"],
+        0,
+    )
+    assert check.checked == ["good"]
+    assert [f.code for f in check.findings] == ["column_undeclared"]
+    assert check.unchecked == {
+        "bad": "metadata_unreadable",
+        "eph": "no_relation",
+        "gone": "relation_not_found",
+    }
+    assert any("bad" in note and "boom" in note for note in check.notes)
+
+
+def test_a_cost_refusal_in_the_column_contract_is_not_swallowed():
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    with pytest.raises(CostGuardError):
+        column_contract_check(
+            _UnreadableAdapter({}, CostGuardError("over the ceiling")),
+            {"bad": {"id": None}},
+            {"bad": "db.main.bad"},
+            ["db.main.bad"],
+            0,
+        )

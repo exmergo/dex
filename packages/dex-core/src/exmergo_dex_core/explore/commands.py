@@ -46,6 +46,7 @@ from ..cache import (
     DatasetDeclaration,
     DeclaredColumn,
     DeclaredFilter,
+    DeclaredParent,
     DeclaredRows,
     DexCache,
     Relationship,
@@ -495,6 +496,46 @@ class _ObjectGap:
         )
 
 
+def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
+    """The cache as a command reading only the source allowlist may adjudicate on.
+
+    `explore profile --target dev` caches what it profiles (#893), so drafting
+    can read a dev-only build. A command that runs SQL through the ordinary
+    adapter must not clear a relation on those entries: the firewall would admit
+    a relation the source scope does not reach, and the adapter would run it
+    without ever having agreed to read that namespace. Only the dev namespace
+    outside the scope this command reads (the allowlist, or the ``--scope``
+    narrowing it) is held back; one that scope reaches is a source like any
+    other. A copy, so the entries stay in the cache for drafting.
+    """
+
+    from ..connect import dev_namespace_outside_allowlist
+
+    connector = engine.connector or engine.config.connector
+    if not connector:
+        return cache
+    target = getattr(engine.config, connector, None)
+    dev = dev_namespace_outside_allowlist(connector, target, engine.scopes)
+    if dev is None:
+        return cache
+    dev = dev.lower()
+    # A bare BigQuery dev dataset lives in the configured project, as the
+    # adapter reads it; a dataset of that name in another project is not it.
+    project = engine.project or getattr(target, "project", None)
+    exact = connector == "bigquery" and ("." in dev or bool(project))
+    if exact and "." not in dev:
+        dev = f"{project}.{dev}".lower()
+
+    def in_dev(identifier: str) -> bool:
+        namespace = identifier.rsplit(".", 1)[0].lower()
+        return namespace == dev or (not exact and namespace.endswith(f".{dev}"))
+
+    kept = [d for d in cache.datasets if not in_dev(d.identifier)]
+    if len(kept) == len(cache.datasets):
+        return cache
+    return cache.model_copy(update={"datasets": kept})
+
+
 def _object_gap(
     adapter: Adapter, prior: DexCache | None, named: list[str]
 ) -> _ObjectGap:
@@ -651,6 +692,7 @@ def profile(
     check_cumulative: bool = False,
     show_all_columns: bool = False,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> ProfileResult:
     """Profile the named objects, reusing fresh cached profiles where they exist.
 
@@ -672,15 +714,32 @@ def profile(
     In values-free mode (#591) every dataset returned has its column values
     withheld, whether it was scanned now or served from the cache, and a scan
     writes its profile to the cache without them.
+
+    ``target`` is dev-target only (#893), as on `maintain verify`: passing
+    ``target='dev'`` reads the dev namespace for the length of this command,
+    so a model whose only build is the dev one can be profiled for drafting
+    without adding the namespace dbt writes into to the source allowlist.
+    ``--scope`` still only narrows, nothing is written back to config, and the
+    cost guard applies as on any profile. Prod-looking targets are refused.
     """
 
+    reads_dev_target = False
+    if target is not None:
+        from ..transform.build import assert_dev_target
+
+        assert_dev_target(target, engine.config.dbt_target)
+        reads_dev_target = True
     mode = engine.resolve_result_mode(result_mode)
     values_free = mode is ResultMode.VALUES_FREE
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
     blob_paths = blob_override_paths(config.blob_overrides)
-    adapter = engine._adapter("explore profile")
+    adapter = (
+        engine._adapter("explore profile", reads_dev_target=True)
+        if reads_dev_target
+        else engine._adapter("explore profile")
+    )
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
@@ -726,18 +785,31 @@ def profile(
     # query` on that table must work without a second warehouse scan. Only the
     # freshly profiled are merged; the reused already live in the cache untouched,
     # and prior relationships are preserved because profile runs no inference pass.
+    # Measurement only. Declared grain and semantic exposure are read from the
+    # project at output time, on a copy, so the cache does not keep a claim the
+    # next run would have to refresh to drop (#926).
     profiled, cache, locator, persist_note = _profile_into_cache(
-        store, adapter, config, defs, stale, prior, now, withhold=values_free
+        store, adapter, config, None, stale, prior, now, withhold=values_free
     )
 
     # Freshly profiled plus fresh-cached: the full requested set, whether scanned
-    # this run or served from the cache. Only the freshly profiled needed
-    # annotation; the fresh-cached carry their keys and grain from the write that
-    # stored them.
+    # this run or served from the cache. The cache holds the measurement. Project
+    # grain claims and semantic exposure are applied to both halves below, when
+    # --use-project asks, so a cache hit and a rescan answer the same way (#926).
     datasets = profiled + list(fresh_reused.values())
 
     notes = [persist_note]
     notes.extend(_override_notes(datasets))
+    if reads_dev_target and getattr(engine, "_dev_target_read", None) is None:
+        notes.append(
+            "--target dev widened nothing: "
+            + (
+                "DuckDB's dev target is the file this connection already reads"
+                if connector == "duckdb"
+                else f"no dev namespace is configured under `{connector}:` in "
+                ".dex/config.yml"
+            )
+        )
     if fresh_reused:
         window = config.profile_freshness_hours
         notes.append(
@@ -815,6 +887,21 @@ def profile(
                 )
 
     if use_project:
+        # Copies: the objects in `datasets` include the ones just saved. Project
+        # claims must not land back in the cache.
+        datasets = [dataset.model_copy(deep=True) for dataset in datasets]
+        _apply_declared_profile(
+            datasets,
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
+        catalog = _semantic_catalog(engine, True)
+        if catalog is not None:
+            _annotate_semantic_exposure(datasets, catalog)
+        else:
+            for dataset in datasets:
+                dataset.semantic_models = []
+        notes.extend(defs.declaration_notes)
         datasets, declaration_notes = _apply_declarations(
             datasets,
             defs,
@@ -856,6 +943,7 @@ def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             show_all_columns=getattr(args, "columns", None) == "all",
             use_project=getattr(args, "use_project", False),
             check_cumulative=getattr(args, "check_cumulative", False),
+            target=getattr(args, "target", None),
         )
     )
 
@@ -914,10 +1002,8 @@ def relationships(
     metas = inventory_mod.inventory(adapter)
     connector = adapter.name
     # See map()'s identical computation: tells carry-forward "out of this
-    # run's scope" apart from "gone from the warehouse" (issue #149).
-    observed_namespaces = {
-        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
-    }
+    # run's scope" apart from "gone from the warehouse" (issues #149, #984).
+    observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
     # Skip re-scanning objects whose cached profile is still fresh (same
     # connector, schema unchanged, within the freshness window); only the stale
     # remainder is estimated, confirmed, and profiled below.
@@ -1000,14 +1086,23 @@ def relationships(
     )
 
     # Annotate before persisting so cached datasets carry candidate_keys and
-    # grain, the same shape a `map`-written cache has. Only the freshly profiled
-    # need it; the fresh-cached already carry theirs from the cache write.
+    # grain, the same shape a `map`-written cache has. Measurement is only
+    # recomputed for a fresh scan; a cache hit already has it.
     _annotate_grain(
         profiled,
         defs,
         high_null_fraction=config.profile_high_null_fraction,
         dialect=adapter.dialect,
     )
+    # A cache hit was measured by whoever wrote it. `profile` no longer bakes
+    # project grain into that write (#926), so a reused profile still has to
+    # take the claim before this command saves.
+    if use_project and fresh_reused:
+        _apply_declared_profile(
+            list(fresh_reused.values()),
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
 
     # Fold same-lineage duplicates before the merge, as `map` does, so the folded
     # set flows into both the cache and the result. Relationships profiles the
@@ -1057,8 +1152,21 @@ def relationships(
     # joins a cooperative project cares most about. Merging first also means no
     # measurement can be lost to the "declared wins over the same inferred edge"
     # rule: at merge time nothing has been measured yet.
+    # A join that names a column its dataset's profile no longer has can never
+    # be probed: the batch SQL would fail to bind and take the whole command
+    # down (issue #924). Check the columns against the profiled datasets first
+    # so the failure stays off the wire -- the edge becomes a finding (surfaced
+    # below beside orphan findings) and everything sound is still measured. The
+    # estimate and the run share the filtered pool, so the priced set and the
+    # run set stay the same set.
+    missing_column_findings = []
+    probe_refused = []
     if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, rels)
+        rel_mod.adopt_profiled_spelling(rels, datasets)
+        missing_column_findings = rel_mod.missing_column_findings(rels, datasets)
+        missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
+        verify_pool = [rel for rel in rels if id(rel) not in missing_column_ids]
+        probe_cost, candidates, objects = _verify_estimate(adapter, verify_pool)
         verify_pending = command_args.verify_handshake(
             "explore relationships",
             adapter,
@@ -1067,12 +1175,12 @@ def relationships(
             object_count=objects,
         )
         if verify_pending is None:
-            probed = rel_mod.probe_candidates(rels)
+            probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
-                    rels,
+                    verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
                 )
@@ -1158,7 +1266,10 @@ def relationships(
     reusable = prior if prior and prior.provenance.connector == connector else None
     examined = {d.identifier for d in datasets}
     rels, carried_relationships = _carry_forward_relationships(
-        reusable, examined, rels, observed_namespaces=observed_namespaces
+        reusable,
+        examined,
+        rels,
+        observed_namespaces=observed_namespaces,
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -1185,6 +1296,23 @@ def relationships(
     notes.extend(text for _rel, text in orphan_findings)
     datasets_by_id = {d.identifier: d for d in datasets}
     for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join naming a column the warehouse does not have is the same shape of
+    # drift as a catastrophic orphan rate: surfaced in notes and mirrored onto
+    # the child dataset's data_quality so it survives into the cache (issue
+    # #924). Only `--verify` computes it, because only a probe would fail.
+    notes.extend(text for _rel, text in missing_column_findings)
+    for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: surfaced in notes and mirrored onto the child
+    # dataset's data_quality so it survives into the cache (issue #933).
+    notes.extend(text for _rel, text in probe_refused)
+    for rel, text in probe_refused:
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
@@ -1451,6 +1579,9 @@ def _run_statements(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode = ResultMode.FULL,
+    adapter: Adapter | None = None,
+    handshake: Callable[..., None] | None = None,
+    reads_dev_target: bool = False,
 ) -> tuple[list[_Statement], _Batch]:
     """Drive every statement of one call through the firewall and the warehouse.
 
@@ -1494,7 +1625,10 @@ def _run_statements(
 
     batch = [_Statement(i, sql, line) for i, (sql, line) in enumerate(statements)]
     size = len(batch)
-    shared = _Batch()
+    shared = _Batch(adapter=adapter)
+
+    def visible_cache(value: DexCache) -> DexCache:
+        return value if reads_dev_target else _without_dev_profiles(engine, value)
 
     def ledger(statement: _Statement, entry: dict) -> None:
         if values_free and "reason" in entry:
@@ -1547,7 +1681,7 @@ def _run_statements(
         named = list(dict.fromkeys(name for names in reads.values() for name in names))
         if named:
             try:
-                shared.adapter = engine._adapter("explore query")
+                shared.adapter = shared.adapter or engine._adapter("explore query")
             except DexError:
                 # No connection settles nothing, exactly as an unreadable column
                 # signature settles nothing inside `_object_gap`. That tolerance
@@ -1564,7 +1698,11 @@ def _run_statements(
                 # unreachable. Only a refusal now returns without it.
                 shared.adapter = None
         if shared.adapter is not None:
-            gap = _object_gap(shared.adapter, cache, named)
+            gap = _object_gap(
+                shared.adapter,
+                None if cache is None else visible_cache(cache),
+                named,
+            )
             if gap.absent:
                 # Only the statements that named a missing object are refused; a
                 # neighbor that reads a table this connection has is unaffected by
@@ -1603,6 +1741,7 @@ def _run_statements(
                     at,
                     size,
                     withhold=values_free,
+                    handshake=handshake,
                 )
 
     if cache is None and any(statement.live for statement in batch):
@@ -1615,7 +1754,10 @@ def _run_statements(
         # After the cache write, never before: mask_overridden edits the datasets
         # in place, and masking first would persist an in-memory override onto
         # objects this run never re-profiled.
-        cache = mask_overridden(cache, pii_override_paths(config.pii_overrides))
+        cache = mask_overridden(
+            visible_cache(cache),
+            pii_override_paths(config.pii_overrides),
+        )
     for statement in batch:
         if not statement.live:
             continue
@@ -1655,7 +1797,7 @@ def _run_statements(
         # would release the profile's booking. Every statement still passes the
         # per-statement gate and the server-side cap on its way out.
         if not shared.profiled:
-            _price_statements(shared.adapter, live, size, ledger)
+            _price_statements(shared.adapter, live, size, ledger, handshake=handshake)
 
         _execute(
             engine,
@@ -1691,6 +1833,8 @@ def _price_statements(
     live: list[_Statement],
     size: int,
     ledger: Callable[[_Statement, dict], None],
+    *,
+    handshake: Callable[..., None] | None = None,
 ) -> None:
     """One handshake for the whole call, itemized per statement.
 
@@ -1709,7 +1853,7 @@ def _price_statements(
     }
     estimate = sum(per_statement.values())
     try:
-        command_args.billed_handshake(
+        (handshake or command_args.billed_handshake)(
             "explore query",
             adapter,
             estimate,
@@ -1936,6 +2080,7 @@ def _profile_for_statements(
     size: int,
     *,
     withhold: bool = False,
+    handshake: Callable[..., None] | None = None,
 ) -> tuple[DexCache, list[str], list[str]]:
     """Price and run the profiles a call needs, then hand back the new cache.
 
@@ -1966,7 +2111,7 @@ def _profile_for_statements(
     statement_estimate = sum(per_statement.values())
     subject = "this statement reads" if size == 1 else "these statements read"
     try:
-        command_args.billed_handshake(
+        (handshake or command_args.billed_handshake)(
             "explore query",
             adapter,
             profile_estimate + statement_estimate,
@@ -2300,11 +2445,9 @@ def map(
     baselined = _baselined_identifiers(store) if orphaned else set()
     # The schema/dataset namespaces this run's inventory actually saw, so
     # carry-forward can tell "out of this run's scope" from "gone from the
-    # warehouse" (issue #149) -- an identifier whose own namespace is here but
-    # who is itself absent from metas was looked at and is not there.
-    observed_namespaces = {
-        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
-    }
+    # warehouse" (issues #149, #984): an identifier whose own namespace is here
+    # but who is itself absent from metas was looked at and is not there.
+    observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
     # First-pass rank on cheap signals (no connectivity yet) to choose what to
     # profile; re-ranked with connectivity once relationships are known.
     first_pass = rank_mod.rank(metas, None, hints, orphaned)
@@ -2376,8 +2519,8 @@ def map(
         raise _budget_exhausted(store, adapter, accumulated, len(stale))
 
     # Freshly profiled plus fresh-cached: the full selected set, whether
-    # scanned this run or reused. Only the freshly profiled need annotation;
-    # the reused already carry theirs from the cache write that stored them.
+    # scanned this run or reused. Measurement is only recomputed for a fresh
+    # scan; a cache hit already has it.
     all_selected = profiled + list(fresh_reused.values())
     _annotate_grain(
         profiled,
@@ -2387,6 +2530,15 @@ def map(
         high_null_fraction=config.profile_high_null_fraction,
         dialect=adapter.dialect,
     )
+    # Same as relationships: a profile cached by `explore profile` holds the
+    # measurement only, so a reused object still needs the project's grain
+    # before this map saves it (#926).
+    if use_project and fresh_reused:
+        _apply_declared_profile(
+            list(fresh_reused.values()),
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
     suppressed: list[rel_mod.SuppressedMatch] = []
     affix_matches: list[rel_mod.AffixMatch] = []
     inferred = rel_mod.infer_relationships(
@@ -2442,8 +2594,23 @@ def map(
 
     # Verify the merged set: declared joins are probe candidates (issue #163)
     # and only exist from the merge above. Same ordering as `relationships`.
+    # A join naming a column its profile no longer has cannot be probed -- the
+    # batch SQL would fail to bind and take the whole command down (issue
+    # #924) -- so it is checked against the profiled/selected datasets first,
+    # reported as a finding below, and excluded from the verify pool; the
+    # estimate and the run share the filtered pool so they stay the same set.
+    missing_column_findings = []
+    probe_refused = []
     if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, relationship_set)
+        rel_mod.adopt_profiled_spelling(relationship_set, all_selected)
+        missing_column_findings = rel_mod.missing_column_findings(
+            relationship_set, all_selected
+        )
+        missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
+        verify_pool = [
+            rel for rel in relationship_set if id(rel) not in missing_column_ids
+        ]
+        probe_cost, candidates, objects = _verify_estimate(adapter, verify_pool)
         verify_pending = command_args.verify_handshake(
             "explore map",
             adapter,
@@ -2452,12 +2619,12 @@ def map(
             object_count=objects,
         )
         if verify_pending is None:
-            probed = rel_mod.probe_candidates(relationship_set)
+            probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
-                    relationship_set,
+                    verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
                 )
@@ -2537,7 +2704,10 @@ def map(
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
     relationship_set, carried_relationships = _carry_forward_relationships(
-        reusable, examined, relationship_set, observed_namespaces=observed_namespaces
+        reusable,
+        examined,
+        relationship_set,
+        observed_namespaces=observed_namespaces,
     )
     final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
     # After inference, so it saw the same profiles in either mode.
@@ -2561,6 +2731,21 @@ def map(
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
+    # A join naming a column the warehouse does not have is the same shape of
+    # drift as a catastrophic orphan rate: surfaced in notes and mirrored onto
+    # the child dataset's data_quality so it survives into the cache (issue
+    # #924). Only `--verify` computes it, because only a probe would fail.
+    for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: mirrored onto the child dataset's data_quality so it
+    # survives into the cache, and surfaced in notes further down (issue #933).
+    for rel, text in probe_refused:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
 
     # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
     # composed set rather than this run's profiles: the link is derived from the
@@ -2572,11 +2757,19 @@ def map(
 
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
+    listed_namespaces = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
+    dropped_namespaces = {id.rpartition(".")[0].lower() for id in dropped}
+    surviving_namespaces = {d.identifier.rpartition(".")[0].lower() for d in datasets}
     cache.provenance.inventory_namespaces = sorted(
-        {
-            *(reusable.provenance.inventory_namespaces if reusable else []),
-            *observed_namespaces,
-        }
+        (
+            {
+                *(reusable.provenance.inventory_namespaces if reusable else []),
+                *listed_namespaces,
+            }
+        )
+        - (dropped_namespaces - surviving_namespaces)
     )
     cache.provenance.created_at = (
         prior.provenance.created_at
@@ -2601,6 +2794,8 @@ def map(
         )
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
+    notes.extend(text for _rel, text in missing_column_findings)
+    notes.extend(text for _rel, text in probe_refused)
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared joins; kept as declared"
@@ -2852,7 +3047,11 @@ def cluster(
             # the opener at the bottom of this function, and raises there.
             adapter = None
     if adapter is not None:
-        gap = _object_gap(adapter, cache, [obj])
+        gap = _object_gap(
+            adapter,
+            None if cache is None else _without_dev_profiles(engine, cache),
+            [obj],
+        )
         if gap.absent:
             raise RequestError(gap.refusal())
         if gap.to_profile:
@@ -2895,6 +3094,7 @@ def cluster(
         )
 
     limits = config.cluster
+    cache = _without_dev_profiles(engine, cache)
     known = [d.identifier for d in cache.datasets if d.columns]
     matches = match_identifier(obj, known)
     if not matches:
@@ -3699,6 +3899,39 @@ _DECLARING_LAYER = {
 }
 
 
+def _drop_metricflow_under_native_vendor(
+    engine: DexEngine, defs: dbt_project.ProjectDefinitions
+) -> dbt_project.ProjectDefinitions:
+    """Drop MetricFlow grain and metric lineage when a native vendor owns the layer.
+
+    Under ``semantic.vendor: ossie|slayer|cube`` the vendor layer is the
+    repository's one semantic layer (#922). ``explore`` still reads the dbt
+    project for transformation declarations (``config.meta.dex``, unique and
+    relationships tests), but MetricFlow-derived ``primary_entities`` and
+    ``metric_models`` must not fold into exploration beside that vendor. Under
+    ``vendor: dbt`` (or an unset vendor) the definitions are unchanged.
+    """
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor not in SEMANTIC_SOURCE_FACTORIES:
+        return defs
+    if (
+        not defs.primary_entities
+        and not defs.metric_models
+        and not defs.semantic_source
+    ):
+        return defs
+    return defs.model_copy(
+        update={
+            "primary_entities": {},
+            "metric_models": [],
+            "semantic_source": None,
+        }
+    )
+
+
 def _project_definitions(
     engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
@@ -3741,6 +3974,7 @@ def _project_definitions(
     # explore path, and `definitions()` is the channel declared keys and joins
     # reach dex through at all. Whichever format configuration named answers here.
     defs = engine.project_format().definitions()
+    defs = _drop_metricflow_under_native_vendor(engine, defs)
     return _fold_semantic_layer_keys(engine, defs)
 
 
@@ -3763,18 +3997,28 @@ def _fold_semantic_layer_keys(
     try:
         from .semantic import resolve_semantic_layer
 
-        keys, composite_keys = resolve_semantic_layer(
-            engine, local=True
-        ).declared_keys()
+        layer = resolve_semantic_layer(engine, local=True)
+        keys, composite_keys = layer.declared_keys()
+        declarations, declaration_notes = layer.declared_models()
     except (DexError, ValueError, OSError):
         return defs
-    if not keys and not composite_keys:
+    if not keys and not composite_keys and not declarations:
+        if declaration_notes:
+            return defs.model_copy(
+                update={
+                    "notes": [*defs.notes, *declaration_notes],
+                    "declaration_notes": declaration_notes,
+                }
+            )
         return defs
     return defs.model_copy(
         update={
             "present": True,
             "declared_keys": [*defs.declared_keys, *keys],
             "declared_composite_keys": [*defs.declared_composite_keys, *composite_keys],
+            "model_declarations": {**declarations, **defs.model_declarations},
+            "notes": [*defs.notes, *declaration_notes],
+            "declaration_notes": declaration_notes,
         }
     )
 
@@ -3956,12 +4200,21 @@ def _apply_declarations(
         return datasets, []
     identifiers = [d.identifier for d in datasets]
     by_identifier: dict[str, Any] = {}
-    for model, declaration in sorted(defs.model_declarations.items()):
+    precedence: list[str] = []
+    # dbt first: a native layer's declaration of a dbt model was derived from the
+    # model's YAML, so the YAML is the source and the layer the copy.
+    for model, declaration in sorted(
+        defs.model_declarations.items(),
+        key=lambda item: (item[1].source in _DECLARING_LAYER, item[0]),
+    ):
         ident, _ambiguous = rel_mod.resolve_declared(
             declaration.relation, model, identifiers
         )
-        if ident is not None:
-            by_identifier.setdefault(ident.lower(), declaration)
+        if ident is None:
+            continue
+        kept = by_identifier.setdefault(ident.lower(), declaration)
+        if kept is not declaration:
+            precedence.append(_declaration_precedence_note(ident, kept, declaration))
 
     out: list[Dataset] = []
     applied = 0
@@ -3986,7 +4239,32 @@ def _apply_declarations(
             "(see declaration on each); a declared grain is reported as grain, with "
             "candidate_keys still measured and grain_status comparing the two"
         )
+    notes.extend(precedence)
     return out, notes
+
+
+def _declaration_precedence_note(ident: str, kept: Any, dropped: Any) -> str:
+    """Which of two declarations of one relation is reported, and why."""
+
+    def layer(declaration: Any) -> str:
+        return _DECLARING_LAYER.get(declaration.source, "the dbt project")
+
+    note = (
+        f"{ident} is declared twice: {kept.model} from {layer(kept)} is reported "
+        f"over {dropped.model} from {layer(dropped)}"
+    )
+    if kept.source not in _DECLARING_LAYER:
+        note += ", since a layer's declaration is derived from the dbt model's"
+    if (
+        kept.grain
+        and dropped.grain
+        and {c.lower() for c in kept.grain} != {c.lower() for c in dropped.grain}
+    ):
+        note += (
+            f"; their grains disagree ({', '.join(kept.grain)} against "
+            f"{', '.join(dropped.grain)})"
+        )
+    return note
 
 
 def _declared_column_cap_notes(datasets: list[Dataset], lift: str) -> list[str]:
@@ -4017,7 +4295,10 @@ def _dataset_declaration(
     if declaration.population is not None:
         flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
         rule = declaration.population.rule
-        if rule is not None and values_free:
+        if rule is not None and (
+            values_free
+            or any(f.column.lower() in flagged for f in declaration.population.filters)
+        ):
             rule = None
             withheld.append("population.rule")
         filters: list[DeclaredFilter] = []
@@ -4032,7 +4313,20 @@ def _dataset_declaration(
                     excludes=None if hide else item.excludes,
                 )
             )
-        population = DeclaredRows(rule=rule, filters=filters)
+        stated_parent = declaration.population.parent
+        population = DeclaredRows(
+            rule=rule,
+            filters=filters,
+            parent=(
+                DeclaredParent(
+                    model=stated_parent.model,
+                    columns=list(stated_parent.key),
+                    parent_columns=list(stated_parent.key.values()),
+                )
+                if stated_parent is not None
+                else None
+            ),
+        )
 
     grain = declaration.grain
     status = None
@@ -4082,11 +4376,12 @@ def _apply_declared_grain(
     else:
         status = "unmeasured"
     if [c.lower() for c in dataset.grain or []] != [c.lower() for c in resolved]:
-        origin = (
-            f"measured grain was {', '.join(dataset.grain)}"
-            if dataset.grain
-            else "measurement found no key of its own"
-        )
+        if not dataset.grain:
+            origin = "measurement found no key of its own"
+        elif dataset.grain in dataset.candidate_keys:
+            origin = f"measured grain was {', '.join(dataset.grain)}"
+        else:
+            origin = f"another declaration states {', '.join(dataset.grain)}"
         dataset.data_quality.append(
             f"grain {', '.join(resolved)} comes from the model's declaration ({origin})"
         )
@@ -4400,7 +4695,7 @@ def _carry_forward_relationships(
 
     ``observed_namespaces`` (see `_compose_datasets`) excludes an edge whose
     endpoint is gone from the warehouse rather than merely out of scope, so a
-    deleted relation's join does not resurrect either (issue #149).
+    deleted relation's join does not resurrect either (issues #149, #984).
     """
 
     if prior is None or not prior.relationships:
@@ -4408,11 +4703,10 @@ def _carry_forward_relationships(
     existing = {_relationship_edge_key(rel) for rel in relationships}
 
     def dropped(identifier: str) -> bool:
-        return (
-            observed_namespaces is not None
-            and identifier not in examined
-            and identifier.rpartition(".")[0].lower() in observed_namespaces
-        )
+        if identifier in examined:
+            return False
+        ns = identifier.rpartition(".")[0].lower()
+        return bool(observed_namespaces is not None and ns in observed_namespaces)
 
     carried = [
         rel
@@ -4530,36 +4824,42 @@ def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
     return merged
 
 
-def _annotate_grain(
-    datasets: list[Dataset],
-    defs: dbt_project.ProjectDefinitions | None = None,
-    *,
-    orphaned: set[str] | None = None,
-    baselined: set[str] | None = None,
-    high_null_fraction: float = 0.95,
-    dialect: str | None = None,
-) -> None:
-    """Attach the interpretation layer to raw profiles: candidate keys, the likely
-    grain, the data-quality warnings an analyst would write (non-unique own
-    key, unknown grain), and the severity-ordered column findings (#291,
-    ``high_null_fraction`` is ``profile_high_null_fraction`` in
-    ``.dex/config.yml``). Shared by profile and map so a single-table profile
-    surfaces a broken grain without requiring a full map.
+def _is_declared_profile_note(text: str) -> bool:
+    """A data-quality note this module added from a project grain claim.
 
-    With project definitions, the declared truth refines the heuristics: a
-    semantic model's primary entity overrides the detected grain (noting any
-    disagreement), and a profiled column contradicting its declared ``unique``
-    test gets a data-quality note. A declared composite key (a model-level
-    ``unique_combination_of_columns`` test -- the one grain shape measurement
-    alone can miss or a column-level test cannot express at all) overrides the
-    detected grain too, unless the detected grain is already a measurement-
-    proven single column, in which case the proven single wins and the
-    composite is only noted. ``candidate_keys`` stays measurement-only: an
-    unmeasured declared key is a claim, and the cache is a drift baseline.
-    ``orphaned`` (map only) badges a relation no current model/source builds:
-    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
-    and otherwise as a new relation no source declares yet. ``dialect`` (the
-    connector's) notes columns whose names it reserves (#651).
+    Measured notes stay. These are the ones a later read has to drop before
+    applying the project as it reads now, or a removed declaration survives in
+    the output for as long as the cache is fresh.
+    """
+
+    return (
+        "declared primary entity" in text
+        or "declared unique" in text
+        or "declared composite" in text
+        or "declared primary key" in text
+        or "composite keys are declared" in text
+        or "also declared for this table" in text
+    )
+
+
+def _apply_declared_profile(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None,
+    *,
+    high_null_fraction: float,
+) -> None:
+    """Project grain claims on ``datasets``, starting from the measured grain.
+
+    A semantic model's primary entity, a declared ``unique`` test, and a
+    declared composite key refine the heuristic the scan stored. They are not
+    part of the scan. ``explore profile`` applies this at read time, to cached
+    and fresh profiles alike, and does not write the result back (#926). Map
+    and relationships still persist it, because their cache is the artifact
+    those commands return.
+
+    Notes this function owns are removed first and the grain is put back to the
+    measurement, so running it again, or running it after the declaration was
+    deleted, cannot keep the old claim. ``candidate_keys`` stays measurement-only.
     """
 
     declared_grain: dict[str, str] = {}
@@ -4567,6 +4867,7 @@ def _annotate_grain(
     # contradiction note names where the claim lives.
     declared_unique: dict[str, dict[str, str]] = {}
     declared_composite: dict[str, list[list[str]]] = {}
+    declared_primary: dict[str, list[str]] = {}
     if defs is not None and (
         defs.primary_entities or defs.declared_keys or defs.declared_composite_keys
     ):
@@ -4587,11 +4888,16 @@ def _annotate_grain(
                 declared_unique.setdefault(ident.lower(), {}).setdefault(
                     key.column.lower(), key.source
                 )
+                if key.primary:
+                    declared_primary.setdefault(ident.lower(), [key.column])
         for composite in defs.declared_composite_keys:
             ident, _ambiguous = rel_mod.resolve_declared(
                 composite.relation, composite.model, identifiers
             )
-            if ident is None:
+            if ident is None or composite.claim == "unique":
+                continue
+            if composite.claim == "primary":
+                declared_primary.setdefault(ident.lower(), list(composite.columns))
                 continue
             bucket = declared_composite.setdefault(ident.lower(), [])
             normalized = {c.lower() for c in composite.columns}
@@ -4599,33 +4905,11 @@ def _annotate_grain(
                 bucket.append(list(composite.columns))
 
     for ds in datasets:
+        ds.data_quality = [
+            note for note in ds.data_quality if not _is_declared_profile_note(note)
+        ]
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
-        # After candidate_keys, because the reported half has to come back in
-        # exactly its order; the probe's suppressed entries ride through.
-        ds.key_evidence = rel_mod.key_evidence(ds)
-        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
-        if dialect is not None:
-            reserved = reserved_column_names(dialect, [c.name for c in ds.columns])
-            if reserved:
-                ds.data_quality.append(
-                    f"column(s) {', '.join(reserved)} are reserved words in "
-                    f"{dialect}; declare them with `quote: true` in dbt, or its "
-                    "generic tests on them fail to compile"
-                )
-        if orphaned and ds.identifier in orphaned:
-            if baselined and ds.identifier.lower() in baselined:
-                ds.data_quality.append(
-                    "no current dbt model or source builds this relation, though "
-                    "the project builds/sources others in this schema; likely "
-                    "orphaned residue of a rename or removal"
-                )
-            else:
-                ds.data_quality.append(
-                    "no dbt source declares this relation yet; add it to the "
-                    "sources file before modelling it"
-                )
-
         grain_column = declared_grain.get(ds.identifier.lower())
         if grain_column is not None:
             profiled = next(
@@ -4661,8 +4945,34 @@ def _annotate_grain(
                     "profiling found duplicates"
                 )
 
+        primary = declared_primary.get(ds.identifier.lower())
+        if primary:
+            live = {c.name.lower(): c.name for c in ds.columns}
+            resolved = [live.get(c.lower()) for c in primary]
+            if all(resolved):
+                chosen = [str(c) for c in resolved]
+                if ds.grain != chosen:
+                    origin = (
+                        f"heuristic suggested {', '.join(ds.grain)}"
+                        if ds.grain
+                        else "measurement found no key of its own"
+                    )
+                    ds.data_quality.append(
+                        f"grain {', '.join(chosen)} comes from the project's "
+                        f"declared primary key ({origin})"
+                    )
+                ds.grain = chosen
+            else:
+                missing = [
+                    c for c, r in zip(primary, resolved, strict=True) if r is None
+                ]
+                ds.data_quality.append(
+                    f"declared primary key ({', '.join(primary)}) names column(s) "
+                    f"not in this profile ({', '.join(missing)}); not applied"
+                )
+
         composite_candidates = declared_composite.get(ds.identifier.lower())
-        if composite_candidates:
+        if composite_candidates and not primary:
             live = {c.name.lower(): c.name for c in ds.columns}
             valid: list[list[str]] = []
             for cols in composite_candidates:
@@ -4724,6 +5034,70 @@ def _annotate_grain(
         ds.findings = rel_mod.profile_findings(
             ds, high_null_fraction=high_null_fraction
         )
+
+
+def _annotate_grain(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None = None,
+    *,
+    orphaned: set[str] | None = None,
+    baselined: set[str] | None = None,
+    high_null_fraction: float = 0.95,
+    dialect: str | None = None,
+) -> None:
+    """Attach the interpretation layer to raw profiles: candidate keys, the likely
+    grain, the data-quality warnings an analyst would write (non-unique own
+    key, unknown grain), and the severity-ordered column findings (#291,
+    ``high_null_fraction`` is ``profile_high_null_fraction`` in
+    ``.dex/config.yml``). Shared by profile and map so a single-table profile
+    surfaces a broken grain without requiring a full map.
+
+    With project definitions, the declared truth refines the heuristics: a
+    semantic model's primary entity overrides the detected grain (noting any
+    disagreement), and a profiled column contradicting its declared ``unique``
+    test gets a data-quality note. A declared composite key (a model-level
+    ``unique_combination_of_columns`` test -- the one grain shape measurement
+    alone can miss or a column-level test cannot express at all) overrides the
+    detected grain too, unless the detected grain is already a measurement-
+    proven single column, in which case the proven single wins and the
+    composite is only noted. ``candidate_keys`` stays measurement-only: an
+    unmeasured declared key is a claim, and the cache is a drift baseline.
+    ``orphaned`` (map only) badges a relation no current model/source builds:
+    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
+    and otherwise as a new relation no source declares yet. ``dialect`` (the
+    connector's) notes columns whose names it reserves (#651). Project grain
+    claims are :func:`_apply_declared_profile`, which this calls once the
+    measurement is on the dataset.
+    """
+
+    for ds in datasets:
+        ds.candidate_keys = rel_mod.candidate_keys(ds)
+        ds.grain = rel_mod.detect_grain(ds)
+        # After candidate_keys, because the reported half has to come back in
+        # exactly its order; the probe's suppressed entries ride through.
+        ds.key_evidence = rel_mod.key_evidence(ds)
+        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
+        if dialect is not None:
+            reserved = reserved_column_names(dialect, [c.name for c in ds.columns])
+            if reserved:
+                ds.data_quality.append(
+                    f"column(s) {', '.join(reserved)} are reserved words in "
+                    f"{dialect}; declare them with `quote: true` in dbt, or its "
+                    "generic tests on them fail to compile"
+                )
+        if orphaned and ds.identifier in orphaned:
+            if baselined and ds.identifier.lower() in baselined:
+                ds.data_quality.append(
+                    "no current dbt model or source builds this relation, though "
+                    "the project builds/sources others in this schema; likely "
+                    "orphaned residue of a rename or removal"
+                )
+            else:
+                ds.data_quality.append(
+                    "no dbt source declares this relation yet; add it to the "
+                    "sources file before modelling it"
+                )
+    _apply_declared_profile(datasets, defs, high_null_fraction=high_null_fraction)
 
 
 def _relationship_notes(
@@ -4986,6 +5360,48 @@ def _split_fresh_stale(
     return stale, fresh
 
 
+def _compute_observed_namespaces(
+    metas: list[ObjectMeta],
+    prior: DexCache | None,
+    adapter: Adapter,
+) -> set[str]:
+    """The schema/dataset namespaces this run's inventory actually examined,
+    so carry-forward can tell "out of this run's scope" from "gone from the
+    warehouse" (issues #149, #984).
+
+    Starts from the namespaces of objects listed this run, and extends to any
+    namespace present in the prior cache that falls within what this run's
+    adapter scope inspected. If a schema was dropped entirely or left empty,
+    its former relations are recognized as dropped rather than carried forward
+    forever (#984), while namespaces outside a narrowed ``--scope`` remain
+    untouched (#111).
+    """
+    observed = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
+    in_scope = getattr(adapter, "in_scope", None)
+    if in_scope is None or prior is None:
+        return observed
+
+    candidate_namespaces: set[str] = set()
+    for ds in prior.datasets:
+        if "." in ds.identifier:
+            candidate_namespaces.add(ds.identifier.rpartition(".")[0].lower())
+    if prior.relationships:
+        for rel in prior.relationships:
+            if "." in rel.from_dataset:
+                candidate_namespaces.add(rel.from_dataset.rpartition(".")[0].lower())
+            if "." in rel.to_dataset:
+                candidate_namespaces.add(rel.to_dataset.rpartition(".")[0].lower())
+
+    for ns in candidate_namespaces:
+        if ns not in observed:
+            with contextlib.suppress(Exception):
+                if in_scope(ns):
+                    observed.add(ns)
+    return observed
+
+
 def _compose_datasets(
     metas: list[ObjectMeta],
     profiled: list[Dataset],
@@ -5054,7 +5470,10 @@ def _compose_datasets(
         if identifier in seen:
             continue
         namespace = identifier.rpartition(".")[0].lower()
-        if observed_namespaces is not None and namespace in observed_namespaces:
+        is_observed = (
+            observed_namespaces is not None and namespace in observed_namespaces
+        )
+        if is_observed:
             dropped.append(identifier)
             continue
         datasets.append(previous.model_copy(deep=True))

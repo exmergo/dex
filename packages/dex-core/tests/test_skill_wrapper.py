@@ -279,6 +279,9 @@ def test_the_slayer_extra_follows_the_configured_vendor(
         (["explore", "map", "--use-project"], "cube", ["cube"]),
         (["explore", "relationships", "--use-project"], "cube", ["cube"]),
         (["transform", "apply"], "cube", ["cube"]),
+        # Authoring always takes it, as `semantic slayer` takes its own (#911).
+        (["semantic", "cube", "plan"], "cube", ["cube"]),
+        (["semantic", "cube", "define"], None, ["cube"]),
         # Not on another vendor, and not for a command that reads no layer.
         (["explore", "map", "--use-project"], "slayer", ["slayer"]),
         (["explore", "inventory"], "cube", []),

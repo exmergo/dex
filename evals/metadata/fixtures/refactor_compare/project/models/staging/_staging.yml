@@ -1,0 +1,14 @@
+version: 2
+models:
+  - name: stg_accounts
+    columns:
+      - name: account_id
+        tests: [unique, not_null]
+  - name: stg_users
+    columns:
+      - name: user_id
+        tests: [unique, not_null]
+  - name: stg_display_names
+    columns:
+      - name: user_id
+        tests: [unique, not_null]

@@ -62,6 +62,7 @@ from .policy import (
     resolve_values_request,
     screen_dimension_refs,
     screen_values_request,
+    sub_threshold_note,
     unadjudicated_refs,
     validate_grain,
 )
@@ -149,6 +150,12 @@ class LocalSlayerLayer:
 
         defs = self._source.declared_definitions()
         return defs.declared_keys, defs.declared_composite_keys
+
+    def declared_models(self) -> tuple[dict[str, Any], list[str]]:
+        """Each definition's declaration (#977), with what could not be read."""
+
+        defs = self._source.declared_definitions()
+        return defs.model_declarations, defs.declaration_notes
 
     def _catalog_view(self):
         """The layer's catalog, read once per command: the listing, the PII
@@ -242,7 +249,10 @@ class LocalSlayerLayer:
             backend=self,
             command="explore semantic query",
             result_type=SemanticQueryResult,
-            extra_notes=name_only_note(unadjudicated_refs(refs, meta_lookup=lookup)),
+            extra_notes=[
+                *name_only_note(unadjudicated_refs(refs, meta_lookup=lookup)),
+                *sub_threshold_note(refs, meta_lookup=lookup),
+            ],
             column_names=rendered.result_keys,
         )
 

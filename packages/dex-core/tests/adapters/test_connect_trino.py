@@ -10,6 +10,8 @@ deterministic, offline, free.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 pytest.importorskip("trino")
@@ -35,6 +37,7 @@ from exmergo_dex_core.adapters.trino import (
 from exmergo_dex_core.config import TrinoTarget
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.errors import ConnectorError, WarehouseQueryError
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -136,6 +139,83 @@ def test_a_degraded_column_gets_only_a_non_null_count(fake_trino_connection):
     assert "approx_distinct" not in sql
     assert "regexp_like" not in sql
     assert "MIN(" not in sql
+
+
+def test_exact_distinct_counts_skips_a_degraded_column(fake_trino_connection):
+    """`maintain verify` and `maintain drift` send key columns directly, and one
+    Trino cannot count would fail the scan."""
+
+    fake_trino_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 50, "d_0": 50}]
+    )
+    adapter = make_adapter(fake_trino_connection)
+    assert adapter.exact_distinct_counts("memory.shop.customers", ["id", "tags"]) == {
+        "id": 50
+    }
+    statements = [
+        q.sql for q in fake_trino_connection.data_queries if "COUNT(DISTINCT" in q.sql
+    ]
+    assert statements
+    assert all('"tags"' not in sql for sql in statements)
+
+
+def test_exact_distinct_counts_keeps_a_comparable_binary_column(fake_trino_connection):
+    """A binary hash can be a declared grain, and Trino can count it."""
+
+    fake_trino_connection.tables.append(
+        FakeTrinoTable(
+            catalog="memory",
+            schema="shop",
+            name="files",
+            columns=[("hash", "varbinary", True)],
+        )
+    )
+    fake_trino_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 50, "d_0": 49}]
+    )
+    adapter = make_adapter(fake_trino_connection)
+    assert adapter.exact_distinct_counts("memory.shop.files", ["hash"]) == {"hash": 49}
+
+
+def test_exact_distinct_counts_runs_nothing_for_only_degraded_columns(
+    fake_trino_connection,
+):
+    adapter = make_adapter(fake_trino_connection)
+    assert adapter.exact_distinct_counts("memory.shop.customers", ["tags"]) == {}
+    assert not [
+        q for q in fake_trino_connection.data_queries if "COUNT(DISTINCT" in q.sql
+    ]
+
+
+def test_profile_leaves_an_opted_in_binary_column_uncounted(fake_trino_connection):
+    """The exact pass keeps a comparable binary column for the callers that name
+    it directly; profiling a skipped type still reports nulls only (#1050)."""
+
+    fake_trino_connection.tables.append(
+        FakeTrinoTable(
+            catalog="memory",
+            schema="shop",
+            name="files",
+            columns=[("id", "bigint", False), ("hash", "varbinary", False)],
+        )
+    )
+
+    def null_free_rows(sql: str) -> FakeResult:
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(
+            rows=[{a: None if a[:3] in ("mn_", "mx_") else 100 for a in aliases}]
+        )
+
+    fake_trino_connection.row_resolver = null_free_rows
+    adapter = make_adapter(fake_trino_connection)
+    dataset = profile(
+        adapter, ["memory.shop.files"], include_blobs={"memory.shop.files.hash"}
+    )[0]
+    binary = next(c for c in dataset.columns if c.name == "hash")
+    assert binary.null_fraction == 0.0
+    assert binary.distinct_count is None
+    statements = [q.sql for q in fake_trino_connection.data_queries]
+    assert 'COUNT(DISTINCT "hash")' not in " ".join(statements)
 
 
 # --- the guard -----------------------------------------------------------------

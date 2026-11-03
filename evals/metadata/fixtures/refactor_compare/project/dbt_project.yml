@@ -1,0 +1,14 @@
+name: accounts
+version: "1.0.0"
+profile: accounts
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+models:
+  accounts:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table

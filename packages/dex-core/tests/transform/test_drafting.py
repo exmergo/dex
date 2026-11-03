@@ -197,7 +197,24 @@ def test_a_key_is_followed_through_a_chain_of_ctes_named_like_their_sources():
     )
 
     assert entry["drafted"]["grain"]["value"] == ["order_id"]
+
+    assert entry["drafted"]["grain"]["evidence"].count("carried through unchanged") == 1
     assert entry["drafted"]["columns"]["order_amount"]["from"] == "stg_orders.amount"
+
+
+def test_drafted_grain_evidence_says_carried_through_unchanged_once():
+    """CTE hops must not re-append the carry phrase (#987)."""
+    entry, _ = _draft(
+        "with source as (select * from {{ ref('stg_orders') }}),\n"
+        "renamed as (select order_id, customer_id, status from source)\n"
+        "select * from renamed\n"
+    )
+    evidence = entry["drafted"]["grain"]["evidence"]
+    assert entry["drafted"]["grain"]["value"] == ["order_id"]
+    assert evidence == (
+        "order_id is a proven unique key of stg_orders, carried through unchanged"
+    )
+    assert evidence.count("carried through unchanged") == 1
 
 
 def test_an_unaliased_relation_never_leaks_the_parse_placeholder():
@@ -721,6 +738,93 @@ def test_an_unprofiled_input_is_named_with_the_command_that_profiles_it():
         "command": "explore profile stg_refunds",
     }
     assert any("`explore profile stg_refunds`" in w for w in warnings)
+
+
+def _dev_draft(cache: DexCache, *, alias: str | None = None):
+    """A mart over a project staging model whose dev build is outside the
+    allowlist (#893): the drafter names the dev namespace it must read."""
+
+    staging = "select 1 as id\n"
+    if alias is not None:
+        staging = f"{{{{ config(alias='{alias}') }}}}\n" + staging
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('stg_refunds') }}\n",
+        "models/staging/stg_refunds.sql": staging,
+    }
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        cache,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+    )
+    return drafts["fct"], warnings
+
+
+def test_a_dev_only_model_is_named_with_a_command_that_reads_the_dev_target():
+    """#893: a plain `explore profile stg_refunds` cannot find a model whose
+    only build is in a dev namespace the allowlist does not reach."""
+
+    entry, warnings = _dev_draft(CACHE)
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input == {
+        "relation": "stg_refunds",
+        "profiled": False,
+        "reason": (
+            "the cache has not profiled it, and its dev build in SHOP.DBT_DEV is "
+            "outside the source allowlist"
+        ),
+        "command": "explore profile SHOP.DBT_DEV.stg_refunds --target dev",
+    }
+    assert any(
+        "`explore profile SHOP.DBT_DEV.stg_refunds --target dev`" in w for w in warnings
+    )
+
+
+def test_the_dev_command_names_the_relation_a_literal_alias_builds():
+    entry, _ = _dev_draft(CACHE, alias="refunds")
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["command"] == (
+        "explore profile SHOP.DBT_DEV.refunds --target dev"
+    )
+
+
+def test_a_source_is_never_sent_to_the_dev_target():
+    """Only a project model is built into the dev namespace; a source lives
+    where the allowlist already reads."""
+
+    drafts, _ = draft(
+        ["fct"],
+        {"models/marts/fct.sql": "select id from {{ source('raw', 'refunds') }}\n"},
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input["command"] == "explore profile refunds"
+
+
+def test_an_ambiguous_input_names_no_command_and_says_why():
+    """#893: when the name matches several profiled relations, profiling again
+    settles nothing, so no command is offered rather than one that fails."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    entry, warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n", cache=cache
+    )
+    [missing_input] = entry["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["reason"] == (
+        "it matches 2 relations in the cache (warehouse.dbt_dev.stg_orders, "
+        "warehouse.main.stg_orders), and a ref() is read by name, so no profile "
+        "run can settle which one it means"
+    )
+    [warning] = [w for w in warnings if "stg_orders" in w and "profiled" in w]
+    assert "explore profile" not in warning
+    assert "no profile run can settle" in warning
 
 
 def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
@@ -1364,3 +1468,145 @@ def test_a_yaml_literal_alias_is_recognized_the_same_way():
     drafts, _ = draft(["fct"], files, ["models"], cache, dialect="duckdb")
     refs = drafts["fct"]["drafted"]["columns"]["customer_id"]["references"]
     assert refs["value"] == "stg_customers.customer_id"
+
+
+def test_a_grain_narrower_than_the_group_by_is_named_as_a_condition_not_an_error():
+    from exmergo_dex_core.transform.drafting import _grain_disagreement
+
+    narrower = _grain_disagreement(
+        "customer_orders", ["customer_id"], ["customer_id", "country_code"]
+    )
+    assert "narrower than the [customer_id, country_code]" in narrower
+    assert "determines country_code" in narrower
+    assert "is wrong" not in narrower
+    wider = _grain_disagreement("m", ["order_id", "status"], ["order_id"])
+    assert "wider than the [order_id]" in wider
+    disjoint = _grain_disagreement("m", ["a"], ["b"])
+    assert disjoint.endswith("one of them is wrong")
+
+
+def test_a_star_hands_on_only_the_columns_its_exclusions_leave():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * exclude (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+    reading = drafting.read(
+        "select * except (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="bigquery",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+
+def test_a_qualified_star_exclusion_drops_the_column_too():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select t.* exclude (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+    reading = drafting.read(
+        "select t.* except (extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="bigquery",
+        vars={},
+    )
+    assert reading.produced == ["id"]
+
+
+def test_a_star_replace_keeps_the_name_and_a_rename_leaves_the_old_one():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * replace (extra + 1 as extra) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="bigquery",
+        vars={},
+    )
+    assert reading.produced == ["id", "extra"]
+
+    reading = drafting.read(
+        "select * rename (extra as e2) from (select 1 as id, 2 as extra) t",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["id", "e2"]
+
+
+def test_a_qualified_exclusion_only_drops_its_own_tables_column():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * exclude (a.id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["extra", "id", "e2"]
+
+    reading = drafting.read(
+        "select * exclude (id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["extra", "e2"]
+
+
+def test_a_qualified_rename_only_moves_its_own_tables_column():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * rename (a.id as a_id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["a_id", "extra", "id", "e2"]
+
+
+def test_a_renamed_column_is_traced_through_its_star_qualifier():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select a.* rename (id as a_id) from"
+        " (select 1 as id, 2 as extra) a"
+        " join (select 1 as id, 3 as e2) b on a.id = b.id",
+        None,
+        dialect="duckdb",
+        vars={},
+    )
+    assert reading.produced == ["a_id", "extra"]
+    assert reading.incomplete == []
+
+
+def test_a_replace_and_a_rename_on_one_column_stack():
+    from exmergo_dex_core.transform import drafting
+
+    reading = drafting.read(
+        "select * replace (0 as id) rename (id as new_id) from"
+        " (select 1 as id, 2 as extra) t",
+        None,
+        dialect="snowflake",
+        vars={},
+    )
+    assert reading.produced == ["new_id", "extra"]
+    assert reading.expressions["new_id"].sql() == "0 AS new_id"

@@ -40,9 +40,13 @@ from .references import resolve, scan
 
 __all__ = [
     "ERROR",
+    "EXTENDS_REASON",
+    "JINJA_REASON",
+    "JS_REASON",
     "WARNING",
     "Diagnostic",
     "LoadResult",
+    "is_template",
     "load_files",
     "validate_model_contents",
 ]
@@ -52,6 +56,13 @@ WARNING = validator.WARNING
 
 #: What marks a YAML file as a Jinja template Cube renders before it compiles.
 _JINJA_MARKERS = ("{{", "{%", "{#")
+
+#: Why each kind of compiled-only definition is not read. Shared with authoring
+#: (:mod:`.authoring`), which refuses to write one for the same reason the
+#: catalog names it under ``compiled_only``, so the two always agree.
+JS_REASON = "a JavaScript model needs Node to compile"
+JINJA_REASON = "a Jinja template Cube renders before compiling"
+EXTENDS_REASON = "`extends` is resolved by Cube's compiler"
 
 #: Top-level keys of a Cube YAML file (`YamlCompiler.transpileYamlFile`).
 _TOP_LEVEL = ("cubes", "views", "view_groups")
@@ -144,6 +155,12 @@ def validate_model_contents(contents: Mapping[str, str]) -> LoadResult:
     return _load(dict(contents), LoadResult())
 
 
+def is_template(text: str) -> bool:
+    """Whether ``text`` carries Jinja, which Cube renders before it compiles."""
+
+    return any(marker in text for marker in _JINJA_MARKERS)
+
+
 def _diagnostic(
     file: str, element: str, rule: str, message: str, severity: str = ERROR
 ) -> Diagnostic:
@@ -204,16 +221,10 @@ def _read_file(
     so a reference to it is reported as unreadable rather than unknown."""
 
     if name.endswith(".js"):
-        result.compiled_only.append(
-            CompiledOnly(file=name, reason="a JavaScript model needs Node to compile")
-        )
+        result.compiled_only.append(CompiledOnly(file=name, reason=JS_REASON))
         return [], []
-    if any(marker in text for marker in _JINJA_MARKERS):
-        result.compiled_only.append(
-            CompiledOnly(
-                file=name, reason="a Jinja template Cube renders before compiling"
-            )
-        )
+    if is_template(text):
+        result.compiled_only.append(CompiledOnly(file=name, reason=JINJA_REASON))
         return [], []
     try:
         raw = yaml.safe_load(text)
@@ -279,7 +290,7 @@ def _read_file(
                     CompiledOnly(
                         file=name,
                         element=f"{key}['{entry.get('name')}']",
-                        reason="`extends` is resolved by Cube's compiler",
+                        reason=EXTENDS_REASON,
                     )
                 )
                 continue

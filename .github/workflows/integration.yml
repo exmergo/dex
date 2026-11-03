@@ -71,6 +71,7 @@ on:
       - "scripts/check_container_hardening.sh"
       - "scripts/trino*"
       - "scripts/trino/**"
+      - "scripts/cube/**"
       - "scripts/setup_trino_iceberg_ci.sh"
       - ".github/workflows/integration.yml"
   schedule:
@@ -429,6 +430,75 @@ jobs:
         run: uv sync --extra postgres --extra duckdb --extra slayer --extra dev
       - name: Live Postgres integration suite
         run: uv run pytest tests/integration -q -m postgres
+
+  cube:
+    # No repository gate and no environment: a governed Cube query (#913) is
+    # rendered by Cube Core and executed by dex, and both the renderer and the
+    # warehouse are containers this job starts. The Cube containers are
+    # render-only (scripts/setup_cube_dev.sh): they know the warehouse's type
+    # and hold no credential for it, so every number this job checks was
+    # executed by dex. Their API secret is random per run and stays in a file.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    # The postgres job's service container, digest and hardening included.
+    services:
+      postgres:
+        image: postgres@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d # 16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --cap-drop ALL
+          --cap-add SETUID
+          --cap-add SETGID
+          --security-opt no-new-privileges:true
+          --pids-limit 256
+          --memory 1g
+    env:
+      DEX_TEST_PG_DSN: postgresql://dex_ro:dex_ro@localhost:5432/dex_dogfood
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Refuse an unhardened service container
+        working-directory: .
+        run: >-
+          scripts/check_container_hardening.sh "${{ job.services.postgres.id }}"
+          sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+          SETUID SETGID
+      - name: Seed the service container
+        working-directory: .
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS dex_dogfood WITH (FORCE)" \
+            -c "CREATE DATABASE dex_dogfood"
+          PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
+            -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
+      - name: Start render-only Cube Core for DuckDB and Postgres
+        working-directory: .
+        run: |
+          scripts/setup_cube_dev.sh --db duckdb
+          scripts/setup_cube_dev.sh --db postgres
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Sync (postgres + duckdb + cube + semantic-api + dev extras)
+        run: >-
+          uv sync --extra postgres --extra duckdb --extra cube
+          --extra semantic-api --extra dev
+      # The secret and the URLs come from the file the setup script wrote, read
+      # in the one step whose tests use them.
+      - name: Live Cube integration suite
+        run: |
+          source ~/.cache/dex-dogfood/cube.env
+          uv run pytest tests/integration -q -m cube
 
   clickhouse:
     # No repository gate and no environment: the target is a container this job

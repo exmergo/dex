@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from exmergo_dex_core.adapters.base import ColumnMeta
+from exmergo_dex_core.adapters.base import ColumnMeta, QueryResult
 from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import QueryLimits
@@ -517,14 +517,15 @@ def test_adapter_without_describe_query_does_not_run(warehouse):
 
     class _Bare:
         dialect = "duckdb"
+        name = "bare"
 
         def run_query(self, sql: str, **kwargs):
             raise AssertionError("run_query was called")
 
     result = _compare("select 1 as id", "select 1 as id", _Bare(), cache)
     assert result.status == "not_checked"
-    assert result.reason_code == "schema_unavailable"
-    assert result.detail == "adapter does not describe query output"
+    assert result.reason_code == "comparison_unsupported_on_connector"
+    assert result.detail == "the bare connector does not describe query output"
 
 
 def test_confirmation_request_stops_before_run(warehouse, monkeypatch):
@@ -560,15 +561,14 @@ def test_confirmation_request_stops_before_run(warehouse, monkeypatch):
 
 
 def test_unsupported_type_is_caught_before_run():
-    # DuckDB 2 grouped BLOB, BIT, INTEGER[], STRUCT, MAP, UUID, INTERVAL, and
-    # JSON. DESCRIBE does not report UNGROUPABLE. The stub does.
+    # A warehouse reports a type it cannot group. The stub stands in for one.
     ran: list[str] = []
 
     class _Stub:
-        dialect = "duckdb"
+        dialect = "bigquery"
 
         def describe_query(self, sql: str):
-            return [ColumnMeta("payload", "UNGROUPABLE", True, 0)]
+            return [ColumnMeta("payload", "ARRAY<STRING>", True, 0)]
 
         def run_query(self, sql: str, **kwargs):
             ran.append(sql)
@@ -582,7 +582,7 @@ def test_unsupported_type_is_caught_before_run():
     )
     assert result.status == "not_checked"
     assert result.reason_code == "unsupported_type"
-    assert result.detail == "payload"
+    assert result.detail == "payload (ARRAY<STRING>)"
     assert ran == []
 
 
@@ -603,6 +603,50 @@ def test_comparison_sql_is_exact_not_hashed(warehouse):
         assert "hash(" not in lowered
         assert "struct_pack(" not in lowered
         assert "list_sort(" not in lowered
-        assert "is not distinct from" in lowered
-        assert "full outer join" in lowered
+        assert "union all" in lowered
         assert "group by" in lowered
+
+
+def test_a_folded_name_is_read_as_the_warehouse_spells_it():
+    """Snowflake reports TEAM_ID for what its author wrote as team_id."""
+
+    class _Folding:
+        name = "folding"
+        dialect = "duckdb"
+
+        def describe_query(self, sql: str):
+            return [
+                ColumnMeta("TEAM_ID", "INT", True, 0),
+                ColumnMeta("N", "INT", True, 1),
+            ]
+
+        def run_query(self, sql: str, **kwargs):
+            return QueryResult(
+                columns=["a", "b", "c", "d"],
+                types=["int"] * 4,
+                cells=[[1, 1, 0, 0]],
+                truncated=False,
+            )
+
+    result = _compare(
+        "select 1 as team_id, 2 as n",
+        "select 1 as team_id, 2 as n",
+        _Folding(),
+        DexCache(),
+        key_columns=["team_id"],
+    )
+    assert result.status == "equivalent", result.detail
+
+
+def test_two_columns_differing_only_in_case_are_not_guessed_between():
+    class _Both:
+        name = "both"
+        dialect = "duckdb"
+
+        def describe_query(self, sql: str):
+            return [ColumnMeta("Id", "INT", True, 0), ColumnMeta("ID", "INT", True, 1)]
+
+    result = _compare(
+        "select 1 as a", "select 1 as a", _Both(), DexCache(), key_columns=["id"]
+    )
+    assert result.reason_code == "invalid_key"

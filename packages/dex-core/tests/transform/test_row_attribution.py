@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.row_attribution import (
@@ -220,6 +221,43 @@ def test_a_join_to_an_existing_cte_is_reported_and_measured(
     assert model["net_delta"] == added[0]["delta"]
 
 
+def test_a_model_over_an_inline_values_list_is_measured(
+    attributable_project, plan_edit, capsys
+):
+    """A comparison-window model builds its windows with ``cross join (values
+    ...)``. The list is self-contained, so attribution counts the model as it
+    counts one over a CTE, rather than refusing every change on it as reading an
+    unsupported source."""
+
+    repo, warehouse = attributable_project
+    windowed_model = (
+        "{{ config(materialized='table') }}\n"
+        "with base as (\n"
+        "    select raw_orders.*, windows.window_days\n"
+        "    from {{ source('raw', 'raw_orders') }}\n"
+        "    cross join (values (7), (28)) as windows (window_days)\n"
+        "    where status != 'CANCELLED' and total_revenue > 0\n"
+        ")\n"
+        "select order_id, customer_id, total_revenue, window_days from base\n"
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(windowed_model, encoding="utf-8")
+    payload = plan_edit(
+        windowed_model.replace(
+            "where status != 'CANCELLED' and total_revenue > 0",
+            "where not is_cancelled and total_revenue > 0",
+        )
+    )
+    model = _attribution(_plan(repo, warehouse, payload, capsys))
+    swap = _by_kind(model, "predicate_replaced")
+    assert len(swap) == 1, model["changes"]
+    assert swap[0]["attributed"] is True, swap[0]
+    assert swap[0]["delta"] not in (None, 0)
+    assert swap[0]["rows"] == model["baseline_rows"] + swap[0]["delta"]
+    # Every order appears once per window, so the whole model is counted too.
+    assert model["baseline_rows"] is not None and model["baseline_rows"] % 2 == 0
+    assert model["net_delta"] == model["authored_rows"] - model["baseline_rows"]
+
+
 def test_attribution_after_built_relation_and_project_drift(
     attributable_project, plan_edit, capsys
 ):
@@ -392,6 +430,12 @@ def test_a_jinja_conditional_says_it_could_not_be_attributed(
     attributable_project, plan_edit, capsys
 ):
     repo, warehouse = attributable_project
+    # Control-flow validation now compiles against a coherent, existing dev
+    # target; the attribution itself remains static and reports its limitation.
+    profile_path = repo / "analytics" / "profiles.yml"
+    profiles = yaml.safe_load(profile_path.read_text())
+    profiles["shop"]["outputs"]["dev"]["path"] = str(warehouse)
+    profile_path.write_text(yaml.safe_dump(profiles))
     payload = plan_edit(
         PRIOR_MODEL.replace(
             "and total_revenue > 0",

@@ -5,6 +5,12 @@ profile can therefore prove that a reference exists, and a complete inventory
 of one namespace can prove that a relation does not.  Every other absence is an
 unknown, never a refusal.  Nothing in this module accepts an adapter or opens a
 connection.
+
+Only a field's expression names a source column. A key and a relationship name
+fields (upstream's Name Resolution), and the loader refuses one that names no
+declared field, so each reaches the warehouse only through a field this module
+already checks: checking the key's own names as columns would check a field name
+against the warehouse, which is wrong whenever the two differ.
 """
 
 from __future__ import annotations
@@ -70,56 +76,48 @@ def validate_cached_references(
     computed_fields = 0
 
     for document in documents:
-        for model_index, model in enumerate(document.data.get("semantic_model") or []):
-            model_name = str(model.get("name"))
-            datasets = model.get("datasets") or []
-            endpoint_columns = _endpoint_columns(model)
+        model_name = str(document.data.get("name"))
+        for dataset_index, dataset in enumerate(document.data.get("datasets") or []):
+            dataset_name = str(dataset.get("name"))
+            location = (
+                f"{document.file}: semantic model '{model_name}' "
+                f"dataset[{dataset_index}] '{dataset_name}'"
+            )
+            relation = normalize_relation(connector, dataset.get("source"))
+            if relation is None:
+                opaque_sources += 1
+                continue
 
-            for dataset_index, dataset in enumerate(datasets):
-                dataset_name = str(dataset.get("name"))
-                location = (
-                    f"{document.file}: semantic_model[{model_index}] "
-                    f"'{model_name}' dataset[{dataset_index}] '{dataset_name}'"
-                )
-                relation = normalize_relation(connector, dataset.get("source"))
-                if relation is None:
-                    opaque_sources += 1
-                    continue
+            matches = match_identifier(relation, identifiers)
+            if len(matches) != 1:
+                namespace = relation.rpartition(".")[0].lower()
+                if not matches and namespace in inventoried:
+                    result.errors.append(
+                        f"{location} names source '{relation}', but the cached "
+                        f"inventory for namespace '{namespace}' does not contain it"
+                    )
+                else:
+                    unknown_relations.add(relation)
+                continue
 
-                matches = match_identifier(relation, identifiers)
-                if len(matches) != 1:
-                    namespace = relation.rpartition(".")[0].lower()
-                    if not matches and namespace in inventoried:
-                        result.errors.append(
-                            f"{location} names source '{relation}', but the cached "
-                            f"inventory for namespace '{namespace}' does not contain it"
-                        )
-                    else:
-                        unknown_relations.add(relation)
-                    continue
+            cached = by_identifier[matches[0]]
+            result.checked_relations += 1
+            references, skipped = _column_references(dataset, connector=connector)
+            computed_fields += skipped
+            if not cached.columns:
+                if references:
+                    unprofiled.add(cached.identifier)
+                continue
 
-                cached = by_identifier[matches[0]]
-                result.checked_relations += 1
-                references, skipped = _column_references(
-                    dataset,
-                    endpoint_columns.get(dataset.get("name"), []),
-                    connector=connector,
-                )
-                computed_fields += skipped
-                if not cached.columns:
-                    if references:
-                        unprofiled.add(cached.identifier)
-                    continue
-
-                known_columns = {column.name.lower() for column in cached.columns}
-                for column, role in references:
-                    result.checked_columns += 1
-                    if column.lower() not in known_columns:
-                        result.errors.append(
-                            f"{location} {role} names column '{column}', but the "
-                            f"cached profile for '{cached.identifier}' does not "
-                            "contain it"
-                        )
+            known_columns = {column.name.lower() for column in cached.columns}
+            for column, role in references:
+                result.checked_columns += 1
+                if column.lower() not in known_columns:
+                    result.errors.append(
+                        f"{location} {role} names column '{column}', but the "
+                        f"cached profile for '{cached.identifier}' does not "
+                        "contain it"
+                    )
 
     if unknown_relations:
         result.notes.append(
@@ -129,8 +127,8 @@ def validate_cached_references(
     if unprofiled:
         result.notes.append(
             "cache validation found relation(s) whose columns are unprofiled, so "
-            "their field, key, and relationship-column references remain unknown: "
-            + ", ".join(sorted(unprofiled))
+            "their field references, and so the keys and relationships on them, "
+            "remain unknown: " + ", ".join(sorted(unprofiled))
         )
     if opaque_sources:
         result.notes.append(
@@ -150,26 +148,10 @@ def validate_cached_references(
     return result
 
 
-def _endpoint_columns(model: dict[str, Any]) -> dict[Any, list[tuple[str, str]]]:
-    columns: dict[Any, list[tuple[str, str]]] = {}
-    for relationship in model.get("relationships") or []:
-        name = str(relationship.get("name"))
-        for side, key in (("from", "from_columns"), ("to", "to_columns")):
-            dataset = relationship.get(side)
-            columns.setdefault(dataset, []).extend(
-                (str(column), f"relationship '{name}' {key}")
-                for column in relationship.get(key) or []
-            )
-    return columns
-
-
 def _column_references(
-    dataset: dict[str, Any],
-    endpoints: list[tuple[str, str]],
-    *,
-    connector: str,
+    dataset: dict[str, Any], *, connector: str
 ) -> tuple[list[tuple[str, str]], int]:
-    references = list(endpoints)
+    references: list[tuple[str, str]] = []
     skipped = 0
     for field_ in dataset.get("fields") or []:
         expression, _dialect, _declared = select_expression(
@@ -180,11 +162,4 @@ def _column_references(
             skipped += 1
         else:
             references.append((column, f"field '{field_.get('name')}'"))
-    references.extend(
-        (str(column), "primary_key") for column in dataset.get("primary_key") or []
-    )
-    for key_index, key in enumerate(dataset.get("unique_keys") or []):
-        references.extend((str(column), f"unique_keys[{key_index}]") for column in key)
-    # The same physical column may be a field, key, and endpoint.  Each role is
-    # useful in a refusal, but duplicate declarations of one role are only noise.
     return list(dict.fromkeys(references)), skipped

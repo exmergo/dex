@@ -41,11 +41,23 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ..dbt_project import DbtProjectView
-from ..errors import DexError
 from ..guards.pii_meta import entry_meta
+
+# The declaration model and its parser live in a leaf (#927), so a semantic
+# layer's own authoring route can read a declaration without importing the dbt
+# rewriter and sqlglot behind it. Re-exported here, where the dbt callers look.
+from ..semantic_declarations import Additivity as Additivity
+from ..semantic_declarations import Assumption as Assumption
+from ..semantic_declarations import ColumnDeclaration as ColumnDeclaration
+from ..semantic_declarations import Declaration as Declaration
+from ..semantic_declarations import DeclarationError as DeclarationError
+from ..semantic_declarations import Evidence as Evidence
+from ..semantic_declarations import Population as Population
+from ..semantic_declarations import PopulationFilter as PopulationFilter
+from ..semantic_declarations import Role as Role
+from ..semantic_declarations import parse_declarations as parse_declarations
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     RewriteError,
@@ -64,130 +76,6 @@ from .rewrite import (
 #: The namespace under ``config.meta`` that dex owns. Everything a declaration
 #: says that dbt has no construct for lands here, and nothing else does.
 DEX_META_KEY = "dex"
-
-
-class DeclarationError(DexError, ValueError):
-    """A declaration dex refuses, with the fix named in the message.
-
-    A ``ValueError`` as well, so it reaches the same request-error envelope every
-    other malformed payload does on the commands that already catch that.
-    """
-
-
-class Role(str, Enum):
-    KEY = "key"
-    FOREIGN_KEY = "foreign_key"
-    DIMENSION = "dimension"
-    TIME = "time"
-    MEASURE = "measure"
-    ATTRIBUTE = "attribute"
-
-
-class Additivity(str, Enum):
-    ADDITIVE = "additive"
-    # Does not add across time: a balance, a running or season-to-date total.
-    SEMI_ADDITIVE = "semi_additive"
-    # Does not add at all: a ratio, a share, a distinct count.
-    NON_ADDITIVE = "non_additive"
-
-
-class Evidence(str, Enum):
-    """Where a decision came from, strongest first."""
-
-    REQUEST = "request"
-    CONTRACT = "contract"
-    PRECEDENT = "precedent"
-    DATA = "data"
-    DEFAULT = "default"
-
-
-class _Strict(BaseModel):
-    # An unknown key is a typo far more often than a deliberate extension, and a
-    # typo silently dropped is a declaration that says less than its author meant.
-    model_config = ConfigDict(extra="forbid")
-
-
-class PopulationFilter(_Strict):
-    column: str
-    includes: list[str | int | float | bool] | None = None
-    excludes: list[str | int | float | bool] | None = None
-
-
-class Population(_Strict):
-    rule: str | None = None
-    filters: list[PopulationFilter] = []
-
-
-class ColumnDeclaration(_Strict):
-    role: Role | None = None
-    description: str | None = None
-    references: str | None = None
-    # `never`, or a sentence saying what NULL means in this column.
-    null_rule: str | None = None
-    aggregation: str | None = None
-    additivity: Additivity | None = None
-    # `currency:<ISO code>`, `fraction`, `percent`, `count`, or a plain unit.
-    unit: str | None = None
-
-
-class Assumption(_Strict):
-    decision: str | None = None
-    chosen: str | None = None
-    evidence: Evidence | None = None
-    detail: str | None = None
-
-
-class Declaration(_Strict):
-    model: str
-    description: str | None = None
-    grain: list[str] | None = None
-    population: Population | None = None
-    columns: dict[str, ColumnDeclaration] = {}
-    assumptions: list[Assumption] = []
-
-
-# --- reading the payload ------------------------------------------------------
-
-
-def parse_declarations(entries: Any) -> list[Declaration]:
-    """The payload's ``declarations`` list, validated, or a refusal naming the fix."""
-
-    if entries is None:
-        return []
-    if not isinstance(entries, list):
-        raise DeclarationError(
-            'declarations must be a list: {"declarations": [{"model": ...}, ...]}'
-        )
-    parsed: list[Declaration] = []
-    for index, entry in enumerate(entries):
-        try:
-            parsed.append(Declaration.model_validate(entry))
-        except ValidationError as exc:
-            raise DeclarationError(_validation_message(index, entry, exc)) from exc
-    seen: set[str] = set()
-    for declaration in parsed:
-        if declaration.model in seen:
-            raise DeclarationError(
-                f"'{declaration.model}' is declared twice in this payload; merge the "
-                "two into one declaration"
-            )
-        seen.add(declaration.model)
-    return parsed
-
-
-def _validation_message(index: int, entry: Any, exc: ValidationError) -> str:
-    model = entry.get("model") if isinstance(entry, dict) else None
-    where = f"declarations[{index}]" + (f" ('{model}')" if model else "")
-    problems = []
-    for error in exc.errors():
-        loc = ".".join(str(part) for part in error["loc"])
-        if error["type"] == "extra_forbidden":
-            problems.append(f"{loc} is not a declaration field")
-        elif error["type"] == "missing":
-            problems.append(f"{loc} is required")
-        else:
-            problems.append(f"{loc}: {error['msg']}")
-    return f"{where} is malformed: " + "; ".join(problems)
 
 
 # --- where a model is declared --------------------------------------------------
@@ -387,6 +275,18 @@ def _check(
 
     if declaration.population is not None:
         _check_filters(model, declaration.population, cache, pii_overrides)
+        parent = declaration.population.parent
+        if parent is not None:
+            warnings.extend(
+                _check_parent(model, declaration, parent, produced, files, view)
+            )
+
+    if declaration.history is not None:
+        warnings.extend(
+            _check_history(
+                model, declaration, produced, files, view, cache, pii_overrides
+            )
+        )
 
     declared_columns = _declared_column_roles(files, declaration.model)
     declared_columns.update(name.lower() for name in declaration.columns)
@@ -400,49 +300,215 @@ def _check_reference(
     target: str,
     files: Mapping[str, str],
     view: DbtProjectView,
+    *,
+    claim: str | None = None,
 ) -> None:
+    """Refuse a reference whose parent or parent column the project lacks.
+
+    ``claim`` is how the refusal names what made the reference, so a
+    ``population.parent`` key reads as that rather than as a column's
+    ``references``."""
+
+    said = claim or f"'{model}.{column}' references '{target}'"
     parent, _, parent_column = target.rpartition(".")
     if not parent or not parent_column:
-        raise DeclarationError(
-            f"'{model}.{column}' references '{target}'; write the target as "
-            "<model>.<column>"
-        )
+        raise DeclarationError(f"{said}; write the target as <model>.<column>")
     parent_sql = model_sql_path(files, view.model_paths, parent)
     if parent_sql is not None:
         produced = select_columns(files[parent_sql])
         if produced is not None and parent_column.lower() not in produced:
             raise DeclarationError(
-                f"'{model}.{column}' references '{target}', and {parent_sql} does not "
-                f"produce a column '{parent_column}'"
+                f"{said}, and {parent_sql} does not produce a column '{parent_column}'"
             )
         return
     if _is_seed_or_snapshot(files, view, parent):
         return
     raise DeclarationError(
-        f"'{model}.{column}' references '{target}', and the project has no model, "
-        f"seed or snapshot named '{parent}'"
+        f"{said}, and the project has no model, seed or snapshot named '{parent}'"
     )
+
+
+def _check_parent(
+    model: str,
+    declaration: Declaration,
+    parent: Any,
+    produced: set[str] | None,
+    files: Mapping[str, str],
+    view: DbtProjectView,
+) -> list[str]:
+    """Validate ``population.parent`` (#857): every output key column is one the
+    model produces, and every parent column is one the parent produces.
+
+    A parent that is the model itself is refused: a key set always equals
+    itself, so the check would prove nothing. A key that is not the declared
+    grain is a warning rather than a refusal, since a model may legitimately
+    hold one row per parent at a grain written differently, but the check then
+    counts entities the grain does not name.
+    """
+
+    if parent.model.lower() == model.lower():
+        raise DeclarationError(
+            f"'{model}' declares itself as its population.parent; name the model, "
+            "seed or snapshot its rows are drawn from"
+        )
+    if produced is not None:
+        unknown = [c for c in parent.key if c.lower() not in produced]
+        if unknown:
+            raise DeclarationError(
+                f"'{model}' declares population.parent key column(s) "
+                f"{', '.join(unknown)} that its SELECT list does not produce; the "
+                "key maps output columns to the parent's"
+            )
+    for output_column, parent_column in parent.key.items():
+        _check_reference(
+            model,
+            output_column,
+            f"{parent.model}.{parent_column}",
+            files,
+            view,
+            claim=(
+                f"'{model}' declares population.parent {parent.model} keyed "
+                f"{output_column} -> {parent_column}"
+            ),
+        )
+    grain = [g.lower() for g in declaration.grain or []]
+    keys = [k.lower() for k in parent.key]
+    if grain and sorted(grain) != sorted(keys):
+        return [
+            f"'{model}' declares population.parent keyed on {', '.join(parent.key)} "
+            f"but its grain is {', '.join(declaration.grain or [])}; the parent "
+            "check counts entities by the key, so the two describe different rows "
+            "unless the key is the grain"
+        ]
+    return []
+
+
+def _check_history(
+    model: str,
+    declaration: Declaration,
+    produced: set[str] | None,
+    files: Mapping[str, str],
+    view: DbtProjectView,
+    cache: Any,
+    pii_overrides: Any,
+) -> list[str]:
+    """Validate a ``history`` block (#1027): a real snapshot, output columns the
+    model produces, and a target that is safe to commit. A policy left out is a
+    warning, since it is intent still owed rather than a malformed statement."""
+
+    history = declaration.history
+    if history is None:  # pragma: no cover - the caller only passes a history
+        return []
+    if not snapshot_defined(files, history.snapshot, view.snapshot_paths):
+        raise DeclarationError(
+            f"'{model}' declares history from '{history.snapshot}', and the project "
+            "has no snapshot by that name; a temporal contract is verified against "
+            "a dbt snapshot's versions"
+        )
+    measures = history.measures
+    named = [
+        *history.entity,
+        *(
+            column
+            for column in (
+                measures.transition_count,
+                measures.latest_target_transition_at,
+                measures.first_target_at,
+            )
+            if column is not None
+        ),
+    ]
+    if produced is not None:
+        unknown = [c for c in named if c.lower() not in produced]
+        if unknown:
+            raise DeclarationError(
+                f"'{model}' declares history column(s) {', '.join(unknown)} that its "
+                "SELECT list does not produce; `entity` keys and `measures` name "
+                "output columns of the model"
+            )
+    try:
+        _check_filters(
+            model,
+            Population(
+                filters=[
+                    PopulationFilter(
+                        column=history.status.column,
+                        includes=[history.status.target],
+                    )
+                ]
+            ),
+            cache,
+            pii_overrides,
+        )
+    except DeclarationError as exc:
+        raise DeclarationError(
+            f"'{model}' declares history on status column "
+            f"'{history.status.column}', whose target would be committed to git, "
+            f"and the column looks like personal data: {exc}"
+        ) from exc
+
+    owed: list[str] = []
+    if history.initial_observation is None:
+        owed.append("initial_observation (`baseline` or `transition`)")
+    if history.null_status is None:
+        owed.append("null_status (`ignore` or `state`)")
+    if history.population is None:
+        owed.append("population (`ever_target` or `all_observed`)")
+    timed = measures.latest_target_transition_at or measures.first_target_at
+    if timed and (history.time is None or history.time.provenance is None):
+        owed.append("time, with its provenance (`business` or `capture`)")
+    if owed:
+        return [
+            f"'{model}' declares history without stating {', '.join(owed)}; Dex "
+            "assumes no temporal policy, so verification reports what depends on "
+            "it as unchecked"
+        ]
+    return []
 
 
 def _is_seed_or_snapshot(
     files: Mapping[str, str], view: DbtProjectView, name: str
 ) -> bool:
     seed_roots = [PurePosixPath(p) for p in view.seed_paths]
-    snapshot_roots = [PurePosixPath(p) for p in view.snapshot_paths]
-    for path, content in files.items():
+    for path in files:
         candidate = PurePosixPath(path)
-        is_seed = (
+        if (
             candidate.suffix == ".csv"
             and candidate.stem == name
             and any(root in candidate.parents for root in seed_roots)
-        )
-        is_snapshot = (
-            candidate.suffix == ".sql"
-            and any(root in candidate.parents for root in snapshot_roots)
-            and re.search(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}", content)
-        )
-        if is_seed or is_snapshot:
+        ):
             return True
+    return snapshot_defined(files, name, view.snapshot_paths)
+
+
+def snapshot_defined(
+    files: Mapping[str, str], name: str, snapshot_paths: Iterable[str] | None = None
+) -> bool:
+    """Whether the project defines a snapshot called ``name``: a ``{% snapshot %}``
+    block (under ``snapshot_paths``, where given), or a ``snapshots:`` entry in a
+    YAML file, which is how dbt 1.9 and later define one."""
+
+    roots = (
+        None if snapshot_paths is None else [PurePosixPath(p) for p in snapshot_paths]
+    )
+    block = re.compile(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}")
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if candidate.suffix == ".sql":
+            placed = roots is None or any(r in candidate.parents for r in roots)
+            if placed and block.search(content):
+                return True
+        elif candidate.suffix in (".yml", ".yaml") and "snapshots" in content:
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError:
+                continue
+            entries = parsed.get("snapshots") if isinstance(parsed, dict) else None
+            if any(
+                isinstance(entry, dict) and entry.get("name") == name
+                for entry in (entries if isinstance(entries, list) else [])
+            ):
+                return True
     return False
 
 
@@ -642,6 +708,10 @@ def _model_dex(declaration: Declaration) -> dict[str, Any]:
             assumption.model_dump(mode="json", exclude_none=True)
             for assumption in declaration.assumptions
         ]
+    if declaration.history is not None:
+        dex["history"] = declaration.history.model_dump(
+            mode="json", exclude_none=True, exclude_defaults=True
+        )
     return dex
 
 
@@ -740,6 +810,8 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
     plain = yaml.safe_load(yaml.serialize(node)) if node is not None else None
     existing = (entry_meta(plain) or {}).get(DEX_META_KEY)
     merged = {**existing, **dex} if isinstance(existing, dict) else dict(dex)
+    if isinstance(existing, dict):
+        merged = _merge_population(existing, merged)
 
     config = _child(node, "config")
     if config is None:
@@ -758,6 +830,20 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         return found[1] if found else None
 
     return _set_key(text, meta_node, DEX_META_KEY, merged)
+
+
+def _merge_population(existing: Mapping[str, Any], merged: dict[str, Any]) -> dict:
+    """Keep ``population``'s own keys a later declaration leaves out (#857).
+
+    A model-level key is replaced whole, but ``population`` holds three
+    independent statements (a rule, filters, a parent), and a payload that adds
+    a parent to a model whose filters were declared earlier would otherwise
+    erase the filters. One level, the same rule one level down."""
+
+    before, after = existing.get("population"), merged.get("population")
+    if isinstance(before, dict) and isinstance(after, dict) and before is not after:
+        merged["population"] = {**before, **after}
+    return merged
 
 
 def _add_tests(text: str, locate, specs: list[Any]) -> str:
@@ -959,6 +1045,11 @@ def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str,
                     "decision": assumption.get("decision"),
                     "chosen": assumption.get("chosen"),
                     "evidence": assumption.get("evidence"),
+                    **(
+                        {"column": assumption["column"]}
+                        if isinstance(assumption.get("column"), str)
+                        else {}
+                    ),
                 }
             )
     return out

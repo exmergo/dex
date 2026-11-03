@@ -1,0 +1,21 @@
+cubes:
+  - name: customers
+    sql_table: app.customers
+    title: Customers
+    dimensions:
+      - name: id
+        sql: id
+        type: number
+        primary_key: true
+      - name: email
+        sql: email
+        type: string
+      - name: city
+        sql: city
+        type: string
+      - name: created_at
+        sql: created_at
+        type: time
+    measures:
+      - name: count
+        type: count

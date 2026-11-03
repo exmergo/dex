@@ -444,6 +444,19 @@ class PostgresAdapter:
             self._dev_target = scope
             self.forget_metadata()
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this Postgres scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            db, _, schema = token.partition(".")
+            if db != self._current_database().lower():
+                return False
+        else:
+            schema = token
+        if not self.target.schemas:
+            return True
+        return schema in {s.lower() for s in self._schema_scope()}
+
     def _resolve_schemas(self) -> list[str]:
         visible = self._schemas()
         if not self.target.schemas:
@@ -904,6 +917,9 @@ class PostgresAdapter:
                     # pg_stats estimates are never a uniqueness verdict; the
                     # near-unique escalation proves keys with an exact scan.
                     distinct_count=distinct,
+                    distinct_count_missing=(
+                        wants_distinct and n_total > 0 and distinct is None
+                    ),
                     is_unique=None,
                     min_value=(
                         json_safe(values.get(f"mn_{i}")) if wants_min_max else None
@@ -950,8 +966,8 @@ class PostgresAdapter:
 
         Columns the adapter degrades (json, xml and friends, which the
         aggregate scan itself refuses to count) are skipped, not counted:
-        the engine also sends columns the catalog had no statistics for,
-        and a degraded column among them would fail the whole statement.
+        `maintain verify` and `maintain drift` send key columns here directly,
+        and a degraded one among them would fail the whole statement.
         A column the inventory does not know is kept, since its type cannot
         be proven degraded. Measured columns are recorded so `table_notes`
         can say they were measured because the catalog had none.
@@ -1089,6 +1105,19 @@ class PostgresAdapter:
 
     # --- execution (the single billed door) --------------------------------------
 
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        _rows, labels, types = self._run_rows(
+            f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
+            fetch_rows=1,
+        )
+        return [
+            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
+            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+        ]
+
     def run_query(
         self,
         sql: str,
@@ -1169,6 +1198,17 @@ class PostgresAdapter:
         types = [self._description_type(d) for d in cursor.description]
         return rows, labels, types
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def _billed_cursor(self, timeout_seconds: float | None) -> tuple[Any, bool]:
         """A cursor prepared for spend: session read-only asserted, and the
         server-side statement timeout wound down to what remains of the
@@ -1179,6 +1219,9 @@ class PostgresAdapter:
         remaining = self.cost_gate.statement_cap(unit="database-second")
         self._ensure_session()
         cursor = self._conn.cursor()
+        if getattr(self, "_utc_session", False):
+            # dex-built session statement, a constant.
+            cursor.execute("SET timezone = 'UTC'")
         timeout_ms: int | None = None
         budget_bound = False
         if remaining is not None:

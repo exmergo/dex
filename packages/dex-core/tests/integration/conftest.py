@@ -190,6 +190,25 @@ def _snowflake_enabled() -> bool:
 
 @pytest.fixture(autouse=True)
 def _require_cloud_env(request):
+    if request.node.get_closest_marker("cube"):
+        # Ahead of every warehouse branch: a Cube test needs its renderer as
+        # well as its warehouse, and one without `postgres` runs on DuckDB.
+        warehouse = (
+            "postgres" if request.node.get_closest_marker("postgres") else "duckdb"
+        )
+        required = ["CUBEJS_API_SECRET", f"DEX_TEST_CUBE_URL_{warehouse.upper()}"]
+        if warehouse == "postgres":
+            required.append("DEX_TEST_PG_DSN")
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            pytest.skip(
+                f"Cube integration disabled: set {', '.join(missing)} (run "
+                f"scripts/setup_cube_dev.sh --db {warehouse}, then source "
+                "~/.cache/dex-dogfood/cube.env)"
+            )
+        pytest.importorskip("httpx")
+        pytest.importorskip("psycopg" if warehouse == "postgres" else "duckdb")
+        return
     if request.node.get_closest_marker("snowflake"):
         if not _snowflake_enabled():
             pytest.skip(

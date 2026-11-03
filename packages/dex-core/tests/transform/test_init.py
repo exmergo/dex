@@ -628,11 +628,31 @@ def test_init_postgres_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch)
     # ~/.pgpass and peer auth still work at dbt runtime.
     assert "hunter2" not in rendered
     assert "env_var" in output["password"] and "PGPASSWORD" in output["password"]
+    # One identity, no note.
+    assert "notes" not in envelope["data"]
     # The dev schema choice is persisted for cmd_map's replica folding.
     config = yaml.safe_load(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
     assert config["postgres"]["dev_schema"] == "dbt_dev"
+
+
+def test_init_postgres_renders_the_committed_build_identity(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """A committed postgres.user is the build identity, even where discovery
+    (DATABASE_URL) found dex a read-only role (#904)."""
+
+    pytest.importorskip("psycopg")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://dex_ro@db.example.com:5439/shop")
+    _seed_postgres_config(tmp_path, user="dbt_dev")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "postgres"), capsys)
+    assert rc == 0, envelope
+    profile = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    assert profile["analytics"]["outputs"]["dev"]["user"] == "dbt_dev"
+    assert "dex_ro" in envelope["data"]["notes"][0]
 
 
 def test_init_postgres_refuses_dev_schema_source_collision(
@@ -711,6 +731,23 @@ def test_init_redshift_bootstraps_a_password_profile(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
     assert config["redshift"]["dev_schema"] == "dbt_dev"
+
+
+def test_init_redshift_renders_the_committed_build_identity(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """Same split as Postgres (#904)."""
+
+    pytest.importorskip("redshift_connector")
+    monkeypatch.setenv("REDSHIFT_HOST", "wg.example.com")
+    monkeypatch.setenv("REDSHIFT_DATABASE", "shop")
+    monkeypatch.setenv("REDSHIFT_USER", "dex_ro")
+    _seed_redshift_config(tmp_path, user="dbt_dev")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "redshift"), capsys)
+    assert rc == 0, envelope
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    assert "user: dbt_dev" in rendered
+    assert "dex_ro" in envelope["data"]["notes"][0]
 
 
 def test_init_redshift_refuses_dev_schema_source_collision(

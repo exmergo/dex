@@ -17,7 +17,7 @@ import re
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 # Bump when the stored cache shape changes in a way old readers cannot handle.
 #
@@ -179,11 +179,30 @@ class DeclaredFilter(BaseModel):
     excludes: list[str | int | float | bool] | None = None
 
 
+class DeclaredParent(BaseModel):
+    """The entity a model's rows are drawn from (#857). Names only, never a
+    value, so nothing here is withheld. The key is two ordered lists rather than
+    a mapping, so a payload path never carries a column name."""
+
+    model: str
+    columns: list[str]
+    parent_columns: list[str]
+
+
 class DeclaredRows(BaseModel):
     """Which rows a model keeps, as its declaration states it."""
 
     rule: str | None = None
     filters: list[DeclaredFilter] = Field(default_factory=list)
+    parent: DeclaredParent | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_parent(self, handler):
+        # A population with no declared parent reads as it always has.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("parent") is None:
+            data.pop("parent", None)
+        return data
 
 
 class DatasetDeclaration(BaseModel):

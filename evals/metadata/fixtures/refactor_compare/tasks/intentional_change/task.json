@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "account_user_summary"
+  ],
+  "prompt": "Test users are inflating `account_user_summary`. Exclude users flagged `is_test` from both `user_count` and `named_users`; every account should still be listed. Rebuild it on dev."
+}

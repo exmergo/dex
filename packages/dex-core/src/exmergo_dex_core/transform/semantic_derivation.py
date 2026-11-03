@@ -37,6 +37,13 @@ from typing import Any
 import yaml
 
 from ..dbt_project import DbtProjectView, EditOp
+from ..semantic_declarations import (
+    DEX_META_KEY,
+    account,
+    column_metadata,
+    model_metadata,
+    with_population,
+)
 from .plans import EditKind, PlanEdit
 from .validate import EditValidationError
 
@@ -96,6 +103,9 @@ class Derivation:
     notes: list[str] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     validation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Declared fields the semantic model carries, and those it does not with why.
+    carried: list[str] = field(default_factory=list)
+    not_carried: dict[str, str] = field(default_factory=dict)
 
     @property
     def content(self) -> str | None:
@@ -113,6 +123,8 @@ class Derivation:
             out["validation"] = self.validation
         out["notes"] = self.notes
         out["limitations"] = self.limitations
+        out["carried"] = self.carried
+        out["not_carried"] = self.not_carried
         return out
 
 
@@ -193,6 +205,8 @@ def derive(
 
     derivation = Derivation(model=model)
     notes, limitations = derivation.notes, derivation.limitations
+    carried: list[str] = []
+    reasons: dict[str, str] = {}
     columns: dict[str, dict[str, Any]] = {
         name: dict(fields)
         for name, fields in (declared.get("columns") or {}).items()
@@ -204,8 +218,17 @@ def derive(
     primary: str | None = None
     if len(grain) == 1:
         primary = _entity_name(grain[0], model)
-        entities.append({"name": primary, "type": "primary", "expr": grain[0]})
+        entities.append(
+            _with_meta(
+                {"name": primary, "type": "primary", "expr": grain[0]},
+                columns.get(grain[0]),
+            )
+        )
+        carried.extend(["grain", *_carried_column(grain[0], columns.get(grain[0]))])
     elif len(grain) > 1:
+        reasons["grain"] = (
+            "composite: MetricFlow's primary entity is one column, and none was guessed"
+        )
         limitations.append(
             f"the grain is composite ({', '.join(grain)}), so no single column is "
             "the primary entity and none was guessed. MetricFlow needs one for any "
@@ -234,7 +257,10 @@ def derive(
             notes.append(f"{name}: no entity name free for it, so it is not derived")
             continue
         used_names.add(entity)
-        entities.append({"name": entity, "type": "foreign", "expr": name})
+        entities.append(
+            _with_meta({"name": entity, "type": "foreign", "expr": name}, fields)
+        )
+        carried.extend(_carried_column(name, fields))
         if not fields.get("references"):
             notes.append(
                 f"{name}: a foreign key with no `references`, so entity '{entity}' "
@@ -249,7 +275,12 @@ def derive(
     for name, fields in columns.items():
         role = fields.get("role")
         if role == "dimension":
-            dimensions.append(_described({"name": name, "type": "categorical"}, fields))
+            dimensions.append(
+                _with_meta(
+                    _described({"name": name, "type": "categorical"}, fields), fields
+                )
+            )
+            carried.extend(_carried_column(name, fields, described=True))
         elif role == "time":
             kind, truncated = column_types.get(name, (None, None))
             if kind == "other":
@@ -272,15 +303,19 @@ def derive(
                     "granularity, which a date or a timestamp both support"
                 )
             dimensions.append(
-                _described(
-                    {
-                        "name": name,
-                        "type": "time",
-                        "type_params": {"time_granularity": granularity},
-                    },
+                _with_meta(
+                    _described(
+                        {
+                            "name": name,
+                            "type": "time",
+                            "type_params": {"time_granularity": granularity},
+                        },
+                        fields,
+                    ),
                     fields,
                 )
             )
+            carried.extend(_carried_column(name, fields, described=True))
             time_columns.append(name)
 
     agg_time = time_columns[0] if time_columns else None
@@ -304,7 +339,10 @@ def derive(
             groupings=[e["name"] for e in entities if e["type"] == "foreign"],
         )
         if measure is not None:
-            measures.append(measure)
+            measures.append(_with_meta(measure, fields, additivity=True))
+            carried.extend(
+                _carried_column(name, fields, described=True, additivity=True)
+            )
 
     entity_columns = {e["expr"] for e in entities}
     if any((columns.get(c) or {}).get("description") for c in entity_columns):
@@ -312,6 +350,10 @@ def derive(
             "key column descriptions are not carried onto entities: MetricFlow's "
             "schema has no description field for an entity"
         )
+        for column in entity_columns:
+            reasons[f"columns.{column}.description"] = (
+                "MetricFlow's schema has no description field for an entity"
+            )
 
     unrolled = [
         name
@@ -323,6 +365,19 @@ def derive(
             "not derived (role key or attribute, which a semantic model has no "
             f"element for): {', '.join(unrolled)}"
         )
+        for column in unrolled:
+            reasons[f"columns.{column}"] = (
+                "role key or attribute, which a semantic model has no element for"
+            )
+
+    meta = model_metadata(declared)
+    carried.extend(meta)
+    derivation.carried, derivation.not_carried = account(
+        declared,
+        carried + (["description"] if declared.get("description") else []),
+        reasons,
+        default="not derived; the notes and limitations say why",
+    )
 
     if not dimensions and not measures:
         derivation.status = "skipped"
@@ -333,8 +388,11 @@ def derive(
         return derivation
 
     body: dict[str, Any] = {"name": model}
-    if isinstance(declared.get("description"), str) and declared["description"]:
-        body["description"] = declared["description"]
+    description = with_population(
+        declared.get("description"), declared.get("population")
+    )
+    if description:
+        body["description"] = description
     body["model"] = f"ref('{model}')"
     if agg_time:
         body["defaults"] = {"agg_time_dimension": agg_time}
@@ -344,6 +402,8 @@ def derive(
         body["dimensions"] = dimensions
     if measures:
         body["measures"] = measures
+    if meta:
+        body["config"] = {"meta": {DEX_META_KEY: meta}}
     derivation.body = body
     if primary is None:
         derivation.status = "failed"
@@ -410,6 +470,45 @@ def _measure(
             "Confirm that is what the column means." + per_entity
         )
     return measure
+
+
+def _with_meta(
+    element: dict[str, Any],
+    fields: Mapping[str, Any] | None,
+    *,
+    additivity: bool = False,
+) -> dict[str, Any]:
+    """``element`` with the column's declared unit and NULL rule as metadata.
+
+    Under ``config.meta.dex``, the key the model's own YAML uses, so a reader
+    finds the same fact under the same name on either side. A ``non_additive``
+    measure also says so there: MetricFlow states ``semi_additive`` natively
+    (``non_additive_dimension``) and reads any other measure as one it may add up.
+    """
+
+    meta = column_metadata(fields)
+    if additivity and (fields or {}).get("additivity") == "non_additive":
+        meta["additivity"] = "non_additive"
+    if meta:
+        element["config"] = {"meta": {DEX_META_KEY: meta}}
+    return element
+
+
+def _carried_column(
+    name: str,
+    fields: Mapping[str, Any] | None,
+    *,
+    described: bool = False,
+    additivity: bool = False,
+) -> list[str]:
+    """The declared fields of one derived column that its element carries."""
+
+    carried = {"role", "references", "unit", "null_rule"}
+    if described:
+        carried.add("description")
+    if additivity:
+        carried |= {"aggregation", "additivity"}
+    return [f"columns.{name}.{key}" for key in carried if (fields or {}).get(key)]
 
 
 def _described(
@@ -742,148 +841,170 @@ def _dump(body: Mapping[str, Any]) -> str:
     return dump_yaml(dict(body))
 
 
-# --- the whole pass ------------------------------------------------------------------
+# --- the whole pass, behind the derivation hook (#927) -------------------------------
 
 
-@dataclass
-class Outcome:
-    """What one plan's derivation pass produced."""
+class MetricFlowDerivation:
+    """The dbt vendor's :class:`~..semantic_source.SemanticDerivationSource`.
 
-    edits: list[PlanEdit]
-    proposal: dict[str, Any] | None = None
-    warnings: list[str] = field(default_factory=list)
-    #: dbt's parse of exactly the plan's edits, when the pass ran one the plan's
-    #: own gate can reuse.
-    parse: dict[str, Any] | None = None
+    MetricFlow's layer lives inside the transformation project, so its derived
+    definitions are spliced into the plan's own edits (``edit_target`` is
+    ``project``) and validated by dbt's parse of a throwaway copy, which the
+    caller may reuse as its own gate. It lives here rather than on the dbt
+    project adapter so the adapters never import the transform layer.
 
-
-def run(
-    view: DbtProjectView,
-    edits: list[PlanEdit],
-    models: Iterable[str],
-    *,
-    project: Any,
-    marts_paths: Iterable[str],
-    cache: Any,
-    dialect: str,
-    target: str | None,
-    vendor: str = "dbt",
-) -> Outcome:
-    """Derive, validate and place a semantic model for each declared mart.
-
-    ``models`` is what the plan creates, edits or declares; only those under
-    ``marts_paths`` whose post-change YAML carries a declaration are considered.
-    ``edits`` comes back with every included derivation added; nothing else in
-    it changes.
+    ``annotate`` is ``unsupported``: a dbt declaration already renders into the
+    model's own YAML through ``transform plan`` and ``semantic plan``, which is
+    where MetricFlow reads it from.
     """
 
-    from . import declarations as declarations_mod
-    from . import drafting
+    vendor = "dbt"
 
-    marts_paths = list(marts_paths)
-    files = declarations_mod.post_change_files(view, edits)
-    candidates: list[tuple[str, str, dict[str, Any]]] = []
-    for model in sorted(set(models)):
-        sql_path = declarations_mod.model_sql_path(files, view.model_paths, model)
-        if sql_path is None or not in_marts(sql_path, marts_paths):
-            continue
-        declared = drafting.read_declared(files, model)
-        if declares_something(declared):
-            candidates.append((model, sql_path, declared))
-    if not candidates:
-        return Outcome(edits=edits)
-    if vendor != "dbt":
-        # The layer this project reads is not MetricFlow, so a MetricFlow model
-        # would be a second, unread layer. Its own authoring verb is the route.
-        return Outcome(
-            edits=edits,
-            warnings=[
-                "no semantic model was derived for "
-                f"{', '.join(c[0] for c in candidates)}: "
-                f"semantic.vendor is '{vendor}', whose layer is authored with "
-                f"`semantic {vendor} plan`, and a derived MetricFlow model would "
-                "be one nothing reads"
-            ],
-        )
+    def __init__(
+        self,
+        view: DbtProjectView,
+        edits: list[PlanEdit],
+        files: Mapping[str, str],
+        *,
+        project: Any,
+        target: str | None,
+    ) -> None:
+        self.view = view
+        self.edits = edits
+        self.files = files
+        self.project = project
+        self.target = target
 
-    from . import semantic as semantic_mod
+    def derive_semantic(self, request: Any) -> Any:
+        from ..semantic_source import DerivedDefinition, SemanticDerivationResult
 
-    docs = documents(files)
-    on_ref = semantic_models_by_ref(docs)
-    spine_missing = (
-        semantic_mod.time_spine_warning(view, [parsed for _p, parsed in docs])
-        is not None
-    )
-    layer = has_semantic_models(docs) and not spine_missing
-    payload_documents = [
-        yaml.safe_load(e.new_content)
-        for e in edits
-        if e.kind is EditKind.SEMANTIC_YML and e.op is EditOp.UPSERT and e.new_content
-    ]
-
-    derivations: list[Derivation] = []
-    for model, sql_path, declared in candidates:
-        time_like = [
-            name
-            for name, fields in (declared.get("columns") or {}).items()
-            if isinstance(fields, dict) and fields.get("role") == "time"
-        ]
-        types = column_types(
-            files[sql_path], cache, time_like, dialect=dialect, vars=view.vars
-        )
-        derivation = derive(model, declared, column_types=types, on_ref=on_ref)
-        derivations.append(derivation)
-        if derivation.body is None or derivation.status == "skipped":
-            continue
-        check_collisions(derivation, docs, on_ref)
-        if derivation.status in ("skipped", "failed"):
-            continue
-        place(derivation, sql_path, docs, edits)
-        try:
-            splice(derivation, files)
-        except EditValidationError as exc:
-            derivation.status = "failed"
-            derivation.blocked = str(exc)
-            continue
-        if not validate_static(derivation, view, payload_documents):
-            derivation.status = (
-                "unvalidated"
-                if derivation.validation["schema"]["result"] == "not_run"
-                else "failed"
+        if request.mode != "derive":
+            return SemanticDerivationResult(
+                vendor=self.vendor,
+                edit_target="project",
+                edits=self.edits,
+                definitions={
+                    d.model: DerivedDefinition(
+                        model=d.model,
+                        status="unsupported",
+                        reason=(
+                            "a dbt declaration renders into the model's own YAML, "
+                            "which is what MetricFlow reads"
+                        ),
+                    )
+                    for d in request.declarations
+                },
             )
-
-    ready = [d for d in derivations if d.status == "proposed"]
-    derived_edits = _spliced_edits(ready, files, edits)
-    parse_result = None
-    if ready:
-        parse_result = validate_parse(
-            ready,
-            derived_edits,
-            edits,
-            project=project,
-            target=target,
-            spine=[] if layer else shadow_spine(view),
+        derivations, edits, proposal, warnings, parse = self._run(request)
+        return SemanticDerivationResult(
+            vendor=self.vendor,
+            edit_target="project",
+            edits=edits,
+            definitions={d.model: _definition(d) for d in derivations},
+            proposal=proposal,
+            warnings=warnings,
+            gate=parse,
         )
-        for derivation in ready:
-            outcome = derivation.validation["parse"]["result"]
-            if outcome == "failed":
+
+    def _run(
+        self, request: Any
+    ) -> tuple[list[Derivation], list[PlanEdit], dict[str, Any], list[str], Any]:
+        from . import semantic as semantic_mod
+
+        view, files, edits = self.view, self.files, self.edits
+        docs = documents(files)
+        on_ref = semantic_models_by_ref(docs)
+        spine_missing = (
+            semantic_mod.time_spine_warning(view, [parsed for _p, parsed in docs])
+            is not None
+        )
+        layer = has_semantic_models(docs) and not spine_missing
+        payload_documents = [
+            yaml.safe_load(e.new_content)
+            for e in edits
+            if e.kind is EditKind.SEMANTIC_YML
+            and e.op is EditOp.UPSERT
+            and e.new_content
+        ]
+
+        derivations: list[Derivation] = []
+        for declaration in request.declarations:
+            model, sql_path = declaration.model, declaration.source_path
+            derivation = derive(
+                model,
+                declaration.declared,
+                column_types=declaration.column_types,
+                on_ref=on_ref,
+            )
+            derivations.append(derivation)
+            if derivation.body is None or derivation.status == "skipped":
+                continue
+            check_collisions(derivation, docs, on_ref)
+            if derivation.status in ("skipped", "failed"):
+                continue
+            place(derivation, sql_path, docs, edits)
+            try:
+                splice(derivation, files)
+            except EditValidationError as exc:
                 derivation.status = "failed"
-            elif outcome == "not_run":
-                derivation.status = "unvalidated"
-            elif layer:
-                derivation.status = "included"
+                derivation.blocked = str(exc)
+                continue
+            if not validate_static(derivation, view, payload_documents):
+                derivation.status = (
+                    "unvalidated"
+                    if derivation.validation["schema"]["result"] == "not_run"
+                    else "failed"
+                )
 
-    included = [d for d in derivations if d.status == "included"]
-    if included:
-        edits = _with_derived(edits, _spliced_edits(included, files, edits))
-    else:
+        ready = [d for d in derivations if d.status == "proposed"]
+        derived_edits = _spliced_edits(ready, files, edits)
         parse_result = None
+        if ready:
+            parse_result = validate_parse(
+                ready,
+                derived_edits,
+                edits,
+                project=self.project,
+                target=self.target,
+                spine=[] if layer else shadow_spine(view),
+            )
+            for derivation in ready:
+                outcome = derivation.validation["parse"]["result"]
+                if outcome == "failed":
+                    derivation.status = "failed"
+                elif outcome == "not_run":
+                    derivation.status = "unvalidated"
+                elif layer:
+                    derivation.status = "included"
 
-    return Outcome(
-        edits=edits,
-        proposal=_proposal(derivations, layer=layer, spine_missing=spine_missing),
-        warnings=_warnings(derivations),
-        parse=parse_result,
+        included = [d for d in derivations if d.status == "included"]
+        if included:
+            edits = _with_derived(edits, _spliced_edits(included, files, edits))
+        else:
+            parse_result = None
+
+        return (
+            derivations,
+            edits,
+            _proposal(derivations, layer=layer, spine_missing=spine_missing),
+            _warnings(derivations),
+            parse_result,
+        )
+
+
+def _definition(derivation: Derivation) -> Any:
+    from ..semantic_source import DerivedDefinition
+
+    return DerivedDefinition(
+        model=derivation.model,
+        status=derivation.status,  # type: ignore[arg-type]
+        name=None if derivation.body is None else derivation.body["name"],
+        path=derivation.path,
+        content=derivation.content,
+        reason=derivation.blocked,
+        notes=list(derivation.notes),
+        limitations=list(derivation.limitations),
+        validation=dict(derivation.validation),
     )
 
 
@@ -924,6 +1045,7 @@ def _proposal(
 ) -> dict[str, Any]:
     proposed = [d for d in derivations if d.status == "proposed"]
     data: dict[str, Any] = {
+        "vendor": "dbt",
         "mode": "included" if layer else "proposed",
         "time_spine": "missing" if spine_missing else "present",
         "definitions": [

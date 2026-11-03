@@ -302,7 +302,9 @@ def packages_digest(project: Path) -> str | None:
                 declared = True
         else:
             parts.append(f"{name}:absent")
-    installed = project / "dbt_packages"
+    from .build import packages_dir as _packages_dir
+
+    installed = _packages_dir(project)
     if installed.is_dir():
         for child in sorted(p for p in installed.iterdir() if p.is_dir()):
             manifest = child / "dbt_project.yml"

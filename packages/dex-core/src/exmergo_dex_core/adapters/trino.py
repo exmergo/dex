@@ -199,6 +199,17 @@ def is_degraded_type(data_type: str) -> bool:
     return data_type.strip().lower().startswith(_DEGRADED_TYPE_PREFIXES)
 
 
+def counts_exactly(data_type: str) -> bool:
+    """Whether the exact-count pass may read a Trino column of this type.
+
+    ``varbinary`` is degraded for profiling but comparable, so a binary hash
+    declared as a grain can still be checked for duplicates.
+    """
+
+    declared = data_type.strip().lower()
+    return declared.startswith("varbinary") or not is_degraded_type(declared)
+
+
 # The table arguments that turn a read of a table into a read of its past; the
 # same node shapes the query firewall refuses for agent SQL.
 _HISTORICAL_READ_ARGS = ("version", "when", "changes")
@@ -507,6 +518,17 @@ class TrinoAdapter:
         if self._resolved_scopes is None:
             self._resolved_scopes = self._resolve_scopes()
         return self._resolved_scopes
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this command's Trino scope (#984)."""
+        token = namespace.strip().lower()
+        catalog, _, schema = token.partition(".")
+        for c, s in self._scopes():
+            if c.lower() != catalog:
+                continue
+            if s is None or s.lower() == schema:
+                return True
+        return False
 
     def _resolve_scopes(self) -> list[tuple[str, str | None]]:
         if not self.target.catalogs:
@@ -1082,8 +1104,22 @@ class TrinoAdapter:
         """Exact COUNT(DISTINCT) for near-unique columns, spent only within the
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let uniqueness verdicts stay approximate.
-        A metered adapter never self-escalates past its ceiling."""
+        A metered adapter never self-escalates past its ceiling.
 
+        Degraded columns are skipped, not counted, except a comparable binary
+        one: `maintain verify` and `maintain drift` send key columns here
+        directly, and one Trino cannot count would fail the whole statement.
+        A column the inventory does not know is kept, since
+        its type cannot be proven degraded.
+        """
+
+        if not columns:
+            return {}
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        columns = [
+            name for name in columns if name not in types or counts_exactly(types[name])
+        ]
         if not columns:
             return {}
         estimate = self._table_seconds(identifier, columns)
@@ -1191,6 +1227,19 @@ class TrinoAdapter:
         return result
 
     # --- execution (the single billed door) --------------------------------------
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
+
+        checked = guard(sql)
+        _rows, labels, types = self._run_rows(
+            f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
+            fetch_rows=1,
+        )
+        return [
+            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
+            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+        ]
 
     def run_query(
         self,

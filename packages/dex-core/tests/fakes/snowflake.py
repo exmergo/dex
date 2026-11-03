@@ -44,13 +44,21 @@ def _object_does_not_exist() -> sf_errors.ProgrammingError:
 
 class FakeClock:
     """The adapter's injectable clock; the fake connection advances it by each
-    statement's simulated duration."""
+    statement's simulated duration. ``wall`` is the same instant in epoch
+    seconds, the clock warehouse claims and ``resumed_on`` are stamped in."""
+
+    # 2026-01-01T00:00:00Z, so a fresh fake's wall clock and the default
+    # `resumed_on` below sit on the same timeline.
+    EPOCH = 1767225600.0
 
     def __init__(self) -> None:
         self.now = 0.0
 
     def __call__(self) -> float:
         return self.now
+
+    def wall(self) -> float:
+        return self.EPOCH + self.now
 
 
 @dataclass
@@ -88,8 +96,14 @@ class FakeWarehouse:
     auto_suspend: int | None = 60
     running: int = 0
     queued: int = 0
-    resumed_on: str | None = "2026-01-01T00:00:00.000-08:00"
+    # Before the fake clock starts, so the first resume always moves it.
+    resumed_on: str | None = "2025-12-31T12:00:00.000-08:00"
     resumes: int = 0
+    # Whether the session's role holds OPERATE, which ALTER WAREHOUSE ...
+    # SUSPEND needs; and how many times a suspend took.
+    operate_granted: bool = True
+    auto_resume: bool = True
+    suspends: int = 0
 
 
 @dataclass
@@ -128,6 +142,10 @@ class FakeCursor:
             self._record(sql, timeout)
             self._apply_session_parameter(sql)
             return self
+        if upper.startswith("ALTER WAREHOUSE"):
+            self._record(sql, timeout)
+            self._alter_warehouse(sql)
+            return self
         if upper.startswith("USE "):
             self._record(sql, timeout)
             self._conn.used.append(sql)
@@ -152,7 +170,7 @@ class FakeCursor:
             seconds += self._conn.resume_seconds
             warehouse.state = "STARTED"
             warehouse.resumes += 1
-            warehouse.resumed_on = f"2026-01-01T00:{warehouse.resumes:02d}:00.000-08:00"
+            warehouse.resumed_on = _iso(self._conn.clock.wall())
         if session_timeout is not None and seconds > session_timeout:
             self._conn.clock.now += float(session_timeout)
             raise sf_errors.ProgrammingError(
@@ -191,6 +209,39 @@ class FakeCursor:
                 ),
             )
         )
+
+    def _alter_warehouse(self, sql: str) -> None:
+        """ALTER WAREHOUSE "<name>" SUSPEND, the only ALTER WAREHOUSE dex
+        issues: refused without OPERATE, refused on a warehouse that is not
+        running, both in the service's own words."""
+
+        match = re.match(r'\s*ALTER WAREHOUSE\s+"?([^"\s]+)"?\s+SUSPEND\s*$', sql, re.I)
+        if match is None:
+            raise sf_errors.ProgrammingError(msg="fake: unsupported ALTER WAREHOUSE")
+        name = match.group(1).upper()
+        warehouse = next(
+            (w for w in self._conn.warehouses if w.name.upper() == name), None
+        )
+        if warehouse is None:
+            raise _object_does_not_exist()
+        if not warehouse.operate_granted:
+            raise sf_errors.ProgrammingError(
+                msg=(
+                    "003001 (42501): SQL access control error: Insufficient "
+                    f"privileges to operate on warehouse '{warehouse.name}'"
+                ),
+                errno=3001,
+            )
+        if warehouse.state != "STARTED":
+            raise sf_errors.ProgrammingError(
+                msg=(
+                    f"090064 (22000): Invalid state. Warehouse '{warehouse.name}' "
+                    "cannot be suspended."
+                ),
+                errno=90064,
+            )
+        warehouse.state = "SUSPENDED"
+        warehouse.suspends += 1
 
     def _apply_session_parameter(self, sql: str) -> None:
         # ALTER SESSION SET <PARAM> = <value>
@@ -244,6 +295,7 @@ class FakeCursor:
                     "state": w.state,
                     "resource_constraint": w.resource_constraint,
                     "auto_suspend": w.auto_suspend,
+                    "auto_resume": "true" if w.auto_resume else "false",
                     "running": w.running,
                     "queued": w.queued,
                     "resumed_on": w.resumed_on,
@@ -338,6 +390,20 @@ class FakeCursor:
         keys = list(rows[0].keys()) if rows else ["name"]
         self.description = [(key, "TEXT", None, None, None, None, True) for key in keys]
         self._rows = [tuple(row[key] for key in keys) for row in rows]
+
+
+def _iso(epoch: float) -> str:
+    """An epoch instant as SHOW WAREHOUSES prints ``resumed_on`` in the
+    account's (Pacific) time zone."""
+
+    from datetime import UTC, datetime, timedelta, timezone
+
+    pacific = timezone(timedelta(hours=-8))
+    return (
+        datetime.fromtimestamp(epoch, UTC)
+        .astimezone(pacific)
+        .isoformat(timespec="milliseconds")
+    )
 
 
 class FakeSnowflakeConnection:

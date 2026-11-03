@@ -2208,7 +2208,7 @@ class _CatalogBlindStubAdapter:
     """Fake adapter whose distinct counts are None where the catalog has
     none, with exact counts supplied per column like a real scan would."""
 
-    def __init__(self, rows, approx, exact, nulls=None):
+    def __init__(self, rows, approx, exact, nulls=None, skipped=()):
         from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
 
         self._meta_cls = ObjectMeta
@@ -2217,6 +2217,7 @@ class _CatalogBlindStubAdapter:
         self.approx = approx
         self.exact = exact
         self.nulls = nulls or {}
+        self.skipped = set(skipped)
         self.calls = []
 
     def table_metadata(self, identifier):
@@ -2255,6 +2256,9 @@ class _CatalogBlindStubAdapter:
                 name=c.name,
                 null_fraction=self.nulls.get(c.name, 0.0),
                 distinct_count=self.approx[c.name],
+                distinct_count_missing=(
+                    self.approx[c.name] is None and c.name not in self.skipped
+                ),
                 is_unique=False,
                 min_value=None,
                 max_value=None,
@@ -2328,6 +2332,28 @@ def test_catalog_blind_column_with_nulls_not_escalated():
     assert adapter.calls == [], "a nullable column can never prove as a key"
     assert datasets[0].columns[0].distinct_count is None
     assert datasets[0].columns[0].is_unique is False
+
+
+def test_column_the_adapter_skipped_is_never_counted_exactly():
+    """A skipped type reports no count too, and one the warehouse cannot group
+    would fail the whole statement (#1050)."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _CatalogBlindStubAdapter(
+        rows=100,
+        approx={"payload": None, "id": None},
+        exact={"id": 100, "payload": 100},
+        skipped={"payload"},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+
+    assert adapter.calls == [["id"]]
+    cols = {c.name: c for c in datasets[0].columns}
+    assert cols["payload"].null_fraction == 0.0
+    assert cols["payload"].distinct_count is None
+    assert rel_mod.candidate_keys(datasets[0]) == [["id"]]
 
 
 def test_id_shaped_catalog_blind_columns_rank_first():
@@ -3114,3 +3140,24 @@ def test_row_count_refreshes_after_the_aggregate_scan():
     assert id_col.distinct_count == 1000
     assert id_col.distinct_count_exact is True
     assert id_col.is_unique is True
+
+
+def test_profile_target_dev_is_a_named_no_op_on_duckdb(duckdb_file: Path, capsys):
+    """#893: DuckDB's dev target is the file the connection already reads, so
+    `--target dev` widens nothing and says so rather than staying silent."""
+
+    payload = _run(
+        ["explore", "profile", "orders", "--target", "dev", "--path", str(duckdb_file)],
+        capsys,
+    )
+    notes = payload["data"]["notes"]
+    assert any("--target dev widened nothing" in note for note in notes), notes
+
+
+def test_profile_refuses_a_prod_target_before_reading(duckdb_file: Path, capsys):
+    rc = main(
+        ["explore", "profile", "orders", "--target", "prod", "--path", str(duckdb_file)]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc != 0 and payload["status"] == "error", payload
+    assert "looks like production" in payload["errors"][0]

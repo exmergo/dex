@@ -1,0 +1,26 @@
+# Dataset-scoped metrics (`datasets[].metrics`): aggregations over one
+# dataset's own fields, named unqualified, addressed as `dataset.metric`.
+version: "0.2.0.dev0"
+name: sales
+datasets:
+  - name: orders
+    source: demo.main.orders
+    primary_key: [order_id]
+    fields:
+      - name: order_id
+        expression:
+          sql: order_id
+      - name: net_amount
+        expression:
+          sql: amount - discount
+    metrics:
+      - name: total_net_amount
+        expression:
+          sql: SUM(net_amount)
+      - name: order_count
+        expression:
+          sql: COUNT(order_id)
+metrics:
+  - name: revenue
+    expression:
+      sql: SUM(orders.net_amount)

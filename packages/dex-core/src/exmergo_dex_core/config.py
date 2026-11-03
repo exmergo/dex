@@ -11,7 +11,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -92,6 +92,12 @@ class SnowflakeTarget(BaseModel):
     (SAMPLE SYSTEM) instead of a full scan. ``credit_price_usd`` is the
     contract-specific dollar price of one credit; set it to see dollar figures
     next to the credit translation (no API exposes it, so dex never guesses).
+    ``suspend_after_command`` (off by default) suspends the pinned warehouse at
+    the end of a command that woke it and left it idle, so the command bills
+    its statements plus Snowflake's 60-second resume minimum rather than the
+    whole AUTO_SUSPEND tail. It needs OPERATE on the warehouse, and it never
+    touches a warehouse that was already running or that other queries are
+    using (issue #664).
     """
 
     account: str | None = None
@@ -102,6 +108,7 @@ class SnowflakeTarget(BaseModel):
     dev_schema: str | None = None
     max_full_profile_bytes: int | None = None
     credit_price_usd: float | None = None
+    suspend_after_command: bool = False
 
 
 class DatabricksTarget(BaseModel):
@@ -579,9 +586,18 @@ class TransformConfig(BaseModel):
     every metric. The default is the folder ``transform init`` scaffolds, so a
     project dex created needs nothing here; a house that keeps marts elsewhere
     names its own. A folder covers everything beneath it.
+
+    ``artifacts``: where the dbt invocations Dex runs on the project write
+    their artifacts (issue #1014). ``isolated``, the default, is a directory of
+    Dex's own per dbt runtime, ``<target-path>/dex/<runtime>``, so a project or
+    CI runtime of another dbt version never trips on what Dex's left behind.
+    ``shared`` writes the project's own target path for a caller whose other
+    tooling reads it there, and refuses one another runtime left incompatible
+    rather than writing over it.
     """
 
     marts_paths: list[str] = Field(default_factory=lambda: ["models/marts"])
+    artifacts: Literal["isolated", "shared"] = "isolated"
 
     @model_validator(mode="after")
     def _check_marts_paths(self) -> TransformConfig:
@@ -616,9 +632,10 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # repository, and a server is a second copy of them that nobody reviews in a
     # pull request. `local` is those files and nothing else.
     "slayer": ("local",),
-    # Cube's YAML model files committed here. Cube Cloud is a deployment of the
-    # same files (#914), and a Cube Core server renders queries over them
-    # (#913); neither is read yet, so `local` is the files and nothing else.
+    # Cube's YAML model files committed here, rendered for a governed query by
+    # the Cube server at `semantic.cube.url` (a Cube Core on this machine by
+    # default) and executed by dex. Cube Cloud is a deployment of the same files
+    # (#914), not read yet.
     "cube": ("local",),
 }
 
@@ -654,7 +671,7 @@ SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
 #: before the layer implements it would exist only to refuse. The route takes
 #: no vendor name of its own; it reads the vendor off the subcommand, and refuses
 #: one that is not the configured `semantic.vendor`.
-SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = ("ossie", "slayer")
+SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = ("ossie", "slayer", "cube")
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",
@@ -857,9 +874,10 @@ class CubeSemanticConfig(BaseModel):
     ``cube.py``/``cube.js`` are deployment configuration, not models, and are
     refused by name.
 
-    ``url`` is the non-secret base of a Cube REST API, for the commands that ask
-    a Cube server to render a query (not read by this release). It may name no
-    credential: a token in a committed URL is a token in git, and the secret a
+    ``url`` is the non-secret base of a Cube REST API, read by ``explore
+    semantic query|values``, which ask a Cube server to render SQL and execute
+    it themselves (``http://localhost:4000/cubejs-api`` when unset). It may name
+    no credential: a token in a committed URL is a token in git, and the secret a
     Cube server needs is read from the environment. ``data_source`` is the Cube
     data source dex treats as the warehouse it is connected to (Cube's own
     default is ``default``); a cube on another one is named in the catalog.

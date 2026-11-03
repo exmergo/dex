@@ -490,3 +490,37 @@ def test_reconcile_advises_and_never_rewrites_a_declaration(maintain_repo):
     assert "maintain snapshot --project-only" in proposal["action"]
     assert "plan_id" not in payload["data"]
     assert (maintain_repo.root / YML_PATH).read_text("utf-8") == changed
+
+
+def test_a_changed_temporal_policy_is_high_severity_drift():
+    from exmergo_dex_core.maintain.drift import _declaration_weight
+
+    assert _declaration_weight("history") == "high"
+    before = DECLARED_YML.replace(
+        "          grain: [order_id]\n",
+        "          grain: [order_id]\n"
+        "          history: {initial_observation: baseline}\n",
+    )
+    after = before.replace("baseline", "transition")
+
+    def fingerprint(text: str):
+        return declaration_fingerprints([(yaml.safe_load(text), YML_PATH)])
+
+    assert fingerprint(before) != fingerprint(after)
+
+
+def test_moving_an_assumption_to_another_column_is_assumptions_drift():
+    """The column an assumption governs (#861) is part of the decision: moving
+    a recorded exclusion from one identifier to another is a change."""
+
+    before = DECLARED_YML.replace(
+        "          grain: [order_id]\n",
+        "          grain: [order_id]\n"
+        "          assumptions:\n"
+        "            - {decision: ids, chosen: integers, evidence: request, "
+        "column: order_id}\n",
+    )
+    after = before.replace("column: order_id}", "column: customer_id}")
+    [finding] = _drift(before, after)
+    assert finding.code == "declaration_changed"
+    assert finding.data["field"] == "assumptions"

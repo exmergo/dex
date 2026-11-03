@@ -63,6 +63,51 @@ def test_plan_from_edits_file(dbt_project_dir: Path, tmp_path: Path, capsys):
     assert not (dbt_project_dir / "models/staging/stg_orders.yml").exists()
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{{ config(materialized='view') }} select 1 as id\n",
+        "{{ config(materialized='view') }}\nselect 1 as id\n",
+    ],
+    ids=["inline", "separate-line"],
+)
+def test_plan_accepts_inline_and_separate_line_config_headers(
+    dbt_project_dir: Path, tmp_path: Path, capsys, content: str
+):
+    """#1003: Inline and separate-line config() headers both plan successfully."""
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/config_probe.sql",
+                "kind": "model_sql",
+                "content": content,
+            },
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "probe config",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["edit_count"] == 1
+    assert envelope["diffs"] and envelope["diffs"][0]["op"] == "create"
+    plan_id = envelope["data"]["plan_id"]
+    plan_file = tmp_path / ".dex" / "plans" / f"{plan_id}.json"
+    assert plan_file.is_file()
+    saved_plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert saved_plan["edits"][0]["new_content"] == content
+
+
 def test_plan_packages_yml_at_project_root(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
@@ -117,6 +162,49 @@ def test_plan_packages_yml_requires_a_packages_key(
     )
     assert rc == 1 and envelope["status"] == "error"
     assert "packages" in envelope["errors"][0]
+
+
+def test_plan_refuses_uninstalled_declared_packages_with_the_dex_verb(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+        encoding="utf-8",
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": (
+                    "version: 2\n"
+                    "models:\n"
+                    "  - name: stg_customers\n"
+                    "    columns:\n"
+                    "      - name: id\n"
+                ),
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "add a column",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    message = envelope["errors"][0]
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    # Planning never installs: the package directory is still absent.
+    assert not (dbt_project_dir / "dbt_packages").exists()
 
 
 def test_plan_reads_stdin(dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch):
@@ -574,6 +662,191 @@ def test_column_contract_reports_a_select_star_as_unresolvable(
     assert any("could not be resolved statically" in w for w in warnings), warnings
 
 
+# --- column contract through a star (#643) -------------------------------------
+
+_DECLARES_ID_AND_NAME = (
+    "version: 2\nmodels:\n  - name: mart\n    columns:\n"
+    "      - name: id\n      - name: name\n"
+)
+
+
+def _contract_plan(project: Path, *edits, store=None) -> list[str]:
+    _plan, _diffs, warnings = transform.plan(
+        "contract",
+        list(edits),
+        project,
+        repo_root=project.parent,
+        store=store or FilesystemStore(project.parent),
+    )
+    return warnings
+
+
+def _schema(content: str = _DECLARES_ID_AND_NAME):
+    return _cfg_edit("models/marts/schema.yml", content, transform.EditKind.SCHEMA_YML)
+
+
+def _sql(path: str, content: str):
+    return _cfg_edit(path, content, transform.EditKind.MODEL_SQL)
+
+
+def _store_with_profile(project: Path, identifier: str, columns: list[str]):
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+
+    store = FilesystemStore(project.parent)
+    store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier=identifier,
+                    columns=[
+                        ColumnProfile(name=name, data_type="VARCHAR")
+                        for name in columns
+                    ],
+                )
+            ]
+        )
+    )
+    return store
+
+
+def test_the_final_cte_shape_is_compared_in_both_directions(dbt_project_dir: Path):
+    warnings = _contract_plan(
+        dbt_project_dir,
+        _schema(),
+        _sql(
+            "models/marts/mart.sql",
+            "with src as (select * from {{ ref('stg_customers') }}),\n"
+            "final as (select id, surname from src)\nselect * from final\n",
+        ),
+    )
+    assert not any("could not be resolved" in w for w in warnings), warnings
+    assert any("name for mart that the SELECT list" in w for w in warnings), warnings
+    assert any("surname not declared" in w for w in warnings), warnings
+
+
+def test_a_star_over_a_ref_reads_the_project_model_as_this_plan_leaves_it(
+    dbt_project_dir: Path,
+):
+    store = _store_with_profile(dbt_project_dir, "main.up", ["id", "stale"])
+    warnings = _contract_plan(
+        dbt_project_dir,
+        _schema(),
+        _sql("models/marts/up.sql", "select 1 as id, 'x' as name\n"),
+        _sql("models/marts/mart.sql", "select * from {{ ref('up') }}\n"),
+        store=store,
+    )
+    assert not any("mart" in w and "stale" in w for w in warnings), warnings
+    assert not any("could not be resolved" in w for w in warnings), warnings
+    assert not any("cached profile" in w for w in warnings), warnings
+
+
+def test_a_star_over_a_source_reads_the_profile_through_its_declared_schema(
+    dbt_project_dir: Path,
+):
+    store = _store_with_profile(dbt_project_dir, "raw_zone.people", ["id", "email"])
+    sources = _cfg_edit(
+        "models/marts/sources.yml",
+        "version: 2\nsources:\n  - name: crm\n    schema: raw_zone\n"
+        "    tables:\n      - name: customers\n        identifier: people\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    warnings = _contract_plan(
+        dbt_project_dir,
+        _schema(),
+        sources,
+        _sql(
+            "models/marts/mart.sql", "select * from {{ source('crm', 'customers') }}\n"
+        ),
+        store=store,
+    )
+    named = [w for w in warnings if "name for mart" in w or "email not declared" in w]
+    assert len(named) == 2, warnings
+    assert all("cached profile of raw_zone.people" in w for w in named)
+
+
+def test_a_star_with_no_profile_says_so_and_names_the_fix(dbt_project_dir: Path):
+    warnings = _contract_plan(
+        dbt_project_dir,
+        _schema(),
+        _sql(
+            "models/marts/mart.sql", "select * from {{ source('crm', 'customers') }}\n"
+        ),
+    )
+    skipped = [w for w in warnings if "could not be resolved statically" in w]
+    assert len(skipped) == 1, warnings
+    assert "source('crm', 'customers')" in skipped[0]
+    assert "dex explore profile customers" in skipped[0]
+
+
+def test_an_upstream_this_plan_changes_never_falls_back_to_its_profile(
+    dbt_project_dir: Path,
+):
+    store = _store_with_profile(dbt_project_dir, "main.up", ["id", "name"])
+    warnings = _contract_plan(
+        dbt_project_dir,
+        _schema(),
+        _sql("models/marts/up.sql", "select * from {{ source('crm', 'unknown') }}\n"),
+        _sql("models/marts/mart.sql", "select * from {{ ref('up') }}\n"),
+        store=store,
+    )
+    skipped = [w for w in warnings if "for mart" in w and "could not be resolved" in w]
+    assert len(skipped) == 1, warnings
+    assert "this plan changes" in skipped[0]
+
+
+def test_a_ref_cycle_is_named(dbt_project_dir: Path):
+    warnings = _contract_plan(
+        dbt_project_dir,
+        _schema(),
+        _sql("models/marts/mart.sql", "select * from {{ ref('mart') }}\n"),
+    )
+    assert any("cycle" in w for w in warnings), warnings
+
+
+def test_a_declaration_against_the_final_cte_is_refused_for_an_absent_column(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/marts/mart.sql",
+                        "kind": "model_sql",
+                        "content": (
+                            "with final as (select 1 as id) select * from final\n"
+                        ),
+                    }
+                ],
+                "declarations": [
+                    {
+                        "model": "mart",
+                        "description": "One row per thing.",
+                        "grain": ["id"],
+                        "columns": {"absent": {"role": "attribute"}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc != 0
+    assert "absent" in json.dumps(envelope["errors"])
+
+
 def test_column_contract_reports_an_unaliased_macro_column_as_unresolvable(
     dbt_project_dir: Path,
 ):
@@ -625,6 +898,107 @@ def test_column_contract_resolves_an_aliased_macro_column(dbt_project_dir: Path)
         "could not be resolved statically" in w or "declares column" in w
         for w in warnings
     ), warnings
+
+
+def test_column_contract_resolves_a_union_model(dbt_project_dir: Path):
+    """#1035: A model ending in a UNION resolves columns from its first branch."""
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n      - name: name\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id, 'alice' as name from t1\nunion all\nselect 2, 'bob' from t2\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "union customers",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert not any(
+        "could not be resolved statically" in w or "declares column" in w
+        for w in warnings
+    ), warnings
+
+
+def test_column_contract_warns_on_union_model_divergence(dbt_project_dir: Path):
+    """#1035: A union model whose first branch omits a declared column warns."""
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n      - name: missing_col\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id from t1 union all select 2 as id from t2\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "union missing col",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert any(
+        "declares column(s) missing_col" in w and "does not produce" in w
+        for w in warnings
+    ), warnings
+
+
+def test_a_declaration_against_a_union_model_is_refused_for_an_absent_column(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#1035: Declarations against a union model refuse an undeclared column."""
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/marts/mart.sql",
+                        "kind": "model_sql",
+                        "content": (
+                            "select 1 as id from t1\n"
+                            "union all\n"
+                            "select 2 as id from t2\n"
+                        ),
+                    }
+                ],
+                "declarations": [
+                    {
+                        "model": "mart",
+                        "description": "One row per thing.",
+                        "grain": ["id"],
+                        "columns": {"absent": {"role": "attribute"}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc != 0
+    assert "absent" in json.dumps(envelope["errors"])
 
 
 def test_plan_cli_refuses_an_inlined_profiles_secret(

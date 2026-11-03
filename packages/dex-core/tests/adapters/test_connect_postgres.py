@@ -5,13 +5,14 @@ and the simulated server (statement_timeout)."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("psycopg")
 
-from fakes.postgres import FakePostgresTable, FakeResult
+from fakes.postgres import FakePostgresConnection, FakePostgresTable, FakeResult
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
 from exmergo_dex_core.adapters.postgres import (
@@ -26,6 +27,7 @@ from exmergo_dex_core.connect import (
     resolve_postgres_connection,
 )
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -565,9 +567,9 @@ def test_missing_stats_partial_measurement_keeps_analyze_note(fake_pg_connection
 
 
 def test_exact_distinct_counts_skips_degraded(fake_pg_connection):
-    # The engine also sends catalog-blind columns, and a degraded column
-    # (jsonb here) among them must not fail the whole statement: Postgres
-    # cannot COUNT(DISTINCT) every degraded type.
+    # `maintain verify` and `maintain drift` send key columns directly, and a
+    # degraded column (jsonb here) among them must not fail the whole statement:
+    # Postgres cannot COUNT(DISTINCT) every degraded type.
     fake_pg_connection.row_resolver = _events_rows
     adapter = make_adapter(fake_pg_connection, ceiling=5000.0)
     assert adapter.exact_distinct_counts("dexdb.shop.events", ["id", "payload"]) == {
@@ -578,6 +580,76 @@ def test_exact_distinct_counts_skips_degraded(fake_pg_connection):
     ]
     assert exact_statements
     assert all("payload" not in sql for sql in exact_statements)
+
+
+def _unanalyzed_table(columns: list[tuple[str, str, bool]]) -> FakePostgresConnection:
+    connection = FakePostgresConnection(
+        tables=[
+            FakePostgresTable(
+                schema="shop",
+                name="wide",
+                columns=columns,
+                reltuples=-1.0,
+                total_bytes=1000,
+            )
+        ],
+        database="dexdb",
+    )
+
+    def rows(sql: str) -> FakeResult:
+        if "COUNT(DISTINCT" in sql:
+            return FakeResult(rows=[{"n_total": 40, "d_0": 40}], seconds=0.5)
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(
+            rows=[{a: None if a[:3] in ("mn_", "mx_") else 40 for a in aliases}],
+            seconds=0.5,
+        )
+
+    connection.row_resolver = rows
+    return connection
+
+
+def test_profile_measures_a_catalog_blind_column():
+    connection = _unanalyzed_table([("id", "bigint", False)])
+    adapter = make_adapter(connection, ceiling=5000.0)
+    column = profile(adapter, ["dexdb.shop.wide"])[0].columns[0]
+    assert column.distinct_count == 40
+    assert column.distinct_count_exact is True
+
+
+def test_profile_does_not_measure_an_empty_block_sample(fake_pg_connection):
+    """No rows means no count for any column, whatever the catalog holds, and
+    that is no reason to scan the whole table (#1050)."""
+
+    def empty_sample(sql: str) -> FakeResult:
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(rows=[dict.fromkeys(aliases, 0)], seconds=0.5)
+
+    fake_pg_connection.row_resolver = empty_sample
+    adapter = make_adapter(
+        fake_pg_connection,
+        ceiling=5000.0,
+        target=PostgresTarget(max_full_profile_bytes=1),
+    )
+    dataset = profile(adapter, ["dexdb.shop.customers"])[0]
+    assert dataset.columns[0].distinct_count is None
+    assert not [
+        s.sql for s in fake_pg_connection.data_statements if "COUNT(DISTINCT" in s.sql
+    ]
+
+
+def test_degraded_columns_take_no_slot_from_a_catalog_blind_one():
+    """Degraded columns report no count either; sent to the exact pass they would
+    fill its slots and be dropped there, leaving this column unmeasured (#1050)."""
+
+    connection = _unanalyzed_table(
+        [(f"j{i}", "jsonb", False) for i in range(8)] + [("code", "text", False)]
+    )
+    adapter = make_adapter(connection, ceiling=5000.0)
+    columns = {c.name: c for c in profile(adapter, ["dexdb.shop.wide"])[0].columns}
+    assert columns["code"].distinct_count == 40
+    assert columns["code"].distinct_count_exact is True
+    assert columns["j0"].distinct_count is None
 
 
 def test_exact_count_from_scan_supersedes_reltuples(fake_pg_connection):
@@ -1098,3 +1170,31 @@ def test_a_host_cap_inside_the_estimate_lets_the_statement_run_capped(
     # from the higher per-command ceiling.
     assert statement.session_timeout_ms is not None
     assert statement.session_timeout_ms <= 120_000
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_pg_connection):
+    """Cube's rendered SQL reads a zone-less timestamp through the session time
+    zone its own driver sets to UTC, so the governed Cube path asks for one."""
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(rows=[{"n": 1}])
+    adapter = make_adapter(fake_pg_connection)
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert "timezone" not in fake_pg_connection.session_parameters
+
+    adapter.pin_utc_session()
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert fake_pg_connection.session_parameters["timezone"] == "UTC"
+
+
+def test_postgres_in_scope_respects_schemas_and_database(fake_pg_connection):
+    """#984: a postgres namespace is in scope if its database matches and
+    its schema lies in the configured scope (or all schemas if unrestricted)."""
+
+    adapter = make_adapter(fake_pg_connection)
+    assert adapter.in_scope("dexdb.shop") is True
+    assert adapter.in_scope("dexdb.legacy") is True
+    assert adapter.in_scope("other_db.shop") is False
+
+    scoped = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
+    assert scoped.in_scope("dexdb.shop") is True
+    assert scoped.in_scope("dexdb.legacy") is False

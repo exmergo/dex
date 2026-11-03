@@ -215,6 +215,28 @@ def test_a_model_without_a_declaration_keeps_the_existing_order():
     assert plan["other"][0].source == "declaration"
 
 
+def test_a_declared_grain_that_holds_is_recorded_as_proven(tmp_path: Path):
+    """#841: the count that would have reported a broken grain also proves an
+    intact one, which is what lets a fan-out on that model rank as intended."""
+
+    result = _run(
+        tmp_path,
+        {
+            "model.shop.held": _model("held", dex={"grain": ["a", "b"]}),
+            "model.shop.broke": _model("broke", dex={"grain": ["a"]}),
+        },
+        "CREATE TABLE held AS SELECT i AS a, i % 2 AS b FROM range(0, 10) t(i)",
+        "CREATE TABLE broke AS SELECT i % 3 AS a FROM range(0, 10) t(i)",
+        check_grain=True,
+    )
+    assert result.proven_grains == {
+        "held": {"columns": ["a", "b"], "source": "declaration"}
+    }
+    assert [f.identifier for f in result.findings if f.code == "grain_broken"] == [
+        "broke"
+    ]
+
+
 def test_a_composite_grain_is_checked_with_no_dbt_utils_test(
     maintain_repo, monkeypatch
 ):
@@ -554,6 +576,31 @@ def test_a_composite_grain_supplies_the_entity_and_the_time(tmp_path: Path):
         _RUNNING,
     )
     assert result.findings[0].data["entity"] == "customer_id"
+
+
+def test_sparse_daily_counts_with_ties_not_contradicted_as_running_total(
+    tmp_path: Path,
+):
+    """Sparse daily counts declared additive are not flagged as contradicted
+    merely because consecutive identical values (ties) do not decrease (#945)."""
+    table_sql = (
+        "CREATE TABLE search_daily AS SELECT i % 5 AS property_id, "
+        "TIMESTAMP '2026-01-01' + to_days(i) AS data_date, "
+        "CASE WHEN i % 7 = 0 THEN 1 ELSE 0 END AS clicks "
+        "FROM range(300) t(i)"
+    )
+    result = _run(
+        tmp_path,
+        {
+            "model.p.search_daily": _model(
+                "search_daily",
+                dex={"grain": ["property_id", "data_date"]},
+                columns=_additive("clicks"),
+            )
+        },
+        table_sql,
+    )
+    assert not any(f.code == "additivity_contradicted" for f in result.findings)
 
 
 def test_too_few_observations_is_unchecked_not_clean(tmp_path: Path):

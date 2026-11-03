@@ -276,13 +276,14 @@ def test_declared_composite_grain_unmeasured_and_missing_columns():
     assert _declare(_dataset(), ["a"]).declaration.grain_status == "unprofiled"
 
 
-def test_population_values_on_a_pii_column_are_withheld_in_full_mode():
+@pytest.mark.parametrize("confidence", [0.2, 0.9])
+def test_population_values_on_a_pii_column_are_withheld_in_full_mode(confidence):
     ds = _dataset(id=True)
     ds.columns.append(
         ColumnProfile(
             name="email",
             data_type="VARCHAR",
-            pii=PIIFlag(category="email", confidence=0.9),
+            pii=PIIFlag(category="email", confidence=confidence),
         )
     )
     defs = ProjectDefinitions(
@@ -294,7 +295,7 @@ def test_population_values_on_a_pii_column_are_withheld_in_full_mode():
                     "population": {
                         "rule": "staff excluded",
                         "filters": [
-                            {"column": "email", "excludes": ["a@b.c"]},
+                            {"column": "EMAIL", "excludes": ["a@b.c"]},
                             {"column": "id", "includes": [1]},
                         ],
                     },
@@ -308,8 +309,11 @@ def test_population_values_on_a_pii_column_are_withheld_in_full_mode():
     email, ident = out.declaration.population.filters
     assert email.excludes is None and email.includes is None
     assert ident.includes == [1]
-    assert out.declaration.population.rule == "staff excluded"
-    assert out.declaration.withheld_fields == ["population.filters[].values"]
+    assert out.declaration.population.rule is None
+    assert out.declaration.withheld_fields == [
+        "population.rule",
+        "population.filters[].values",
+    ]
 
 
 # --- end to end -------------------------------------------------------------------
@@ -545,3 +549,34 @@ def test_values_free_withholds_every_population_value(
     assert declaration["grain"] == ["order_id", "line_no"]
     cache_text = (repo / ".dex" / "cache.json").read_text(encoding="utf-8")
     assert "cancelled_zq7" not in cache_text
+
+
+@pytest.mark.parametrize("values_free", [False, True])
+def test_a_declared_parent_is_carried_as_names_in_every_mode(
+    values_free: bool, warehouse: Path, tmp_path: Path, capsys
+):
+    """A `population.parent` (#857) names a model and columns, never a value,
+    so it is carried whole in values-free mode too, and every path it adds was
+    reviewed for the mode."""
+
+    schema = _DECLARED_ORDERS.replace(
+        "            filters:\n",
+        "            parent:\n"
+        "              model: customers\n"
+        "              key: {customer_id: customer_id}\n"
+        "            filters:\n",
+    )
+    repo = _repo(tmp_path, schema)
+    extra = ["--values-free"] if values_free else []
+    payload = _run(
+        _args("profile", warehouse, repo, "fct_orders", "--use-project", *extra),
+        capsys,
+    )
+    declaration = _orders(payload)["declaration"]
+    assert declaration["population"]["parent"] == {
+        "model": "customers",
+        "columns": ["customer_id"],
+        "parent_columns": ["customer_id"],
+    }
+    if values_free:
+        assert _unknown_paths("profile", payload["data"]) == []

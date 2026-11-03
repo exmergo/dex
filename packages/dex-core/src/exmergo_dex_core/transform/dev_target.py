@@ -41,7 +41,6 @@ import yaml
 from ..config import CONFIG_FILE, DexConfig
 from ..connect import _profile_scalar
 from ..dbt_project import (
-    MANIFEST_PATH,
     PROFILES_FILE,
     duckdb_target_path,
     target_auth_method,
@@ -49,6 +48,9 @@ from ..dbt_project import (
     target_role,
 )
 from ..dbt_project import load as load_project
+from ..dbt_project import (
+    manifest_file as compiled_manifest_file,
+)
 from ..errors import DexError
 from ..storage import DEX_DIR, ExploreStore
 
@@ -422,6 +424,59 @@ def preflight_opener(
     return open_probe
 
 
+def seed_relation_columns(
+    project: Path,
+    target: str,
+    repo_root: Path | str,
+    config: DexConfig,
+    connection: ConnectionSource | None = None,
+) -> Callable[[list[str]], dict[str, list[str]]] | None:
+    """A reader of relations' columns in the DuckDB file the dev target writes,
+    or ``None`` when that file does not exist yet.
+
+    It backs the build's seed check, which compares each seed's CSV header with
+    the table dbt would reload it into. A missing file holds no seed table, so
+    there is nothing to compare and no reason to ask dbt anything. The file is
+    the one the profile names, which a project may keep beside ``profiles.yml``
+    rather than in the run directory. Each read opens it read-only and closes it
+    before returning, because DuckDB lets one process write a file and dbt is
+    about to be that process. A failure raises, and the build reports it as a
+    warning rather than letting the check go quiet. DuckDB only: on a billed
+    connector the refresh the check leads to would spend outside what the build
+    settles.
+    """
+
+    from ..cache import match_identifier
+    from ..connect import open_adapter
+    from ..dbt_project import strip_relation_quoting
+
+    database = duckdb_target_path(project, target)
+    if database is None or not database.is_file():
+        return None
+
+    def read(relations: list[str]) -> dict[str, list[str]]:
+        columns: dict[str, list[str]] = {}
+        adapter = open_adapter(
+            connector="duckdb",
+            path=str(database),
+            repo_root=repo_root,
+            config=config,
+            connection=connection,
+        )
+        try:
+            live = [meta.identifier for meta in adapter.list_objects()]
+            for relation in relations:
+                matched = match_identifier(strip_relation_quoting(relation), live)
+                if len(matched) == 1:
+                    _meta, found = adapter.table_metadata(matched[0])
+                    columns[relation] = [column.name for column in found]
+        finally:
+            adapter.close()
+        return columns
+
+    return read
+
+
 def _duckdb_namespace(project: Path, target: str) -> list[str]:
     """A duckdb target whose file does not exist yet is legitimate when the
     project builds everything from models, but a project reading from ``sources:``
@@ -710,6 +765,31 @@ def _trino_namespace(
     return list(warnings)
 
 
+def _identity_refusal(
+    connector: str,
+    noun: str,
+    committed: str | None,
+    role: str,
+    problem: str,
+    dev_schema: str,
+) -> str | None:
+    """The refusal that leads with the committed build identity, or None when
+    the config records no identity other than the profile's: granting CREATE
+    to the role dex reads with would widen dex's own access (#904)."""
+
+    if not committed or committed == role:
+        return None
+    return (
+        f"{connector} {noun} {role} is missing {problem}; but {connector}.user in "
+        f".dex/config.yml commits {committed} as the build identity, and this "
+        f"profile does not name it. Point the profile's user at {committed} "
+        f"(re-run `transform init`, or edit profiles.yml), or grant the {noun} "
+        "it does name with:\n"
+        f"  GRANT USAGE, CREATE ON SCHEMA {dev_schema} TO {role};\n"
+        "(dbt builds every model in that schema)"
+    )
+
+
 def _postgres_namespace(
     project: Path,
     target: str,
@@ -767,6 +847,11 @@ def _postgres_namespace(
             "build otherwise dies on a bare permission error), or point "
             "postgres.dev_schema at a schema the role can write"
         )
+    refusal = _identity_refusal(
+        "postgres", "role", pg.user, role, problem, pg.dev_schema
+    )
+    if refusal is not None:
+        raise DevTargetError(refusal)
     raise DevTargetError(
         f"postgres role {role} is missing {problem}; grant it with:\n"
         f"  GRANT USAGE, CREATE ON SCHEMA {pg.dev_schema} TO {role};\n"
@@ -832,6 +917,11 @@ def _redshift_namespace(
             "build otherwise dies on a bare permission error), or point "
             "redshift.dev_schema at a schema the user can write"
         )
+    refusal = _identity_refusal(
+        "redshift", "user", rs.user, role, problem, rs.dev_schema
+    )
+    if refusal is not None:
+        raise DevTargetError(refusal)
     raise DevTargetError(
         f"redshift user {role} is missing {problem}; grant it with:\n"
         f"  GRANT USAGE, CREATE ON SCHEMA {rs.dev_schema} TO {role};\n"
@@ -995,7 +1085,7 @@ def _manifest_namespaces(project: Path, field: str) -> set[str] | None:
     check, the same as before this existed (issue #110).
     """
 
-    manifest_file = project / MANIFEST_PATH
+    manifest_file = compiled_manifest_file(project)
     if not manifest_file.is_file():
         return None
     try:

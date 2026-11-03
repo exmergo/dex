@@ -2,33 +2,106 @@
 
 ``compare_refactors`` checks the output schema, then the row multiset, then an
 optional declared key. Counts are the only values that come back. The statements
-run through the query firewall, the adapter, and the cost handshake. DuckDB is
-the only adapter that describes a query's output today. Other connectors stay
-unchecked until they grow ``describe_query``.
+run through the query firewall, the adapter, and the cost handshake.
 
-Compiling a dbt graph into the two statements stays with the caller.
+Both sides are stacked with ``UNION ALL`` and grouped, rather than grouped and
+joined. ``GROUP BY`` already puts NULL with NULL on every warehouse, so there is
+no NULL-safe join spelling to keep per dialect and no ``FULL OUTER JOIN`` to rely
+on, and each side is read once. It is still exact: the statement holds no hash,
+sample or approximate count. What a warehouse's grouping treats as one value
+(NaN, -0.0, trailing blanks, a collation) is the warehouse's own equality, and
+the connector notes in ``skills/transform/references/`` state it per connector.
+
+An adapter without ``describe_query`` is reported, by name, as a connector the
+comparison does not support. Compiling a dbt graph into the two statements stays
+with :mod:`.refactor_compare`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
 import sqlglot.expressions as exp
 
+from .. import command_args
 from ..adapters.base import Adapter, ColumnMeta, QueryResult
 from ..cache import DexCache
 from ..config import QueryLimits
 from ..errors import DexError
+from ..guards.cost_guard import CostGuardError
 from ..guards.query_firewall import QueryRefusedError, assert_query_shape, inspect_query
 from ..results import ConfirmationRequest
 
-#: A type name ``DESCRIBE`` does not produce. DuckDB 2 groups BLOB, BIT, lists,
-#: structs, maps, UUID, INTERVAL, and JSON, so the check has nothing real to
-#: refuse until a connector reports a type it cannot group.
-_UNGROUPABLE_TYPES = frozenset({"UNGROUPABLE"})
+#: Per dialect, the base type names a comparison cannot group, or cannot group
+#: with a meaning anyone could call equality. A column of one is reported as
+#: ``unsupported_type`` before anything runs. DuckDB 2 groups BLOB, BIT, lists,
+#: structs, maps, UUID, INTERVAL, and JSON, so it has no entry to refuse.
+_UNGROUPABLE_TYPES: Mapping[str, frozenset[str]] = {
+    "bigquery": frozenset({"ARRAY", "STRUCT", "RECORD", "JSON", "GEOGRAPHY"}),
+    "snowflake": frozenset({"VARIANT", "OBJECT", "ARRAY", "MAP"}),
+    "redshift": frozenset({"SUPER", "GEOMETRY", "GEOGRAPHY", "HLLSKETCH"}),
+    "databricks": frozenset({"MAP", "VARIANT"}),
+    "postgres": frozenset(
+        {"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"}
+    ),
+    "trino": frozenset({"MAP", "JSON", "HYPERLOGLOG", "QDIGEST", "TDIGEST"}),
+    "clickhouse": frozenset({"MAP", "JSON", "OBJECT", "AGGREGATEFUNCTION"}),
+}
+
+#: Type families a caller may accept a change within, because a warehouse widens
+#: inside one without changing a value. Float is apart from exact numerics, since
+#: a union of the two compares as floats and large integers would collapse. A
+#: blank-padded CHAR is in none, since casting it drops trailing blanks.
+_TYPE_FAMILIES: Mapping[str, frozenset[str]] = {
+    "text": frozenset({"VARCHAR", "TEXT", "STRING", "CHARACTER VARYING"}),
+    "exact_numeric": frozenset(
+        {
+            "TINYINT",
+            "SMALLINT",
+            "INT",
+            "INTEGER",
+            "BIGINT",
+            "HUGEINT",
+            "INT2",
+            "INT4",
+            "INT8",
+            "INT16",
+            "INT32",
+            "INT64",
+            "INT128",
+            "INT256",
+            "UINT8",
+            "UINT16",
+            "UINT32",
+            "UINT64",
+            "UINT128",
+            "UINT256",
+            "NUMBER",
+            "NUMERIC",
+            "DECIMAL",
+            "BIGNUMERIC",
+        }
+    ),
+    "float": frozenset(
+        {"REAL", "FLOAT", "FLOAT4", "FLOAT8", "FLOAT32", "FLOAT64", "DOUBLE"}
+    ),
+}
+
+#: The largest count a float carries exactly.
+_MAX_EXACT_FLOAT = 2**53
+
+#: Wrappers a type name carries that say nothing about whether it groups.
+_TYPE_WRAPPERS = frozenset({"NULLABLE", "LOWCARDINALITY"})
+
+#: The working columns the statement adds. An output column of the same name
+#: would collide with them on a warehouse that folds unquoted identifiers.
+_RESERVED_COLUMNS = frozenset(
+    {"dex_side_l", "dex_side_r", "dex_ln", "dex_rn", "dex_kl", "dex_kr", "dex_diff"}
+)
 
 ReasonCode = Literal[
     "equivalent_on_compared_inputs",
@@ -47,6 +120,14 @@ ReasonCode = Literal[
     "invalid_key",
     "awaiting_confirmation",
     "comparison_unreadable",
+    "comparison_unsupported_on_connector",
+    "baseline_not_compilable",
+    "proposed_not_compilable",
+    "nondeterministic_expression",
+    "inputs_unsynchronized",
+    "plan_applied",
+    "plan_stale",
+    "invalid_type_acceptance",
 ]
 
 _VERDICT_CODES = frozenset(
@@ -71,6 +152,14 @@ _NOT_CHECKED_CODES = frozenset(
         "invalid_key",
         "awaiting_confirmation",
         "comparison_unreadable",
+        "comparison_unsupported_on_connector",
+        "baseline_not_compilable",
+        "proposed_not_compilable",
+        "nondeterministic_expression",
+        "inputs_unsynchronized",
+        "plan_applied",
+        "plan_stale",
+        "invalid_type_acceptance",
     }
 )
 
@@ -127,6 +216,9 @@ class SchemaDiff:
     only_in_left: tuple[SchemaColumn, ...]
     only_in_right: tuple[SchemaColumn, ...]
     type_mismatches: tuple[TypeMismatch, ...]
+    #: Type changes the caller stated with ``accepted_type_changes``. Reported,
+    #: because accepted is not the same as absent, and their rows are compared.
+    accepted_type_changes: tuple[TypeMismatch, ...] = ()
 
     @property
     def compatible(self) -> bool:
@@ -248,6 +340,7 @@ class _MatchedColumn:
     left_name: str
     right_name: str
     type_name: str
+    right_type_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -330,6 +423,13 @@ def compare_schemas(
     left, right = _require_sql(left_sql, right_sql)
     mapping = _column_mapping(column_mapping)
     try:
+        _assert_shapes(left, right, adapter)
+        if not _describe_is_free(adapter):
+            raise _NotCheckedError(
+                "schema_unavailable",
+                "describing a query costs compute on this connector, so it runs "
+                "only behind compare_refactors' cost handshake",
+            )
         left_cols, right_cols = _describe_pair(left, right, adapter)
         return _align(left_cols, right_cols, mapping).schema
     except _NotCheckedError as exc:
@@ -349,6 +449,8 @@ def compare_refactors(
     input_scope: str | None = None,
     column_mapping: Mapping[str, str] | None = None,
     key_columns: Sequence[str] | None = None,
+    prepriced: bool = False,
+    accepted_type_changes: Sequence[str] | None = None,
 ) -> RefactorCompareResult:
     """Compare two compiled SELECTs on schema, multiset, and an optional key.
 
@@ -362,6 +464,16 @@ def compare_refactors(
     a statement the adapter cannot describe, a duplicate output name, a mapping
     key that is not a baseline output, or a declared key that is not an output
     column is ``not_checked``. An empty statement raises ``ValueError``.
+
+    ``accepted_type_changes`` names baseline columns whose type may differ, within
+    one family (text, exact numeric, float). Their rows are still compared
+    exactly, under the warehouse's common type for the two. A change across
+    families is ``not_checked`` with ``invalid_type_acceptance``, since a common
+    type there could make unequal values equal.
+
+    ``prepriced`` says the caller already took this comparison through one
+    handshake, as a command that had to profile the inputs first does. The
+    statements still charge the gate as they run.
     """
 
     left, right = _require_sql(left_sql, right_sql)
@@ -406,6 +518,8 @@ def compare_refactors(
             limits,
             command,
             finish,
+            prepriced=prepriced,
+            accepted=tuple(accepted_type_changes or ()),
         )
     except _NotCheckedError as exc:
         return finish(
@@ -427,14 +541,42 @@ def _compare(
     limits: QueryLimits,
     command: str,
     finish,
+    *,
+    prepriced: bool = False,
+    accepted: tuple[str, ...] = (),
 ):
+    _assert_shapes(left, right, adapter)
+    if not callable(getattr(adapter, "describe_query", None)):
+        raise _NotCheckedError(
+            "comparison_unsupported_on_connector",
+            f"the {adapter.name} connector does not describe query output",
+        )
+    # Reading the schema can wake paid compute on some connectors. There the
+    # statements are priced as written, which is what the comparison reads, and
+    # nothing reaches the warehouse until that is confirmed.
+    if not prepriced and not _describe_is_free(adapter):
+        raw_estimate = _raw_estimate(left, right, adapter, keyed=keys is not None)
+        pending = command_args.confirmation_request(
+            command,
+            adapter,
+            raw_estimate,
+            per_table={"(refactor comparison)": raw_estimate},
+            notes=[
+                "reading the output schema runs on the warehouse here, so this "
+                "estimate covers the schema read and the comparison together"
+            ],
+        )
+        if pending is not None:
+            raise _NotCheckedError("awaiting_confirmation", pending=pending)
+        prepriced = True
+
     left_cols, right_cols = _describe_pair(left, right, adapter)
-    aligned = _align(left_cols, right_cols, mapping)
+    aligned = _align(left_cols, right_cols, mapping, accepted)
     schema = aligned.schema
     if not schema.compatible:
         return finish(status="different", reason_code="schemas_differ", schema=schema)
 
-    unsupported = _unsupported_column(aligned.matched)
+    unsupported = _unsupported_column(aligned.matched, adapter.dialect)
     if unsupported is not None:
         raise _NotCheckedError(
             "unsupported_type",
@@ -449,9 +591,23 @@ def _compare(
         )
 
     if keys is not None:
-        problem = _key_problem(keys, [column.left_name for column in aligned.matched])
+        described = [column.left_name for column in aligned.matched]
+        keys = tuple(_as_described(key, described) for key in keys)
+        problem = _key_problem(keys, described)
         if problem is not None:
             raise _NotCheckedError("invalid_key", problem, schema=schema)
+
+    reserved = [
+        column.left_name
+        for column in aligned.matched
+        if column.left_name.lower() in _RESERVED_COLUMNS
+    ]
+    if reserved:
+        raise _NotCheckedError(
+            "comparison_unreadable",
+            f"output column name is reserved by the comparison: {reserved[0]!r}",
+            schema=schema,
+        )
 
     left_names = [column.left_name for column in aligned.matched]
     right_names = [column.right_name for column in aligned.matched]
@@ -470,33 +626,31 @@ def _compare(
             raise _NotCheckedError("firewall_refused", str(exc), schema=schema) from exc
         approved.append(inspected.sql)
 
-    from .. import command_args
-
-    estimator = getattr(adapter, "query_estimate", None)
-    estimates = [
-        float(estimator(sql)) if callable(estimator) else 0.0 for sql in approved
-    ]
-    per_table = {"(refactor comparison)": estimates[0]}
-    if len(estimates) == 2:
-        per_table["(refactor key comparison)"] = estimates[1]
-    pending = command_args.confirmation_request(
-        command,
-        adapter,
-        sum(estimates),
-        per_table=per_table,
-        notes=["one confirmation covers the refactor comparison"],
-    )
-    if pending is not None:
-        raise _NotCheckedError(
-            "awaiting_confirmation",
-            schema=schema,
-            pending=pending,
+    if not prepriced:
+        estimates = _estimates(approved, adapter, schema)
+        per_table = {"(refactor comparison)": estimates[0]}
+        if len(estimates) == 2:
+            per_table["(refactor key comparison)"] = estimates[1]
+        pending = command_args.confirmation_request(
+            command,
+            adapter,
+            sum(estimates),
+            per_table=per_table,
+            notes=["one confirmation covers the refactor comparison"],
         )
+        if pending is not None:
+            raise _NotCheckedError(
+                "awaiting_confirmation",
+                schema=schema,
+                pending=pending,
+            )
 
     try:
         multiset_row = adapter.run_query(
             approved[0], max_rows=1, timeout_seconds=limits.timeout_seconds
         )
+    except CostGuardError:
+        raise
     except Exception as exc:
         raise _NotCheckedError(
             "comparison_unreadable", type(exc).__name__, schema=schema
@@ -510,6 +664,8 @@ def _compare(
             keyed_row = adapter.run_query(
                 approved[1], max_rows=1, timeout_seconds=limits.timeout_seconds
             )
+        except CostGuardError:
+            raise
         except Exception as exc:
             raise _NotCheckedError(
                 "comparison_unreadable", type(exc).__name__, schema=schema
@@ -580,9 +736,7 @@ def _key_columns(key_columns: Sequence[str] | None) -> tuple[str, ...] | None:
     return keys
 
 
-def _describe_pair(
-    left: str, right: str, adapter: Adapter
-) -> tuple[tuple[ColumnMeta, ...], tuple[ColumnMeta, ...]]:
+def _assert_shapes(left: str, right: str, adapter: Adapter) -> None:
     try:
         assert_query_shape(left, dialect=adapter.dialect)
     except QueryRefusedError as exc:
@@ -592,11 +746,49 @@ def _describe_pair(
     except QueryRefusedError as exc:
         raise _NotCheckedError("proposed_refused", str(exc)) from exc
 
+
+def _describe_is_free(adapter: Adapter) -> bool:
+    """Whether reading a query's output schema can bill anything here."""
+
+    return bool(getattr(adapter, "describe_query_free", True))
+
+
+def _estimates(
+    statements: Sequence[str], adapter: Adapter, schema: SchemaDiff | None = None
+) -> list[float]:
+    estimator = getattr(adapter, "query_estimate", None)
+    if not callable(estimator):
+        return [0.0 for _ in statements]
+    try:
+        return [float(estimator(sql)) for sql in statements]
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        # An estimator that plans the statement can quote the warehouse's words.
+        raise _NotCheckedError(
+            "comparison_unreadable", type(exc).__name__, schema=schema
+        ) from exc
+
+
+def _raw_estimate(left: str, right: str, adapter: Adapter, *, keyed: bool) -> float:
+    """The comparison priced from the two statements as written.
+
+    The comparison reads each side once per statement, so this is what the schema
+    was not yet available to build.
+    """
+
+    reads = sum(_estimates([left, right], adapter))
+    return reads * (2 if keyed else 1)
+
+
+def _describe_pair(
+    left: str, right: str, adapter: Adapter
+) -> tuple[tuple[ColumnMeta, ...], tuple[ColumnMeta, ...]]:
     describe = getattr(adapter, "describe_query", None)
     if not callable(describe):
         raise _NotCheckedError(
-            "schema_unavailable",
-            "adapter does not describe query output",
+            "comparison_unsupported_on_connector",
+            f"the {adapter.name} connector does not describe query output",
         )
     return (
         _describe_side(describe, left, "baseline_not_executable"),
@@ -607,10 +799,28 @@ def _describe_pair(
 def _describe_side(describe, sql: str, code: ReasonCode) -> tuple[ColumnMeta, ...]:
     try:
         columns = tuple(describe(sql))
+    except CostGuardError:
+        raise
     except Exception as exc:
         # Class name only. DuckDB conversion errors quote the offending value.
         raise _NotCheckedError(code, type(exc).__name__) from exc
     return columns
+
+
+def _as_described(name: str, described: Iterable[str]) -> str:
+    """A caller's column name as the warehouse spells it.
+
+    Snowflake reports ``TEAM_ID`` for what its author wrote as ``team_id``. An
+    exact match wins, and a spelling that differs only in case is taken when it
+    names one column. Two columns that differ only in case stay the caller's to
+    tell apart.
+    """
+
+    names = list(described)
+    if name in names:
+        return name
+    folded = [candidate for candidate in names if candidate.lower() == name.lower()]
+    return folded[0] if len(folded) == 1 else name
 
 
 def _reject_duplicate_names(columns: Sequence[ColumnMeta], side: str) -> None:
@@ -628,6 +838,7 @@ def _align(
     left_cols: Sequence[ColumnMeta],
     right_cols: Sequence[ColumnMeta],
     mapping: Mapping[str, str],
+    accepted: Sequence[str] = (),
 ) -> _Aligned:
     _reject_duplicate_names(left_cols, "baseline")
     _reject_duplicate_names(right_cols, "proposed")
@@ -638,6 +849,19 @@ def _align(
             )
         raise _NotCheckedError("proposed_not_executable", "query returns no columns")
     left_names = {column.name for column in left_cols}
+    right_names = [column.name for column in right_cols]
+    mapping = {
+        _as_described(left, left_names): _as_described(right, right_names)
+        for left, right in mapping.items()
+    }
+    accepted_names = {_as_described(name, left_names) for name in accepted}
+    not_outputs = sorted(accepted_names - left_names)
+    if not_outputs:
+        shown = ", ".join(repr(name) for name in not_outputs)
+        raise _NotCheckedError(
+            "invalid_type_acceptance",
+            f"an accepted type change names a column that is not an output: {shown}",
+        )
     unknown = [name for name in mapping if name not in left_names]
     if unknown:
         shown = ", ".join(repr(name) for name in unknown)
@@ -656,6 +880,7 @@ def _align(
     unmatched_right = {column.name for column in right_cols}
     only_left: list[SchemaColumn] = []
     mismatches: list[TypeMismatch] = []
+    accepted_changes: list[TypeMismatch] = []
     matched: list[_MatchedColumn] = []
     for column, target in zip(left_cols, targets, strict=True):
         right = right_by_name.get(target)
@@ -665,10 +890,22 @@ def _align(
             continue
         unmatched_right.discard(target)
         right_schema = SchemaColumn(right.name, right.data_type)
-        if column.data_type != right.data_type:
-            mismatches.append(TypeMismatch(left=left_schema, right=right_schema))
-            continue
-        matched.append(_MatchedColumn(column.name, right.name, column.data_type))
+        if _normal_type(column.data_type) != _normal_type(right.data_type):
+            change = TypeMismatch(left=left_schema, right=right_schema)
+            if column.name not in accepted_names:
+                mismatches.append(change)
+                continue
+            if not _same_family(column.data_type, right.data_type):
+                raise _NotCheckedError(
+                    "invalid_type_acceptance",
+                    f"{column.name} changes from {column.data_type} to "
+                    f"{right.data_type}, which is not one type family, so comparing "
+                    "their values under a common type would not be exact",
+                )
+            accepted_changes.append(change)
+        matched.append(
+            _MatchedColumn(column.name, right.name, column.data_type, right.data_type)
+        )
     only_right = tuple(
         SchemaColumn(column.name, column.data_type)
         for column in right_cols
@@ -679,16 +916,46 @@ def _align(
             only_in_left=tuple(only_left),
             only_in_right=only_right,
             type_mismatches=tuple(mismatches),
+            accepted_type_changes=tuple(accepted_changes),
         ),
         matched=tuple(matched),
     )
 
 
-def _unsupported_column(columns: Sequence[_MatchedColumn]) -> str | None:
+def _normal_type(type_name: str) -> str:
+    """One spelling of a type, so ``varchar`` and ``VARCHAR`` are not a change."""
+
+    return " ".join(type_name.split()).upper()
+
+
+def _base_type(type_name: str) -> str:
+    """The outermost type a name states, past wrappers that do not affect grouping."""
+
+    text = _normal_type(type_name)
+    while True:
+        base = re.split(r"[(<\[ ]", text, maxsplit=1)[0]
+        if base not in _TYPE_WRAPPERS or "(" not in text:
+            return base
+        text = text.split("(", 1)[1].rstrip(") ")
+
+
+def _same_family(left: str, right: str) -> bool:
+    left_base, right_base = _base_type(left), _base_type(right)
+    return any(
+        left_base in members and right_base in members
+        for members in _TYPE_FAMILIES.values()
+    )
+
+
+def _unsupported_column(columns: Sequence[_MatchedColumn], dialect: str) -> str | None:
+    refused = _UNGROUPABLE_TYPES.get(dialect, frozenset())
     for column in columns:
-        base = column.type_name.strip().upper().split("(", 1)[0].strip()
-        if base in _UNGROUPABLE_TYPES:
-            return column.left_name
+        for type_name in (column.type_name, column.right_type_name or column.type_name):
+            base = _base_type(type_name)
+            # A bare number is a type code the driver could not name, so nothing
+            # here can say it groups.
+            if base in refused or base.isdigit():
+                return f"{column.left_name} ({type_name})"
     return None
 
 
@@ -717,14 +984,37 @@ def _project(
     return f"select {select_list} from ({sql}) as dex_proj"  # noqa: S608
 
 
-def _grouped_cte(name: str, projection: str, column_list: str) -> str:
+def _rows_cte(left_proj: str, right_proj: str, column_list: str) -> str:
+    """Each distinct row, with how many times each side holds it.
+
+    Grouping is what makes this NULL-safe on every connector, and each side is
+    read once. Every working column has its own name because ClickHouse resolves
+    an alias inside the expressions beside it, which would nest the aggregates.
+    The projections are quoted identifiers over statements the
+    firewall has already shaped.
+    """
+
     return (
-        f"{name} as (\n"  # noqa: S608
-        f"    select {column_list}, count(*) as dex_n\n"
-        f"    from ({projection}) as s\n"
+        "dex_stacked as (\n"  # noqa: S608
+        f"    select {column_list}, 1 as dex_side_l, 0 as dex_side_r\n"
+        f"    from ({left_proj}) as dex_left\n"
+        "    union all\n"
+        f"    select {column_list}, 0 as dex_side_l, 1 as dex_side_r\n"
+        f"    from ({right_proj}) as dex_right\n"
+        "),\n"
+        "dex_rows as (\n"
+        f"    select {column_list},\n"
+        "           sum(dex_side_l) as dex_ln, sum(dex_side_r) as dex_rn\n"
+        "    from dex_stacked\n"
         f"    group by {column_list}\n"
         ")"
     )
+
+
+def _count(expression: str, alias: str) -> str:
+    # Cast because several warehouses widen a sum to a decimal, and json_safe
+    # would carry a decimal as a float, which is not an exact count.
+    return f"cast(coalesce({expression}, 0) as bigint) as {alias}"
 
 
 def _multiset_sql(
@@ -733,30 +1023,21 @@ def _multiset_sql(
     columns: Sequence[str],
     dialect: str,
 ) -> str:
-    quoted = [_quote(name, dialect) for name in columns]
-    column_list = ", ".join(quoted)
-    join = " and ".join(
-        f"dex_l.{name} is not distinct from dex_r.{name}" for name in quoted
+    column_list = ", ".join(_quote(name, dialect) for name in columns)
+    excess_left = "sum(case when dex_ln > dex_rn then dex_ln - dex_rn else 0 end)"
+    excess_right = "sum(case when dex_rn > dex_ln then dex_rn - dex_ln else 0 end)"
+    selected = ",\n    ".join(
+        (
+            _count("sum(dex_ln)", "left_rows"),
+            _count("sum(dex_rn)", "right_rows"),
+            _count(excess_left, "only_in_left"),
+            _count(excess_right, "only_in_right"),
+        )
     )
-    left_cte = _grouped_cte("dex_l", left_proj, column_list)
-    right_cte = _grouped_cte("dex_r", right_proj, column_list)
-    # Quoted identifiers and projections the firewall has already shaped.
     return (
-        f"with {left_cte},\n"
-        f"{right_cte}\n"
-        "select\n"
-        "    coalesce(sum(coalesce(dex_l.dex_n, 0)), 0) as left_rows,\n"
-        "    coalesce(sum(coalesce(dex_r.dex_n, 0)), 0) as right_rows,\n"
-        "    coalesce(sum(case\n"
-        "        when coalesce(dex_l.dex_n, 0) > coalesce(dex_r.dex_n, 0)\n"
-        "        then coalesce(dex_l.dex_n, 0) - coalesce(dex_r.dex_n, 0)\n"
-        "        else 0 end), 0) as only_in_left,\n"
-        "    coalesce(sum(case\n"
-        "        when coalesce(dex_r.dex_n, 0) > coalesce(dex_l.dex_n, 0)\n"
-        "        then coalesce(dex_r.dex_n, 0) - coalesce(dex_l.dex_n, 0)\n"
-        "        else 0 end), 0) as only_in_right\n"
-        "from dex_l full outer join dex_r\n"
-        f"    on {join}\n"
+        f"with {_rows_cte(left_proj, right_proj, column_list)}\n"
+        f"select\n    {selected}\n"
+        "from dex_rows\n"
     )
 
 
@@ -767,47 +1048,37 @@ def _keyed_sql(
     keys: Sequence[str],
     dialect: str,
 ) -> str:
-    quoted = [_quote(name, dialect) for name in columns]
-    key_quoted = [_quote(name, dialect) for name in keys]
-    column_list = ", ".join(quoted)
-    key_list = ", ".join(key_quoted)
-    # dex_n, not coalesce of the two keys. A NULL key on a present row must not
-    # collapse into the missing side, whose key is also NULL.
-    key_exprs = ", ".join(
-        "case when dex_l.dex_n is not null"
-        f" then dex_l.{name} else dex_r.{name} end as {name}"
-        for name in key_quoted
+    column_list = ", ".join(_quote(name, dialect) for name in columns)
+    key_list = ", ".join(_quote(name, dialect) for name in keys)
+    selected = ",\n    ".join(
+        (
+            _count(
+                "sum(case when dex_kl > 1 or dex_kr > 1 then 1 else 0 end)",
+                "non_unique_keys",
+            ),
+            _count(
+                "sum(case when dex_kl > 0 and dex_kr = 0 then 1 else 0 end)",
+                "only_in_left",
+            ),
+            _count(
+                "sum(case when dex_kr > 0 and dex_kl = 0 then 1 else 0 end)",
+                "only_in_right",
+            ),
+            _count(
+                "sum(case when dex_kl > 0 and dex_kr > 0 and dex_diff = 1 "
+                "then 1 else 0 end)",
+                "changed",
+            ),
+        )
     )
-    join = " and ".join(
-        f"dex_l.{name} is not distinct from dex_r.{name}" for name in quoted
-    )
-    left_cte = _grouped_cte("dex_l", left_proj, column_list)
-    right_cte = _grouped_cte("dex_r", right_proj, column_list)
     return (
-        f"with {left_cte},\n"  # noqa: S608
-        f"{right_cte},\n"
-        "dex_rows as (\n"
-        "    select\n"
-        f"        {key_exprs},\n"
-        "        coalesce(dex_l.dex_n, 0) as dex_ln,\n"
-        "        coalesce(dex_r.dex_n, 0) as dex_rn\n"
-        "    from dex_l full outer join dex_r\n"
-        f"        on {join}\n"
-        "),\n"
+        f"with {_rows_cte(left_proj, right_proj, column_list)},\n"  # noqa: S608
         "dex_keys as (\n"
-        f"    select {key_list}, sum(dex_ln) as dex_ln, sum(dex_rn) as dex_rn,\n"
+        f"    select {key_list}, sum(dex_ln) as dex_kl, sum(dex_rn) as dex_kr,\n"
         "           max(case when dex_ln <> dex_rn then 1 else 0 end) as dex_diff\n"
         f"    from dex_rows group by {key_list}\n"
         ")\n"
-        "select\n"
-        "    coalesce(sum(case when dex_ln > 1 or dex_rn > 1\n"
-        "        then 1 else 0 end), 0) as non_unique_keys,\n"
-        "    coalesce(sum(case when dex_ln > 0 and dex_rn = 0\n"
-        "        then 1 else 0 end), 0) as only_in_left,\n"
-        "    coalesce(sum(case when dex_rn > 0 and dex_ln = 0\n"
-        "        then 1 else 0 end), 0) as only_in_right,\n"
-        "    coalesce(sum(case when dex_ln > 0 and dex_rn > 0 and dex_diff = 1\n"
-        "        then 1 else 0 end), 0) as changed\n"
+        f"select\n    {selected}\n"
         "from dex_keys\n"
     )
 
@@ -839,13 +1110,34 @@ def _read_counts(result: QueryResult, width: int) -> list[int]:
         )
     values: list[int] = []
     for value in row:
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        count = _exact_count(value)
+        if count is None:
             raise _NotCheckedError(
                 "comparison_unreadable",
                 "comparison returned a count that is not a non-negative integer",
             )
-        values.append(value)
+        values.append(count)
     return values
+
+
+def _exact_count(value: object) -> int | None:
+    """A count as an int, or ``None`` when it cannot be read exactly.
+
+    A driver can hand back a cast bigint as a string, or as a float through
+    json_safe. A float is taken only inside the range it represents exactly.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value.is_integer() and 0 <= value <= _MAX_EXACT_FLOAT:
+            return int(value)
+        return None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
 
 
 def _multiset_from_counts(values: Sequence[int]) -> MultisetDiff:

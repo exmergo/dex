@@ -1856,3 +1856,69 @@ def test_a_real_duplicate_stays_high_end_to_end(dex, tmp_path):
     # not what decides the severity.
     assert finding["data"]["grain_holds"] is True
     assert "the grain (id) is still unique" in finding["detail"]
+
+
+def _declared_join_layer():
+    from exmergo_dex_core.maintain.snapshot import (
+        RelationshipDef,
+        SemanticLayerSnapshot,
+        SemanticModelDef,
+    )
+
+    return SemanticLayerSnapshot(
+        semantic_models=[
+            SemanticModelDef(name="orders", content_sha256="a", relation="db.s.orders"),
+            SemanticModelDef(
+                name="customers", content_sha256="b", relation="db.s.customers"
+            ),
+        ],
+        relationships=[
+            RelationshipDef(
+                name="orders->customers",
+                content_sha256="c",
+                model="orders",
+                to_model="customers",
+                column_pairs=[("customer_id", "id")],
+                cardinality="many_to_one",
+            )
+        ],
+        relationships_and_keys_captured=True,
+        relationship_cardinality_captured=True,
+    )
+
+
+@pytest.mark.parametrize(("row_count", "planned"), [(None, 1), (0, 0), (5, 1)])
+def test_a_declared_join_with_no_free_row_count_is_still_planned(row_count, planned):
+    """No free count (Postgres before ANALYZE, any view) is unknown, not empty:
+    the scan that measures the join supplies it (#912)."""
+
+    from exmergo_dex_core.maintain import drift
+
+    notes: list[str] = []
+    checks = drift._join_cardinality_checks(
+        _declared_join_layer(),
+        ["db.s.orders", "db.s.customers"],
+        None,
+        lambda _identifier: ({"id", "customer_id"}, row_count),
+        notes,
+    )
+
+    assert len(checks) == planned
+    assert notes == []
+
+
+def test_a_key_on_a_table_nothing_counted_is_named_not_passed():
+    """A connector with no free row count whose scan does not count either
+    (Databricks) cannot judge uniqueness; the plan says so, once (#912)."""
+
+    from exmergo_dex_core.maintain.drift import grain_drift
+
+    plan = _small_key_plan(None)
+    plan.key_checks.append(plan.key_checks[0])
+
+    findings = grain_drift(_SmallKeyAdapter(None, 2), plan)
+
+    assert findings == []
+    assert plan.notes == [
+        "nothing counted db.s.t's rows, so the uniqueness of its keys was not verified"
+    ]

@@ -1,0 +1,26 @@
+version: 2
+models:
+  - name: product_region_share
+    description: One row per region and product, with the product's revenue and its share of the region's revenue.
+    config:
+      meta:
+        dex:
+          grain: [region, product_id]
+          population:
+            rule: Every product sold in a region; products with no sales there have no row.
+          assumptions:
+            - decision: Whether the share is a fraction or a percent
+              chosen: a fraction between 0 and 1
+              evidence: default
+    columns:
+      - name: region
+        config: {meta: {dex: {role: dimension}}}
+      - name: product_id
+        config: {meta: {dex: {role: foreign_key, references: stg_products.product_id}}}
+      - name: product_name
+        config: {meta: {dex: {role: attribute}}}
+      - name: revenue
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: "currency:USD"}}}
+      - name: share_of_region
+        description: The product's revenue over the region's revenue; sums to 1 within a region.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: non_additive, unit: fraction}}}

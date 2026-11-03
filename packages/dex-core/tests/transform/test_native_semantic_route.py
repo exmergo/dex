@@ -229,3 +229,159 @@ def test_the_route_and_its_dispatch_name_no_vendor():
     for name in config_mod.SEMANTIC_SOURCE_FACTORIES:
         assert name not in route.lower(), f"native_semantic.py names '{name}'"
         assert name not in dispatch.lower(), f"cli.dispatch names '{name}'"
+
+
+# --- declarations through the derivation hook (#927) ------------------------------
+
+
+class _DerivingLayer(_Layer):
+    """A layer implementing the derivation hook, recording each request."""
+
+    def derive_semantic(self, request: Any) -> Any:
+        from exmergo_dex_core.semantic_source import (
+            DerivedDefinition,
+            SemanticDerivationResult,
+        )
+
+        self.calls.append(("derive", request))
+        content = "".join(
+            f"{d.model}: {{rule: {(d.declared.get('population') or {}).get('rule')}}}\n"
+            for d in request.declarations
+        )
+        definitions = {
+            d.model: DerivedDefinition(
+                model=d.model,
+                status="included",
+                path=DOCUMENT,
+                content=content,
+                carried=["population"] if d.declared.get("population") else [],
+            )
+            for d in request.declarations
+        }
+        return SemanticDerivationResult(
+            vendor=VENDOR,
+            edit_target="semantic",
+            edits=[_edit(content)],
+            definitions=definitions,
+            proposal={
+                "vendor": VENDOR,
+                "mode": "included",
+                "models": {
+                    name: {"status": d.status} for name, d in definitions.items()
+                },
+            },
+        )
+
+
+def _declarations_payload(root: Path, body: dict) -> str:
+    path = root / "declarations.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return str(path)
+
+
+def test_a_layer_without_the_hook_refuses_declarations_by_name(vendor):
+    with DexEngine.from_repo(str(vendor.root)) as engine:
+        with pytest.raises(ValueError) as refused:
+            engine.semantic_native(
+                VENDOR,
+                "plan",
+                "declare orders",
+                [_edit()],
+                declarations=[{"model": "orders", "grain": ["id"]}],
+            )
+        assert engine.require_full_store("listing").list_plans() == []
+
+    message = str(refused.value)
+    assert f"`semantic {VENDOR}` does not take declarations yet" in message
+    assert "SemanticDerivationSource" in message
+
+
+def test_declarations_reach_the_layer_through_its_hook_in_annotate_mode(vendor):
+    vendor.layer_type[0] = _DerivingLayer
+
+    with DexEngine.from_repo(str(vendor.root)) as engine:
+        result = engine.semantic_native(
+            VENDOR,
+            "plan",
+            "declare orders",
+            [],
+            declarations=[{"model": "orders", "population": {"rule": "paid orders"}}],
+        )
+
+    assert result.plan_id
+    (request,) = [r for kind, r in vendor.calls if kind == "derive"]
+    assert request.mode == "annotate"
+    assert request.declarations[0].declared == {"population": {"rule": "paid orders"}}
+    # The derived document was validated by the layer itself before storing.
+    assert ("validate", "plan") in vendor.calls
+
+
+def test_a_native_layer_refuses_a_history_it_cannot_carry_or_check(vendor):
+    vendor.layer_type[0] = _DerivingLayer
+    history = {
+        "snapshot": "s",
+        "entity": {"id": "id"},
+        "status": {"column": "x", "target": True},
+    }
+
+    with DexEngine.from_repo(str(vendor.root)) as engine:
+        with pytest.raises(ValueError) as refused:
+            engine.semantic_native(
+                VENDOR,
+                "plan",
+                "declare orders",
+                [],
+                declarations=[{"model": "orders", "history": history}],
+            )
+        assert engine.require_full_store("listing").list_plans() == []
+
+    assert "does not take a `history` declaration (orders)" in str(refused.value)
+
+
+def test_a_declared_mart_derives_into_any_vendor_with_the_hook_as_a_companion_plan(
+    vendor, dbt_project_dir: Path, capsys, monkeypatch
+):
+    from transform.test_semantic_derivation import MART, MART_SQL, _fake_parse
+
+    vendor.layer_type[0] = _DerivingLayer
+    _fake_parse(monkeypatch)
+    declared = {**MART, "population": {"rule": "paid orders"}}
+
+    planned = _run(
+        vendor.root,
+        capsys,
+        "transform",
+        "plan",
+        "orders mart",
+        "--edits-file",
+        _declarations_payload(
+            vendor.root,
+            {
+                "edits": [
+                    {
+                        "path": "models/marts/fct_orders.sql",
+                        "kind": "model_sql",
+                        "content": MART_SQL,
+                    }
+                ],
+                "declarations": [declared],
+            },
+        ),
+    )
+
+    assert planned["_exit"] == 0, planned
+    (request,) = [r for kind, r in vendor.calls if kind == "derive"]
+    assert request.mode == "derive"
+    (declaration,) = request.declarations
+    assert declaration.model == "fct_orders"
+    assert declaration.source_path == "models/marts/fct_orders.sql"
+    assert declaration.references[0].parent_model == "stg_customers"
+    proposal = planned["data"]["semantic_proposal"]
+    assert proposal["vendor"] == VENDOR
+    companion = proposal["plan_id"]
+    assert companion != planned["data"]["plan_id"]
+    assert companion in planned["data"]["next"]
+    with DexEngine.from_repo(str(vendor.root)) as engine:
+        stored = engine.require_full_store("loading").load_plan(companion)
+    assert stored.edit_target == "semantic"
+    assert [e.path for e in stored.edits] == [DOCUMENT]

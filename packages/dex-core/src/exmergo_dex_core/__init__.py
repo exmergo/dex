@@ -70,6 +70,7 @@ _EXPORTS = {
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
     "CubeDependencyError": "cube.dependency",
+    "CubeTransportDependencyError": "cube.transport",
     "CredentialDiscoveryError": "connect",
     "DEMO_FILENAME": "demo",
     "Dataset": "cache",
@@ -86,6 +87,7 @@ _EXPORTS = {
     "Document": "storage",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "IncompatibleArtifactsError": "transform.artifact_runtime",
     "InvalidConfigError": "config_document",
     "LedgerUnreadableError": "guards.cost_guard",
     "MaintainStore": "storage",
@@ -147,6 +149,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         SemanticSource,
     )
     from .cube.dependency import CubeDependencyError
+    from .cube.transport import CubeTransportDependencyError
     from .demo import (
         DEMO_FILENAME,
         DemoDependencyError,
@@ -212,6 +215,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         StoreContext,
         StoreFactory,
     )
+    from .transform.artifact_runtime import IncompatibleArtifactsError
     from .transform.build import MissingPackagesError
     from .transform.evidence import BuildEvidenceError
     from .transform.plans import PlanError, PlanNotFoundError
@@ -253,6 +257,7 @@ __all__ = [
     "CostGuardError",
     "CredentialDiscoveryError",
     "CubeDependencyError",
+    "CubeTransportDependencyError",
     "Dataset",
     "DeclarationError",
     "DemoDependencyError",
@@ -267,6 +272,7 @@ __all__ = [
     "Document",
     "ExploreStore",
     "FilesystemStore",
+    "IncompatibleArtifactsError",
     "InvalidConfigError",
     "LedgerUnreadableError",
     "MaintainStore",

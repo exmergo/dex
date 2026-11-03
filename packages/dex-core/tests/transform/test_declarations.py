@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
@@ -102,6 +103,10 @@ def _entry(content: str, model: str = "fct_orders") -> dict:
             "assumptions.0.evidence",
         ),
         ({"model": "m", "owner": "me"}, "owner is not a declaration field"),
+        (
+            {"model": "m", "assumptions": [{"decision": "d", "column": "  "}]},
+            "assumptions.0.column",
+        ),
         ({"description": "no model"}, "model is required"),
     ],
 )
@@ -332,6 +337,47 @@ def test_a_declaration_that_contradicts_the_project_is_refused(declaration, expe
         apply_declarations(parsed, _view(_project()), [])
 
     assert expected in str(caught.value)
+
+
+def test_a_declaration_against_a_union_model_refuses_an_absent_column():
+    files = {
+        "models/marts/fct_orders.sql": (
+            "select 1 as order_id, 2 as customer_id\nunion all\nselect 3, 4\n"
+        ),
+    }
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "columns": {"absent": {"role": "dimension"}},
+            }
+        ]
+    )
+    with pytest.raises(DeclarationError, match="does not produce"):
+        apply_declarations(parsed, _view(files), [])
+
+
+def test_a_declaration_against_a_union_model_accepts_declared_columns():
+    files = {
+        "models/marts/fct_orders.sql": (
+            "select 1 as order_id, 2 as customer_id\nunion all\nselect 3, 4\n"
+        ),
+    }
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "columns": {
+                    "order_id": {"role": "key"},
+                    "customer_id": {"role": "dimension"},
+                },
+            }
+        ]
+    )
+    _edits, warnings = apply_declarations(parsed, _view(files), [])
+    assert not any("not checked" in w for w in warnings)
 
 
 def test_a_filter_on_a_column_that_looks_like_personal_data_is_refused():
@@ -714,7 +760,7 @@ def test_build_reports_the_decisions_of_the_models_it_ran(
         capsys,
     )
 
-    run_results = dbt_project_dir / "target" / "run_results.json"
+    run_results = dex_target(dbt_project_dir) / "run_results.json"
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
 
     def fake(timeout: float, cwd, env=None):
@@ -779,3 +825,283 @@ def test_a_command_that_takes_no_declarations_refuses_a_payload_carrying_them(
 
     assert envelope["status"] == "error"
     assert "does not take declarations" in envelope["errors"][0]
+
+
+# --- population.parent (#857) ------------------------------------------------------
+
+PARENT = {"model": "dim_customers", "key": {"customer_id": "customer_id"}}
+
+
+@pytest.mark.parametrize(
+    ("parent", "expected"),
+    [
+        ({"model": "dim_customers"}, "population.parent.key is required"),
+        ({"model": "dim_customers", "key": {}}, "map at least one output column"),
+        ({"model": " ", "key": {"a": "b"}}, "name the parent model"),
+        ({"model": "dim_customers", "key": {"a": "b"}, "kind": "x"}, "kind"),
+    ],
+)
+def test_a_malformed_population_parent_is_refused_naming_the_field(parent, expected):
+    with pytest.raises(DeclarationError, match="declarations\\[0\\]") as caught:
+        parse_declarations([{"model": "m", "population": {"parent": parent}}])
+
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("parent", "expected"),
+    [
+        (
+            {"model": "dim_people", "key": {"customer_id": "customer_id"}},
+            "no model, seed or snapshot named 'dim_people'",
+        ),
+        (
+            {"model": "dim_customers", "key": {"customer_id": "cust_key"}},
+            "does not produce a column 'cust_key'",
+        ),
+        (
+            {"model": "dim_customers", "key": {"cust": "customer_id"}},
+            "population.parent key column(s) cust",
+        ),
+        (
+            {"model": "fct_orders", "key": {"order_id": "order_id"}},
+            "declares itself as its population.parent",
+        ),
+    ],
+)
+def test_a_population_parent_the_project_cannot_satisfy_is_refused(parent, expected):
+    parsed = parse_declarations(
+        [{"model": "fct_orders", "population": {"parent": parent}}]
+    )
+
+    with pytest.raises(DeclarationError) as caught:
+        apply_declarations(parsed, _view(_project()), [])
+
+    assert expected in str(caught.value)
+    assert "population.parent" in str(caught.value)
+
+
+def test_a_population_parent_renders_into_meta_and_warns_off_the_grain():
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "population": {"parent": PARENT},
+            }
+        ]
+    )
+
+    edits, warnings = apply_declarations(parsed, _view(_project()), [])
+
+    entry = _entry(edits[0].new_content)
+    assert entry["config"]["meta"]["dex"]["population"] == {"parent": PARENT}
+    assert any("keyed on customer_id but its grain is order_id" in w for w in warnings)
+
+
+def test_adding_a_parent_keeps_the_population_rule_and_filters_already_declared():
+    [first] = parse_declarations([FULL])
+    [second] = parse_declarations(
+        [{"model": "fct_orders", "population": {"parent": PARENT}}]
+    )
+
+    population = _entry(render(render(HAND_WRITTEN, first), second))["config"]["meta"][
+        "dex"
+    ]["population"]
+
+    assert population["rule"] == FULL["population"]["rule"]
+    assert population["filters"] == FULL["population"]["filters"]
+    assert population["parent"] == PARENT
+
+    # And the other way round: restating the filters keeps the parent.
+    [third] = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "population": {"filters": [{"column": "status", "excludes": ["x"]}]},
+            }
+        ]
+    )
+    again = _entry(render(render(HAND_WRITTEN, second), third))["config"]["meta"][
+        "dex"
+    ]["population"]
+    assert again["parent"] == PARENT
+    assert again["filters"] == [{"column": "status", "excludes": ["x"]}]
+
+
+def test_a_population_with_only_a_parent_reads_back():
+    from exmergo_dex_core.project_definitions import read_population
+
+    population = read_population({"parent": PARENT})
+
+    assert population is not None
+    assert population.parent is not None
+    assert population.parent.key == {"customer_id": "customer_id"}
+    assert read_population({"parent": {"model": "x", "key": {"a": 1}}}) is None
+
+
+# --- history: a temporal contract (#1027) -----------------------------------------
+
+_SNAPSHOT = (
+    "{% snapshot hosts_snapshot %}\n{{ config(unique_key='host_id', "
+    "strategy='check', check_cols='all') }}\nselect 1 as host_id\n{% endsnapshot %}\n"
+)
+_HISTORY_SQL = "select 1 as host_id, 0 as changes, current_date as latest_at\n"
+_HISTORY = {
+    "snapshot": "hosts_snapshot",
+    "entity": {"host_id": "host_id"},
+    "status": {"column": "is_super", "target": True},
+    "initial_observation": "baseline",
+    "null_status": "ignore",
+    "population": "ever_target",
+    "time": {"column": "dbt_valid_from", "provenance": "capture"},
+    "measures": {
+        "transition_count": "changes",
+        "latest_target_transition_at": "latest_at",
+    },
+}
+
+
+def _history_view(**extra: str) -> DbtProjectView:
+    view = _view(
+        {
+            "models/marts/host_history.sql": _HISTORY_SQL,
+            "snapshots/hosts_snapshot.sql": _SNAPSHOT,
+            **extra,
+        }
+    )
+    return view.model_copy(update={"snapshot_paths": ["snapshots"]})
+
+
+def _declare_history(history: dict, view: DbtProjectView | None = None):
+    parsed = parse_declarations([{"model": "host_history", "history": history}])
+    return apply_declarations(parsed, view or _history_view(), [])
+
+
+def test_a_history_renders_into_meta_as_declared():
+    edits, warnings = _declare_history(_HISTORY)
+    entry = _entry(edits[0].new_content, "host_history")
+    assert entry["config"]["meta"]["dex"]["history"] == _HISTORY
+    assert not any("declares history without" in w for w in warnings)
+
+
+def test_a_history_on_a_yaml_defined_snapshot_is_accepted():
+    view = _view(
+        {
+            "models/marts/host_history.sql": _HISTORY_SQL,
+            "snapshots/hosts.yml": (
+                "snapshots:\n  - name: hosts_snapshot\n    relation: ref('x')\n"
+            ),
+        }
+    )
+    edits, _warnings = _declare_history(_HISTORY, view)
+    assert _entry(edits[0].new_content, "host_history")
+
+
+def test_a_population_parent_can_name_a_yaml_defined_snapshot():
+    view = _view(
+        {
+            "models/marts/fct_orders.sql": ORDERS_SQL,
+            "snapshots/hosts.yml": (
+                "snapshots:\n  - name: hosts_snapshot\n    relation: ref('x')\n"
+            ),
+        }
+    )
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "population": {
+                    "parent": {
+                        "model": "hosts_snapshot",
+                        "key": {"customer_id": "customer_id"},
+                    }
+                },
+            }
+        ]
+    )
+    assert apply_declarations(parsed, view, [])
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({"initial_observation": "maybe"}, "initial_observation"),
+        ({"null_status": "as_false"}, "null_status"),
+        ({"population": "some"}, "population"),
+        ({"time": {"column": "x", "provenance": "wall"}}, "provenance"),
+        ({"entity": {}}, "entity"),
+        ({"surprise": 1}, "surprise"),
+    ],
+)
+def test_a_malformed_history_is_refused_naming_the_field(change, expected):
+    with pytest.raises(DeclarationError) as caught:
+        parse_declarations(
+            [{"model": "host_history", "history": {**_HISTORY, **change}}]
+        )
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({"snapshot": "stg_hosts"}, "no snapshot by that name"),
+        ({"entity": {"nope": "host_id"}}, "nope"),
+        ({"measures": {"transition_count": "nope"}}, "nope"),
+    ],
+)
+def test_a_history_the_project_cannot_satisfy_is_refused(change, expected):
+    with pytest.raises(DeclarationError) as caught:
+        _declare_history({**_HISTORY, **change})
+    assert expected in str(caught.value)
+
+
+def test_a_status_target_on_personal_data_is_refused():
+    with pytest.raises(DeclarationError) as caught:
+        _declare_history(
+            {**_HISTORY, "status": {"column": "email", "target": "a@example.com"}}
+        )
+    assert "personal data" in str(caught.value)
+    assert "history" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("dropped", "owed"),
+    [
+        ("initial_observation", "initial_observation"),
+        ("null_status", "null_status"),
+        ("population", "population"),
+        ("time", "time, with its provenance"),
+    ],
+)
+def test_a_policy_left_out_warns_and_is_never_assumed(dropped, owed):
+    history = {k: v for k, v in _HISTORY.items() if k != dropped}
+    edits, warnings = _declare_history(history)
+    rendered = _entry(edits[0].new_content, "host_history")["config"]["meta"]["dex"]
+    assert dropped not in rendered["history"]
+    assert any(owed in w and "assumes no temporal policy" in w for w in warnings)
+
+
+def test_a_declaration_with_no_history_renders_no_history_key():
+    edits, _warnings = apply_declarations(
+        parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}]),
+        _view(_project()),
+        [],
+    )
+    assert "history" not in edits[0].new_content
+
+
+@pytest.mark.parametrize(
+    ("sql", "owed"),
+    [
+        ("select host_id, lag(s) over (order by t) from {{ ref('snap') }}", True),
+        ("select host_id, min(dbt_valid_from) from {{ ref('snap') }} group by 1", True),
+        ("select host_id from {{ ref('snap') }} where dbt_valid_to is null", False),
+        ("select host_id, lag(s) over (order by t) from {{ ref('stg') }}", False),
+    ],
+)
+def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owed):
+    from exmergo_dex_core.transform import drafting
+
+    files = {"snapshots/snap.sql": "{% snapshot snap %}select 1{% endsnapshot %}"}
+    assert drafting._reads_snapshot_history(sql, files) is owed

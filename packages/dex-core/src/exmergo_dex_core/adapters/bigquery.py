@@ -402,6 +402,16 @@ class BigQueryAdapter:
             self._resolved_datasets = self._resolve_datasets()
         return self._resolved_datasets
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this BigQuery scope (#984)."""
+        qualified = namespace.strip().lower()
+        if "." not in qualified:
+            qualified = f"{self.project.lower()}.{qualified}"
+        project, _, _dataset = qualified.partition(".")
+        if not self.target.datasets:
+            return project == self.project.lower()
+        return qualified in {d.lower() for d in self._dataset_ids()}
+
     def _resolve_datasets(self) -> list[str]:
         if not self.target.datasets:
             datasets = self._request(
@@ -1319,6 +1329,24 @@ class BigQueryAdapter:
         return max(len(tables), 1)
 
     # --- execution (the single billed door) -----------------------------------
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from the free dry run's own schema."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        job_config = self._bq.QueryJobConfig(dry_run=True, use_query_cache=False)
+        job = self._client.query(
+            checked, job_config=job_config, location=self.target.location
+        )
+        return [
+            ColumnMeta(
+                name=field.name,
+                data_type=self._render_type(field),
+                nullable=(field.mode or "NULLABLE") != "REQUIRED",
+                ordinal=ordinal,
+            )
+            for ordinal, field in enumerate(job.schema or [])
+        ]
 
     def run_query(
         self,

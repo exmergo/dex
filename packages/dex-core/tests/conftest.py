@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import ci_groups
 import pytest
 
 _importorskip = pytest.importorskip
@@ -40,6 +43,125 @@ def _importorskip_absent_only(modname: str, *args, **kwargs):
 
 
 pytest.importorskip = _importorskip_absent_only
+
+
+# --- CI groups (tests/ci_groups.py) -------------------------------------------
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("ci groups")
+    group.addoption(
+        "--ci-group",
+        choices=sorted(ci_groups.GROUPS),
+        help="run only the test files tests/ci_groups.py assigns to this group",
+    )
+    group.addoption(
+        "--ci-group-report",
+        metavar="PATH",
+        help=(
+            "write what was collected, selected and run as JSON, for "
+            "scripts/check_test_groups.py to prove the groups cover the suite"
+        ),
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    group = config.getoption("--ci-group")
+    config.stash[_COLLECTED] = [item.nodeid for item in items]
+    if group is None:
+        return
+    root = config.rootpath
+    keep, drop = [], []
+    for item in items:
+        path = item.path.relative_to(root).as_posix()
+        (keep if ci_groups.group_of(path) == group else drop).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+    items[:] = keep
+    config.stash[_SELECTED] = [item.nodeid for item in keep]
+
+
+def pytest_runtest_logfinish(nodeid: str) -> None:
+    _RAN.append(nodeid)
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    _DEX_BEFORE.update(path for path in _CHECKOUT_DEX if path.exists())
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    # After every test and fixture has finished, so a write no single test's
+    # teardown saw (a session finalizer, an atexit hook) still fails the run.
+    leaked = _leaked_dex()
+    if leaked:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        sys.stderr.write(f"\n{_leak_message('the test session', leaked)}\n")
+    config = session.config
+    report = config.getoption("--ci-group-report")
+    if not report:
+        return
+    collected = config.stash.get(_COLLECTED, [])
+    Path(report).write_text(
+        json.dumps(
+            {
+                "group": config.getoption("--ci-group"),
+                "python": "{}.{}".format(*sys.version_info[:2]),
+                "collected": collected,
+                "selected": config.stash.get(_SELECTED, collected),
+                "ran": _RAN,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+_COLLECTED = pytest.StashKey[list[str]]()
+_SELECTED = pytest.StashKey[list[str]]()
+_RAN: list[str] = []
+
+
+# --- no test writes a `.dex/` into the checkout (#990) ------------------------
+#
+# A command whose store resolves against the working directory instead of the
+# test's ``tmp_path`` leaves a cache behind that `git add -A` commits and a later
+# `dex` run reads as real. A `.dex/` already there when the session started is a
+# developer's own state and none of the suite's business.
+
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+_CHECKOUT_DEX = [_PACKAGE_ROOT / ".dex", _PACKAGE_ROOT.parent.parent / ".dex"]
+_DEX_BEFORE: set[Path] = set()
+
+
+def _leaked_dex() -> list[Path]:
+    """The `.dex/` directories written into the checkout since the session
+    started, removed so the next check does not blame someone else for them."""
+
+    leaked = [p for p in _CHECKOUT_DEX if p not in _DEX_BEFORE and p.exists()]
+    for path in leaked:
+        shutil.rmtree(path, ignore_errors=True)
+    return leaked
+
+
+def _leak_message(culprit: str, leaked: list[Path]) -> str:
+    return (
+        f"{culprit} wrote {', '.join(str(p) for p in leaked)} into the checkout "
+        "(#990); give its engine or CLI call a tmp_path (repo_root, a store, or "
+        "monkeypatch.chdir)"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_dex_in_checkout():
+    """Fail the test that wrote a `.dex/` into the checkout. Checked per test
+    so the failure names the test that leaked it."""
+
+    yield
+    leaked = _leaked_dex()
+    if leaked:
+        pytest.fail(_leak_message("this test", leaked))
 
 
 @pytest.fixture

@@ -585,6 +585,56 @@ def test_joins_and_keys_arrive_as_physical_declarations(tmp_path):
     }
 
 
+def test_snowflake_columns_keys_and_joins_are_folded_the_way_snowflake_resolves_them(
+    tmp_path,
+):
+    """An unquoted column is the column the warehouse folded it to: reading it
+    as written made every SLayer column look gone from a Snowflake table (#923)."""
+
+    orders = model(
+        "orders",
+        columns=[
+            {"name": "order_id", "type": "INT", "primary_key": True},
+            {"name": "customer_id", "type": "INT"},
+            {"name": "nick", "type": "TEXT", "sql": '"Nick"'},
+        ],
+        joins=[
+            {
+                "target_model": "customers",
+                "join_pairs": [["customer_id", "customer_key"]],
+                "cardinality": "many_to_one",
+            }
+        ],
+    )
+    customers = model(
+        "customers",
+        columns=[{"name": "customer_key", "type": "INT", "primary_key": True}],
+    )
+    layer = SlayerSemanticLayer.from_context(
+        SemanticSourceContext(
+            repo_root=str(tmp_path),
+            connector="snowflake",
+            options={
+                "base_dir": BASE,
+                "models": list(write(tmp_path, orders, customers)),
+            },
+        )
+    )
+
+    rows = {d.name: d for d in layer.semantic_catalog().dimensions}
+    assert rows["orders.order_id"].column == "ORDER_ID"
+    assert rows["orders.customer_id"].column == "CUSTOMER_ID"
+    assert rows["orders.nick"].column is None
+
+    defs = layer.declared_definitions()
+    (relationship,) = defs.declared_relationships
+    assert relationship.column_pairs == [("CUSTOMER_ID", "CUSTOMER_KEY")]
+    assert {(k.model, k.column) for k in defs.declared_keys} == {
+        ("orders", "ORDER_ID"),
+        ("customers", "CUSTOMER_KEY"),
+    }
+
+
 def test_a_one_to_many_join_is_written_child_to_parent(tmp_path):
     customers = model(
         "customers",

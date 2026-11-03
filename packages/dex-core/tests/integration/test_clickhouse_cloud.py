@@ -63,6 +63,33 @@ def cloud_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+def test_refactor_comparison_shared_cases_on_cloud(cloud_repo: Path):
+    """The cases every connector answers (#899). Literal statements, so no table
+    is read."""
+
+    from transform.refactor_conformance import CASES, assert_case, run_case
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    raw = yaml.safe_load((cloud_repo / ".dex" / "config.yml").read_text("utf-8"))
+    engine = DexEngine(
+        connector="clickhouse",
+        repo_root=str(cloud_repo),
+        store=FilesystemStore(cloud_repo),
+        config=DexConfig.model_validate(raw),
+        confirmed=True,
+        budget=float(os.environ["DEX_TEST_CH_CLOUD_MAX_SECONDS"]),
+    )
+    try:
+        for case in CASES:
+            adapter = engine._adapter("transform compare")
+            assert_case(case, run_case(case, adapter))
+    finally:
+        engine.close()
+
+
 def _cloud_api_key() -> dict[str, str]:
     """The scoped API key as the two variables clickhousectl reads. Built for the
     one subprocess that needs them, never set on this process."""

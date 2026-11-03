@@ -694,6 +694,15 @@ class ClickHouseAdapter:
             self._dev_target = scope
             self.forget_metadata()
 
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a namespace lies inside this ClickHouse scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            token = token.split(".")[0]
+        if not self.target.databases:
+            return True
+        return token in {d.lower() for d in self._resolve_databases()}
+
     def _resolve_databases(self) -> list[str]:
         visible = self._databases()
         if not self.target.databases:
@@ -1350,6 +1359,26 @@ class ClickHouseAdapter:
         return result
 
     # --- execution (the single billed door) --------------------------------------
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from ``DESCRIBE`` of it, which reads no
+        data. A statement Cloud would have to wake for is held to the same
+        capacity check as any other."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        self._require_cloud_capacity()
+        result = self._client.query(
+            f"DESCRIBE ({checked})", settings=dict(_SESSION_SETTINGS)
+        )
+        return [
+            ColumnMeta(
+                name=str(row[0]),
+                data_type=str(row[1]),
+                nullable=str(row[1]).startswith("Nullable("),
+                ordinal=ordinal,
+            )
+            for ordinal, row in enumerate(result.result_rows)
+        ]
 
     def run_query(
         self,

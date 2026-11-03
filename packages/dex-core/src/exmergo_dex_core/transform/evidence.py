@@ -674,18 +674,23 @@ def build_evidence(
     source_digest: str | None = None,
     artifact_directory: Path | str | None = None,
     expected_invocation_id: str | None = None,
+    full_refresh: bool = False,
 ) -> BuildEvidence:
     """Read dbt's own artifacts and say what this build established.
 
     Reads ``run_results.json`` and ``manifest.json`` from ``artifact_directory``
-    (default ``<project>/target``) rather than scraping log text, exactly as
-    :func:`~.build._summarize` does, and reads them separately from it on
-    purpose. ``summary`` is a released payload shape and nothing here may move
-    it.
+    (by default the newest on disk, see
+    :func:`~.artifact_runtime.readable_artifact_dir`) rather than scraping log
+    text, exactly as :func:`~.build._summarize` does, and reads them
+    separately from it on purpose. ``summary`` is a released payload shape
+    and nothing here may move it.
 
     ``expected_invocation_id``, when set, refuses artifacts whose invocation id
     is a different id. A missing file has no id to disagree with and stays
     ``not_run`` rather than a successful completion.
+
+    ``full_refresh`` records under ``invocation`` that the build ran with
+    ``--full-refresh`` (issue #1015).
     """
 
     from ..dbt_project import load as load_project
@@ -699,11 +704,12 @@ def build_evidence(
         artifact_paths,
         artifact_producer,
         assert_same_invocation,
+        readable_artifact_dir,
     )
 
     root = Path(project)
     if artifact_directory is None:
-        chosen = root / "target"
+        chosen = readable_artifact_dir(root)
     else:
         chosen = Path(artifact_directory)
         if not chosen.is_absolute():
@@ -842,6 +848,7 @@ def build_evidence(
             "command": "build",
             "target": target,
             "select": select,
+            "full_refresh": full_refresh,
             "artifact_producer": producer.as_dict(),
             # dbt writes this at the top of run_results, not inside `metadata`.
             "elapsed_seconds": (

@@ -611,6 +611,42 @@ def _databricks_profile(
 _DEFAULT_PG_DEV_SCHEMA = "dbt_dev"
 
 
+def identity_notes(connector: str, config: DexConfig, root: Path) -> list[str]:
+    """Where the profile builds as one role and dex reads as another, say so:
+    a privilege granted to one says nothing about the other, and the split
+    would otherwise surface as a build refusal about the wrong role (#904)."""
+
+    from ..connect import CredentialDiscoveryError
+
+    target = getattr(config, connector, None)
+    if connector not in ("postgres", "redshift") or target is None or not target.user:
+        return []
+    try:
+        if connector == "postgres":
+            from ..connect import resolve_postgres_connection
+
+            _params, method = resolve_postgres_connection(target, os.environ, root)
+            if method.split(":", 1)[0] == "dbt_profile":
+                return []
+            reads_as = _pg_connection_fields(target, method).get("user")
+        else:
+            from ..connect import resolve_redshift_connection
+
+            params, method, _compute = resolve_redshift_connection(
+                target, os.environ, root
+            )
+            reads_as = None if method.startswith("iam") else params.get("user")
+    except CredentialDiscoveryError:
+        return []
+    if reads_as is None or reads_as == target.user:
+        return []
+    return [
+        f"the profile builds as {connector}.user '{target.user}', but dex itself "
+        f"reads as '{reads_as}': two identities, so a privilege granted to one "
+        "says nothing about the other"
+    ]
+
+
 def _postgres_profile(
     project_name: str,
     path: str | None,
@@ -636,7 +672,9 @@ def _postgres_profile(
     fields = _pg_connection_fields(target, method)
     host = fields.get("host")
     dbname = fields.get("dbname")
-    user = fields.get("user")
+    # A committed postgres.user is the build identity: the one place a role
+    # separate from dex's own read identity can be stated (#904).
+    user = target.user or fields.get("user")
     if not host or not dbname or not user:
         missing = ", ".join(
             name
@@ -806,7 +844,8 @@ def _redshift_profile(
     else:
         host = params.get("host")
         dbname = params.get("database")
-        user = params.get("user")
+        # The build identity, as in Postgres (#904).
+        user = target.user or params.get("user")
         if not host or not dbname or not user:
             missing = ", ".join(
                 name

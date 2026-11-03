@@ -23,6 +23,7 @@ from .config import CONFIG_FILE
 from .envelope import Cost
 from .guards.cost_guard import (
     SUGGESTED_SESSION_CEILING_MULTIPLE,
+    UPTIME_LINE,
     ConfirmationRequiredError,
     CostGate,
     OverCeilingError,
@@ -212,6 +213,35 @@ def upper_bound_notes(
     ]
 
 
+def with_uptime(
+    adapter: Adapter, estimate: float, per_table: dict[str, float] | None
+) -> tuple[float, dict[str, float] | None, Any]:
+    """Add the warehouse's uptime overhead to an estimate a handshake is about
+    to show, once per command (issues #656, #936).
+
+    The overhead (Snowflake's resume minimum and idle tail) belongs to the
+    command, not to any statement, so the estimators leave it out and the two
+    handshakes add it here: whichever priced phase the caller actually sees
+    carries it, and a phase priced and then discarded cannot take it. A caller
+    that already broke it out as :data:`UPTIME_LINE` (a build, mutation
+    coverage) is left as it is. Returns the estimate, the breakdown, and the
+    uptime model to :meth:`admit` once the gate has admitted the estimate, or
+    ``None`` on a connector that bills no uptime.
+    """
+
+    uptime = getattr(adapter, "warehouse_uptime", None)
+    if uptime is None:
+        return estimate, per_table, None
+    if per_table is not None and UPTIME_LINE in per_table:
+        return estimate, per_table, uptime
+    overhead = uptime.quote()
+    if overhead <= 0:
+        return estimate, per_table, uptime
+    if per_table is not None:
+        per_table = {UPTIME_LINE: overhead, **per_table}
+    return estimate + overhead, per_table, uptime
+
+
 def billed_handshake(
     command: str,
     adapter: Adapter,
@@ -245,6 +275,7 @@ def billed_handshake(
     gate = cost_gate(adapter)
     if gate is None:
         return
+    estimate, per_table, uptime = with_uptime(adapter, estimate, per_table)
     # What a connector can say about the composition of the estimate it just
     # priced, asked once and used by both refusals below. Only this handshake
     # asks: it is the one whose estimate the connector's profile pricing built,
@@ -337,6 +368,8 @@ def billed_handshake(
             cost=exc.cost, data=data, warnings=gate.warnings()
         )
         raise
+    if uptime is not None:
+        uptime.admit()
 
 
 def confirmation_request(
@@ -444,10 +477,12 @@ def phase_handshake(
     gate = cost_gate(adapter)
     if gate is None or skip:
         return None
+    phase_lines = {per_table_key: estimate} if per_table_key else None
+    estimate, phase_lines, uptime = with_uptime(adapter, estimate, phase_lines)
     try:
         gate.preflight_phase(estimate)
     except ConfirmationRequiredError as exc:
-        per_table = {per_table_key: estimate} if per_table_key else None
+        per_table = phase_lines if per_table_key else None
         describe = getattr(adapter, "describe_estimate", None)
         if describe is not None:
             data = {"command": command, **describe(estimate, per_table)}
@@ -491,6 +526,8 @@ def phase_handshake(
         if extra_notes:
             data["notes"] = [*data.get("notes", []), *extra_notes]
         return ConfirmationRequest(cost=exc.cost, data=data)
+    if uptime is not None:
+        uptime.admit()
     return None
 
 

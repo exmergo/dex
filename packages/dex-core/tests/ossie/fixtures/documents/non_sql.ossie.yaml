@@ -4,31 +4,30 @@
 # identifier means something else entirely, which is why reading one would be
 # worse than reading none.
 version: "0.2.0.dev0"
-semantic_model:
-  - name: bi
-    datasets:
-      - name: orders
-        source: demo.main.orders
-        fields:
-          - name: mdx_only
-            expression:
-              dialects:
-                - dialect: MDX
-                  expression: "[Order].[Placed At]"
-          - name: tableau_only
-            expression:
-              dialects:
-                - dialect: TABLEAU
-                  expression: "[Order Total]"
-          - name: maql_only
-            expression:
-              dialects:
-                - dialect: MAQL
-                  expression: "SELECT SUM({metric/total})"
-          - name: mixed
-            expression:
-              dialects:
-                - dialect: MDX
-                  expression: "[Order].[Id]"
-                - dialect: ANSI_SQL
-                  expression: order_id
+name: bi
+datasets:
+  - name: orders
+    source: demo.main.orders
+    fields:
+      - name: mdx_only
+        expression:
+          dialects:
+            - dialect: MDX
+              expression: "[Order].[Placed At]"
+      - name: tableau_only
+        expression:
+          dialects:
+            - dialect: TABLEAU
+              expression: "[Order Total]"
+      - name: maql_only
+        expression:
+          dialects:
+            - dialect: MAQL
+              expression: "SELECT SUM({metric/total})"
+      - name: mixed
+        expression:
+          dialects:
+            - dialect: MDX
+              expression: "[Order].[Id]"
+            - dialect: ANSI_SQL
+              expression: order_id

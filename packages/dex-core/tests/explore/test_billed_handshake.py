@@ -2240,3 +2240,103 @@ def test_a_refusal_that_never_reached_the_warehouse_reports_no_spend(
     assert rc == 1
     assert payload["reason"] == Reason.GUARD.value
     assert "spend" not in payload["data"]
+
+
+# --- the warehouse's uptime reaches the estimate the caller sees (#936) ----------
+#
+# Snowflake's resume minimum and idle tail belong to the command, so the
+# handshake that shows an estimate adds them, once. They used to ride in the
+# first estimate priced, and `explore relationships --verify` with every profile
+# cached priced (and discarded) an empty profile phase first: the verify phase
+# then quoted about a second and the run billed the tail, or returned `ok` with
+# nothing verified when the budget could not cover it.
+
+
+def _sf_verify_adapter(fake_sf_connection, *, ceiling: float, confirmed: bool = True):
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+    from exmergo_dex_core.config import SnowflakeTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    fake_sf_connection.warehouses[0].auto_suspend = 600
+    return SnowflakeAdapter(
+        connection=fake_sf_connection,
+        cost_gate=CostGate(
+            paradigm=Paradigm.COMPUTE_TIME,
+            ceiling=ceiling,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=confirmed,
+            connector="snowflake",
+            command="explore relationships",
+        ),
+        target=SnowflakeTarget(warehouse="DEX_WH"),
+        clock=fake_sf_connection.clock,
+        wall_clock=fake_sf_connection.clock.wall,
+    )
+
+
+_PROBE = 'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+
+
+def test_a_verify_phase_after_a_discarded_profile_phase_quotes_the_uptime(
+    fake_sf_connection,
+):
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.explore import commands as cmds
+
+    adapter = _sf_verify_adapter(fake_sf_connection, ceiling=2000.0, confirmed=False)
+    # Every profile cached: the profile phase prices nothing and shows nothing.
+    assert cmds._profile_estimate(adapter, []) == (0.0, {})
+    adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])  # and a priced one, dropped
+    probes = adapter.query_estimate(_PROBE)
+    pending = command_args.verify_handshake(
+        "explore relationships", adapter, probes, candidate_count=1, object_count=1
+    )
+    assert pending is not None
+    # Resume minimum plus the 600-second tail, on a line of its own.
+    assert pending.cost.estimate == pytest.approx(probes + 600.0)
+    assert pending.data["per_table_seconds"]["(warehouse uptime)"] == pytest.approx(
+        600.0
+    )
+    assert pending.data["per_table_seconds"]["(join overlap probes)"] == pytest.approx(
+        probes
+    )
+
+
+def test_a_verify_budget_that_cannot_cover_the_uptime_asks_rather_than_runs(
+    fake_sf_connection,
+):
+    from exmergo_dex_core import command_args
+
+    adapter = _sf_verify_adapter(fake_sf_connection, ceiling=224.0)
+    probes = adapter.query_estimate(_PROBE)
+    pending = command_args.verify_handshake(
+        "explore relationships", adapter, probes, candidate_count=21, object_count=4
+    )
+    # Was: quoted about a second, admitted, and `ok` with 0 of 21 verified.
+    assert pending is not None
+    assert pending.cost.estimate == pytest.approx(probes + 600.0)
+    assert fake_sf_connection.data_statements == []
+
+
+def test_a_command_priced_in_several_phases_carries_the_uptime_once(
+    fake_sf_connection,
+):
+    from exmergo_dex_core import command_args
+
+    adapter = _sf_verify_adapter(fake_sf_connection, ceiling=5000.0)
+    total, per_table = adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
+    command_args.billed_handshake(
+        "explore relationships", adapter, total, per_table=per_table
+    )
+    assert adapter.cost_gate.cost().estimate == pytest.approx(total + 600.0)
+    probes = adapter.query_estimate(_PROBE)
+    assert (
+        command_args.verify_handshake(
+            "explore relationships", adapter, probes, candidate_count=1, object_count=1
+        )
+        is None
+    )
+    # Admitted with the first phase, so no later phase quotes it again.
+    assert adapter.warehouse_uptime.quote() == 0.0
+    assert command_args.with_uptime(adapter, probes, None)[0] == pytest.approx(probes)

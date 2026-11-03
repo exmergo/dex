@@ -79,6 +79,11 @@ class ColumnAggregate:
     min_value: object | None
     max_value: object | None
     distinct_count_exact: bool = False
+    #: The adapter can count this column and has no count for it, as on a Postgres
+    #: view or a table nobody has analyzed, where counts come from the catalog, so
+    #: the engine may measure it with an exact scan. No count without this flag
+    #: means the adapter skips the column's type or read no rows: nothing is sent.
+    distinct_count_missing: bool = False
     #: Value-shape statistics, computed only for columns the engine requested via
     #: ``shape_stats`` (name-flagged generic-name columns). Numeric fractions and
     #: averages derived in-engine from regex predicates inside aggregates; never
@@ -1029,10 +1034,19 @@ class Adapter(Protocol):
       where the table cannot be probed in one statement; the caller then issues
       the separate probes exactly as it would without the pair.
     - ``describe_query(sql)``: output columns of one SELECT, in order, without
-      executing it. Returns a list of :class:`ColumnMeta`. Reading a query's
+      reading any row. Returns a list of :class:`ColumnMeta`. Reading a query's
       output schema is metadata, and ``DESCRIBE`` is not a SELECT
       ``run_query`` can re-assert, so it stays on the adapter. An adapter
-      without it leaves a refactor comparison unchecked.
+      without it reports a refactor comparison as
+      ``comparison_unsupported_on_connector``.
+    - ``describe_query_free``: ``False`` where ``describe_query`` runs on paid
+      compute (it can start a stopped warehouse), so a comparison prices first.
+      Absent reads as free.
+    - ``in_scope(namespace)``: whether a dotted namespace lies inside the
+      scope this command examined (issue #984). Tells carry-forward whether
+      an object missing from this run's inventory was looked for and is gone
+      from the warehouse (dropped), versus lived outside a narrowed ``--scope``
+      or allowlist and must be carried forward untouched (#111, #149).
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".
@@ -1087,9 +1101,10 @@ class Adapter(Protocol):
         self, identifier: str, columns: list[str]
     ) -> dict[str, int]:
         """Exact ``COUNT(DISTINCT)`` for the named columns, batched into as few
-        statements as possible. The engine calls this only for columns whose
-        approximate distinct landed within noise of the non-null count, so the
-        spend is bounded and deliberate; a metered adapter never self-escalates."""
+        statements as possible. ``explore profile`` calls this only for columns
+        whose approximate distinct landed within noise of the non-null count or
+        that set ``distinct_count_missing``, so the spend is bounded and
+        deliberate; a metered adapter never self-escalates."""
         ...
 
     def distinct_combination_counts(

@@ -1,0 +1,23 @@
+version: 2
+models:
+  - name: account_event_rate
+    description: One row per account with its event rate over the 30-day window.
+    config:
+      meta:
+        dex:
+          grain: [account_id]
+          population:
+            rule: Accounts with at least one event.
+          assumptions:
+            - decision: Whether accounts with no events belong in the output
+              chosen: only accounts with events
+              evidence: request
+              detail: the request says to leave out accounts with zero events
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key}}}
+      - name: event_count
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+      - name: events_per_day
+        config: {meta: {dex: {role: measure, aggregation: avg, additivity: non_additive, unit: events per day}}}

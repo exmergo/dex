@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from ..yaml_spans import block_end, indent_of
+from ..yaml_spans import sequence_item_span
 
 if TYPE_CHECKING:
     from ..maintain.drift import DriftFinding
@@ -205,7 +205,7 @@ def apply_removal(text: str, removal: dict[str, Any]) -> str | None:
         for item, node in zip(items, sequence.value, strict=True):
             if not selected(item):
                 continue
-            span = _item_span(text, node)
+            span = sequence_item_span(text, node.start_mark.index)
             if span is None:
                 return None
             changes.append((*span, ""))
@@ -253,21 +253,6 @@ def _locate(
         colon = text.find(":", key_node.end_mark.index)
         return (colon, value) if colon >= 0 else None
     return None
-
-
-def _item_span(text: str, node: yaml.Node) -> tuple[int, int] | None:
-    """Where one block-sequence item starts and stops, dash line to last line.
-
-    Only an item whose dash opens its own line: anything else shares a line
-    with something that is not being removed.
-    """
-
-    start = node.start_mark.index
-    line_start = text.rfind("\n", 0, start) + 1
-    lead = text[line_start:start]
-    if lead.strip() != "-" or lead.rstrip().count("-") != 1:
-        return None
-    return line_start, block_end(text, line_start, indent_of(text, line_start))
 
 
 def _proposal(

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import write_manifest
 
+from exmergo_dex_core.adapters.base import QueryResult
 from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
@@ -23,6 +24,7 @@ from exmergo_dex_core.cache import (
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
+from exmergo_dex_core.errors import WarehouseQueryError
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
     _declared_relationship_conflicts,
@@ -1604,6 +1606,313 @@ def test_map_verify_also_reports_orphan_findings(tmp_path: Path, capsys):
     assert any("not evidence of a shared key" in n for n in orders.data_quality)
 
 
+def test_a_declared_join_takes_the_spelling_its_profile_records():
+    """A dbt project writes ``customer_id`` where Snowflake stores
+    ``CUSTOMER_ID``; the probe quotes identifiers, so the edge has to carry the
+    profiled spelling or the statement binds to nothing. A column with no
+    match, or with two that differ only by case, is left as written."""
+
+    from exmergo_dex_core.explore.relationships import adopt_profiled_spelling
+
+    orders = _ds("DB.DEV.FCT_ORDERS", [_col("ORDER_ID"), _col("CUSTOMER_ID")])
+    customers = _ds(
+        "DB.DEV.DIM_CUSTOMERS", [_col("CUSTOMER_ID"), _col("Id"), _col("ID")]
+    )
+    declared = _rel(
+        from_dataset="DB.DEV.FCT_ORDERS",
+        from_columns=["customer_id"],
+        to_dataset="DB.DEV.DIM_CUSTOMERS",
+        to_columns=["customer_id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    ambiguous = _rel(
+        from_dataset="DB.DEV.FCT_ORDERS",
+        from_columns=["order_id"],
+        to_dataset="DB.DEV.DIM_CUSTOMERS",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    unprofiled = _rel(
+        from_dataset="DB.DEV.FCT_ORDERS",
+        from_columns=["ghost"],
+        to_dataset="DB.DEV.ELSEWHERE",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+
+    adopt_profiled_spelling([declared, ambiguous, unprofiled], [orders, customers])
+
+    assert declared.from_columns == ["CUSTOMER_ID"]
+    assert declared.to_columns == ["CUSTOMER_ID"]
+    assert ambiguous.from_columns == ["ORDER_ID"]
+    assert ambiguous.to_columns == ["id"]
+    assert unprofiled.from_columns == ["ghost"]
+    assert unprofiled.to_columns == ["id"]
+
+
+def test_missing_column_findings_names_the_relation_and_column():
+    """A declared edge referencing a column its dataset's profile does not
+    have carries a finding naming the relation and the missing column; a
+    sound edge and an edge whose parent was not profiled do not."""
+
+    from exmergo_dex_core.explore.relationships import missing_column_findings
+
+    orders = _ds("db.main.orders", [_col("id"), _col("customer_id")])
+    customers = _ds("db.main.customers", [_col("id")])
+
+    good = _rel(
+        from_dataset="db.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="db.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    broken = _rel(
+        from_dataset="db.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="db.main.customers",
+        to_columns=["region_code"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    unprofiled_parent = _rel(
+        from_dataset="db.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="db.main.archived_orders",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+
+    findings = missing_column_findings(
+        [good, broken, unprofiled_parent], [orders, customers]
+    )
+    assert len(findings) == 1
+    found_rel, text = findings[0]
+    assert found_rel is broken
+    assert "db.main.orders.customer_id -> db.main.customers.region_code" in text
+    assert '"region_code"' in text
+    assert "does not exist on db.main.customers" in text
+    assert "declared as a foreign key" in text
+    assert "the project and the warehouse disagree" in text
+
+
+def test_verify_survives_a_declared_join_naming_a_missing_column(
+    tmp_path: Path, capsys
+):
+    """Issue #924 end to end: one declared join is measurable, the other names
+    a column the warehouse does not have. `--verify` still succeeds: the good
+    edge is verified, the broken one is reported as a finding (relation and
+    missing column named) rather than failing the whole command, and the same
+    text lands in the child dataset's persisted data_quality."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, region_code VARCHAR)"
+    )
+    conn.execute("INSERT INTO orders VALUES (1, 1, 'EU'), (2, 2, 'US'), (3, 1, 'APAC')")
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: customer_id\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('customers')\n"
+        "              field: id\n"
+        "      - name: region_code\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('customers')\n"
+        "              field: region_code\n",
+        encoding="utf-8",
+    )
+
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--verify",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    by_fk = {tuple(r["from_columns"]): r for r in data["relationships"]}
+    good = by_fk[("customer_id",)]
+    assert good["verified"] is True
+    assert good["orphan_fraction"] == 0.0
+    broken = by_fk[("region_code",)]
+    assert broken["kind"] == "declared"
+    assert broken["verified"] is False
+    # A declaration is not demoted: only the verification verdict is withheld.
+    assert broken["confidence"] == 1.0
+
+    notes = " ".join(data["notes"])
+    assert "wh.main.orders.region_code -> wh.main.customers.region_code" in notes
+    assert '"region_code"' in notes
+    assert "does not exist on wh.main.customers" in notes
+    assert "declared as a foreign key" in notes
+    assert "the project and the warehouse disagree" in notes
+    # The probe never ran against the ghost column, so no raw warehouse error
+    # text leaks into the envelope.
+    assert "Binder" not in notes
+    assert "Error" not in notes
+
+    cache = FilesystemStore(repo).load_cache()
+    orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
+    assert any("does not exist on wh.main.customers" in n for n in orders.data_quality)
+
+
+class _RefusingProbeAdapter:
+    """A probe-only adapter stand-in: ``run_query`` answers from a rule over
+    the statement, so a refused batch, a ClickHouse supertype refusal, and a
+    permanently refused edge are reproducible without a warehouse."""
+
+    def __init__(self, dialect: str, rule):
+        self.dialect = dialect
+        self.statements: list[str] = []
+        self._rule = rule
+
+    def run_query(self, sql, *, max_rows, timeout_seconds):
+        self.statements.append(sql)
+        return self._rule(sql)
+
+
+def _probe_counts(nonnull: int, orphans: int) -> QueryResult:
+    return QueryResult(
+        columns=["nonnull_fk_0", "orphans_0"],
+        types=["INTEGER", "INTEGER"],
+        cells=[[nonnull, orphans]],
+        truncated=False,
+    )
+
+
+def test_verify_retries_a_refused_batch_edge_by_edge():
+    """Issue #933: one edge the warehouse refuses must not take the batch
+    down. The batched statement fails, each edge is re-probed on its own, and
+    both are measured."""
+
+    def _rule(sql):
+        if "nonnull_fk_1" in sql:
+            raise WarehouseQueryError("the warehouse refused the statement")
+        return _probe_counts(10, 2)
+
+    adapter = _RefusingProbeAdapter("duckdb", _rule)
+    rels = [
+        _probe_rel("orders", "customer_id", "customers", "id"),
+        _probe_rel("returns", "customer_id", "customers", "id"),
+    ]
+    refused = verify_relationships(adapter, rels)
+    assert refused == []
+    assert [(r.verified, r.orphan_fraction) for r in rels] == [
+        (True, 0.2),
+        (True, 0.2),
+    ]
+    assert len(adapter.statements) == 3  # one batch, then one per edge
+
+
+def test_verify_reports_an_edge_that_refuses_even_alone():
+    """Issue #933: an edge that refuses its own single-edge probe is reported
+    and left unverified while the rest of the batch is still measured."""
+
+    def _rule(sql):
+        if "ghost" in sql:
+            raise WarehouseQueryError("table does not exist")
+        return _probe_counts(10, 0)
+
+    adapter = _RefusingProbeAdapter("duckdb", _rule)
+    good = _probe_rel("orders", "customer_id", "customers", "id")
+    broken = _probe_rel("ghost_orders", "customer_id", "customers", "id")
+    refused = verify_relationships(adapter, [good, broken])
+    assert good.verified is True
+    assert good.orphan_fraction == 0.0
+    assert broken.verified is False
+    assert broken.orphan_fraction is None
+    assert len(refused) == 1
+    assert refused[0][0] is broken
+    assert "wh.main.ghost_orders.customer_id" in refused[0][1]
+    assert "could not be probed" in refused[0][1]
+    assert "stays unverified" in refused[0][1]
+
+
+def test_verify_retries_a_clickhouse_supertype_refusal_with_int128():
+    """Issue #933, first acceptance bullet: a ClickHouse join between a
+    UInt64 key and an Int32 key is refused for lack of a supertype, then
+    measured when both sides are compared as Int128."""
+
+    def _rule(sql):
+        if "CAST" in sql.upper() and "INT128" in sql.upper():
+            return _probe_counts(10, 1)
+        raise WarehouseQueryError(
+            "Code: 386. DB::Exception: There is no supertype for types "
+            "UInt64, Int32 because some of them are signed integers and "
+            "some are unsigned integers [386]"
+        )
+
+    adapter = _RefusingProbeAdapter("clickhouse", _rule)
+    rel = _probe_rel("orders", "customer_id", "customers", "id")
+    refused = verify_relationships(adapter, [rel])
+    assert refused == []
+    assert rel.verified is True
+    assert rel.orphan_fraction == 0.1
+    assert any(
+        "CAST" in stmt.upper() and "INT128" in stmt.upper()
+        for stmt in adapter.statements
+    )
+
+
+def test_verify_does_not_cast_retry_a_non_supertype_refusal():
+    """The Int128 retry is for the ClickHouse no-supertype refusal only: any
+    other refusal is reported after the single-edge retry, with no cast
+    statement issued."""
+
+    def _rule(sql):
+        raise WarehouseQueryError("table does not exist")
+
+    adapter = _RefusingProbeAdapter("clickhouse", _rule)
+    rel = _probe_rel("orders", "customer_id", "customers", "id")
+    refused = verify_relationships(adapter, [rel])
+    assert len(refused) == 1
+    assert rel.verified is False
+    assert not any("CAST" in stmt.upper() for stmt in adapter.statements)
+
+
+def test_verify_still_raises_a_non_warehouse_failure():
+    """The fallback swallows warehouse refusals only: a budget, timeout, or
+    connection failure still aborts the verify pass as before."""
+
+    def _rule(sql):
+        raise ValueError("boom")
+
+    adapter = _RefusingProbeAdapter("duckdb", _rule)
+    with pytest.raises(ValueError, match="boom"):
+        verify_relationships(
+            adapter, [_probe_rel("orders", "customer_id", "customers", "id")]
+        )
+
+
 def test_relationships_persists_datasets_and_relationships(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
@@ -2669,3 +2978,25 @@ def test_verify_at_75_percent_orphans_demotes_below_half_and_notes_why(
     assert rel["confidence"] < 0.5, "measured orphan rate demotes confidence below 0.5"
     assert any("75% of values have no match" in n for n in data["notes"])
     assert any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_a_key_that_mixes_value_shapes_is_restated_as_a_finding_code():
+    """`transform plan` cites a mixed-shape key beside a conversion of it
+    (#861), and reads the code rather than the sentence."""
+
+    note = (
+        "id is a candidate key but mixes value shapes: 90% numeric, 10% other; "
+        "casting to a number or comparing numerically will silently drop the "
+        "non-numeric group(s)"
+    )
+    ds = Dataset(
+        identifier="db.main.t",
+        row_count=100,
+        columns=[ColumnProfile(name="id", data_type="VARCHAR", null_fraction=0.0)],
+        data_quality=[note, "ghost is a candidate key but mixes value shapes: x"],
+    )
+    findings = profile_findings(ds, high_null_fraction=0.95)
+    (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
+    assert mixed.column == "id"
+    assert mixed.severity == "low"
+    assert mixed.detail == note

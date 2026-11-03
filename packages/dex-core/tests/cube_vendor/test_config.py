@@ -61,8 +61,9 @@ def test_cube_is_a_vendor_with_one_local_deployment_and_its_own_source():
     assert SEMANTIC_SOURCE_FACTORIES["cube"] == (
         "exmergo_dex_core.cube.project:build_semantic_layer"
     )
-    # Authoring arrives with #911, once the layer validates authored files.
-    assert "cube" not in SEMANTIC_DOCUMENT_AUTHORING
+    # Authored through `semantic cube` (#911), validated by the layer itself.
+    assert "cube" in SEMANTIC_DOCUMENT_AUTHORING
+    assert set(SEMANTIC_DOCUMENT_AUTHORING) <= set(SEMANTIC_SOURCE_FACTORIES)
 
 
 def test_the_documented_block_loads(tmp_path):
