@@ -116,9 +116,14 @@ class ConversionCounts(BaseModel):
 class IdentityChange(BaseModel):
     """The prior and the authored model's identities in one output column,
     compared as text, distinct and NULL-free. ``identity_changed`` holds even
-    when the two row counts are equal: that is the case it exists for."""
+    when the two row counts are equal: that is the case it exists for.
+
+    ``column`` is the authored output name the probe reads. When a repair also
+    renames that key, ``prior_column`` names the prior output it mapped back to.
+    """
 
     column: str
+    prior_column: str | None = None
     prior_rows: int | None = None
     authored_rows: int | None = None
     prior_entities: int | None = None
@@ -784,13 +789,22 @@ def _outputs(tree: exp.Expression) -> set[str] | None:
 
 
 def identity_probe(
-    prior: exp.Expression, authored: exp.Expression, column: str, dialect: str
+    prior: exp.Expression,
+    authored: exp.Expression,
+    column: str,
+    dialect: str,
+    authored_column: str | None = None,
 ) -> str:
-    """One statement comparing the distinct identities ``column`` holds in the
-    prior and the authored model, as text, plus both row counts."""
+    """One statement comparing the distinct identities a key holds in the prior
+    and the authored model, as text, plus both row counts.
+
+    ``column`` is the prior output name; ``authored_column`` defaults to the
+    same name and covers a repair that renames the key.
+    """
 
     text = _text_type(dialect).sql(dialect=dialect)
-    ident = exp.to_identifier(column).sql(dialect=dialect)
+    prior_ident = exp.to_identifier(column).sql(dialect=dialect)
+    authored_ident = exp.to_identifier(authored_column or column).sql(dialect=dialect)
 
     def body(tree: exp.Expression) -> str:
         inner = tree.copy()
@@ -805,15 +819,16 @@ def identity_probe(
     sql = (
         "SELECT pr.prior_rows, pr.prior_entities, au.authored_rows, "
         "au.authored_entities, k.kept FROM ("
-        f"SELECT COUNT(*) AS prior_rows, COUNT(DISTINCT CAST(x.{ident} AS {text})) "
+        "SELECT COUNT(*) AS prior_rows, "
+        f"COUNT(DISTINCT CAST(x.{prior_ident} AS {text})) "
         f"AS prior_entities FROM ({p}) AS x) AS pr CROSS JOIN ("
         "SELECT COUNT(*) AS authored_rows, "
-        f"COUNT(DISTINCT CAST(x.{ident} AS {text})) "
+        f"COUNT(DISTINCT CAST(x.{authored_ident} AS {text})) "
         f"AS authored_entities FROM ({a}) AS x) AS au CROSS JOIN ("
         "SELECT COUNT(*) AS kept FROM ("
-        + keys.format(c=ident, t=text, b=p)
+        + keys.format(c=prior_ident, t=text, b=p)
         + ") AS pk INNER JOIN ("
-        + keys.format(c=ident, t=text, b=a)
+        + keys.format(c=authored_ident, t=text, b=a)
         + ") AS ak ON pk.dex_k = ak.dex_k) AS k"
     )
     return sqlglot.parse_one(sql, read=dialect).sql(dialect=dialect)
@@ -1047,6 +1062,56 @@ def diagnose(
     return diagnosis
 
 
+def _projection_for(tree: exp.Expression, name: str) -> exp.Expression | None:
+    """The SELECT projection that emits ``name``, or None when it cannot be read."""
+
+    body = tree.unnest() if hasattr(tree, "unnest") else tree
+    branches = sql_shape.select_branches(body)
+    if not branches:
+        return None
+    wanted = name.lower()
+    for projection in branches[0].expressions:
+        out = (projection.alias_or_name or "").lower()
+        if out == wanted:
+            return projection
+    return None
+
+
+def _source_columns(projection: exp.Expression) -> set[str]:
+    """Bare column names a projection expression reads."""
+
+    inner = projection.this if isinstance(projection, exp.Alias) else projection
+    return {column.name.lower() for column in inner.find_all(exp.Column)}
+
+
+def _prior_for_renamed_output(
+    authored: exp.Expression, authored_name: str, prior_out: set[str]
+) -> str | None:
+    """Map an authored-only output back to the prior column it came from.
+
+    Returns the prior name when the projection reads exactly one column that
+    the prior model exposed, and no other authored output also reads that
+    column (two outputs from one source stay ``no_shared_key_column``).
+    """
+
+    projection = _projection_for(authored, authored_name)
+    if projection is None:
+        return None
+    sources = _source_columns(projection)
+    if len(sources) != 1 or not sources <= prior_out:
+        return None
+    prior_name = next(iter(sources))
+    authored_names = _outputs(authored) or set()
+    readers = []
+    for other in authored_names:
+        other_proj = _projection_for(authored, other)
+        if other_proj is not None and prior_name in _source_columns(other_proj):
+            readers.append(other)
+    if readers != [authored_name.lower()]:
+        return None
+    return prior_name
+
+
 def _plan_identity(
     entry: _Entry,
     conversion: _Found,
@@ -1062,8 +1127,9 @@ def _plan_identity(
     converted column itself where the driving relation carries it straight
     through, or the declared single-column grain. A join conversion on the
     joined side names a column of another relation, so it falls to the grain.
-    The statements are shared per column: two conversions on one model read
-    the same two model versions once.
+    When a repair renames the key, the authored output is traced back to the
+    prior column it still reads. The statements are shared per authored
+    column: two conversions on one model read the same two model versions once.
     """
 
     record = entry.record
@@ -1092,30 +1158,59 @@ def _plan_identity(
     ):
         carried = partner.name
     grain = [str(c).lower() for c in declared.get("grain") or []]
+    prior_column: str | None = None
+    authored_column: str | None = None
     for candidate in (
         conversion.output,
         carried,
         grain[0] if len(grain) == 1 else None,
     ):
         if candidate and candidate.lower() in prior_out & authored_out:
-            column = candidate.lower()
+            prior_column = authored_column = candidate.lower()
             break
     else:
-        record.identity_reason_code = "no_shared_key_column"
-        record.identity_reason = (
-            "no output column carries the identifier in both the prior and the "
-            "authored model"
-        )
-        return
-    record.identity = IdentityChange(column=column)
-    if column not in shared:
-        shared[column] = (
+        for candidate in (
+            conversion.output,
+            carried,
+            grain[0] if len(grain) == 1 else None,
+        ):
+            if not candidate or candidate.lower() not in authored_out:
+                continue
+            mapped = _prior_for_renamed_output(authored, candidate, prior_out)
+            if mapped is not None:
+                prior_column, authored_column = mapped, candidate.lower()
+                break
+        if prior_column is None or authored_column is None:
+            record.identity_reason_code = "no_shared_key_column"
+            record.identity_reason = (
+                "no output column carries the identifier in both the prior and the "
+                "authored model"
+            )
+            return
+    record.identity = IdentityChange(
+        column=authored_column,
+        prior_column=None if prior_column == authored_column else prior_column,
+    )
+    share_key = (
+        authored_column
+        if prior_column == authored_column
+        else f"{prior_column}->{authored_column}"
+    )
+    if share_key not in shared:
+        shared[share_key] = (
             ExtraProbe(sql=count_sql(prior, dialect), label=LABEL),
             ExtraProbe(
-                sql=identity_probe(prior, authored, column, dialect), label=LABEL
+                sql=identity_probe(
+                    prior,
+                    authored,
+                    prior_column,
+                    dialect,
+                    authored_column=authored_column,
+                ),
+                label=LABEL,
             ),
         )
-    entry.baseline, entry.identity = shared[column]
+    entry.baseline, entry.identity = shared[share_key]
 
 
 def _text_source(cache: DexCache | None, conversion: _Found) -> bool:
