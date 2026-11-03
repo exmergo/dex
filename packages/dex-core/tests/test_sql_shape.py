@@ -216,3 +216,20 @@ def test_from_relation_handles_non_select():
     assert sql_shape.from_relation(None) is None
     union = _parse("select 1 union all select 2")
     assert sql_shape.from_relation(union) is None
+
+
+def test_scope_identifiers_preserves_quoted_mixed_case_cte_names():
+    """scope_identifiers retains original casing and quotes on cte identifiers."""
+    sql = (
+        'with "Orders_Clean" as (select 1 as id), '
+        "raw as (select 2 as id) "
+        'select * from "Orders_Clean"'
+    )
+    tree = _parse(sql)
+    idents = sql_shape.scope_identifiers(tree)
+    assert idents["orders_clean"].this == "Orders_Clean"
+    assert idents["orders_clean"].quoted is True
+    assert idents["raw"].this == "raw"
+    assert not idents["raw"].quoted
+    assert sql_shape.scope_identifier(tree, "orders_clean").this == "Orders_Clean"
+    assert sql_shape.scope_identifier(tree, "orders_clean").quoted is True
