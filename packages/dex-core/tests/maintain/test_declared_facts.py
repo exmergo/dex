@@ -995,3 +995,42 @@ def test_an_additivity_finding_names_columns_as_declared(tmp_path: Path):
     assert finding.column == "running_total"
     assert finding.data["entity"] == "customer_id"
     assert finding.data["ordered_by"] == "placed_at"
+
+
+def test_unchecked_parents_preserves_parent_unwritten_over_scan_offer():
+    """When a parent is in parent_unwritten, unchecked_parents keeps its
+    reason_code and message even when a scan offer reason is passed."""
+
+    from exmergo_dex_core.maintain.declared_facts import (
+        DeclaredFactsResult,
+        DeclaredModel,
+        ParentRule,
+        Prepared,
+        _unchecked_parents,
+    )
+
+    m1 = DeclaredModel(
+        model="rpt_orders",
+        unique_id="model.p.rpt_orders",
+        relation="rpt_orders",
+        parent=ParentRule("orders", "orders", (("order_id", "order_id"),)),
+    )
+    m2 = DeclaredModel(
+        model="rpt_users",
+        unique_id="model.p.rpt_users",
+        relation="rpt_users",
+        parent=ParentRule("users", "users", (("user_id", "user_id"),)),
+    )
+    prepared = Prepared(
+        parent_models=[m1, m2],
+        parent_unwritten={"rpt_orders": ("parent_not_built", "orders was not built")},
+    )
+    result = DeclaredFactsResult()
+    _unchecked_parents(prepared, result, "scan_offered", "a scan is required")
+
+    assert len(result.parent_coverage) == 2
+    by_model = {r["model"]: r for r in result.parent_coverage}
+    assert by_model["rpt_orders"]["reason_code"] == "parent_not_built"
+    assert by_model["rpt_orders"]["reason"] == "orders was not built"
+    assert by_model["rpt_users"]["reason_code"] == "scan_offered"
+    assert by_model["rpt_users"]["reason"] == "a scan is required"

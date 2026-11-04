@@ -1186,6 +1186,186 @@ def test_a_build_measures_its_joins_and_its_declared_parent(tmp_path: Path):
     assert parent["status"] == "contradicted"
 
 
+def test_a_build_whose_selection_omits_the_declared_parent_reports_parent_not_built(
+    tmp_path: Path,
+):
+    """When a build's selection omits the parent relation, parent_population
+    reports unchecked with reason_code parent_not_built and names the selection."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.activity AS SELECT * FROM (VALUES "
+        "(1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')) t(activity_id, subscription_id)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_subscriptions AS "
+        "SELECT 1 AS activity_id, 'a1' AS subscription_id, "
+        "TIMESTAMP '2026-01-01' AS created_at"
+    )
+    conn.close()
+    _repro_manifest(tmp_path)
+    adapter = DuckDBAdapter(path)
+    try:
+        summary = {
+            **_summary([_node("model.p.rpt_subscriptions")]),
+            "selection": "+rpt_subscriptions",
+        }
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            summary,
+            resolve_adapter=lambda: adapter,
+            selection="+rpt_subscriptions",
+        )
+    finally:
+        adapter.close()
+
+    payload = result.payload()
+    (parent,) = payload["parent_population"]
+    assert parent["status"] == "unchecked"
+    assert parent["reason_code"] == "parent_not_built"
+    assert "+rpt_subscriptions" in parent["reason"]
+    assert "add it to --select" in parent["reason"]
+    expected_note = (
+        "(a parent that is not an ancestor is never built by +rpt_subscriptions)"
+    )
+    assert expected_note in parent["reason"]
+    assert parent["reason"] == parent.get("detail")
+
+
+def test_a_parent_matching_several_relations_keeps_its_current_reason(
+    tmp_path: Path,
+):
+    """When the parent identifier matches several warehouse objects, the record
+    stays unchecked with reason_code not_measured and its current message."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute("CREATE SCHEMA other_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.subscriptions AS SELECT 1 AS subscription_id, "
+        "TIMESTAMP '2026-01-01' AS created_at"
+    )
+    conn.execute(
+        "CREATE TABLE other_dev.subscriptions AS SELECT 1 AS subscription_id, "
+        "TIMESTAMP '2026-01-01' AS created_at"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.activity AS SELECT * FROM (VALUES "
+        "(1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')) t(activity_id, subscription_id)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_subscriptions AS "
+        "SELECT 1 AS activity_id, 'a1' AS subscription_id, "
+        "TIMESTAMP '2026-01-01' AS created_at"
+    )
+    conn.close()
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.subscriptions": {
+                "name": "subscriptions",
+                "resource_type": "model",
+                "relation_name": "subscriptions",
+                "compiled_code": "select * from subscriptions",
+            },
+            "model.p.rpt_subscriptions": {
+                "name": "rpt_subscriptions",
+                "resource_type": "model",
+                "relation_name": '"dbt_dev"."rpt_subscriptions"',
+                "compiled_code": _REPRO_SQL,
+                "config": {
+                    "materialized": "table",
+                    "meta": {
+                        "dex": {
+                            "population": {
+                                "parent": {
+                                    "model": "subscriptions",
+                                    "key": {"subscription_id": "subscription_id"},
+                                }
+                            }
+                        }
+                    },
+                },
+                "columns": {
+                    "created_at": {
+                        "name": "created_at",
+                        "config": {"meta": {"dex": {"null_rule": "never"}}},
+                    }
+                },
+            },
+        },
+        results=[{"unique_id": "model.p.rpt_subscriptions", "status": "success"}],
+    )
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_subscriptions")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    payload = result.payload()
+    (parent,) = payload["parent_population"]
+    assert parent["status"] == "unchecked"
+    assert parent["reason_code"] == "not_measured"
+    assert "no single relation in the warehouse matched the parent" in parent["reason"]
+
+
+def test_build_omitting_parent_without_selection_reports_parent_not_built(
+    tmp_path: Path,
+):
+    """When no selection is given and the parent is absent from the warehouse,
+    parent_population reports unchecked with reason_code parent_not_built."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.activity AS SELECT * FROM (VALUES "
+        "(1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')) t(activity_id, subscription_id)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_subscriptions AS "
+        "SELECT 1 AS activity_id, 'a1' AS subscription_id, "
+        "TIMESTAMP '2026-01-01' AS created_at"
+    )
+    conn.close()
+    _repro_manifest(tmp_path)
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_subscriptions")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    payload = result.payload()
+    (parent,) = payload["parent_population"]
+    assert parent["status"] == "unchecked"
+    assert parent["reason_code"] == "parent_not_built"
+    assert "no relation in the warehouse matched" in parent["reason"]
+
+
 def test_a_failed_build_suppresses_the_join_contract_and_says_why(tmp_path: Path):
     _repro_manifest(tmp_path)
     result = _sweep(

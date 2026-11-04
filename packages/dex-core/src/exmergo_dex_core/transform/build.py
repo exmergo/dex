@@ -393,6 +393,8 @@ def build(
         log_file=log_file,
         label_root=run_cwd if detached else None,
     )
+    if select is not None:
+        summary.setdefault("selection", select)
     try:
         remember_seed_types(artifacts, seed_history_directory, target)
     except (OSError, ValueError) as exc:
@@ -2644,6 +2646,14 @@ def _summarize(
         "counts": counts,
         "messages": messages,
     }
+    if run_results.is_file():
+        select_arg = (document.get("args") or {}).get("select")
+        if select_arg:
+            summary["selection"] = (
+                " ".join(select_arg)
+                if isinstance(select_arg, list)
+                else str(select_arg)
+            )
     # Internal hand-offs, not envelope shape: `_shape_build_result` pops these to
     # ledger the build and report it under `data.spend`, the one key every billed
     # command reports spend under (issue #276). `bytes_billed` is present only

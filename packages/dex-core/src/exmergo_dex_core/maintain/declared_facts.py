@@ -368,6 +368,10 @@ class Prepared:
     temporal_models: list[DeclaredModel] = field(default_factory=list)
     #: Each contract no statement could be written for, with why (#1027).
     temporal_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: Each parent check no statement could be written for, with code and why.
+    parent_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: The selector expression that scoped the build, when one did.
+    selection: str | None = None
 
     def statements(self) -> list[str]:
         return [s for probe in self.probes for s in probe.statements()]
@@ -380,6 +384,7 @@ def prepare(
     *,
     check_grain: bool = False,
     tested_grain: bool = False,
+    selection: str | None = None,
 ) -> Prepared:
     """Resolve each model to its relation and write the statements that check it.
 
@@ -398,11 +403,14 @@ def prepare(
     left to that test unless ``tested_grain`` says otherwise: a build runs the
     test itself, while `maintain verify` ranks the declaration first among its
     grain sources and so checks it here instead.
+
+    ``selection`` carries the build selector, when one was used, so a parent
+    omitted by a narrow selection can say which selector skipped it.
     """
 
     from ..guards.cost_guard import CostGuardError
 
-    prepared = Prepared()
+    prepared = Prepared(selection=selection)
     for finding_class in CLASSES:
         prepared.declared[finding_class] = sum(
             m.declares(finding_class) for m in models
@@ -649,10 +657,12 @@ def _parent_probe(
         raise ValueError("no declared parent")
     name = model.model
     if parent.relation is None:
-        prepared.dropped["parent_population"].append(
-            f"{name}: the project has no built model, seed or snapshot named "
+        why = (
+            f"the project has no built model, seed or snapshot named "
             f"'{parent.model}' to compare against"
         )
+        prepared.parent_unwritten[name] = ("no_such_relation", why)
+        prepared.dropped["parent_population"].append(f"{name}: {why}")
         return
 
     parent_live: dict[str, tuple[str, str]] | None = None
@@ -660,11 +670,28 @@ def _parent_probe(
         parent_identifier = parent.relation
     else:
         matches = match_identifier(parent.relation, live_identifiers)
-        if len(matches) != 1:
-            prepared.dropped["parent_population"].append(
-                f"{name}: no single relation in the warehouse matched the parent "
+        if not matches:
+            if prepared.selection:
+                why = (
+                    f"the declared parent '{parent.model}' was not built by selection "
+                    f"'{prepared.selection}': add it to --select "
+                    f"(a parent that is not an ancestor is never built by +{name})"
+                )
+            else:
+                why = (
+                    f"the declared parent '{parent.model}' was not built: "
+                    f"no relation in the warehouse matched '{parent.relation}'"
+                )
+            prepared.parent_unwritten[name] = ("parent_not_built", why)
+            prepared.dropped["parent_population"].append(f"{name}: {why}")
+            return
+        if len(matches) > 1:
+            why = (
+                f"no single relation in the warehouse matched the parent "
                 f"{parent.relation}"
             )
+            prepared.parent_unwritten[name] = ("not_measured", why)
+            prepared.dropped["parent_population"].append(f"{name}: {why}")
             return
         parent_identifier = matches[0]
         try:
@@ -672,9 +699,9 @@ def _parent_probe(
         except CostGuardError:
             raise
         except Exception as exc:
-            prepared.dropped["parent_population"].append(
-                f"{name}: the parent's columns could not be read ({_refusal(exc)})"
-            )
+            why = f"the parent's columns could not be read ({_refusal(exc)})"
+            prepared.parent_unwritten[name] = ("columns_unread", why)
+            prepared.dropped["parent_population"].append(f"{name}: {why}")
             return
         parent_live = {c.name.lower(): (c.name, c.data_type) for c in columns} or None
 
@@ -700,10 +727,12 @@ def _parent_probe(
         if r is None
     ]
     if absent:
-        prepared.dropped["parent_population"].append(
-            f"{name}: the parent key names column(s) a relation does not have "
+        why = (
+            f"the parent key names column(s) a relation does not have "
             f"({', '.join(absent)})"
         )
+        prepared.parent_unwritten[name] = ("key_missing", why)
+        prepared.dropped["parent_population"].append(f"{name}: {why}")
         return
 
     out_names = [c for c in out_keys if c is not None]
@@ -1085,20 +1114,26 @@ def _unchecked_parents(
     for model in prepared.parent_models:
         if model.model in recorded:
             continue
-        why = reason or next(
-            (
-                d.partition(": ")[2]
-                for d in prepared.dropped.get("parent_population", [])
-                if d.startswith(f"{model.model}: ")
-            ),
-            "the check could not be written",
-        )
+        if model.model in prepared.parent_unwritten:
+            code, why = prepared.parent_unwritten[model.model]
+        elif reason is not None:
+            code, why = reason_code, reason
+        else:
+            code = reason_code
+            why = next(
+                (
+                    d.partition(": ")[2]
+                    for d in prepared.dropped.get("parent_population", [])
+                    if d.startswith(f"{model.model}: ")
+                ),
+                "the check could not be written",
+            )
         probe = next(
             (p for p in prepared.probes if p.model.model == model.model),
             _Probe(model=model, identifier=model.relation),
         )
         result.parent_coverage.append(
-            _parent_record(probe, None, "unchecked", reason_code, why)
+            _parent_record(probe, None, "unchecked", code, why)
         )
 
 
@@ -1146,6 +1181,8 @@ def _parent_record(
     reason_code: str | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
+    """Build one parent population coverage record for payload output."""
+
     parent = probe.model.parent
     if parent is None:  # pragma: no cover - callers only pass parent models
         raise ValueError("no declared parent")
@@ -1166,6 +1203,7 @@ def _parent_record(
         record["reason_code"] = reason_code
     if reason is not None:
         record["reason"] = reason
+        record["detail"] = reason
     return record
 
 
