@@ -17,6 +17,16 @@ relation dbt built, with one aggregate statement per relation:
 - **Population.** A value a ``population.filters`` entry excludes (or, for an
   ``includes`` list, any value it does not include) still present in the
   relation is ``population_contradicted``, stated as a count and never as rows.
+- **Parent population** (#857). A ``population.parent`` names the model, seed
+  or snapshot the rows are drawn from and the key that identifies one row per
+  parent. Parent keys absent from the output are ``parent_population_missing``
+  and output keys absent from the parent ``parent_population_unexpected``, both
+  stated as distinct-key counts. A ``population.filters`` entry whose column the
+  parent also has is applied to the parent first, so a parent the declaration
+  excludes is counted as excluded rather than missing.
+- **Temporal contract** (#1027). A ``history`` block states how a model reads a
+  snapshot's versions. :mod:`~.temporal_contracts` derives each entity's expected
+  values from the snapshot and that policy and counts the disagreements.
 - **Grain**, on the build path only. `maintain verify` checks a declared grain
   through its own grain axis, where the declaration is the first of four
   sources (:func:`~.verify.grain_plan`); a build's sweep folds a declared grain
@@ -45,10 +55,11 @@ from ..cache import match_identifier
 from ..dbt_project import manifest_node_label, strip_relation_quoting
 from ..errors import WarehouseQueryError
 from ..guards.pii_meta import entry_meta
+from . import temporal_contracts as temporal_mod
 from .drift import DriftFinding
 
 #: The declared-fact finding classes this module owns, as `suppressed` names them.
-CLASSES = ("unit", "additivity", "population")
+CLASSES = ("unit", "additivity", "population", "parent_population", "temporal")
 
 #: The units this module can check. Anything else (``currency:EUR``, ``count``,
 #: a plain unit) has no range to check against.
@@ -63,6 +74,17 @@ class PopulationRule:
     column: str
     includes: tuple[Any, ...] | None = None
     excludes: tuple[Any, ...] | None = None
+
+
+@dataclass(frozen=True)
+class ParentRule:
+    """A declared ``population.parent``, with the parent's relation as the
+    manifest names it (``None`` when no project node by that name has one)."""
+
+    model: str
+    relation: str | None
+    #: (output column, parent column) pairs, in declared order.
+    key: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -86,6 +108,8 @@ class DeclaredModel:
     unique_tested: frozenset[str] = frozenset()
     #: The manifest's declared ``data_type`` per lowered column, where one is.
     declared_types: tuple[tuple[str, str], ...] = ()
+    parent: ParentRule | None = None
+    history: temporal_mod.HistoryRule | None = None
 
     def declares(self, finding_class: str) -> bool:
         return bool(
@@ -93,6 +117,8 @@ class DeclaredModel:
                 "unit": self.units,
                 "additivity": self.additive,
                 "population": self.filters,
+                "parent_population": self.parent,
+                "temporal": self.history,
             }[finding_class]
         )
 
@@ -101,7 +127,7 @@ def plan(
     project_dir: Path, *, scope: set[str] | None = None
 ) -> tuple[list[DeclaredModel], list[str]]:
     """Every selected model's checkable declared facts. Free and connectionless:
-    read from ``target/manifest.json``, where dbt has already merged each
+    read from ``the compiled ``manifest.json``, where dbt has already merged each
     model's and column's ``config.meta`` into the node.
 
     ``scope`` holds model unique ids or lowered labels, the same convention
@@ -133,6 +159,31 @@ def plan(
         if isinstance(column, str) and isinstance(attached, str):
             unique_tested.setdefault(attached, set()).add(column.lower())
 
+    # A parent is named the way `ref()` names it: a version label
+    # (`dim_teams.v2`) is that version, and the bare name of a versioned model
+    # is the version an unversioned `ref()` resolves to, its `latest_version`
+    # (#895), never whichever version the manifest happens to list first.
+    relations_by_name: dict[str, str] = {}
+    for uid, node in nodes.items():
+        if not (
+            isinstance(node, dict)
+            and node.get("resource_type") in ("model", "seed", "snapshot")
+            and isinstance(node.get("name"), str)
+            and isinstance(node.get("relation_name"), str)
+            and node["relation_name"]
+        ):
+            continue
+        built = strip_relation_quoting(node["relation_name"])
+        version = node.get("version")
+        if node.get("resource_type") == "model" and version not in (None, ""):
+            relations_by_name[manifest_node_label(uid, node).lower()] = built
+            if str(version) == str(node.get("latest_version")):
+                relations_by_name[node["name"].lower()] = built
+            continue
+        relations_by_name.setdefault(node["name"].lower(), built)
+
+    snapshots = temporal_mod.snapshot_nodes(nodes, project_dir)
+
     models: list[DeclaredModel] = []
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
@@ -148,8 +199,24 @@ def plan(
         declared = _read(node)
         if declared is None:
             continue
-        units, additive, filters, grain, roles, types = declared
-        if not (units or additive or filters or grain):
+        units, additive, filters, grain, roles, types, stated_parent = declared
+        parent = (
+            ParentRule(
+                model=stated_parent[0],
+                relation=relations_by_name.get(stated_parent[0].lower()),
+                key=stated_parent[1],
+            )
+            if stated_parent is not None
+            else None
+        )
+        model_dex = entry_meta(node).get("dex")
+        history = temporal_mod.read_rule(
+            model_dex.get("history") if isinstance(model_dex, dict) else None,
+            snapshots,
+            nodes,
+            uid,
+        )
+        if not (units or additive or filters or grain or parent or history):
             continue
         models.append(
             DeclaredModel(
@@ -163,6 +230,8 @@ def plan(
                 roles=roles,
                 unique_tested=frozenset(unique_tested.get(uid, set())),
                 declared_types=types,
+                parent=parent,
+                history=history,
             )
         )
     return sorted(models, key=lambda m: m.model), []
@@ -206,6 +275,13 @@ def _read(node: dict[str, Any]):
         if includes or excludes:
             filters.append(PopulationRule(entry["column"], includes, excludes))
 
+    from ..project_definitions import read_population_parent
+
+    stated = read_population_parent(
+        population.get("parent") if isinstance(population, dict) else None
+    )
+    parent = (stated.model, tuple(stated.key.items())) if stated is not None else None
+
     grain = model_dex.get("grain")
     grain_columns = (
         tuple(grain)
@@ -219,6 +295,7 @@ def _read(node: dict[str, Any]):
         grain_columns,
         tuple(roles),
         tuple(types),
+        parent,
     )
 
 
@@ -248,9 +325,25 @@ class _Probe:
     #: finding here does, whatever case the warehouse folded it to.
     spellings: dict[str, str] = field(default_factory=dict)
     cumulative_sql: str | None = None
+    #: The parent-population statement and what it applied (#857).
+    parent_sql: str | None = None
+    parent_identifier: str | None = None
+    parent_filters_applied: list[str] = field(default_factory=list)
+    parent_filters_unapplied: list[str] = field(default_factory=list)
+    #: The temporal contract's statement (#1027) and what it measured.
+    temporal: temporal_mod.Written | None = None
 
     def statements(self) -> list[str]:
-        return [s for s in (self.aggregate_sql, self.cumulative_sql) if s]
+        return [
+            s
+            for s in (
+                self.aggregate_sql,
+                self.cumulative_sql,
+                self.parent_sql,
+                self.temporal.sql if self.temporal else None,
+            )
+            if s
+        ]
 
 
 @dataclass
@@ -268,6 +361,17 @@ class Prepared:
     #: each one that will not be checked was dropped.
     declared: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, list[str]] = field(default_factory=dict)
+    #: Every model in scope that declares a parent population, so each one gets
+    #: a record whether or not a statement could be written for it.
+    parent_models: list[DeclaredModel] = field(default_factory=list)
+    #: Per-model reason code for an unmeasured parent population (#1102): a
+    #: parent that was never built reports "parent_not_built" instead of the
+    #: generic "not_measured".
+    parent_reason_codes: dict[str, str] = field(default_factory=dict)
+    #: Every model in scope that declares a temporal contract (#1027).
+    temporal_models: list[DeclaredModel] = field(default_factory=list)
+    #: Each contract no statement could be written for, with why (#1027).
+    temporal_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def statements(self) -> list[str]:
         return [s for probe in self.probes for s in probe.statements()]
@@ -308,6 +412,8 @@ def prepare(
             m.declares(finding_class) for m in models
         )
         prepared.dropped[finding_class] = []
+    prepared.parent_models = [m for m in models if m.parent is not None]
+    prepared.temporal_models = [m for m in models if m.history is not None]
 
     for model in models:
         if live_identifiers is None:
@@ -349,7 +455,11 @@ def prepare(
             prepared,
             check_grain and (tested_grain or grain_untested(model)),
         )
-        if probe.aggregate_sql or probe.cumulative_sql:
+        if model.parent is not None:
+            _parent_probe(adapter, probe, live, live_identifiers, prepared)
+        if model.history is not None:
+            temporal_mod.write_probe(adapter, probe, live, live_identifiers, prepared)
+        if probe.statements():
             prepared.probes.append(probe)
     return prepared
 
@@ -505,6 +615,169 @@ def _probe(
                 f"{model.model}: no declared column could be measured"
             )
     return probe
+
+
+def _parent_probe(
+    adapter,
+    probe: _Probe,
+    live: dict[str, tuple[str, str]] | None,
+    live_identifiers: list[str] | None,
+    prepared: Prepared,
+) -> None:
+    """Write the statement that holds a model's keys to its declared parent's.
+
+    One aggregate statement of scalar subqueries, each an ungrouped count over
+    one row, so nothing but counts comes back:
+
+    - the output's rows, its distinct non-NULL keys, and its rows with a NULL
+      key component;
+    - the parent's distinct non-NULL keys, and those its population filters
+      keep (the eligible parents);
+    - how many eligible parents the output holds, and how many output keys the
+      parent holds (each a LEFT JOIN of distinct keys against distinct keys
+      with a hit flag compared ``= 1``, so a connector that fills a miss with a
+      default still counts it as one).
+
+    A filter applies to the parent only where the parent has that column: the
+    declaration states the filter over the model's columns, and the parent is a
+    different relation, so a filter it cannot evaluate is named as unapplied
+    rather than guessed at.
+    """
+
+    from ..guards.cost_guard import CostGuardError
+    from ..guards.sql_guard import assert_select_only
+
+    model = probe.model
+    parent = model.parent
+    if parent is None:  # pragma: no cover - callers only pass parent models
+        raise ValueError("no declared parent")
+    name = model.model
+    if parent.relation is None:
+        prepared.dropped["parent_population"].append(
+            f"{name}: the project has no built model, seed or snapshot named "
+            f"'{parent.model}' to compare against"
+        )
+        return
+
+    parent_live: dict[str, tuple[str, str]] | None = None
+    if live_identifiers is None:
+        parent_identifier = parent.relation
+    else:
+        matches = match_identifier(parent.relation, live_identifiers)
+        if len(matches) == 0:
+            # The parent was never built in this run, so there is nothing to
+            # match against. This is not a naming problem: the build's
+            # selection simply did not include the parent.
+            prepared.dropped["parent_population"].append(
+                f"{name}: the parent {parent.relation} was not built in this "
+                f"run; add it to --select (a parent that is not an ancestor "
+                f"of {name} is never built by +{name})"
+            )
+            prepared.parent_reason_codes[name] = "parent_not_built"
+            return
+        if len(matches) != 1:
+            prepared.dropped["parent_population"].append(
+                f"{name}: no single relation in the warehouse matched the parent "
+                f"{parent.relation}"
+            )
+            return
+        parent_identifier = matches[0]
+        try:
+            _meta, columns = adapter.table_metadata(parent_identifier)
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            prepared.dropped["parent_population"].append(
+                f"{name}: the parent's columns could not be read ({_refusal(exc)})"
+            )
+            return
+        parent_live = {c.name.lower(): (c.name, c.data_type) for c in columns} or None
+
+    declared_types = dict(model.declared_types)
+
+    def out_column(column: str) -> str | None:
+        if live is None:
+            return column
+        found = live.get(column.lower())
+        return found[0] if found else None
+
+    def parent_column(column: str) -> tuple[str, str | None] | None:
+        if parent_live is None:
+            return column, None
+        return parent_live.get(column.lower())
+
+    out_keys = [out_column(o) for o, _p in parent.key]
+    parent_keys = [parent_column(p) for _o, p in parent.key]
+    absent = [o for (o, _p), r in zip(parent.key, out_keys, strict=True) if r is None]
+    absent += [
+        f"{parent.model}.{p}"
+        for (_o, p), r in zip(parent.key, parent_keys, strict=True)
+        if r is None
+    ]
+    if absent:
+        prepared.dropped["parent_population"].append(
+            f"{name}: the parent key names column(s) a relation does not have "
+            f"({', '.join(absent)})"
+        )
+        return
+
+    out_names = [c for c in out_keys if c is not None]
+    parent_names = [c[0] for c in parent_keys if c is not None]
+    out_rel = _quote_relation(probe.identifier)
+    parent_rel = _quote_relation(parent_identifier)
+    out_nonnull = " AND ".join(f"{_quote(c)} IS NOT NULL" for c in out_names)
+    out_anynull = " OR ".join(f"{_quote(c)} IS NULL" for c in out_names)
+    parent_nonnull = " AND ".join(f"{_quote(c)} IS NOT NULL" for c in parent_names)
+
+    kept: list[str] = []
+    for rule in model.filters:
+        resolved = parent_column(rule.column)
+        if resolved is None:
+            probe.parent_filters_unapplied.append(rule.column)
+            continue
+        spelled, data_type = resolved
+        data_type = data_type or declared_types.get(rule.column.lower())
+        subject, values = _comparison(
+            spelled, data_type, rule.includes or rule.excludes
+        )
+        if rule.excludes:
+            kept.append(f"({_quote(spelled)} IS NULL OR {subject} NOT IN ({values}))")
+        else:
+            kept.append(f"{subject} IN ({values})")
+        probe.parent_filters_applied.append(rule.column)
+    eligible_where = " AND ".join([parent_nonnull, *kept])
+
+    out_select = ", ".join(f"{_quote(c)} AS k{i}" for i, c in enumerate(out_names))
+    parent_select = ", ".join(
+        f"{_quote(c)} AS k{i}" for i, c in enumerate(parent_names)
+    )
+    on = " AND ".join(f"a.k{i} = b.k{i}" for i in range(len(out_names)))
+
+    def distinct(select: str, relation: str, where: str, hit: bool = False) -> str:
+        flag = ", 1 AS dex_hit" if hit else ""
+        return f"(SELECT DISTINCT {select}{flag} FROM {relation} WHERE {where})"  # noqa: S608
+
+    out_d = distinct(out_select, out_rel, out_nonnull)
+    out_hit = distinct(out_select, out_rel, out_nonnull, hit=True)
+    parent_all = distinct(parent_select, parent_rel, parent_nonnull)
+    parent_all_hit = distinct(parent_select, parent_rel, parent_nonnull, hit=True)
+    parent_eligible = distinct(parent_select, parent_rel, eligible_where)
+    sql = (
+        "SELECT "  # noqa: S608
+        f"(SELECT COUNT(*) FROM {out_rel}) AS dex_out_rows, "
+        f"(SELECT COUNT(*) FROM {out_rel} WHERE {out_anynull}) AS dex_out_null, "
+        f"(SELECT COUNT(*) FROM {out_d} a) AS dex_out_keys, "
+        f"(SELECT COUNT(*) FROM {parent_all} a) AS dex_parent_keys, "
+        f"(SELECT COUNT(*) FROM {parent_eligible} a) AS dex_eligible_parents, "
+        f"(SELECT COUNT(CASE WHEN b.dex_hit = 1 THEN 1 END) FROM {parent_eligible} a "
+        f"LEFT JOIN {out_hit} b ON {on}) AS dex_parents_present, "
+        f"(SELECT COUNT(CASE WHEN b.dex_hit = 1 THEN 1 END) FROM {out_d} a "
+        f"LEFT JOIN {parent_all_hit} b ON {on}) AS dex_out_known"
+    )
+    probe.parent_identifier = parent_identifier
+    probe.parent_sql = assert_select_only(
+        _transpile(sql, adapter.dialect), dialect=adapter.dialect
+    )
 
 
 def _cumulative_candidate(model: DeclaredModel, resolve, live):
@@ -674,6 +947,14 @@ class DeclaredFactsResult:
     notes: list[str] = field(default_factory=list)
     suppressed: dict[str, str] = field(default_factory=dict)
     offer: object | None = None
+    # The declared grains the statement counted unique, per model (#841).
+    proven_grains: dict[str, dict] = field(default_factory=dict)
+    #: One record per declared parent population, measured or not (#857): the
+    #: declaration, the counts, and a status, so a clean check is visible as
+    #: evidence rather than as an absent finding.
+    parent_coverage: list[dict] = field(default_factory=list)
+    #: One record per declared temporal contract, measured or not (#1027).
+    temporal_contracts: list[dict] = field(default_factory=list)
 
 
 def nothing_declared(finding_class: str, where: str) -> str:
@@ -683,6 +964,8 @@ def nothing_declared(finding_class: str, where: str) -> str:
         "population": (
             f"no model {where} declares population filters with includes or excludes"
         ),
+        "parent_population": f"no model {where} declares a population.parent",
+        "temporal": f"no model {where} declares a history temporal contract",
     }[finding_class]
 
 
@@ -733,6 +1016,8 @@ def findings(
                     + ": counting it is a scan, offered above"
                 )
             result.offer = offer
+            _unchecked_parents(prepared, result, "scan_offered", reason)
+            temporal_mod.record_unmeasured(prepared, result, "scan_offered", reason)
             return result
 
     checked: dict[str, int] = dict.fromkeys(CLASSES, 0)
@@ -761,6 +1046,12 @@ def findings(
                 _judge_aggregate(
                     probe, row, result, checked, prepared, pii_overrides, min_rows
                 )
+        if probe.parent_sql:
+            _run_parent(adapter, probe, result, checked, prepared, timeout_seconds)
+        if probe.temporal is not None:
+            temporal_mod.run_probe(
+                adapter, probe, result, checked, prepared, timeout_seconds
+            )
         if probe.cumulative is not None:
             try:
                 fractions = cumulative_mod.measure_fractions(
@@ -783,6 +1074,8 @@ def findings(
             else:
                 _judge_additivity(probe, fractions, result, checked, prepared)
 
+    _unchecked_parents(prepared, result, "not_measured", None)
+    temporal_mod.record_unmeasured(prepared, result, "not_measured", None)
     for finding_class in CLASSES:
         if finding_class in result.suppressed:
             continue
@@ -792,6 +1085,220 @@ def findings(
             ]
             result.suppressed[finding_class] = _suppression_reason(reasons)
     return result
+
+
+def _unchecked_parents(
+    prepared: Prepared,
+    result: DeclaredFactsResult,
+    reason_code: str,
+    reason: str | None,
+) -> None:
+    """A record for every declared parent population that has none yet, so an
+    obligation nothing measured reads as unchecked rather than as absent."""
+
+    recorded = {r["model"] for r in result.parent_coverage}
+    for model in prepared.parent_models:
+        if model.model in recorded:
+            continue
+        why = reason or next(
+            (
+                d.partition(": ")[2]
+                for d in prepared.dropped.get("parent_population", [])
+                if d.startswith(f"{model.model}: ")
+            ),
+            "the check could not be written",
+        )
+        probe = next(
+            (p for p in prepared.probes if p.model.model == model.model),
+            _Probe(model=model, identifier=model.relation),
+        )
+        # A parent that was never built gets its own reason code (#1102).
+        code = prepared.parent_reason_codes.get(model.model, reason_code)
+        result.parent_coverage.append(
+            _parent_record(probe, None, "unchecked", code, why)
+        )
+
+
+def _run_parent(
+    adapter,
+    probe: _Probe,
+    result: DeclaredFactsResult,
+    checked: dict[str, int],
+    prepared: Prepared,
+    timeout_seconds: float,
+) -> None:
+    from ..guards.cost_guard import CostGuardError
+
+    model = probe.model.model
+    try:
+        answer = adapter.run_query(
+            probe.parent_sql, max_rows=1, timeout_seconds=timeout_seconds
+        )
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        detail = _refusal(exc)
+        result.notes.append(
+            f"the declared population.parent on {model} could not be measured: "
+            f"the warehouse refused the statement ({detail})"
+        )
+        prepared.dropped["parent_population"].append(
+            f"{model}: the warehouse refused the check ({detail})"
+        )
+        result.parent_coverage.append(
+            _parent_record(probe, None, "unchecked", "probe_refused", detail)
+        )
+        return
+    row = {
+        str(k).lower(): int(v or 0)
+        for k, v in zip(answer.columns, answer.cells[0], strict=True)
+    }
+    _judge_parent(probe, row, result, checked, prepared)
+
+
+def _parent_record(
+    probe: _Probe,
+    counts: dict[str, Any] | None,
+    status: str,
+    reason_code: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    parent = probe.model.parent
+    if parent is None:  # pragma: no cover - callers only pass parent models
+        raise ValueError("no declared parent")
+    record: dict[str, Any] = {
+        "model": probe.model.model,
+        "declared": {
+            "parent": parent.model,
+            "key": [{"column": o, "parent_column": p} for o, p in parent.key],
+            "filters_applied": list(probe.parent_filters_applied),
+            "filters_unapplied": list(probe.parent_filters_unapplied),
+        },
+        "parent_relation": probe.parent_identifier or parent.relation,
+        "status": status,
+    }
+    if counts is not None:
+        record["measured"] = counts
+    if reason_code is not None:
+        record["reason_code"] = reason_code
+    if reason is not None:
+        record["reason"] = reason
+    return record
+
+
+def _judge_parent(
+    probe: _Probe,
+    row: dict[str, int],
+    result: DeclaredFactsResult,
+    checked: dict[str, int],
+    prepared: Prepared,
+) -> None:
+    """Judge one declared parent population from its counts.
+
+    Coverage is undefined, never 100%, when nothing is eligible on the parent
+    side: an empty parent cannot be fully represented or under-represented. An
+    output with rows but no parent keys still has its unexpected keys judged,
+    since every one of them is unexpected.
+    """
+
+    model = probe.model.model
+    parent = probe.model.parent
+    if parent is None:  # pragma: no cover - callers only pass parent models
+        raise ValueError("no declared parent")
+    out_keys = row.get("dex_out_keys", 0)
+    eligible = row.get("dex_eligible_parents", 0)
+    present = row.get("dex_parents_present", 0)
+    known = row.get("dex_out_known", 0)
+    parent_keys = row.get("dex_parent_keys", 0)
+    missing = eligible - present
+    unexpected = out_keys - known
+    counts = {
+        "output_rows": row.get("dex_out_rows", 0),
+        "output_keys": out_keys,
+        "output_null_key_rows": row.get("dex_out_null", 0),
+        "parent_keys": parent_keys,
+        "eligible_parent_keys": eligible,
+        "excluded_by_filters": parent_keys - eligible,
+        "parents_present": present,
+        "missing_parents": missing,
+        "unexpected_keys": unexpected,
+        "coverage": round(present / eligible, 4) if eligible else None,
+    }
+    if eligible == 0 and out_keys == 0:
+        reason = (
+            "the parent has no eligible key and the output none either, so "
+            "coverage is undefined rather than complete"
+        )
+        prepared.dropped["parent_population"].append(f"{model}: {reason}")
+        result.parent_coverage.append(
+            _parent_record(probe, counts, "not_applicable", "empty_input", reason)
+        )
+        return
+    checked["parent_population"] += 1
+    key_text = ", ".join(f"{o} -> {parent.model}.{p}" for o, p in parent.key)
+    data: dict[str, Any] = {
+        "model": model,
+        "parent": parent.model,
+        "parent_relation": probe.parent_identifier,
+        "key": [{"column": o, "parent_column": p} for o, p in parent.key],
+        "filters_applied": list(probe.parent_filters_applied),
+        "filters_unapplied": list(probe.parent_filters_unapplied),
+        **counts,
+    }
+    contradicted = False
+    if missing > 0:
+        contradicted = True
+        unapplied = probe.parent_filters_unapplied
+        scope = (
+            f" after the declared filters on {', '.join(probe.parent_filters_applied)} "
+            "excluded the parents they rule out"
+            if probe.parent_filters_applied
+            else ""
+        )
+        caveat = (
+            f"; the declared filter(s) on {', '.join(unapplied)} name columns the "
+            "parent does not have, so some of these may be exclusions the count "
+            "cannot see"
+            if unapplied
+            else ""
+        )
+        result.findings.append(
+            DriftFinding(
+                axis="declaration",
+                code="parent_population_missing",
+                identifier=model,
+                severity="medium" if unapplied else "high",
+                detail=(
+                    f"'{model}' declares one row per {parent.model} ({key_text}), "
+                    f"but {missing} of {eligible} eligible {parent.model} key(s) "
+                    f"have no row in it{scope}{caveat}: a model driven from "
+                    "another relation, or an inner join, drops the parents with "
+                    "nothing to join"
+                ),
+                data=data,
+            )
+        )
+    if unexpected > 0:
+        contradicted = True
+        result.findings.append(
+            DriftFinding(
+                axis="declaration",
+                code="parent_population_unexpected",
+                identifier=model,
+                severity="high",
+                detail=(
+                    f"'{model}' declares one row per {parent.model} ({key_text}), "
+                    f"but {unexpected} of its {out_keys} distinct key(s) are not "
+                    f"{parent.model} keys: its rows come from somewhere other than "
+                    "the declared parent. They are not a replacement population; "
+                    "drive the model from the parent, or correct the declaration"
+                ),
+                data=data,
+            )
+        )
+    result.parent_coverage.append(
+        _parent_record(probe, counts, "contradicted" if contradicted else "satisfied")
+    )
 
 
 def _suppression_reason(reasons: list[str]) -> str:
@@ -909,6 +1416,11 @@ def _judge_aggregate(
 
     if probe.grain is not None:
         distinct = row.get("dex_grain")
+        if distinct is not None and int(distinct) >= rows:
+            result.proven_grains[model] = {
+                "columns": list(probe.grain),
+                "source": "declaration",
+            }
         if distinct is not None and int(distinct) < rows:
             from .verify import _grain_broken_finding
 
