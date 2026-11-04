@@ -143,7 +143,9 @@ SUITE = ["tests/a.py::t1", "tests/a.py::t2", "tests/b.py::t1", "tests/c.py::t1"]
 @pytest.fixture
 def verify(monkeypatch):
     module = runpy.run_path(str(CHECKER))
-    monkeypatch.setitem(module["verify"].__globals__, "_groups", lambda: ["one", "two"])
+    monkeypatch.setitem(
+        module["verify"].__globals__, "_groups", lambda suite="engine": ["one", "two"]
+    )
     return module["verify"]
 
 
