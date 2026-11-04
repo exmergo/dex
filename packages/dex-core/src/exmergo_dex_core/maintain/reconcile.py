@@ -36,6 +36,7 @@ from ..transform.plans import EditKind, PlanEdit
 from ..transform.rewrite import (
     RewriteError,
     column_tests,
+    output_columns,
     project_column_in_sql,
     unproject_column_in_sql,
 )
@@ -677,9 +678,22 @@ def _splice_model(
             # Stage YAML only when the model's output actually changes (#983).
             settled.append(finding)
         else:
-            # SQL splice was a no-op: the model already absorbs this drift
-            # (for example ``page as page_path`` over a renamed source column).
-            already_reflected.append(finding)
+            # SQL splice was a no-op. For a drop, only treat it as covered when
+            # the model still *outputs* that column (alias absorption, #983).
+            # A star over a dropped source column, or SQL already edited by
+            # hand, leaves the column absent from the declared output and still
+            # needs the YAML half cleaned up (CodeRabbit on #1117). Added
+            # columns keep the prior covered path: a no-op add is either a star
+            # that already carries the column or a rename the model already
+            # reads under another alias.
+            if finding.code == "column_dropped":
+                outs = output_columns(content, model_path, through_ctes=True)
+                if outs is not None and column.lower() in outs:
+                    already_reflected.append(finding)
+                else:
+                    settled.append(finding)
+            else:
+                already_reflected.append(finding)
 
     placed = declarations.resolve(table)
     in_yaml: list[DriftFinding] = []
@@ -703,7 +717,9 @@ def _splice_model(
             )
         else:
             proposals.append(_schema_advisory(identifier, finding, reason))
-    warnings.extend(_downstream_readers(view, model, settled + already_reflected))
+    # Warn only for drops that actually change staging output. An absorbed
+    # alias (#983) keeps the contract name, so downstream readers still work.
+    warnings.extend(_downstream_readers(view, model, settled))
 
     if not changed:
         declined = [finding for finding, _reason in unstaged]
