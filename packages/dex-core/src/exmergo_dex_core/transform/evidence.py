@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,21 @@ SKIPPED_STATUSES = frozenset({"skipped"})
 #: either documents nodes (a schema.yml), points at one (a semantic YAML), or
 #: can affect any node at all (a macro, the project config).
 _NODE_KINDS = frozenset({EditKind.MODEL_SQL, EditKind.SNAPSHOT_SQL, EditKind.SEED_CSV})
+
+
+#: dbt colors a unit test's diff even in run_results.json; the escapes are noise
+#: in a JSON payload and push the diff itself past the length cap.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _node_message(message: object) -> str | None:
+    """dbt's message on one node, bounded, with its color codes removed and
+    the blank lines a unit test diff opens with trimmed (#1111)."""
+
+    if not message:
+        return None
+    text = _ANSI_ESCAPE.sub("", str(message)).replace("\r\n", "\n").strip()
+    return text[:400] or None
 
 
 class BuildOutcome(str, Enum):
@@ -815,9 +831,7 @@ def build_evidence(
             # dbt's message on a failure is the actionable half; it is bounded
             # here for the same reason build messages are, since a traceback in a
             # payload is a payload nobody reads.
-            message=(
-                str(result.get("message"))[:400] if result.get("message") else None
-            ),
+            message=_node_message(result.get("message")),
         )
         nodes.append(built)
         node_answers = {built.name}

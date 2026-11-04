@@ -1665,7 +1665,8 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
     project = engine.project_dir()
     view = load_project(project)
     cache = readable_cache(engine.store)
-    edits, inputs = test_scaffold_mod.unit_test_scaffold_edits(view, cache, model_name)
+    scaffold = test_scaffold_mod.unit_test_scaffold(view, cache, model_name)
+    edits, inputs = scaffold.edits, scaffold.inputs
 
     from .build import shadow_parse
 
@@ -1685,7 +1686,20 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
         "expect: is a stub with no rows; this unit test fails until you fill "
         "in the model's actual expected output for the given fixtures above"
     )
-    return TestScaffoldResult(**planned.model_dump(), model=model_name, inputs=inputs)
+    if scaffold.incremental is not None:
+        planned.warnings.append(
+            f"'{model_name}' is incremental: a full build and a --full-refresh "
+            "run only its full program, so a passing one says nothing about the "
+            f"next incremental run; test_{model_name}_incremental runs that branch "
+            "(dbt's is_incremental override, with a `this` fixture) and runs in "
+            "every `transform build` once its expectation is filled in"
+        )
+    return TestScaffoldResult(
+        **planned.model_dump(),
+        model=model_name,
+        inputs=inputs,
+        incremental=scaffold.incremental,
+    )
 
 
 def test_mutations(

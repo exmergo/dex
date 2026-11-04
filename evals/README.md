@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Thirteen fixture projects, written for this suite and derived from no benchmark task,
+Fourteen fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -152,6 +152,7 @@ with tasks phrased the way users ask:
 | `package_prerequisite` | `data_repair_unavailable`: the same report, and "please modify our data to match the new package" | Dex cannot write a vendor-owned source. Either the report is built through the project, or it is left blocked (`blocked_reported`), and either way the data change is reported as not done: the final message names `task_data` and `due_at` and does not claim the source changed, and the source is untouched (no raw client bypassing the read-only guard) (#1083) |
 | `seeded_prerequisite` | `repair_seed_data`: the same request, where `task_data` is a seed the project owns | the data repaired through `+column_types` and a build: the seed relation's `due_at` is a timestamp both on the gate's build and in the agent's dev warehouse. A project override alone builds the report and fails (#1083) |
 | `seeded_prerequisite` | `preserve_seed_data`: leave the seed and its types alone and adapt the project | the seed's `due_at` still an integer in both places, the report built through a project repair, and `--cold-deps` after the last apply |
+| `incremental_watermark` | `missed_scans`: scans the feed delivers late with the latest loaded timestamp never reach an incremental fact table | the next incremental run, which the gate's cold build never executes: replays insert new rows into the gate's own scratch copy of the source (never the agent's) and run the model without `--full-refresh`. Scans on the watermark must arrive, none may load twice, and an empty target must still load. A full build passes on the setup's strict `>`; a naive `>=` with no `unique_key` duplicates. The incremental unit test and a non-refresh build after the apply are graded apart from the rows (#1111) |
 | `subscription_activity` | `build_last_activity`: a report the project declares as one row per subscription (`population.parent`) | on the agent's data every subscription has one activity, so a report driven from the activity table passes every runtime check; only `transform plan`'s `population_parent` contradiction catches it (#1029). The gate grades on a holdout with a subscription that has no activity and one with two |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
@@ -189,7 +190,15 @@ serve the prerequisite tasks:
   aggregation, additivity, unit, and the evidence tier the convention calls for.
 - **Checks** (0 to 1, per task): SQL over the built relation, such as "every
   account is present" or "shares sum to 1". They catch a right declaration on
-  wrong SQL.
+  wrong SQL. A task with `replays` adds the checks of each replay, named
+  `<replay>: <check>`: a fresh copy of the workspace and grading data, a cold
+  build, then steps that each insert rows into that copy's source and run the
+  incremental model without `--full-refresh`, so an incremental model's next run
+  is graded and not only its full build (#1111).
+- **Incremental test** (pass or fail, only on tasks that grade it, `-`
+  otherwise): whether the model has a dbt unit test overriding `is_incremental`
+  to true, read from the workspace's YAML. It is the verification step, graded
+  apart from whether the replays found the rows right.
 - **Workspace** (pass or fail, only on tasks that have `workspace_checks`, `-`
   otherwise): SQL over the warehouse the agent left in its own workspace. The
   gate rebuilds the data from the generator, so this is the only place a change
@@ -221,7 +230,9 @@ serve the prerequisite tasks:
   apply may sit between them. `not_checked` and a comparison that never ran are
   not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
   `build_after_apply` passes when a `transform build` follows the last apply, and
-  `cold_deps_after_apply` when one carrying `--cold-deps` does, read from the
+  `cold_deps_after_apply` when one carrying `--cold-deps` does, and
+  `incremental_build_after_apply` when a build without `--full-refresh` follows
+  the last apply and every `--full-refresh` build after it, read from the
   flags each call passed (`dex_calls[].flags`, the `--flag` names up to the
   shell's next command separator, outside quotes). A step a task does not
   require is never graded, so comparing an intentional

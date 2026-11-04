@@ -53,3 +53,39 @@ def test_a_source_input_is_typed_from_the_relation_it_declares(dbt_project_dir: 
     test = yaml.safe_load(edits[0].new_content)["unit_tests"][0]
     assert test["given"][0]["input"] == "source('memory_app', 'orders')"
     assert set(test["given"][0]["rows"][0]) == {"id", "status"}
+
+
+def test_a_source_whose_identifier_differs_from_its_name_is_found(
+    dbt_project_dir: Path,
+):
+    """A source table named `scans` that reads the relation `feed_scans_v2`
+    (its `identifier`) is cached under the relation, so looking it up by the
+    name the model writes found nothing and the scaffold was refused (#1111)."""
+
+    staging = dbt_project_dir / "models" / "staging"
+    (staging / "_dex_sources.yml").write_text(
+        "version: 2\n\nsources:\n  - name: feed\n    schema: raw\n    tables:\n"
+        "      - name: scans\n        identifier: feed_scans_v2\n",
+        encoding="utf-8",
+    )
+    (staging / "stg_scans.sql").write_text(
+        "select scan_id from {{ source('feed', 'scans') }}\n", encoding="utf-8"
+    )
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="raw.feed_scans_v2",
+                columns=[ColumnProfile(name="scan_id", data_type="INTEGER")],
+            )
+        ],
+        provenance=CacheProvenance(connector="duckdb"),
+    )
+
+    edits, inputs = unit_test_scaffold_edits(load(dbt_project_dir), cache, "stg_scans")
+
+    assert inputs == ["scans"]
+    test = yaml.safe_load(edits[0].new_content)["unit_tests"][0]
+    assert test["given"][0] == {
+        "input": "source('feed', 'scans')",
+        "rows": [{"scan_id": 1}],
+    }

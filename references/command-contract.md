@@ -423,7 +423,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
-                                     filled in (dbt-parse-checked; apply like any plan)
+                                     filled in (dbt-parse-checked; apply like any plan). A model with
+                                     an {% if is_incremental() %} branch gets a second test with the
+                                     is_incremental override and a typed `this` fixture, with rows
+                                     before, on and after the watermark it read (data.incremental)
 dex transform test --mutate <m>   -> measure the tests <m> already has: plant standard analytics
                                      defects in its SQL one at a time, run its own tests against each,
                                      and report which defects nothing caught. Dev-target only, and

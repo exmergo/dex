@@ -164,6 +164,16 @@ declares is `contract`.
   `<model>_v2`. Declare a version as `<model>.v<N>`. Promotion is its own plan:
   `data.model_versions` names the default and every consumer it moves.
   Recipe: `skills/transform/references/model-versions.md`.
+- An incremental model is two programs: the full build and the next
+  incremental run. A `--full-refresh` runs only the first, so it does not show
+  that rows the next run skips or duplicates are fixed. Before choosing a
+  repair, read the materialization, the watermark comparison (`>` skips rows on
+  the current watermark) and the `unique_key` or deduplication that makes `>=`
+  safe. Prove the incremental branch with a unit test that overrides
+  `is_incremental` (`dex transform test --scaffold <model>` writes one), build
+  again without `--full-refresh`, and state the late-arrival horizon the repair
+  supports. Never insert probe rows into a loader's source.
+  Recipe: `skills/transform/references/incremental-repairs.md`.
 - Change only what the request asks; keep the output columns the request and
   the existing model define.
 - A balance or a running total is `semi_additive`: never sum it across time.

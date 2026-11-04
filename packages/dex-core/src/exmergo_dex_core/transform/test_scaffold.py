@@ -19,6 +19,8 @@ clear reason rather than guessing.
 
 from __future__ import annotations
 
+import datetime
+import re
 from typing import NamedTuple
 
 import sqlglot
@@ -26,7 +28,13 @@ import yaml
 from sqlglot import exp
 
 from ..cache import DexCache, match_identifier
-from ..dbt_project import REF_PATTERN, SOURCE_PATTERN, DbtProjectView, model_file
+from ..dbt_project import (
+    REF_PATTERN,
+    SOURCE_PATTERN,
+    DbtProjectView,
+    jinja_regions,
+    model_file,
+)
 from ..errors import DexError
 from .plans import EditKind, PlanEdit
 from .row_attribution import UnattributableError, naming_resolver, render_model_sql
@@ -46,6 +54,42 @@ class ModelInput(NamedTuple):
 
     name: str
     literal: str
+    #: What the exploration cache is searched for: the relation a ``source()``
+    #: declares (its ``identifier`` can differ from the table name the model
+    #: writes), otherwise ``name``.
+    lookup: str = ""
+
+    @property
+    def cached_as(self) -> str:
+        return self.lookup or self.name
+
+
+class Watermark(NamedTuple):
+    """The comparison an incremental branch selects its new rows with.
+
+    ``column`` is the model-side column compared, ``operator`` the comparison
+    as read with that column on the left (``>`` or ``>=`` for the usual
+    high-water mark), ``input`` the model input the column is read from
+    (``None`` where no input, or more than one, reads a column of that name),
+    and ``this_column`` the column of ``{{ this }}`` the bound reads.
+    """
+
+    column: str
+    operator: str
+    input: str | None
+    this_column: str | None
+
+
+class Scaffold(NamedTuple):
+    """What :func:`unit_test_scaffold` planned.
+
+    ``incremental`` is ``None`` for a model with no ``is_incremental()``
+    branch, otherwise ``{"tests": [...], "watermark": {...} | None}``.
+    """
+
+    edits: list[PlanEdit]
+    inputs: list[str]
+    incremental: dict[str, object] | None
 
 
 def unit_test_scaffold_edits(
@@ -60,6 +104,26 @@ def unit_test_scaffold_edits(
     the model.
     """
 
+    scaffold = unit_test_scaffold(view, cache, model_name)
+    return scaffold.edits, scaffold.inputs
+
+
+def unit_test_scaffold(
+    view: DbtProjectView, cache: DexCache | None, model_name: str
+) -> Scaffold:
+    """:func:`unit_test_scaffold_edits`, plus what it read of an incremental
+    model (issue #1111).
+
+    A model whose only jinja control flow is ``{% if is_incremental() %}``
+    (with an optional ``{% else %}``) is two programs: the full build and the
+    next incremental run. A full build, and so a ``--full-refresh``, never runs
+    the second, so this scaffolds a test for each. The incremental one carries
+    dbt's ``is_incremental`` override and a ``this`` fixture. Where the branch
+    compares a column with a subquery over ``{{ this }}``, the watermark's input
+    gets rows before, on and after it plus a NULL, so the expectation filled in
+    pins which side of the boundary each one lands on.
+    """
+
     path = model_file(view, model_name)
     sql = view.files[path].content
 
@@ -70,24 +134,45 @@ def unit_test_scaffold_edits(
             "to scaffold a fixture from"
         )
     cache = _pinned_to_sources(cache, view, sql)
+    declared = _declared_source_relations(view)
+    inputs = [
+        i._replace(lookup=declared.get(_source_key(i), ""))
+        if i.literal.startswith("source(")
+        else i
+        for i in inputs
+    ]
 
-    try:
-        rendered = render_model_sql(sql, naming_resolver)
-    except UnattributableError as exc:
-        raise TestScaffoldError(
-            f"'{model_name}': {exc}; a unit test needs a statically readable SELECT"
-        ) from exc
+    variants = _incremental_variants(sql)
+    parsed = _parse_model(model_name, variants.full if variants else sql)
 
-    try:
-        parsed = sqlglot.parse_one(rendered, read="duckdb")
-    except Exception as exc:
-        raise TestScaffoldError(
-            f"'{model_name}': the rendered SQL could not be parsed ({exc})"
-        ) from exc
-
-    inputs_by_lower = {i.name.lower(): i.name for i in inputs}
+    inputs_by_lower = {i.name.lower(): i for i in inputs}
     reads: dict[str, set[str]] = {}
-    _resolve_reads(parsed, {}, inputs_by_lower, reads, cache, outermost=True)
+    full_output = _resolve_reads(
+        parsed, {}, inputs_by_lower, reads, cache, outermost=True
+    )
+
+    this_reads: set[str] = set()
+    watermark: Watermark | None = None
+    if variants is not None:
+        incremental = _parse_model(model_name, variants.incremental)
+        incremental_reads: dict[str, set[str]] = {}
+        _resolve_reads(
+            incremental,
+            {},
+            {
+                **inputs_by_lower,
+                THIS_PLACEHOLDER: ModelInput(THIS, THIS, lookup=model_name),
+            },
+            incremental_reads,
+            cache,
+            outermost=True,
+        )
+        this_reads = incremental_reads.pop(THIS, set()) | _subquery_reads_of_this(
+            incremental
+        )
+        for name, columns in incremental_reads.items():
+            reads.setdefault(name, set()).update(columns)
+        watermark = _watermark(incremental, reads)
 
     unread = [i.name for i in inputs if not reads.get(i.name)]
     if unread:
@@ -102,12 +187,268 @@ def unit_test_scaffold_edits(
     yaml_path = (
         f"{dir_path}/test_{model_name}.yml" if dir_path else f"test_{model_name}.yml"
     )
+    full_test = _test_block(
+        f"test_{model_name}",
+        model_name,
+        [
+            _Given(i.literal, [_example_row(types[i.name], reads[i.name])], [None])
+            for i in inputs
+        ],
+        is_incremental=False if variants is not None else None,
+    )
+    if variants is None:
+        edit = PlanEdit(
+            path=yaml_path,
+            kind=EditKind.SCHEMA_YML,
+            new_content=_unit_tests_yaml([full_test]),
+        )
+        return Scaffold([edit], [i.name for i in inputs], None)
+
+    this_types = _this_types(model_name, this_reads, full_output, types, cache)
+    incremental_name = f"test_{model_name}_incremental"
+    given = [
+        _incremental_given(i, reads[i.name], types[i.name], watermark) for i in inputs
+    ]
+    if this_types:
+        given.append(_this_given(this_types, watermark))
+    incremental_test = _test_block(
+        incremental_name,
+        model_name,
+        given,
+        is_incremental=True,
+        expect_note=(
+            "for this test: the rows this incremental run inserts or merges, "
+            "not the whole table"
+        ),
+    )
     edit = PlanEdit(
         path=yaml_path,
         kind=EditKind.SCHEMA_YML,
-        new_content=_unit_test_yaml(model_name, inputs, reads, types),
+        new_content=_unit_tests_yaml([full_test, incremental_test]),
     )
-    return [edit], [i.name for i in inputs]
+    return Scaffold(
+        [edit],
+        [i.name for i in inputs],
+        {
+            "tests": [f"test_{model_name}", incremental_name],
+            "watermark": watermark._asdict() if watermark is not None else None,
+        },
+    )
+
+
+def _parse_model(model_name: str, sql: str) -> exp.Expression:
+    try:
+        rendered = render_model_sql(sql, naming_resolver)
+    except UnattributableError as exc:
+        raise TestScaffoldError(
+            f"'{model_name}': {exc}; a unit test needs a statically readable SELECT"
+        ) from exc
+    try:
+        return sqlglot.parse_one(rendered, read="duckdb")
+    except Exception as exc:
+        raise TestScaffoldError(
+            f"'{model_name}': the rendered SQL could not be parsed ({exc})"
+        ) from exc
+
+
+# --- the incremental branch (issue #1111) ----------------------------------------
+
+#: What ``{{ this }}`` is read as while the incremental branch is parsed. It
+#: never leaves this module, and the leading ``__dex`` keeps it apart from any
+#: name a project would give a model.
+THIS_PLACEHOLDER = "__dex_this"
+#: How a dbt unit test names the model's own relation in ``given``.
+THIS = "this"
+
+_IF_INCREMENTAL = re.compile(r"if\s+is_incremental\s*\(\s*\)")
+
+
+class _Variants(NamedTuple):
+    full: str
+    incremental: str
+
+
+def _incremental_variants(sql: str) -> _Variants | None:
+    """The model as its full build and as its incremental run, or ``None``.
+
+    Only a flat ``{% if is_incremental() %} ... [{% else %} ...] {% endif %}``
+    is read, any number of times. Any other statement block (another ``if``, a
+    ``for``, a nested ``if``) returns ``None``, so the caller's own render
+    refuses it exactly as before. ``{{ this }}`` becomes
+    :data:`THIS_PLACEHOLDER`, and a ``{{ this }}`` outside the branch also
+    returns ``None``, since the full build has no ``this`` to fixture.
+    """
+
+    regions, text = jinja_regions(sql)
+    if not any(r.kind == "statement" for r in regions):
+        return None
+    full: list[str] = []
+    incremental: list[str] = []
+    branch: str | None = None
+    seen = False
+
+    def emit(piece: str) -> None:
+        if branch != "else":
+            incremental.append(piece)
+        if branch != "if":
+            full.append(piece)
+
+    cursor = 0
+    for region in regions:
+        emit(text[cursor : region.start])
+        cursor = region.end
+        word = " ".join(region.body.strip().strip("-").split())
+        if region.kind == "expression":
+            emit(THIS_PLACEHOLDER if word == THIS else text[region.start : region.end])
+            continue
+        if branch is None and _IF_INCREMENTAL.fullmatch(word):
+            branch, seen = "if", True
+        elif branch == "if" and word == "else":
+            branch = "else"
+        elif branch is not None and word == "endif":
+            branch = None
+        else:
+            return None
+    emit(text[cursor:])
+    if branch is not None or not seen:
+        return None
+    full_text = "".join(full)
+    if THIS_PLACEHOLDER in full_text:
+        return None
+    return _Variants(full_text, "".join(incremental))
+
+
+def _is_this(node: exp.Expression) -> bool:
+    return isinstance(node, exp.Table) and node.name.lower() == THIS_PLACEHOLDER
+
+
+def _subquery_reads_of_this(parsed: exp.Expression) -> set[str]:
+    """Columns read from ``{{ this }}`` in a SELECT whose only source it is:
+    the watermark shape ``(select max(d) from {{ this }})``, which
+    :func:`_resolve_reads` does not walk into."""
+
+    columns: set[str] = set()
+    for table in parsed.find_all(exp.Table):
+        if not _is_this(table):
+            continue
+        select = table.find_ancestor(exp.Select)
+        if select is None or len(_from_and_join_nodes(select)) != 1:
+            continue
+        alias = (table.alias_or_name or "").lower()
+        for column in select.find_all(exp.Column):
+            if isinstance(column.this, exp.Star):
+                continue
+            if column.find_ancestor(exp.Select) is not select:
+                continue
+            if column.table and column.table.lower() != alias:
+                continue
+            columns.add(column.name)
+    return columns
+
+
+_OPERATORS: dict[type, str] = {exp.GT: ">", exp.GTE: ">=", exp.LT: "<", exp.LTE: "<="}
+_FLIPPED = {">": "<", ">=": "<=", "<": ">", "<=": ">="}
+
+
+def _watermark(parsed: exp.Expression, reads: dict[str, set[str]]) -> Watermark | None:
+    """The one comparison of a column with a subquery over ``{{ this }}``.
+
+    ``None`` where there is no such comparison, or more than one, since then
+    there is no single boundary for the fixture rows to sit on.
+    """
+
+    found: list[Watermark] = []
+    for where in parsed.find_all(exp.Where):
+        for predicate in where.find_all(*_OPERATORS):
+            if predicate.find_ancestor(exp.Where) is not where:
+                continue
+            operator = _OPERATORS[type(predicate)]
+            sides = (
+                (predicate.this, predicate.expression, operator),
+                (predicate.expression, predicate.this, _FLIPPED[operator]),
+            )
+            for column, bound, op in sides:
+                if not isinstance(column, exp.Column):
+                    continue
+                if not any(_is_this(t) for t in bound.find_all(exp.Table)):
+                    continue
+                found.append(
+                    Watermark(
+                        column=column.name,
+                        operator=op,
+                        input=_owner(reads, column.name),
+                        this_column=_bound_column(bound),
+                    )
+                )
+    return found[0] if len(set(found)) == 1 else None
+
+
+def _owner(reads: dict[str, set[str]], column: str) -> str | None:
+    owners = [
+        name
+        for name, columns in reads.items()
+        if column.lower() in {c.lower() for c in columns}
+    ]
+    return owners[0] if len(owners) == 1 else None
+
+
+def _bound_column(bound: exp.Expression) -> str | None:
+    """The ``{{ this }}`` column a watermark bound reads, as in
+    ``(select max(d) from {{ this }})``, where exactly one is read."""
+
+    subquery = bound if isinstance(bound, exp.Subquery) else bound.find(exp.Subquery)
+    if subquery is None or not isinstance(subquery.this, exp.Select):
+        return None
+    projections = subquery.this.expressions
+    if len(projections) != 1:
+        return None
+    names = {c.name for c in projections[0].find_all(exp.Column)}
+    return names.pop() if len(names) == 1 else None
+
+
+def _this_types(
+    model_name: str,
+    columns: set[str],
+    full_output: _Derived,
+    types: dict[str, dict[str, str]],
+    cache: DexCache | None,
+) -> dict[str, str]:
+    """Each ``{{ this }}`` column's type: the type of the input column the full
+    build passes through to it first, then the model's own cached relation.
+    Never guessed: a column neither settles is refused, naming the profile that
+    would settle it."""
+
+    resolved: dict[str, str] = {}
+    unresolved: list[str] = []
+    for column in sorted(columns):
+        provenance = full_output.get(column.lower())
+        data_type = (
+            types.get(provenance[0], {}).get(provenance[1])
+            if provenance is not None
+            else None
+        )
+        if data_type:
+            resolved[column] = data_type
+        else:
+            unresolved.append(column)
+    if unresolved and cache is not None:
+        matches = match_identifier(model_name, [d.identifier for d in cache.datasets])
+        if len(matches) == 1:
+            dataset = next(d for d in cache.datasets if d.identifier == matches[0])
+            cached = {c.name.lower(): c.data_type for c in dataset.columns}
+            for column in list(unresolved):
+                if cached.get(column.lower()):
+                    resolved[column] = cached[column.lower()]
+                    unresolved.remove(column)
+    if unresolved:
+        raise TestScaffoldError(
+            f"'{model_name}': the incremental branch reads "
+            f"{', '.join(unresolved)} from {{{{ this }}}}, which no input column "
+            "passes through and the exploration cache does not type; profile the "
+            "model's built relation first (`explore profile "
+            f"<dev namespace>.{model_name} --target dev`)"
+        )
+    return resolved
 
 
 # --- model + input discovery ---------------------------------------------------
@@ -145,6 +486,11 @@ def _pinned_to_sources(
         == d.identifier.lower()
     ]
     return cache.model_copy(update={"datasets": kept})
+
+
+def _source_key(model_input: ModelInput) -> tuple[str, str]:
+    match = SOURCE_PATTERN.search("{{ " + model_input.literal + " }}")
+    return (match.group(1), match.group(2)) if match else ("", model_input.name)
 
 
 def _declared_source_relations(view: DbtProjectView) -> dict[tuple[str, str], str]:
@@ -212,6 +558,7 @@ def _find_inputs(sql: str) -> list[ModelInput]:
 # that input's same-named column.
 class _BaseInput(NamedTuple):
     name: str
+    lookup: str = ""
 
 
 # A resolved CTE/subquery: its own output columns, each either a direct
@@ -223,7 +570,7 @@ _Derived = dict
 def _resolve_reads(
     node: exp.Expression,
     env: dict[str, object],
-    inputs_by_lower: dict[str, str],
+    inputs_by_lower: dict[str, ModelInput],
     reads: dict[str, set[str]],
     cache: DexCache | None,
     *,
@@ -276,7 +623,8 @@ def _resolve_reads(
             if table_name.lower() in local_env:
                 sources[alias] = local_env[table_name.lower()]
             elif table_name.lower() in inputs_by_lower:
-                sources[alias] = _BaseInput(inputs_by_lower[table_name.lower()])
+                found = inputs_by_lower[table_name.lower()]
+                sources[alias] = _BaseInput(found.name, found.cached_as)
             else:
                 raise TestScaffoldError(
                     f"'{table_name}' is neither a ref()/source() input nor a "
@@ -348,7 +696,7 @@ def _resolve_reads(
 
 def _expand_source(source: object, cache: DexCache | None) -> _Derived:
     if isinstance(source, _BaseInput):
-        dataset = _lookup_dataset(cache, source.name, source.name)
+        dataset = _lookup_dataset(cache, source.lookup or source.name, source.name)
         return {c.name.lower(): (source.name, c.name) for c in dataset.columns}
     return dict(source)  # a CTE/subquery: already a name -> provenance map
 
@@ -391,7 +739,7 @@ def _lookup_dataset(cache: DexCache | None, name: str, label: str) -> object:
 def _column_types(
     cache: DexCache | None, model_input: ModelInput, columns: set[str]
 ) -> dict[str, str]:
-    dataset = _lookup_dataset(cache, model_input.name, model_input.literal)
+    dataset = _lookup_dataset(cache, model_input.cached_as, model_input.literal)
     by_name = {c.name.lower(): c for c in dataset.columns}
 
     types: dict[str, str] = {}
@@ -414,55 +762,208 @@ def _column_types(
 # --- YAML rendering --------------------------------------------------------------
 
 
-def _unit_test_yaml(
+class _Given(NamedTuple):
+    literal: str
+    rows: list[dict[str, object]]
+    #: One YAML comment per row, written above it, or ``None``.
+    notes: list[str | None]
+    #: Written as ``format: sql`` with each value cast to its type instead,
+    #: for an input dbt would otherwise type from a relation that may not
+    #: exist yet (``this``).
+    types: dict[str, str] | None = None
+
+
+def _test_block(
+    name: str,
     model_name: str,
-    inputs: list[ModelInput],
-    reads: dict[str, set[str]],
-    types: dict[str, dict[str, str]],
-) -> str:
-    lines = [
-        "version: 2",
-        "",
-        "unit_tests:",
-        f"  - name: test_{model_name}",
-        f"    model: {model_name}",
-        "    given:",
-    ]
-    for model_input in inputs:
-        lines.append(f"      - input: {model_input.literal}")
+    given: list[_Given],
+    *,
+    is_incremental: bool | None = None,
+    expect_note: str | None = None,
+) -> list[str]:
+    lines = [f"  - name: {name}", f"    model: {model_name}"]
+    if is_incremental is not None:
+        # dbt refuses a unit test on an incremental model that leaves this
+        # override out, so the full-build test states `false` as well.
+        note = (
+            "runs the {% if is_incremental() %} branch, which a full build and "
+            "a --full-refresh never execute"
+            if is_incremental
+            else "the full build: the program a --full-refresh runs"
+        )
+        lines += [
+            "    overrides:",
+            "      macros:",
+            f"        # {note}",
+            f"        is_incremental: {'true' if is_incremental else 'false'}",
+        ]
+    lines.append("    given:")
+    for block in given:
+        lines.append(f"      - input: {block.literal}")
+        if block.types is not None:
+            lines += [
+                "        # format: sql, typed here, because dbt types a dict fixture",
+                "        # for `this` from the model's relation, which a cold dev",
+                "        # target does not have yet",
+                "        format: sql",
+                "        rows: |",
+            ]
+            selects = []
+            for row, note in zip(block.rows, block.notes, strict=True):
+                if note:
+                    lines.append(f"          -- {note}")
+                selects.append(
+                    "select "
+                    + ", ".join(
+                        f"{_sql_literal(value, block.types[column])} as {column}"
+                        for column, value in row.items()
+                    )
+                )
+            lines += [
+                f"          {line}"
+                for line in "\nunion all\n".join(selects).split("\n")
+            ]
+            continue
         lines.append("        rows:")
-        row = {
-            column: _example_value(types[model_input.name][column])
-            for column in sorted(reads[model_input.name])
-        }
-        lines.append(f"          - {_yaml_flow_mapping(row)}")
+        for row, note in zip(block.rows, block.notes, strict=True):
+            if note:
+                lines.append(f"          # {note}")
+            lines.append(f"          - {_yaml_flow_mapping(row)}")
     lines += [
         "    expect:",
         "      rows:",
         "        # TODO: this stub is deliberately empty and fails until you",
         "        # replace it with the model's actual expected output for",
         "        # the given fixtures above; dex never invents an expectation",
-        "        - {}",
     ]
+    if expect_note:
+        lines.append(f"        # ({expect_note})")
+    lines.append("        - {}")
+    return lines
+
+
+def _unit_tests_yaml(tests: list[list[str]]) -> str:
+    lines = ["version: 2", "", "unit_tests:"]
+    for test in tests:
+        lines += test
     return "\n".join(lines) + "\n"
 
 
-def _example_value(data_type: str) -> object:
+def _example_row(
+    types: dict[str, str], columns: set[str], index: int | None = None
+) -> dict[str, object]:
+    return {column: _example_value(types[column], index) for column in sorted(columns)}
+
+
+_BOUNDARY_NOTES: tuple[str, ...] = (
+    "before the current watermark in `this`: an incremental run skips it "
+    "unless a lookback window reaches back to it",
+    "exactly on the current watermark: `>` skips it and `>=` loads it (a "
+    "unique_key keeps a row loaded before from duplicating)",
+    "after the current watermark: every incremental run loads it",
+    "no watermark value: neither `>` nor `>=` is true for NULL, so only a "
+    "full build loads it",
+)
+
+
+def _incremental_given(
+    model_input: ModelInput,
+    columns: set[str],
+    types: dict[str, str],
+    watermark: Watermark | None,
+) -> _Given:
+    """The input's rows for the incremental test. On the watermark's input,
+    one row before, on and after the current watermark, and one NULL; on any
+    other input, the single example row the full test has."""
+
+    column = _actual(columns, watermark.column) if watermark is not None else None
+    if (
+        watermark is None
+        or watermark.input != model_input.name
+        or column not in types
+        or _ordered_value(types[column], 0) is None
+    ):
+        return _Given(model_input.literal, [_example_row(types, columns)], [None])
+    rows = []
+    for index, offset in enumerate((-1, 0, 1, None), start=1):
+        row = _example_row(types, columns, index)
+        row[column] = None if offset is None else _ordered_value(types[column], offset)
+        rows.append(row)
+    return _Given(model_input.literal, rows, list(_BOUNDARY_NOTES))
+
+
+def _this_given(this_types: dict[str, str], watermark: Watermark | None) -> _Given:
+    row = _example_row(this_types, set(this_types))
+    note = None
+    if watermark is not None and watermark.this_column is not None:
+        column = _actual(set(this_types), watermark.this_column)
+        value = _ordered_value(this_types.get(column, ""), 0)
+        if value is not None:
+            row[column] = value
+            note = "what earlier runs loaded: its max is the current watermark"
+    return _Given(THIS, [row], [note], types=this_types)
+
+
+def _sql_literal(value: object, data_type: str) -> str:
+    """``value`` as a SQL literal cast to ``data_type``, the column's type as
+    the warehouse reported it, so the fixture carries the type dbt would
+    otherwise read from a relation."""
+
+    if value is None:
+        literal = "null"
+    elif isinstance(value, bool):
+        literal = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        literal = str(value)
+    else:
+        literal = "'" + str(value).replace("'", "''") + "'"
+    return f"cast({literal} as {data_type})"
+
+
+def _actual(columns: set[str], name: str) -> str:
+    """``name`` as ``columns`` spells it, matched case-insensitively."""
+
+    return next((c for c in columns if c.lower() == name.lower()), name)
+
+
+def _ordered_value(data_type: str, offset: int) -> object | None:
+    """A value ``offset`` steps from the fixture's watermark, in ``data_type``,
+    or ``None`` for a type with no obvious order (text, boolean)."""
+
+    upper = data_type.upper()
+    day = datetime.date(2024, 1, 2) + datetime.timedelta(days=offset)
+    if "TIMESTAMP" in upper or "DATETIME" in upper:
+        return f"{day.isoformat()} 00:00:00"
+    if "DATE" in upper:
+        return day.isoformat()
+    if any(h in upper for h in ("INT", "DECIMAL", "NUMERIC", "NUMBER")):
+        return 2 + offset
+    if any(h in upper for h in ("DOUBLE", "FLOAT", "REAL")):
+        return 2.0 + offset
+    return None
+
+
+def _example_value(data_type: str, index: int | None = None) -> object:
+    """One example value for ``data_type``. ``index`` numbers the rows of a
+    multi-row fixture, so keys and labels stay distinct across them."""
+
     upper = data_type.upper()
     if "BOOL" in upper:
         return True
     if any(h in upper for h in ("INT", "HUGEINT", "DECIMAL", "NUMERIC")):
-        return 1
+        return index or 1
     if any(h in upper for h in ("DOUBLE", "FLOAT", "REAL")):
-        return 1.0
+        return float(index or 1)
     if "TIMESTAMP" in upper:
         return "2024-01-01 00:00:00"
     if "DATE" in upper:
         return "2024-01-01"
-    return "example"
+    return "example" if index is None else f"example_{index}"
 
 
 def _yaml_scalar(value: object) -> str:
+    if value is None:
+        return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):

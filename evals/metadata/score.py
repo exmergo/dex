@@ -22,7 +22,13 @@ Truth (``truth.json``), per task::
                            "live_only": true}],
      "report": {"names": ["task_data", "due_at"], "not_done": true},
      "incomplete_allowed": {"blocked_by": ["tasks_task"]},
-     "procedure": {"build_after_apply": true, "cold_deps_after_apply": true}}
+     "procedure": {"build_after_apply": true, "cold_deps_after_apply": true,
+                   "incremental_build_after_apply": true},
+     "replays": [{"name": "next_batch", "select": "fct_x",
+                  "setup": ["delete from raw.x"],
+                  "steps": [["insert into raw.x ..."], []],
+                  "checks": [{"name": "...", "sql": "...", "expect": 0}]}],
+     "incremental_test": {"model": "fct_x"}}
 
 ``checks`` run against the gate's own build of a fresh copy, on fresh data (the
 fixture's ``grading_tables`` where it has them). ``workspace_checks`` run
@@ -30,6 +36,15 @@ read-only against the warehouse the agent left in its workspace, which is the
 only place a change the agent made to data, or failed to make, can be seen; a
 ``live_only`` one is skipped on a reference run, which never builds there.
 ``report`` grades the agent's final message (see :func:`report_rubric`).
+``replays`` grade an incremental model's next run, which a single cold build
+never executes (#1111): each starts from its own fresh copy of the workspace and
+grading warehouse, runs its ``setup`` statements, builds the project cold, then
+for each step runs the step's statements against that scratch warehouse (new
+source rows, never the agent's) and ``dbt run --select <select>`` without
+``--full-refresh``, and finally its ``checks``. Their results join ``checks``,
+named ``<replay>: <check>``. ``incremental_test`` grades, from the workspace's
+YAML alone, whether the model has a unit test that overrides ``is_incremental``
+to true: the verification step, graded apart from the data the replays judge.
 ``incomplete_allowed`` accepts a deliverable left blocked by the named
 prerequisite, where the build failed on nothing else and the final message
 reports it (status ``blocked_reported``): a request the agent cannot carry out
@@ -217,6 +232,34 @@ def _tail(output: str, lines: int = 25) -> list[str]:
     return [line for line in output.strip().splitlines()[-lines:] if line.strip()]
 
 
+_GATE_IGNORE = shutil.ignore_patterns(
+    "target", "logs", "dbt_packages", "*.duckdb*", ".dex", ".git"
+)
+
+
+def _dbt_stage(
+    scratch: Path, args: list[str]
+) -> subprocess.CompletedProcess[str] | None:
+    """One dbt invocation in ``scratch``; ``None`` when it timed out."""
+
+    try:
+        return subprocess.run(
+            [_dbt(), *args, "--profiles-dir", ".", "--no-use-colors"],
+            cwd=scratch,
+            capture_output=True,
+            text=True,
+            timeout=GATE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _declares_packages(project: Path) -> bool:
+    return (project / "packages.yml").is_file() or (
+        project / "dependencies.yml"
+    ).is_file()
+
+
 def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
     """A cold ``dbt parse`` then ``dbt build`` in a fresh copy of the workspace,
     against a freshly generated warehouse, with no ``target/`` left over. A
@@ -240,29 +283,16 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
                 for name, paths in duplicates.items()
             ],
         )
-    shutil.copytree(
-        workspace,
-        scratch,
-        ignore=shutil.ignore_patterns(
-            "target", "logs", "dbt_packages", "*.duckdb*", ".dex", ".git"
-        ),
-    )
+    shutil.copytree(workspace, scratch, ignore=_GATE_IGNORE)
     build_warehouse(scratch / WAREHOUSE_FILE, fixture.grading_tables())
     stages = [("parse", ["parse"]), ("build", ["build"])]
-    if (scratch / "packages.yml").is_file() or (scratch / "dependencies.yml").is_file():
+    if _declares_packages(scratch):
         # `dbt_packages/` was left behind above, so this is a reinstall: an edit
         # made only under the installed packages is gone, as after `dbt deps`.
         stages.insert(0, ("deps", ["deps"]))
     for stage, args in stages:
-        try:
-            proc = subprocess.run(
-                [_dbt(), *args, "--profiles-dir", ".", "--no-use-colors"],
-                cwd=scratch,
-                capture_output=True,
-                text=True,
-                timeout=GATE_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired:
+        proc = _dbt_stage(scratch, args)
+        if proc is None:
             return Gate(
                 False, stage, [f"dbt {stage} timed out after {GATE_TIMEOUT_S}s"]
             )
@@ -274,6 +304,90 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
                 _failed_nodes(scratch) if stage == "build" else [],
             )
     return Gate(True, "ok")
+
+
+def _execute(database: Path, statements: list[str]) -> None:
+    import duckdb
+
+    con = duckdb.connect(str(database))
+    try:
+        for statement in statements:
+            con.execute(statement)
+        con.execute("checkpoint")
+    finally:
+        con.close()
+
+
+def run_replays(
+    workspace: Path, fixture: Fixture, root: Path, replays: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Run each replay (see the module docstring) and return its checks' results,
+    named ``<replay>: <check>``. A replay whose dbt run fails fails every check
+    it carries, with the stage that failed as the error."""
+
+    results: list[dict[str, Any]] = []
+    for replay in replays:
+        name = replay["name"]
+        checks = replay.get("checks") or []
+        scratch = root / f"replay-{name}"
+        shutil.copytree(workspace, scratch, ignore=_GATE_IGNORE)
+        database = scratch / WAREHOUSE_FILE
+        build_warehouse(database, fixture.grading_tables())
+        _execute(database, replay.get("setup") or [])
+        stages: list[tuple[str, list[str], list[str]]] = []
+        if _declares_packages(scratch):
+            stages.append(("deps", ["deps"], []))
+        stages.append(("cold run", ["run"], []))
+        for index, statements in enumerate(replay.get("steps") or [], start=1):
+            stages.append(
+                (
+                    f"incremental run {index}",
+                    ["run", "--select", replay["select"]],
+                    list(statements),
+                )
+            )
+        failed = None
+        for stage, args, statements in stages:
+            _execute(database, statements)
+            proc = _dbt_stage(scratch, args)
+            if proc is None or proc.returncode != 0:
+                failed = f"dbt {stage} failed"
+                break
+        if failed is not None:
+            results += [
+                {"name": f"{name}: {c['name']}", "passed": False, "error": failed}
+                for c in checks
+            ]
+            continue
+        results += [
+            {**result, "name": f"{name}: {result['name']}"}
+            for result in run_checks(scratch, checks)
+        ]
+    return results
+
+
+def incremental_unit_tests(project: Path, model: str) -> list[str]:
+    """The unit tests on ``model`` that override ``is_incremental`` to true, read
+    from the project's YAML: the test that runs the branch a full build never
+    does (#1111)."""
+
+    import yaml
+
+    found = []
+    for path in _yaml_files(project):
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            continue
+        if not isinstance(document, dict):
+            continue
+        for test in document.get("unit_tests") or []:
+            if not isinstance(test, dict) or test.get("model") != model:
+                continue
+            macros = (test.get("overrides") or {}).get("macros") or {}
+            if isinstance(macros, dict) and macros.get("is_incremental") is True:
+                found.append(str(test.get("name")))
+    return sorted(found)
 
 
 def relation_columns(scratch: Path, model: str) -> list[str] | None:
@@ -473,7 +587,12 @@ def attribution(decl: Declared, truth: dict[str, Any] | None) -> dict[str, Any] 
 
 #: Procedure steps graded from the order of the agent's Dex calls (#1049, #855).
 #: Each reads ``Session.dex_calls``, in the order the agent made them.
-PROCEDURE_STEPS = ("compare_before_apply", "build_after_apply", "cold_deps_after_apply")
+PROCEDURE_STEPS = (
+    "compare_before_apply",
+    "build_after_apply",
+    "cold_deps_after_apply",
+    "incremental_build_after_apply",
+)
 
 
 def _compared_the_apply(
@@ -516,6 +635,10 @@ def procedure_steps(
       last ``transform apply``, so the repair that went in is the one shown to
       survive a reinstall of the packages (#860, #1057). Read from the call's
       ``flags``; a session recorded before flags were has none, so it is a miss.
+    - ``incremental_build_after_apply``: a ``transform build`` without
+      ``--full-refresh`` follows the last ``transform apply`` and every
+      ``--full-refresh`` build after it, so an incremental model's next run, not
+      only its full build, ran on the applied change (#1111).
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
@@ -538,6 +661,14 @@ def procedure_steps(
         results["cold_deps_after_apply"] = bool(applies) and any(
             i > applies[-1] and "cold-deps" in (calls[i].get("flags") or [])
             for i in builds
+        )
+    if "incremental_build_after_apply" in required:
+        after = [i for i in builds if applies and i > applies[-1]]
+        refreshes = [
+            i for i in after if "full-refresh" in (calls[i].get("flags") or [])
+        ]
+        results["incremental_build_after_apply"] = any(
+            i not in refreshes and all(i > r for r in refreshes) for i in after
         )
     return {
         "passed": all(results.values()),
@@ -651,6 +782,10 @@ class TaskScore:
     workspace_checks: list[dict[str, Any]] | None = None
     #: Whether the final message reports what was not done (``report_rubric``).
     report: dict[str, Any] | None = None
+    #: ``{"passed", "tests"}``: whether the task's incremental model has a unit
+    #: test overriding ``is_incremental`` (``truth.incremental_test``, #1111);
+    #: ``None`` when the task grades none.
+    incremental_test: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -743,6 +878,10 @@ def score_workspace(
     score.privacy = privacy_checks(
         task.truth.get("privacy"), fixture, workspace, transcript
     )
+    wanted_test = task.truth.get("incremental_test")
+    if wanted_test:
+        tests = incremental_unit_tests(workspace, wanted_test["model"])
+        score.incremental_test = {"passed": bool(tests), "tests": tests}
     graded = procedure_steps(task.truth.get("procedure"), calls)
     if graded is not None:
         score.procedure = graded["score"]
@@ -793,6 +932,9 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
                 "description": decl.description,
             }
         checks = run_checks(tmp_path / "built", task.truth.get("checks") or [])
+        checks += run_replays(
+            workspace, fixture, tmp_path, task.truth.get("replays") or []
+        )
     return TaskScore(
         task=task.key,
         status="scored",

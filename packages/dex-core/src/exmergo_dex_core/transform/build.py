@@ -2421,7 +2421,9 @@ def _collect_messages(
             continue
         msg = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
         msg_lines = msg.splitlines()
-        first_line = msg_lines[0].strip() if msg_lines else msg.strip()
+        # A unit test's failure opens with blank lines before its diff, so the
+        # first line with something on it is the one that names the failure.
+        first_line = next((ln.strip() for ln in msg_lines if ln.strip()), msg.strip())
         if _VALIDATION_HEADER.match(first_line):
             details = []
             for candidate in msg_lines[1:]:
