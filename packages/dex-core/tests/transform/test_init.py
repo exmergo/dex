@@ -907,6 +907,19 @@ def test_init_refuses_an_explicit_project_on_a_non_bigquery_connector(
     assert not (tmp_path / "analytics").exists()
 
 
+def test_init_refuses_an_empty_explicit_project(tmp_path: Path, capsys):
+    """``--project ""`` is a stated value, not an absent flag: refuse it rather
+    than silently falling back to the configured or discovered project."""
+
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "bigquery", "--project", ""),
+        capsys,
+    )
+    assert rc == 1
+    assert "--project" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
 def test_init_bigquery_without_a_project_errors_actionably(
     tmp_path: Path, capsys, monkeypatch
 ):

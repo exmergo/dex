@@ -152,6 +152,12 @@ def init_project(
         )
 
     config = load_config(root) or DexConfig()
+    if project == "":
+        # An explicit empty value must not read as "flag absent": it would fall
+        # back to the configured or discovered project without saying so.
+        raise InitError(
+            "--project needs a BigQuery project id; an empty value is not one"
+        )
     if project:
         if connector != "bigquery":
             raise InitError(
