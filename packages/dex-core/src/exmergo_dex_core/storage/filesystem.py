@@ -9,6 +9,7 @@ Layout (all non-secret, committed to the user's repo):
     .dex/queries.jsonl  the append-only `explore query` decision ledger
     .dex/spend.jsonl    the append-only billed-command ledger
     .dex/spend.lock     an empty file; the spend-admission lock is held on it
+    .dex/cache.lock     an empty file; a cache read-merge-write holds it
     .dex/plans/*.json   the stored transform plans
 
 State on disk is what lets the CLI subcommands stay stateless: the agent
@@ -48,6 +49,7 @@ DRIFT_FILE = "drift.json"
 QUERIES_FILE = "queries.jsonl"
 SPEND_FILE = "spend.jsonl"
 SPEND_LOCK_FILE = "spend.lock"
+CACHE_LOCK_FILE = "cache.lock"
 PLANS_DIR = "plans"
 
 # One re-entrant lock per resolved `.dex/` path, shared by every store instance
@@ -111,6 +113,53 @@ except ImportError:  # Windows
     def _unlock_descriptor(handle) -> None:
         handle.seek(0)
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+
+
+@contextmanager
+def hold_file_lock(path: Path, label: str, timeout: float) -> Iterator[None]:
+    """Hold an exclusive advisory lock on ``path``, re-entrant for one thread.
+
+    The OS lock keeps processes apart and the per-path :func:`_process_lock`
+    keeps threads apart; a nested acquisition on the holding thread takes the
+    fast path and touches no descriptor. Raises the builtin
+    :class:`TimeoutError` when ``timeout`` elapses, naming ``label``. The file
+    is created and never removed, for the reason :meth:`FilesystemStore.spend_lock`
+    gives.
+    """
+
+    key = str(path)
+    depths = _held_depths()
+    if depths.get(key, 0):
+        depths[key] += 1
+        try:
+            yield
+        finally:
+            depths[key] -= 1
+        return
+
+    deadline = time.monotonic() + timeout
+    if not _process_lock(key).acquire(timeout=max(timeout, 0.0)):
+        raise TimeoutError(
+            f"waited {timeout}s for the {label} lock at {path} and another "
+            "thread still holds it"
+        )
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            while not _lock_descriptor(handle):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"waited {timeout}s for the {label} lock at {path} and "
+                        "another process still holds it"
+                    )
+                time.sleep(0.01)
+            depths[key] = 1
+            try:
+                yield
+            finally:
+                depths[key] = 0
+                _unlock_descriptor(handle)
+    finally:
+        _process_lock(key).release()
 
 
 _DOCUMENT_FILES = {
@@ -273,40 +322,23 @@ class FilesystemStore:
         """
 
         self.dex_dir.mkdir(parents=True, exist_ok=True)
-        path = self.dex_dir / SPEND_LOCK_FILE
-        key = str(path)
-        depths = _held_depths()
-        if depths.get(key, 0):
-            depths[key] += 1
-            try:
-                yield
-            finally:
-                depths[key] -= 1
-            return
+        with hold_file_lock(self.dex_dir / SPEND_LOCK_FILE, "spend", timeout):
+            yield
 
-        deadline = time.monotonic() + timeout
-        if not _process_lock(key).acquire(timeout=max(timeout, 0.0)):
-            raise TimeoutError(
-                f"waited {timeout}s for the spend lock at {path} and another "
-                "thread still holds it"
-            )
-        try:
-            with path.open("a", encoding="utf-8") as handle:
-                while not _lock_descriptor(handle):
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"waited {timeout}s for the spend lock at {path} and "
-                            "another process still holds it"
-                        )
-                    time.sleep(0.01)
-                depths[key] = 1
-                try:
-                    yield
-                finally:
-                    depths[key] = 0
-                    _unlock_descriptor(handle)
-        finally:
-            _process_lock(key).release()
+    @contextmanager
+    def cache_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
+        """Serialize a cache read-merge-write across every process holding this root.
+
+        The same two-lock shape as :meth:`spend_lock`, on its own file
+        (`.dex/cache.lock`), so a cache write never waits on a spend admission
+        and the reverse. A writer holds it from re-reading the cache to saving
+        the merged result, which is what stops a profile written by another
+        command in between from being overwritten by a stale copy.
+        """
+
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        with hold_file_lock(self.dex_dir / CACHE_LOCK_FILE, "cache", timeout):
+            yield
 
     # --- plans ----------------------------------------------------------------
 

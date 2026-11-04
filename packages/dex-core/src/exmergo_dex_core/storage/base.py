@@ -410,6 +410,32 @@ class SpendLock(Protocol):
 
 
 @runtime_checkable
+class CacheLock(Protocol):
+    """Optional: serialize a cache read-merge-write so no writer reverts another.
+
+    A command that writes the cache re-reads it under this lock, folds its own
+    profiles into what it finds, and saves before releasing. Without it, a
+    command that loaded the cache at its start and saved at its end would
+    overwrite every profile another command wrote in between, a raised PII flag
+    included. A store without it still works: the re-read narrows the window to
+    the merge itself, and nothing closes it.
+
+    **The scope to lock is this store's cache document**, keyed the way the
+    cache is, and nothing wider: it must not contend with :class:`SpendLock`,
+    since a holder can take one inside the other. It is held across a load, an
+    in-memory merge and a save, never across a warehouse query.
+
+    It must be **reentrant for one holder**, and raise the builtin
+    :class:`TimeoutError` when ``timeout`` elapses, for the reasons
+    :class:`SpendLock` gives.
+    """
+
+    def cache_lock(self, *, timeout: float = 30.0) -> AbstractContextManager[None]:
+        """Hold the cache-write lock for this store's cache document."""
+        ...
+
+
+@runtime_checkable
 class SpendHistory(Protocol):
     """Optional: hand back spend-ledger entries, so a refusal can calibrate.
 

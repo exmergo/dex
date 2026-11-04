@@ -50,6 +50,7 @@ class MemoryStore:
         self._queries: list[dict] = []
         self._spend: list[dict] = []
         self._spend_lock = threading.RLock()
+        self._cache_lock = threading.RLock()
 
     @classmethod
     def from_context(cls, context: StoreContext) -> MemoryStore:
@@ -148,6 +149,18 @@ class MemoryStore:
         """
 
         with self._spend_lock:
+            yield
+
+    @contextmanager
+    def cache_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
+        """Serialize a cache read-merge-write across threads sharing this instance.
+
+        ``timeout`` is accepted and not enforced, for the reason
+        :meth:`spend_lock` gives: the section spans a cache read, a merge and a
+        write, with no warehouse call inside it.
+        """
+
+        with self._cache_lock:
             yield
 
     # --- plans ----------------------------------------------------------------

@@ -677,9 +677,14 @@ def _profile_into_cache(
     if withhold:
         for dataset in profiled:
             withhold_values(dataset)
-    cache, stats = _merge_profiles(prior, profiled, adapter.name, now)
-    locator = store.save_cache(cache, now=now)
-    note = _persist_note(stats, len(profiled), keeps_relationships=True)
+    merged: dict = {}
+
+    def _fold(latest: DexCache | None) -> DexCache:
+        cache, merged["stats"] = _merge_profiles(latest, profiled, adapter.name, now)
+        return cache
+
+    cache, locator = _save_over_latest(store, now, prior, _fold)
+    note = _persist_note(merged["stats"], len(profiled), keeps_relationships=True)
     return profiled, cache, locator, note
 
 
@@ -845,6 +850,7 @@ def profile(
                 # a double append on the freshly profiled path, where they are
                 # the same object.
                 cache_by_id = {d.identifier: d for d in cache.datasets}
+                measured_notes: dict[str, list[str]] = {}
                 measured = 0
                 try:
                     for dataset, candidate in candidates:
@@ -869,6 +875,9 @@ def profile(
                                 and text not in cache_entry.data_quality
                             ):
                                 cache_entry.data_quality.append(text)
+                            measured_notes.setdefault(dataset.identifier, []).append(
+                                text
+                            )
                             notes.append(f"{dataset.identifier}: {text}")
                         measured += 1
                 except OverCeilingError:
@@ -879,7 +888,12 @@ def profile(
                         "and re-run to finish (a re-run re-profiles first)"
                     )
                 finally:
-                    locator = store.save_cache(cache, now=now)
+                    cache, locator = _save_over_latest(
+                        store,
+                        now,
+                        cache,
+                        lambda latest: _with_notes(latest, cache, measured_notes),
+                    )
             else:
                 notes.append(
                     "cumulative-measure check saved unverified; the check "
@@ -1370,18 +1384,25 @@ def relationships(
     if values_free:
         for dataset in profiled:
             withhold_values(dataset)
-    cache, stats = _merge_profiles(
-        prior,
-        datasets,
-        connector,
-        now,
-        relationships=rels,
-        observed_namespaces=observed_namespaces,
+    merged: dict = {}
+
+    def _fold(latest: DexCache | None) -> DexCache:
+        cache, merged["stats"] = _merge_profiles(
+            latest,
+            datasets,
+            connector,
+            now,
+            relationships=rels,
+            observed_namespaces=observed_namespaces,
+        )
+        if catalog is not None:
+            _annotate_semantic_exposure(cache.datasets, catalog)
+        return cache
+
+    _cache, locator = _save_over_latest(store, now, prior, _fold)
+    notes.append(
+        _persist_note(merged["stats"], len(datasets), keeps_relationships=False)
     )
-    if catalog is not None:
-        _annotate_semantic_exposure(cache.datasets, catalog)
-    locator = store.save_cache(cache, now=now)
-    notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
     result = RelationshipsResult(
         relationships=rels,
@@ -2776,7 +2797,10 @@ def map(
         if prior and prior.provenance.created_at
         else now.isoformat()
     )
-    locator = store.save_cache(cache, now=now)
+    # Map composes the whole landscape, so it writes its own set rather than
+    # folding into the latest; only a profile another command wrote since this
+    # run began, newer than the one map carries, is kept over map's copy.
+    cache, locator = _save_over_latest(store, now, prior, lambda _latest: cache)
 
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -5483,6 +5507,102 @@ def _compose_datasets(
 
 # Sentinel: preserve the prior cache's relationships (profile has no inference
 # pass, so it has no business touching them).
+@contextlib.contextmanager
+def _cache_write_lock(store: ExploreStore):
+    """Hold the store's cache lock where it offers one (:class:`CacheLock`).
+
+    A store without one still gets the re-read in :func:`_save_over_latest`,
+    which narrows the window to the merge itself without closing it.
+    """
+
+    lock = getattr(store, "cache_lock", None)
+    if callable(lock):
+        with lock():
+            yield
+    else:
+        yield
+
+
+def _save_over_latest(
+    store: ExploreStore,
+    now: datetime,
+    prior: DexCache | None,
+    compose: Callable[[DexCache | None], DexCache],
+) -> tuple[DexCache, str]:
+    """Write the cache as ``compose`` builds it over the latest stored one.
+
+    Every cache write goes through here. A command loads the cache when it
+    starts and saves when it ends, and anything another command saved in
+    between (a refresh, a raised PII flag) was overwritten by the stale copy.
+    So the cache is re-read under the store's cache
+    lock, ``compose`` folds this run's work into that, any profile in it newer
+    than the one the composed cache carries is kept, and the result is saved
+    before the lock is released. Nothing inside reaches the warehouse.
+
+    ``prior`` stands in for the latest only when the stored cache can no longer
+    be read, which the load at the command's start already ruled out once.
+    """
+
+    with _cache_write_lock(store):
+        try:
+            latest = store.load_cache()
+        except ValueError:
+            latest = prior
+        cache = compose(latest)
+        _keep_newer_profiles(cache, latest)
+        locator = store.save_cache(cache, now=now)
+    return cache, locator
+
+
+def _profiled_later(candidate: str | None, current: str | None) -> bool:
+    if not candidate:
+        return False
+    if not current:
+        return True
+    try:
+        return datetime.fromisoformat(candidate) > datetime.fromisoformat(current)
+    except (TypeError, ValueError):
+        return False
+
+
+def _keep_newer_profiles(cache: DexCache, latest: DexCache | None) -> None:
+    """Keep the stored profile wherever it is newer than the one about to be saved.
+
+    The stored one was scanned after this run read the cache, by another
+    command; its measurement, PII flags included, supersedes the copy this run
+    carried. What this run derived rather than scanned (its rank and semantic
+    exposure) stays on the dataset.
+    """
+
+    if latest is None or latest.provenance.connector != cache.provenance.connector:
+        return
+    stored = {d.identifier: d for d in latest.datasets}
+    for index, dataset in enumerate(cache.datasets):
+        newer = stored.get(dataset.identifier)
+        if newer is None or newer is dataset:
+            continue
+        if not _profiled_later(newer.profiled_at, dataset.profiled_at):
+            continue
+        kept = newer.model_copy(deep=True)
+        kept.rank_score = dataset.rank_score
+        kept.semantic_models = list(dataset.semantic_models)
+        cache.datasets[index] = kept
+
+
+def _with_notes(
+    latest: DexCache | None, ours: DexCache, notes: dict[str, list[str]]
+) -> DexCache:
+    """The latest cache with this run's measured notes added to their datasets."""
+
+    if latest is None or latest.provenance.connector != ours.provenance.connector:
+        return ours
+    for dataset in latest.datasets:
+        for text in notes.get(dataset.identifier, []):
+            if text not in dataset.data_quality:
+                dataset.data_quality.append(text)
+    return latest
+
+
 def _profile_checkpointer(
     store: ExploreStore,
     prior: DexCache | None,
@@ -5508,8 +5628,12 @@ def _profile_checkpointer(
             # withheld one too, and nothing later writes its values back.
             withhold_values(ds)
         accumulated.append(ds)
-        cache, _ = _merge_profiles(prior, accumulated, connector, now)
-        store.save_cache(cache, now=now)
+        _save_over_latest(
+            store,
+            now,
+            prior,
+            lambda latest: _merge_profiles(latest, accumulated, connector, now)[0],
+        )
 
     return checkpoint, accumulated
 

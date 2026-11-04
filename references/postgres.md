@@ -160,6 +160,22 @@ autovacuum's ANALYZE cadence. `json`, `jsonb`, arrays, `bytea`, `xml`,
 Tables above `postgres.max_full_profile_bytes` are profiled from a block
 sample (`TABLESAMPLE SYSTEM`), noted, with uniqueness not judged.
 
+**The value-shape probes read a string column as text under the `C`
+collation.** The probes behind the type-contradiction, mixed-key-shape and
+generic-name findings use a regular expression and `replace()`, and Postgres
+refuses both under a nondeterministic collation (an ICU collation created with
+`deterministic = false`, such as a case-insensitive one). Each probe therefore
+reads `column::text COLLATE "C"`, so a table with such a column profiles like
+any other. The patterns are ASCII with explicit ranges, so `C` matches a text
+value exactly as its own collation would. The cast to `text` also means a
+`char(n)` column is matched without its padding, as `length()` already
+measures it, and a `citext` column is matched case-sensitively, as every other
+connector matches a string. Counts and min/max still read the column itself,
+in its own collation. Grouping, distinct counts and equality joins on a
+nondeterministic column follow that collation, so on a case-insensitive
+column `'A'` and `'a'` are one value to a uniqueness check or a join probe,
+as they are to a unique index on that column.
+
 **A cast key is measured through a guarded cast.** Postgres has no cast that
 returns NULL on failure, so where `transform plan` (identifier conversions) or
 `maintain verify` (join coverage) measures a key cast to `smallint`, `integer`
