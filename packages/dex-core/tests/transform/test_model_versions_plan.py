@@ -377,3 +377,35 @@ def test_renaming_the_file_of_a_now_versioned_model_is_not_a_dangling_ref():
         _yml(yml),
     ]
     assert validate_deletions(_view(files), edits) == []
+
+
+# --- a dotted source name is not a version label -----------------------------------
+
+
+def test_a_source_parent_is_not_split_as_a_version():
+    from exmergo_dex_core.explore.relationships import declaration_relationships
+    from exmergo_dex_core.project_definitions import (
+        DeclaredColumnMeaning,
+        ModelDeclaration,
+        ProjectDefinitions,
+    )
+
+    defs = ProjectDefinitions(
+        present=True,
+        model_declarations={
+            "fct_orders": ModelDeclaration(
+                model="fct_orders",
+                source="yaml",
+                columns={
+                    "vendor_id": DeclaredColumnMeaning(
+                        references="raw.vendors.vendor_id"
+                    )
+                },
+            )
+        },
+    )
+    edges, notes = declaration_relationships(defs, ["main.fct_orders", "raw.vendors"])
+    assert [(e.from_dataset, e.to_dataset, e.to_columns) for e in edges] == [
+        ("main.fct_orders", "raw.vendors", ["vendor_id"])
+    ]
+    assert not notes, notes

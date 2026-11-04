@@ -167,9 +167,10 @@ on that model. `data.declaration_drift` says whether this focus ran:
 declarations were fingerprinted is unchecked, never clean and never every
 declaration newly added. So is a versioned model on a baseline that keyed its
 declaration by the bare name, before declarations were read per version: it is
-named under `data.declaration_drift.unchecked_models` (`unchecked_reason:
-baseline_predates_versions`) with a warning, never reported as removed; `maintain snapshot --project-only` baselines them
-without re-measuring the warehouse, which is also how an intended declaration
+named under `data.declaration_drift.unchecked_models`, with
+`unchecked_reason: baseline_predates_versions` and a warning, and is never
+reported as removed. `maintain snapshot --project-only` baselines them without
+re-measuring the warehouse, which is also how an intended declaration
 change is accepted. `maintain reconcile` answers these findings with advisories
 only: a declaration is a human's decision, so Dex never rewrites one to match the
 baseline.

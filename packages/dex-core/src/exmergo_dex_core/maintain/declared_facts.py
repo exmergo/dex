@@ -173,14 +173,14 @@ def plan(
             and node["relation_name"]
         ):
             continue
-        relation = strip_relation_quoting(node["relation_name"])
+        built = strip_relation_quoting(node["relation_name"])
         version = node.get("version")
         if node.get("resource_type") == "model" and version not in (None, ""):
-            relations_by_name[manifest_node_label(uid, node).lower()] = relation
+            relations_by_name[manifest_node_label(uid, node).lower()] = built
             if str(version) == str(node.get("latest_version")):
-                relations_by_name[node["name"].lower()] = relation
+                relations_by_name[node["name"].lower()] = built
             continue
-        relations_by_name.setdefault(node["name"].lower(), relation)
+        relations_by_name.setdefault(node["name"].lower(), built)
 
     snapshots = temporal_mod.snapshot_nodes(nodes, project_dir)
 
