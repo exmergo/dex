@@ -46,6 +46,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
     private = [s for s in scored if s.get("privacy") is not None]
     reported = [s["report"]["passed"] for s in scored if s.get("report") is not None]
+    caught = [
+        s["defects_caught"] for s in scored if s.get("defects_caught") is not None
+    ]
     return {
         "tasks": len(scored),
         "build_gate_pass_rate": round(1 - len(gate_failed) / n, 4),
@@ -78,6 +81,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if any(not c["passed"] for c in s.get("workspace_checks") or [])
         ],
         "report": round(sum(reported) / len(reported), 4) if reported else None,
+        # Planted defects the agent's tests caught (#1112), over the tasks that
+        # plant any: a statement about the tests, never about the model.
+        "defects_caught": round(sum(caught) / len(caught), 4) if caught else None,
     }
 
 
@@ -92,7 +98,8 @@ def _print_table(report: dict[str, Any]) -> None:
 
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
-        f"{'attrib':>7} {'proc':>5} {'privacy':>7} {'wspace':>6} {'report':>6}"
+        f"{'attrib':>7} {'proc':>5} {'privacy':>7} {'wspace':>6} {'report':>6} "
+        f"{'defects':>7}"
     )
     for row in report["results"]:
         s = row["score"]
@@ -124,6 +131,11 @@ def _print_table(report: dict[str, Any]) -> None:
                 if s.get("report") is not None
                 else f" {'-':>6}"
             )
+            + (
+                f" {s['defects_caught']:7.2f}"
+                if s.get("defects_caught") is not None
+                else f" {'-':>7}"
+            )
         )
     agg = report["aggregate"]
     print(
@@ -153,6 +165,11 @@ def _print_table(report: dict[str, Any]) -> None:
             else ""
         )
         + (f"; report {agg['report']:.2f}" if agg.get("report") is not None else "")
+        + (
+            f"; defects caught {agg['defects_caught']:.2f}"
+            if agg.get("defects_caught") is not None
+            else ""
+        )
     )
 
 
@@ -300,6 +317,9 @@ def main(argv: list[str] | None = None) -> int:
             r["score"]["correctness"],
             r["score"]["checks_passed"],
             1 if r["score"]["attribution"] is None else r["score"]["attribution"],
+            1
+            if r["score"].get("defects_caught") is None
+            else r["score"]["defects_caught"],
         )
         < 1
         for r in report["results"]

@@ -1,0 +1,50 @@
+{
+  "models": {
+    "fct_depot_trailing": {
+      "grain": [
+        "depot",
+        "pickup_date"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "parcels": {
+          "role": "measure",
+          "aggregation": "sum",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "the model itself is unchanged: every trailing count matches a seven-day window",
+      "expect": 0,
+      "sql": "select count(*) from main.fct_depot_trailing f where f.parcels_7d is distinct from (select sum(p.parcels) from raw.pickups p where p.depot = f.depot and p.pickup_date between f.pickup_date - interval 6 day and f.pickup_date)"
+    }
+  ],
+  "planted_defects": [
+    {
+      "name": "window one day wider",
+      "path": "models/marts/fct_depot_trailing.sql",
+      "replace": ["interval '6 day' preceding", "interval '7 day' preceding"],
+      "select": "fct_depot_trailing"
+    },
+    {
+      "name": "window one day narrower",
+      "path": "models/marts/fct_depot_trailing.sql",
+      "replace": ["interval '6 day' preceding", "interval '5 day' preceding"],
+      "select": "fct_depot_trailing"
+    },
+    {
+      "name": "rows counted instead of days",
+      "path": "models/marts/fct_depot_trailing.sql",
+      "replace": ["range between interval '6 day' preceding", "rows between 6 preceding"],
+      "select": "fct_depot_trailing"
+    }
+  ],
+  "procedure": {
+    "mutate_after_tests": true
+  }
+}

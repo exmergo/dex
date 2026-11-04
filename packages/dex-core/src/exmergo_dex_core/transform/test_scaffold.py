@@ -28,6 +28,7 @@ from sqlglot import exp
 from ..cache import DexCache, match_identifier
 from ..dbt_project import REF_PATTERN, SOURCE_PATTERN, DbtProjectView, model_file
 from ..errors import DexError
+from . import window_fixture
 from .plans import EditKind, PlanEdit
 from .row_attribution import UnattributableError, naming_resolver, render_model_sql
 
@@ -48,6 +49,20 @@ class ModelInput(NamedTuple):
     literal: str
 
 
+class UnitTestScaffold(NamedTuple):
+    """What :func:`unit_test_scaffold` planned, and the windows it reached.
+
+    ``window_boundaries`` and ``window_notes`` come from
+    :mod:`.window_fixture`: the calendar windows whose boundary rows were
+    placed, and those it could not place rows for, each with a reason code.
+    """
+
+    edits: list[PlanEdit]
+    inputs: list[str]
+    window_boundaries: list[dict[str, object]]
+    window_notes: list[dict[str, str]]
+
+
 def unit_test_scaffold_edits(
     view: DbtProjectView, cache: DexCache | None, model_name: str
 ) -> tuple[list[PlanEdit], list[str]]:
@@ -59,6 +74,15 @@ def unit_test_scaffold_edits(
     inputs it scaffolded a ``given`` block for, in the order they appear in
     the model.
     """
+
+    scaffold = unit_test_scaffold(view, cache, model_name)
+    return scaffold.edits, scaffold.inputs
+
+
+def unit_test_scaffold(
+    view: DbtProjectView, cache: DexCache | None, model_name: str
+) -> UnitTestScaffold:
+    """:func:`unit_test_scaffold_edits`, with the calendar windows it reached."""
 
     path = model_file(view, model_name)
     sql = view.files[path].content
@@ -102,12 +126,22 @@ def unit_test_scaffold_edits(
     yaml_path = (
         f"{dir_path}/test_{model_name}.yml" if dir_path else f"test_{model_name}.yml"
     )
+    windows = window_fixture.boundary_rows(
+        parsed, inputs_by_lower, reads, types, _example_value
+    )
     edit = PlanEdit(
         path=yaml_path,
         kind=EditKind.SCHEMA_YML,
-        new_content=_unit_test_yaml(model_name, inputs, reads, types),
+        new_content=_unit_test_yaml(
+            model_name, inputs, reads, types, placed=windows.rows
+        ),
     )
-    return [edit], [i.name for i in inputs]
+    return UnitTestScaffold(
+        edits=[edit],
+        inputs=[i.name for i in inputs],
+        window_boundaries=windows.boundaries,
+        window_notes=windows.notes,
+    )
 
 
 # --- model + input discovery ---------------------------------------------------
@@ -419,6 +453,8 @@ def _unit_test_yaml(
     inputs: list[ModelInput],
     reads: dict[str, set[str]],
     types: dict[str, dict[str, str]],
+    *,
+    placed: dict[str, list[dict[str, object]]] | None = None,
 ) -> str:
     lines = [
         "version: 2",
@@ -431,11 +467,13 @@ def _unit_test_yaml(
     for model_input in inputs:
         lines.append(f"      - input: {model_input.literal}")
         lines.append("        rows:")
-        row = {
-            column: _example_value(types[model_input.name][column])
-            for column in sorted(reads[model_input.name])
-        }
-        lines.append(f"          - {_yaml_flow_mapping(row)}")
+        rows = (placed or {}).get(model_input.name) or [
+            {
+                column: _example_value(types[model_input.name][column])
+                for column in sorted(reads[model_input.name])
+            }
+        ]
+        lines.extend(f"          - {_yaml_flow_mapping(row)}" for row in rows)
     lines += [
         "    expect:",
         "      rows:",

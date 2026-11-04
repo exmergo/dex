@@ -580,6 +580,17 @@ Plans a `unit_tests:` skeleton: a `given` block per `ref()`/`source()` input
 carrying only the columns the model reads, typed from the cache, and an `expect:`
 stub that fails until filled in.
 
+- A `RANGE` frame with a day or week interval bound, ordered by a date or
+  timestamp column of one input, gets boundary rows for that input: the current
+  day, the last day the window includes, the first it excludes, and a gap a
+  row-count frame would cross. The partition is held constant and the aggregated
+  column is numbered 1, 10, 100, 1000. `data.window_boundaries` says what each
+  date tests; you still write `expect:`.
+- A window it cannot reach (an ordering expression, a month unit, a non-temporal
+  column, a bare-number `RANGE` bound such as BigQuery's over `unix_date`) is a
+  warning with a reason code, and the input keeps one example row.
+- The full loop, with a worked example: `${CLAUDE_SKILL_DIR}/references/test-strength.md`.
+
 ## `transform test --mutate <model> [--max-mutants <n>] [--check-equivalence|--no-check-equivalence] [--downstream|--no-downstream]`
 
 Plants one standard analytics defect at a time in the model's compiled SQL (a
@@ -598,6 +609,12 @@ the model's own tests against each, and reports which defects nothing caught.
   Snowflake it needs `--check-equivalence` and joins the same single estimate;
   other connectors report `not_checked`, which carries a `reason`.
 - `score` is a ratio of two small integers over one model.
+- A window frame bound moves one step wider. An interval bound also moves one
+  unit narrower, and each window mutant carries `frame`: `last_included` and
+  `first_excluded` are the offsets a boundary fixture needs rows at, in `unit`.
+- `data.unsupported_sites` lists the frame bounds no mutant moved, each with a
+  `reason_code` (a column or expression offset, a fraction, a compound
+  interval, the frame's other bound). Their boundaries are untested; say so.
 - `--downstream` also runs the tests of the models that read this one, against
   each mutant (on by default on DuckDB, opt-in and priced into the same estimate
   elsewhere). A defect only those caught is `caught_downstream`, named in
