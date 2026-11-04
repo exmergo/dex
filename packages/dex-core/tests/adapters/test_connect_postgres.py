@@ -434,7 +434,8 @@ def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
         "dexdb.shop.customers", columns, shape_stats={"email"}
     )
     sql = fake_pg_connection.data_statements[0].sql
-    assert '"email" ~ \'' in sql
+    assert '("email"::text COLLATE "C") ~ \'' in sql
+    assert '"email" ~' not in sql
     for alias in ("su_1", "sp_1", "st_1"):
         assert f" AS {alias}" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
@@ -446,6 +447,56 @@ def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
     assert by_name["id"].upper_vocab_fraction is None
     assert by_name["id"].person_shape_fraction is None
     assert by_name["id"].avg_token_count is None
+
+
+def _c(col: str) -> str:
+    return f'("{col}"::text COLLATE "C")'
+
+
+def test_shape_probes_read_c_collated_text(fake_pg_connection):
+    """Every regex and substring search reads the column as C-collated text
+    (#1096): Postgres refuses both under a nondeterministic collation, and the
+    refusal fails the statement for the whole table. Counts, MIN/MAX and an
+    integer column's numeric comparisons keep the column itself."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = make_adapter(fake_pg_connection)
+    columns = [
+        ColumnMeta(name="code", data_type="text", nullable=True, ordinal=1),
+        ColumnMeta(name="padded", data_type="character(6)", nullable=True, ordinal=2),
+        ColumnMeta(name="n", data_type="bigint", nullable=True, ordinal=3),
+    ]
+    every = {"code", "padded", "n"}
+    sql, _plan = adapter._build_aggregate_sql(
+        "dexdb.shop.customers",
+        columns,
+        safe=every,
+        shape={"code", "padded"},
+        type_req=every,
+        key_shape_req={"code", "padded"},
+        temporal_req=set(),
+    )
+    assert assert_select_only(sql, dialect="postgres") == sql
+    # Every regex operand is a column read as C text, whatever wraps it.
+    regex_count = sql.count(" ~ '")
+    assert regex_count, "the probes were requested, so a regex must render"
+    collated = re.findall(r'\("(\w+)"::text COLLATE "C"\) ~ \'', sql)
+    assert len(collated) == regex_count
+    assert set(collated) == {"code", "padded"}
+    for col in ("code", "padded"):
+        assert f'"{col}" ~' not in sql
+        assert f'REPLACE("{col}"' not in sql
+        assert f'LENGTH("{col}")' not in sql
+        assert f"REPLACE({_c(col)}, ' ', '')" in sql
+        assert f"LENGTH({_c(col)})" in sql
+        assert f'COUNT("{col}") AS' in sql
+        assert f'MIN("{col}") AS' in sql
+        assert f'MAX("{col}") AS' in sql
+    # The integer branch compares numbers: no regex, no text cast.
+    assert _c("n") not in sql
+    assert 'MIN(CASE WHEN "n" BETWEEN' in sql
 
 
 def test_degraded_types_get_non_null_counts_only(fake_pg_connection):

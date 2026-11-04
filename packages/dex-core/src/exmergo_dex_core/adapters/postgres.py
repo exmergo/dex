@@ -122,9 +122,27 @@ _ESTIMATE_QUALITY_NOTE = (
 )
 
 
-def _regexp_predicate(qcol: str, pattern: str) -> str:
+def _c_text(qcol: str) -> str:
+    """The column as text under the C collation: the operand every value-shape
+    probe reads (#1096).
+
+    Postgres refuses a regular expression and a substring search (``replace``)
+    under a nondeterministic collation, so one such column used to fail the
+    profile statement for its whole table. The shared patterns are ASCII with
+    explicit ranges, so C matches a text value exactly as its own collation
+    would. The cast to ``text`` matters as well: ``char(n)``'s regex operator
+    sees the padding (``'ab'::char(6) ~ '^[a-z]+$'`` is false) and ``citext``'s
+    ignores case, while ``text`` does neither, which is how every other
+    connector reads a string.
+    """
+
+    return f'({qcol}::text COLLATE "C")'
+
+
+def _regexp_predicate(operand: str, pattern: str) -> str:
+    # `operand` is the `_c_text` form, never a bare collatable column (#1096).
     # ~ matches substrings; the shared patterns' anchors make it a full match.
-    return f"{qcol} ~ '{pattern}'"
+    return f"{operand} ~ '{pattern}'"
 
 
 def _date_trunc_expr(qcol: str, unit: str) -> str:
@@ -819,16 +837,24 @@ class PostgresAdapter:
             if wants_min_max:
                 select_parts.append(f"MIN({qcol}) AS mn_{i}")
                 select_parts.append(f"MAX({qcol}) AS mx_{i}")
+            # The shape probes read C-collated text (see `_c_text`); counts,
+            # MIN/MAX and the temporal probes keep the column itself, so MIN/MAX
+            # still order by the column's own collation.
+            text_col = _c_text(qcol)
+            is_string = is_string_type(col.data_type)
             wants_shape = (col.name in shape) and not degraded
             if wants_shape:
-                select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
+                select_parts.extend(
+                    shape_stat_expressions(text_col, i, _regexp_predicate)
+                )
             wants_type = (col.name in type_req) and not degraded
             if wants_type:
                 select_parts.extend(
                     type_contradiction_expressions(
-                        qcol,
+                        # The integer branch compares numbers and runs no regex.
+                        text_col if is_string else qcol,
                         i,
-                        is_string=is_string_type(col.data_type),
+                        is_string=is_string,
                         is_integer=is_integer_type(col.data_type),
                         regexp_predicate=_regexp_predicate,
                         bigint_type=_BIGINT_TYPE,
@@ -836,7 +862,9 @@ class PostgresAdapter:
                 )
             wants_key_shape = (col.name in key_shape_req) and not degraded
             if wants_key_shape:
-                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+                select_parts.extend(
+                    key_shape_expressions(text_col, i, _regexp_predicate)
+                )
             wants_temporal = (col.name in temporal_req) and not degraded
             if wants_temporal:
                 select_parts.extend(

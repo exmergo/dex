@@ -241,3 +241,104 @@ def test_scope_cannot_widen_the_committed_allowlist_live(
     assert rc == 1
     assert "never widens" in envelope["errors"][0]
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+# --- value-shape probes under a nondeterministic collation (#1096) -------------------
+
+
+def test_shape_probes_run_under_a_nondeterministic_collation(pg_dsn):
+    """Postgres refuses a regex and a substring search (``replace``) under a
+    nondeterministic collation, and one such column used to fail the profile
+    statement for the whole table. The probes read the column as C-collated
+    text, so they run, and the cast to ``text`` also stops a ``char(n)``
+    column's padding from defeating the patterns' end anchors."""
+
+    psycopg = pytest.importorskip("psycopg")
+    from exmergo_dex_core.adapters.base import ColumnMeta
+    from exmergo_dex_core.adapters.postgres import PostgresAdapter
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    with psycopg.connect(pg_dsn) as conn:
+        database = conn.execute("select current_database()").fetchone()[0]
+        conn.execute(
+            "create collation pg_temp.dex_ci (provider = icu,"
+            " locale = 'und-u-ks-level2', deterministic = false)"
+        )
+        conn.execute(
+            "create temp table dex_ci_shapes ("
+            " code text collate pg_temp.dex_ci,"
+            " padded char(6) collate pg_temp.dex_ci,"
+            " plain_padded char(6),"
+            " control text)"
+        )
+        rows = [
+            ("123", "ab", "12", "x"),
+            ("550e8400-e29b-41d4-a716-446655440000", "cd", "34", "y"),
+            ("deadbeef01", "12", "56", "z"),
+            ("ALPHA", None, None, None),
+            ("Ada Lovelace", None, None, None),
+            (None, None, None, None),
+        ]
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                "insert into dex_ci_shapes values (%s, %s, %s, %s)", rows
+            )
+
+        adapter = PostgresAdapter(
+            connection=conn,
+            owns_connection=False,
+            cost_gate=CostGate(
+                paradigm=Paradigm.DB_LOAD,
+                ceiling=60.0,
+                session_ceiling=None,
+                session_spent=0.0,
+                confirmed=True,
+                connector="postgres",
+                command="explore profile",
+            ),
+        )
+        columns = [
+            ColumnMeta(name, data_type, True, ordinal)
+            for ordinal, (name, data_type) in enumerate(
+                [
+                    ("code", "text"),
+                    ("padded", "character(6)"),
+                    ("plain_padded", "character(6)"),
+                    ("control", "text"),
+                ],
+                start=1,
+            )
+        ]
+        every = {c.name for c in columns}
+        sql, plan = adapter._build_aggregate_sql(
+            f"{database}.pg_temp.dex_ci_shapes",
+            columns,
+            safe=every,
+            shape=every,
+            type_req=every,
+            key_shape_req=every,
+            temporal_req=set(),
+        )
+        values, labels = adapter._execute(sql, estimate=1.0)
+        record = dict(zip(labels, values[0], strict=True))
+        aggregates = {
+            a.name: a
+            for a in adapter._read_aggregates(
+                record, plan, {}, row_basis=None, sampled=False
+            )
+        }
+
+    code = aggregates["code"]
+    assert code.null_fraction == pytest.approx(1 / 6)
+    assert code.uuid_string_fraction == pytest.approx(1 / 5)
+    assert code.hex_string_fraction == pytest.approx(1 / 5)
+    assert code.numeric_string_fraction == pytest.approx(1 / 5)
+    # Case-sensitive: only ALPHA is upper vocabulary, only Ada Lovelace a name.
+    assert code.upper_vocab_fraction == pytest.approx(1 / 5)
+    assert code.person_shape_fraction == pytest.approx(1 / 5)
+    assert code.avg_token_count == pytest.approx(6 / 5)
+    # char(6) padding no longer hides a two-digit value from `^-?[0-9]+$`.
+    assert aggregates["padded"].integer_string_fraction == pytest.approx(1 / 3)
+    assert aggregates["plain_padded"].integer_string_fraction == pytest.approx(1.0)
+    assert aggregates["control"].integer_string_fraction == pytest.approx(0.0)
