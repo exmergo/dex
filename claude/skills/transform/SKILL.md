@@ -19,7 +19,9 @@ the `dex` CLI; where it is not installed, run the same command through the
 skill's `scripts/run.py` wrapper. Each command prints one JSON envelope: read
 it and decide the next step from it. Step 1 only reads. Steps 2 to 5 change the
 project, so take them only when the task asks for a change; a question about the
-data stops after step 1 and reports what it found.
+data stops after step 1 and reports what it found. Explore and maintain report
+findings and hand repair work to transform; only the transform workflow performs
+the project edits, migrations and dev builds described below.
 
 1. **Profile what the change reads.** Before writing or fixing SQL against a
    table whose columns, types, grain or join keys you have not verified in this
@@ -130,6 +132,17 @@ declares is `contract`.
 
 **Correct rows, not only a green build.**
 
+- A protected-value read refusal is not an instruction to remove, redact or
+  replace a column in a transformation. When the requested or existing output
+  contract includes a protected field, preserve its authorized pass-through
+  through the normal plan/apply path where supported. Check column presence and
+  types with metadata and rows with permitted aggregates, without requesting raw
+  protected values. Intentional removal or redaction needs an applicable user
+  instruction or contract. If the transformation itself is prohibited or
+  unsupported, report that limitation accurately: permission on another command
+  does not transfer, and a privacy or dev-target guard is never bypassed. Keep
+  protected examples out of assumptions, tests, logs and explanations. Only a
+  human clears a PII flag.
 - Drive a model from the entity it describes. When that entity is the parent
   and the population keeps parents with no children, left-join the children so
   each such parent survives, with a count of zero rather than NULL.
@@ -146,6 +159,12 @@ declares is `contract`.
   only the conditionals. A flag's default decides neither. State the behavior
   that survives with a `retirement` contract on `dex transform remove var`.
   Recipe: `skills/transform/references/feature-retirement.md`.
+- A new version of an existing model ("v2", a future replacement) is a native
+  dbt version: a `versions:` list on the model's YAML entry, with
+  `latest_version` keeping the current default, never an independent
+  `<model>_v2`. Declare a version as `<model>.v<N>`. Promotion is its own plan:
+  `data.model_versions` names the default and every consumer it moves.
+  Recipe: `skills/transform/references/model-versions.md`.
 - Change only what the request asks; keep the output columns the request and
   the existing model define.
 - A balance or a running total is `semi_additive`: never sum it across time.
@@ -153,6 +172,22 @@ declares is `contract`.
   entities.
 - Test logic with `dex transform test --scaffold <model>` (dbt unit tests) and
   measure the tests with `dex transform test --mutate <model>`.
+- Repair the layer the request names, and settle which one before choosing a
+  remedy. "Modify our data" or "fix the source types" asks for an input change;
+  "make it build" or "adapt the project" asks for a project change; otherwise the
+  contract decides who owns the input (a seed the project loads, or a source a
+  loader owns), recorded as an assumption. Explore and maintain report the owner,
+  requested postcondition and supported remedy, then hand off to transform.
+  In transform, a project change does not fulfil an
+  input request, and an input request authorizes no write Dex cannot make:
+  change a project seed through its CSV or `+column_types` and a build; for a
+  loader's source, write any migration as a reviewable file, say it was not run,
+  and report that part incomplete, never reaching for a raw database client. A
+  project request never changes the input. Check the requested postcondition on
+  the original relation (`explore profile` for types, aggregates for rows); for a
+  built project seed use `explore profile <dev namespace>.<seed> --target dev`:
+  `--cold-deps` proves a project repair survives a reinstall, not that the data
+  changed.
 - Never edit installed packages (`dbt_packages/`) and never repair only in the
   warehouse: a reinstall or a reload undoes both. When a prerequisite blocks a
   deliverable, read `data.prerequisites` for its owner, its `plan_relation` and
@@ -410,6 +445,15 @@ a field, flag, or macro you need is not described here.
 
 ### Seeds and PII
 
+- Preserve a protected field the requested or existing output contract includes
+  through supported, authorized model plans. A read refusal does not authorize
+  dropping, redacting or replacing it. Check presence and types with metadata
+  and rows with permitted aggregates; keep protected examples out of the diff
+  and the report. Redaction needs an applicable instruction or contract.
+- A model pass-through does not authorize a seed export. If the transformation
+  itself is prohibited or unsupported, report that limitation without bypassing
+  a privacy or dev-target guard. Only a human clears a PII flag.
+
 - A seed puts values into git. Never build one out of warehouse rows you have not
   looked at: detection reads names and types, never values, so it cannot see
   personal data under a neutral column name.
@@ -493,12 +537,16 @@ a field, flag, or macro you need is not described here.
 - `${CLAUDE_SKILL_DIR}/references/declarations.md`: the `declarations` payload,
   every field and its allowed values, what each renders into, and
   `transform declare` for models that already exist.
-- `${CLAUDE_SKILL_DIR}/references/prerequisite-repairs.md`: a failed prerequisite's
+- `${CLAUDE_SKILL_DIR}/references/prerequisite-repairs.md`: which layer the
+  request asks to change (the input data or the project), a failed prerequisite's
   owner and repair routes, keeping a type repair's meaning, proving it with
   `--cold-deps`, and reporting a deliverable incomplete.
 - `${CLAUDE_SKILL_DIR}/references/feature-retirement.md`: retiring a feature flag
   versus making it permanent, the `retirement` contract on `remove var`, and how
   each check holds the change to the behavior it keeps.
+- `${CLAUDE_SKILL_DIR}/references/model-versions.md`: a new version of a model as
+  native dbt versions, declaring each version, reading `data.model_versions`, and
+  promotion as its own plan.
 - `${CLAUDE_SKILL_DIR}/references/commands.md`: `references`, `rename`, `remove`,
   `place`, `declare`, `build`, `build --verify`, `test --mutate`, and `deps` in detail.
 - `${CLAUDE_SKILL_DIR}/references/init-and-dev-target.md`: per-connector init and

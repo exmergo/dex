@@ -1,1 +1,0 @@
-**Show earlier prerequisite statuses.** Failed prerequisites include context from the last available build artifact, preserved across pricing and confirmation retries without another warehouse build. The evidence is historical and does not change `plan_relation`.
