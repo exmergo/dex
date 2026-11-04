@@ -643,6 +643,7 @@ def _splice_model(
     model = PurePosixPath(model_path).stem
     settled: list[DriftFinding] = []
     in_sql: list[DriftFinding] = []
+    already_reflected: list[DriftFinding] = []
     for finding in written:
         if finding.code == "nullability_changed":
             settled.append(finding)
@@ -673,7 +674,12 @@ def _splice_model(
         if result.changed:
             declarations.stage_sql(model_path, result.content)
             in_sql.append(finding)
-        settled.append(finding)
+            # Stage YAML only when the model's output actually changes (#983).
+            settled.append(finding)
+        else:
+            # SQL splice was a no-op: the model already absorbs this drift
+            # (for example ``page as page_path`` over a renamed source column).
+            already_reflected.append(finding)
 
     placed = declarations.resolve(table)
     in_yaml: list[DriftFinding] = []
@@ -697,14 +703,16 @@ def _splice_model(
             )
         else:
             proposals.append(_schema_advisory(identifier, finding, reason))
-    warnings.extend(_downstream_readers(view, model, settled))
+    warnings.extend(_downstream_readers(view, model, settled + already_reflected))
 
     if not changed:
         declined = [finding for finding, _reason in unstaged]
-        already = [f for f in settled if f not in declined]
+        already = already_reflected + [f for f in settled if f not in declined]
         if already:
             proposals.append(_covered_advisory(identifier, already))
         return
+    if already_reflected:
+        proposals.append(_covered_advisory(identifier, already_reflected))
     paths = ([model_path] if in_sql else []) + (
         [placed.path] if isinstance(placed, Placed) and in_yaml else []
     )

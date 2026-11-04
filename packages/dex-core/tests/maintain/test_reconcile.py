@@ -1091,6 +1091,41 @@ def test_no_test_is_invented_for_an_added_column(maintain_repo):
     assert added == ["+      - name: captured_at"], added
 
 
+def test_aliased_source_rename_is_covered_without_yaml_edit(maintain_repo):
+    """#983: model already maps renamed source column; do not stage YAML from source.
+
+    Loader renames ``status`` -> ``st``. Staging keeps its contract with
+    ``st as status``. SQL splices are no-ops; YAML must not drop ``status`` /
+    add ``st`` (that would break the model contract).
+    """
+
+    _edit_sql(maintain_repo, "        status,\n", "        st as status,\n")
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "ALTER TABLE orders ADD COLUMN st VARCHAR",
+        "UPDATE orders SET st = status",
+        "ALTER TABLE orders DROP status",
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    # No YAML (or SQL) diff for the absorbed rename.
+    yml_diffs = [
+        d for d in payload.get("diffs") or [] if d["path"].endswith("stg_orders.yml")
+    ]
+    assert not yml_diffs
+    covered = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["kind"] == "advisory" and p["finding_code"] == "schema_drift"
+    )
+    assert "already reflects" in covered["action"]
+
+
 def test_drift_the_project_already_reflects_is_advisory_and_stores_no_plan(
     maintain_repo,
 ):
