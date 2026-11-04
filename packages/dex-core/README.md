@@ -510,6 +510,7 @@ For a repository that must not publish warehouse values, start with:
 .dex/drift.json
 .dex/spend.jsonl
 .dex/spend.lock
+.dex/cache.lock
 ```
 
 Review `snapshot.json` separately; ignoring the cache does not remove values

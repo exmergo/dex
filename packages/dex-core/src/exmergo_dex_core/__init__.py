@@ -55,6 +55,7 @@ _EXPORTS = {
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
     "BuildEvidenceError": "transform.evidence",
+    "CacheLock": "storage",
     "CacheRequiredError": "explore.commands",
     "CacheUnreadableError": "storage.base",
     "CeilingRequiredError": "guards.cost_guard",
@@ -204,6 +205,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     )
     from .slayer.dependency import SlayerDependencyError
     from .storage import (
+        CacheLock,
         CacheUnreadableError,
         Document,
         ExploreStore,
@@ -243,6 +245,7 @@ __all__ = [
     "BaselineUnreadableError",
     "BudgetExhaustedError",
     "BuildEvidenceError",
+    "CacheLock",
     "CacheRequiredError",
     "CacheUnreadableError",
     "CeilingRequiredError",
