@@ -409,6 +409,15 @@ def _advisory(
             "investigate the upstream load; a dbt `relationships` test would "
             "make the orphaned keys visible in builds"
         ),
+        "declared_join_orphans": (
+            "the project declares a join the data does not meet, and no "
+            "baseline measurement shows it ever held, so this is not drift: repoint "
+            "the declaration at the parent that holds these keys, load the "
+            "missing parents, or drop the claim. Once the join is right, re-pin "
+            "with `explore map --verify --use-project` (the map reads no "
+            "declared join without it) and `maintain snapshot` so later runs "
+            "judge it against a before"
+        ),
         "dangling_reference": (
             "update the semantic definition with `"
             + _semantic_update_command(semantic_vendor)

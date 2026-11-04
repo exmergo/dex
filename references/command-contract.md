@@ -462,7 +462,10 @@ dex maintain volume [<objects>]   -> freshness drift: row counts that collapsed,
 dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join
                                      fanout, the grains the project declares re-verified, and declared
                                      join arity (SLayer cardinality, Cube relationship) measured
-                                     (join_cardinality_exceeded)
+                                     (join_cardinality_exceeded); a baseline join that gained orphans
+                                     (join_orphans_increased), and a join declared now that the
+                                     baseline never measured, or measured already over the bound,
+                                     held to a 20% orphan bound (declared_join_orphans)
                                      (aggregates; gated by --confirm --budget on billed connectors)
 dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + declaration drift
                                      (declaration_added|removed|changed naming the model, column and
