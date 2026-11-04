@@ -1070,7 +1070,7 @@ def verify_relationships(
     *,
     timeout_seconds: float = 30.0,
     progress: ProgressReporter | None = None,
-) -> None:
+) -> list[tuple[Relationship, str]]:
     """Measure each join with one overlap probe and adjust in place.
 
     The probe counts non-null foreign-key values and how many have no match in

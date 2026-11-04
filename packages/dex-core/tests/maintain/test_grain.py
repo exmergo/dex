@@ -242,6 +242,284 @@ def test_declared_join_fanout_regression_is_a_finding(maintain_repo):
     assert len(findings) == 1, payload["data"]["findings"]
     assert findings[0]["data"]["orphan_fraction_before"] == 0.0
     assert findings[0]["data"]["orphan_fraction_after"] > 0.0
+    # The baseline measured this declaration, so it is judged against that
+    # before alone and never also against the bound (#1095).
+    codes = {f["code"] for f in payload["data"]["findings"]}
+    assert "declared_join_orphans" not in codes
+
+
+# --- issue #1095: a join declared after the baseline is judged ---------------
+
+_VIP_SOURCE = (
+    "      - name: vip_customers\n"
+    "        columns:\n"
+    "          - name: id\n"
+    "          - name: name\n"
+)
+
+
+def _declare_customer_fk_to(repo, table: str, field: str = "id") -> None:
+    """Point the declared stg_orders.customer_id join at ``table``, a source
+    in the `main` schema, without rebuilding the map or the baseline."""
+
+    sources = repo.root / "models" / "staging" / "_dex_sources.yml"
+    text = sources.read_text(encoding="utf-8")
+    if table == "vip_customers" and "vip_customers" not in text:
+        text = text.replace(
+            "      - name: orders\n", _VIP_SOURCE + "      - name: orders\n"
+        )
+        sources.write_text(text, encoding="utf-8")
+    repo.edit(
+        "models/staging/stg_orders.yml",
+        _STG_ORDERS_WITH_DECLARED_FK.replace(
+            "source('main', 'customers')", f"source('main', '{table}')"
+        ).replace("field: id", f"field: {field}"),
+    )
+
+
+def _declared_join_findings(payload):
+    return [
+        f for f in payload["data"]["findings"] if f["code"] == "declared_join_orphans"
+    ]
+
+
+@pytest.fixture
+def judged_joins(monkeypatch):
+    """Every declared-join check the run judged, with what its probe measured,
+    so a test asserting silence can tell a join that held from one that was
+    never planned or never probed."""
+
+    from exmergo_dex_core.maintain import drift
+
+    judged: list[tuple[str, str, str, float | None]] = []
+    original = drift._declared_join_findings
+
+    def recording(plan, refused):
+        for check in plan.declared_join_checks or []:
+            measured = check.measured_by or check.relationship
+            judged.append(
+                (
+                    check.relationship.from_dataset,
+                    check.relationship.to_dataset,
+                    check.baseline,
+                    measured.orphan_fraction,
+                )
+            )
+        return original(plan, refused)
+
+    monkeypatch.setattr(drift, "_declared_join_findings", recording)
+    return judged
+
+
+def test_a_join_pinned_while_already_wrong_is_held_to_the_bound(maintain_repo):
+    """The issue's step 4, second case: the mis-declared join is already in
+    the map when the baseline is pinned, so its 75% is the before and the
+    relative comparison stays quiet however long the declaration is false."""
+
+    maintain_repo.sql(
+        "CREATE TABLE vip_customers AS SELECT * FROM customers WHERE id <= 10"
+    )
+    _declare_customer_fk_to(maintain_repo, "vip_customers")
+    rc, payload = maintain_repo.dex("explore", "map", "--verify", "--use-project")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    (finding,) = _declared_join_findings(payload)
+    assert finding["data"]["baseline"] == "measured"
+    assert finding["data"]["orphan_fraction_baseline"] == 0.75
+    assert finding["data"]["orphan_fraction"] == 0.75
+    assert "has not held since it was pinned" in finding["detail"]
+    assert not [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "join_orphans_increased"
+        and f["data"]["to_dataset"] == "warehouse.main.vip_customers"
+    ]
+
+
+def test_a_wrong_join_that_worsens_is_reported_once(maintain_repo, judged_joins):
+    """Where the relative comparison does fire, it speaks for the join alone:
+    one finding per join, not one per code."""
+
+    maintain_repo.sql(
+        "CREATE TABLE vip_customers AS SELECT * FROM customers WHERE id <= 10"
+    )
+    _declare_customer_fk_to(maintain_repo, "vip_customers")
+    rc, payload = maintain_repo.dex("explore", "map", "--verify", "--use-project")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+    maintain_repo.sql("DELETE FROM vip_customers WHERE id > 5")
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    on_vip = [
+        f
+        for f in payload["data"]["findings"]
+        if f.get("data", {}).get("to_dataset") == "warehouse.main.vip_customers"
+    ]
+    assert [f["code"] for f in on_vip] == ["join_orphans_increased"], on_vip
+    # It was planned as a declared check and read the fanout pair's probe.
+    assert (
+        "warehouse.main.stg_orders",
+        "warehouse.main.vip_customers",
+        "measured",
+        0.875,
+    ) in judged_joins
+
+
+def test_a_join_redeclared_after_the_baseline_is_held_to_the_bound(maintain_repo):
+    """The issue's reproduction: the declared join is measured into the
+    baseline, then re-pointed at a parent holding a quarter of the keys. The
+    baseline has no edge with the new endpoints, so `join_orphans_increased`
+    has nothing to compare and used to be the only code that could speak."""
+
+    maintain_repo.sql(
+        "CREATE TABLE vip_customers AS SELECT * FROM customers WHERE id <= 10"
+    )
+    _declare_the_customer_fk(maintain_repo)
+    maintain_repo.snapshot()
+
+    _declare_customer_fk_to(maintain_repo, "vip_customers")
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+
+    (finding,) = _declared_join_findings(payload)
+    assert finding["identifier"] == "warehouse.main.stg_orders"
+    assert finding["column"] == "customer_id"
+    # customer_id runs 1..40 and the new parent holds 1..10.
+    assert finding["data"]["orphan_fraction"] == 0.75
+    assert finding["data"]["baseline"] == "absent"
+    assert finding["data"]["to_dataset"] == "warehouse.main.vip_customers"
+    assert finding["data"]["threshold"] == 0.2
+    assert finding["severity"] == "high"
+    assert "rather than drift" in finding["detail"]
+    # Not a regression of anything the baseline measured.
+    assert not [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "join_orphans_increased"
+        and f["data"]["to_dataset"] == "warehouse.main.vip_customers"
+    ]
+
+
+def test_a_join_declared_after_the_baseline_that_holds_is_quiet(
+    maintain_repo, judged_joins
+):
+    """The control: a parent holding every key, declared after the snapshot.
+    Name inference never matches `vip_customers`, so the baseline holds no
+    edge to it and the join is planned, probed, and found to hold."""
+
+    maintain_repo.sql("CREATE TABLE vip_customers AS SELECT * FROM customers")
+    maintain_repo.snapshot()
+    _declare_customer_fk_to(maintain_repo, "vip_customers")
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert _declared_join_findings(payload) == []
+    assert judged_joins == [
+        ("warehouse.main.stg_orders", "warehouse.main.vip_customers", "absent", 0.0)
+    ]
+
+
+def test_a_declared_join_under_the_bound_is_not_reported(maintain_repo, judged_joins):
+    maintain_repo.sql(
+        "CREATE TABLE vip_customers AS SELECT * FROM customers WHERE id <= 36"
+    )
+    maintain_repo.snapshot()
+    _declare_customer_fk_to(maintain_repo, "vip_customers")
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    # 4 of 40 keys orphaned is 10%: real, and a sparse join can be legitimate.
+    assert _declared_join_findings(payload) == []
+    assert judged_joins == [
+        ("warehouse.main.stg_orders", "warehouse.main.vip_customers", "absent", 0.1)
+    ]
+
+
+def test_a_declared_join_naming_a_missing_column_is_said_not_passed(maintain_repo):
+    maintain_repo.snapshot()
+    _declare_customer_fk_to(maintain_repo, "customers", field="customer_key")
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert _declared_join_findings(payload) == []
+    assert any(
+        "warehouse.main.customers.customer_key" in w and "orphans were not checked" in w
+        for w in payload["warnings"]
+    ), payload["warnings"]
+
+
+def test_a_declared_join_that_does_not_resolve_is_said_not_passed(maintain_repo):
+    maintain_repo.snapshot()
+    _declare_customer_fk_to(maintain_repo, "vip_customers")  # no such table
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert any(
+        "were not checked for orphans" in w and "vip_customers" in w
+        for w in payload["warnings"]
+    ), payload["warnings"]
+
+
+def test_declared_join_findings_report_what_went_unmeasured():
+    """The two ways a planned declared join yields no fraction are noted on the
+    plan rather than read as a join that held."""
+
+    from exmergo_dex_core.cache import Relationship, RelationshipKind
+    from exmergo_dex_core.maintain import drift
+    from exmergo_dex_core.maintain.drift import DeclaredJoinCheck, GrainPlan
+
+    def declared(child: str, **measured) -> Relationship:
+        return Relationship(
+            from_dataset=child,
+            from_columns=["parent_id"],
+            to_dataset="db.main.parent",
+            to_columns=["id"],
+            kind=RelationshipKind.DECLARED,
+            confidence=1.0,
+            **measured,
+        )
+
+    refused = declared("db.main.refused")
+    empty = declared("db.main.empty", verified=True)
+    composite = Relationship(
+        from_dataset="db.main.lines",
+        from_columns=["order_id", "line_no"],
+        to_dataset="db.main.order_lines",
+        to_columns=["order_id", "line_no"],
+        kind=RelationshipKind.DECLARED,
+        verified=True,
+        orphan_fraction=0.3,
+    )
+    plan = GrainPlan(
+        key_checks=[],
+        fanout_pairs=[],
+        composite_checks=[],
+        declared_composite_checks=[],
+        notes=[],
+        declared_join_checks=[
+            DeclaredJoinCheck(refused, "absent"),
+            DeclaredJoinCheck(empty, "absent"),
+            DeclaredJoinCheck(composite, "unmeasured"),
+        ],
+    )
+
+    findings = drift._declared_join_findings(plan, [(refused, "refused: boom")])
+
+    (finding,) = findings
+    assert finding.severity == "medium"
+    assert finding.data["baseline"] == "unmeasured"
+    assert finding.data["from_columns"] == ["order_id", "line_no"]
+    assert "(order_id, line_no)" in finding.detail
+    assert "no orphan fraction to compare" in finding.detail
+    assert plan.notes == [
+        "a declared join was not checked for orphans: refused: boom",
+        "the declared join db.main.empty.parent_id -> db.main.parent.id has no "
+        "non-null keys on db.main.empty, so it had no orphans to count",
+    ]
 
 
 def test_dropped_key_column_is_left_to_the_schema_axis(maintain_repo):

@@ -1200,6 +1200,11 @@ reads the model files and the metadata dex captured through its own connection.
   match several and anything aggregated across the join is counted more than
   once. A `one_to_many` join is read the other way round. A join declaring no
   cardinality is named in `warnings` as unchecked, never passed silently.
+  Each join's orphans are measured as well. A join the baseline measured is
+  compared with its earlier fraction (`join_orphans_increased`); one declared
+  since, or already over the bound when the baseline was pinned, is held to a
+  20% orphan bound (`declared_join_orphans`). A `many_to_many` join states no
+  containment, so it is held to no bound.
 - **Schema.** SLayer's `validate-models` compares each `sql_table` model with the
   live schema through SLayer's own datasource connection, which carries
   credentials dex does not read. dex runs the same comparison instead, through
