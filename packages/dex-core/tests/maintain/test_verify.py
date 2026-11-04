@@ -1686,6 +1686,66 @@ def test_a_group_by_model_with_fewer_rows_is_not_reported(tmp_path: Path):
     assert findings == []
 
 
+def test_a_scalar_aggregate_model_with_one_row_is_not_reported(tmp_path: Path):
+    """#1098: COUNT(*) without a GROUP BY intentionally returns one row; that
+    is design, not unexplained loss."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "control",
+                'select count(*) as source_rows from "wh"."main"."stg_orders"',
+            )
+        },
+    )
+    assert checks[0].reducers == ("a scalar aggregate",)
+    findings, _ = _judge(checks, {"stg_orders": 5000, "control": 1})
+    assert findings == []
+
+
+def test_a_scalar_aggregate_behind_a_cte_is_not_reported(tmp_path: Path):
+    """#1098's reproduced shape: the aggregate lives in a CTE, the final
+    select only projects it. The driving-parent walk must still see the
+    reducer."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "control",
+                'with d as (select count(*) as source_rows from '
+                '"wh"."main"."stg_orders") '
+                "select 1 as control_id, source_rows from d",
+            )
+        },
+    )
+    assert "a scalar aggregate" in checks[0].reducers
+    findings, _ = _judge(checks, {"stg_orders": 5000, "control": 1})
+    assert findings == []
+
+
+def test_a_window_count_does_not_silence_real_row_loss(tmp_path: Path):
+    """#1098: COUNT(*) OVER () is not a scalar aggregate; a join that drops
+    rows must still surface."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "fct",
+                'select o.id, count(*) over () as n from "wh"."main"."stg_orders" o '
+                'inner join "wh"."main"."stg_customers" c on o.cid = c.id',
+            )
+        },
+    )
+    assert "a scalar aggregate" not in checks[0].reducers
+    findings, _ = _judge(
+        checks, {"stg_orders": 200, "stg_customers": 40, "fct": 100}
+    )
+    assert [f.code for f in findings] == ["row_loss"]
+
+
 @pytest.mark.parametrize(
     ("sql", "reducer"),
     [

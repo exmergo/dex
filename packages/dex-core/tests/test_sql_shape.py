@@ -96,6 +96,9 @@ def test_equality_columns_of_no_condition_is_empty():
         ),
         ("select * from t semi join u on t.id = u.id", "a semi join"),
         ("select * from t anti join u on t.id = u.id", "a anti join"),
+        ("select count(*) from t", "a scalar aggregate"),
+        ("select count(distinct a) as n from t", "a scalar aggregate"),
+        ("select sum(a), max(b) from t", "a scalar aggregate"),
     ],
 )
 def test_reducing_clauses_names_every_honest_reason_to_hold_fewer_rows(
@@ -106,6 +109,38 @@ def test_reducing_clauses_names_every_honest_reason_to_hold_fewer_rows(
 
 def test_a_plain_projection_has_no_reason_to_hold_fewer_rows():
     assert sql_shape.reducing_clauses(_parse("select a, b from t")) == []
+
+
+def test_a_window_aggregate_is_not_a_scalar_aggregate():
+    """COUNT(*) OVER () keeps one row per input; it must not silence real
+    row loss the way a collapsing COUNT(*) would (#1098)."""
+
+    assert sql_shape.reducing_clauses(_parse("select count(*) over () from t")) == []
+    assert (
+        sql_shape.reducing_clauses(
+            _parse("select a, count(*) over (partition by a) from t")
+        )
+        == []
+    )
+
+
+def test_an_aggregate_inside_a_scalar_subquery_does_not_reduce_the_outer_select():
+    """The subquery collapses its own input; the outer select still projects
+    one row per driving row (#1098)."""
+
+    assert (
+        sql_shape.reducing_clauses(
+            _parse("select a, (select count(*) from u) as n from t")
+        )
+        == []
+    )
+
+
+def test_a_grouped_aggregate_is_named_as_group_by_not_a_scalar_aggregate():
+    clauses = sql_shape.reducing_clauses(
+        _parse("select a, count(*) from t group by a")
+    )
+    assert clauses == ["a GROUP BY"]
 
 
 def test_an_ordinary_join_is_not_a_reducing_clause():
