@@ -2031,7 +2031,8 @@ def _resolve_within_scope(select, column_name: str, cte_scopes: dict, sql_shape,
 
     Refuses -- rather than resolving through -- any scope that reduces rows
     (:func:`~..sql_shape.reducing_clauses`: a WHERE, a HAVING, a GROUP BY, a
-    DISTINCT, a LIMIT). ``select * from customers where active = true``
+    scalar aggregate, a DISTINCT, a LIMIT). ``select * from customers where
+    active = true``
     projects the same column names the physical ``customers`` table has,
     but not the same rows: probing a join against the whole table when the
     project's own SQL joins against only the active subset can report a

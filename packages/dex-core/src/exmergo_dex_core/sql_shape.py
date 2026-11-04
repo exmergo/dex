@@ -276,6 +276,45 @@ ROW_MULTIPLIERS = tuple(
 _FILTERING_SIDES = ("semi", "anti")
 
 
+def _projection_holds_scalar_aggregate(projection: exp.Expression) -> bool:
+    """Whether this projection expression itself aggregates rows.
+
+    A window (`COUNT(*) OVER ()`) keeps one output row per input, so it is not
+    a reducer. An aggregate nested in a scalar subquery belongs to that
+    subquery's scope, not this select's: the outer query still projects one
+    row per driving row. Only an aggregate that is part of this select's own
+    projection, outside a window or subquery, collapses the input.
+    """
+
+    stack: list[exp.Expression] = [projection]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (exp.Window, exp.Subquery)):
+            continue
+        if isinstance(node, exp.AggFunc):
+            return True
+        stack.extend(node.iter_expressions())
+    return False
+
+
+def holds_scalar_aggregate(select: exp.Select) -> bool:
+    """Whether this select collapses every input row into one by aggregating
+    without a GROUP BY.
+
+    `SELECT COUNT(*) FROM t` and `SELECT SUM(a), MAX(b) FROM t` intentionally
+    return one row. A `GROUP BY` is already named by :func:`reducing_clauses`;
+    this helper is only for the no-group form, so callers that already saw a
+    group do not double-count.
+    """
+
+    if select.args.get("group") is not None:
+        return False
+    return any(
+        _projection_holds_scalar_aggregate(projection)
+        for projection in select.expressions
+    )
+
+
 def reducing_clauses(select: exp.Select) -> list[str]:
     """Every clause in this select that gives it an honest reason to hold fewer
     rows than the relation it reads.
@@ -286,7 +325,9 @@ def reducing_clauses(select: exp.Select) -> list[str]:
     reporting it would bury the first case under the second.
 
     Named in the order a reader would look for them, and returned as prose
-    fragments because they end up in a finding a person reads.
+    fragments because they end up in a finding a person reads. A scalar
+    aggregate without a GROUP BY is one of those reasons (#1098): the select
+    collapses its input on purpose, the same way a GROUP BY does.
     """
 
     found: list[str] = []
@@ -298,6 +339,8 @@ def reducing_clauses(select: exp.Select) -> list[str]:
         found.append("a QUALIFY filter")
     if select.args.get("group") is not None:
         found.append("a GROUP BY")
+    elif holds_scalar_aggregate(select):
+        found.append("a scalar aggregate")
     if select.args.get("distinct") is not None:
         found.append("a DISTINCT")
     if select.args.get("limit") is not None:
