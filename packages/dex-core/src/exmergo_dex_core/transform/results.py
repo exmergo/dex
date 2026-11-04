@@ -300,6 +300,10 @@ class ApplyResult(Result):
     """
 
     plan_id: str = ""
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     written: list[str] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
     conflicts_overridden: list[str] = Field(default_factory=list)
@@ -313,10 +317,20 @@ class ApplyResult(Result):
     refactor_comparison: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
+        resolution = (
+            {"resolved_plan": self.resolved_plan}
+            if self.resolved_plan is not None
+            else {}
+        )
         if self.pending_confirmation is not None:
-            return {"plan_id": self.plan_id, "conflicts": self.conflicts}
+            return {
+                "plan_id": self.plan_id,
+                **resolution,
+                "conflicts": self.conflicts,
+            }
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
+            **resolution,
             "written": self.written,
             "conflicts_overridden": self.conflicts_overridden,
         }
@@ -348,6 +362,10 @@ class PlanExportResult(Result):
     """
 
     plan_id: str = ""
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     digest: str = ""
     plan: PortablePlan = Field(
         default_factory=lambda: PortablePlan(
@@ -366,7 +384,10 @@ class PlanExportResult(Result):
             if hasattr(self.plan, "data")
             else (self.plan.model_dump(mode="json") if self.plan is not None else {})
         )
-        return {"plan_id": self.plan_id, "digest": self.digest, "plan": plan_data}
+        payload: dict[str, Any] = {"plan_id": self.plan_id}
+        if self.resolved_plan is not None:
+            payload["resolved_plan"] = self.resolved_plan
+        return {**payload, "digest": self.digest, "plan": plan_data}
 
 
 class ClassificationResult(Result):
@@ -377,6 +398,10 @@ class ClassificationResult(Result):
     """
 
     plan_id: str | None = None
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     classifications: list[ArtifactClassification] = Field(default_factory=list)
 
     always_reports_notes: ClassVar[bool] = True
@@ -392,6 +417,8 @@ class ClassificationResult(Result):
             c.data() if hasattr(c, "data") else c for c in self.classifications
         ]
         payload: dict[str, Any] = {"classifications": classifications_data}
+        if self.resolved_plan is not None:
+            payload = {"resolved_plan": self.resolved_plan, **payload}
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
         return payload
@@ -406,6 +433,10 @@ class GroundingResult(Result):
     """
 
     plan_id: str | None = None
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     grounding: Grounding = Field(default_factory=Grounding)
 
     always_reports_notes: ClassVar[bool] = True
@@ -421,6 +452,8 @@ class GroundingResult(Result):
             else dict(self.grounding)
         )
         payload = dict(grounding_data)
+        if self.resolved_plan is not None:
+            payload = {"resolved_plan": self.resolved_plan, **payload}
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
         return payload
@@ -479,6 +512,8 @@ class RefactorComparisonResult(Result):
     """
 
     plan_id: str = ""
+    # Which plan "no plan id" picked (#1103); None, and absent, for an explicit id.
+    resolved_plan: dict[str, Any] | None = None
     model: str = ""
     target: str = ""
     status: str = "not_checked"
@@ -501,9 +536,15 @@ class RefactorComparisonResult(Result):
 
     def data(self) -> dict[str, Any]:
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
+        resolution = (
+            {"resolved_plan": self.resolved_plan}
+            if self.resolved_plan is not None
+            else {}
+        )
         return {
             **branch,
             "plan_id": self.plan_id,
+            **resolution,
             "model": self.model,
             "target": self.target,
             "status": self.status,

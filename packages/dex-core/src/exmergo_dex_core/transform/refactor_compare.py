@@ -142,22 +142,33 @@ def compare(
     leaving the engine able to run dbt or compare again.
     """
 
+    from .commands import _naming_resolution, _resolution_warnings, _resolve_plan_id
+
+    # Resolved here rather than inside `_compare`, so every verdict it returns,
+    # a pending price included, says which plan "no id" picked, and so does a
+    # refusal raised after the pick (#1103). An explicitly empty id is refused
+    # before anything else.
+    _, plan_id, resolved = _resolve_plan_id(engine, plan_id, "comparing a plan")
     local = (engine.connector or engine.config.connector) == "duckdb"
     if local:
         engine.close()
-    try:
-        result = _compare(
-            engine,
-            plan_id,
-            model=model,
-            column_mapping=column_mapping,
-            key_columns=key_columns,
-            target=target,
-            accepted_type_changes=accepted_type_changes,
-        )
-    finally:
-        if local:
-            engine.close()
+    with _naming_resolution(resolved):
+        try:
+            result = _compare(
+                engine,
+                plan_id,
+                model=model,
+                column_mapping=column_mapping,
+                key_columns=key_columns,
+                target=target,
+                accepted_type_changes=accepted_type_changes,
+            )
+        finally:
+            if local:
+                engine.close()
+    if resolved is not None:
+        result.resolved_plan = resolved
+        result.warnings = [*_resolution_warnings(resolved), *result.warnings]
     _record_verdict(engine, result)
     return result
 
@@ -222,7 +233,7 @@ def _compare(
     from . import dev_target
     from .commands import _resolve_plan_id
 
-    store, plan_id = _resolve_plan_id(engine, plan_id, "comparing a plan")
+    store, plan_id, _ = _resolve_plan_id(engine, plan_id, "comparing a plan")
     stored = store.load_plan(plan_id)
     if stored.edit_target != "project":
         raise ValueError(
