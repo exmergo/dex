@@ -45,7 +45,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
-    distinct_combination_sql,
+    distinct_combination_parts,
     is_blob_type,
     is_integer_type,
     is_string_type,
@@ -1166,7 +1166,9 @@ class DatabricksAdapter:
                 "not cover the extra scan; uniqueness verdicts stay approximate",
             )
             return {}
-        select_parts = [
+        # count(*) rides along so the same scan also upgrades the metadata row
+        # figure to an exact count (grain verdicts compare against it).
+        select_parts = ["COUNT(*) AS n_total"] + [
             f"COUNT(DISTINCT {_quote_ident(name)}) AS d_{i}"
             for i, name in enumerate(columns)
         ]
@@ -1176,6 +1178,8 @@ class DatabricksAdapter:
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
+        if "n_total" in values and values["n_total"] is not None:
+            self._entry(identifier)["row_count"] = int(values["n_total"])
         return {name: int(values[f"d_{i}"]) for i, name in enumerate(columns)}
 
     def distinct_combination_counts(
@@ -1203,12 +1207,23 @@ class DatabricksAdapter:
             self._note(identifier, note)
         if not probed:
             return {}
+        # the row count rides along as one more scalar subquery in the same
+        # statement, mirroring exact_distinct_counts: the grain
+        # check reads the row count only after the scan ran, so a composite
+        # grain or join fanout check is measured against the exact total, never
+        # against a missing or stale catalog row count (#946).
+        parts = [
+            f"(SELECT COUNT(*) FROM {self._quote(identifier)}) AS n_total",  # noqa: S608
+            *distinct_combination_parts(self._quote(identifier), probed, _quote_ident),
+        ]
         sql = assert_select_only(
-            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
+            f"SELECT {', '.join(parts)}",
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
+        if "n_total" in values and values["n_total"] is not None:
+            self._entry(identifier)["row_count"] = int(values["n_total"])
         return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
