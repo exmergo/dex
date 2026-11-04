@@ -309,6 +309,18 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
     return None
 
 
+_SURVIVED = re.compile(r'"survived"\s*:\s*(\d+)')
+
+
+def _mutation_survivors(block: dict[str, Any]) -> int | None:
+    """How many mutants one ``transform test --mutate`` run reported surviving,
+    read from ``data.counts.survived``; ``None`` when the agent's pipe hid it or
+    the run returned no counts (an error, a cost handshake)."""
+
+    found = _SURVIVED.findall(_result_text(block))
+    return int(found[0]) if found else None
+
+
 def summarize(
     events: list[dict[str, Any]], session: Session, plugin_dir: Path = REPO
 ) -> Session:
@@ -319,6 +331,7 @@ def summarize(
     sequence: list[str] = []
     calls: list[dict[str, Any]] = []
     pending_compares: dict[str, dict[str, Any]] = {}
+    pending_mutations: dict[str, dict[str, Any]] = {}
     for event in events:
         if event.get("type") == "user":
             content = (event.get("message") or {}).get("content")
@@ -327,6 +340,9 @@ def summarize(
                     call = pending_compares.pop(str(block.get("tool_use_id")), None)
                     if call is not None:
                         call["verdict"] = _compare_verdict(block)
+                    run = pending_mutations.pop(str(block.get("tool_use_id")), None)
+                    if run is not None:
+                        run["survived"] = _mutation_survivors(block)
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
             session.model = event.get("model")
@@ -377,6 +393,15 @@ def summarize(
                     ]
                     if len(compares) == 1 and block.get("id"):
                         pending_compares[str(block["id"])] = compares[0]
+                    # The same for a mutation run's survivor count (#1112).
+                    mutations = [
+                        call
+                        for call in ordered
+                        if call["label"] == "transform test"
+                        and "mutate" in (call.get("flags") or [])
+                    ]
+                    if len(mutations) == 1 and block.get("id"):
+                        pending_mutations[str(block["id"])] = mutations[0]
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")

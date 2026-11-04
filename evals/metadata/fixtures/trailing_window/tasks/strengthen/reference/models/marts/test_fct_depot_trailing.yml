@@ -1,0 +1,24 @@
+version: 2
+unit_tests:
+  - name: fct_depot_trailing_window_boundary
+    description: >
+      Seen from 04-15, 04-09 is the last day the window includes and 04-08 the
+      first it excludes. Seen from 04-08, 04-01 is outside the window but is the
+      row just before, so a seven-row window would count it. The parcels are
+      numbered so each sum says which rows it counted.
+    model: fct_depot_trailing
+    given:
+      - input: ref('stg_pickups')
+        rows:
+          - {depot: harbour, pickup_date: '2025-04-01', parcels: 1}
+          - {depot: harbour, pickup_date: '2025-04-08', parcels: 10}
+          - {depot: harbour, pickup_date: '2025-04-09', parcels: 100}
+          - {depot: harbour, pickup_date: '2025-04-15', parcels: 1000}
+          - {depot: quarry, pickup_date: '2025-04-15', parcels: 5}
+    expect:
+      rows:
+        - {depot: harbour, pickup_date: '2025-04-01', parcels_7d: 1}
+        - {depot: harbour, pickup_date: '2025-04-08', parcels_7d: 10}
+        - {depot: harbour, pickup_date: '2025-04-09', parcels_7d: 110}
+        - {depot: harbour, pickup_date: '2025-04-15', parcels_7d: 1100}
+        - {depot: quarry, pickup_date: '2025-04-15', parcels_7d: 5}

@@ -68,6 +68,7 @@ DIGESTS = {
     # No raw tables: its data is a seed in the project, checked below.
     "seeded_prerequisite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "subscription_activity": "4000c9999bb1e8dc18cee579b87b74f1ac2d21fb70cfeea17e65fc01ff5cc457",
+    "trailing_window": "9bc38c6d85e6e7bcfa81ad11926d7c7207ce20265dc699b9c1f9f4f444c37a74",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -95,7 +96,7 @@ def _edit_yaml(path: Path, edit) -> None:
 def test_the_suite_covers_the_issues_five_cases_with_build_and_fix_tasks():
     assert {fx.name for fx in FIXTURES} == set(DIGESTS)
     assert len(TASKS) >= 7
-    assert {t.kind for t in TASKS} == {"build", "fix"}
+    assert {t.kind for t in TASKS} == {"build", "fix", "test"}
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=lambda fx: fx.name)
@@ -140,6 +141,8 @@ def test_every_reference_answer_scores_perfect(task, tmp_path):
     )
     # A reference run has no final message to grade.
     assert score.report is None
+    if task.truth.get("planted_defects"):
+        assert score.defects_caught == 1, score.planted_defects
 
 
 def test_an_untouched_workspace_scores_zero_not_perfect(tmp_path):
@@ -1834,3 +1837,151 @@ def test_a_blocked_deliverable_with_another_failure_is_not_allowed(tmp_path):
     score = score_workspace(task, fixture, workspace, final=HONEST)
     assert score.status == "gate_failed"
     assert "broken" in score.gate["failed_nodes"]
+
+
+# --- test strength: planted defects and the mutation step (#1112) -----------
+
+
+@needs_dbt
+def test_a_weak_calendar_test_catches_none_of_the_planted_boundary_defects(tmp_path):
+    """The negative control. The strengthen task's starting unit test runs on
+    consecutive days inside the window, so it passes a window a day wider, a day
+    narrower, or counted in rows. The reference catches all three, so the grade
+    separates a test that reaches the boundary from one that does not."""
+
+    from evals.metadata.score import build_gate, planted_defects
+
+    task = _task("trailing_window/strengthen")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    gate = build_gate(workspace, fixture, tmp_path / "built")
+    assert gate.passed, gate
+    results = planted_defects(
+        tmp_path / "built", task.truth["planted_defects"], tmp_path / "defects"
+    )
+    assert [r["planted"] for r in results] == [True, True, True]
+    assert [r["caught"] for r in results] == [False, False, False], results
+
+
+@needs_dbt
+def test_a_reference_catches_each_defect_by_its_unit_test(tmp_path):
+    task, fixture, workspace = _reference(tmp_path, "trailing_window/author")
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored"
+    assert [d["caught_by"] for d in score.planted_defects] == [
+        ["fct_depot_trailing_window_boundary"]
+    ] * 3
+
+
+@needs_dbt
+def test_a_defect_the_model_no_longer_contains_is_not_planted(tmp_path):
+    """An agent that rewrote the window's text has nothing to plant into. That
+    is never read as a catch."""
+
+    from evals.metadata.score import build_gate, planted_defects
+
+    task, fixture, workspace = _reference(tmp_path, "trailing_window/author")
+    model = workspace / "models/marts/fct_depot_trailing.sql"
+    model.write_text(
+        model.read_text(encoding="utf-8").replace(
+            "interval '6 day'", "interval 6 days"
+        ),
+        encoding="utf-8",
+    )
+    assert build_gate(workspace, fixture, tmp_path / "built").passed
+    results = planted_defects(
+        tmp_path / "built", task.truth["planted_defects"], tmp_path / "defects"
+    )
+    assert {(r["planted"], r["caught"]) for r in results} == {(False, False)}
+
+
+def test_tests_alone_count_as_touching_their_model(tmp_path):
+    from evals.metadata.score import touched_models
+
+    task = _task("trailing_window/author")
+    fixture = fixture_of(task, FIXTURES)
+    baseline = materialize(task, fixture, tmp_path / "base")
+    workspace = materialize(task, fixture, tmp_path / "ws", reference=True)
+    assert touched_models(baseline, workspace) == ["fct_depot_trailing"]
+
+
+def _mutation_call(flags=("mutate",), survived=None):
+    return {"label": "transform test", "flags": list(flags), "survived": survived}
+
+
+def _apply_call():
+    return {"label": "transform apply", "flags": []}
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        ([_apply_call(), _mutation_call()], True),
+        # Measured, strengthened, and never measured again.
+        ([_apply_call(), _mutation_call(survived=2), _apply_call()], False),
+        ([_apply_call(), _mutation_call(flags=("scaffold",))], False),
+        ([_mutation_call()], False),
+    ],
+)
+def test_the_mutation_step_counts_only_after_the_last_apply(calls, passed):
+    from evals.metadata.score import procedure_steps
+
+    graded = procedure_steps({"mutate_after_tests": True}, calls)
+    assert graded["passed"] is passed
+
+
+def test_the_mutation_record_follows_survivors_into_new_tests():
+    from evals.metadata.score import mutation_record
+
+    record = mutation_record(
+        [
+            _apply_call(),
+            _mutation_call(survived=2),
+            _apply_call(),
+            _mutation_call(survived=0),
+        ]
+    )
+    assert record == {
+        "runs": 2,
+        "survived": [2, 0],
+        "strengthened": True,
+        "remeasured": True,
+    }
+    assert mutation_record([_apply_call()]) == {
+        "runs": 0,
+        "survived": [],
+        "strengthened": False,
+        "remeasured": False,
+    }
+    assert mutation_record(None) is None
+
+
+@pytest.mark.parametrize(
+    ("result", "survived"),
+    [
+        ('{"status": "ok", "data": {"counts": {"killed": 3, "survived": 2}}}', 2),
+        ('{"status": "ok", "data": {"counts": {"survived": 0, "killed": 5}}}', 0),
+        ('{"status": "needs_confirmation", "data": {}}', None),
+    ],
+)
+def test_a_mutation_run_records_how_many_survived(result, survived):
+    from evals.metadata.live import Session, summarize
+
+    session = summarize(
+        [
+            _bash_call("dex transform test --mutate fct_depot_trailing", "t1"),
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": result}
+                    ]
+                },
+            },
+        ],
+        Session(),
+    )
+    (call,) = session.dex_calls
+    assert call["label"] == "transform test"
+    assert call["flags"] == ["mutate"]
+    assert call["survived"] == survived
