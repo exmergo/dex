@@ -187,6 +187,10 @@ def init_project(
     and attributed, and a bare init is an error. Init bakes the connector into
     the generated ``profiles.yml``, and misconfiguration that works is the worst
     kind.
+
+    An explicit ``--project`` on the engine is handed to the renderer as the
+    BigQuery target, so init names the project the command already named rather
+    than whichever one a later reload could discover.
     """
 
     from . import dev_target
@@ -212,6 +216,7 @@ def init_project(
         repo_root=repo_root,
         layered_schemas=layered_schemas,
         in_place=in_place,
+        project=engine.project,
     )
 
     # The renderers persisted the resolved dev namespaces into .dex/config.yml,

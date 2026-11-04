@@ -894,7 +894,9 @@ default, or a filter or operator after it is refused. A key naming a location
   connectors. On success init writes `connector`, `dbt_project_dir`, and
   `dbt_target: dev` back to `.dex/config.yml`, so the choice is made once and is
   ambient for every later command. Every connector renders: DuckDB, BigQuery,
-  Snowflake, Databricks, Postgres, and Redshift.
+  Snowflake, Databricks, Postgres, and Redshift. On BigQuery, `--project <id>`
+  names the project explicitly: it wins over a configured or discovered one, and
+  init writes the same value to `bigquery.project`.
 
   `--layered-schemas` opts into per-layer schema routing: init additionally
   scaffolds `models/intermediate/`, the shipped `generate_schema_name` macro

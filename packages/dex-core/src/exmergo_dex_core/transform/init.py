@@ -100,6 +100,7 @@ def init_project(
     repo_root: Path | str = ".",
     layered_schemas: bool = False,
     in_place: bool = False,
+    project: str | None = None,
 ) -> InitResult:
     """Render a fresh dbt project skeleton and record the choices in config.
 
@@ -114,6 +115,10 @@ def init_project(
     shipped ``generate_schema_name`` macro override, and per-folder ``+schema:``
     config, so each layer builds into its own ``<layer>_<target name>`` schema
     instead of one shared dev namespace.
+
+    ``project`` is the explicit BigQuery project (the CLI's ``--project``). It
+    wins over a configured or discovered one, and both the rendered profile and
+    the saved config carry it, so the choice is stated once and stays ambient.
     """
 
     root = Path(repo_root)
@@ -147,6 +152,18 @@ def init_project(
         )
 
     config = load_config(root) or DexConfig()
+    if project:
+        if connector != "bigquery":
+            raise InitError(
+                f"--project is BigQuery vocabulary and has no meaning for the "
+                f"{connector} connector"
+            )
+        # The explicit choice wins over a configured or discovered one. Writing
+        # it onto the target here is what makes the rendered profile, the saved
+        # config and the envelope's connection attribution agree.
+        config.bigquery = (config.bigquery or BigQueryTarget()).model_copy(
+            update={"project": project}
+        )
     from ..connect import assert_deployment_supported
     from ..errors import ConfigurationError
 
@@ -397,7 +414,14 @@ def _bigquery_profile(
 def _resolve_init_project(target: BigQueryTarget, root: Path) -> str | None:
     """The connect-time resolution chain, minus the hard ADC requirement: init
     only renders config, so absent credentials degrade to "not found" rather
-    than an auth error."""
+    than an auth error.
+
+    A project the target already names (configured, or set from ``--project``)
+    settles it before any credential lookup, which no discovery could improve
+    on and which would otherwise make init depend on ADC for nothing."""
+
+    if target.project:
+        return target.project
 
     from ..connect import (
         CredentialDiscoveryError,

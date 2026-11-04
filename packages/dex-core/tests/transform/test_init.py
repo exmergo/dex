@@ -812,6 +812,101 @@ def test_init_bigquery_bootstraps_a_project(tmp_path: Path, capsys):
     assert config["bigquery"]["dev_dataset"] == "dbt_dev"
 
 
+def _no_ambient_bigquery(monkeypatch) -> None:
+    """Pin the project resolution chain off the developer's machine: no gcloud
+    env vars and no Application Default Credentials (#1101)."""
+
+    from exmergo_dex_core import connect
+
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GCLOUD_PROJECT", raising=False)
+
+    def no_adc():
+        raise connect.CredentialDiscoveryError("no ADC")
+
+    monkeypatch.setattr(connect, "_default_credentials", no_adc)
+
+
+def _connection_project(repo: Path) -> str | None:
+    """What a later command would attribute this repo's connection to."""
+
+    from exmergo_dex_core.engine import DexEngine
+
+    engine = DexEngine.from_repo(repo)
+    try:
+        return engine.connection_provenance().target.get("project")
+    finally:
+        engine.close()
+
+
+def test_init_bigquery_honors_an_explicit_project_on_a_fresh_root(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """A fresh root with no config and no ADC initializes when --project names
+    the target, and the profile, config and attribution all choose it."""
+
+    _no_ambient_bigquery(monkeypatch)
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "bigquery", "--project", "example-project"),
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "bigquery"
+    assert _connection_project(tmp_path) == "example-project"
+
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    dev = profiles["analytics"]["outputs"]["dev"]
+    assert dev["type"] == "bigquery"
+    assert dev["project"] == "example-project"
+    assert dev["dataset"] == "dbt_dev"
+
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["bigquery"]["project"] == "example-project"
+    assert config["bigquery"]["dev_dataset"] == "dbt_dev"
+
+
+def test_init_bigquery_explicit_project_beats_the_configured_one(
+    tmp_path: Path, capsys, monkeypatch
+):
+    _no_ambient_bigquery(monkeypatch)
+    _seed_bigquery_config(tmp_path, project="configured-project")
+    rc, envelope = _run(
+        _init_argv(
+            tmp_path, "--connector", "bigquery", "--project", "explicit-project"
+        ),
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert _connection_project(tmp_path) == "explicit-project"
+
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    assert profiles["analytics"]["outputs"]["dev"]["project"] == "explicit-project"
+
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["bigquery"]["project"] == "explicit-project"
+
+
+def test_init_refuses_an_explicit_project_on_a_non_bigquery_connector(
+    tmp_path: Path, capsys
+):
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "duckdb", "--project", "example-project"),
+        capsys,
+    )
+    assert rc == 1
+    assert "--project" in envelope["errors"][0]
+    assert "duckdb" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
 def test_init_bigquery_without_a_project_errors_actionably(
     tmp_path: Path, capsys, monkeypatch
 ):
