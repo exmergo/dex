@@ -45,7 +45,7 @@ class FakeDatabricksTable:
     # (column_name, type_text, nullable), type_text as Unity Catalog reports
     # it, e.g. "bigint", "string", "array<string>", "struct<a:int>".
     columns: list[tuple[str, str, bool]]
-    rows: int = 0
+    rows: int | None = 0
     bytes: int = 0
     kind: str = "table"
 
