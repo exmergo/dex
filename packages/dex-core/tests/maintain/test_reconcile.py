@@ -1091,6 +1091,121 @@ def test_no_test_is_invented_for_an_added_column(maintain_repo):
     assert added == ["+      - name: captured_at"], added
 
 
+def test_aliased_source_rename_is_covered_without_yaml_edit(maintain_repo):
+    """#983: model already maps renamed source column; do not stage YAML from source.
+
+    Loader renames ``status`` -> ``st``. Staging keeps its contract with
+    ``st as status``. SQL splices are no-ops; YAML must not drop ``status`` /
+    add ``st`` (that would break the model contract).
+    """
+
+    _edit_sql(maintain_repo, "        status,\n", "        st as status,\n")
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "ALTER TABLE orders ADD COLUMN st VARCHAR",
+        "UPDATE orders SET st = status",
+        "ALTER TABLE orders DROP status",
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    # No YAML (or SQL) diff for the absorbed rename.
+    yml_diffs = [
+        d for d in payload.get("diffs") or [] if d["path"].endswith("stg_orders.yml")
+    ]
+    assert not yml_diffs
+    covered = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["kind"] == "advisory" and p["finding_code"] == "schema_drift"
+    )
+    assert "already reflects" in covered["action"]
+
+
+def test_star_model_drop_still_stages_stale_yaml(maintain_repo):
+    """#1117 / CodeRabbit: star SQL no-op must not skip YAML removal.
+
+    ``select *`` cannot be rewritten to exclude a dropped source column, but the
+    model output no longer contains it. Stale YAML ``not_null`` on that column
+    would fail the build if reconcile reported the drift as covered.
+    """
+
+    (maintain_repo.root / _STG_SQL).write_text(
+        "select * from {{ source('main', 'orders') }}\n", encoding="utf-8"
+    )
+    yml = maintain_repo.root / _STG_YML
+    yml.write_text(
+        yml.read_text(encoding="utf-8") + "      - name: status\n"
+        "        tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql("ALTER TABLE orders DROP status")
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 1
+    assert "-      - name: status" in _diff(payload, _STG_YML)["unified"]
+    covered = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["kind"] == "advisory"
+        and p["finding_code"] == "schema_drift"
+        and "already reflects" in p["action"]
+    ]
+    assert not covered
+
+
+def test_hand_removed_sql_column_still_stages_stale_yaml(maintain_repo):
+    """#1117 / CodeRabbit: SQL already dropped the column; YAML must still go."""
+
+    _edit_sql(maintain_repo, "        status,\n", "")
+    yml = maintain_repo.root / _STG_YML
+    yml.write_text(
+        yml.read_text(encoding="utf-8") + "      - name: status\n"
+        "        tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql("ALTER TABLE orders DROP status")
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 1
+    assert "-      - name: status" in _diff(payload, _STG_YML)["unified"]
+
+
+def test_absorbed_alias_drop_does_not_warn_downstream_readers(maintain_repo):
+    """#1117 / CodeRabbit: preserved alias must not claim downstream will break."""
+
+    maintain_repo.edit(
+        "models/marts/fct_orders.sql",
+        "select order_id, status from {{ ref('stg_orders') }}\n",
+    )
+    _edit_sql(maintain_repo, "        status,\n", "        st as status,\n")
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "ALTER TABLE orders ADD COLUMN st VARCHAR",
+        "UPDATE orders SET st = status",
+        "ALTER TABLE orders DROP status",
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 0
+    assert not any("still read it" in w for w in payload.get("warnings") or [])
+
+
 def test_drift_the_project_already_reflects_is_advisory_and_stores_no_plan(
     maintain_repo,
 ):

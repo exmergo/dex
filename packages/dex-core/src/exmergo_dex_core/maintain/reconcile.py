@@ -36,6 +36,7 @@ from ..transform.plans import EditKind, PlanEdit
 from ..transform.rewrite import (
     RewriteError,
     column_tests,
+    output_columns,
     project_column_in_sql,
     unproject_column_in_sql,
 )
@@ -643,6 +644,7 @@ def _splice_model(
     model = PurePosixPath(model_path).stem
     settled: list[DriftFinding] = []
     in_sql: list[DriftFinding] = []
+    already_reflected: list[DriftFinding] = []
     for finding in written:
         if finding.code == "nullability_changed":
             settled.append(finding)
@@ -673,7 +675,25 @@ def _splice_model(
         if result.changed:
             declarations.stage_sql(model_path, result.content)
             in_sql.append(finding)
-        settled.append(finding)
+            # Stage YAML only when the model's output actually changes (#983).
+            settled.append(finding)
+        else:
+            # SQL splice was a no-op. For a drop, only treat it as covered when
+            # the model still *outputs* that column (alias absorption, #983).
+            # A star over a dropped source column, or SQL already edited by
+            # hand, leaves the column absent from the declared output and still
+            # needs the YAML half cleaned up (CodeRabbit on #1117). Added
+            # columns keep the prior covered path: a no-op add is either a star
+            # that already carries the column or a rename the model already
+            # reads under another alias.
+            if finding.code == "column_dropped":
+                outs = output_columns(content, model_path, through_ctes=True)
+                if outs is not None and column.lower() in outs:
+                    already_reflected.append(finding)
+                else:
+                    settled.append(finding)
+            else:
+                already_reflected.append(finding)
 
     placed = declarations.resolve(table)
     in_yaml: list[DriftFinding] = []
@@ -697,14 +717,18 @@ def _splice_model(
             )
         else:
             proposals.append(_schema_advisory(identifier, finding, reason))
+    # Warn only for drops that actually change staging output. An absorbed
+    # alias (#983) keeps the contract name, so downstream readers still work.
     warnings.extend(_downstream_readers(view, model, settled))
 
     if not changed:
         declined = [finding for finding, _reason in unstaged]
-        already = [f for f in settled if f not in declined]
+        already = already_reflected + [f for f in settled if f not in declined]
         if already:
             proposals.append(_covered_advisory(identifier, already))
         return
+    if already_reflected:
+        proposals.append(_covered_advisory(identifier, already_reflected))
     paths = ([model_path] if in_sql else []) + (
         [placed.path] if isinstance(placed, Placed) and in_yaml else []
     )
