@@ -78,6 +78,13 @@ class InitResult(BaseModel):
     diffs: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# A BigQuery project id: letters, digits, dots and hyphens, optionally in the
+# legacy domain-scoped form (``example.com:my-project``).
+_BIGQUERY_PROJECT_ID = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9.\-]*(?::[A-Za-z0-9][A-Za-z0-9\-]*)?"
+)
+
+
 def sanitize_project_name(raw: str) -> str:
     """Reduce free-form input to a valid dbt project name (lowercase,
     underscores, no leading digit)."""
@@ -152,11 +159,12 @@ def init_project(
         )
 
     config = load_config(root) or DexConfig()
-    if project == "":
-        # An explicit empty value must not read as "flag absent": it would fall
-        # back to the configured or discovered project without saying so.
+    # An explicit value must not read as "flag absent" when it is blank, and a
+    # malformed id would otherwise reach the rendered profile and the config.
+    if project is not None and not _BIGQUERY_PROJECT_ID.fullmatch(project):
         raise InitError(
-            "--project needs a BigQuery project id; an empty value is not one"
+            "--project needs a BigQuery project id: letters, digits, dots and "
+            "hyphens, or the legacy domain-scoped form example.com:my-project"
         )
     if project:
         if connector != "bigquery":

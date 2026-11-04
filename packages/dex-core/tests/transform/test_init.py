@@ -907,17 +907,47 @@ def test_init_refuses_an_explicit_project_on_a_non_bigquery_connector(
     assert not (tmp_path / "analytics").exists()
 
 
-def test_init_refuses_an_empty_explicit_project(tmp_path: Path, capsys):
-    """``--project ""`` is a stated value, not an absent flag: refuse it rather
-    than silently falling back to the configured or discovered project."""
+@pytest.mark.parametrize(
+    "project",
+    ["", "   ", "my project", "proj/ect", "example.com:my-project:extra"],
+)
+def test_init_refuses_a_malformed_explicit_project(tmp_path: Path, capsys, project):
+    """``--project`` is a stated value, not an absent flag: a blank or
+    malformed id must fail rather than fall back to the configured or
+    discovered project, or reach the rendered profile."""
 
     rc, envelope = _run(
-        _init_argv(tmp_path, "--connector", "bigquery", "--project", ""),
+        _init_argv(tmp_path, "--connector", "bigquery", "--project", project),
         capsys,
     )
     assert rc == 1
     assert "--project" in envelope["errors"][0]
     assert not (tmp_path / "analytics").exists()
+
+
+def test_init_bigquery_accepts_a_domain_scoped_project(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """The legacy ``example.com:my-project`` form is still a valid explicit
+    project."""
+
+    _no_ambient_bigquery(monkeypatch)
+    rc, envelope = _run(
+        _init_argv(
+            tmp_path,
+            "--connector",
+            "bigquery",
+            "--project",
+            "example.com:my-project",
+        ),
+        capsys,
+    )
+    assert rc == 0, envelope
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    dev = profiles["analytics"]["outputs"]["dev"]
+    assert dev["project"] == "example.com:my-project"
 
 
 def test_init_bigquery_without_a_project_errors_actionably(
