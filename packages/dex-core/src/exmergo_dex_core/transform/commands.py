@@ -1694,11 +1694,25 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
             "(dbt's is_incremental override, with a `this` fixture) and runs in "
             "every `transform build` once its expectation is filled in"
         )
+    for boundary in scaffold.window_boundaries:
+        planned.warnings.append(
+            f"the given rows for {boundary['input']} sit on the boundary of the "
+            f"window ordered by {boundary['order_by']}: the last day it includes, "
+            "the first it excludes, and a gap a row-count frame would cross; "
+            "data.window_boundaries says what each date tests"
+        )
+    for note in scaffold.window_notes:
+        planned.warnings.append(
+            f"no boundary rows for the window {note['frame']} "
+            f"({note['reason_code']}): {note['reason']}; its fixture keeps one "
+            "example row, which cannot tell the window's width"
+        )
     return TestScaffoldResult(
         **planned.model_dump(),
         model=model_name,
         inputs=inputs,
         incremental=scaffold.incremental,
+        window_boundaries=scaffold.window_boundaries,
     )
 
 
@@ -1839,6 +1853,7 @@ def test_mutations(
                     f"'{model}' has no SQL dex knows how to plant a defect in "
                     "(no comparison, filter, join, CASE, division, window frame "
                     "or aggregate), so there is nothing to measure its tests against"
+                    + _unsupported_frames_clause(batch.unsupported)
                 )
 
             equivalence = _EquivalenceCheck.prepare(
@@ -1914,6 +1929,8 @@ def test_mutations(
 
     warnings.extend(_survivor_warnings(result["counts"], result["equivalence"]))
     warnings.extend(below.warnings(result["counts"]))
+    if batch.unsupported:
+        warnings.append(_unsupported_frames_warning(batch.unsupported))
     if batch.elided_total:
         warnings.append(
             f"{batch.elided_total} further mutant(s) were not run: the cap is "
@@ -1934,12 +1951,41 @@ def test_mutations(
             "considered": batch.considered,
             "elided": batch.elided,
         },
+        unsupported_sites=batch.unsupported,
         runs=runs,
         equivalence=result["equivalence"],
         downstream=below.summary(),
         spend=spend,
         cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
         warnings=warnings,
+    )
+
+
+def _unsupported_frames_warning(unsupported: list[dict[str, str]]) -> str:
+    """The pointer line for the frame bounds no mutant moved (#1112).
+
+    Without it a model whose only window is ``INTERVAL (n) DAY PRECEDING``
+    reports no window-frame mutant and no survivor, which reads as a window
+    nothing could break rather than one nothing tested.
+    """
+
+    codes = sorted({entry["reason_code"] for entry in unsupported})
+    return (
+        f"{len(unsupported)} window frame bound(s) were not mutated "
+        f"({', '.join(codes)}), so this run says nothing about their boundaries; "
+        "each is in data.unsupported_sites"
+    )
+
+
+def _unsupported_frames_clause(unsupported: list[dict[str, str]]) -> str:
+    if not unsupported:
+        return ""
+    bounds = "; ".join(
+        f"{entry['bound']} ({entry['reason_code']})" for entry in unsupported[:5]
+    )
+    return (
+        f". Its window frame bound(s) are ones dex cannot shift, so their "
+        f"boundaries are untested: {bounds}"
     )
 
 
@@ -2383,7 +2429,7 @@ def _run_mutants(
         label = equivalence.check(meter, mutant.id, mutation_mod)
         record["equivalence"] = label.payload()
         record["suggested_test"] = mutation_mod.suggested_test(
-            mutant.operator, label.status
+            mutant.operator, label.status, frame=mutant.frame
         )
         if equivalence.out_of_budget:
             stop(batch.mutants[index + 1 :])

@@ -36,6 +36,7 @@ from ..dbt_project import (
     model_file,
 )
 from ..errors import DexError
+from . import window_fixture
 from .plans import EditKind, PlanEdit
 from .row_attribution import UnattributableError, naming_resolver, render_model_sql
 
@@ -80,16 +81,21 @@ class Watermark(NamedTuple):
     this_column: str | None
 
 
-class Scaffold(NamedTuple):
-    """What :func:`unit_test_scaffold` planned.
+class UnitTestScaffold(NamedTuple):
+    """What :func:`unit_test_scaffold` planned, and what it reached.
 
+    ``window_boundaries`` and ``window_notes`` come from
+    :mod:`.window_fixture`: the calendar windows whose boundary rows were
+    placed, and those it could not place rows for, each with a reason code.
     ``incremental`` is ``None`` for a model with no ``is_incremental()``
     branch, otherwise ``{"tests": [...], "watermark": {...} | None}``.
     """
 
     edits: list[PlanEdit]
     inputs: list[str]
-    incremental: dict[str, object] | None
+    window_boundaries: list[dict[str, object]]
+    window_notes: list[dict[str, str]]
+    incremental: dict[str, object] | None = None
 
 
 def unit_test_scaffold_edits(
@@ -110,7 +116,7 @@ def unit_test_scaffold_edits(
 
 def unit_test_scaffold(
     view: DbtProjectView, cache: DexCache | None, model_name: str
-) -> Scaffold:
+) -> UnitTestScaffold:
     """:func:`unit_test_scaffold_edits`, plus what it read of an incremental
     model (issue #1111).
 
@@ -122,6 +128,9 @@ def unit_test_scaffold(
     compares a column with a subquery over ``{{ this }}``, the watermark's input
     gets rows before, on and after it plus a NULL, so the expectation filled in
     pins which side of the boundary each one lands on.
+
+    Calendar windows the full program reads get boundary rows from
+    :mod:`.window_fixture` (#1112), in the full-build test.
     """
 
     path = model_file(view, model_name)
@@ -188,13 +197,21 @@ def unit_test_scaffold(
     yaml_path = (
         f"{dir_path}/test_{model_name}.yml" if dir_path else f"test_{model_name}.yml"
     )
+    windows = window_fixture.boundary_rows(
+        parsed,
+        {key: found.name for key, found in inputs_by_lower.items()},
+        reads,
+        types,
+        _example_value,
+    )
+    full_given = []
+    for i in inputs:
+        rows = windows.rows.get(i.name) or [_example_row(types[i.name], reads[i.name])]
+        full_given.append(_Given(i.literal, rows, [None] * len(rows)))
     full_test = _test_block(
         f"test_{model_name}",
         model_name,
-        [
-            _Given(i.literal, [_example_row(types[i.name], reads[i.name])], [None])
-            for i in inputs
-        ],
+        full_given,
         is_incremental=False if variants is not None else None,
     )
     if variants is None:
@@ -203,7 +220,12 @@ def unit_test_scaffold(
             kind=EditKind.SCHEMA_YML,
             new_content=_unit_tests_yaml([full_test]),
         )
-        return Scaffold([edit], [i.name for i in inputs], None)
+        return UnitTestScaffold(
+            edits=[edit],
+            inputs=[i.name for i in inputs],
+            window_boundaries=windows.boundaries,
+            window_notes=windows.notes,
+        )
 
     this_types = _this_types(model_name, this_reads, full_output, types, cache)
     incremental_name = f"test_{model_name}_incremental"
@@ -227,10 +249,12 @@ def unit_test_scaffold(
         kind=EditKind.SCHEMA_YML,
         new_content=_unit_tests_yaml([full_test, incremental_test]),
     )
-    return Scaffold(
-        [edit],
-        [i.name for i in inputs],
-        {
+    return UnitTestScaffold(
+        edits=[edit],
+        inputs=[i.name for i in inputs],
+        window_boundaries=windows.boundaries,
+        window_notes=windows.notes,
+        incremental={
             "tests": [f"test_{model_name}", incremental_name],
             "watermark": watermark._asdict() if watermark is not None else None,
         },

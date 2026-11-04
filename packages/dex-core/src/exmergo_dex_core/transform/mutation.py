@@ -56,12 +56,14 @@ import json
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any, NamedTuple
 
 import sqlglot
 from sqlglot import expressions as exp
 
 from .. import sql_shape
 from ..errors import DexError
+from . import window_frames
 
 #: How many mutants one run may execute. Every mutant is a dbt invocation, so
 #: this is a bound on wall time and on spend, not a matter of taste. A caller may
@@ -297,9 +299,12 @@ class Mutant:
     suggested_test: str
     body: str
     compiled: str = ""
+    #: For a window-frame mutant, the bound it moved and the boundary a fixture
+    #: has to reach (see :func:`_frame_payload`); ``None`` for every other class.
+    frame: dict[str, object] | None = None
 
     def payload(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "id": self.id,
             "operator": self.operator,
             "scope": self.scope,
@@ -308,6 +313,9 @@ class Mutant:
             "after": self.after,
             "suggested_test": self.suggested_test,
         }
+        if self.frame is not None:
+            record["frame"] = self.frame
+        return record
 
 
 @dataclass
@@ -327,6 +335,10 @@ class MutantBatch:
     unparsed: int = 0
     cap: int = MAX_MUTANTS
     identity_compiled: str = ""
+    #: Window-frame bounds no mutant moves, each with a ``reason_code``. They
+    #: are not mutants, so they count toward neither ``considered`` nor the cap;
+    #: they are listed so a boundary nothing tested never reads as tested.
+    unsupported: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def elided_total(self) -> int:
@@ -686,37 +698,157 @@ def _swap_division(node: exp.Expression, dialect: str) -> Applied | None:
     )
 
 
-def _window_sites(tree: exp.Expression) -> list[exp.Expression]:
-    return [
-        spec
-        for spec in tree.find_all(exp.WindowSpec)
-        if any(
-            isinstance(spec.args.get(bound), exp.Literal)
-            and not spec.args[bound].args.get("is_string")
-            for bound in ("start", "end")
+class _FrameSite(NamedTuple):
+    """One window-frame mutation: the bound it moves and which way.
+
+    A frame is one site per mutation rather than one per frame, because an
+    interval bound carries two defects worth planting (one unit wider, one
+    unit narrower) and each must be its own mutant to be its own finding.
+    """
+
+    spec: exp.WindowSpec
+    bound: str
+    step: int
+
+
+def _window_sites(tree: exp.Expression) -> list[_FrameSite]:
+    """The frame bounds dex can shift, in the order the frames are written.
+
+    Per frame, only the first bound dex can read is moved, as it always was: a
+    bare number one step wider, an interval one unit wider and, while it is
+    above zero, one unit narrower. An interval carries both because a calendar
+    window has two boundary questions (does the day after the last eligible
+    day leak in, is the last eligible day still counted) and a fixture can
+    answer one without the other. Every other offset bound is accounted for by
+    :func:`_unmutated_frame_bounds`, never silently.
+    """
+
+    sites: list[_FrameSite] = []
+    for spec in tree.find_all(exp.WindowSpec):
+        readable = [
+            o
+            for o in window_frames.offsets(spec)
+            if isinstance(o, window_frames.FrameOffset)
+        ]
+        if not readable:
+            continue
+        first = readable[0]
+        sites.append(_FrameSite(spec, first.bound, 1))
+        if first.is_interval and first.value >= 1:
+            sites.append(_FrameSite(spec, first.bound, -1))
+    return sites
+
+
+def _unmutated_frame_bounds(tree: exp.Expression, dialect: str) -> list[dict[str, str]]:
+    """Every offset bound no mutant moves, and why, so none reads as tested.
+
+    Two kinds: a bound dex cannot read exactly (a column, a fraction, a
+    compound interval), and the second readable bound of a frame whose first
+    one is already mutated. ``UNBOUNDED`` and ``CURRENT ROW`` are not offsets
+    and are not listed: there is no boundary there to be off by one.
+    """
+
+    unmutated: list[dict[str, str]] = []
+    for spec in tree.find_all(exp.WindowSpec):
+        mutated = False
+        for offset in window_frames.offsets(spec):
+            if isinstance(offset, window_frames.FrameOffset) and not mutated:
+                mutated = True
+                continue
+            if isinstance(offset, window_frames.FrameOffset):
+                code, reason = (
+                    "other_bound_of_mutated_frame",
+                    "dex shifts one bound per frame, and this frame's other bound "
+                    "is the one it shifted",
+                )
+            else:
+                code, reason = offset.reason_code, offset.reason
+            unmutated.append(
+                {
+                    "operator": "window_frame",
+                    "scope": _scope_label(spec, tree),
+                    "bound": _clip(_text(dialect, spec.args.get(offset.bound))),
+                    "side": offset.side,
+                    "reason_code": code,
+                    "reason": reason,
+                }
+            )
+    return unmutated
+
+
+def _shift_window_frame(site: _FrameSite, dialect: str) -> Applied | None:
+    offset = window_frames.read_bound(site.spec, site.bound)
+    if not isinstance(offset, window_frames.FrameOffset):
+        return None
+    target = offset.value + site.step
+    if target < 0:
+        return None
+    before = _text(dialect, site.spec)
+    window_frames.with_value(offset, target)
+    after = _text(dialect, site.spec)
+    return before, after, _frame_defect(offset, target)
+
+
+def _frame_defect(offset: window_frames.FrameOffset, target: int) -> str:
+    """The sentence for a moved bound, in the frame's own units.
+
+    A ROWS bound counts rows and a numeric RANGE bound counts the ordering
+    value, so "one row further" is only true of the first. An interval's
+    sentence names the calendar consequence, since that is what a fixture has
+    to reach.
+    """
+
+    value = offset.value
+    if offset.is_interval:
+        unit = offset.unit
+        direction = "back" if offset.side == "preceding" else "ahead"
+        span = (
+            f"{window_frames.plural(unit, value)} became "
+            f"{window_frames.plural(unit, target)}"
         )
-    ]
-
-
-def _shift_window_frame(node: exp.Expression, dialect: str) -> Applied | None:
-    for bound in ("start", "end"):
-        literal = node.args.get(bound)
-        if not isinstance(literal, exp.Literal) or literal.args.get("is_string"):
-            continue
-        try:
-            value = int(literal.this)
-        except (TypeError, ValueError):
-            continue
-        before = _text(dialect, node)
-        node.set(bound, exp.Literal.number(value + 1))
+        if target > value:
+            return (
+                f"the window reaches one {unit} further {direction} ({span}), so "
+                f"a row on the first {unit} it should exclude is counted"
+            )
         return (
-            before,
-            _text(dialect, node),
-            f"the window frame reaches one row further than it should "
-            f"({value} became {value + 1}), so every rolling value is computed "
-            "over the wrong span",
+            f"the window stops one {unit} short ({span}), so a row on the last "
+            f"{unit} it should include is dropped"
         )
-    return None
+    if offset.kind == "range":
+        return (
+            "the window frame reaches one unit of the ordering value further than "
+            f"it should ({value} became {target}), so a row whose ordering value "
+            "sits just past the boundary is counted"
+        )
+    return (
+        f"the window frame reaches one row further than it should "
+        f"({value} became {target}), so every rolling value is computed "
+        "over the wrong span"
+    )
+
+
+def _frame_payload(site: _FrameSite) -> dict[str, object] | None:
+    """What a fixture needs to reach this boundary, in the frame's units.
+
+    ``last_included`` and ``first_excluded`` are offsets from the current row,
+    in ``unit``, on the bound's own side. A RANGE interval frame over dates
+    with ``6 day PRECEDING`` includes the row six days back and excludes the
+    one seven days back: a fixture with rows on exactly those two days, and a
+    gap in the dates so a ROWS frame cannot give the same answer, is the one
+    that tells the widened and the narrowed mutant from the model.
+    """
+
+    offset = window_frames.read_bound(site.spec, site.bound)
+    if not isinstance(offset, window_frames.FrameOffset):
+        return None
+    return {
+        **offset.payload(),
+        "from": offset.value,
+        "to": offset.value + site.step,
+        "last_included": offset.value,
+        "first_excluded": offset.value + 1,
+    }
 
 
 def _aggregate_sites(tree: exp.Expression) -> list[exp.Expression]:
@@ -744,8 +876,8 @@ def _swap_aggregate(node: exp.Expression, dialect: str) -> Applied | None:
 @dataclass(frozen=True)
 class _Operator:
     name: str
-    sites: Callable[[exp.Expression], list[exp.Expression]]
-    apply: Callable[[exp.Expression, str], Applied | None]
+    sites: Callable[[exp.Expression], list[Any]]
+    apply: Callable[[Any, str], Applied | None]
 
 
 # Ordered as the issue's defect table is, and iterated round robin, so a cap cuts
@@ -793,6 +925,10 @@ def enumerate_mutants(
         considered=len(ordered),
         cap=cap,
         identity_compiled=prepared.compiled(),
+        unsupported=[
+            {**entry, "bound": prepared.readable(entry["bound"])}
+            for entry in _unmutated_frame_bounds(prepared.tree, prepared.dialect)
+        ],
     )
     by_name = {operator.name: operator for operator in _OPERATORS}
 
@@ -806,7 +942,8 @@ def enumerate_mutants(
         if index >= len(sites):
             continue
         node = sites[index]
-        scope = _scope_label(node, tree)
+        frame = _frame_payload(node) if isinstance(node, _FrameSite) else None
+        scope = _scope_label(node.spec if isinstance(node, _FrameSite) else node, tree)
         applied = operator.apply(node, prepared.dialect)
         if applied is None:
             continue
@@ -831,9 +968,10 @@ def enumerate_mutants(
                 defect=defect,
                 before=before,
                 after=after,
-                suggested_test=_SUGGESTED_TEST[operator_name],
+                suggested_test=suggested_test(operator_name, frame=frame),
                 body=body,
                 compiled=prepared.compiled(tree),
+                frame=frame,
             )
         )
     return batch
@@ -980,14 +1118,27 @@ def _not_routable(node: dict, project: str | None) -> str | None:
     return None
 
 
-def suggested_test(operator: str, equivalence: str | None = None) -> str:
+def suggested_test(
+    operator: str,
+    equivalence: str | None = None,
+    *,
+    frame: dict[str, object] | None = None,
+) -> str:
     """The test that would catch this survivor, once its label is known.
 
     Without a label (the comparison did not run) the operator's general
     suggestion stands. With one, an ``equivalent`` survivor gets the fixture
     that reaches the case and a ``distinguishable`` one gets the assertion over
     data that already differs.
+
+    An interval frame gets its own sentence whatever the label, naming the two
+    days a fixture needs rows on. An assertion over the dev data rarely pins a
+    calendar boundary, and a fixture on consecutive days cannot tell a day
+    window from a row window, so the gap is part of the advice.
     """
+
+    if operator == "window_frame" and frame and frame.get("unit"):
+        return _interval_fixture_advice(frame)
 
     pair = _SUGGESTED_BY_EQUIVALENCE.get(operator)
     if pair is not None and equivalence == "equivalent":
@@ -995,6 +1146,18 @@ def suggested_test(operator: str, equivalence: str | None = None) -> str:
     if pair is not None and equivalence == "distinguishable":
         return pair[1]
     return _SUGGESTED_TEST[operator]
+
+
+def _interval_fixture_advice(frame: dict[str, object]) -> str:
+    unit = str(frame["unit"])
+    side = "before" if frame.get("side") == "preceding" else "after"
+    last = window_frames.plural(unit, int(frame["last_included"]))  # type: ignore[arg-type]
+    first = window_frames.plural(unit, int(frame["first_excluded"]))  # type: ignore[arg-type]
+    return (
+        f"a unit test with one row {last} {side} the current row (the last one "
+        f"the window includes) and one {first} {side} it (the first it excludes), "
+        f"with a gap in the {unit}s so a row-count window cannot give the same answer"
+    )
 
 
 def equivalence_model(model_ref: str, dialect: str) -> str | None:

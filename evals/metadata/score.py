@@ -23,12 +23,16 @@ Truth (``truth.json``), per task::
      "report": {"names": ["task_data", "due_at"], "not_done": true},
      "incomplete_allowed": {"blocked_by": ["tasks_task"]},
      "procedure": {"build_after_apply": true, "cold_deps_after_apply": true,
-                   "incremental_build_after_apply": true},
+                   "incremental_build_after_apply": true,
+                   "mutate_after_tests": true},
      "replays": [{"name": "next_batch", "select": "fct_x",
                   "setup": ["delete from raw.x"],
                   "steps": [["insert into raw.x ..."], []],
                   "checks": [{"name": "...", "sql": "...", "expect": 0}]}],
-     "incremental_test": {"model": "fct_x"}}
+     "incremental_test": {"model": "fct_x"},
+     "planted_defects": [{"name": "window one day wider",
+                          "path": "models/marts/fct_x.sql",
+                          "replace": ["'6 day'", "'7 day'"], "select": "fct_x"}]}
 
 ``checks`` run against the gate's own build of a fresh copy, on fresh data (the
 fixture's ``grading_tables`` where it has them). ``workspace_checks`` run
@@ -49,6 +53,13 @@ to true: the verification step, graded apart from the data the replays judge.
 prerequisite, where the build failed on nothing else and the final message
 reports it (status ``blocked_reported``): a request the agent cannot carry out
 from Dex may be reported rather than worked around (#1083).
+``planted_defects`` grade the tests the agent left, not the model (#1112): each
+defect is planted in its own copy of the gate's build by an exact, single text
+replacement in the model's SQL, and ``dbt build --select`` must then fail at
+least one test, unit or data. A defect whose text is not found exactly once is
+``planted: false`` and not caught. The grade is the share caught, apart from
+every other score, and says only that these defects could not ship, never that
+the model is right.
 
 A ``unit`` ending in ``*`` matches by prefix (``currency:*`` accepts any ISO code),
 and a list accepts any of its values, for a field where more than one answer is
@@ -168,18 +179,43 @@ def _model_sql(project: Path) -> dict[str, str]:
     }
 
 
+def unit_test_entries(project: Path) -> dict[str, list[dict[str, Any]]]:
+    """Every ``unit_tests:`` entry in the project's YAML, by the model it tests."""
+
+    import yaml
+
+    entries: dict[str, list[dict[str, Any]]] = {}
+    for path in _yaml_files(project):
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            continue
+        if not isinstance(document, dict):
+            continue
+        for entry in document.get("unit_tests") or []:
+            if isinstance(entry, dict) and entry.get("model"):
+                entries.setdefault(str(entry["model"]), []).append(entry)
+    return entries
+
+
 def touched_models(baseline: Path, workspace: Path) -> list[str]:
-    """Models whose SQL or YAML entry differs from the task's starting state."""
+    """Models whose SQL, YAML entry or unit tests differ from the starting state.
+
+    A unit test is part of what a model ships with: a task that asks for tests
+    (#1112) changes nothing else, and must not read as untouched.
+    """
 
     before_sql, after_sql = _model_sql(baseline), _model_sql(workspace)
     before_yml, after_yml = model_entries(baseline), model_entries(workspace)
-    names = set(after_sql) | set(after_yml)
+    before_ut, after_ut = unit_test_entries(baseline), unit_test_entries(workspace)
+    names = set(after_sql) | set(after_yml) | set(after_ut) | set(before_ut)
     return sorted(
         name
         for name in names
         if after_sql.get(name) != before_sql.get(name)
         or [e for _, e in after_yml.get(name, [])]
         != [e for _, e in before_yml.get(name, [])]
+        or after_ut.get(name, []) != before_ut.get(name, [])
     )
 
 
@@ -390,6 +426,74 @@ def incremental_unit_tests(project: Path, model: str) -> list[str]:
     return sorted(found)
 
 
+def planted_defects(
+    built: Path, defects: list[dict[str, Any]], scratch: Path
+) -> list[dict[str, Any]]:
+    """Whether the project's own tests catch each planted defect (#1112).
+
+    ``built`` is a project the gate already built, warehouse included. Each
+    defect gets its own copy of it, so defects never compound, and the copy is
+    built with ``dbt build --select <select>``: unit tests read the defective
+    SQL, the model is rebuilt from it, and its data tests read the result. A
+    test reported ``fail`` is a catch. A model that errors is not a catch, since
+    the defect was meant to build and a refusal says nothing about the tests.
+    """
+
+    import json
+
+    results: list[dict[str, Any]] = []
+    for index, defect in enumerate(defects):
+        copy = scratch / f"defect_{index}"
+        shutil.copytree(
+            built, copy, ignore=shutil.ignore_patterns("target", "logs", ".dex")
+        )
+        path = copy / defect["path"]
+        old, new = defect["replace"]
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        record: dict[str, Any] = {"name": defect["name"], "planted": False}
+        if text.count(old) != 1:
+            record.update(caught=False, error="defect text not found exactly once")
+            results.append(record)
+            continue
+        path.write_text(text.replace(old, new), encoding="utf-8")
+        record["planted"] = True
+        try:
+            subprocess.run(
+                [
+                    _dbt(),
+                    "build",
+                    "--select",
+                    defect["select"],
+                    "--profiles-dir",
+                    ".",
+                    "--no-use-colors",
+                ],
+                cwd=copy,
+                capture_output=True,
+                text=True,
+                timeout=GATE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            record.update(caught=False, error="dbt build timed out")
+            results.append(record)
+            continue
+        run_results = copy / "target" / "run_results.json"
+        statuses: dict[str, str] = {}
+        if run_results.is_file():
+            for result in json.loads(run_results.read_text(encoding="utf-8")).get(
+                "results", []
+            ):
+                statuses[str(result.get("unique_id"))] = str(result.get("status"))
+        caught_by = sorted(
+            uid.split(".")[-1] if uid.startswith("unit_test.") else uid
+            for uid, status in statuses.items()
+            if uid.startswith(("test.", "unit_test.")) and status == "fail"
+        )
+        record.update(caught=bool(caught_by), caught_by=caught_by)
+        results.append(record)
+    return results
+
+
 def relation_columns(scratch: Path, model: str) -> list[str] | None:
     import duckdb
 
@@ -592,7 +696,12 @@ PROCEDURE_STEPS = (
     "build_after_apply",
     "cold_deps_after_apply",
     "incremental_build_after_apply",
+    "mutate_after_tests",
 )
+
+
+def _is_mutation(call: dict[str, Any]) -> bool:
+    return call["label"] == "transform test" and "mutate" in (call.get("flags") or [])
 
 
 def _compared_the_apply(
@@ -639,6 +748,10 @@ def procedure_steps(
       ``--full-refresh`` follows the last ``transform apply`` and every
       ``--full-refresh`` build after it, so an incremental model's next run, not
       only its full build, ran on the applied change (#1111).
+    - ``mutate_after_tests``: a ``transform test --mutate`` follows the last
+      ``transform apply``, so the tests that were measured are the ones that
+      ship (#1112). Measuring, strengthening and stopping leaves the strengthened
+      tests unmeasured, so it is a miss.
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
@@ -670,10 +783,37 @@ def procedure_steps(
         results["incremental_build_after_apply"] = any(
             i not in refreshes and all(i > r for r in refreshes) for i in after
         )
+    if "mutate_after_tests" in required:
+        results["mutate_after_tests"] = bool(applies) and any(
+            i > applies[-1] and _is_mutation(call) for i, call in enumerate(calls)
+        )
     return {
         "passed": all(results.values()),
         "steps": results,
         "score": sum(results.values()) / len(results),
+    }
+
+
+def mutation_record(calls: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """What the agent did with mutation testing, recorded and never graded.
+
+    ``survived`` is each run's survivor count as its envelope reported it
+    (``None`` where the agent's pipe hid it). ``strengthened`` is whether a
+    ``transform apply`` followed a run with survivors, and ``remeasured``
+    whether another run followed that apply. ``None`` with no session to read.
+    """
+
+    if calls is None:
+        return None
+    runs = [i for i, call in enumerate(calls) if _is_mutation(call)]
+    applies = [i for i, call in enumerate(calls) if call["label"] == "transform apply"]
+    with_survivors = [i for i in runs if calls[i].get("survived")]
+    strengthened = [a for a in applies if any(r < a for r in with_survivors)]
+    return {
+        "runs": len(runs),
+        "survived": [calls[i].get("survived") for i in runs],
+        "strengthened": bool(strengthened),
+        "remeasured": any(r > strengthened[0] for r in runs) if strengthened else False,
     }
 
 
@@ -786,6 +926,13 @@ class TaskScore:
     #: test overriding ``is_incremental`` (``truth.incremental_test``, #1111);
     #: ``None`` when the task grades none.
     incremental_test: dict[str, Any] | None = None
+    #: Each planted defect and whether the tests caught it (#1112); ``None``
+    #: when the task plants none.
+    planted_defects: list[dict[str, Any]] | None = None
+    #: Share of the planted defects the tests caught; ``None`` when none planted.
+    defects_caught: float | None = None
+    #: What the agent did with ``transform test --mutate`` (``mutation_record``).
+    mutation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -886,6 +1033,8 @@ def score_workspace(
     if graded is not None:
         score.procedure = graded["score"]
         score.procedure_steps = graded["steps"]
+    if task.truth.get("planted_defects"):
+        score.mutation = mutation_record(calls)
     return score
 
 
@@ -935,6 +1084,11 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         checks += run_replays(
             workspace, fixture, tmp_path, task.truth.get("replays") or []
         )
+        defects = (
+            planted_defects(tmp_path / "built", task.truth["planted_defects"], tmp_path)
+            if task.truth.get("planted_defects")
+            else None
+        )
     return TaskScore(
         task=task.key,
         status="scored",
@@ -950,4 +1104,8 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
             sum(c["passed"] for c in checks) / len(checks) if checks else 1.0
         ),
         attribution=(sum(attributed) / len(attributed)) if attributed else None,
+        planted_defects=defects,
+        defects_caught=(
+            sum(d["caught"] for d in defects) / len(defects) if defects else None
+        ),
     )

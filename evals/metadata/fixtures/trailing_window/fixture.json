@@ -1,0 +1,5 @@
+{
+  "name": "trailing_window",
+  "seed": 7311,
+  "description": "Parcel pickups per depot on irregular dates, and a mart with each day's trailing seven-day parcel count. The window is a calendar RANGE frame, so its tests are only worth something if a fixture reaches the boundary: the last day it includes, the first it excludes, and a gap a row-count window would cross (#1112)."
+}

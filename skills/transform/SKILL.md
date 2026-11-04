@@ -182,8 +182,14 @@ declares is `contract`.
 - A balance or a running total is `semi_additive`: never sum it across time.
   Take each entity's latest value (`max` for a running total), then sum across
   entities.
-- Test logic with `dex transform test --scaffold <model>` (dbt unit tests) and
-  measure the tests with `dex transform test --mutate <model>`.
+- Test logic with `dex transform test --scaffold <model>` (dbt unit tests), then
+  measure the tests with `dex transform test --mutate <model>` before calling the
+  model covered. Each survivor is a defect the tests let through: add the fixture
+  its `suggested_test` names (a window survivor's `frame` gives the last day the
+  window includes and the first it excludes), and mutate again. A frame bound
+  under `data.unsupported_sites` was never tested. The score covers only the
+  defects Dex plants, so it is not proof the model is right.
+  Recipe: `skills/transform/references/test-strength.md`.
 - Repair the layer the request names, and settle which one before choosing a
   remedy. "Modify our data" or "fix the source types" asks for an input change;
   "make it build" or "adapt the project" asks for a project change; otherwise the
@@ -310,7 +316,9 @@ fetches the engine's dependencies from PyPI or your configured index.
 5. **Read the plan** (rules below), then `transform apply <plan-id>`.
 6. **Build and verify:** `transform build --target dev --verify`.
 7. **Measure the tests** right after you author or scaffold them, and before
-   telling the user a model is covered: `transform test --mutate <model>`.
+   telling the user a model is covered: `transform test --mutate <model>`. Fix
+   each survivor with the fixture its `suggested_test` names, then measure again
+   (`${CLAUDE_SKILL_DIR}/references/test-strength.md`).
 
 Per-command fields and flags are in `${CLAUDE_SKILL_DIR}/references/commands.md`.
 Shipped macros are in `${CLAUDE_SKILL_DIR}/references/macros.md`. Read them when

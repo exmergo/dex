@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Fourteen fixture projects, written for this suite and derived from no benchmark task,
+Fifteen fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -154,6 +154,8 @@ with tasks phrased the way users ask:
 | `seeded_prerequisite` | `preserve_seed_data`: leave the seed and its types alone and adapt the project | the seed's `due_at` still an integer in both places, the report built through a project repair, and `--cold-deps` after the last apply |
 | `incremental_watermark` | `missed_scans`: scans the feed delivers late with the latest loaded timestamp never reach an incremental fact table | the next incremental run, which the gate's cold build never executes: replays insert new rows into the gate's own scratch copy of the source (never the agent's) and run the model without `--full-refresh`. Scans on the watermark must arrive, none may load twice, and an empty target must still load. A full build passes on the setup's strict `>`; a naive `>=` with no `unique_key` duplicates. The incremental unit test and a non-refresh build after the apply are graded apart from the rows (#1111) |
 | `subscription_activity` | `build_last_activity`: a report the project declares as one row per subscription (`population.parent`) | on the agent's data every subscription has one activity, so a report driven from the activity table passes every runtime check; only `transform plan`'s `population_parent` contradiction catches it (#1029). The gate grades on a holdout with a subscription that has no activity and one with two |
+| `trailing_window` | `author`: add unit tests that pin a trailing seven-day count written as `RANGE BETWEEN INTERVAL '6 day' PRECEDING` | the tests catch three planted defects (the window a day wider, a day narrower, and counted in rows), which needs fixture rows on the last included day, the first excluded day and across a gap in the dates; and `transform test --mutate` after the last apply (#1112) |
+| `trailing_window` | `strengthen`: the same model, starting from a unit test on consecutive days | the same. The starting test catches none of the three, which is the negative control |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -234,13 +236,27 @@ serve the prerequisite tasks:
   `incremental_build_after_apply` when a build without `--full-refresh` follows
   the last apply and every `--full-refresh` build after it, read from the
   flags each call passed (`dex_calls[].flags`, the `--flag` names up to the
-  shell's next command separator, outside quotes). A step a task does not
+  shell's next command separator, outside quotes). `mutate_after_tests` passes
+  when a `transform test --mutate` follows the last apply, so the tests that were
+  measured are the ones that ship: measuring, strengthening and stopping is a miss
+  (#1112). A step a task does not
   require is never graded, so comparing an intentional
   change costs nothing. A reference run has no session and reports none. One
   trial per task can show whether agents take a step at all; it cannot measure a
   difference between two runs.
+- **Defects** (0 to 1, only on tasks with `planted_defects`, `-` otherwise): the
+  share of planted defects the agent's tests catch (#1112). Each is planted in its
+  own copy of the gate's build by one exact text replacement in the model's SQL,
+  and `dbt build --select` must report a test `fail`. A defect whose text is gone
+  (the agent rewrote the model) is `planted: false` and not caught. It grades the
+  tests, apart from the model: a perfect share says these defects could not ship,
+  not that the model is right. Beside it, ungraded, `mutation` records what the
+  agent did with `transform test --mutate`: the runs, each run's survivor count
+  read from its envelope, whether tests were applied after a run with survivors,
+  and whether it measured again.
 - A task where the agent touched none of the models it was asked for scores 0 on
-  every axis (`no_models`), never a vacuous 1.
+  every axis (`no_models`), never a vacuous 1. Adding or changing a model's unit
+  tests counts as touching it.
 - A task whose truth names `incomplete_allowed.blocked_by` accepts a deliverable
   left blocked by that prerequisite as `blocked_reported`, but only where the gate
   failed on that node alone and the final message passes the report rubric.

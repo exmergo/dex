@@ -358,6 +358,219 @@ def test_a_frame_with_no_numeric_bound_is_not_a_site():
     assert "window_frame" not in _operators(batch)
 
 
+def test_the_issues_reproduction_now_finds_the_interval_bound():
+    """#1112's parser-only reproduction: a numeric ROWS bound was one site and
+    the same window written as a day interval was none."""
+
+    rows = (
+        "select sum(v) over (order by d rows between 27 preceding and current row) "
+        "from t"
+    )
+    days = (
+        "select sum(v) over (order by d range between interval '27 day' preceding "
+        "and current row) from t"
+    )
+    assert len(mutation._window_sites(sqlglot.parse_one(rows, read="duckdb"))) == 1
+    assert len(mutation._window_sites(sqlglot.parse_one(days, read="duckdb"))) == 2
+
+
+_INTERVAL_FRAME = (
+    "select region, d, sum(a) over (partition by region order by d "
+    "range between {bound} preceding and current row) as trailing "
+    "from t where a > 0"
+)
+
+
+@pytest.mark.parametrize(
+    "dialect,bound,widened,narrowed",
+    [
+        ("duckdb", "interval '6 day'", "INTERVAL '7' DAY", "INTERVAL '5' DAY"),
+        ("duckdb", "interval 6 days", "INTERVAL '7' DAYS", "INTERVAL '5' DAYS"),
+        ("snowflake", "interval '6 days'", "INTERVAL '7 DAYS'", "INTERVAL '5 DAYS'"),
+        ("postgres", "interval '6 days'", "INTERVAL '7 DAYS'", "INTERVAL '5 DAYS'"),
+    ],
+)
+def test_an_interval_bound_is_widened_and_narrowed_keeping_its_unit(
+    dialect, bound, widened, narrowed
+):
+    """Both calendar boundary questions get a mutant of their own, and only the
+    quantity moves: the unit as written, the partition, the ordering and every
+    unrelated clause are what they were."""
+
+    batch = mutation.enumerate_mutants(
+        _prepare(_INTERVAL_FRAME.format(bound=bound), dialect, parents=[])
+    )
+    frames = _of(batch, "window_frame")
+    assert [m.after.split(" preceding")[0].split("BETWEEN ")[1] for m in frames] == [
+        widened,
+        narrowed,
+    ]
+    for mutant in frames:
+        assert "PARTITION BY region ORDER BY d" in mutant.compiled
+        assert "a > 0" in mutant.body
+        sqlglot.parse_one(
+            mutation._PLACEHOLDER_RE.sub("x", mutant.compiled), read=dialect
+        )
+    assert "one day further back (6 days became 7 days)" in frames[0].defect
+    assert "first day it should exclude" in frames[0].defect
+    assert "one day short (6 days became 5 days)" in frames[1].defect
+    assert "last day it should include" in frames[1].defect
+
+
+def test_an_interval_mutant_names_the_boundary_a_fixture_must_reach():
+    batch = mutation.enumerate_mutants(
+        _prepare(_INTERVAL_FRAME.format(bound="interval '6 day'"), parents=[])
+    )
+    widen, narrow = _of(batch, "window_frame")
+    assert widen.frame == {
+        "kind": "range",
+        "bound": "start",
+        "side": "preceding",
+        "value": 6,
+        "unit": "day",
+        "from": 6,
+        "to": 7,
+        "last_included": 6,
+        "first_excluded": 7,
+    }
+    assert narrow.frame["to"] == 5
+    assert widen.payload()["frame"] == widen.frame
+    for mutant in (widen, narrow):
+        assert "6 days before the current row" in mutant.suggested_test
+        assert "7 days before it" in mutant.suggested_test
+        assert "gap" in mutant.suggested_test
+    # The label does not replace the calendar advice: a data assertion rarely
+    # pins a boundary, whichever way the dev data fell.
+    for label in ("equivalent", "distinguishable", None):
+        assert "gap" in mutation.suggested_test(
+            "window_frame", label, frame=widen.frame
+        )
+
+
+def test_a_following_interval_bound_says_ahead():
+    batch = mutation.enumerate_mutants(
+        _prepare(
+            "select sum(a) over (order by d range between current row and "
+            "interval '3 day' following) from t",
+            parents=[],
+        )
+    )
+    widen, _narrow = _of(batch, "window_frame")
+    assert "one day further ahead" in widen.defect
+    assert "3 days after the current row" in widen.suggested_test
+
+
+def test_a_zero_interval_is_widened_but_never_narrowed_below_zero():
+    batch = mutation.enumerate_mutants(
+        _prepare(
+            "select sum(a) over (order by d range between interval '0 day' "
+            "preceding and current row) from t",
+            parents=[],
+        )
+    )
+    frames = _of(batch, "window_frame")
+    assert len(frames) == 1 and frames[0].frame["to"] == 1
+
+
+def test_a_numeric_frame_keeps_its_single_mutant_and_its_wording():
+    """The numeric behavior #1112 asks to keep: one +1 mutant per frame, and a
+    ROWS sentence that counts rows. A numeric RANGE bound counts the ordering
+    value, so it no longer claims a row."""
+
+    rows = mutation.enumerate_mutants(
+        _prepare(
+            "select sum(a) over (order by d rows between 2 preceding and "
+            "current row) from t"
+        )
+    )
+    ranged = mutation.enumerate_mutants(
+        _prepare(
+            "select sum(a) over (order by n range between 2 preceding and "
+            "current row) from t"
+        )
+    )
+    assert len(_of(rows, "window_frame")) == 1
+    assert "one row further" in _of(rows, "window_frame")[0].defect
+    assert (
+        _of(rows, "window_frame")[0].suggested_test
+        == (mutation._SUGGESTED_TEST["window_frame"])
+    )
+    (ranged_mutant,) = _of(ranged, "window_frame")
+    assert "one unit of the ordering value" in ranged_mutant.defect
+    assert "row further" not in ranged_mutant.defect
+
+
+@pytest.mark.parametrize(
+    "bound,code",
+    [
+        ("interval (lookback) day", "non_literal_offset"),
+        ("interval '1.5' day", "fractional_offset"),
+        ("interval '1 day 2 hours'", "compound_interval"),
+        ("'6'", "string_offset"),
+        ("2.5", "fractional_offset"),
+        ("interval '-2' day", "negative_offset"),
+        ("to_days(6)", "non_literal_offset"),
+    ],
+)
+def test_a_bound_dex_cannot_shift_is_listed_and_never_mutated(bound, code):
+    """#1112: an unsupported bound never implies its boundary was tested. It is
+    no mutant and no part of the cap, and it is named with its reason."""
+
+    batch = mutation.enumerate_mutants(
+        _prepare(_INTERVAL_FRAME.format(bound=bound), parents=[])
+    )
+    assert "window_frame" not in _operators(batch)
+    assert [entry["reason_code"] for entry in batch.unsupported] == [code]
+    entry = batch.unsupported[0]
+    assert entry["operator"] == "window_frame"
+    assert entry["scope"] == "(final select)"
+    assert entry["side"] == "preceding"
+    assert entry["reason"]
+    assert batch.considered == len(batch.mutants)
+
+
+def test_the_bound_a_frame_does_not_shift_is_listed_too():
+    batch = mutation.enumerate_mutants(
+        _prepare(
+            "select sum(a) over (order by d rows between 2 preceding and 3 following) "
+            "from t"
+        )
+    )
+    assert len(_of(batch, "window_frame")) == 1
+    assert "2 became 3" in _of(batch, "window_frame")[0].defect
+    assert [(e["side"], e["reason_code"]) for e in batch.unsupported] == [
+        ("following", "other_bound_of_mutated_frame")
+    ]
+
+
+def test_unbounded_and_current_row_are_neither_sites_nor_unsupported():
+    batch = mutation.enumerate_mutants(
+        _prepare(
+            "select count(a) over (order by d rows between unbounded preceding and "
+            "current row) from t"
+        )
+    )
+    assert batch.mutants == [] and batch.unsupported == []
+
+
+def test_interval_mutants_share_the_cap_like_any_other_class():
+    """Two mutants per interval frame are two cap slots, spread round robin
+    and counted per class when the cap cuts them."""
+
+    sql = (
+        "select sum(a) over (order by d range between interval '6 day' preceding "
+        "and current row) as w1, sum(a) over (order by d range between "
+        "interval '13 day' preceding and current row) as w2 from t where a > 1"
+    )
+    full = mutation.enumerate_mutants(_prepare(sql, parents=[]))
+    assert len(_of(full, "window_frame")) == 4
+    assert full.considered == len(full.mutants)
+    capped = mutation.enumerate_mutants(_prepare(sql, parents=[]), cap=3)
+    assert "window_frame" in _operators(capped)
+    assert capped.elided_total == full.considered - 3
+    assert capped.elided.get("window_frame", 0) >= 2
+
+
 @pytest.mark.parametrize(
     "written,expected", [("sum(a)", "MAX(a)"), ("max(a)", "SUM(a)")]
 )

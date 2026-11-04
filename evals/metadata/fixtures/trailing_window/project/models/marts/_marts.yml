@@ -1,0 +1,28 @@
+version: 2
+models:
+  - name: fct_depot_trailing
+    description: One row per depot per pickup day, with the parcels picked up over the seven calendar days ending that day.
+    config:
+      meta:
+        dex:
+          grain: [depot, pickup_date]
+          population:
+            rule: Every pickup day of every depot; days with no pickup have no row.
+          assumptions:
+            - decision: What the trailing window spans
+              chosen: seven calendar days, the day itself and the six before it
+              evidence: request
+              detail: a trailing week counts days, not rows, so gaps in the dates shorten it
+    columns:
+      - name: depot
+        data_tests: [not_null]
+        config: {meta: {dex: {role: dimension, null_rule: never}}}
+      - name: pickup_date
+        data_tests: [not_null]
+        config: {meta: {dex: {role: time, null_rule: never}}}
+      - name: parcels
+        description: Parcels picked up that day.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+      - name: parcels_7d
+        description: Parcels picked up over the seven calendar days ending that day. Neighbouring days overlap, so it never sums across days.
+        config: {meta: {dex: {role: measure, aggregation: max, additivity: non_additive, unit: count}}}

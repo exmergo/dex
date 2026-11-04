@@ -278,6 +278,12 @@ class TestScaffoldResult(PlanResult):
     scaffolding a unit test *is* planning an edit. ``inputs`` are the bare
     names of every input a ``given`` block was built for, in the order the
     model reads them.
+
+    ``window_boundaries`` names each calendar window (a ``RANGE`` frame with a
+    day or week interval bound) whose boundary rows were placed in the
+    ``given`` block: the input, the ordering column, the frame, and what each
+    placed date tests (#1112). A window it could not reach is a warning with a
+    reason code, and that input keeps its single example row.
     """
 
     model: str = ""
@@ -288,9 +294,14 @@ class TestScaffoldResult(PlanResult):
     #: where no single comparison with a subquery over ``{{ this }}`` was
     #: read). Issue #1111.
     incremental: dict[str, Any] | None = None
+    window_boundaries: list[dict[str, Any]] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"model": self.model, "inputs": self.inputs}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "inputs": self.inputs,
+            "window_boundaries": self.window_boundaries,
+        }
         if self.incremental is not None:
             payload["incremental"] = self.incremental
         return {**payload, **super().data()}
@@ -604,6 +615,12 @@ class MutationCoverageResult(Result):
     it answers for the model's own suite and must mean what it meant before
     downstream tests ran; ``score_with_downstream`` counts it as caught, and is
     null when they did not run.
+
+    ``unsupported_sites`` lists every window-frame offset bound no mutant
+    moved, each with a ``reason_code`` (a column or expression offset, a
+    fraction, a compound interval, the second bound of a frame whose first one
+    was moved). Its boundary is untested by this run, and an empty list means
+    every offset bound was mutated (#1112).
     """
 
     model: str = ""
@@ -617,6 +634,7 @@ class MutationCoverageResult(Result):
     runs: int = 0
     equivalence: dict[str, Any] | None = None
     downstream: dict[str, Any] | None = None
+    unsupported_sites: list[dict[str, Any]] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
         return {
@@ -628,6 +646,7 @@ class MutationCoverageResult(Result):
             "score": self.score,
             "score_with_downstream": self.score_with_downstream,
             "cap": self.cap,
+            "unsupported_sites": self.unsupported_sites,
             "runs": self.runs,
             "equivalence": self.equivalence,
             "downstream": self.downstream,

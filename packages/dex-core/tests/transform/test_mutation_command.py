@@ -247,6 +247,19 @@ def test_the_selection_flags_are_pinned_rather_than_inherited(
             _manifest(config={"materialized": "ephemeral", "sql_header": "set x=1"}),
             "sql_header",
         ),
+        # A window is the only thing to mutate, and its bound is one dex cannot
+        # shift: the refusal names it rather than implying a window nothing can
+        # break (#1112).
+        (
+            _manifest(
+                compiled_code=(
+                    "select count(a) over (order by d range between interval "
+                    "(lookback) day preceding and current row) as n "
+                    'from "d"."m"."stg_orders"'
+                )
+            ),
+            r"untested: INTERVAL \(lookback\) DAY \(non_literal_offset\)",
+        ),
     ],
 )
 def test_a_model_dex_will_not_mutate_is_refused_before_any_test_runs(

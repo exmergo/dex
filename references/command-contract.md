@@ -423,8 +423,11 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
-                                     filled in (dbt-parse-checked; apply like any plan). A model with
-                                     an {% if is_incremental() %} branch gets a second test with the
+                                     filled in (dbt-parse-checked; apply like any plan). A RANGE frame
+                                     with a day or week interval over a date column of one input gets
+                                     boundary rows (current day, last included, first excluded, a gap),
+                                     named in data.window_boundaries (#1112). A model with an
+                                     {% if is_incremental() %} branch gets a second test with the
                                      is_incremental override and a typed `this` fixture, with rows
                                      before, on and after the watermark it read (data.incremental)
 dex transform test --mutate <m>   -> measure the tests <m> already has: plant standard analytics
@@ -751,7 +754,24 @@ The defect classes are the ones that recur in analytics code: a boundary
 comparison flipped to include or exclude its edge, a `WHERE` predicate dropped or
 negated, an inner join swapped for a left join or the reverse, a `CASE` branch
 removed, a ratio inverted, a window frame bound shifted by one, and `sum`
-swapped with `max`. Each finding is written as the defect rather than as a diff,
+swapped with `max`.
+
+A window frame's first constant bound moves one step wider. A `ROWS` bound counts
+rows; a numeric `RANGE` bound counts units of the ordering value, and its defect
+says so. An interval bound (`RANGE BETWEEN INTERVAL '6 day' PRECEDING`) gets two
+mutants, one unit wider and one unit narrower, because a calendar window asks two
+boundary questions: does the first day it should exclude leak in, and is the last
+day it should include still counted. Only the quantity changes; the unit is kept as
+written. Each window mutant carries `frame` (`kind`, `side`, `unit`, `from`, `to`,
+`last_included`, `first_excluded`), and an interval survivor's `suggested_test`
+names the two days a fixture needs rows on, with a gap in the dates so a row-count
+frame cannot give the same answer (#1112). Every bound no mutant moved is listed in
+`data.unsupported_sites` with a `reason_code` (`non_literal_offset`,
+`fractional_offset`, `compound_interval`, `string_offset`, `negative_offset`,
+`unknown_unit`, `other_bound_of_mutated_frame`), with a warning, and is never
+counted toward the cap: its boundary is untested by the run. `UNBOUNDED` and
+`CURRENT ROW` have no offset and are not listed. A model whose only mutable SQL is
+such a bound is refused, naming it. Each finding is written as the defect rather than as a diff,
 and carries `suggested_test`, because the reader's next action is to write a
 test.
 
