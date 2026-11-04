@@ -246,7 +246,9 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      names a <model>_v<N> copy that is not a version (#859;
                                      skills/transform/references/model-versions.md)
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
-                                     no id means the latest unapplied plan of any kind; once
+                                     no id means the latest unapplied plan of any kind, named in
+                                     data.resolved_plan and a warnings line, and an empty id is refused
+                                     (reason: request) rather than read as no id (#1103); once
                                      something is written, data.commit_trailer is the
                                      Co-authored-by line the commit of those files ends with;
                                      data.refactor_comparison reports each rewritten model's recorded
@@ -352,7 +354,8 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      digests, the relations generated, and the principal errors.
                                      --for-plan (a stored id) or --for-plan-file (an exported document,
                                      which is what a sandbox holds) adds coverage: the nodes the change
-                                     required, which of them ran, and how each requirement was derived.
+                                     required, which of them ran, and how each requirement was derived;
+                                     an empty one is refused before anything runs, not read as absent.
                                      --no-install-deps refuses a declared-but-uninstalled package by
                                      name, before any subprocess and before pricing, instead of
                                      installing it. data.completion leads data on success and on
@@ -375,7 +378,8 @@ dex transform apply               -> applies a plan document in this checkout, w
                                      a document that verifies on its own terms and is not the plan the
                                      caller pinned. Containment and kind placement are re-checked
                                      against this checkout's own surface. A file this checkout edited
-                                     first is a conflict, not an overwrite
+                                     first is a conflict, not an overwrite. An empty --plan-file is
+                                     refused, never routed to the latest stored plan
 dex transform ground [plan-id]    -> what the plan depends on and how finished the answer is:
                                      dependencies, the relations behind them, what could not be
                                      resolved (with file and line), what more than one thing defines,
@@ -1022,6 +1026,20 @@ default, or a filter or operator after it is refused. A key naming a location
   applies the latest unapplied plan of any kind (semantic plans included; `emit
   dbt` remains the semantic-scoped spelling). `transform plans` lists what is
   stored, pending and applied.
+- **No plan id names the plan; an empty one is refused.** `transform apply`,
+  `export`, `ground`, `classify` and `compare` all read a missing id as the
+  latest unapplied plan, and each says which one it picked: `data.resolved_plan`
+  is `{plan_id, intent, created_at, resolved_from: "latest_unapplied"}`, beside
+  `data.plan_id`, and one `warnings` line names the same plan, on a refusal
+  raised after the pick too (a containment refusal on apply, a plan with no
+  baseline on compare), where a host calling the engine in process finds it as
+  the exception's `resolved_plan`. An explicit id carries neither. An id given but empty or blank (`apply ""`, which is what
+  `apply "$(dex transform plan ...)"` passes when the plan failed) is refused
+  with `reason: request` before the store is read, and so are an empty
+  `--plan-file`, `--for-plan` and `--for-plan-file`, because reading any of them
+  as absent does something the caller did not ask for (#1103). An unquoted empty
+  substitution leaves no argument at all and cannot be told from an omitted one,
+  which is why the resolution is always named.
 - **A commit of what dex wrote credits Dex.** dex never commits, so an apply
   that wrote at least one file, from the store or from `--plan-file`, hands the
   credit to whoever does: `data.commit_trailer` is
@@ -1116,8 +1134,9 @@ default, or a filter or operator after it is refused. A key naming a location
   what a build sandbox holds instead of a store). It reports the nodes the change
   required, which of them ran, and how each requirement was derived: a model edit
   requires its own node, a `schema.yml` the nodes it documents, and a semantic
-  YAML the dbt model its semantic model sits on. Without either flag there is no
-  coverage and the key is absent rather than empty, because an empty coverage
+  YAML the dbt model its semantic model sits on. An empty `--for-plan` or
+  `--for-plan-file` is refused rather than read as absent. Without either flag
+  there is no coverage and the key is absent rather than empty, because an empty coverage
   block reads as "nothing required was built", which is the opposite of "nobody
   asked what was required".
 

@@ -271,7 +271,8 @@ which would fail every task's build gate on the interpreter:
 # Free: score every reference answer. This is the scorer's own self-test.
 uv run --python 3.13 --project packages/dex-core --extra duckdb python -m evals metadata --reference
 
-# The scorer and fixture tests (also in CI):
+# The scorer and fixture tests (also in CI, split into the parallel groups in
+# tests/eval_groups.py; add --eval-group <name> to run one):
 uv run --python 3.13 --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
 
 # Paid: one headless Claude Code session per task, then score.

@@ -130,6 +130,30 @@ def test_a_positive_refactor_is_equivalent_on_the_compared_inputs(project):
     assert result.model == "team_activity"
 
 
+def test_no_plan_id_names_the_plan_compared(project):
+    """`compare` shares the "latest unapplied" default, so it says which plan
+    it picked, and an explicit id says nothing of the kind (#1103)."""
+
+    engine = _engine(project)
+    plan_id = _plan(engine, project, ("models/team_activity.sql", _EQUIVALENT))
+    picked = engine.compare()
+    assert picked.status == "equivalent", picked.detail
+    assert picked.plan_id == plan_id
+    assert picked.resolved_plan == {
+        "plan_id": plan_id,
+        "intent": "refactor",
+        "created_at": picked.resolved_plan["created_at"],
+        "resolved_from": "latest_unapplied",
+    }
+    assert picked.data()["resolved_plan"]["plan_id"] == plan_id
+    assert any(plan_id in w and "no plan id given" in w for w in picked.warnings)
+
+    named = engine.compare(plan_id)
+    assert named.resolved_plan is None
+    assert "resolved_plan" not in named.data()
+    assert not any("no plan id given" in w for w in named.warnings)
+
+
 def test_a_rewritten_parent_is_inlined_on_both_sides(project):
     """The dev relation of a parent the plan edits holds the old rows, so reading
     it would compare the new model against the old parent."""

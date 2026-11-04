@@ -54,6 +54,17 @@ class ModelVersionError(PlanError):
 # --- reading the project -----------------------------------------------------------
 
 
+def _manifest_path(node: Mapping[str, Any]) -> str:
+    """A manifest node's file, with slashes as every plan and version names it.
+
+    dbt writes ``original_file_path`` with the platform's separator, so on
+    Windows it reads ``models\\dim_teams_v2.sql`` and would never equal the
+    ``models/dim_teams_v2.sql`` a version entry records.
+    """
+
+    return str(node.get("original_file_path") or "").replace("\\", "/")
+
+
 def _files(view: DbtProjectView) -> dict[str, str]:
     return {path: source.content for path, source in view.files.items()}
 
@@ -491,7 +502,7 @@ def confirm(
 
     nodes = manifest.get("nodes") or {}
     by_file = {
-        node.get("original_file_path"): uid
+        _manifest_path(node): uid
         for uid, node in nodes.items()
         if isinstance(node, dict) and node.get("resource_type") == "model"
     }
@@ -518,13 +529,10 @@ def confirm(
                 version["in_manifest"] = False
                 continue
             version["in_manifest"] = True
-            if (
-                version.get("file")
-                and node.get("original_file_path") != version["file"]
-            ):
+            if version.get("file") and _manifest_path(node) != version["file"]:
                 miss(
                     "version_file_mismatch",
-                    f"{uid} is built from {node.get('original_file_path')}, not "
+                    f"{uid} is built from {_manifest_path(node)}, not "
                     f"{version['file']}",
                     version["label"],
                 )

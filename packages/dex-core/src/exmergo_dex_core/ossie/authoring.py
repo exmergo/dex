@@ -213,7 +213,9 @@ def write_edits(
     written: list[str] = []
     for target, edit in staged:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(edit.new_content, encoding="utf-8")
+        # Bytes, not text: text mode would write CRLF on Windows, and the file
+        # has to hold exactly what the plan's content hash records.
+        target.write_bytes(edit.new_content.encode("utf-8"))
         written.append(edit.path)
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
 

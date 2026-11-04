@@ -3132,7 +3132,7 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             )
         )
     except ValueError as exc:
-        return env.error_for(exc)
+        return env.error_for(exc, **_resolution_error(exc))
 
 
 def _column_map(pairs: list[str] | None) -> dict[str, str] | None:
@@ -3202,19 +3202,20 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
     nothing written until the caller confirms deliberately.
     """
 
-    store = engine.require_full_store("applying a plan")
-    if not plan_id:
-        # No id means the latest unapplied plan of any kind: apply does not
-        # dispatch on kind, a plan is a plan (a semantic plan applies the same
-        # way a model plan does).
-        latest = store.latest_plan(None)
-        if latest is None:
-            raise ValueError(
-                "no unapplied plan found; run `transform plan` or `semantic "
-                "define|update|plan` first, or pass a plan id"
-            )
-        plan_id = latest.plan_id
+    # No id means the latest unapplied plan of any kind: apply does not dispatch
+    # on kind, a plan is a plan (a semantic plan applies the same way a model plan
+    # does). An empty id is refused rather than read as no id (#1103).
+    store, plan_id, resolved = _resolve_plan_id(engine, plan_id, "applying a plan")
+    with _naming_resolution(resolved):
+        return _apply_stored(engine, store, plan_id, resolved)
 
+
+def _apply_stored(
+    engine: DexEngine, store: Store, plan_id: str, resolved: dict[str, Any] | None
+) -> ApplyResult:
+    """:func:`apply` once the plan id is settled."""
+
+    resolution_warnings = _resolution_warnings(resolved)
     repo_root = engine.require_repo_root("applying a plan")
     stored = store.load_plan(plan_id)
     semantic_layer = None
@@ -3242,6 +3243,8 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
 
         return ApplyResult(
             plan_id=plan_id,
+            resolved_plan=resolved,
+            warnings=resolution_warnings,
             conflicts=conflicts,
             diffs=outcome.diffs,
             # Not a spend confirmation but the same shape: a priced-out ask the
@@ -3260,6 +3263,8 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
     comparison = refactor_comparison_states(stored)
     return ApplyResult(
         plan_id=plan_id,
+        resolved_plan=resolved,
+        warnings=resolution_warnings,
         written=outcome.written,
         conflicts_overridden=[c.path for c in outcome.conflicts],
         diffs=outcome.diffs,
@@ -3387,29 +3392,121 @@ def cmd_apply(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # `PlanError` is the apply-time containment refusal, which is a refusal
         # the caller can act on rather than a failure, so it gets the same named
         # envelope every other refusal on this path gets.
-        return env.error_for(exc)
+        return env.error_for(exc, **_resolution_error(exc))
+
+
+def _reject_blank(value: str | None, flag: str, fix: str) -> None:
+    """Refuse an argument given explicitly but empty.
+
+    A shell substitution whose command failed (`apply "$(dex transform plan
+    ...)"`) yields an empty string, and every one of these arguments has a
+    meaning when absent. Reading an empty one as absent quietly does something
+    other than what the caller asked for, which is how an earlier plan got
+    applied in place of the one that failed to be made (#1103).
+    """
+
+    if value is not None and not value.strip():
+        raise RequestError(f"empty {flag}; {fix}")
+
+
+def _reject_empty_plan_id(plan_id: str | None) -> None:
+    _reject_blank(
+        plan_id,
+        "plan id",
+        "pass a plan id, or omit the argument to use the latest unapplied plan "
+        "(an empty shell substitution, such as a `transform plan` that failed, "
+        "is one way to get here)",
+    )
+
+
+#: The longest intent quoted in the warning line; ``data.resolved_plan`` keeps
+#: it whole.
+_INTENT_IN_WARNING = 80
+
+
+def _resolved_plan_info(plan: Any) -> dict[str, Any]:
+    """``data.resolved_plan``: which plan "no id" picked, and when it was made."""
+
+    return {
+        "plan_id": plan.plan_id,
+        "intent": plan.intent,
+        "created_at": plan.created_at,
+        "resolved_from": "latest_unapplied",
+    }
+
+
+def _resolution_warnings(resolved: dict[str, Any] | None) -> list[str]:
+    """The one ``warnings`` line naming the picked plan, or none for an explicit id."""
+
+    if resolved is None:
+        return []
+    intent = str(resolved.get("intent") or "")
+    if len(intent) > _INTENT_IN_WARNING:
+        intent = intent[: _INTENT_IN_WARNING - 3].rstrip() + "..."
+    return [
+        "no plan id given, so the latest unapplied plan was used: "
+        f"{resolved['plan_id']} ({intent!r}, created {resolved['created_at']}); "
+        "pass a plan id to choose another"
+    ]
+
+
+@contextlib.contextmanager
+def _naming_resolution(resolved: dict[str, Any] | None) -> Any:
+    """Tag a refusal raised after "no id" picked a plan with the plan it picked.
+
+    A verb can still refuse once the plan is chosen (a containment refusal on
+    apply, a plan with no baseline on compare), and that error is exactly where
+    a caller most needs to know which plan was read. The tag is the exception's
+    ``resolved_plan`` attribute, which :func:`_resolution_error` turns into the
+    error envelope's ``data.resolved_plan`` and ``warnings`` line, and which a
+    host calling the engine in process can read off the exception itself.
+    """
+
+    try:
+        yield
+    except Exception as exc:
+        if resolved is not None and getattr(exc, "resolved_plan", None) is None:
+            with contextlib.suppress(AttributeError, TypeError):
+                exc.resolved_plan = resolved  # type: ignore[attr-defined]
+        raise
+
+
+def _resolution_error(exc: BaseException) -> dict[str, Any]:
+    """``env.error_for`` keyword arguments naming the plan a refusal read."""
+
+    resolved = getattr(exc, "resolved_plan", None)
+    if not isinstance(resolved, dict):
+        return {}
+    return {
+        "data": {"resolved_plan": resolved},
+        "warnings": _resolution_warnings(resolved),
+    }
 
 
 def _resolve_plan_id(
     engine: DexEngine, plan_id: str | None, what: str
-) -> tuple[Store, str]:
-    """The store and the plan id, resolving "the latest unapplied plan" once.
+) -> tuple[Store, str, dict[str, Any] | None]:
+    """The store, the plan id, and how "no id" resolved, decided once.
 
     Shared by every verb that takes an optional plan id, so "no id" means the
-    same thing on `export`, `ground`, and `classify` as it already does on
-    `apply`, rather than each verb inventing its own default.
+    same thing on `apply`, `export`, `ground`, `classify` and `compare`, rather
+    than each verb inventing its own default. The third element is ``None`` for
+    an explicit id and :func:`_resolved_plan_info` for a picked one, so the
+    caller can say which plan it chose. An explicitly empty id is refused before
+    the store is read.
     """
 
+    _reject_empty_plan_id(plan_id)
     store = engine.require_full_store(what)
-    if plan_id:
-        return store, plan_id
+    if plan_id is not None:
+        return store, plan_id, None
     latest = store.latest_plan(None)
     if latest is None:
         raise ValueError(
             "no unapplied plan found; run `transform plan` or `semantic "
             "define|update|plan` first, or pass a plan id"
         )
-    return store, latest.plan_id
+    return store, latest.plan_id, _resolved_plan_info(latest)
 
 
 def export_plan(engine: DexEngine, plan_id: str | None = None) -> PlanExportResult:
@@ -3422,9 +3519,18 @@ def export_plan(engine: DexEngine, plan_id: str | None = None) -> PlanExportResu
     worth failing on here rather than at apply time in another process.
     """
 
+    store, plan_id, resolved = _resolve_plan_id(engine, plan_id, "exporting a plan")
+    with _naming_resolution(resolved):
+        return _export_stored(engine, store, plan_id, resolved)
+
+
+def _export_stored(
+    engine: DexEngine, store: Store, plan_id: str, resolved: dict[str, Any] | None
+) -> PlanExportResult:
+    """:func:`export_plan` once the plan id is settled."""
+
     from .portable import plan_document
 
-    store, plan_id = _resolve_plan_id(engine, plan_id, "exporting a plan")
     repo_root = Path(engine.require_repo_root("exporting a plan"))
     stored = store.load_plan(plan_id)
     project = repo_root / stored.project_dir
@@ -3440,8 +3546,10 @@ def export_plan(engine: DexEngine, plan_id: str | None = None) -> PlanExportResu
     document = plan_document(stored, read_existing=read_existing)
     return PlanExportResult(
         plan_id=document.plan_id,
+        resolved_plan=resolved,
         digest=document.digest,
         plan=document,
+        warnings=_resolution_warnings(resolved),
     )
 
 
@@ -3449,7 +3557,7 @@ def cmd_export(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(export_plan(engine, getattr(args, "argument", None)))
     except (ValueError, PlanError) as exc:
-        return env.error_for(exc)
+        return env.error_for(exc, **_resolution_error(exc))
 
 
 def apply_document(
@@ -3516,6 +3624,14 @@ def cmd_apply_document(args: argparse.Namespace, engine: DexEngine) -> env.Envel
 
     try:
         path = getattr(args, "plan_file", None)
+        # Routed here whenever the flag was given, so an empty one is refused
+        # rather than falling through to the latest stored plan (#1103).
+        _reject_blank(
+            path,
+            "--plan-file",
+            "pass the plan document's path (or `-` for stdin), or drop the flag "
+            "and pass a stored plan id",
+        )
         raw = sys.stdin.read() if path == "-" else read_payload_file(path)
         return to_envelope(
             apply_document(
@@ -3582,10 +3698,19 @@ def ground(engine: DexEngine, plan_id: str | None = None) -> GroundingResult:
     refusing would make the common case pay for the rare one.
     """
 
+    store, plan_id, resolved = _resolve_plan_id(engine, plan_id, "grounding a plan")
+    with _naming_resolution(resolved):
+        return _ground_stored(engine, store, plan_id, resolved)
+
+
+def _ground_stored(
+    engine: DexEngine, store: Store, plan_id: str, resolved: dict[str, Any] | None
+) -> GroundingResult:
+    """:func:`ground` once the plan id is settled."""
+
     from .grounding import ground_plan
     from .portable import plan_document
 
-    store, plan_id = _resolve_plan_id(engine, plan_id, "grounding a plan")
     repo_root = Path(engine.require_repo_root("grounding a plan"))
     stored = store.load_plan(plan_id)
     project = repo_root / stored.project_dir
@@ -3612,14 +3737,19 @@ def ground(engine: DexEngine, plan_id: str | None = None) -> GroundingResult:
         catalog_error=catalog_error,
         plan_digest=plan_document(stored).digest,
     )
-    return GroundingResult(plan_id=plan_id, grounding=grounding)
+    return GroundingResult(
+        plan_id=plan_id,
+        resolved_plan=resolved,
+        grounding=grounding,
+        warnings=_resolution_warnings(resolved),
+    )
 
 
 def cmd_ground(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(ground(engine, getattr(args, "argument", None)))
     except (ValueError, PlanError) as exc:
-        return env.error_for(exc)
+        return env.error_for(exc, **_resolution_error(exc))
 
 
 def classify(
@@ -3641,7 +3771,18 @@ def classify(
         classifications = [classify_edit(edit) for edit in edits]
         return ClassificationResult(classifications=classifications)
 
-    store, plan_id = _resolve_plan_id(engine, plan_id, "classifying a plan")
+    store, plan_id, resolved = _resolve_plan_id(engine, plan_id, "classifying a plan")
+    with _naming_resolution(resolved):
+        return _classify_stored(engine, store, plan_id, resolved)
+
+
+def _classify_stored(
+    engine: DexEngine, store: Store, plan_id: str, resolved: dict[str, Any] | None
+) -> ClassificationResult:
+    """:func:`classify` once the plan id is settled."""
+
+    from .classify import classify_edit
+
     repo_root = Path(engine.require_repo_root("classifying a plan"))
     stored = store.load_plan(plan_id)
     project = repo_root / stored.project_dir
@@ -3653,7 +3794,12 @@ def classify(
             with contextlib.suppress(OSError, UnicodeDecodeError):
                 existing = candidate.read_text(encoding="utf-8")
         classifications.append(classify_edit(edit, existing_content=existing))
-    return ClassificationResult(plan_id=plan_id, classifications=classifications)
+    return ClassificationResult(
+        plan_id=plan_id,
+        resolved_plan=resolved,
+        classifications=classifications,
+        warnings=_resolution_warnings(resolved),
+    )
 
 
 def cmd_classify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -3664,7 +3810,7 @@ def cmd_classify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             classify(engine, getattr(args, "argument", None), edits=edits)
         )
     except (ValueError, PlanError) as exc:
-        return env.error_for(exc)
+        return env.error_for(exc, **_resolution_error(exc))
 
 
 def plans(engine: DexEngine) -> PlanListResult:
@@ -3720,6 +3866,14 @@ def build(
         has_package_spec,
     )
 
+    # An empty `--for-plan` read as absent builds with no coverage at all, and
+    # the caller who meant to name a plan never learns it was dropped (#1103).
+    _reject_blank(
+        for_plan,
+        "--for-plan",
+        "pass the plan id the build is for, or omit the flag to build with no "
+        "plan coverage",
+    )
     kwargs: dict[str, Any] = {
         "target": target,
         "select": select,
@@ -4289,8 +4443,13 @@ def _for_plan_document(args: argparse.Namespace) -> Any:
     """The plan document `--for-plan-file` names, or None."""
 
     path = getattr(args, "for_plan_file", None)
-    if not path:
+    if path is None:
         return None
+    _reject_blank(
+        path,
+        "--for-plan-file",
+        "pass the plan document's path (or `-` for stdin), or omit the flag",
+    )
     return sys.stdin.read() if path == "-" else read_payload_file(path)
 
 

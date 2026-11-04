@@ -1020,13 +1020,26 @@ def _build_parser() -> argparse.ArgumentParser:
                 transform_positional = {
                     "init": ("name", "name of the dbt project to create"),
                     "plan": ("intent", "one line saying what the edits are for"),
-                    "apply": ("plan-id", "plan to apply (default: latest unapplied)"),
+                    "apply": (
+                        "plan-id",
+                        "plan to apply "
+                        "(default: latest unapplied, named in data.resolved_plan)",
+                    ),
                     "macro": ("macro", "shipped macro to scaffold (omit to list them)"),
-                    "export": ("plan-id", "plan to export (default: latest unapplied)"),
-                    "ground": ("plan-id", "plan to ground (default: latest unapplied)"),
+                    "export": (
+                        "plan-id",
+                        "plan to export "
+                        "(default: latest unapplied, named in data.resolved_plan)",
+                    ),
+                    "ground": (
+                        "plan-id",
+                        "plan to ground "
+                        "(default: latest unapplied, named in data.resolved_plan)",
+                    ),
                     "classify": (
                         "plan-id",
-                        "plan to classify (default: latest unapplied)",
+                        "plan to classify "
+                        "(default: latest unapplied, named in data.resolved_plan)",
                     ),
                 }
                 if group == "transform" and name in transform_positional:
@@ -1316,7 +1329,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "plan_id",
                         nargs="?",
                         default=None,
-                        help="stored plan id; defaults to the latest unapplied plan",
+                        help=(
+                            "stored plan id "
+                            "(default: latest unapplied, named in data.resolved_plan)"
+                        ),
                     )
                     sp.add_argument(
                         "--model",
@@ -1709,7 +1725,10 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # gating it on the dialect engine would make the offline apply need a
         # dependency it never uses, in the one environment least able to install
         # one.
-        if getattr(args, "plan_file", None):
+        # `is not None`, not truthiness: `--plan-file ""` (an empty substitution)
+        # must reach the document path's refusal, not fall through to applying
+        # the latest stored plan (#1103).
+        if getattr(args, "plan_file", None) is not None:
             from .transform.commands import cmd_apply_document
 
             return cmd_apply_document(args, engine)
@@ -1743,7 +1762,7 @@ def _apply_authors_sql(args: argparse.Namespace, engine: Any) -> bool:
     try:
         store = engine.require_full_store("applying a plan")
         plan_id = getattr(args, "argument", None)
-        if not plan_id:
+        if plan_id is None:
             latest = store.latest_plan(None)
             if latest is None:
                 return True

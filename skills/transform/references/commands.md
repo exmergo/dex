@@ -155,6 +155,17 @@ when no id is given. If a human edited a file after planning, nothing is written
 and the divergence comes back as diffs with `needs_confirmation`. `plans` lists
 stored plans, pending and applied, newest first.
 
+When no id is given, the envelope names the plan it picked:
+`data.resolved_plan` is `{plan_id, intent, created_at, resolved_from:
+"latest_unapplied"}`, and a `warnings` line names the same plan, on a refusal
+after the pick too. Check that it is the plan you meant. `export`, `ground`, `classify` and `compare` take the same
+default and report it the same way. An id that is given but empty (`apply ""`,
+which is what `apply "$(dex transform plan ...)"` passes when the plan failed) is
+refused with `reason: request`, as are an empty `--plan-file`, `--for-plan` and
+`--for-plan-file`. An unquoted empty substitution leaves no argument at all, so
+it still means "latest": take the id from the plan's envelope, or quote the
+substitution.
+
 An apply that wrote at least one file returns `data.commit_trailer`, the line
 `Co-authored-by: Dex <dex@exmergo.com>`. End the message of the commit that
 carries those files with it, after a blank line: the forge credits Dex as a
@@ -288,7 +299,8 @@ Runs `dbt build` against a dev target, with a cost preflight first.
   is needed by hand.
 - Each node in `data.nodes` carries dbt's `unique_id` beside a readable `name`.
 - `data.outcome` says what the run established: `empty_selection`, `unrelated`,
-  `stale`, or `validated`. `--for-plan <id>` adds `coverage`.
+  `stale`, or `validated`. `--for-plan <id>` adds `coverage`; an empty one is
+  refused rather than read as absent.
 - `data.completion` is the first key of `data`: a bounded summary of all of the
   above. Read it first. See below.
 
@@ -498,6 +510,10 @@ stored plan, keyed by model, so `transform apply` and a `transform build
 --for-plan` report whether each rewrite was compared and what came back. The
 latest comparison of a model replaces the earlier one. Recording moves no plan
 digest: the portable document carries the edits alone.
+
+With no plan id, `compare` uses the latest unapplied plan and names it in
+`data.resolved_plan` and a `warnings` line on every verdict; an empty id is
+refused.
 
 Before compiling anything, it reads the last build's `run_results.json`: a parent
 of the compared model that the last build tried and that errored or was skipped is

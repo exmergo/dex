@@ -402,6 +402,14 @@ uv run --python 3.13 --project packages/dex-core --extra duckdb --with pytest py
 uv run --python 3.13 --project packages/dex-core --extra duckdb python -m evals metadata --reference
 ```
 
+CI runs the eval tests in that environment, split into parallel groups defined in
+`evals/tests/eval_groups.py`. They are cut test by test rather than by file, since
+nearly all the time is the metadata eval's dbt builds. A new eval needs nothing:
+it lands in the catch-all group. To reproduce one group locally, add
+`--eval-group <name>` to the `pytest evals/tests` command above. The `evals` check
+stays red unless the groups ran every eval exactly once between them and skipped
+none (`scripts/check_test_groups.py verify --suite evals`).
+
 ## Writing a storage backend
 
 `.dex/` state lives behind a `Store` protocol, and the contract is public so a

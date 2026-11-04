@@ -193,7 +193,9 @@ def main() -> int:
     if result.success and manifest.is_file():
         content = json.loads(manifest.read_text(encoding="utf-8"))
         for node in content.get("nodes", {}).values():
-            path = node.get("original_file_path")
+            # dbt writes the path with the platform's separator (a backslash on
+            # Windows); the spec, like every plan edit, names it with slashes.
+            path = str(node.get("original_file_path") or "").replace("\\", "/")
             if (
                 path in spec["paths"]
                 and node.get("resource_type") == "model"
