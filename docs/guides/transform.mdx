@@ -152,10 +152,21 @@ it; this flag is not a routine fix for a failed build.
 
 A model configured with `full_refresh: false` is not rebuilt: check
 `data.full_refresh.not_refreshed` before treating a selected relation as
-rebuilt. `--verify` does not run its row-population checks on incremental
-models, so a green verification does not show the rebuilt history is right.
-Check the rebuilt rows yourself before accepting the change, for example with
+rebuilt. With `--verify`, a rebuilt incremental model's row count is compared
+with its driving parent, as a table's is, but not every model gets the comparison:
+a microbatch model, and one whose compiled SQL or driving parent Dex cannot
+resolve, are skipped and named in `warnings`, and a check that did not run is
+listed under `data.verification.suppressed`. Read both before relying on it. Even
+where it ran, these are counts: a green verification does not show the rebuilt
+values are right, so check them before accepting the change, for example with
 `dex explore profile <relation> --target dev --refresh`.
+
+A full refresh runs only the model's full build, never its
+`{% if is_incremental() %}` branch. If the problem is rows the next incremental
+run skips or loads twice, prove that branch with the unit test
+`dex transform test --scaffold <model>` writes for an incremental model, which
+overrides `is_incremental` and puts rows before, on and after the watermark.
+Then build again without `--full-refresh`.
 
 </Accordion>
 

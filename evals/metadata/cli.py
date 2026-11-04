@@ -46,6 +46,11 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
     private = [s for s in scored if s.get("privacy") is not None]
     reported = [s["report"]["passed"] for s in scored if s.get("report") is not None]
+    tested = [
+        s["incremental_test"]["passed"]
+        for s in scored
+        if s.get("incremental_test") is not None
+    ]
     caught = [
         s["defects_caught"] for s in scored if s.get("defects_caught") is not None
     ]
@@ -81,6 +86,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if any(not c["passed"] for c in s.get("workspace_checks") or [])
         ],
         "report": round(sum(reported) / len(reported), 4) if reported else None,
+        # An incremental model's next run tested at all (#1111), apart from
+        # whether the replays found its rows right.
+        "incremental_test": (round(sum(tested) / len(tested), 4) if tested else None),
         # Planted defects the agent's tests caught (#1112), over the tasks that
         # plant any: a statement about the tests, never about the model.
         "defects_caught": round(sum(caught) / len(caught), 4) if caught else None,
@@ -99,7 +107,7 @@ def _print_table(report: dict[str, Any]) -> None:
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
         f"{'attrib':>7} {'proc':>5} {'privacy':>7} {'wspace':>6} {'report':>6} "
-        f"{'defects':>7}"
+        f"{'inctest':>7} {'defects':>7}"
     )
     for row in report["results"]:
         s = row["score"]
@@ -130,6 +138,11 @@ def _print_table(report: dict[str, Any]) -> None:
                 f" {'pass' if s['report']['passed'] else 'FAIL':>6}"
                 if s.get("report") is not None
                 else f" {'-':>6}"
+            )
+            + (
+                f" {_verdict(s['incremental_test']['passed']):>7}"
+                if s.get("incremental_test") is not None
+                else f" {'-':>7}"
             )
             + (
                 f" {s['defects_caught']:7.2f}"

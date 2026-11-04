@@ -68,6 +68,7 @@ DIGESTS = {
     # No raw tables: its data is a seed in the project, checked below.
     "seeded_prerequisite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "subscription_activity": "4000c9999bb1e8dc18cee579b87b74f1ac2d21fb70cfeea17e65fc01ff5cc457",
+    "incremental_watermark": "708724ae33e4abd42360c359667364542bbf75beac5b3bd7a385cac1f8b15d0f",
     "trailing_window": "9bc38c6d85e6e7bcfa81ad11926d7c7207ce20265dc699b9c1f9f4f444c37a74",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
@@ -1837,6 +1838,120 @@ def test_a_blocked_deliverable_with_another_failure_is_not_allowed(tmp_path):
     score = score_workspace(task, fixture, workspace, final=HONEST)
     assert score.status == "gate_failed"
     assert "broken" in score.gate["failed_nodes"]
+
+
+# --- incremental replay (#1111) ----------------------------------------------
+
+_SCANS = "incremental_watermark/missed_scans"
+
+
+def _scans_with(tmp_path: Path, sql: str):
+    """The reference answer with ``fct_parcel_scans`` replaced by ``sql``."""
+
+    task, fixture, workspace = _reference(tmp_path, _SCANS)
+    (workspace / "models/marts/fct_parcel_scans.sql").write_text(sql, encoding="utf-8")
+    return score_workspace(task, fixture, workspace)
+
+
+_NAIVE_INCLUSIVE = """{{ config(materialized='incremental') }}
+select scan_id, parcel_id, hub_code, scanned_at
+from {{ ref('stg_parcel_scans') }}
+{% if is_incremental() %}
+where scanned_at >= (select max(scanned_at) from {{ this }})
+{% endif %}
+"""
+
+
+@needs_dbt
+def test_the_strict_watermark_passes_a_full_build_and_misses_the_late_scans(tmp_path):
+    """The defect a full refresh hides: the gate's cold build loads every scan,
+    and only the next incremental run shows what `>` skips. An empty target is
+    missed too, since `> NULL` holds for no row."""
+
+    task, fixture, workspace = _reference(tmp_path, _SCANS)
+    setup = fixture.project / "models/marts/fct_parcel_scans.sql"
+    (workspace / "models/marts/fct_parcel_scans.sql").write_text(
+        setup.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    # the reference's incremental unit test catches `>` at the gate, which is
+    # its point; without it, only the replays can
+    (workspace / "models/marts/test_fct_parcel_scans.yml").unlink()
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored"
+    assert [c["passed"] for c in score.checks[:2]] == [True, True]
+    assert sorted(_failed(score)) == [
+        "empty_target: an incremental run into an empty table loads the new scans",
+        "next_batch: scans delivered late on the loaded watermark arrive",
+    ]
+
+
+@needs_dbt
+def test_an_inclusive_watermark_with_no_unique_key_loads_scans_twice(tmp_path):
+    score = _scans_with(tmp_path, _NAIVE_INCLUSIVE)
+    assert sorted(_failed(score)) == [
+        "empty_target: an incremental run into an empty table loads the new scans",
+        "next_batch: no scan is loaded twice by the next runs",
+    ]
+
+
+@needs_dbt
+def test_a_watermark_with_no_floor_loads_nothing_into_an_empty_table(tmp_path):
+    task, fixture, workspace = _reference(tmp_path, _SCANS)
+    path = workspace / "models/marts/fct_parcel_scans.sql"
+    floor = "coalesce(\n    (select max(scanned_at) from {{ this }}),\n"
+    floor += "    cast('1900-01-01' as timestamp)\n)"
+    sql = path.read_text(encoding="utf-8")
+    assert floor in sql
+    path.write_text(
+        sql.replace(floor, "(select max(scanned_at) from {{ this }})"),
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert _failed(score) == [
+        "empty_target: an incremental run into an empty table loads the new scans"
+    ]
+
+
+@needs_dbt
+def test_the_incremental_unit_test_is_graded_apart_from_the_rows(tmp_path):
+    """A right model with no test of its incremental branch keeps its data score
+    and loses the verification grade, and the reverse holds for the setup."""
+
+    task, fixture, workspace = _reference(tmp_path, _SCANS)
+    assert score_workspace(task, fixture, workspace).incremental_test == {
+        "passed": True,
+        "tests": ["test_fct_parcel_scans_incremental"],
+    }
+    (workspace / "models/marts/test_fct_parcel_scans.yml").unlink()
+    score = score_workspace(task, fixture, workspace)
+    assert score.checks_passed == 1.0
+    assert score.incremental_test == {"passed": False, "tests": []}
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        # A full refresh after the apply runs only the full program.
+        ([("apply",), ("build", "full-refresh")], False),
+        ([("apply",), ("build", "full-refresh"), ("build",)], True),
+        ([("apply",), ("build", "full-refresh", "verify"), ("build", "verify")], True),
+        # A plain build before a later full refresh is not the last word.
+        ([("apply",), ("build",), ("build", "full-refresh")], False),
+        # Built before the change went in.
+        ([("build",), ("apply",)], False),
+        ([("build",)], False),
+    ],
+)
+def test_an_incremental_build_must_follow_the_apply_and_any_full_refresh(calls, passed):
+    from evals.metadata.score import procedure_steps
+
+    def call(verb, *flags):
+        return {"label": f"transform {verb}", "flags": list(flags)}
+
+    graded = procedure_steps(
+        {"incremental_build_after_apply": True}, [call(*spec) for spec in calls]
+    )
+    assert graded["passed"] is passed
 
 
 # --- test strength: planted defects and the mutation step (#1112) -----------

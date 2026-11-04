@@ -1,0 +1,49 @@
+version: 2
+models:
+  - name: fct_parcel_scans
+    description: One row per parcel scan, loaded nightly.
+    config:
+      meta:
+        dex:
+          grain: [scan_id]
+          population:
+            rule: >-
+              Every scan the feed delivered. A scan with no timestamp loads on
+              a full build only, since no watermark comparison holds for NULL.
+          assumptions:
+            - decision: Late-arrival horizon of the nightly run
+              chosen: >-
+                scans at or after the latest timestamp already loaded; older
+                late scans need a full refresh
+              evidence: default
+              detail: >-
+                the request names only scans sharing the latest loaded
+                timestamp; a lookback window would reach further back
+            - decision: How a scan selected again is kept from loading twice
+              chosen: unique_key scan_id with delete+insert
+              evidence: contract
+              detail: scan_id carries a unique test
+    columns:
+      - name: scan_id
+        tests:
+          - unique
+          - not_null
+        config:
+          meta:
+            dex:
+              role: key
+      - name: parcel_id
+        config:
+          meta:
+            dex:
+              role: foreign_key
+      - name: hub_code
+        config:
+          meta:
+            dex:
+              role: dimension
+      - name: scanned_at
+        config:
+          meta:
+            dex:
+              role: time

@@ -288,15 +288,23 @@ class TestScaffoldResult(PlanResult):
 
     model: str = ""
     inputs: list[str] = Field(default_factory=list)
+    #: ``None`` unless the model has an ``{% if is_incremental() %}`` branch;
+    #: then ``tests`` (the full-build test, then the incremental one) and
+    #: ``watermark`` (``{column, operator, input, this_column}``, or ``None``
+    #: where no single comparison with a subquery over ``{{ this }}`` was
+    #: read). Issue #1111.
+    incremental: dict[str, Any] | None = None
     window_boundaries: list[dict[str, Any]] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "model": self.model,
             "inputs": self.inputs,
             "window_boundaries": self.window_boundaries,
-            **super().data(),
         }
+        if self.incremental is not None:
+            payload["incremental"] = self.incremental
+        return {**payload, **super().data()}
 
 
 class ApplyResult(Result):

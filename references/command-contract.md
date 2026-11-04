@@ -426,7 +426,10 @@ dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: 
                                      filled in (dbt-parse-checked; apply like any plan). A RANGE frame
                                      with a day or week interval over a date column of one input gets
                                      boundary rows (current day, last included, first excluded, a gap),
-                                     named in data.window_boundaries (#1112)
+                                     named in data.window_boundaries (#1112). A model with an
+                                     {% if is_incremental() %} branch gets a second test with the
+                                     is_incremental override and a typed `this` fixture, with rows
+                                     before, on and after the watermark it read (data.incremental)
 dex transform test --mutate <m>   -> measure the tests <m> already has: plant standard analytics
                                      defects in its SQL one at a time, run its own tests against each,
                                      and report which defects nothing caught. Dev-target only, and

@@ -1,0 +1,5 @@
+{
+  "name": "incremental_watermark",
+  "seed": 1111,
+  "description": "Parcel scans loaded by a scanner feed, and an incremental fact table over them. Scanners report in batches, so many scans share a timestamp, and a scanner with no clock sends none. The fact table's watermark is strict and it appends, so a scan arriving after the nightly run with the latest timestamp already loaded is never picked up, and a naive inclusive watermark loads rows twice. Only an incremental run shows either; a full refresh hides both."
+}

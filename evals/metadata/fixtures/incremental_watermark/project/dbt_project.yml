@@ -1,0 +1,9 @@
+name: parcels
+version: "1.0.0"
+profile: parcels
+model-paths: ["models"]
+
+models:
+  parcels:
+    staging:
+      +materialized: view

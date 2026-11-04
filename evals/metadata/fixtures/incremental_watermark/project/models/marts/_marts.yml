@@ -1,0 +1,9 @@
+version: 2
+models:
+  - name: fct_parcel_scans
+    description: One row per parcel scan, loaded nightly.
+    columns:
+      - name: scan_id
+        tests:
+          - unique
+          - not_null

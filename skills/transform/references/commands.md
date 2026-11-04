@@ -381,6 +381,13 @@ incremental model's logic: an incremental run only adds or merges new rows, so
 the rows the old logic wrote stay in the dev table until the model is rebuilt.
 It is not a routine build. A full rebuild scans the model's whole history.
 
+A full refresh runs only the model's full program, never its
+`{% if is_incremental() %}` branch. When the defect is in what the next
+incremental run skips or duplicates, a green full refresh is not the evidence:
+test the branch with the incremental unit test `transform test --scaffold`
+writes, and build again without the flag. Recipe:
+[incremental-repairs.md](incremental-repairs.md).
+
 - Name the model with `--select`. With no `--select`, every incremental model
   and seed dbt's default selection reaches is rebuilt: the whole project, unless
   the project defines a default selector, which narrows it. A warning gives the
@@ -590,6 +597,28 @@ stub that fails until filled in.
   column, a bare-number `RANGE` bound such as BigQuery's over `unix_date`) is a
   warning with a reason code, and the input keeps one example row.
 - The full loop, with a worked example: `${CLAUDE_SKILL_DIR}/references/test-strength.md`.
+
+On a model whose only jinja control flow is `{% if is_incremental() %}` (with an
+optional `{% else %}`), it plans two tests in the one file:
+
+- `test_<model>`, the full build, with dbt's `is_incremental: false` override,
+  which dbt requires on every unit test of an incremental model.
+- `test_<model>_incremental`, with `is_incremental: true` and a `this` fixture
+  written as typed SQL (`format: sql`), so it runs before the model was ever
+  built. A `this` column is typed from the input column the full build passes
+  through to it, then from the cached profile of the model's own relation;
+  otherwise the scaffold refuses and names the `explore profile ... --target dev`
+  that would type it.
+
+`data.incremental` is `{tests, watermark}`, and absent for any other model.
+`watermark` is `{column, operator, input, this_column}` where the branch compares
+one column with a subquery over `{{ this }}` (`operator` as read with the column
+on the left), or `null`. Where it is read, the watermark's input gets one row
+before, on and after the current watermark plus one NULL, each commented with
+what it probes. Where it is not, or where Dex cannot place the boundary (more
+than one input reads the watermark column, or the column is text or boolean),
+the input gets the single example row the full test has: read the fixture, and
+add the boundary rows yourself. Recipe: [incremental-repairs.md](incremental-repairs.md).
 
 ## `transform test --mutate <model> [--max-mutants <n>] [--check-equivalence|--no-check-equivalence] [--downstream|--no-downstream]`
 

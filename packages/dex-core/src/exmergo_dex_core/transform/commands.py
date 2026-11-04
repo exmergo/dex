@@ -1686,6 +1686,14 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
         "expect: is a stub with no rows; this unit test fails until you fill "
         "in the model's actual expected output for the given fixtures above"
     )
+    if scaffold.incremental is not None:
+        planned.warnings.append(
+            f"'{model_name}' is incremental: a full build and a --full-refresh "
+            "run only its full program, so a passing one says nothing about the "
+            f"next incremental run; test_{model_name}_incremental runs that branch "
+            "(dbt's is_incremental override, with a `this` fixture) and runs in "
+            "every `transform build` once its expectation is filled in"
+        )
     for boundary in scaffold.window_boundaries:
         planned.warnings.append(
             f"the given rows for {boundary['input']} sit on the boundary of the "
@@ -1703,6 +1711,7 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
         **planned.model_dump(),
         model=model_name,
         inputs=inputs,
+        incremental=scaffold.incremental,
         window_boundaries=scaffold.window_boundaries,
     )
 
