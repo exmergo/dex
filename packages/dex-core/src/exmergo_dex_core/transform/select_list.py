@@ -13,6 +13,7 @@ profile of stg_orders" does. Nothing here opens a connection or reads the cache.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,16 +31,26 @@ class RelationRef:
 
     kind: str
     parts: tuple[str, ...]
+    #: The ``v=``/``version=`` a ``ref()`` pins to one version of a versioned
+    #: model (#859), as written; ``None`` for an unversioned ``ref()``.
+    version: str | None = None
 
     @property
     def name(self) -> str:
         return self.parts[-1]
 
+    @property
+    def label(self) -> str:
+        """The model the ref reads: ``dim_teams.v2`` for a pinned version."""
+
+        return f"{self.name}.v{self.version}" if self.version else self.name
+
     def __str__(self) -> str:
         if self.kind == "table":
             return ".".join(self.parts)
         quoted = ", ".join(f"'{part}'" for part in self.parts)
-        return f"{self.kind}({quoted})"
+        pinned = f", v={self.version}" if self.version else ""
+        return f"{self.kind}({quoted}{pinned})"
 
 
 @dataclass
@@ -103,6 +114,9 @@ def resolve_select_list(
     return SelectList(columns=names, read_from=reader.read_from)
 
 
+_REF_VERSION = re.compile(r"\b(?:v|version)\s*=\s*['\"]?([A-Za-z0-9_.]+)")
+
+
 def _tokenize_relations(sql: str) -> tuple[str, dict[str, RelationRef]]:
     """``sql`` with each literal ``ref()``/``source()`` a plain identifier, so a
     star over one can still say which relation it reads once jinja is gone."""
@@ -122,7 +136,11 @@ def _tokenize_relations(sql: str) -> tuple[str, dict[str, RelationRef]]:
             or None in call.args
         ):
             continue
-        reference = RelationRef(call.callee, tuple(call.args))
+        version = None
+        if call.callee == "ref":
+            pinned = _REF_VERSION.search(region.body)
+            version = pinned.group(1) if pinned else None
+        reference = RelationRef(call.callee, tuple(call.args), version)
         token = next((t for t, r in relations.items() if r == reference), None)
         if token is None:
             token = f"dex_relation_{len(relations)}"

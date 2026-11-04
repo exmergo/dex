@@ -1364,23 +1364,45 @@ def _declarations_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> N
     order, as the declaration fingerprint reads it.
     """
 
+    from .model_versions import entry_variants
+
     declarations: dict[str, ModelDeclaration] = {}
     for parsed, _path in sorted(yaml_documents(view), key=lambda d: d[1]):
-        for entry in parsed.get("models") or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
-            model = entry["name"]
+        variants = [
+            variant
+            for raw in parsed.get("models") or []
+            if isinstance(raw, dict)
+            for variant in entry_variants(raw)
+        ]
+        for model, entry in variants:
             if model in declarations:
                 continue
             declaration = declared_meaning(
                 entry,
                 model,
-                relation=defs.model_relations.get(model),
+                relation=defs.model_relations.get(model) or _version_alias(entry),
                 source="yaml",
             )
             if declaration is not None:
                 declarations[model] = declaration
     defs.model_declarations = declarations
+
+
+def _version_alias(entry: dict[str, Any]) -> str | None:
+    """The relation name a version builds under, read from its YAML alone.
+
+    Only for a version (an effective entry carries ``version``), where there is
+    no manifest to say: its configured ``alias``, else dbt's default
+    ``<name>_v<v>``. A project overriding ``generate_alias_name`` can differ,
+    which only a compiled manifest settles.
+    """
+
+    version = entry.get("version")
+    if version is None or not isinstance(entry.get("name"), str):
+        return None
+    config = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+    alias = config.get("alias")
+    return alias if isinstance(alias, str) and alias else f"{entry['name']}_v{version}"
 
 
 def manifest_node_label(unique_id: str, node: dict[str, Any] | None = None) -> str:
@@ -1983,6 +2005,11 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
         label = manifest_node_label(uid, node)
         names[uid] = label
         written[uid] = name
+        version = node.get("version")
+        if version not in (None, "") and str(version) == str(
+            node.get("latest_version")
+        ):
+            defs.version_defaults[name] = label
         relation = node.get("relation_name")
         # Ephemeral models compile with a null relation_name: referable in the
         # project but not physically resolvable, so they stay out of relations.
@@ -2177,11 +2204,18 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
 
     keys: dict[tuple[str, str], DeclaredKey] = {}
     composite_keys: dict[tuple[str, tuple[str, ...]], DeclaredCompositeKey] = {}
+    from .model_versions import entry_variants
+
     for parsed, _path in yaml_documents(view):
-        for entry in parsed.get("models") or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
-            model = entry["name"]
+        # A versioned model is read per version, under the label the manifest
+        # reader gives it, so the compiled and uncompiled reads agree (#895).
+        variants = [
+            variant
+            for raw in parsed.get("models") or []
+            if isinstance(raw, dict)
+            for variant in entry_variants(raw)
+        ]
+        for model, entry in variants:
             grain = declared_grain(entry)
             if grain:
                 defs.declared_grains[model] = grain

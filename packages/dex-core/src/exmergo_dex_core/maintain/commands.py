@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
@@ -1097,6 +1098,11 @@ def verify(
                 for label in model_relations
                 if label.split(".", 1)[0].lower() in wanted
             }
+            # A version's file stem (`dim_customers_v2`, or a `defined_in`
+            # stem) selects the version that file builds, as in `transform
+            # declare` (#895).
+            if project_dir is not None:
+                wanted |= _version_stems(project_dir, wanted)
         try:
             if reads_dev_target:
                 adapter = engine._adapter("maintain verify", reads_dev_target=True)
@@ -2353,6 +2359,28 @@ def _final_note(note: str) -> bool:
     return "FINAL" in note and "MergeTree" in note
 
 
+def _version_stems(project_dir: Path, wanted: set[str]) -> set[str]:
+    """The labels of the versions whose file stems ``wanted`` names."""
+
+    from ..dbt_project import DbtProjectError
+    from ..dbt_project import load as load_project
+    from ..model_versions import label_for_stem, version_map
+
+    try:
+        view = load_project(project_dir)
+    except DbtProjectError:
+        return set()
+    vmap = version_map(
+        {path: source.content for path, source in view.files.items()},
+        view.model_paths,
+    )
+    return {
+        label.lower()
+        for name in wanted
+        if (label := label_for_stem(name, vmap)) is not None
+    }
+
+
 def _declaration_drift(
     current_transform: TransformLayer | None,
     current_semantic: SemanticLayer | None,
@@ -2383,7 +2411,23 @@ def _declaration_drift(
             drift_mod.declaration_drift(current_transform, snap, current_semantic),
             scope_names,
         )
-        return findings, status, []
+        rekeyed = drift_mod.rekeyed_versioned_declarations(current_transform, snap)
+        if not rekeyed:
+            return findings, status, []
+        status["unchecked_models"] = rekeyed
+        status["unchecked_reason"] = "baseline_predates_versions"
+        return (
+            findings,
+            status,
+            [
+                "declaration drift was not checked for "
+                + ", ".join(rekeyed)
+                + ": the baseline keyed each versioned model's declaration by its "
+                "bare name, and declarations are now read per version "
+                "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
+                "baseline them per version"
+            ],
+        )
     status["reason"] = reason
     if baseline is None and current_transform is None:
         return [], status, []

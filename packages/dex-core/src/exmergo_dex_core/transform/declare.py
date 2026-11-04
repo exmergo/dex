@@ -31,14 +31,12 @@ to the next batch.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import yaml
-
+from .. import model_versions as mv
 from . import declarations as declarations_mod
 from .declarations import Declaration, DeclarationError
 from .rewrite import RewriteError
@@ -98,44 +96,45 @@ def select_models(
 
     files = {path: source.content for path, source in view.files.items()}
     sql = _model_files(files, view.model_paths)
-    versioned = _versioned_models(files)
+    vmap = mv.cached_version_map(files, view.model_paths)
     by_name = {Path(path).stem.lower(): Path(path).stem for path in sql}
 
     wanted = [
         name.strip() for raw in objects or [] for name in raw.split(",") if name.strip()
     ]
     selection = Selection()
+    names: list[str] = []
     if not wanted:
-        names = [Path(path).stem for path in sql]
+        # A version is declared under its label (#895), whichever file builds it.
+        names = list(
+            dict.fromkeys(mv.label_for_file(p, vmap) or Path(p).stem for p in sql)
+        )
     else:
-        names = []
         for name in dict.fromkeys(wanted):
-            base = name.split(".", 1)[0].lower()
-            if "." in name and base in versioned:
-                names.append(name)
+            labels = mv.resolve(name, vmap)
+            if labels is not None:
+                if not labels:
+                    base = mv.split_label(name)[0]
+                    model = mv.lookup(vmap, base)
+                    listed = ", ".join(v.v for v in model.versions) if model else ""
+                    selection.skipped.append(
+                        {
+                            "model": name,
+                            "reason": "not_a_model",
+                            "detail": (
+                                f"'{base}' lists versions {listed}, and no version "
+                                f"named by '{name}'"
+                            ),
+                        }
+                    )
+                names.extend(label for label in labels if label not in names)
                 continue
             found = by_name.get(name.lower())
             if found is None:
                 selection.skipped.append(_unmatched(name, view, root))
             elif found not in names:
                 names.append(found)
-
-    for name in names:
-        owner = _version_owner(name, versioned)
-        if owner is not None:
-            selection.skipped.append(
-                {
-                    "model": name,
-                    "reason": "versioned",
-                    "detail": (
-                        f"'{owner}' is a versioned model; its declaration belongs "
-                        "under each entry in `versions:`, which dex does not "
-                        "write. Declare it by hand"
-                    ),
-                }
-            )
-            continue
-        selection.models.append(name)
+    selection.models.extend(names)
     return selection
 
 
@@ -147,46 +146,6 @@ def _model_files(files: Mapping[str, str], model_paths: Iterable[str]) -> list[s
         if PurePosixPath(path).suffix == ".sql"
         and any(root in PurePosixPath(path).parents for root in roots)
     )
-
-
-def _versioned_models(files: Mapping[str, str]) -> set[str]:
-    """Lowercased names of the models whose YAML entry carries ``versions:``."""
-
-    out: set[str] = set()
-    for path, content in files.items():
-        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
-            continue
-        try:
-            parsed = yaml.safe_load(content)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        for entry in parsed.get("models") or []:
-            if (
-                isinstance(entry, dict)
-                and isinstance(entry.get("name"), str)
-                and entry.get("versions")
-            ):
-                out.add(entry["name"].lower())
-    return out
-
-
-def _version_owner(name: str, versioned: set[str]) -> str | None:
-    """The versioned model ``name`` is a version of (or is), if any.
-
-    dbt's default file for version ``2`` of ``dim_customers`` is
-    ``dim_customers_v2.sql``, and a selector may also say ``dim_customers.v2``.
-    """
-
-    lowered = name.lower()
-    base = lowered.split(".", 1)[0]
-    if base in versioned:
-        return name.split(".", 1)[0]
-    match = re.fullmatch(r"(.+)_v[^_]+", lowered)
-    if match and match.group(1) in versioned:
-        return name[: len(match.group(1))]
-    return None
 
 
 def _unmatched(name: str, view: Any, root: Path | None) -> dict[str, Any]:

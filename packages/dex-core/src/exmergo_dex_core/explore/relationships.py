@@ -35,6 +35,7 @@ from ..cache import (
 from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
 from ..errors import WarehouseQueryError
+from ..model_versions import split_label
 from ..progress import ProgressReporter
 from ..semantic_catalog import EntityJoin
 from .profile import (
@@ -2068,10 +2069,20 @@ def declaration_relationships(
             child, child_ambiguous = resolve_declared(
                 declaration.relation, model, known_identifiers
             )
+            # A parent is named the way `ref()` names it (#895): a version
+            # label is that version, a versioned model's bare name its default.
+            # Only a known versioned model's label is split: `raw.vendors` is a
+            # source, and its `.vendors` is not a version.
+            parent_label = defs.version_defaults.get(parent_model, parent_model)
+            base, version = split_label(parent_label)
+            if version is not None and not (
+                parent_label in defs.model_relations or base in defs.version_defaults
+            ):
+                version = None
             parent, parent_ambiguous = resolve_declared(
-                defs.model_relations.get(parent_model)
+                defs.model_relations.get(parent_label)
                 or defs.source_relations.get(parent_model),
-                parent_model,
+                f"{base}_v{version}" if version is not None else parent_model,
                 known_identifiers,
             )
             if child is None or parent is None:

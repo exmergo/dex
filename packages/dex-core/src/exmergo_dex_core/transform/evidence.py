@@ -30,6 +30,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from ..edits import EditOp
+from ..model_versions import expand, label_for_file, version_map
 from .plans import EditKind, PlanEdit, PlanError
 
 #: dbt node statuses that mean the node did not produce a good relation. `fail`
@@ -277,6 +278,9 @@ def required_nodes(
     # Measure -> transformation model, union of plan edits and on-disk YAML.
     measure_owners = _measure_owners(edits, project)
     metric_defs = _metric_definitions(edits, project)
+    # A version is required by its label (`dim_teams.v1`), whichever file
+    # builds it, so one version building never answers for another (#859).
+    versions = _version_map(edits, project)
 
     for edit in edits:
         if edit.op is EditOp.DELETE:
@@ -285,7 +289,7 @@ def required_nodes(
             basis.append(f"{edit.path}: a deletion requires no node")
             continue
         if edit.kind in _NODE_KINDS:
-            name = node_name(edit.path)
+            name = label_for_file(edit.path, versions) or node_name(edit.path)
             required.add(name)
             basis.append(f"{edit.path}: builds '{name}'")
             continue
@@ -295,6 +299,7 @@ def required_nodes(
                 measure_owners=measure_owners,
                 metric_defs=metric_defs,
             )
+            named = expand(named, versions)
             if named:
                 required.update(named)
                 basis.append(f"{edit.path}: {detail}")
@@ -312,6 +317,24 @@ def required_nodes(
         )
     undetermined = undetermined_edits and not required
     return sorted(required), basis, undetermined
+
+
+def _version_map(edits: list[PlanEdit], project: Path) -> dict[str, Any]:
+    """The versioned models of the project as the plan leaves it."""
+
+    from ..dbt_project import DbtProjectError, load
+
+    try:
+        view = load(project)
+    except (DbtProjectError, OSError):
+        return {}
+    files = {path: source.content for path, source in view.files.items()}
+    for edit in edits:
+        if edit.op is EditOp.DELETE:
+            files.pop(edit.path, None)
+        elif edit.new_content is not None:
+            files[edit.path] = edit.new_content
+    return version_map(files, view.model_paths)
 
 
 def _ref_model(value: Any) -> str | None:

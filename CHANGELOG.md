@@ -14,6 +14,93 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.3] - 2026-11-04
+
+### Added
+
+- **Declare one version of a versioned model.** A declaration naming `dim_teams.v2` renders into that version's item under `versions:`, and every other byte is kept. A fact about a column the version inherits is written as dbt's own override, and a model-level fact the shared entry also states is refused, because dbt concatenates the two lists. `transform declare dim_teams.v2` proposes for that version instead of skipping it. `explore --use-project`, `maintain snapshot` and declaration drift, `maintain verify` and drafting all read a version under its label.
+- **Plan and verify native dbt model versions.** A plan that touches a versioned model reports it under `data.model_versions`: each version's file and relation, the default an unversioned `ref()` resolves to before and after, and what every consumer's `ref` resolves to. dbt's own parse of the post-change project confirms it. A version no file builds (dbt only warns about it), two versions on one file, or a plain entry beside a version is refused with a typed code. A promotion and a warehouse relation that would move are warnings, and a new `<model>_v<N>` copy is named as an independent model, not a version. `transform build --verify --for-plan` holds the plan's versioned models to the manifest it built, with one record per version, default and consumer under `data.verification.model_versions`, each reaching the completion obligations. New recipe: `skills/transform/references/model-versions.md`.
+- **Show earlier prerequisite statuses.** Failed prerequisites include context from the last available build artifact, preserved across pricing and confirmation retries without another warehouse build. The evidence is historical and does not change `plan_relation`.
+
+### Changed
+
+- **stale-renderer check compares join sql and relationship.**
+  the stale-renderer check in `cube/query.py` previously compared every member
+  a query names and references, but skipped joins. queries against a cube whose
+  join condition or relationship changed in the repository after the server
+  started were rendered with outdated conditions. the stale check now compares
+  the join sql and canonical relationship for every cube the query reaches,
+  refusing when the server's `/v1/meta` disagrees. ([#969](https://github.com/exmergo/dex/pull/969))
+- `explore profile` now reports `mixed_identifier_shapes` for id-shaped columns that are not proven unique, so `transform plan` can cite that evidence on the common nullable-key repair case (#1072). ([#1072](https://github.com/exmergo/dex/pull/1072))
+- **A key cast to an integer is measured on Postgres.** Postgres has no cast that
+  returns NULL on failure, so `transform plan` (`data.identifier_conversions`)
+  and `maintain verify` (join coverage) reported every cast key there as
+  `unchecked` with `reason_code: no_safe_cast_on_connector`. A cast to
+  `smallint`, `integer` or `bigint` is now measured through a guarded cast: a
+  value that is not an integer, or is out of range for the type, counts as
+  failed instead of failing the probe. A cast to any other type still reports
+  `no_safe_cast_on_connector`. ([#1087](https://github.com/exmergo/dex/pull/1087))
+- **The agent procedure repairs the layer the request names.** Before choosing a
+  remedy for a failing prerequisite, the procedure now has the agent settle whether
+  the request asks for a change to the input data or to the project. A project
+  override no longer stands in for a request to modify the data, and a request to
+  adapt the project never changes the input. A project-owned seed changes through
+  its CSV or `+column_types` and a build. A source a loader owns cannot be changed
+  from Dex, so any migration is a reviewable file marked as not run, and that part
+  is reported incomplete. The agent checks the requested postcondition on the
+  original relation, and `--cold-deps` evidence is no longer read as proof that
+  data changed. The prerequisite-repair recipe gains a section on choosing the
+  layer. No guard changes: Dex stays read-only against data.
+
+### Fixed
+
+- **snowflake uptime settlement applies resume minimum when warehouse resumes mid-run.**
+  when another command suspended a shared snowflake warehouse between statements of a
+  running command, the next statement resumed the warehouse, but settlement charged no
+  resume floor because the warehouse was found running at the start. settlement now
+  detects that `resumed_on` moved during the command and applies the 60-second floor
+  from the statement that resumed it. ([#938](https://github.com/exmergo/dex/pull/938))
+- Identity comparison on an identifier conversion now follows a repair that casts and renames the key column, naming both the prior and authored outputs; two authored outputs from one source column still report `no_shared_key_column`. ([#1074](https://github.com/exmergo/dex/pull/1074))
+- **identifier conversion probe preserves quoted mixed-case cte names.**
+  `conversion_probe` previously re-emitted cte names lowercased and unquoted
+  in the probe's from clause, which failed to resolve on case-sensitive
+  connectors like snowflake and postgres when a cte name was quoted and
+  mixed-case. the probe now re-emits the cte's original identifier node,
+  preserving quotes and casing as written. ([#1077](https://github.com/exmergo/dex/pull/1077))
+- Grain drafting no longer picks a PII-flagged column as the grain when a non-PII candidate exists, and when every candidate is flagged the draft evidence says so instead of staying silent. The PII preference also reads profiles stored under a model's configured alias, and the contradiction check matches a declared grain against every proven key, so an edit that strips the declared key of its proof still warns when another key remains. ([#1079](https://github.com/exmergo/dex/pull/1079))
+- ``macro_dispatch`` repair now walks through plain package macros that a model depends on, so models that depend on a macro which itself dispatches still get the prerequisite. ([#1081](https://github.com/exmergo/dex/pull/1081))
+- **`maintain grain` now checks a join declared after the baseline.** Before, `join_orphans_increased` covered only joins the baseline already held, so a relationship declared since the snapshot, or re-declared on other columns, was never checked. A join that was already wrong when the baseline was pinned was never reported either, because its orphan fraction became the "before". The grain axis now reads the joins declared today, the same way it reads declared grains. These come from the project (`relationships` tests, `references:` declarations, declared relationships) and from a native semantic layer (Ossie, Cube, SLayer); a dbt semantic layer's entity joins are not read here. A join the baseline measured under the bound is still compared with its earlier orphan fraction. Any other declared join is checked against a fixed bound and reported as `declared_join_orphans` at 20% orphaned or more (`high` from 50%). `data.baseline` (`absent`, `unmeasured` or `measured`) says why the bound applied, and a join that `join_orphans_increased` already reports is not reported twice. A declared join that does not resolve to the warehouse, or that names a missing column, is listed in `warnings`. `maintain check` runs the same probes. On a billed connector the new probes are priced in the same estimate, so a baseline mapped without `--verify` can now make `maintain grain` ask for confirmation, or `maintain check` make an offer, where it ran free before. ([#1097](https://github.com/exmergo/dex/pull/1097))
+- **A version's build no longer answers for another version.** A `--for-plan` build named a versioned model's deliverables by file stem, so a v2 that built could cover a v1 that failed. Deliverables are now each version's label (`dim_teams.v1`). A declared `population.parent` naming a versioned model now resolves to its default version, not to whichever version the manifest listed first.
+- **Agents preserve authorized protected columns when inspection is refused.** The
+  shared procedure distinguishes a protected-value read refusal from a supported
+  transformation: retain the requested or existing column contract, validate with
+  metadata and permitted aggregates, and redact only when an applicable instruction
+  or contract requires it. Privacy guards and human-only PII clearing are unchanged.
+- **Deleting a project override of a package model is no longer refused.** A plan
+  that deletes a project model overriding a package model, and removes the
+  `+enabled: false` that disabled the package's own copy, was refused because a
+  surviving `ref()` still named the model. The package's model answers that `ref()`
+  once it is enabled again, so the delete guard now accepts it. It is the step that
+  undoes a project adaptation, for instance when the request turns out to be a repair
+  to the data. A deletion that leaves the package model disabled is still refused.
+- **Honor repair and evaluation boundaries.** Removing a seed column type declaration rebuilds the selected dev seed using CSV inference, retaining applied declarations across pricing and narrow selections. Restored package models cannot satisfy references pinned to another package. Evaluation flags exclude shell comments, and incomplete-report scoring recognizes straight and curly apostrophes in contractions. Shared guidance hands repairs from read-only workflows to transform and profiles built seeds on dev.
+- **Nested `DESCRIBE` queries now return an actionable refusal.** Queries with
+  unsupported nested statement shapes are rejected before warehouse access rather
+  than raising an internal planning error. The refusal directs metadata requests
+  to `explore inventory` or `explore profile`; ordinary SELECTs and existing
+  privacy and read-only guards keep their behavior.
+- **Report which models actually built.** Verification scope excludes failed and skipped models and names them under `scope_not_built`. Build coverage preserves `covered` as presence in run results and adds `built` and `not_built` for successful execution.
+- **`transform build` applies a changed seed `+column_types` on DuckDB.** dbt
+  reloads a seed into the table it already built, so a `column_types` entry added
+  or changed after the first build was ignored and the column kept the type
+  inferred from the CSV, with a green build. The pre-build seed check now also
+  compares each selected seed's declared column types with its table in the dev
+  target, through the connector's type aliases, and rebuilds a seed that differs
+  with `dbt seed --full-refresh`. `data.full_refresh` names it and a warning says
+  why.
+- Package readers (`installed_packages`, `needs_deps`, grounding and reference scans) honour `packages-install-path` instead of hardcoding `dbt_packages/`.
+
+
 ## [1.17.2] - 2026-11-02
 
 ### Added

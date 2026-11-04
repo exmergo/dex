@@ -517,6 +517,35 @@ def declaration_drift_status(
     return True, None
 
 
+def rekeyed_versioned_declarations(
+    current_transform: TransformLayer | None, snap: Snapshot
+) -> list[str]:
+    """Models whose declaration the baseline keyed by a bare name, and today keys
+    per version (#895), so the two sides cannot be compared for them.
+
+    Only a baseline that never recorded versions (``versions is None``) keys a
+    versioned model that way; re-baselining with ``maintain snapshot
+    --project-only`` makes them comparable again.
+    """
+
+    baseline = snap.transform_layer
+    if (
+        baseline is None
+        or current_transform is None
+        or baseline.versions is not None
+        or baseline.declarations is None
+        or current_transform.declarations is None
+    ):
+        return []
+    labels = set(current_transform.versions or [])
+    return sorted(
+        model
+        for model in baseline.declarations
+        if model not in current_transform.declarations
+        and any(label.startswith(f"{model}.v") for label in labels)
+    )
+
+
 def declaration_drift(
     current_transform: TransformLayer | None,
     snap: Snapshot,
@@ -549,9 +578,17 @@ def declaration_drift(
     comparable, _ = declaration_drift_status(current_transform, snap)
     if not comparable or snap.transform_layer is None or current_transform is None:
         return []
-    base = snap.transform_layer.declarations or {}
-    cur = current_transform.declarations or {}
-    present = set(current_transform.models)
+    base = dict(snap.transform_layer.declarations or {})
+    cur = dict(current_transform.declarations or {})
+    present = set(current_transform.models) | set(current_transform.versions or [])
+    # A baseline pinned before versions were read keyed a versioned model by its
+    # bare name; comparing that with today's per-version keys would report the
+    # whole declaration as removed and every version as newly declared. Those
+    # models are left out here and named by `rekeyed_versioned_declarations`.
+    for model in rekeyed_versioned_declarations(current_transform, snap):
+        base.pop(model, None)
+        for label in [k for k in cur if k.startswith(f"{model}.v")]:
+            cur.pop(label)
 
     findings: list[DriftFinding] = []
 

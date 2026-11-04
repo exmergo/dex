@@ -88,6 +88,9 @@ class BuildVerification:
     column_contract: dict[str, Any] | None = None
     #: One record per output and metric a retirement contract names (#858).
     retirement: list[dict] = field(default_factory=list)
+    #: One record per version, default and consumer of each versioned model
+    #: the plan named by ``--for-plan`` touches (#859).
+    model_versions: list[dict] = field(default_factory=list)
     #: Findings ranked below :data:`MAX_FINDINGS` and left out of ``findings``,
     #: counted so a summary can say the list is not the whole answer.
     dropped: int = 0
@@ -115,6 +118,8 @@ class BuildVerification:
             payload["column_contract"] = self.column_contract
         if self.retirement:
             payload["retirement"] = self.retirement
+        if self.model_versions:
+            payload["model_versions"] = self.model_versions
         return payload
 
 
@@ -214,6 +219,7 @@ def verify_build(
     *,
     resolve_adapter: Callable[[], Adapter],
     retirement: dict[str, Any] | None = None,
+    plan_edits: list[Any] | None = None,
 ) -> BuildVerification:
     """Sweep the nodes this build ran, and report what it could not sweep.
 
@@ -291,6 +297,9 @@ def verify_build(
             project_dir, retirement, built, scope, adapter_once, result
         )
 
+    if plan_edits:
+        _model_versions_contract(project_dir, plan_edits, summary, result)
+
     reason = _row_population(engine, project_dir, summary, scope, adapter_once, result)
     if reason is not None:
         result.suppressed["row_population"] = reason
@@ -353,6 +362,57 @@ def _judgeable(
         "run; the failures are tests or other nodes, reported under build status"
     )
     return {**summary, "success": True}, good
+
+
+def _model_versions_contract(
+    project_dir: Path,
+    plan_edits: list[Any],
+    summary: dict[str, Any],
+    result: BuildVerification,
+) -> None:
+    """The plan's versioned models against the manifest this build wrote (#859).
+
+    What each version, the default and every consumer should be is read from
+    the applied tree and the plan's edits; what dbt resolved is read from this
+    build's own manifest, never from file names. Free: no statement runs.
+    """
+
+    import json
+
+    from ..dbt_project import load as load_project
+    from ..dbt_project import manifest_file
+    from ..errors import DexError
+    from ..maintain.drift import DriftFinding
+    from . import model_versions as versions_mod
+
+    try:
+        view = load_project(project_dir)
+        files = {path: source.content for path, source in view.files.items()}
+        report = versions_mod.build_report(files, plan_edits, list(view.model_paths))
+        if not report:
+            return
+        manifest = json.loads(manifest_file(project_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError, DexError) as exc:
+        result.suppressed["model_versions"] = (
+            f"the versioned models could not be read ({type(exc).__name__})"
+        )
+        return
+    statuses = {
+        str(node.get("unique_id") or ""): str(node.get("status") or "unknown").lower()
+        for node in summary.get("nodes") or []
+    }
+    versions_mod.confirm(report, manifest, view.project_name, statuses=statuses)
+    result.model_versions = versions_mod.records(report)
+    result.findings.extend(
+        DriftFinding(
+            axis="model_versions",
+            code=item["code"],
+            identifier=item["model"],
+            severity=item["severity"],
+            detail=item["detail"],
+        )
+        for item in versions_mod.findings(report)
+    )
 
 
 def _retirement_contract(

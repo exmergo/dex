@@ -658,6 +658,7 @@ def shadow_parse(
     target: str | None = None,
     runner: Runner | None = None,
     timeout: float = _PARSE_TIMEOUT_SECONDS,
+    keep_manifest: bool = False,
 ) -> dict[str, Any]:
     """Validate proposed edits with dbt's own parser, without touching the project.
 
@@ -675,6 +676,10 @@ def shadow_parse(
     validates today should not go on to warn about them for the first time at
     `transform build` (#55). On failure, ``messages`` are the parse errors
     (dbt's own summary event leads if present; see :func:`_collect_messages`).
+
+    ``keep_manifest`` adds ``manifest``, the parsed ``manifest.json`` of the
+    post-change copy (``None`` where it could not be read), for a caller that
+    must confirm what dbt resolved rather than what the files suggest (#859).
     """
 
     # Absolute so --profiles-dir (pointing at the real project) does not
@@ -723,9 +728,19 @@ def shadow_parse(
         ]
         if target:
             argv += ["--target", target]
+        manifest_dir = shadow / ".dex-parse-target"
+        if keep_manifest:
+            argv += ["--target-path", str(manifest_dir)]
         run = runner or _default_runner(timeout, shadow)
         completed = run(argv)
         success = completed.returncode == 0
+        manifest: dict[str, Any] | None = None
+        if keep_manifest and success:
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(
+                    (manifest_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                manifest = loaded if isinstance(loaded, dict) else None
         # Collected unconditionally: a passing parse can still have logged
         # deprecation notices, which the caller surfaces as plan-time warnings
         # rather than letting the author discover them for the first time at
@@ -733,7 +748,15 @@ def shadow_parse(
         messages = _collect_messages(completed)
         if not success and not messages:
             messages = ["dbt parse failed"]
-    return {"available": True, "reason": None, "success": success, "messages": messages}
+    result: dict[str, Any] = {
+        "available": True,
+        "reason": None,
+        "success": success,
+        "messages": messages,
+    }
+    if keep_manifest:
+        result["manifest"] = manifest
+    return result
 
 
 # dbt reads these from the environment, and each one can silently change which

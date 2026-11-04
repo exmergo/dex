@@ -44,6 +44,7 @@ from ..dbt_project import (
     yaml_documents,
 )
 from ..guards.pii_meta import entry_meta
+from ..model_versions import entry_variants, version_map
 
 #: The ``config.meta`` namespace a declaration lives under. The same string as
 #: ``transform.declarations.DEX_META_KEY``, restated rather than imported so
@@ -201,6 +202,11 @@ class TransformLayer(BaseModel):
     model_sources: dict[str, list[str]] = Field(default_factory=dict)
     model_refs: dict[str, list[str]] = Field(default_factory=dict)
     declarations: dict[str, DeclarationFingerprint] | None = None
+    #: Each native dbt model version the project declares, by label
+    #: (``dim_teams.v2``), which is how ``declarations`` keys a versioned model
+    #: (#895). ``None`` on a baseline pinned before versions were read, whose
+    #: declarations keyed a versioned model by its bare name.
+    versions: list[str] | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -503,6 +509,14 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
         model_sources=model_sources,
         model_refs=model_refs,
         declarations=declaration_fingerprints(documents),
+        versions=sorted(
+            label
+            for model in version_map(
+                {path: source.content for path, source in view.files.items()},
+                view.model_paths,
+            ).values()
+            for label in model.labels
+        ),
     )
 
 
@@ -515,15 +529,22 @@ def declaration_fingerprints(
     the same ``meta`` precedence dbt applies (``config.meta`` over a top-level
     ``meta``), so a key a human moved is read where they put it. A model entry
     that appears in two files (which dbt refuses) is read from the first path in
-    sorted order, so the fingerprint does not depend on file-system order.
+    sorted order, so the fingerprint does not depend on file-system order. A
+    versioned model is one fingerprint per version, under its label.
     """
 
     out: dict[str, DeclarationFingerprint] = {}
     for parsed, path in sorted(documents, key=lambda document: document[1]):
-        for entry in parsed.get("models") or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
-            if entry["name"] in out:
+        # A versioned model is fingerprinted per version, from what dbt builds
+        # each one from, under its label (#895).
+        variants = [
+            variant
+            for raw in parsed.get("models") or []
+            if isinstance(raw, dict)
+            for variant in entry_variants(raw)
+        ]
+        for name, entry in variants:
+            if name in out:
                 continue
             fields = _declared_fields(entry)
             columns: dict[str, dict[str, str]] = {}
@@ -536,7 +557,7 @@ def declaration_fingerprints(
                 if column_fields:
                     columns[column["name"]] = column_fields
             if fields or columns:
-                out[entry["name"]] = DeclarationFingerprint(
+                out[name] = DeclarationFingerprint(
                     path=path, fields=fields, columns=columns
                 )
     return out

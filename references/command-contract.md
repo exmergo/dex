@@ -233,7 +233,18 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      each cast/try_cast/lower/upper/trim the plan adds to an identifier
                                      and, gated like row attribution, counts what it does to entities
                                      (failed, merged, respelled, matched, prior identities lost), with
-                                     a status of lossless, declared, undeclared or unchecked (#861)
+                                     a status of lossless, declared, undeclared or unchecked (#861);
+                                     data.model_versions reports each native dbt versioned model
+                                     the plan touches: versions (label, file, file_source,
+                                     relation), the default before and after, each consumer's ref
+                                     and what it resolves to before and after, relation_changes,
+                                     contract_changes, and manifest (confirmed / contradicted /
+                                     unchecked, from dbt's parse of the post-change project). A
+                                     version no file builds, two versions on one file or a plain
+                                     entry beside a version is refused by code; a promotion is a
+                                     warning naming each consumer it moves; independent_models
+                                     names a <model>_v<N> copy that is not a version (#859;
+                                     skills/transform/references/model-versions.md)
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind; once
                                      something is written, data.commit_trailer is the
@@ -303,14 +314,16 @@ dex transform declare [<model>]   -> declarations for models that already exist,
                                      references to a model/seed/snapshot of this project, and
                                      semi_additive for a running total, each under data.proposed with
                                      its evidence. Selector as `maintain verify` (names, repeatable,
-                                     comma-separated; none = every model), read from the repo alone.
+                                     comma-separated; none = every model), read from the repo alone;
+                                     a version is selected and proposed by its label, dim_teams.v2,
+                                     and the bare name selects every version (#895).
                                      A declared field is never proposed, so a second run after apply
                                      is a no-op. Unit shape, NULL facts, PII and value domains stay
                                      evidence in data.declarations.<model>.drafted; intent stays in
                                      missing unless the payload's declarations supply it (they win
                                      field by field; edits are refused). Every model not proposed is
                                      in data.skipped with a reason (not_a_model, python_model,
-                                     versioned, sql_unreadable, unprofiled_inputs + a profile
+                                     sql_unreadable, unprofiled_inputs + a profile
                                      command that can reach the input, --target dev for a
                                      dev-only build outside the allowlist, none with the reason
                                      for a name matching several profiled relations, nothing_drafted, complete, not_writable). Capped at 25
@@ -606,7 +619,14 @@ and never as a filter, since the mart's SQL already enforces it; per model,
 `semantic slayer define|update|plan`, `semantic cube define|update|plan` and
 `semantic ossie define|update|plan` take `declarations` too, annotating a model,
 cube or dataset the payload or the layer defines. A command that takes no declarations refuses a payload
-carrying them rather than dropping them. `transform declare [<model>...]` takes the
+carrying them rather than dropping them. A version of a native dbt versioned
+model is declared as `"model": "dim_teams.v2"` and renders into that item of the
+model's `versions:` list, every other byte kept (#895); the bare name is the
+shared entry every version inherits, a version's file stem is refused naming the
+label, a model-level fact stated at the other level is refused (dbt concatenates
+a version's lists into the shared entry's), and a fact about an inherited column
+is written as dbt's override, the column excluded from the version and declared
+as its own entry with the inherited tests carried over. `transform declare [<model>...]` takes the
 same payload for models that already exist: it proposes only the measured facts
 each selected model does not yet declare, lays the supplied `declarations` over
 them field by field, and stores the lot as one capped plan, naming every model it
@@ -1291,7 +1311,13 @@ default, or a filter or operator after it is refused. A key naming a location
   rows, or go missing on its own. The sweep's scope names the successful models
   from the exact nodes the build ran, so a build of `dim_customers.v2` never judges `dim_customers.v1`. As in
   dbt's `--select`, `maintain verify dim_customers` selects every version and
-  `maintain verify dim_customers.v2` selects one.
+  `maintain verify dim_customers.v2` selects one; the file stem that builds a
+  version (`dim_customers_v2`) selects that version too. A plan's deliverables
+  name a version by its label, so a `--for-plan` build of `dim_customers.v2`
+  never answers for `dim_customers.v1`, and with `--verify` the build holds the
+  plan's versioned models to its own manifest under
+  `data.verification.model_versions` (a record per version, default and
+  consumer, each reaching `data.completion.obligations`; #859).
 
   **Findings never fail the build.** A build dbt completed is a build that
   completed; whether a `row_loss` should gate a pipeline is a caller's policy,

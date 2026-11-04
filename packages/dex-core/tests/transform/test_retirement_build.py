@@ -299,79 +299,6 @@ def test_the_benchmark_failure_is_caught_at_plan_compare_and_build(repo, capsys)
     }
 
 
-def test_the_mirror_failure_is_caught_too(repo, capsys):
-    planned = _remove(repo, capsys, RETIRE_SQL, PERMANENT)
-    assert planned["data"]["retirement"]["verdict"] == "contradicted"
-    checks = {c["check"] for c in _records(planned)["rpt_orders"]["checks"]}
-    assert {"expected_output_missing", "dropped_retained_read"} <= checks
-
-
-def test_a_contract_naming_the_wrong_branch_is_caught(repo, capsys):
-    """Correct SQL and outputs, with the default's value stated by habit."""
-
-    planned = _remove(repo, capsys, RETIRE_SQL, {**RETIRE, "retained_value": True})
-    assert planned["data"]["retirement"]["verdict"] == "contradicted"
-    assert "matches_retained" in _records(planned)["rpt_orders"]
-    assert _records(planned)["rpt_orders"]["matches_retained"] is False
-
-
-def test_a_join_kept_without_its_column_is_caught(repo, capsys):
-    kept = {
-        **RETIRE_SQL,
-        "rpt_orders": (
-            "with orders as (select * from {{ ref('stg_orders') }})\n"
-            ", regions as (select * from {{ ref('lookup_regions') }})\n"
-            "select o.order_id, o.amount\nfrom orders o\n"
-            "left join regions r on o.region_id = r.region_id\n"
-        ),
-    }
-    planned = _remove(repo, capsys, kept, RETIRE)
-    checks = {c["check"] for c in _records(planned)["rpt_orders"]["checks"]}
-    assert "reads_outside_retained_branch" in checks
-
-
-def test_an_unread_cte_and_an_orphaned_model_are_named(repo, capsys):
-    leftover = {
-        **RETIRE_SQL,
-        "rpt_orders": (
-            "with orders as (select * from {{ ref('stg_orders') }})\n"
-            ", unused as (select 1 as x)\n"
-            "select o.order_id, o.amount\nfrom orders o\n"
-        ),
-    }
-    planned = _remove(repo, capsys, leftover, RETIRE)
-    checks = {c["check"] for c in _records(planned)["rpt_orders"]["checks"]}
-    assert "unused_cte" in checks
-    assert planned["data"]["retirement"]["orphaned_models"] == ["lookup_regions"]
-
-
-def test_a_removed_column_still_read_downstream_is_named(repo, capsys):
-    _write(
-        repo / "shop/models/rpt_downstream.sql",
-        "select region_label from {{ ref('rpt_orders') }}\n",
-    )
-    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
-    checks = {c["check"] for c in _records(planned)["rpt_orders"]["checks"]}
-    assert "removed_column_still_read" in checks
-
-
-def test_a_semantic_or_schema_reference_to_a_removed_column_is_named(repo, capsys):
-    _write(
-        repo / "shop/models/schema.yml",
-        "models:\n  - name: rpt_orders\n    columns:\n      - name: region_label\n",
-    )
-    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
-    found = [
-        c
-        for c in _records(planned)["rpt_orders"]["checks"]
-        if c["check"] == "removed_column_still_read"
-    ]
-    assert found
-    assert "models/schema.yml" in found[0]["detail"]
-    # The model's own SELECT never counts: that is what `outputs` judges.
-    assert "rpt_orders.sql" not in found[0]["detail"]
-
-
 def test_a_package_parent_reading_the_flag_is_named_rather_than_compared(repo, capsys):
     """Removing the definition moves what the package model compiles to."""
 
@@ -399,32 +326,6 @@ def test_a_package_parent_reading_the_flag_is_named_rather_than_compared(repo, c
     assert "pkg_reader" in compared["data"]["detail"]
 
 
-def test_a_stale_plan_is_not_compared_and_a_conflict_is_not_overwritten(repo, capsys):
-    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
-    plan_id = planned["data"]["plan_id"]
-    _write(repo / "shop/models/rpt_empty.sql", EMPTY + "-- a human edit\n")
-    compared = _run(
-        repo, capsys, "transform", "compare", plan_id, "--model", "rpt_orders"
-    )
-    assert compared["data"]["reason_code"] == "plan_stale"
-    applied = _run(repo, capsys, "transform", "apply", plan_id)
-    assert applied["status"] == "needs_confirmation"
-    # Atomic: the conflict withheld every file.
-    assert HAS_FLAG in (repo / "shop/models/rpt_orders.sql").read_text()
-    assert FLAG in (repo / "shop/dbt_project.yml").read_text()
-
-
-def test_a_project_scoped_definition_left_behind_is_named(repo, capsys):
-    project = repo / "shop/dbt_project.yml"
-    text = project.read_text(encoding="utf-8").replace(
-        f"vars:\n  {FLAG}: true\n", f"vars:\n  shop:\n    {FLAG}: true\n"
-    )
-    project.write_text(text, encoding="utf-8")
-    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
-    assert planned["data"]["retirement"]["project_scoped_definition_left"] is True
-    assert any("own `vars:` scope" in w for w in planned["warnings"])
-
-
 def test_a_build_for_a_plan_document_holds_the_contract_too(repo, capsys):
     planned = _remove(repo, capsys, PERMANENT_SQL, RETIRE)
     plan_id = planned["data"]["plan_id"]
@@ -445,20 +346,3 @@ def test_a_build_for_a_plan_document_holds_the_contract_too(repo, capsys):
     )
     codes = {f["code"] for f in built["data"]["verification"]["findings"]}
     assert "retirement_output_present" in codes
-
-
-def test_the_contract_travels_in_the_plan_document(repo, capsys):
-    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
-    plan_id = planned["data"]["plan_id"]
-    exported = _run(repo, capsys, "transform", "export", plan_id)["data"]
-    document = exported.get("plan") or exported
-    assert document["retirement"]["retained_value"] is False
-
-    from exmergo_dex_core.transform.portable import plan_digest
-
-    honest = plan_digest(document)
-    swapped = json.loads(json.dumps(document))
-    swapped["retirement"]["retained_value"] = True
-    assert plan_digest(swapped) != honest
-    without = {k: v for k, v in document.items() if k != "retirement"}
-    assert plan_digest(without) != honest

@@ -67,12 +67,17 @@ jobs:
           uv run --no-sync pytest -q --durations=15
           --ci-group ${{ matrix.group }}
           --ci-group-report "$RUNNER_TEMP/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.json"
+          --junitxml "$RUNNER_TEMP/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.xml"
       - name: Upload the group report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-group-${{ matrix.python-version }}-${{ matrix.group }}
-          path: ${{ runner.temp }}/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.json
+          # JSON proves coverage; JUnit records every test's duration so a slow
+          # file can be identified without another profiling run.
+          path: |
+            ${{ runner.temp }}/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.json
+            ${{ runner.temp }}/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.xml
           if-no-files-found: error
           retention-days: 3
 

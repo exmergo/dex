@@ -1,1 +1,0 @@
-**Report which models actually built.** Verification scope excludes failed and skipped models and names them under `scope_not_built`. Build coverage preserves `covered` as presence in run results and adds `built` and `not_built` for successful execution.
