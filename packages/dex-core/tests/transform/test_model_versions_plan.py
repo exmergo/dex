@@ -297,6 +297,19 @@ def test_the_manifest_confirms_ids_relations_and_resolution():
     assert entry["versions"][0]["relation_source"] == "manifest"
 
 
+def test_a_windows_manifest_path_confirms_like_a_posix_one():
+    # dbt writes original_file_path with the platform's separator, so a
+    # Windows manifest says models\dim_teams_v2.sql where the plan says
+    # models/dim_teams_v2.sql. Read as different files, every version would be
+    # a file mismatch and every consumer missing.
+    manifest = _manifest()
+    for node in manifest["nodes"].values():
+        node["original_file_path"] = node["original_file_path"].replace("/", "\\")
+    report, _ = versions_mod.analyze(_view(_project()), _initial())
+    assert versions_mod.confirm(report, manifest, "shop") == []
+    assert report["dim_teams"]["manifest"] == {"status": "confirmed"}
+
+
 def test_the_manifest_contradicts_a_misresolved_ref_and_default():
     report, _ = versions_mod.analyze(_view(_project()), _initial())
     lines = versions_mod.confirm(

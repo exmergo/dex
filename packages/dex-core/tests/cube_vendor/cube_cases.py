@@ -14,7 +14,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 MODEL = ROOT / "scripts" / "cube" / "model"
 RECORDED = Path(__file__).resolve().parent / "recorded"
-MODEL_FILES = sorted(str(path.relative_to(MODEL)) for path in MODEL.rglob("*.yml"))
+# Slashes on every platform, as semantic.cube.files requires of a config.
+MODEL_FILES = sorted(
+    path.relative_to(MODEL).as_posix() for path in MODEL.rglob("*.yml")
+)
 
 #: The connectors Cube renders for in this release, each recorded.
 CONNECTORS = ("duckdb", "postgres", "bigquery", "snowflake", "redshift")

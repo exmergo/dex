@@ -32,7 +32,9 @@ permissions:
   contents: read
 
 jobs:
-  tests:
+  # The whole suite in one job: a weekly canary has no merge to unblock, so it
+  # does not need ci.yml's parallel groups or their coverage gate.
+  windows:
     runs-on: windows-latest
     # The full suite took just under eighteen minutes on a Windows workstation
     # with every extra installed; a hosted runner is slower. A bound well above
