@@ -694,6 +694,7 @@ def test_databricks_distinct_probes_judge_key_and_join_without_numrows(
             t.rows = None
 
     def resolver(sql: str) -> list[dict]:
+        """simulated query results for distinct and row count probes (#946)."""
         if "SELECT DISTINCT" in sql or "d_0" in sql:
             return [{"n_total": 50, "d_0": 45}]
         return [{"n_total": 50}]
