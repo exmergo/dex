@@ -220,6 +220,7 @@ def verify_build(
     resolve_adapter: Callable[[], Adapter],
     retirement: dict[str, Any] | None = None,
     plan_edits: list[Any] | None = None,
+    selection: str | None = None,
 ) -> BuildVerification:
     """Sweep the nodes this build ran, and report what it could not sweep.
 
@@ -232,6 +233,9 @@ def verify_build(
     this module opens nothing: :meth:`DexEngine._adapter` is the only opener in
     the tree, and that is asserted structurally by reading the source for the
     funnel's own name.
+
+    ``selection`` carries the build selector, when one was used, so
+    declared-fact checks can attribute missing parents to narrow selection.
 
     Never raises except on a cost-guard refusal, which is re-raised untouched:
     a build that has already run must report what it found, so every other
@@ -308,7 +312,16 @@ def verify_build(
     if reason is not None:
         result.suppressed["join_contract"] = reason
 
-    proven = _declared_facts(engine, project_dir, summary, scope, adapter_once, result)
+    effective_selection = selection or summary.get("selection") or summary.get("select")
+    proven = _declared_facts(
+        engine,
+        project_dir,
+        summary,
+        scope,
+        adapter_once,
+        result,
+        selection=effective_selection,
+    )
     # A grain this build proved, by its own passing uniqueness test or by the
     # declared-fact count, ranks a fan-out on that model as intended (#841).
     if summary.get("success"):
@@ -808,10 +821,14 @@ def _declared_facts(
     scope: set[str],
     resolve_adapter: Callable[[], Adapter],
     result: BuildVerification,
+    selection: str | None = None,
 ) -> dict[str, dict]:
     """What the built models' declarations say, checked against what dbt wrote
     (#496): unit, additivity, population, and a declared grain no ``unique``
     test in this build covers.
+
+    ``selection`` carries the build selector, when one was used, so
+    declared-fact checks can attribute missing parents to narrow selection.
 
     Writes findings, warnings, suppressions and any deferred offer onto
     ``result``, and returns the declared grains the count proved unique. The
@@ -882,8 +899,15 @@ def _declared_facts(
         return {}
 
     try:
+        effective_selection = (
+            selection or summary.get("selection") or summary.get("select")
+        )
         prepared = facts_mod.prepare(
-            adapter, models, [meta.identifier for meta in live], check_grain=True
+            adapter,
+            models,
+            [meta.identifier for meta in live],
+            check_grain=True,
+            selection=effective_selection,
         )
         facts = facts_mod.findings(
             adapter,

@@ -3981,6 +3981,7 @@ def _build_project(
             invocation_id=logged_id,
             retirement=_plan_retirement(engine, for_plan, for_plan_document),
             plan_edits=_plan_edits(engine, for_plan, for_plan_document),
+            select=select,
         )
         return _shape_build_result(
             summary,
@@ -4131,6 +4132,7 @@ def _build_project(
         invocation_id=logged_id,
         retirement=_plan_retirement(engine, for_plan, for_plan_document),
         plan_edits=_plan_edits(engine, for_plan, for_plan_document),
+        select=select,
     )
     decisions = _with_retirement(
         _built_decisions(engine, summary),
@@ -4221,6 +4223,7 @@ def _verify_build(
     invocation_id: str | None = None,
     retirement: dict[str, Any] | None = None,
     plan_edits: list[PlanEdit] | None = None,
+    select: str | None = None,
 ) -> BuildVerification:
     """The sweep, or the statement that it did not run.
 
@@ -4239,6 +4242,8 @@ def _verify_build(
     reads that directory, not the newest one on disk, and only that
     invocation's run results, so another dbt process writing meanwhile cannot
     hand it a different run's manifest or a different run's passing tests.
+
+    ``select`` carries the build's selector expression, when supplied.
     """
 
     from .artifact_runtime import pinned_artifacts
@@ -4261,6 +4266,7 @@ def _verify_build(
             resolve_adapter=opener,
             retirement=retirement,
             plan_edits=plan_edits,
+            selection=select,
         )
     with pinned_artifacts(artifact_directory, invocation_id):
         return verify_build(
@@ -4270,6 +4276,7 @@ def _verify_build(
             resolve_adapter=opener,
             retirement=retirement,
             plan_edits=plan_edits,
+            selection=select,
         )
 
 
