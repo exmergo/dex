@@ -414,7 +414,8 @@ def _advisory(
             "baseline measurement shows it ever held, so this is not drift: repoint "
             "the declaration at the parent that holds these keys, load the "
             "missing parents, or drop the claim. Once the join is right, re-pin "
-            "with `explore map --verify` and `maintain snapshot` so later runs "
+            "with `explore map --verify --use-project` (the map reads no "
+            "declared join without it) and `maintain snapshot` so later runs "
             "judge it against a before"
         ),
         "dangling_reference": (
