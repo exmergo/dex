@@ -137,9 +137,7 @@ def test_an_aggregate_inside_a_scalar_subquery_does_not_reduce_the_outer_select(
 
 
 def test_a_grouped_aggregate_is_named_as_group_by_not_a_scalar_aggregate():
-    clauses = sql_shape.reducing_clauses(
-        _parse("select a, count(*) from t group by a")
-    )
+    clauses = sql_shape.reducing_clauses(_parse("select a, count(*) from t group by a"))
     assert clauses == ["a GROUP BY"]
 
 

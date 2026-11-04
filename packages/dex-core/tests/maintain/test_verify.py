@@ -1714,7 +1714,7 @@ def test_a_scalar_aggregate_behind_a_cte_is_not_reported(tmp_path: Path):
         {
             "m.1": _model(
                 "control",
-                'with d as (select count(*) as source_rows from '
+                "with d as (select count(*) as source_rows from "
                 '"wh"."main"."stg_orders") '
                 "select 1 as control_id, source_rows from d",
             )
@@ -1740,9 +1740,7 @@ def test_a_window_count_does_not_silence_real_row_loss(tmp_path: Path):
         },
     )
     assert "a scalar aggregate" not in checks[0].reducers
-    findings, _ = _judge(
-        checks, {"stg_orders": 200, "stg_customers": 40, "fct": 100}
-    )
+    findings, _ = _judge(checks, {"stg_orders": 200, "stg_customers": 40, "fct": 100})
     assert [f.code for f in findings] == ["row_loss"]
 
 
