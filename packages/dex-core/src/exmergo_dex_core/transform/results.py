@@ -15,6 +15,7 @@ from pydantic import Field
 from ..attribution import COMMIT_TRAILER
 from ..results import Result
 from .classify import ArtifactClassification
+from .completion import BuildCompletion
 from .evidence import BuildEvidence
 from .grounding import Grounding
 from .portable import PortablePlan
@@ -85,8 +86,26 @@ class PlanResult(Result):
     # layer, offered here where it does not. Absent when no declared mart was
     # touched.
     semantic_proposal: dict[str, Any] | None = None
+    # The free pointer to `transform compare` on a plan that rewrites a model
+    # that already exists (#856). Planning scans nothing for it. Absent when the
+    # plan rewrites none.
+    refactor_comparison_offer: dict[str, Any] | None = None
+    # Each conversion this plan adds to an identifier column (a cast, a safe
+    # cast, a lower/upper/trim), with what it does to the entities the model
+    # holds: counts with their denominator, and a status of lossless,
+    # declared, undeclared or unchecked (#861). Absent when the plan adds none.
+    identifier_conversions: list[dict[str, Any]] | None = None
+    # Per versioned model the plan touches (#859): each version's file and
+    # relation, the default before and after, every consumer's ref and what it
+    # resolves to, relation and contract changes, and dbt's own manifest
+    # confirmation; plus `independent_models`, a `<model>_v<N>` copy the plan
+    # writes that is not a version. Absent when the plan touches neither.
+    model_versions: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
+        """The plan envelope's ``data``, carrying each optional section only where it
+        was produced.
+        """
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
             "intent": self.intent,
@@ -94,6 +113,12 @@ class PlanResult(Result):
             "paths": self.paths,
             "plan_path": self.plan_path,
         }
+        if self.refactor_comparison_offer is not None:
+            payload["refactor_comparison_offer"] = self.refactor_comparison_offer
+        if self.identifier_conversions is not None:
+            payload["identifier_conversions"] = self.identifier_conversions
+        if self.model_versions is not None:
+            payload["model_versions"] = self.model_versions
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.declarations is not None:
@@ -127,15 +152,22 @@ class PropagationResult(PlanResult):
     change: str = ""
     kind: str = ""
     sites: dict[str, int] = Field(default_factory=dict)
+    # The contract and how the proposal measured against it (#858).
+    retirement: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload = {
             "change": self.change,
             "kind": self.kind,
             "sites": self.sites,
             "site_count": sum(self.sites.values()),
+            **({"retirement": self.retirement} if self.retirement else {}),
             **super().data(),
         }
+        if not self.plan_id:
+            # Nothing to apply: an already complete retirement stores no plan.
+            payload["plan_id"] = None
+        return payload
 
 
 class PlacementResult(PlanResult):
@@ -271,18 +303,35 @@ class ApplyResult(Result):
     written: list[str] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
     conflicts_overridden: list[str] = Field(default_factory=list)
+    # Which plan Dex picked when the caller passed no plan id: the picked
+    # plan's id, intent and creation time, plus
+    # ``resolved_from: "latest_unapplied"``. None when the caller passed an
+    # explicit id (#1103).
+    resolved_plan: dict[str, Any] | None = None
     # The assumptions declared on the models this apply wrote, as the project
     # now records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
+    # Per model this plan rewrote, the refactor comparison the plan recorded,
+    # or `not_compared` (#1049). Reported, never enforced: an intentional
+    # behavior change needs no equivalence. Absent when the plan rewrote no
+    # existing model.
+    refactor_comparison: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
         if self.pending_confirmation is not None:
-            return {"plan_id": self.plan_id, "conflicts": self.conflicts}
+            payload = {"plan_id": self.plan_id, "conflicts": self.conflicts}
+            if self.resolved_plan is not None:
+                payload["resolved_plan"] = self.resolved_plan
+            return payload
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
             "written": self.written,
             "conflicts_overridden": self.conflicts_overridden,
         }
+        if self.resolved_plan is not None:
+            payload["resolved_plan"] = self.resolved_plan
+        if self.refactor_comparison is not None:
+            payload["refactor_comparison"] = self.refactor_comparison
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.commit_trailer is not None:
@@ -315,6 +364,8 @@ class PlanExportResult(Result):
             plan_id="", intent="", created_at="", project_dir=""
         )
     )
+    # Which plan Dex picked when the caller passed no plan id (#1103).
+    resolved_plan: dict[str, Any] | None = None
 
     def plan_model(self) -> PortablePlan:
         """The typed :class:`~exmergo_dex_core.transform.portable.PortablePlan`
@@ -327,7 +378,10 @@ class PlanExportResult(Result):
             if hasattr(self.plan, "data")
             else (self.plan.model_dump(mode="json") if self.plan is not None else {})
         )
-        return {"plan_id": self.plan_id, "digest": self.digest, "plan": plan_data}
+        payload = {"plan_id": self.plan_id, "digest": self.digest, "plan": plan_data}
+        if self.resolved_plan is not None:
+            payload["resolved_plan"] = self.resolved_plan
+        return payload
 
 
 class ClassificationResult(Result):
@@ -339,6 +393,8 @@ class ClassificationResult(Result):
 
     plan_id: str | None = None
     classifications: list[ArtifactClassification] = Field(default_factory=list)
+    # Which plan Dex picked when the caller passed no plan id (#1103).
+    resolved_plan: dict[str, Any] | None = None
 
     always_reports_notes: ClassVar[bool] = True
 
@@ -355,6 +411,8 @@ class ClassificationResult(Result):
         payload: dict[str, Any] = {"classifications": classifications_data}
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
+        if self.resolved_plan is not None:
+            payload["resolved_plan"] = self.resolved_plan
         return payload
 
 
@@ -368,6 +426,8 @@ class GroundingResult(Result):
 
     plan_id: str | None = None
     grounding: Grounding = Field(default_factory=Grounding)
+    # Which plan Dex picked when the caller passed no plan id (#1103).
+    resolved_plan: dict[str, Any] | None = None
 
     always_reports_notes: ClassVar[bool] = True
 
@@ -384,6 +444,8 @@ class GroundingResult(Result):
         payload = dict(grounding_data)
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
+        if self.resolved_plan is not None:
+            payload["resolved_plan"] = self.resolved_plan
         return payload
 
 
@@ -423,6 +485,65 @@ class DepsResult(Result):
         if not self.ran:
             return {"ran": False, "reason": self.reason}
         return {"ran": True, **self.summary}
+
+
+class RefactorComparisonResult(Result):
+    """Whether a stored plan keeps one model's results on the compared inputs.
+
+    ``status`` is ``equivalent``, ``different`` or ``not_checked``, and
+    ``reason_code`` says which of them and why. ``equivalent`` means the schema
+    and the row multiset matched on ``input_scope`` at ``compared_at``. It is not
+    a claim about a build, or about any input that was not compared. Every field
+    here is a count, a name or a type: no row comes back.
+
+    ``keyed`` is present only when a key was given or declared, and unique on both
+    sides. ``key_source`` says which, because a key the request named and one a
+    declaration stated are different evidence.
+    """
+
+    plan_id: str = ""
+    model: str = ""
+    target: str = ""
+    status: str = "not_checked"
+    reason_code: str = ""
+    detail: str | None = None
+    compared_at: str = ""
+    baseline_compiled: str | None = None
+    proposed_compiled: str | None = None
+    input_scope: list[str] = Field(default_factory=list)
+    schema_diff: dict[str, Any] | None = None
+    multiset: dict[str, Any] | None = None
+    key_columns: list[str] | None = None
+    key_source: str | None = None
+    keyed: dict[str, Any] | None = None
+    keyed_reason: str | None = None
+    profiled_on_demand: list[str] = Field(default_factory=list)
+    # The values the baseline compiled at, where a retirement contract chose a
+    # branch (#858). Absent everywhere else.
+    baseline_vars: dict[str, Any] | None = None
+
+    def data(self) -> dict[str, Any]:
+        branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
+        return {
+            **branch,
+            "plan_id": self.plan_id,
+            "model": self.model,
+            "target": self.target,
+            "status": self.status,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "compared_at": self.compared_at,
+            "baseline_compiled": self.baseline_compiled,
+            "proposed_compiled": self.proposed_compiled,
+            "input_scope": self.input_scope,
+            "schema": self.schema_diff,
+            "multiset": self.multiset,
+            "key_columns": self.key_columns,
+            "key_source": self.key_source,
+            "keyed": self.keyed,
+            "keyed_reason": self.keyed_reason,
+            "profiled_on_demand": self.profiled_on_demand,
+        }
 
 
 class MutationCoverageResult(Result):
@@ -515,6 +636,14 @@ class BuildResult(Result):
     # The assumptions declared on the models this build ran, as the project
     # records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
+    # The bounded lead (#855): what the run established about the change, held
+    # to a size that survives a truncated read, ahead of every unbounded list.
+    completion: BuildCompletion | None = None
+    # Who owns each failed node and which repairs dbt has for it (#860).
+    prerequisites: list[dict[str, Any]] | None = None
+    prerequisites_elided: int = 0
+    # What `--cold-deps` reinstalled and what the installed tree lost (#860).
+    cold_verification: dict[str, Any] | None = None
 
     def evidence_model(self) -> BuildEvidence | None:
         """The typed :class:`~exmergo_dex_core.transform.evidence.BuildEvidence`
@@ -543,4 +672,17 @@ class BuildResult(Result):
             payload["verification"] = self.verification
         if self.decisions is not None:
             payload["decisions"] = self.decisions
+        lead: dict[str, Any] = {}
+        if self.prerequisites:
+            lead["prerequisites"] = self.prerequisites
+            if self.prerequisites_elided:
+                lead["prerequisites_elided"] = self.prerequisites_elided
+        if self.cold_verification is not None:
+            lead["cold_verification"] = self.cold_verification
+        payload = {**lead, **payload}
+        if self.completion is not None:
+            # First, by construction rather than by luck: key order means
+            # nothing to a parser and everything to a reader whose harness cut
+            # the output after a few kilobytes (#855).
+            payload = {"completion": self.completion.data(), **payload}
         return payload

@@ -542,3 +542,52 @@ def test_guarded_delete_is_identical_across_connectors(
     )
     assert rc == 0, (connector, envelope)
     assert not (dbt_project_dir / "models/staging/stg_customers.sql").exists()
+
+
+def test_apply_empty_plan_id_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    plan_id = _make_plan(
+        tmp_path, capsys, "models/marts/fct_orders.sql", "select 1 as id\n"
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", ""], capsys
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert envelope["reason"] == "request"
+    assert "empty plan id" in envelope["errors"][0]
+    # Nothing was written: the stored plan is still unapplied.
+    plan_file = tmp_path / ".dex" / "plans" / f"{plan_id}.json"
+    assert json.loads(plan_file.read_text())["applied_at"] is None
+
+
+def test_apply_without_id_reports_the_resolved_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _make_plan(tmp_path, capsys, "models/marts/first.sql", "select 1 as id\n", "one")
+    latest_id = _make_plan(
+        tmp_path, capsys, "models/marts/second.sql", "select 2 as id\n", "two"
+    )
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, envelope
+    resolved = envelope["data"]["resolved_plan"]
+    assert resolved["plan_id"] == latest_id
+    assert resolved["intent"] == "two"
+    assert resolved["created_at"]
+    assert resolved["resolved_from"] == "latest_unapplied"
+    assert any(latest_id in w for w in envelope["warnings"])
+
+
+def test_apply_with_explicit_id_reports_no_resolved_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    plan_id = _make_plan(
+        tmp_path, capsys, "models/marts/fct_orders.sql", "select 1 as id\n"
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", plan_id], capsys
+    )
+    assert rc == 0, envelope
+    assert "resolved_plan" not in envelope["data"]
+    assert not envelope["warnings"]
