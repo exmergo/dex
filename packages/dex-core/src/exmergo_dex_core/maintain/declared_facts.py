@@ -1114,10 +1114,10 @@ def _unchecked_parents(
     for model in prepared.parent_models:
         if model.model in recorded:
             continue
-        if reason is not None:
-            code, why = reason_code, reason
-        elif model.model in prepared.parent_unwritten:
+        if model.model in prepared.parent_unwritten:
             code, why = prepared.parent_unwritten[model.model]
+        elif reason is not None:
+            code, why = reason_code, reason
         else:
             code = reason_code
             why = next(
