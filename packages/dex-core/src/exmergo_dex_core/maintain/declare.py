@@ -210,7 +210,9 @@ class DeclarationEdits:
     def _placed(self, kind: EditKind, table: str) -> str | None:
         if self._placement is None:
             suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
-            return None if suffix is None else f"models/staging/stg_{table}.{suffix}"
+            if suffix is None:
+                return None
+            return f"models/staging/stg_{table.lower()}.{suffix}"
         return self._placement.edit_path(kind, table)
 
     def content_for(self, path: str) -> str | None:
