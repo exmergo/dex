@@ -55,8 +55,8 @@ class ModelInput(NamedTuple):
     name: str
     literal: str
     #: What the exploration cache is searched for: the relation a ``source()``
-    #: declares (its ``identifier`` can differ from the table name the model
-    #: writes), otherwise ``name``.
+    #: declares, where the cache holds it (its ``identifier`` can differ from
+    #: the table name the model writes), otherwise ``name``.
     lookup: str = ""
 
     @property
@@ -135,8 +135,9 @@ def unit_test_scaffold(
         )
     cache = _pinned_to_sources(cache, view, sql)
     declared = _declared_source_relations(view)
+    known = [d.identifier for d in cache.datasets] if cache is not None else []
     inputs = [
-        i._replace(lookup=declared.get(_source_key(i), ""))
+        i._replace(lookup=_cached_relation(declared.get(_source_key(i), ""), known))
         if i.literal.startswith("source(")
         else i
         for i in inputs
@@ -237,6 +238,8 @@ def unit_test_scaffold(
 
 
 def _parse_model(model_name: str, sql: str) -> exp.Expression:
+    """One program of the model, rendered and parsed, or a scaffold refusal."""
+
     try:
         rendered = render_model_sql(sql, naming_resolver)
     except UnattributableError as exc:
@@ -288,6 +291,8 @@ def _incremental_variants(sql: str) -> _Variants | None:
     seen = False
 
     def emit(piece: str) -> None:
+        """Write ``piece`` into each program the current branch belongs to."""
+
         if branch != "else":
             incremental.append(piece)
         if branch != "if":
@@ -319,6 +324,8 @@ def _incremental_variants(sql: str) -> _Variants | None:
 
 
 def _is_this(node: exp.Expression) -> bool:
+    """Whether ``node`` is the relation ``{{ this }}`` was read as."""
+
     return isinstance(node, exp.Table) and node.name.lower() == THIS_PLACEHOLDER
 
 
@@ -384,6 +391,8 @@ def _watermark(parsed: exp.Expression, reads: dict[str, set[str]]) -> Watermark 
 
 
 def _owner(reads: dict[str, set[str]], column: str) -> str | None:
+    """The one input that reads ``column``, or ``None`` where none or several do."""
+
     owners = [
         name
         for name, columns in reads.items()
@@ -488,7 +497,16 @@ def _pinned_to_sources(
     return cache.model_copy(update={"datasets": kept})
 
 
+def _cached_relation(relation: str, known: list[str]) -> str:
+    """``relation`` where the cache holds it, otherwise ``""``, so an input
+    whose declared relation was never cached keeps the bare-name lookup."""
+
+    return relation if relation and match_identifier(relation, known) else ""
+
+
 def _source_key(model_input: ModelInput) -> tuple[str, str]:
+    """The ``(source, table)`` a ``source()`` input names."""
+
     match = SOURCE_PATTERN.search("{{ " + model_input.literal + " }}")
     return (match.group(1), match.group(2)) if match else ("", model_input.name)
 
@@ -695,6 +713,8 @@ def _resolve_reads(
 
 
 def _expand_source(source: object, cache: DexCache | None) -> _Derived:
+    """A ``*`` over one source, as output name -> the input column it passes through."""
+
     if isinstance(source, _BaseInput):
         dataset = _lookup_dataset(cache, source.lookup or source.name, source.name)
         return {c.name.lower(): (source.name, c.name) for c in dataset.columns}
@@ -702,6 +722,8 @@ def _expand_source(source: object, cache: DexCache | None) -> _Derived:
 
 
 def _expand_all(sources: dict[str, object], cache: DexCache | None) -> _Derived:
+    """A bare ``*`` over every source a SELECT reads."""
+
     expanded: _Derived = {}
     for source in sources.values():
         expanded.update(_expand_source(source, cache))
@@ -709,6 +731,8 @@ def _expand_all(sources: dict[str, object], cache: DexCache | None) -> _Derived:
 
 
 def _from_and_join_nodes(select: exp.Select) -> list[exp.Expression]:
+    """The relations a SELECT reads in its FROM and JOIN clauses."""
+
     nodes: list[exp.Expression] = []
     from_clause = select.args.get("from_") or select.args.get("from")
     if from_clause is not None:
@@ -721,6 +745,8 @@ def _from_and_join_nodes(select: exp.Select) -> list[exp.Expression]:
 
 
 def _lookup_dataset(cache: DexCache | None, name: str, label: str) -> object:
+    """The cached dataset ``name`` matches, or a refusal naming the profile to run."""
+
     known = [d.identifier for d in cache.datasets] if cache is not None else []
     matches = match_identifier(name, known)
     if not matches:
@@ -763,6 +789,8 @@ def _column_types(
 
 
 class _Given(NamedTuple):
+    """One ``given`` block: an input, its rows, and a note per row."""
+
     literal: str
     rows: list[dict[str, object]]
     #: One YAML comment per row, written above it, or ``None``.
@@ -781,6 +809,9 @@ def _test_block(
     is_incremental: bool | None = None,
     expect_note: str | None = None,
 ) -> list[str]:
+    """One unit test's YAML lines. ``is_incremental`` sets dbt's override,
+    which is left out where it is ``None``."""
+
     lines = [f"  - name: {name}", f"    model: {model_name}"]
     if is_incremental is not None:
         # dbt refuses a unit test on an incremental model that leaves this
@@ -843,6 +874,8 @@ def _test_block(
 
 
 def _unit_tests_yaml(tests: list[list[str]]) -> str:
+    """The ``unit_tests:`` document holding ``tests``, each a block of lines."""
+
     lines = ["version: 2", "", "unit_tests:"]
     for test in tests:
         lines += test
@@ -852,6 +885,8 @@ def _unit_tests_yaml(tests: list[list[str]]) -> str:
 def _example_row(
     types: dict[str, str], columns: set[str], index: int | None = None
 ) -> dict[str, object]:
+    """One example value per column, numbered by ``index`` in a multi-row fixture."""
+
     return {column: _example_value(types[column], index) for column in sorted(columns)}
 
 
@@ -893,6 +928,9 @@ def _incremental_given(
 
 
 def _this_given(this_types: dict[str, str], watermark: Watermark | None) -> _Given:
+    """The ``this`` fixture: one row of what earlier runs loaded, on the
+    watermark where one was read."""
+
     row = _example_row(this_types, set(this_types))
     note = None
     if watermark is not None and watermark.this_column is not None:
@@ -962,6 +1000,8 @@ def _example_value(data_type: str, index: int | None = None) -> object:
 
 
 def _yaml_scalar(value: object) -> str:
+    """``value`` as a YAML flow scalar."""
+
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -973,6 +1013,8 @@ def _yaml_scalar(value: object) -> str:
 
 
 def _yaml_flow_mapping(row: dict[str, object]) -> str:
+    """``row`` as a one-line YAML flow mapping."""
+
     if not row:
         return "{}"
     return (

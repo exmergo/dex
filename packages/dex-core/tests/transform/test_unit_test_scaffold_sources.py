@@ -89,3 +89,36 @@ def test_a_source_whose_identifier_differs_from_its_name_is_found(
         "input": "source('feed', 'scans')",
         "rows": [{"scan_id": 1}],
     }
+
+
+def test_a_declared_relation_the_cache_lacks_keeps_the_name_lookup(
+    dbt_project_dir: Path,
+):
+    """Looking an input up by its declared relation applies only where the
+    cache holds that relation; otherwise the bare table name is searched, as
+    before, so a lone cached table of that name still types the fixture."""
+
+    staging = dbt_project_dir / "models" / "staging"
+    (staging / "_dex_sources.yml").write_text(
+        "version: 2\n\nsources:\n  - name: shop\n    schema: raw_a\n    tables:\n"
+        "      - name: orders\n",
+        encoding="utf-8",
+    )
+    (staging / "stg_orders.sql").write_text(
+        "select id from {{ source('shop', 'orders') }}\n", encoding="utf-8"
+    )
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="raw_b.orders",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+            )
+        ],
+        provenance=CacheProvenance(connector="duckdb"),
+    )
+
+    edits, inputs = unit_test_scaffold_edits(load(dbt_project_dir), cache, "stg_orders")
+
+    assert inputs == ["orders"]
+    test = yaml.safe_load(edits[0].new_content)["unit_tests"][0]
+    assert test["given"][0]["rows"] == [{"id": 1}]

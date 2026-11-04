@@ -3,7 +3,8 @@
 An incremental model is two programs in one file. The full build selects every
 row; the incremental run selects only the rows inside its `{% if is_incremental() %}`
 branch and adds or merges them into what earlier runs loaded. A first build and
-every `--full-refresh` run only the full program. So a full refresh that matches
+every `--full-refresh` run only the full program (a model with `full_refresh: false`
+is not rebuilt at all; see section 3). So a full refresh that matches
 the source row for row says nothing about the next incremental run, and a defect
 in the branch (rows it skips, rows it loads twice) is still there afterwards.
 
@@ -32,18 +33,25 @@ then you read the branch yourself.
 Measure what the data says with aggregates, never rows:
 
 ```bash
-dex explore profile <dev namespace>.<model> --target dev --refresh
-dex explore query "select max(<col>) as watermark, count(*) as rows from <source>"
-dex explore query "select count(*) as on_watermark from <source> where <col> = <that max>"
+dex explore profile <dev namespace>.<model> --target dev --refresh --columns all
+dex explore query "select max(<col>) as source_max, count(*) as rows from <source>"
+dex explore query "select count(*) as on_watermark from <source> where <col> = <watermark>"
 ```
 
-The profile gives the built model's `row_count` and whether the key is still a
+The profile gives the built model's `row_count`, whether the key is still a
 candidate key (a repeated key drops out of `candidate_keys` and shows in
-`data_quality`). `explore query` reads the source; it does not reach a dev
-relation outside the source allowlist, so take the model's counts from the
-profile. The last count is how many source rows share the watermark the next run
-starts from. Under `>`, every such row that arrives after the run that set the
-watermark is skipped forever.
+`data_quality`), and the watermark column's `max_value`: the target's watermark,
+which is the bound the next run starts from. `explore query` reads the source; it
+does not reach a dev relation outside the source allowlist, so take the model's
+figures from the profile.
+
+The source maximum is not the target watermark. They agree only when the target
+has loaded every source row; where the strict run already missed rows, the source
+maximum can be later. Count the rows on the target's watermark. Where it cannot be
+read (values-free mode withholds `max_value`), count on the source maximum and
+report the boundary as unresolved, naming the source maximum as what you used.
+Under `>`, every row that arrives after the run that set the watermark, with the
+watermark's value, is skipped forever.
 
 ## 1. Choose the repair
 
@@ -52,7 +60,7 @@ watermark is skipped forever.
 | Rows arriving with the current maximum value are skipped | `>=` instead of `>` | A `unique_key` with `merge` or `delete+insert`, otherwise every row on the watermark loads twice |
 | Rows arriving with an earlier value (late data) are skipped | A lookback: `col >= (select max(col) from {{ this }}) - <window>` | A `unique_key`, and a stated window. Rows older than the window still need a full refresh |
 | An empty target loads nothing | `coalesce((select max(col) from {{ this }}), <lowest value>)` | A literal of the column's type |
-| Rows load twice | A `unique_key` and a merging strategy, or deduplication in the model | The key the grain declares |
+| Rows load twice | A strategy that replaces rows already in the target: `merge` or `delete+insert` on a `unique_key`, or deduplication that reads the target as well as the batch | The key the grain declares. A `unique_key` under `append`, or deduplication within the selected batch alone, still inserts a row the target already holds |
 | Rows with a NULL watermark never load incrementally | A policy: keep them for the full build only, coalesce to another timestamp, or exclude them | An assumption saying which |
 
 Record each choice that changes which rows exist as an `assumptions` entry with its
@@ -81,8 +89,11 @@ file:
 Both `expect:` blocks are empty stubs that fail until you fill them in. For the
 incremental test, expect the rows this run inserts or merges, not the whole table:
 with `>=`, the rows on and after the watermark; with `>`, only the row after it.
-Add rows for what the request is about (a key already in `this`, to see it merged
-rather than duplicated). Then plan and apply the test with the repair, and build:
+Add rows for what the request is about, such as a key already in `this`: the test
+then shows whether the branch selects that row again. It does not run the
+warehouse's merge, so whether a selected row is merged rather than duplicated
+needs the build evidence in section 3. Then plan and apply the test with the
+repair, and build:
 
 ```bash
 dex transform apply <plan-id>
@@ -100,6 +111,10 @@ boundary rows in the incremental test are what pin that comparison.
 
 1. `dex transform build --target dev --select <model> --full-refresh --verify`
    rewrites what the old logic loaded. It is evidence about the full program only.
+   Read `data.full_refresh.not_refreshed` first: a model listed there has
+   `full_refresh: false`, so dbt ran it incrementally and kept what the old logic
+   wrote. Its history is not repaired; report that part incomplete, or change the
+   config in a plan if the request allows it.
 2. Build again without `--full-refresh`. Nothing new arrived, so the second run has
    to change nothing: the row count holds and no key repeats. A declared grain (a
    `unique` test or `"grain"` in the declaration) makes `--verify` count the
@@ -113,7 +128,7 @@ boundary rows in the incremental test are what pin that comparison.
 
 | Evidence | Shows | Does not show |
 |---|---|---|
-| A green `--full-refresh` build, row parity with the source | The full program is right on today's data | Anything about the next incremental run |
+| A green `--full-refresh` build, row parity with the source | The full refresh holds the same row population as today's source, for a model not in `not_refreshed` | That the values are right (check them with `explore profile`), or anything about the next incremental run |
 | The incremental unit test passing | The branch selects the rows the expectation names, for the fixture's boundary cases | That the strategy merges correctly in the warehouse |
 | A second plain build changing nothing, grain held | Re-running the branch on loaded data duplicates nothing | That new rows on the watermark are picked up |
 | A second batch through a project-owned input | The whole incremental path on real data | Late rows outside the stated horizon |

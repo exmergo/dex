@@ -604,7 +604,10 @@ optional `{% else %}`), it plans two tests in the one file:
 one column with a subquery over `{{ this }}` (`operator` as read with the column
 on the left), or `null`. Where it is read, the watermark's input gets one row
 before, on and after the current watermark plus one NULL, each commented with
-what it probes. Recipe: [incremental-repairs.md](incremental-repairs.md).
+what it probes. Where it is not, or where Dex cannot place the boundary (more
+than one input reads the watermark column, or the column is text or boolean),
+the input gets the single example row the full test has: read the fixture, and
+add the boundary rows yourself. Recipe: [incremental-repairs.md](incremental-repairs.md).
 
 ## `transform test --mutate <model> [--max-mutants <n>] [--check-equivalence|--no-check-equivalence] [--downstream|--no-downstream]`
 

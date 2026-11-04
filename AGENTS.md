@@ -179,7 +179,9 @@ declares is `contract`.
   Recipe: `skills/transform/references/model-versions.md`.
 - An incremental model is two programs: the full build and the next
   incremental run. A `--full-refresh` runs only the first, so it does not show
-  that rows the next run skips or duplicates are fixed. Before choosing a
+  that rows the next run skips or duplicates are fixed; a model it lists under
+  `data.full_refresh.not_refreshed` (`full_refresh: false`) was not rebuilt at
+  all, so report its history repair incomplete. Before choosing a
   repair, read the materialization, the watermark comparison (`>` skips rows on
   the current watermark) and the `unique_key` or deduplication that makes `>=`
   safe. Prove the incremental branch with a unit test that overrides
