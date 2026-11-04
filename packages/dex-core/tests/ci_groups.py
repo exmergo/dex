@@ -56,6 +56,8 @@ GROUPS: dict[str, tuple[str, ...]] = {
     # Multi-build retirement cases run apart from both refactor comparisons and
     # plan-only retirement contracts (assigned to contracts below).
     "transform-retirement": ("tests/transform/test_retirement",),
+    # Native model versions on real dbt: several cold builds and a promotion.
+    "transform-versions": ("tests/transform/test_model_versions_build.py",),
     "transform-refactor": (
         "tests/transform/test_refactor",
         "tests/transform/test_transform_compare.py",

@@ -95,6 +95,12 @@ class PlanResult(Result):
     # holds: counts with their denominator, and a status of lossless,
     # declared, undeclared or unchecked (#861). Absent when the plan adds none.
     identifier_conversions: list[dict[str, Any]] | None = None
+    # Per versioned model the plan touches (#859): each version's file and
+    # relation, the default before and after, every consumer's ref and what it
+    # resolves to, relation and contract changes, and dbt's own manifest
+    # confirmation; plus `independent_models`, a `<model>_v<N>` copy the plan
+    # writes that is not a version. Absent when the plan touches neither.
+    model_versions: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         """The plan envelope's ``data``, carrying each optional section only where it
@@ -111,6 +117,8 @@ class PlanResult(Result):
             payload["refactor_comparison_offer"] = self.refactor_comparison_offer
         if self.identifier_conversions is not None:
             payload["identifier_conversions"] = self.identifier_conversions
+        if self.model_versions is not None:
+            payload["model_versions"] = self.model_versions
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.declarations is not None:

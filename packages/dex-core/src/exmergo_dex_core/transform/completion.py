@@ -81,6 +81,7 @@ _RECORD_KINDS = (
     "parent_population",
     "temporal_contracts",
     "retirement",
+    "model_versions",
 )
 
 #: The deliverable lists that say the change is not done. Each keeps at least

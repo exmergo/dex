@@ -124,21 +124,51 @@ def test_a_python_model_is_skipped_with_its_file(tmp_path: Path):
     assert "models/scores.py" in selection.skipped[0]["detail"]
 
 
-def test_a_versioned_model_is_skipped_however_it_is_named():
-    files = {
+def _versioned_shop() -> dict[str, str]:
+    return {
         **_shop(),
+        "models/marts/dim_customers.sql": "select 1 as customer_id, 'a' as tier\n",
         "models/marts/dim_customers_v2.sql": "select 1 as customer_id\n",
         "models/marts/_marts.yml": (
-            "version: 2\nmodels:\n  - name: dim_customers\n    latest_version: 2\n"
-            "    versions:\n      - v: 2\n"
+            "version: 2\nmodels:\n  - name: dim_customers\n    latest_version: 1\n"
+            "    versions:\n      - v: 1\n        defined_in: dim_customers\n"
+            "      - v: 2\n"
         ),
     }
-    everything = declare_mod.select_models(_view(files), [])
+
+
+def test_every_version_is_selected_under_its_label():
+    # #895: a version is declared under the label dbt gives it, whichever file
+    # builds it, never skipped and never under its file stem.
+    everything = declare_mod.select_models(_view(_versioned_shop()), [])
+    assert "dim_customers.v1" in everything.models
+    assert "dim_customers.v2" in everything.models
     assert "dim_customers_v2" not in everything.models
-    assert [s["reason"] for s in everything.skipped] == ["versioned"]
-    named = declare_mod.select_models(_view(files), ["dim_customers.v2"])
-    assert named.models == []
-    assert named.skipped[0]["reason"] == "versioned"
+    assert "dim_customers" not in everything.models
+    assert everything.skipped == []
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected"),
+    [
+        (["dim_customers.v2"], ["dim_customers.v2"]),
+        (["dim_customers_v2"], ["dim_customers.v2"]),
+        (["DIM_CUSTOMERS"], ["dim_customers.v1", "dim_customers.v2"]),
+    ],
+)
+def test_a_version_is_selected_however_it_is_named(selector, expected):
+    selection = declare_mod.select_models(_view(_versioned_shop()), selector)
+    assert selection.models == expected
+    assert selection.skipped == []
+
+
+def test_a_version_the_model_does_not_list_is_named():
+    selection = declare_mod.select_models(
+        _view(_versioned_shop()), ["dim_customers.v9"]
+    )
+    assert selection.models == []
+    assert selection.skipped[0]["reason"] == "not_a_model"
+    assert "lists versions 1, 2" in selection.skipped[0]["detail"]
 
 
 # --- what is proposed -------------------------------------------------------------

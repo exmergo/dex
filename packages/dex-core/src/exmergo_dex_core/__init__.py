@@ -94,6 +94,7 @@ _EXPORTS = {
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
     "MissingPackagesError": "transform.build",
+    "ModelVersionError": "transform.model_versions",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
     "OssieDependencyError": "ossie.loader",
@@ -218,6 +219,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .transform.artifact_runtime import IncompatibleArtifactsError
     from .transform.build import MissingPackagesError
     from .transform.evidence import BuildEvidenceError
+    from .transform.model_versions import ModelVersionError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -279,6 +281,7 @@ __all__ = [
     "MemoryStore",
     "MermaidDiagram",
     "MissingPackagesError",
+    "ModelVersionError",
     "NoBaselineError",
     "NoConnectorSelectedError",
     "OssieDependencyError",

@@ -280,6 +280,10 @@ class ProjectDefinitions(BaseModel):
     declared_keys: list[DeclaredKey] = Field(default_factory=list)
     declared_composite_keys: list[DeclaredCompositeKey] = Field(default_factory=list)
     model_relations: dict[str, str] = Field(default_factory=dict)
+    #: Each versioned model's bare name -> the label of the version an
+    #: unversioned ``ref()`` resolves to (its ``latest_version``), so a reader
+    #: that holds a bare name resolves it the way dbt does (#895).
+    version_defaults: dict[str, str] = Field(default_factory=dict)
     source_relations: dict[str, str] = Field(default_factory=dict)
     primary_entities: dict[str, str] = Field(default_factory=dict)
     declared_grains: dict[str, list[str]] = Field(default_factory=dict)

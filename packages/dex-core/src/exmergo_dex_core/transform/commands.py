@@ -323,7 +323,11 @@ def plan(
             "skeleton"
         )
 
+    from . import model_versions as versions_mod
+
     parse_notes: list[str] = []
+    version_report: dict[str, Any] | None = None
+    version_notes: list[str] = []
     has_delete = any(e.op is EditOp.DELETE for e in edits)
     # dbt's own parser is a far better gate than a regex on the two kinds whose
     # shape it fully owns: it resolves a snapshot's config against the project
@@ -381,14 +385,26 @@ def plan(
         # hard gate; the parse below is the authoritative backstop.
         if has_delete:
             plans_mod.validate_deletions(view, edits)
+        # Native model versions (#859): what dbt would build wrong or drop
+        # silently is refused here, before the parse, since dbt only warns
+        # about a version with no file. What survives is confirmed against the
+        # parse's own manifest below.
+        version_report, version_notes = versions_mod.analyze(view, edits)
         # After the guards above, because a derivation is checked by dbt's
         # parse of a copy of the project with these edits in it.
         derived = _derive_semantic(engine, view, edits)
         edits = derived.edits
         semantic_proposal = derived.proposal
         derivation_notes = derived.warnings
-        if has_delete or parser_owned or derived.parse is not None:
-            if derived.parse is not None:
+        if (
+            has_delete
+            or parser_owned
+            or derived.parse is not None
+            or version_report is not None
+        ):
+            if derived.parse is not None and (
+                version_report is None or "manifest" in derived.parse
+            ):
                 # The derivation's own parse covered exactly these edits.
                 parse_result = derived.parse
             elif blocker := _unparseable_reason(view, edits):
@@ -402,7 +418,10 @@ def plan(
                 # whole plan: the parse either runs or degrades to a warning.
                 assert_packages_installed(project, unverifiable_is_fatal=False)
                 parse_result = shadow_parse(
-                    project, edits, target=engine.config.dbt_target
+                    project,
+                    edits,
+                    target=engine.config.dbt_target,
+                    keep_manifest=version_report is not None,
                 )
             if not parse_result["available"]:
                 parse_notes.append(parse_result["reason"])
@@ -413,11 +432,17 @@ def plan(
                 )
             elif parse_result["messages"]:
                 parse_notes = [f"dbt: {m}" for m in parse_result["messages"]]
+            if version_report is not None:
+                version_notes.extend(
+                    _confirm_versions(version_report, parse_result, view.project_name)
+                )
 
     result = _make_plan(engine, intent, edits)
     result.warnings.extend(scaffold_notes)
     result.warnings.extend(declaration_notes)
     result.warnings.extend(parse_notes)
+    result.warnings.extend(version_notes)
+    result.model_versions = version_report
     result.warnings.extend(derivation_notes)
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
@@ -428,6 +453,47 @@ def plan(
     _contradiction_warnings(result)
     _offer_refactor_comparison(engine, result, edits)
     return result
+
+
+def _confirm_versions(
+    report: dict[str, Any], parse_result: dict[str, Any], package: str
+) -> list[str]:
+    """Hold a plan's version report to dbt's parse of the post-change project.
+
+    ``unchecked`` with a reason where there was no parse to read (dbt or a
+    profile missing, or a project dbt cannot parse for an unrelated reason);
+    a parse by a dbt with no model versions is refused by name.
+    """
+
+    from . import model_versions as versions_mod
+
+    if not parse_result.get("available"):
+        reason = str(parse_result.get("reason") or "")
+        code = (
+            "dbt_unavailable"
+            if "not installed" in reason
+            else "no_profile"
+            if "profiles" in reason
+            else "parse_skipped"
+        )
+        versions_mod.unchecked(report, code, reason)
+        return []
+    manifest = parse_result.get("manifest")
+    if not isinstance(manifest, dict):
+        versions_mod.unchecked(
+            report,
+            "manifest_unreadable",
+            "dbt parsed the project, and its manifest could not be read",
+        )
+        return []
+    supported, version = versions_mod.dbt_version_supported(manifest)
+    if not supported:
+        raise versions_mod.ModelVersionError(
+            f"dbt {version} parsed this project, and model versions need dbt "
+            f"{'.'.join(map(str, versions_mod.MIN_DBT))} or later"
+        )
+    lines = versions_mod.confirm(report, manifest, package)
+    return [f"dbt's parse disagrees with the plan's versions: {line}" for line in lines]
 
 
 def _has_dbt_project(engine: DexEngine) -> bool:
@@ -610,10 +676,12 @@ def _draft(
     exception rather than a plan that fails to exist.
     """
 
+    from ..model_versions import cached_version_map, label_for_file
     from . import declarations as declarations_mod
     from . import drafting
 
     files = declarations_mod.post_change_files(view, edits)
+    versions = cached_version_map(files, view.model_paths)
     models = set(declared)
     for edit in edits:
         if (
@@ -621,7 +689,8 @@ def _draft(
             and edit.op is EditOp.UPSERT
             and edit.path.endswith(".sql")
         ):
-            models.add(Path(edit.path).stem)
+            # A version's file is drafted under the version's label (#895).
+            models.add(label_for_file(edit.path, versions) or Path(edit.path).stem)
     if not models:
         return {}, []
 
@@ -1423,8 +1492,7 @@ def declare(
         )
     common: dict[str, Any] = {
         "selector": selector,
-        "selected_count": len(selection.models)
-        + sum(1 for s in selection.skipped if s["reason"] == "versioned"),
+        "selected_count": len(selection.models),
         "proposed": [p.as_dict() for p in outcome.proposals],
         "skipped": skipped,
         "elided_count": len(outcome.elided),
@@ -3912,6 +3980,7 @@ def _build_project(
             artifact_directory=artifacts_dir,
             invocation_id=logged_id,
             retirement=_plan_retirement(engine, for_plan, for_plan_document),
+            plan_edits=_plan_edits(engine, for_plan, for_plan_document),
         )
         return _shape_build_result(
             summary,
@@ -4061,6 +4130,7 @@ def _build_project(
         artifact_directory=artifacts_dir,
         invocation_id=logged_id,
         retirement=_plan_retirement(engine, for_plan, for_plan_document),
+        plan_edits=_plan_edits(engine, for_plan, for_plan_document),
     )
     decisions = _with_retirement(
         _built_decisions(engine, summary),
@@ -4108,6 +4178,22 @@ def _build_project(
     )
 
 
+def _plan_edits(
+    engine: DexEngine, for_plan: str | None, for_plan_document: Any
+) -> list[PlanEdit] | None:
+    """The edits of the plan this build answers for, to judge its versions (#859)."""
+
+    with contextlib.suppress(Exception):
+        if for_plan:
+            store = engine.require_full_store("reading a plan")
+            return list(store.load_plan(for_plan).edits)
+        if for_plan_document is not None:
+            from .portable import verify_plan_document
+
+            return list(verify_plan_document(for_plan_document).edits)
+    return None
+
+
 def _plan_retirement(
     engine: DexEngine, for_plan: str | None, for_plan_document: Any
 ) -> dict[str, Any] | None:
@@ -4134,6 +4220,7 @@ def _verify_build(
     artifact_directory: Path | None = None,
     invocation_id: str | None = None,
     retirement: dict[str, Any] | None = None,
+    plan_edits: list[PlanEdit] | None = None,
 ) -> BuildVerification:
     """The sweep, or the statement that it did not run.
 
@@ -4173,6 +4260,7 @@ def _verify_build(
             summary,
             resolve_adapter=opener,
             retirement=retirement,
+            plan_edits=plan_edits,
         )
     with pinned_artifacts(artifact_directory, invocation_id):
         return verify_build(
@@ -4181,6 +4269,7 @@ def _verify_build(
             summary,
             resolve_adapter=opener,
             retirement=retirement,
+            plan_edits=plan_edits,
         )
 
 
@@ -5679,7 +5768,7 @@ def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any
     except CacheUnreadableError:
         cache = None
     try:
-        return semantic_hook.derive(
+        outcome = semantic_hook.derive(
             engine,
             view,
             edits,
@@ -5687,6 +5776,12 @@ def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any
             cache=cache,
             dialect=get_dialect(engine.connector or engine.config.connector),
         )
+        outcome.warnings.extend(
+            semantic_hook.versioned_marts(
+                view, edits, models, engine.config.transform.marts_paths
+            )
+        )
+        return outcome
     except Exception as exc:
         # Total for the same reason drafting is: nothing was added to the plan
         # yet, so a defect here costs the proposal and nothing else.

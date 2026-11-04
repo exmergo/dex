@@ -956,6 +956,17 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     restored = _package_models_restored(
         root, deleted_models, surviving.get("dbt_project.yml")
     )
+    # A file that goes while the post-change `versions:` keeps its name
+    # referable (`dim_teams.sql` renamed to `dim_teams_v1.sql` under a
+    # versioned `dim_teams`) leaves every `ref('dim_teams')` resolving (#859).
+    from ..model_versions import version_map
+
+    still_versioned = {
+        base
+        for base, model in version_map(surviving, view.model_paths).items()
+        if any(item.file is not None for item in model.versions)
+    }
+    deleted_models -= still_versioned
     danglers: dict[str, list[str]] = {}
     for model in sorted(deleted_models):
         for kind in ("model", "seed", "snapshot"):
@@ -1065,6 +1076,8 @@ def column_contract_warnings(
         if edit.kind is EditKind.SCHEMA_YML and edit.new_content is not None:
             schema_sources[edit.path] = edit.new_content
 
+    from ..model_versions import entry_variants
+
     declared_by_model: dict[str, list[str]] = {}
     for content in schema_sources.values():
         try:
@@ -1073,22 +1086,30 @@ def column_contract_warnings(
             continue
         if not isinstance(parsed, dict):
             continue
-        for entry in parsed.get("models") or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
+        # A version is held to its own columns, the shared ones its
+        # include/exclude admits plus its own (#859).
+        variants = [
+            variant
+            for raw in parsed.get("models") or []
+            if isinstance(raw, dict)
+            for variant in entry_variants(raw)
+        ]
+        for name, entry in variants:
             columns = [
                 column["name"]
                 for column in entry.get("columns") or []
                 if isinstance(column, dict) and isinstance(column.get("name"), str)
             ]
             if columns:
-                declared_by_model[entry["name"]] = columns
+                declared_by_model[name] = columns
 
     from ..dbt_project import column_contract_divergence
+    from ..model_versions import cached_version_map, label_for_file
     from .select_list import resolve_select_list
 
     warnings: list[str] = []
     catalog = _ProjectCatalog(edits, view, schema_sources, cache, dialect)
+    versions = cached_version_map(catalog.files, view.model_paths)
     for edit in edits:
         if (
             edit.kind is not EditKind.MODEL_SQL
@@ -1096,7 +1117,7 @@ def column_contract_warnings(
             or edit.new_content is None
         ):
             continue
-        model = Path(edit.path).stem
+        model = label_for_file(edit.path, versions) or Path(edit.path).stem
         declared = declared_by_model.get(model)
         if not declared:
             continue
@@ -1165,7 +1186,14 @@ class _ProjectCatalog:
         self.schema_sources = schema_sources
         self.cache = cache
         self.dialect = dialect
+        from ..model_versions import cached_version_map, label_for_file
+
+        vmap = cached_version_map(self.files, self.model_paths)
         self.changed = {
+            (label_for_file(edit.path, vmap) or Path(edit.path).stem).lower()
+            for edit in edits
+            if edit.kind is EditKind.MODEL_SQL
+        } | {
             Path(edit.path).stem.lower()
             for edit in edits
             if edit.kind is EditKind.MODEL_SQL
@@ -1180,10 +1208,10 @@ class _ProjectCatalog:
 
         inner: str | None = None
         if relation.kind == "ref" and len(relation.parts) == 1:
-            model = relation.name.lower()
+            model = relation.label.lower()
             if model in stack:
                 return RelationColumns(reason=f"a ref() cycle through {relation.name}")
-            path = model_sql_path(self.files, self.model_paths, relation.name)
+            path = model_sql_path(self.files, self.model_paths, relation.label)
             if path is not None:
                 resolved = resolve_select_list(
                     self.files[path],

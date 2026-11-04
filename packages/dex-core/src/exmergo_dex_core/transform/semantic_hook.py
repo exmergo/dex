@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .. import model_versions as mv
 from .plans import PlanEdit
 
 if TYPE_CHECKING:
@@ -71,8 +72,13 @@ def candidates(
 
     marts_paths = list(marts_paths)
     files = declarations_mod.post_change_files(view, edits)
+    vmap = mv.cached_version_map(files, view.model_paths)
     found: list[tuple[str, str, dict[str, Any]]] = []
     for model in sorted(set(models)):
+        if mv.resolve(model, vmap):
+            # A version is not derived (#895): a semantic model sits on one
+            # `ref()`, and two versions of one mart would each claim its name.
+            continue
         sql_path = declarations_mod.model_sql_path(files, view.model_paths, model)
         if sql_path is None or not in_marts(sql_path, marts_paths):
             continue
@@ -80,6 +86,41 @@ def candidates(
         if declares_something(declared):
             found.append((model, sql_path, declared))
     return files, found
+
+
+def versioned_marts(
+    view: DbtProjectView,
+    edits: list[PlanEdit],
+    models: Iterable[str],
+    marts_paths: Iterable[str],
+) -> list[str]:
+    """One note per declared mart version a semantic model was not derived for."""
+
+    from . import declarations as declarations_mod
+    from . import drafting
+    from .semantic_derivation import declares_something, in_marts
+
+    marts_paths = list(marts_paths)
+    files = declarations_mod.post_change_files(view, edits)
+    vmap = mv.cached_version_map(files, view.model_paths)
+    labels = sorted(
+        {label for model in set(models) for label in mv.resolve(model, vmap) or []}
+    )
+    skipped: dict[str, list[str]] = {}
+    for label in labels:
+        sql_path = declarations_mod.model_sql_path(files, view.model_paths, label)
+        if sql_path is None or not in_marts(sql_path, marts_paths):
+            continue
+        if declares_something(drafting.read_declared(files, label)):
+            skipped.setdefault(mv.split_label(label)[0], []).append(label)
+    return [
+        f"no semantic model was derived for {', '.join(names)}: "
+        + ("they are versions" if len(names) > 1 else "it is a version")
+        + f" of the versioned mart '{base}', and a semantic model sits on one "
+        "`ref()`. Author it with `semantic plan`, naming the version in "
+        "`model: ref(...)`"
+        for base, names in skipped.items()
+    ]
 
 
 def derive(

@@ -357,8 +357,31 @@ def _untoken(value: Any, tokens: Mapping[str, str]) -> Any:
 
 
 def read_declared(files: Mapping[str, str], model: str) -> dict[str, Any]:
-    """What the model's YAML entry declares, in the declaration's own shape."""
+    """What the model's YAML entry declares, in the declaration's own shape.
 
+    A version (its label ``dim_teams.v2``, or the file stem that builds it) is
+    read from its effective entry, the shared entry merged with the version's
+    the way dbt merges them (#895); the bare name of a versioned model is its
+    shared top-level entry.
+    """
+
+    from .. import model_versions as mv
+
+    vmap = mv.cached_version_map(files)
+    base, version = mv.split_label(model)
+    if version is not None and mv.lookup(vmap, base) is not None:
+        label: str | None = model
+    elif mv.lookup(vmap, model) is not None:
+        label = None
+    else:
+        label = mv.label_for_stem(model, vmap)
+    if label is not None:
+        base, version = mv.split_label(label)
+        versioned = mv.lookup(vmap, base)
+        item = versioned.version(version) if versioned and version else None
+        if versioned is None or item is None:
+            return {}
+        return _declared_from(mv.effective_entry(versioned.entry, item.item))
     for path in sorted(files):
         if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
             continue

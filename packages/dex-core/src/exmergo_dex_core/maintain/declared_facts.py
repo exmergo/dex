@@ -159,18 +159,28 @@ def plan(
         if isinstance(column, str) and isinstance(attached, str):
             unique_tested.setdefault(attached, set()).add(column.lower())
 
+    # A parent is named the way `ref()` names it: a version label
+    # (`dim_teams.v2`) is that version, and the bare name of a versioned model
+    # is the version an unversioned `ref()` resolves to, its `latest_version`
+    # (#895), never whichever version the manifest happens to list first.
     relations_by_name: dict[str, str] = {}
-    for node in nodes.values():
-        if (
+    for uid, node in nodes.items():
+        if not (
             isinstance(node, dict)
             and node.get("resource_type") in ("model", "seed", "snapshot")
             and isinstance(node.get("name"), str)
             and isinstance(node.get("relation_name"), str)
             and node["relation_name"]
         ):
-            relations_by_name.setdefault(
-                node["name"].lower(), strip_relation_quoting(node["relation_name"])
-            )
+            continue
+        relation = strip_relation_quoting(node["relation_name"])
+        version = node.get("version")
+        if node.get("resource_type") == "model" and version not in (None, ""):
+            relations_by_name[manifest_node_label(uid, node).lower()] = relation
+            if str(version) == str(node.get("latest_version")):
+                relations_by_name[node["name"].lower()] = relation
+            continue
+        relations_by_name.setdefault(node["name"].lower(), relation)
 
     snapshots = temporal_mod.snapshot_nodes(nodes, project_dir)
 
