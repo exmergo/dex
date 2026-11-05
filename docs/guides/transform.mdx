@@ -185,7 +185,9 @@ table is empty. State it with a `toggle` key beside the edits in the
             "columns": ["fee_amount"], "exempt_models": ["stg_orders"]}}
 ```
 
-Dex compiles every model at each value, with no rows read, and `data.toggle`
+Dex compiles every model at each value without probing any table's rows (a
+compile-time macro such as `run_query` can still query the warehouse), and
+`data.toggle`
 names each model that still outputs a governed column with the flag off or loses
 one with it on. `transform compare` checks the on value against today's results.
 After `transform build --verify --for-plan <plan-id>`,

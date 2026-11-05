@@ -2146,7 +2146,57 @@ def test_gating_only_the_order_models_leaves_fees_in_the_ledger_and_empty_report
     assert score.status == "scored"
     assert _failed(score) == [
         "fees_off: no reporting model exposes a fee column",
-        "fees_off: the empty dispute report keeps its other columns",
+        "fees_off: the empty dispute report has exactly its other columns",
+        "fees_off: the ledger has exactly its other columns",
+    ]
+
+
+_LEDGER_GATED = """select
+    posted_on,
+    account,
+    {columns}
+    {{% if var('enable_platform_fees') %}}
+    , sum(fee_amount) as total_fees
+    {{% endif %}}
+from {{{{ ref('stg_ledger_postings') }}}}
+group by posted_on, account
+"""
+
+
+@needs_dbt
+def test_a_staging_fee_column_passed_through_off_is_caught(tmp_path):
+    """Hiding the fee total while passing the staging fee column through, under
+    a name the six reporting names do not include, still fails the off build."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/ledger_daily.sql": _LEDGER_GATED.format(
+                columns="count(*) as posting_count, sum(amount) as total_amount,\n"
+                "    max(fee_amount) as fee_amount"
+            )
+        },
+    )
+    assert "fees_off: no reporting model exposes a fee column" in _failed(score)
+    assert "fees_off: the ledger has exactly its other columns" in _failed(score)
+
+
+@needs_dbt
+def test_dropping_an_unrelated_column_fails_on_both_values(tmp_path):
+    """Every row check passes and the fee columns behave; the ledger lost a
+    column the request keeps, which only the column sets show."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/ledger_daily.sql": _LEDGER_GATED.format(
+                columns="sum(amount) as total_amount"
+            )
+        },
+    )
+    assert sorted(_failed(score)) == [
+        "fees_off: the ledger has exactly its other columns",
+        "fees_on: the ledger has exactly its fee and other columns",
     ]
 
 
@@ -2168,6 +2218,7 @@ def test_dropping_the_fees_outright_fails_the_on_value(tmp_path):
     assert sorted(_failed(score)) == [
         "fees_on: every reporting fee column is there",
         "fees_on: ledger fees match the postings",
+        "fees_on: the ledger has exactly its fee and other columns",
         "the default keeps every fee column",
     ]
 
@@ -2200,15 +2251,29 @@ def test_a_default_of_off_changes_todays_deployments(tmp_path):
         # Checked only after the change went in.
         ([("apply", None), ("plan", "satisfied")], False),
         ([("plan", "satisfied")], False),
+        # A toggled plan A, then an untoggled plan B that is the one applied.
+        ([("plan", "satisfied", "A"), ("plan", "absent", "B"), ("apply", "B")], False),
+        ([("plan", "satisfied", "A"), ("plan", "absent", "B"), ("apply", None)], False),
+        # The apply names the toggled plan, with another planned after it.
+        ([("plan", "satisfied", "A"), ("plan", "absent", "B"), ("apply", "A")], True),
+        # A refused plan stores nothing, so an apply with no id writes the
+        # earlier one.
+        ([("plan", "satisfied", "A"), ("plan", "error"), ("apply", None)], True),
+        ([("plan", "error"), ("apply", None)], False),
+        # The apply names a plan whose result was hidden.
+        ([("plan", "absent", "A"), ("plan", None), ("apply", "X")], True),
     ],
 )
 def test_a_toggle_check_must_precede_the_apply(calls, passed):
     from evals.metadata.score import procedure_steps
 
-    def call(verb, *toggle):
+    def call(verb, *details):
         entry = {"label": f"transform {verb}", "flags": []}
-        if verb == "plan" and toggle:
-            entry["toggle"] = toggle[0]
+        if verb == "plan" and details:
+            entry["toggle"] = details[0]
+            entry["plan_id"] = details[1] if len(details) > 1 else None
+        if verb == "apply":
+            entry["plan"] = details[0] if details else None
         return entry
 
     graded = procedure_steps(
@@ -2228,9 +2293,21 @@ def test_a_toggle_check_must_precede_the_apply(calls, passed):
         ('{"status": "ok", "data": {"plan_id": "p1", "paths": []}}', "absent"),
         ("satisfied", None),
         ("", None),
+        ('{"status": "error", "errors": ["toggle needs off_value"]}', "error"),
     ],
 )
 def test_a_plans_toggle_verdict_is_read_from_its_result(text, expected):
     from evals.metadata.live import _plan_toggle
 
     assert _plan_toggle({"content": text}) == expected
+
+
+def test_a_readable_plan_failure_is_not_a_hidden_result():
+    from evals.metadata.live import _plan_id, _plan_toggle
+
+    assert _plan_toggle({"content": "Error: invalid toggle", "is_error": True}) == (
+        "error"
+    )
+    assert _plan_id({"content": '{"data": {"plan_id": "20261105-ab12"}}'}) == (
+        "20261105-ab12"
+    )

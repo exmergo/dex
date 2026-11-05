@@ -379,3 +379,23 @@ def test_the_plan_document_carries_the_toggle(repo: Path, capsys) -> None:
     from exmergo_dex_core.transform.portable import plan_digest
 
     assert plan_digest(tampered) != plan_digest(document)
+
+
+def test_a_failed_analysis_keeps_the_plan_and_its_contract(
+    repo: Path, capsys, monkeypatch
+) -> None:
+    """The plan is stored before the analysis runs, so an analysis that raises
+    reports unchecked and leaves the contract on the plan for a later build."""
+
+    from exmergo_dex_core.transform import toggle as toggle_mod
+
+    def broken(*_args, **_kwargs):
+        raise KeyError("boom")
+
+    monkeypatch.setattr(toggle_mod, "analyze", broken)
+    out = _plan(repo, capsys, GATED)
+    assert out["status"] == "ok", out
+    assert out["data"]["toggle"]["verdict"] == "unchecked"
+    assert "KeyError" in out["data"]["toggle"]["limits"][0]
+    exported = _run(repo, capsys, "transform", "export", out["data"]["plan_id"])
+    assert exported["data"]["plan"]["toggle"]["variable"] == FLAG

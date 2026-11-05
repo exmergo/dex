@@ -151,7 +151,8 @@ See the cost-controls reference for the shared budget mechanism.
   (`variable`, `on_value`, `off_value`, `columns`, `exempt_models`, `packages`,
   `assumptions`). It is the one command that takes one. Every model of the
   project is compiled in a throwaway copy at each value, and the tree before the
-  plan at `on_value`. No row is read. Returned fields:
+  plan at `on_value`. No check probes a table's rows; compiling can still query
+  the warehouse where a macro does (`run_query`). Returned fields:
   - `verdict`: `satisfied`, `contradicted` or `unchecked`.
   - `completeness` and `limits`, for example a `var()` read whose name is not a
     literal.

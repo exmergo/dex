@@ -497,7 +497,6 @@ def _toggle_contract(
     """
 
     from ..dbt_project import load as load_project
-    from ..errors import DexError
     from ..guards.cost_guard import CostGuardError
     from ..maintain import verify as verify_mod
     from . import toggle as toggle_mod
@@ -519,7 +518,10 @@ def _toggle_contract(
         )
     except CostGuardError:
         raise
-    except (DexError, ValueError, OSError) as exc:
+    except Exception as exc:
+        # The build has run and been billed, so verification reports what it
+        # could not judge rather than failing the command (a driver error from
+        # `list_objects()` included), as the other phases do.
         result.suppressed["toggle"] = (
             f"the toggle contract could not be read ({type(exc).__name__})"
         )

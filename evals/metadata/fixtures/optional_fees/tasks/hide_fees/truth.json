@@ -62,7 +62,7 @@
     {
       "name": "the default keeps every fee column",
       "expect": 6,
-      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'fee_amount', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
     }
   ],
   "var_builds": [
@@ -75,7 +75,27 @@
         {
           "name": "every reporting fee column is there",
           "expect": 6,
-          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'fee_amount', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+        },
+        {
+          "name": "the order fact has exactly its fee and other columns",
+          "expect": "gross_amount,merchant_id,net_amount,order_id,ordered_on,platform_fee",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'fct_orders'"
+        },
+        {
+          "name": "the merchant report has exactly its fee and other columns",
+          "expect": "gross_revenue,merchant_id,net_revenue,order_count,platform_fees",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_merchant_revenue'"
+        },
+        {
+          "name": "the empty dispute report has exactly its fee and other columns",
+          "expect": "dispute_id,disputed_fee,merchant_id,opened_on,order_id",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_fee_disputes'"
+        },
+        {
+          "name": "the ledger has exactly its fee and other columns",
+          "expect": "account,posted_on,posting_count,total_amount,total_fees",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'ledger_daily'"
         },
         {
           "name": "platform fees match the orders",
@@ -133,17 +153,27 @@
         {
           "name": "no reporting model exposes a fee column",
           "expect": 0,
-          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'fee_amount', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
         },
         {
-          "name": "the empty dispute report keeps its other columns",
-          "expect": 4,
-          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_fee_disputes'"
+          "name": "the order fact has exactly its other columns",
+          "expect": "gross_amount,merchant_id,order_id,ordered_on",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'fct_orders'"
         },
         {
-          "name": "the order fact keeps its other columns",
-          "expect": 4,
-          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'fct_orders'"
+          "name": "the merchant report has exactly its other columns",
+          "expect": "gross_revenue,merchant_id,order_count",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_merchant_revenue'"
+        },
+        {
+          "name": "the empty dispute report has exactly its other columns",
+          "expect": "dispute_id,merchant_id,opened_on,order_id",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_fee_disputes'"
+        },
+        {
+          "name": "the ledger has exactly its other columns",
+          "expect": "account,posted_on,posting_count,total_amount",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'ledger_daily'"
         },
         {
           "name": "every order is reported",

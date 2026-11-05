@@ -501,10 +501,23 @@ def _check_toggle(
     variable, contract = stated
     project = Path(engine.project_dir())
     view = load_project(project)
+    from ..guards.cost_guard import CostGuardError
+
     store = engine.require_full_store("recording a toggle contract")
     stored = store.load_plan(result.plan_id)
     form = toggle_mod.stored_form(variable, contract)
-    analysis = toggle_mod.analyze(engine, stored, project, view, variable, contract)
+    # The contract is recorded before the analysis runs: the plan is already
+    # stored, so a defect in the analysis must neither turn it into an error nor
+    # leave it carrying no contract for apply and a `--for-plan` build to read.
+    form["producers"] = {}
+    stored.toggle = form
+    store.save_plan(stored)
+    try:
+        analysis = toggle_mod.analyze(engine, stored, project, view, variable, contract)
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        analysis = toggle_mod.analysis_failed(type(exc).__name__)
     # The producers travel with the contract, so a `--for-plan` build (or a
     # plan document) can hold the on branch to them without compiling again.
     form["producers"] = analysis.get("producers") or {}

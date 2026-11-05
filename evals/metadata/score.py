@@ -767,6 +767,31 @@ def _compared_the_apply(
     return not any(compare < i < last for i in applies)
 
 
+def _toggled_the_apply(
+    calls: list[dict[str, Any]], plans: list[int], last: int
+) -> bool:
+    """Whether the plan the last apply wrote carried a toggle check (#1113).
+
+    The plan is the one whose recorded ``plan_id`` the apply names. Where the
+    apply names none, or names one no readable plan result recorded, it is the
+    latest plan before the apply that stored a plan (a refused plan stores
+    none), as an apply with no id resolves the latest unapplied plan. A toggle
+    on an earlier plan that was never applied does not count.
+    """
+
+    stored = [i for i in plans if i < last and calls[i].get("toggle") != "error"]
+    applied = calls[last].get("plan")
+    named = [i for i in stored if applied and calls[i].get("plan_id") == applied]
+    if not named and applied:
+        # The apply names a plan no readable result recorded: only a plan whose
+        # id the transcript hid can be it.
+        named = [i for i in stored if calls[i].get("plan_id") is None]
+    candidates = named or ([] if applied else stored)
+    if not candidates:
+        return False
+    return calls[candidates[-1]].get("toggle", "absent") not in ("absent", "error")
+
+
 def procedure_steps(
     truth: dict[str, Any] | None, calls: list[dict[str, Any]] | None
 ) -> dict[str, Any] | None:
@@ -801,13 +826,14 @@ def procedure_steps(
       ``transform apply``, so the tests that were measured are the ones that
       ship (#1112). Measuring, strengthening and stopping leaves the strengthened
       tests unmeasured, so it is a miss.
-    - ``toggle_contract_before_apply``: a ``transform plan`` whose result carried
-      a ``toggle`` check precedes the last ``transform apply``, so the change was
-      held on both values of its flag in every model before it went in
-      (#1113). Read from the call's ``toggle`` (see ``live._plan_toggle``); a
-      plan whose result the agent's own pipe hid is given the benefit of the
-      doubt, as a hidden comparison verdict is, and one whose readable result
-      carried no toggle is a miss.
+    - ``toggle_contract_before_apply``: the plan the last ``transform apply``
+      wrote carried a ``toggle`` check, so the change that went in was held on
+      both values of its flag in every model (#1113). The plan is matched by
+      the id the apply names, or else is the latest stored plan before it (see
+      ``_toggled_the_apply``). Read from the call's ``toggle`` (see
+      ``live._plan_toggle``): a plan whose result the agent's own pipe hid is
+      given the benefit of the doubt, as a hidden comparison verdict is; a
+      readable result with no toggle, or a failed plan, is a miss.
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
@@ -841,9 +867,8 @@ def procedure_steps(
         )
     if "toggle_contract_before_apply" in required:
         plans = [i for i, label in enumerate(labels) if label == "transform plan"]
-        results["toggle_contract_before_apply"] = bool(applies) and any(
-            i < applies[-1] and calls[i].get("toggle", "absent") != "absent"
-            for i in plans
+        results["toggle_contract_before_apply"] = bool(applies) and _toggled_the_apply(
+            calls, plans, applies[-1]
         )
     if "mutate_after_tests" in required:
         results["mutate_after_tests"] = bool(applies) and any(

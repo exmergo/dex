@@ -7,7 +7,7 @@ see either. `transform plan` now takes a `toggle` contract beside the edits:
 `variable`, `on_value`, `off_value` (both required, never read off a default),
 the governed `columns` and any `exempt_models`. `data.toggle` compiles every
 model of the project in a throwaway copy at each value, and the tree before the
-plan at the on value, with no row read. It names each model that still outputs
+plan at the on value, probing no table's rows. It names each model that still outputs
 or reads a governed column with the flag off, loses one with it on, or loses or
 varies a column the toggle does not govern, with a `verdict`, `completeness`,
 `contract.producers` and the package readers it leaves out of scope.

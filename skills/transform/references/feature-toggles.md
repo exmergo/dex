@@ -19,16 +19,20 @@ passes; only its columns are.
 ## 1. Find every producer before writing anything
 
 ```bash
-dex transform references fee_amount fees --kind column
-dex transform references <flag> --kind var
+dex transform references fee_amount fees --kind column --full
+dex transform references <flag> --kind var --full
 ```
 
 The first lists every model, YAML entry and semantic definition that names a
 governed column, across the whole project, connected to the mart or not. The
-second lists the flag's existing reads, if it already exists. Read
-`data.completeness`: `incomplete` with `data.limits` means some files could not
-be read, so the list may be short. Dex re-checks this from compiled SQL in step 3
-either way; the search tells you what to edit.
+second lists the flag's existing reads, if it already exists. `--full` lifts
+the cap of 200 occurrences and 50 files; without it the answer can stop short
+with no file named. Read `data.completeness` and `data.limits`: `incomplete`
+means some files could not be read, so the list may be short. Resolve each entry
+under `data.indeterminate` by reading its line, since it may or may not name
+what you asked about. Dex re-checks the models from compiled SQL in step 3; it
+does not re-check tests or semantic definitions, so the search is what finds
+those.
 
 ## 2. Write the gated edits, with a `toggle` contract
 
@@ -73,7 +77,10 @@ dropping it unread, and a payload cannot carry `toggle` and `retirement` togethe
 
 Dex compiles **every model of the project** in a throwaway copy three times: the
 proposal at `on_value`, the proposal at `off_value`, and the tree before the plan
-at `on_value`. No row is read, so an empty table is judged like a full one.
+at `on_value`. The checks read compiled SQL and never probe a table's rows, so an
+empty table is judged like a full one. Compiling can still query the warehouse
+where a macro does (`run_query` and other introspective macros), which a
+metered connector bills.
 `models[]` lists each producer and each model with a problem, with its columns on
 each value under `branches` (`"disabled"` where the model is off at that value);
 the rest are counted in `models_clean`. `contract.producers` is every model that
@@ -86,7 +93,7 @@ outputs a governed column with the flag on.
 | `governed_column_lost_when_on` | With the flag on, the model no longer outputs a governed column it outputs today | The on branch must keep today's behavior |
 | `ungoverned_column_lost` | A column the toggle does not govern is gone on either value | Keep it, or add it to `columns` |
 | `ungoverned_columns_differ` | The two values output different non-governed columns | Same as above |
-| `branch_compile_failed` | The project does not compile at one value (a dangling ref, a missing column in a join) | Fix that branch |
+| `branch_compile_failed` | The project does not compile at one value (for example, a dangling ref) | Fix that branch |
 
 `verdict: satisfied` needs every record satisfied **and** `completeness: complete`.
 `unchecked` is not clean. A record carries `reason_code` `unreadable_select` (a
@@ -136,8 +143,8 @@ and the toggle record judges it instead. Every record reaches
 `data.completion.obligations`.
 
 To build the other value on dev, flip the flag's value in `dbt_project.yml`
-through a reviewed plan that carries the same `toggle`, build with `--verify
---for-plan` again, and flip it back the same way. There is no `--vars` on
+through a reviewed plan that carries the same `toggle`, then build again with
+`--verify` and `--for-plan`, and flip it back the same way. There is no `--vars` on
 `transform build`.
 
 ## What this does not establish

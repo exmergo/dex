@@ -71,12 +71,16 @@ class ToggleContract(_Strict):
     @field_validator("on_value", "off_value", mode="before")
     @classmethod
     def _scalar(cls, value: Any) -> Any:
+        """Refuse a list or a mapping where one flag value is expected."""
+
         if isinstance(value, (list, dict)):
             raise ValueError("a toggle value is one scalar value of the flag")
         return value
 
     @model_validator(mode="after")
     def _distinct(self) -> ToggleContract:
+        """Refuse equal on and off values and a column named twice."""
+
         if self.on_value == self.off_value and type(self.on_value) is type(
             self.off_value
         ):
@@ -162,6 +166,8 @@ def decisions(stored: Mapping[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def _files_after(view: DbtProjectView, edits: list[PlanEdit]) -> DbtProjectView:
+    """The project as it reads once ``edits`` land."""
+
     from .propagate import _project_after_edits
 
     return _project_after_edits(view, edits)
@@ -260,6 +266,8 @@ class _Model:
     """One model's compiled form in one branch."""
 
     def __init__(self, sql: str, relation: str | None, package: str, path: str) -> None:
+        """One model's compiled SQL, relation and file, with no columns read yet."""
+
         self.sql = sql
         self.relation = relation
         self.package = package
@@ -272,6 +280,8 @@ class _Branch:
     """Every project model compiled at one value, or why the compile failed."""
 
     def __init__(self) -> None:
+        """An empty branch: no models, nothing disabled, no failure."""
+
         self.models: dict[str, _Model] = {}
         self.disabled: set[str] = set()
         self.failure: str | None = None
@@ -282,6 +292,8 @@ _QUOTES = re.compile(r'["`\[\]]')
 
 
 def _relation_key(name: str) -> tuple[str, ...]:
+    """A compiled relation name as lowercase parts, quoting removed."""
+
     return tuple(
         part.strip().lower() for part in _QUOTES.sub("", name).split(".") if part
     )
@@ -331,6 +343,8 @@ def _compile_branch(
 
 
 def _read_manifest(branch: _Branch, manifest: Mapping[str, Any], project: str) -> None:
+    """Fill ``branch`` with this project's compiled and disabled models."""
+
     for uid, node in (manifest.get("nodes") or {}).items():
         if not uid.startswith("model.") or node.get("package_name") != project:
             continue
@@ -366,6 +380,8 @@ class _Catalog:
         dialect: str | None,
         cache: Callable[[], Any],
     ) -> None:
+        """Index every relation the branch's manifest names by its parts."""
+
         self.branch = branch
         self.view = view
         self.dialect = dialect
@@ -390,6 +406,8 @@ class _Catalog:
                 )
 
     def resolve(self, label: str, stack: frozenset[str] = frozenset()) -> None:
+        """Read ``label``'s output columns, following stars through ``_columns``."""
+
         from .select_list import resolve_select_list
 
         model = self.branch.models[label]
@@ -409,6 +427,8 @@ class _Catalog:
             model.reason = read.reason or "the SELECT list could not be read"
 
     def _lookup(self, parts: tuple[str, ...]) -> tuple[str, str] | None:
+        """The model, seed or cached relation a compiled name refers to, if unique."""
+
         key = tuple(p.lower() for p in parts)
         if key in self.by_relation:
             return self.by_relation[key]
@@ -420,6 +440,8 @@ class _Catalog:
         return found[0] if len(found) == 1 else None
 
     def _columns(self, relation: Any, stack: frozenset[str]) -> Any:
+        """The columns a star over ``relation`` reads, or why they are unknown."""
+
         from .select_list import RelationColumns
 
         found = self._lookup(tuple(relation.parts))
@@ -448,6 +470,8 @@ class _Catalog:
         return self._cached(where, str(relation))
 
     def _cached(self, name: str, shown: str) -> Any:
+        """A relation's columns from the cache, or a reason naming the profile."""
+
         from .drafting import dataset_for
         from .select_list import RelationColumns
 
@@ -482,16 +506,22 @@ def _identifiers(sql: str, dialect: str | None) -> set[str] | None:
 
 
 def _record(model: str) -> dict[str, Any]:
+    """A fresh record for ``model``, satisfied until a check says otherwise."""
+
     return {"model": model, "status": "satisfied", "checks": []}
 
 
 def _contradict(record: dict[str, Any], check: str, detail: str) -> None:
+    """Mark ``record`` contradicted by ``check``, keeping every check's detail."""
+
     record["status"] = "contradicted"
     record["finding"] = record.get("finding") or check
     record["checks"].append({"check": check, "detail": detail})
 
 
 def _uncheck(record: dict[str, Any], code: str, reason: str | None = None) -> None:
+    """Mark ``record`` unchecked with ``code``, never downgrading a contradiction."""
+
     if record["status"] != "contradicted":
         record["status"] = "unchecked"
     record.setdefault("reason_code", code)
@@ -551,6 +581,8 @@ def analyze(
     cached: list[Any] = []
 
     def cache() -> Any:
+        """The exploration cache, read once and only when a star needs it."""
+
         if not cached:
             cached.append(readable_cache(engine.store))
         return cached[0]
@@ -642,6 +674,8 @@ def _judge_model(
     contract: ToggleContract,
     producers: dict[str, list[str]],
 ) -> None:
+    """Run every toggle check on one model across the compiled branches."""
+
     on = branches["on"].models.get(label)
     off = branches["off"].models.get(label)
     before = branches["before"].models.get(label)
@@ -732,6 +766,8 @@ def _report(
     *,
     clean: int = 0,
 ) -> dict[str, Any]:
+    """The ``data.toggle`` report, its verdict computed from records and limits."""
+
     limits = list(dict.fromkeys(limits))
     verdict = (
         "contradicted"
@@ -752,6 +788,20 @@ def _report(
         "models": listed,
         "models_elided": max(0, len(records) - len(listed)),
     }
+
+
+def analysis_failed(reason: str) -> dict[str, Any]:
+    """The report for an analysis that raised: unchecked, never clean.
+
+    The plan is stored by then, so a failure here is reported as a limit on an
+    empty reading rather than as an error that would hide the stored plan.
+    """
+
+    report = _report([], [f"the toggle could not be analysed ({reason})"], [], 0)
+    report["producers"] = {}
+    report["exempt_models"] = []
+    report["package_scope"] = {}
+    return report
 
 
 def plan_warnings(variable: str, analysis: Mapping[str, Any]) -> list[str]:

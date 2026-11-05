@@ -362,3 +362,41 @@ def test_an_off_build_absorbs_the_documented_governed_columns() -> None:
     kept, notes = toggle.absorb_column_contract([missing(["fee_amount"])], stored, "on")
     assert len(kept) == 1
     assert notes == []
+
+
+def test_a_driver_error_while_verifying_is_reported_not_raised(tmp_path: Path) -> None:
+    """The build has run and been billed, so a driver error reading the warehouse
+    leaves the contract unchecked rather than failing the command."""
+
+    from exmergo_dex_core.transform.verify import BuildVerification, _toggle_contract
+
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0"\nprofile: shop\n', encoding="utf-8"
+    )
+
+    def broken_adapter():
+        raise RuntimeError("driver went away")
+
+    result = BuildVerification(ran=True)
+    stored = {**CONTRACT, "producers": {"fct": ["fee_amount"]}}
+    _toggle_contract(
+        tmp_path,
+        stored,
+        {"model.shop.fct": "fct"},
+        {"model.shop.fct"},
+        broken_adapter,
+        result,
+    )
+    assert "toggle" in result.suppressed
+    assert "RuntimeError" in result.suppressed["toggle"]
+    assert result.toggle == [
+        {"model": "fct", "status": "unchecked", "reason_code": "unreadable"}
+    ]
+
+
+def test_an_analysis_failure_reads_as_unchecked() -> None:
+    report = toggle.analysis_failed("KeyError")
+    assert report["verdict"] == "unchecked"
+    assert report["completeness"] == "incomplete"
+    assert report["producers"] == {}
+    assert "KeyError" in report["limits"][0]

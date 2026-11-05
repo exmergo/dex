@@ -123,7 +123,8 @@ class Session:
     #: ``plan`` (the literal id named, or ``None``), ``flags`` (the ``--flag``
     #: names the call passed, without their dashes or values, see ``_flags``)
     #: and, on a comparison, ``verdict`` (see ``_compare_verdict``), and on a
-    #: plan, ``toggle`` (see ``_plan_toggle``). A procedure step reads these.
+    #: plan, ``toggle`` and ``plan_id`` (see ``_plan_toggle``). A procedure step
+    #: reads these.
     dex_calls: list[dict[str, Any]] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
@@ -312,18 +313,33 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
 _TOGGLE = re.compile(r'"toggle"\s*:\s*\{[^{}]*?"verdict"\s*:\s*"(\w+)"')
 
 
+_PLAN_ID = re.compile(r'"plan_id"\s*:\s*"([\w.-]+)"')
+
+
 def _plan_toggle(block: dict[str, Any]) -> str | None:
     """What one ``transform plan`` said about a toggle contract (#1113): the
-    ``data.toggle`` verdict, ``absent`` when a readable plan result carried no
-    toggle, or ``None`` when the agent's pipe left nothing to read."""
+    ``data.toggle`` verdict, ``error`` when the plan failed (a tool error or an
+    error envelope, which stores no plan), ``absent`` when a readable plan
+    result carried no toggle, or ``None`` only when the agent's pipe left
+    nothing to read."""
 
     text = _result_text(block)
     found = _TOGGLE.findall(text)
     if found:
         return found[0]
-    if '"plan_id"' in text or _STATUS.findall(text):
+    statuses = _STATUS.findall(text)
+    if block.get("is_error") or "error" in statuses:
+        return "error"
+    if '"plan_id"' in text or statuses:
         return "absent"
     return None
+
+
+def _plan_id(block: dict[str, Any]) -> str | None:
+    """The plan id a ``transform plan`` result names, if it is readable."""
+
+    found = _PLAN_ID.findall(_result_text(block))
+    return found[0] if found else None
 
 
 _SURVIVED = re.compile(r'"survived"\s*:\s*(\d+)')
@@ -364,6 +380,7 @@ def summarize(
                     planned = pending_plans.pop(str(block.get("tool_use_id")), None)
                     if planned is not None:
                         planned["toggle"] = _plan_toggle(block)
+                        planned["plan_id"] = _plan_id(block)
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
             session.model = event.get("model")
