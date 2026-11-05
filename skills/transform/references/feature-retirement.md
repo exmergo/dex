@@ -149,6 +149,7 @@ What changes, and what does not:
 | Literal reads the scan found, reads in YAML | refused until edited | refused until edited |
 | Dynamic var reads in this project | refused until rewritten | listed under `data.retirement.discovery.dynamic_reads`, not refused |
 | `outputs` models | any | must be models this project defines; a package model or a misspelling is refused |
+| `metrics.removed` | any | must be metrics this project defines before the payload; a package metric or a misspelling is refused |
 | Models the payload rewrites | unchecked without an `outputs` entry | refused without one |
 | Global reference discovery | complete | `unchecked`, with `reason_code: discovery_incomplete` |
 

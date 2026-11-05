@@ -380,6 +380,20 @@ def validate_scope(
             "model is out of scope, since Dex never edits it). Name the project "
             "model that outputs the feature's columns, or fix the spelling"
         )
+    # A removed metric is judged absent after the payload, so one that never
+    # existed here (a misspelling, a package's) would pass without a check.
+    before = ReferenceIndex(view, scan_packages=False)
+    unknown = sorted(
+        name
+        for name in contract.metrics.removed
+        if not before.definitions_of(name, "metric")
+    )
+    if unknown:
+        raise ValueError(
+            f"a scoped retirement removes only metrics this project defines, and "
+            f"{', '.join(unknown)} is not one before this payload (a package's "
+            "metric is out of scope). Name the project metric, or fix the spelling"
+        )
     written = sorted(
         {
             Path(edit.path).stem

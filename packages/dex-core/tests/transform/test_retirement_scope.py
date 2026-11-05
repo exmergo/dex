@@ -290,6 +290,19 @@ def test_a_package_model_is_out_of_scope(root: Path):
         _validate(root, contract, _edit())
 
 
+def test_a_removed_metric_the_project_never_defined_is_refused(root: Path):
+    _write(root / "macros/unioned.sql", UNPARSEABLE)
+    _write(
+        root / "models/metrics.yml",
+        "version: 2\nmetrics:\n  - name: revenue_by_region\n    label: r\n"
+        "    type: simple\n    type_params:\n      measure: revenue\n",
+    )
+    contract = {**SCOPED, "metrics": {"removed": ["revenue_by_regoin"]}}
+    with pytest.raises(ValueError, match=r"revenue_by_regoin is not one"):
+        _validate(root, contract, _edit())
+    _validate(root, {**SCOPED, "metrics": {"removed": ["revenue_by_region"]}}, _edit())
+
+
 def test_an_authored_model_without_outputs_is_refused(root: Path):
     _write(root / "macros/unioned.sql", UNPARSEABLE)
     other = _edit("select 1 as order_id\n", "models/stg_orders.sql")
