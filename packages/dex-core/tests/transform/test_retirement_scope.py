@@ -128,8 +128,9 @@ def test_the_digest_moves_when_only_the_scope_changes():
             )
         )
 
-    full = stored_form(FLAG, parse_contract(CONTRACT))
-    scoped = stored_form(FLAG, parse_contract(SCOPED), {"status": "unchecked"})
+    discovery = {"status": "unchecked"}
+    full = stored_form(FLAG, parse_contract(CONTRACT), discovery)
+    scoped = stored_form(FLAG, parse_contract(SCOPED), discovery)
     assert digest(full) != digest(scoped)
 
 
