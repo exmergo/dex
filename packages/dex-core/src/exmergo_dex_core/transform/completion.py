@@ -40,7 +40,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .evidence import FAILED_STATUSES, SKIPPED_STATUSES, BuildEvidence, BuildNode
+from .evidence import (
+    BUILT_STATUS,
+    FAILED_STATUSES,
+    SKIPPED_STATUSES,
+    BuildEvidence,
+    BuildNode,
+    status_kind,
+)
 
 __all__ = [
     "COMPLETION_BUDGET_BYTES",
@@ -87,11 +94,18 @@ _RECORD_KINDS = (
 
 #: The deliverable lists that say the change is not done. Each keeps at least
 #: one name however tight the budget.
-_UNFINISHED = frozenset({"failed", "skipped", "missing", "stale"})
+_UNFINISHED = frozenset({"failed", "skipped", "unrecognized", "missing", "stale"})
 
 _PREDATES = (
     "not rebuilt by this run; any relation it has in the dev target predates "
     "this run and was not verified by it"
+)
+
+
+_UNRECOGNIZED_NOTE = (
+    "reported a status dex does not recognize (a microbatch model's partial "
+    "success, say); this run may have written part of its relation, and nothing "
+    "established that it is complete"
 )
 
 
@@ -133,6 +147,11 @@ class Deliverables(BaseModel):
     built: NameList = Field(default_factory=NameList)
     failed: NameList = Field(default_factory=NameList)
     skipped: NameList = Field(default_factory=NameList)
+    #: Ran with a status dex does not recognize (``partial success``,
+    #: ``no-op``), so it is not counted as built and is not a failure (#1105).
+    #: Present only when there is one, so the bounded block is unchanged for
+    #: every build dbt reports in its usual words.
+    unrecognized: NameList | None = None
     missing: NameList = Field(default_factory=NameList)
     stale: NameList = Field(default_factory=NameList)
     blocked: list[Blocked] = Field(default_factory=list)
@@ -309,12 +328,17 @@ def _names(values: Iterable[str], limit: int = _NAMES) -> NameList:
 
 
 def _status_kind(status: str) -> str:
-    lowered = status.lower()
-    if lowered in FAILED_STATUSES:
-        return "failed"
-    if lowered in SKIPPED_STATUSES:
-        return "skipped"
-    return "built"
+    """``built``, ``failed``, ``skipped`` or ``unrecognized`` for one node.
+
+    Built is the one status the coverage partition counts, so a deliverable
+    and ``coverage.built`` can never disagree (#1105). A passing test is
+    ``succeeded`` in the evidence, and never stands for a deliverable here.
+    """
+
+    kind = status_kind(status)
+    if kind == "succeeded":
+        return "built" if status.lower() == BUILT_STATUS else "succeeded"
+    return kind
 
 
 def _tests_on(graph: Mapping[str, list[str]]) -> dict[str, list[str]]:
@@ -417,6 +441,7 @@ def _deliverables(
     built: list[str] = []
     failed: list[str] = []
     skipped: list[str] = []
+    unrecognized: list[str] = []
     blocked: list[Blocked] = []
     causes: list[str] = []
     missing: list[str] = []
@@ -440,10 +465,19 @@ def _deliverables(
             blocked.append(Blocked(deliverable=name, status=node.status, cause=cause))
             if cause:
                 causes.append(cause)
+        elif kinds - {"built"}:
+            # Every match has to have built: a versioned requirement with one
+            # version on an unrecognized status did not build as a whole.
+            unrecognized.append(name)
+            odd = next(n for n in matches if _status_kind(n.status) != "built")
+            blocked.append(Blocked(deliverable=name, status=odd.status))
         else:
             built.append(name)
-    if failed or skipped or missing:
-        note = _PREDATES
+    notes = [_PREDATES] if failed or skipped or missing else []
+    if unrecognized:
+        notes.append(_UNRECOGNIZED_NOTE)
+    if notes:
+        note = "; ".join(notes)
     return (
         Deliverables(
             coverage="known",
@@ -451,6 +485,7 @@ def _deliverables(
             built=_names(built),
             failed=_names(failed),
             skipped=_names(skipped),
+            unrecognized=_names(unrecognized) if unrecognized else None,
             missing=_names(missing),
             stale=_names(stale_names),
             blocked=blocked,
@@ -844,13 +879,15 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         for owner, fields in (
             (
                 completion.deliverables,
-                ("built", "failed", "skipped", "missing", "stale"),
+                ("built", "failed", "skipped", "unrecognized", "missing", "stale"),
             ),
             (completion.assurance, ("asserted", "failed_checks", "build_only")),
             (completion.obligations, ("no_declared_columns", "prose_population")),
         ):
             for field in fields:
-                listed: NameList = getattr(owner, field)
+                listed: NameList | None = getattr(owner, field)
+                if listed is None:
+                    continue
                 floor = max(keep, 1) if field in _UNFINISHED else keep
                 if len(listed.names) > floor:
                     listed.elided += len(listed.names) - floor

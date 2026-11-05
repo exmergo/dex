@@ -615,3 +615,56 @@ def test_no_unsettled_conversion_leaves_no_key():
         identifier_conversions={REPORT: [{"status": "declared"}]},
     )
     assert "identifier_conversions" not in completion.data()["obligations"]
+
+
+def test_an_unrecognized_status_is_not_a_built_deliverable():
+    """#1105: completion agrees with the outcome and the coverage partition. A
+    deliverable on a status dex does not know is listed apart, blocked, and not
+    a blocker, since nothing failed."""
+
+    nodes = [
+        *_staging(2),
+        BuildNode(
+            unique_id=_uid(REPORT),
+            name=REPORT,
+            resource_type="model",
+            status="partial success",
+        ),
+    ]
+    evidence = _evidence(nodes, required=[REPORT, "stg_source_000"])
+    completion = summarize_completion(evidence, None)
+
+    assert completion.outcome == "indeterminate"
+    assert completion.deliverables.unrecognized.names == [REPORT]
+    assert completion.deliverables.built.names == ["stg_source_000"]
+    assert completion.deliverables.failed.count == 0
+    assert [(b.deliverable, b.status) for b in completion.deliverables.blocked] == [
+        (REPORT, "partial success")
+    ]
+    assert completion.blockers == []
+    # Part of a microbatch model may have been written: not "predates this run".
+    assert completion.deliverables.note.startswith("reported a status dex does not")
+
+
+def test_an_unrecognized_model_is_not_counted_built_without_a_plan():
+    nodes = [
+        *_staging(1),
+        BuildNode(unique_id=_uid(REPORT), name=REPORT, status="no-op"),
+    ]
+    completion = summarize_completion(_evidence(nodes), None)
+    assert completion.outcome == "indeterminate"
+    assert REPORT not in completion.assurance.build_only.names
+    assert REPORT not in completion.assurance.asserted.names
+
+
+def test_an_unrecognized_deliverable_survives_the_4_kib_cut():
+    nodes = [
+        *_staging(300),
+        BuildNode(unique_id=_uid(REPORT), name=REPORT, status="partial success"),
+    ]
+    evidence = _evidence(
+        nodes, required=[REPORT, *(f"stg_source_{i:03d}" for i in range(300))]
+    )
+    completion = summarize_completion(evidence, None)
+    assert completion.size() <= COMPLETION_BUDGET_BYTES
+    assert completion.deliverables.unrecognized.names == [REPORT]

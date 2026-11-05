@@ -44,6 +44,35 @@ FAILED_STATUSES = frozenset({"error", "runtime error", "fail", "failed"})
 #: as a pass.
 SKIPPED_STATUSES = frozenset({"skipped"})
 
+#: Statuses that mean the node ran and did what it was for. A model, seed or
+#: snapshot says `success`; a test says `pass`, or `warn` when it returned rows
+#: under `severity: warn`, which dbt counts as a passed build.
+SUCCEEDED_STATUSES = frozenset({"success", "pass", "warn"})
+
+#: The one status that means a node produced its relation in this run.
+BUILT_STATUS = "success"
+
+
+def status_kind(status: str) -> str:
+    """What one dbt node status means: ``succeeded``, ``failed``, ``skipped``
+    or ``unrecognized`` (#1105).
+
+    An allow-list, not a deny-list: a status dex does not know (``partial
+    success`` from a microbatch model with a failed batch, ``no-op``, the
+    ``unknown`` a document without a status defaults to) is never read as a
+    pass. It is not a failure either, and the outcome says ``indeterminate``.
+    """
+
+    lowered = status.lower()
+    if lowered in FAILED_STATUSES:
+        return "failed"
+    if lowered in SKIPPED_STATUSES:
+        return "skipped"
+    if lowered in SUCCEEDED_STATUSES:
+        return "succeeded"
+    return "unrecognized"
+
+
 #: Edit kinds that name a buildable node by their own path. Everything else
 #: either documents nodes (a schema.yml), points at one (a semantic YAML), or
 #: can affect any node at all (a macro, the project config).
@@ -82,9 +111,14 @@ class BuildOutcome(str, Enum):
     FAILED = "failed"
     #: Every node was skipped, which usually means a parent failed elsewhere.
     SKIPPED = "skipped"
+    #: Nothing failed, but at least one node reported a status dex does not
+    #: recognize (``partial success``, ``no-op``, ``unknown``), so what it built
+    #: cannot be told. Never read as a pass, never reported as a failure (#1105).
+    INDETERMINATE = "indeterminate"
     #: Nodes ran, and not one of them was a node this change required.
     UNRELATED = "unrelated"
-    #: Some of the required nodes ran and some did not.
+    #: Some of the required nodes built and some did not: absent from run
+    #: results, or present without succeeding (``coverage.not_built``).
     PARTIAL = "partial"
     #: A plan was named, but no buildable requirement could be derived for its
     #: edits (a metric whose measure cannot be located, a macro, a project-config
@@ -215,6 +249,9 @@ class BuildEvidence(BaseModel):
     selection: BuildSelection = Field(default_factory=BuildSelection)
     coverage: BuildCoverage | None = None
     digests: BuildDigests = Field(default_factory=BuildDigests)
+    #: Relations of the models, seeds and snapshots that succeeded in this run.
+    #: A skipped or failed node's relation is never listed, whatever survives
+    #: of it in the target from an earlier run (#1104).
     generated: list[str] = Field(default_factory=list)
     errors: list[dict[str, str]] = Field(default_factory=list)
     #: Why the outcome is `stale`, where it is. Always present so an empty list
@@ -594,10 +631,15 @@ def _outcome(
         return BuildOutcome.FAILED
     if statuses and statuses <= SKIPPED_STATUSES:
         return BuildOutcome.SKIPPED
+    if any(status_kind(status) == "unrecognized" for status in statuses):
+        return BuildOutcome.INDETERMINATE
     if coverage is not None and coverage.required:
         if not coverage.covered:
             return BuildOutcome.UNRELATED
-        if coverage.missing:
+        # A required node in run results that did not succeed (skipped beside
+        # nodes that passed, with nothing failed) did not build either, so the
+        # outcome agrees with the execution partition (#1105).
+        if coverage.missing or coverage.not_built:
             return BuildOutcome.PARTIAL
     if coverage is not None and coverage.undetermined and not coverage.required:
         return BuildOutcome.COVERAGE_UNDETERMINED
@@ -842,11 +884,17 @@ def build_evidence(
         ):
             node_answers.add(node_name(node["original_file_path"]))
         answers.update(node_answers)
-        if status.lower() != "success":
+        if status.lower() != BUILT_STATUS:
             unsuccessful_answers.update(node_answers)
         if status.lower() in FAILED_STATUSES:
             errors.append({"node": built.name, "message": built.message or status})
-        elif built.relation and built.resource_type in {"model", "snapshot", "seed"}:
+        # Only a node that succeeded produced its relation in this run: a
+        # skipped node's relation, where one exists, predates the run (#1104).
+        elif (
+            status.lower() == BUILT_STATUS
+            and built.relation
+            and built.resource_type in {"model", "snapshot", "seed"}
+        ):
             generated.append(built.relation)
 
     matched = [n.name for n in nodes]

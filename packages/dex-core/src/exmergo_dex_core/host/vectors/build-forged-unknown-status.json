@@ -1,0 +1,35 @@
+{
+  "name": "build-forged-unknown-status",
+  "contract": "build-evidence",
+  "description": "A document claiming `validated` for a required model whose status is one dex does not recognize. Its own coverage says the model was not built, so the claim is refused: an unrecognized status is never read as a pass.",
+  "payload": {
+    "claimed_outcome": "validated"
+  },
+  "expect": {
+    "verifies": false,
+    "outcome": "indeterminate",
+    "error": "contradicts evidence fields",
+    "result": {
+      "outcome": "validated",
+      "nodes": [
+        {
+          "unique_id": "model.p.mart",
+          "name": "mart",
+          "status": "unknown"
+        }
+      ],
+      "coverage": {
+        "required": [
+          "mart"
+        ],
+        "covered": [
+          "mart"
+        ],
+        "built": [],
+        "not_built": [
+          "mart"
+        ]
+      }
+    }
+  }
+}

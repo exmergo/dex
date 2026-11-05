@@ -537,6 +537,31 @@ def test_a_later_ordinary_failure_blocks_again(dbt_project_dir):
     ]
 
 
+@pytest.mark.parametrize("status", ["partial success", "no-op", "unknown"])
+def test_a_parent_on_an_unrecognized_status_blocks_the_baseline(
+    dbt_project_dir, status
+):
+    """#1105: only `success` rebuilt a parent's dev relation. A status dex does
+    not recognize leaves it as an earlier run wrote it, as `skipped` does."""
+
+    from tests.dbt_artifacts import dex_target
+
+    from exmergo_dex_core.transform.refactor_compare import _blocked_parents
+
+    _artifacts(
+        dex_target(dbt_project_dir),
+        _OVERRIDE_MANIFEST,
+        [
+            {"unique_id": "model.p.members", "status": status},
+            {"unique_id": "model.p.summary", "status": "success"},
+        ],
+        "2026-11-05T09:00:00Z",
+    )
+    assert _blocked_parents(dbt_project_dir, "summary", set()) == [
+        ("members", status, None)
+    ]
+
+
 def test_a_compile_is_not_a_rebuild(dbt_project_dir):
     """A build is priced with a compile, which writes `success` for every node
     it compiled; that says nothing about the relation."""

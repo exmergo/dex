@@ -370,11 +370,15 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      or shared, refused when another runtime left it incompatible
                                      data.outcome says what the run established, which success cannot:
                                      success is dbt's exit code and an empty selection exits zero, so
-                                     empty_selection, unrelated, partial, skipped, stale, failed and
-                                     not_run are all distinguishable from validated. data.evidence
-                                     carries the invocation, typed per-node statuses, the selection
-                                     asked for against what it got, the manifest and run-results
-                                     digests, the relations generated, and the principal errors.
+                                     empty_selection, unrelated, partial, skipped, indeterminate,
+                                     stale, failed and not_run are all distinguishable from
+                                     validated. A node status outside dbt's known words is
+                                     indeterminate: never built, never validated, not a failure.
+                                     data.evidence carries the invocation, typed per-node statuses,
+                                     the selection asked for against what it got, the manifest and
+                                     run-results digests, the relations this run's successful nodes
+                                     generated (never a skipped node's surviving relation), and the
+                                     principal errors.
                                      --for-plan (a stored id) or --for-plan-file (an exported document,
                                      which is what a sandbox holds) adds coverage: the nodes the change
                                      required, which of them ran, and how each requirement was derived;
@@ -1185,11 +1189,15 @@ default, or a filter or operator after it is refused. A key naming a location
   line and because consumers read it. `outcome` is `validated` only when every
   node the change required ran and passed against artifacts that still describe
   the tree; otherwise it is `empty_selection`, `unrelated`, `partial`, `skipped`,
-  `stale`, `failed`, or `not_run`, each of which a caller acts on differently.
-  `data.evidence` is where the reasoning lives: the dbt invocation, per-node
-  status and materialization and relation, what the selection asked for against
-  what it matched, the manifest and run-results digests, the relations the run
-  generated, and the principal errors. `data.completion` leads the payload with
+  `indeterminate`, `stale`, `failed`, or `not_run`, each of which a caller acts on
+  differently. `indeterminate` is a run where nothing failed and a node reported a
+  status dex does not recognize (`partial success`, `no-op`): such a node is never
+  counted as built and never read as a pass, and a required one is listed under
+  `data.completion.deliverables.unrecognized`. `data.evidence` is where the
+  reasoning lives: the dbt invocation, per-node status and materialization and
+  relation, what the selection asked for against what it matched, the manifest
+  and run-results digests, the relations the run's successful nodes generated
+  (a skipped node's surviving relation is not one), and the principal errors. `data.completion` leads the payload with
   the bounded summary of all of it, because `data.nodes` grows with the project
   and a reader whose harness cuts the output after a few kilobytes otherwise sees
   successful staging models and nothing about the deliverable that was skipped.

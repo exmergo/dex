@@ -87,6 +87,17 @@ def vectors_for(contract: str) -> list[dict]:
     return [v for v in host.conformance_vectors() if v["contract"] == contract]
 
 
+def build_vectors(*, verifies: bool = True) -> list[dict]:
+    """Build vectors that record a real outcome, or (``verifies=False``) the
+    forged documents a host must refuse (#1105)."""
+
+    return [
+        v
+        for v in vectors_for("build-evidence")
+        if v["expect"].get("verifies", True) is verifies
+    ]
+
+
 def test_the_vectors_ship_and_describe_themselves():
     vectors = host.conformance_vectors()
     assert vectors, "no conformance vectors shipped"
@@ -219,9 +230,7 @@ def test_each_grounding_vector_replays_from_the_project_it_carries(vector, tmp_p
     assert replayed == shipped
 
 
-@pytest.mark.parametrize(
-    "vector", vectors_for("build-evidence"), ids=lambda v: v["name"]
-)
+@pytest.mark.parametrize("vector", build_vectors(), ids=lambda v: v["name"])
 def test_each_build_vector_records_the_outcome_it_claims(vector):
     result = vector["expect"]["result"]
     assert result["outcome"] == vector["expect"]["outcome"]
@@ -258,7 +267,7 @@ def test_build_evidence_refuses_contradictory_and_forged_documents():
         host.verify_build_evidence({"outcome": "validated"})
 
     # Every shipped build vector with a forged outcome is refused
-    for vector in vectors_for("build-evidence"):
+    for vector in build_vectors():
         original_outcome = vector["expect"]["outcome"]
         for forged_outcome in host.BuildOutcome:
             if forged_outcome.value == original_outcome:
@@ -273,9 +282,7 @@ def test_build_evidence_refuses_contradictory_and_forged_documents():
 
 def test_verify_build_evidence_contract():
     """Issue #581: verify_build_evidence accepts BuildEvidence, dict, str, and bytes."""
-    valid_vector = next(
-        v for v in vectors_for("build-evidence") if v["name"] == "build-validated"
-    )
+    valid_vector = next(v for v in build_vectors() if v["name"] == "build-validated")
     result = valid_vector["expect"]["result"]
 
     # Dict
@@ -313,8 +320,31 @@ def test_verify_build_evidence_contract():
 def test_the_vectors_cover_every_build_outcome_the_engine_can_report():
     """A new outcome with no vector is a shape a host cannot prepare for."""
 
-    covered = {v["expect"]["outcome"] for v in vectors_for("build-evidence")}
+    covered = {v["expect"]["outcome"] for v in build_vectors()}
     assert covered == {o.value for o in host.BuildOutcome}
+
+
+@pytest.mark.parametrize(
+    "vector", build_vectors(verifies=False), ids=lambda v: v["name"]
+)
+def test_each_forged_build_vector_is_refused(vector):
+    """#1105: a document whose claim its own nodes do not support is refused,
+    and recomputes to the outcome those nodes do support."""
+
+    expect = vector["expect"]
+    result = expect["result"]
+    assert host.recompute_outcome(result).value == expect["outcome"]
+    assert result["outcome"] != expect["outcome"]
+    with pytest.raises(host.BuildEvidenceError, match=expect["error"]):
+        host.verify_build_evidence(result)
+    with pytest.raises((host.BuildEvidenceError, ValueError)):
+        host.BuildEvidence.model_validate(result)
+
+
+def test_a_forged_build_vector_ships():
+    assert [v["name"] for v in build_vectors(verifies=False)] == [
+        "build-forged-unknown-status"
+    ]
 
 
 def test_the_vectors_cover_every_artifact_class_except_the_one_with_no_yaml_form():
