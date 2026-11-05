@@ -405,6 +405,51 @@
    }
   }
  },
+ "relative_range": {
+  "query": {
+   "limit": 51,
+   "measures": [
+    "orders.revenue"
+   ],
+   "timeDimensions": [
+    {
+     "dateRange": "last 7 days",
+     "dimension": "orders.ordered_at",
+     "granularity": "day"
+    }
+   ],
+   "timezone": "UTC"
+  },
+  "response": {
+   "dataSource": "default",
+   "sql": {
+    "aliasNameToMember": {
+     "orders__ordered_at_day": "orders.ordered_at.day",
+     "orders__revenue": "orders.revenue"
+    },
+    "dataSource": "default",
+    "external": false,
+    "lambdaQueries": {},
+    "memberNames": [
+     "orders.revenue",
+     "orders.ordered_at"
+    ],
+    "order": {
+     "orders.ordered_at": "asc"
+    },
+    "preAggregations": [],
+    "sql": [
+     "SELECT DATE_TRUNC('day', timezone('UTC', \"orders\".ordered_at::timestamptz)) \"orders__ordered_at_day\", sum(\"orders\".total) \"orders__revenue\" \nFROM  app.orders  AS \"orders\"\nWHERE (timezone('UTC', \"orders\".ordered_at::timestamptz) >= ?::timestamptz AND timezone('UTC', \"orders\".ordered_at::timestamptz) <= ?::timestamptz)\nGROUP BY 1\nORDER BY  1  ASC\nLIMIT 51",
+     [
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-07T23:59:59.999Z"
+     ]
+    ],
+    "timeDimensionAlias": "orders__ordered_at_day",
+    "timeDimensionField": "orders.ordered_at"
+   }
+  }
+ },
  "rolling": {
   "query": {
    "limit": 51,
