@@ -1,4 +1,8 @@
-"""Thirty accounts, users for twenty-four of them, display names for some users."""
+"""Thirty accounts, users for twenty-four of them, display names for some users.
+
+Three display names belong to users the account data no longer has, so a
+refactor that counts names rather than users with a name counts them (#1114).
+"""
 
 from __future__ import annotations
 
@@ -22,6 +26,11 @@ def tables(seed: int) -> list[Table]:
             if rng.random() < 0.6:
                 names.append((user_id, f"user {user_id:03d}"))
             user_id += 1
+    # Names left behind by users who are gone. Appended after the draws above,
+    # so every account, user and name generated before keeps its value.
+    names.extend(
+        (orphan, f"user {orphan:03d}") for orphan in range(user_id + 5, user_id + 8)
+    )
     return [
         Table(
             "raw.accounts",

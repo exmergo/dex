@@ -520,3 +520,98 @@ def readable_artifact_dir(project_root: Path | str) -> Path:
     """The directory holding the manifest :func:`readable_artifact` would pick."""
 
     return readable_artifact(project_root, "manifest.json").parent
+
+
+#: dbt commands that attempt to build nodes. A ``compile``, ``parse`` or ``ls``
+#: writes ``run_results.json`` too (Dex prices a build with a compile), and its
+#: ``success`` says a node compiled, not that its relation was rebuilt.
+_BUILDING_COMMANDS = frozenset({"build", "run", "seed", "snapshot", "test"})
+
+
+@dataclass(frozen=True)
+class NodeRun:
+    """The latest run that attempted one node, read from ``run_results.json``."""
+
+    status: str
+    invocation_id: str | None
+    generated_at: str | None
+    #: True when that run was a ``--cold-deps`` build, whose artifacts live in
+    #: ``cold/`` beside the ordinary build's.
+    cold: bool
+
+
+@dataclass(frozen=True)
+class LatestRuns:
+    """Each node's latest building attempt, ordinary and cold builds together,
+    with the manifest of the newest of those runs."""
+
+    nodes: dict[str, NodeRun]
+    manifest: Path | None
+
+
+def latest_node_runs(project_root: Path | str) -> LatestRuns:
+    """Each node's status from the latest run that attempted it (#1114).
+
+    A ``--cold-deps`` build rebuilds the dev relations from a fresh install of
+    the packages, but writes its artifacts to ``cold/`` beside the ordinary
+    build's, so a reader of "the last build" alone keeps finding the failure the
+    cold build repaired. This reads both, in the project's target path and in
+    Dex's own directory, and overlays them oldest first by ``generated_at`` (the
+    file's mtime where a run recorded none), so a node's latest attempt wins
+    whichever kind of build made it. A run that built nothing (a compile, a
+    parse) is skipped. Inside :func:`pinned_artifacts` only the pinned directory
+    and its ``cold/`` are read.
+
+    The manifest is the one beside the newest building run, so the graph a
+    caller walks is the one that run built: a project override a cold build
+    introduced is in it, the package model it disabled is not.
+    """
+
+    import json
+
+    pinned = _PINNED.get()
+    if pinned is not None:
+        roots = [pinned.directory]
+    else:
+        isolated = isolated_artifact_dir(project_root)
+        roots = [shared_target_dir(project_root)] + ([isolated] if isolated else [])
+    found: list[tuple[str, float, Path, bool, dict[str, Any]]] = []
+    for root in roots:
+        for directory, cold in ((root, False), (root / "cold", True)):
+            path = directory / "run_results.json"
+            try:
+                mtime = path.stat().st_mtime
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            which = str((document.get("args") or {}).get("which") or "build")
+            if which not in _BUILDING_COMMANDS:
+                continue
+            meta = document.get("metadata") or {}
+            stamp = str(meta.get("generated_at") or "")
+            found.append((stamp, mtime, directory, cold, document))
+    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
+    found.sort(key=lambda run: (run[0], run[1]))
+    nodes: dict[str, NodeRun] = {}
+    for stamp, _, _, cold, document in found:
+        meta = document.get("metadata") or {}
+        for row in document.get("results") or []:
+            if not isinstance(row, dict) or not row.get("unique_id"):
+                continue
+            nodes[str(row["unique_id"])] = NodeRun(
+                status=str(row.get("status") or "").lower(),
+                invocation_id=meta.get("invocation_id"),
+                generated_at=stamp or None,
+                cold=cold,
+            )
+    manifest = None
+    for _, _, directory, _, _ in reversed(found):
+        if (directory / "manifest.json").is_file():
+            manifest = directory / "manifest.json"
+            break
+    if manifest is None:
+        fallback = readable_artifact(project_root, "manifest.json")
+        manifest = fallback if fallback.is_file() else None
+    return LatestRuns(nodes=nodes, manifest=manifest)

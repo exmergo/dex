@@ -46,10 +46,30 @@
       "name": "no user was dropped to make the build pass",
       "expect": 0,
       "sql": "select (select count(*) from raw.users) - (select sum(user_count) from main.account_user_summary)"
+    },
+    {
+      "name": "names of users who are gone are not counted",
+      "expect": 0,
+      "sql": "select (select sum(named_users) from main.account_user_summary) - (select count(*) from raw.display_names d join raw.users u using (user_id))"
     }
   ],
   "procedure": {
     "compare_before_apply": true,
-    "build_after_apply": true
-  }
+    "build_after_apply": true,
+    "rebuilt_before_compare": true
+  },
+  "workspace_checks": [
+    {
+      "name": "the intermediate is deployed on dev",
+      "expect": 1,
+      "sql": "select count(*) from information_schema.tables where table_schema = 'main' and table_name = 'int_account_users'",
+      "live_only": true
+    },
+    {
+      "name": "the refactored mart is deployed on dev with every user counted",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.users) - (select sum(user_count) from main.account_user_summary) + (select count(*) from raw.accounts) - (select count(*) from main.account_user_summary)",
+      "live_only": true
+    }
+  ]
 }

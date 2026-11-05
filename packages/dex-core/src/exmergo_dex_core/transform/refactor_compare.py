@@ -19,12 +19,13 @@ warehouse state held or what a future input would do.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -169,6 +170,12 @@ def compare(
     if resolved is not None:
         result.resolved_plan = resolved
         result.warnings = [*_resolution_warnings(resolved), *result.warnings]
+    if result.model and result.reason_code not in _UNRECORDED:
+        # Which build the baseline's inputs came from, so a recorded verdict is
+        # tied to the state it compared (#1114): a repaired prerequisite's
+        # cold build, or the failed build it would otherwise have read.
+        with contextlib.suppress(Exception):
+            result.inputs_built_by = inputs_built_by(engine.project_dir(), result.model)
     _record_verdict(engine, result)
     return result
 
@@ -205,6 +212,7 @@ def _record_verdict(engine: DexEngine, result: RefactorComparisonResult) -> None
                 "input_scope": list(result.input_scope),
                 "baseline_compiled": result.baseline_compiled,
                 "proposed_compiled": result.proposed_compiled,
+                "inputs_built_by": result.inputs_built_by,
             },
         }
         store.save_plan(stored)
@@ -287,21 +295,22 @@ def _compare(
         project, chosen, {Path(edit.path).stem for edit in _touched(stored)}
     )
     if blocked:
-        names = [name for name, _ in blocked]
         one = len(blocked) == 1
         return not_checked(
             "inputs_unsynchronized",
             "the last build did not rebuild "
-            + ", ".join(f"{name} ({status})" for name, status in blocked)
+            + ", ".join(f"{b.model} ({b.status})" for b in blocked)
             + (
                 ", so its dev relation predates its current SQL and would stand in "
                 if one
                 else ", so their dev relations predate their current SQL and would "
                 "stand in "
             )
-            + "for both sides as an obsolete input; repair what failed, rebuild "
-            f"with `transform build --target dev --select {' '.join(names)}`, then "
-            "compare again",
+            + "for both sides as an obsolete input. "
+            + repair_first(blocked)
+            + " Leave this plan unapplied until then: applying it discards the "
+            "baseline, and a repair added to this plan would leave the comparison "
+            "nothing built to read.",
         )
     through_ancestors = any(edit.kind in _GLOBAL_KINDS for edit in stored.edits)
 
@@ -850,39 +859,72 @@ def _compile_side(
 _NOT_REBUILT = frozenset({"error", "runtime error", "fail", "failed", "skipped"})
 
 
-def _blocked_parents(
-    project: Path, model: str, touched: set[str]
-) -> list[tuple[str, str]]:
-    """Upstream models the last build tried and failed, or skipped (#1049).
+def _blocked_key(blocked: BlockedInput) -> tuple[str, str, str]:
+    """Sort key for blocked inputs: a project model's ``package`` is ``None``,
+    and a project model and a package's model can share a name and status."""
 
-    Read from the last run's ``run_results.json`` and the manifest beside it,
-    both free. A parent whose last build errored or was skipped still has a
-    relation in the dev target, from some earlier run, and both sides of the
-    comparison would read it: the verdict would then hold for inputs the current
-    project no longer produces. Only the parents that last run *attempted* are
-    judged; a parent it did not select tells nothing, and no results at all
-    leaves the comparison exactly as it was. A model the plan itself rewrites
-    is compiled inline on both sides rather than read, so it is not judged.
+    return (blocked.model, blocked.status, blocked.package or "")
+
+
+def repair_first(blocked: Sequence[BlockedInput]) -> str:
+    """The sequence that gives a blocked comparison a baseline (#1114).
+
+    One sentence an agent can follow: the repair in a plan of its own, applied
+    and built (cold where a package owns the node, since the repair has to
+    survive a reinstall), and only then the comparison.
+    """
+
+    names = sorted({b.model for b in blocked})
+    packages = sorted({b.package for b in blocked if b.package})
+    build = f"`transform build --target dev --select {' '.join(names)}`"
+    if packages:
+        owned = [b.model for b in blocked if b.package]
+        build = (
+            "`transform build --target dev --cold-deps --for-plan <repair plan>`, "
+            + ", ".join(sorted(owned))
+            + (" belongs" if len(owned) == 1 else " belong")
+            + " to "
+            + ", ".join(packages)
+            + ", so the repair is a project change from `data.prerequisites` "
+            "(never an edit under `dbt_packages/`) and `--cold-deps` shows it "
+            "survives a reinstall"
+        )
+    return (
+        "Repair what failed in its own plan, apply that plan and build it ("
+        + build
+        + "), then compare again."
+    )
+
+
+class BlockedInput(NamedTuple):
+    """An upstream model the last attempt to build it left unbuilt (#1049, #1114)."""
+
+    model: str
+    status: str
+    #: The package that owns the node, or ``None`` for the project's own model.
+    #: A package's node is repaired by a project change and proven cold.
+    package: str | None = None
+
+
+def _upstream(project: Path, model: str) -> tuple[dict[str, Any], set[str], Any] | None:
+    """The manifest nodes, the model's upstream model ids, and the latest runs.
+
+    ``None`` with no building run or no manifest to read, which leaves a
+    comparison exactly as it was.
     """
 
     import json
 
-    from ..dbt_project import manifest_node_label
-    from .artifact_runtime import artifact_paths, readable_artifact_dir
+    from .artifact_runtime import latest_node_runs
 
     try:
-        paths = artifact_paths(readable_artifact_dir(project))
-        if not paths.run_results.is_file() or not paths.manifest.is_file():
-            return []
-        results = json.loads(paths.run_results.read_text(encoding="utf-8"))
-        nodes = json.loads(paths.manifest.read_text(encoding="utf-8")).get("nodes", {})
+        runs = latest_node_runs(project)
+        if not runs.nodes or runs.manifest is None:
+            return None
+        manifest = json.loads(runs.manifest.read_text(encoding="utf-8"))
     except (OSError, ValueError, DexError):
-        return []
-    status_of = {
-        str(r.get("unique_id")): str(r.get("status") or "").lower()
-        for r in results.get("results") or []
-        if isinstance(r, dict)
-    }
+        return None
+    nodes = manifest.get("nodes", {})
 
     def names(node: Mapping[str, Any]) -> set[str]:
         # A versioned model's name is shared by its versions; its file stem
@@ -898,7 +940,6 @@ def _blocked_parents(
         for uid, node in nodes.items()
         if uid.startswith("model.") and model in names(node)
     ]
-    blocked: list[tuple[str, str]] = []
     seen: set[str] = set()
     pending = [
         dep
@@ -910,16 +951,78 @@ def _blocked_parents(
         if uid in seen or not uid.startswith("model."):
             continue
         seen.add(uid)
-        node = nodes.get(uid) or {}
-        pending.extend((node.get("depends_on") or {}).get("nodes") or [])
+        pending.extend(
+            ((nodes.get(uid) or {}).get("depends_on") or {}).get("nodes") or []
+        )
+    root = str((manifest.get("metadata") or {}).get("project_name") or "")
+    return {"nodes": nodes, "names": names, "root": root}, seen, runs
+
+
+def _blocked_parents(
+    project: Path, model: str, touched: set[str]
+) -> list[BlockedInput]:
+    """Upstream models the last attempt to build failed, or skipped (#1049).
+
+    Read from the latest ``run_results.json`` that attempted each node, an
+    ordinary build's or a ``--cold-deps`` build's, whichever ran last (#1114),
+    and the manifest beside the newest of them, all free. A parent whose last
+    build errored or was skipped still has a relation in the dev target, from
+    some earlier run, and both sides of the comparison would read it: the
+    verdict would then hold for inputs the current project no longer produces.
+    Only the parents a run *attempted* are judged; a parent no run selected
+    tells nothing, and no results at all leaves the comparison exactly as it
+    was. A model the plan itself rewrites is compiled inline on both sides
+    rather than read, so it is not judged.
+    """
+
+    from ..dbt_project import manifest_node_label
+
+    upstream = _upstream(project, model)
+    if upstream is None:
+        return []
+    graph, seen, runs = upstream
+    blocked: list[BlockedInput] = []
+    for uid in seen:
+        node = graph["nodes"].get(uid) or {}
         if (node.get("config") or {}).get("materialized") == "ephemeral":
             continue
-        if names(node) & touched:
+        if graph["names"](node) & touched:
             continue
-        status = status_of.get(uid)
-        if status in _NOT_REBUILT:
-            blocked.append((manifest_node_label(uid, node), status))
-    return sorted(blocked)
+        run = runs.nodes.get(uid)
+        if run is not None and run.status in _NOT_REBUILT:
+            package = str(node.get("package_name") or "")
+            blocked.append(
+                BlockedInput(
+                    manifest_node_label(uid, node),
+                    run.status,
+                    package if package and package != graph["root"] else None,
+                )
+            )
+    return sorted(blocked, key=_blocked_key)
+
+
+def inputs_built_by(project: Path, model: str) -> dict[str, Any] | None:
+    """The latest building run among the model's upstream models (#1114).
+
+    The invocation, when it ran, and whether it was a ``--cold-deps`` build.
+    It names one run: other upstream models may have last been built by an
+    earlier one, so ``cold`` does not say every input was built cold. ``None``
+    when no run attempted any of them.
+    """
+
+    upstream = _upstream(project, model)
+    if upstream is None:
+        return None
+    _, seen, runs = upstream
+    attempted = [runs.nodes[uid] for uid in seen if uid in runs.nodes]
+    if not attempted:
+        return None
+    latest = max(attempted, key=lambda run: run.generated_at or "")
+    return {
+        "invocation_id": latest.invocation_id,
+        "generated_at": latest.generated_at,
+        "cold": latest.cold,
+    }
 
 
 def _built_parents(

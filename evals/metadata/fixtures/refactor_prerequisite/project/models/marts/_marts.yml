@@ -1,0 +1,36 @@
+version: 2
+models:
+  - name: team_member_summary
+    description: One row per team, with how many members it has, how many of them have a chat handle, and when its first member joined.
+    config:
+      meta:
+        dex:
+          grain: [team_id]
+          population:
+            rule: Every team, including teams with no members.
+          assumptions:
+            - decision: Which teams are in
+              chosen: every team, with zero counts where it has no members
+              evidence: request
+    columns:
+      - name: team_id
+        data_tests: [unique, not_null]
+        config:
+          meta:
+            dex: {role: key}
+      - name: team_name
+        config:
+          meta:
+            dex: {role: attribute}
+      - name: member_count
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, additivity: additive, unit: count}
+      - name: handled_members
+        config:
+          meta:
+            dex: {role: measure, aggregation: sum, additivity: additive, unit: count}
+      - name: first_joined_ts
+        config:
+          meta:
+            dex: {role: time}

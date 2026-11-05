@@ -238,6 +238,10 @@ class ComparisonState(BaseModel):
     static_attribution: str | None = None
     reason_code: str | None = None
     compared_at: str | None = None
+    #: The latest build among the compared model's upstream models (#1114): its
+    #: invocation, when it ran, and whether it was a `--cold-deps` build. One
+    #: run; other inputs may come from earlier builds.
+    inputs_built_by: dict[str, Any] | None = None
 
 
 class BuildCompletion(BaseModel):

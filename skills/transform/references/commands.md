@@ -38,7 +38,17 @@ See the cost-controls reference for the shared budget mechanism.
   is invisible to it) or `attributed`.
   `recommended_before_apply` is true unless every model is `attributed`, and
   `why` says so in one line. `data.next` names the comparison ahead of
-  `transform apply`. If the change should keep the model's results, run it
+  `transform apply`. `baseline_ready` says whether the comparison can run now:
+  `false` when an upstream model's latest build attempt, ordinary or
+  `--cold-deps`, left it `error` or `skipped`. Each such input is under
+  `per_model[].blocked_inputs` (`model`, `status`, `owner`: `project` or
+  `package`, and `package`), and `why` and `data.next` lead with the repair: a
+  plan of its own, applied and built (`--cold-deps` for a package's node),
+  with this plan left unapplied until it is compared. Read free from the run
+  results and manifest already on disk (#1114). `mixed_with_repair` names the
+  blocked inputs this plan itself repairs (it edits them, or edits the project,
+  packages or a macro while one is blocked), with a warning: such a plan's
+  comparison can only read the failed build, so the repair has to be split out. If the change should keep the model's results, run it
   before applying: once applied, the plan's baseline is gone. Nothing scans at
   plan time, and nothing refuses: a change meant to alter results needs no
   comparison. The released `models` and `command` fields are unchanged.
@@ -194,8 +204,10 @@ commit.
 A plan that rewrote existing models also returns `data.refactor_comparison`: one
 entry per rewritten model with its `static_attribution`, and per model compared on
 the plan (a downstream mart counts), with the last `transform compare` verdict
-recorded (`status`, `reason_code`, `compared_at`), or `status: not_compared`. It is
-reported, never enforced. A `notes` line names the rewrites when nothing on the
+recorded (`status`, `reason_code`, `compared_at`, and `inputs_built_by`: the
+invocation, time and kind of the latest build among the compared model's
+upstream models), or
+`status: not_compared`. It is reported, never enforced. A `notes` line names the rewrites when nothing on the
 plan was compared and static attribution established nothing, and any model whose
 last comparison was `different` or `not_checked`, so a refactor that went in
 unverified says so in the envelope rather than in nobody's memory.
@@ -553,13 +565,25 @@ With no plan id, `compare` uses the latest unapplied plan and names it in
 `data.resolved_plan` and a `warnings` line on every verdict; an empty id is
 refused.
 
-Before compiling anything, it reads the last build's `run_results.json`: a parent
-of the compared model that the last build tried and that errored or was skipped is
-`inputs_unsynchronized`, naming the parent and its status. Its dev relation is
-older than its SQL, and both sides would read it, so a verdict would hold only for
-inputs the project no longer produces. A model the plan itself rewrites is
-compiled inline and not judged this way, and no run results at all changes
-nothing.
+Before compiling anything, it reads, per upstream model, the latest build that
+attempted it: an ordinary build's `run_results.json` or a `--cold-deps` build's
+(written apart, under `cold/`), whichever ran last, with the manifest of the
+newest. A compile is not an attempt. A parent that latest attempt left `error` or
+`skipped` is `inputs_unsynchronized`, naming the parent, its status and, for a
+package's model, its package. Its dev relation is older than its SQL, and both
+sides would read it, so a verdict would hold only for inputs the project no
+longer produces. The detail names the order that clears it: the repair in a plan
+of its own, applied and built (`--cold-deps` for a package's model), then this
+plan compared, still unapplied. A model the plan itself rewrites is compiled
+inline and not judged this way, and no run results at all changes nothing.
+
+A verdict carries `inputs_built_by` (`invocation_id`, `generated_at`, `cold`) where
+an upstream build exists (`null` where no build attempted the compared model's
+upstream models; not set on `awaiting_confirmation` or `plan_applied`, which are
+never recorded): the latest build among those models, so an `equivalent`
+can be tied to the repaired state it read. It names one run: other inputs may
+come from earlier builds, so `cold: true` does not mean every input came from a
+cold build. It is recorded on the plan with the verdict.
 
 - Read `data.status`, then `data.reason_code`. `equivalent` holds for
   `data.input_scope` at `data.compared_at`, on the dev relations as they stand. Say
@@ -581,7 +605,7 @@ nothing.
 |---|---|
 | `plan_applied`, `plan_stale` | plan the change again against the tree as it is |
 | `baseline_not_compilable`, `proposed_not_compilable` | the model does not compile on that side; `detail` quotes a compile error, and a connection failure says to run `dbt compile` |
-| `inputs_unsynchronized` | build the named parents on dev; one the last build left `error` or `skipped` needs its failure repaired first. A plan that changes a seed or snapshot, or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows. This plan stays uncompared: once it is applied the baseline is gone (`plan_applied`). After applying and building, a further change needs its own new, unapplied plan to compare |
+| `inputs_unsynchronized` | build the named parents on dev; one the last build left `error` or `skipped` needs its failure repaired first, in a plan of its own, applied and built (`--cold-deps` where a package owns it). A cold build counts. A plan that changes a seed or snapshot, or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows. This plan stays uncompared: once it is applied the baseline is gone (`plan_applied`). After applying and building, a further change needs its own new, unapplied plan to compare |
 | `nondeterministic_expression` | the model calls a random, uuid or current-time function, or samples, so two runs can differ on their own |
 | `unsupported_type` | the named column cannot be grouped on this connector; `detail` names it and its type |
 | `baseline_refused`, `proposed_refused` | before anything reaches the warehouse, that side's compiled SQL is not a single SELECT; fix the model |
@@ -704,4 +728,8 @@ the model's own tests against each, and reports which defects nothing caught.
 ## `transform deps`
 
 Installs or refreshes dbt packages. No confirmation needed: it writes only inside
-the project and never touches the warehouse.
+the project and never touches the warehouse. It installs the packages the project
+already declares in `packages.yml`, at the versions `package-lock.yml` pins where
+the lockfile matches it (dbt resolves them again where it does not): that is
+not installing or upgrading a tool, and a request not to update tools does not rule
+it out.

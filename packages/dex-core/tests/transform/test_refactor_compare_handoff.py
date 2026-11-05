@@ -193,8 +193,12 @@ def test_the_inner_join_extraction_is_different_and_recorded(accounts):
             "status": "different",
             "reason_code": "rows_differ",
             "compared_at": result.compared_at,
+            "inputs_built_by": recorded["inputs_built_by"],
         }
     ]
+    # The fixture's own build made the inputs the comparison read (#1114).
+    assert recorded["inputs_built_by"]["cold"] is False
+    assert recorded["inputs_built_by"]["invocation_id"]
     assert any("did not establish equivalence" in n for n in applied.notes)
     assert not any("comparison" in w for w in applied.warnings)
 
@@ -275,6 +279,9 @@ def test_a_for_plan_build_carries_the_recorded_verdict(accounts):
             "compared_at": engine.store.load_plan(planned.plan_id).comparisons[
                 "account_summary"
             ]["compared_at"],
+            "inputs_built_by": engine.store.load_plan(planned.plan_id).comparisons[
+                "account_summary"
+            ]["inputs_built_by"],
         }
     ]
 
@@ -357,7 +364,7 @@ def test_blocked_parents_match_a_versioned_model_by_its_file_stem(dbt_project_di
     )
     # The plan rewrites int_rewritten, so it is inlined and not judged.
     assert _blocked_parents(dbt_project_dir, "dim_customers_v2", {"int_rewritten"}) == [
-        ("stg_customers", "error")
+        ("stg_customers", "error", None)
     ]
 
 
@@ -379,3 +386,265 @@ def test_the_offered_command_quotes_a_model_name_the_shell_would_read(monkeypatc
     )
     assert "--model 'a;touch b' " in offer["command"]
     assert shlex.split(offer["per_model"][0]["command"])[-1] == "a;touch b"
+
+
+# --- #1114: a baseline repaired by a cold build, and an offer that knows ---
+
+
+def _artifacts(
+    directory: Path, manifest: dict, results: list, when: str, which: str = "build"
+) -> None:
+    """Write a manifest and the run results of one build into ``directory``."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    (directory / "run_results.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"generated_at": when, "invocation_id": f"inv-{when}"},
+                "args": {"which": which},
+                "results": results,
+            }
+        )
+    )
+
+
+_PACKAGE_MANIFEST = {
+    "metadata": {"project_name": "p"},
+    "nodes": {
+        "model.p.summary": {
+            "name": "summary",
+            "package_name": "p",
+            "depends_on": {"nodes": ["model.roster.members"]},
+        },
+        "model.roster.members": {
+            "name": "members",
+            "package_name": "roster",
+            "depends_on": {"nodes": []},
+        },
+    },
+}
+
+#: The cold build's graph: the project's override of `members`, the package's
+#: own model disabled and so absent.
+_OVERRIDE_MANIFEST = {
+    "metadata": {"project_name": "p"},
+    "nodes": {
+        "model.p.summary": {
+            "name": "summary",
+            "package_name": "p",
+            "depends_on": {"nodes": ["model.p.members"]},
+        },
+        "model.p.members": {
+            "name": "members",
+            "package_name": "p",
+            "depends_on": {"nodes": []},
+        },
+    },
+}
+
+
+def test_a_package_parent_that_failed_is_blocked_and_named_with_its_package(
+    dbt_project_dir,
+):
+    """A package's failed model is blocked and named with its package, and the
+    advice names the cold build."""
+
+    from tests.dbt_artifacts import dex_target
+
+    from exmergo_dex_core.transform.refactor_compare import (
+        _blocked_parents,
+        repair_first,
+    )
+
+    _artifacts(
+        dex_target(dbt_project_dir),
+        _PACKAGE_MANIFEST,
+        [
+            {"unique_id": "model.roster.members", "status": "error"},
+            {"unique_id": "model.p.summary", "status": "skipped"},
+        ],
+        "2026-11-05T09:00:00Z",
+    )
+    blocked = _blocked_parents(dbt_project_dir, "summary", set())
+    assert blocked == [("members", "error", "roster")]
+    advice = repair_first(blocked)
+    assert "its own plan" in advice
+    assert "--cold-deps" in advice
+    assert "roster" in advice
+    assert "dbt_packages/" in advice
+
+
+def test_a_cold_build_that_repaired_the_parent_unblocks_the_comparison(
+    dbt_project_dir,
+):
+    """The cold build writes `cold/`; before #1114 compare read only the
+    ordinary build's results and kept naming the failure it repaired."""
+
+    from tests.dbt_artifacts import dex_target
+
+    from exmergo_dex_core.transform.refactor_compare import (
+        _blocked_parents,
+        inputs_built_by,
+    )
+
+    target = dex_target(dbt_project_dir)
+    _artifacts(
+        target,
+        _PACKAGE_MANIFEST,
+        [{"unique_id": "model.roster.members", "status": "error"}],
+        "2026-11-05T09:00:00Z",
+    )
+    _artifacts(
+        target / "cold",
+        _OVERRIDE_MANIFEST,
+        [
+            {"unique_id": "model.p.members", "status": "success"},
+            {"unique_id": "model.p.summary", "status": "success"},
+        ],
+        "2026-11-05T09:05:00Z",
+    )
+    assert _blocked_parents(dbt_project_dir, "summary", set()) == []
+    assert inputs_built_by(dbt_project_dir, "summary") == {
+        "invocation_id": "inv-2026-11-05T09:05:00Z",
+        "generated_at": "2026-11-05T09:05:00Z",
+        "cold": True,
+    }
+
+
+def test_a_later_ordinary_failure_blocks_again(dbt_project_dir):
+    """An ordinary build newer than the cold one wins, so its failure blocks again."""
+
+    from tests.dbt_artifacts import dex_target
+
+    from exmergo_dex_core.transform.refactor_compare import _blocked_parents
+
+    target = dex_target(dbt_project_dir)
+    _artifacts(
+        target / "cold",
+        _OVERRIDE_MANIFEST,
+        [{"unique_id": "model.p.members", "status": "success"}],
+        "2026-11-05T09:00:00Z",
+    )
+    _artifacts(
+        target,
+        _OVERRIDE_MANIFEST,
+        [{"unique_id": "model.p.members", "status": "error"}],
+        "2026-11-05T09:05:00Z",
+    )
+    assert _blocked_parents(dbt_project_dir, "summary", set()) == [
+        ("members", "error", None)
+    ]
+
+
+def test_a_compile_is_not_a_rebuild(dbt_project_dir):
+    """A build is priced with a compile, which writes `success` for every node
+    it compiled; that says nothing about the relation."""
+
+    from tests.dbt_artifacts import dex_target
+
+    from exmergo_dex_core.transform.refactor_compare import _blocked_parents
+
+    target = dex_target(dbt_project_dir)
+    _artifacts(
+        target,
+        _PACKAGE_MANIFEST,
+        [{"unique_id": "model.roster.members", "status": "error"}],
+        "2026-11-05T09:00:00Z",
+    )
+    _artifacts(
+        target / "cold",
+        _PACKAGE_MANIFEST,
+        [{"unique_id": "model.roster.members", "status": "success"}],
+        "2026-11-05T09:05:00Z",
+        which="compile",
+    )
+    assert _blocked_parents(dbt_project_dir, "summary", set()) == [
+        ("members", "error", "roster")
+    ]
+
+
+def _fail(project: Path, unique_id: str) -> None:
+    """Mark ``unique_id`` as errored in the last build's run results."""
+
+    run_results = artifact_paths(readable_artifact_dir(project)).run_results
+    document = json.loads(run_results.read_text(encoding="utf-8"))
+    for row in document["results"]:
+        if row["unique_id"] == unique_id:
+            row["status"] = "error"
+    run_results.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_the_offer_says_the_baseline_does_not_build_and_how_to_repair_it(accounts):
+    """The offer reports the blocked input and leads ``data.next`` with the repair."""
+
+    engine = _engine(accounts)
+    _fail(accounts, "model.p.users")
+    planned = _extraction(engine, _LEFT_INT)
+    offer = planned.data()["refactor_comparison_offer"]
+    assert offer["baseline_ready"] is False
+    (entry,) = offer["per_model"]
+    assert entry["blocked_inputs"] == [
+        {"model": "users", "status": "error", "owner": "project"}
+    ]
+    assert "its own plan" in offer["why"]
+    assert "unapplied" in offer["why"]
+    assert "mixed_with_repair" not in offer
+    hint = plan_hint(planned)["next"]
+    assert hint.startswith("the baseline does not build (users)")
+    # The comparison is still named, after the repair.
+    assert f"transform compare {planned.plan_id}" in hint
+
+
+def test_a_ready_baseline_says_so(accounts):
+    """With nothing blocked the offer says the baseline is ready and names no input."""
+
+    planned = _extraction(_engine(accounts), _LEFT_INT)
+    offer = planned.data()["refactor_comparison_offer"]
+    assert offer["baseline_ready"] is True
+    assert "blocked_inputs" not in offer["per_model"][0]
+
+
+def test_a_repair_bundled_with_the_refactor_is_named_and_warned(accounts):
+    """The 1.17.3 failure: one plan carrying the repair and the extraction has
+    nothing built to compare against, ever."""
+
+    engine = _engine(accounts)
+    _fail(accounts, "model.p.users")
+    planned = _plan(
+        engine,
+        (
+            "models/users.sql",
+            "select * from (values ('u1', 1), ('u2', 1), ('u3', 2), ('u4', 2))"
+            " as t(user_id, account_id)\n",
+        ),
+        ("models/int_account_users.sql", _LEFT_INT),
+        ("models/account_summary.sql", _EXTRACTED_SUMMARY),
+    )
+    offer = planned.data()["refactor_comparison_offer"]
+    assert offer["mixed_with_repair"] == ["users"]
+    (warning,) = [w for w in planned.warnings if "both repairs" in w]
+    assert "its own plan" in warning
+    assert plan_hint(planned)["next"].startswith("this plan carries a repair of users")
+
+
+def test_a_comparison_after_the_repair_records_what_built_its_inputs(accounts):
+    """Blocked, repaired and built: the comparison is equivalent and records the
+    build it read."""
+
+    engine = _engine(accounts)
+    planned = _extraction(engine, _LEFT_INT)
+    _fail(accounts, "model.p.users")
+    blocked = engine.compare(planned.plan_id, model="account_summary")
+    assert blocked.reason_code == "inputs_unsynchronized"
+    assert "its own plan" in blocked.detail
+    assert "unapplied" in blocked.detail
+    # The repair, built: the comparison now reads it and says so.
+    _engine(accounts).build(target="dev")
+    result = _engine(accounts).compare(planned.plan_id, model="account_summary")
+    assert result.status == "equivalent", result.detail
+    built = result.inputs_built_by
+    assert built["cold"] is False and built["invocation_id"]
+    recorded = engine.store.load_plan(planned.plan_id).comparisons["account_summary"]
+    assert recorded["inputs_built_by"] == built
+    assert result.data()["inputs_built_by"] == built

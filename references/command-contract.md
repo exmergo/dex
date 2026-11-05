@@ -229,7 +229,11 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      rewrites an existing model carries data.refactor_comparison_offer:
                                      per model the transform compare command and static_attribution
                                      (unattributed, unmeasured, none, attributed), and data.next names
-                                     the comparison before apply; data.identifier_conversions names
+                                     the comparison before apply; baseline_ready false with
+                                     per_model[].blocked_inputs says the baseline does not build yet
+                                     and leads with the repair in a plan of its own, and
+                                     mixed_with_repair (with a warning) names a plan carrying that
+                                     repair beside the rewrite, which cannot be compared (#1114); data.identifier_conversions names
                                      each cast/try_cast/lower/upper/trim the plan adds to an identifier
                                      and, gated like row attribution, counts what it does to entities
                                      (failed, merged, respelled, matched, prior identities lost), with
@@ -433,8 +437,14 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      A plan with a toggle compiles both sides at its on_value
                                      (data.baseline_vars, data.proposed_vars).
                                      The verdict is recorded on the stored plan for apply and a
-                                     --for-plan build; a parent the last build left error or skipped
-                                     is inputs_unsynchronized before anything compiles
+                                     --for-plan build; a parent whose latest build attempt (ordinary
+                                     or --cold-deps, whichever ran last) left it error or skipped is
+                                     inputs_unsynchronized before anything compiles, and the detail
+                                     names the repair as its own plan, built, then this plan compared
+                                     unapplied. A recorded verdict carries inputs_built_by (invocation_id,
+                                     generated_at, cold): the latest build among the model's upstream
+                                     models, one run, recorded with it; null where no build
+                                     attempted them (#1114)
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
@@ -722,7 +732,9 @@ would change, computes the diffs, and stores the plan under
 `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
 `packages_yml` is the guarded way to declare dbt package dependencies: a
 reviewable diff like any other edit, then `transform deps` (or the automatic
-deps step in `transform build`) installs them. `macro_sql` is how a macro is
+deps step in `transform build`) installs them. Installing the packages a project
+declares (at the versions `package-lock.yml` pins, where it matches) is not
+installing or upgrading a tool. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path
 for the macros dex ships. `snapshot_sql` and `seed_csv` bring slowly-changing
 dimension capture and small reference tables into the same flow, each confined to

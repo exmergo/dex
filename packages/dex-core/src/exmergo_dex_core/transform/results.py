@@ -562,6 +562,10 @@ class RefactorComparisonResult(Result):
     # The values the proposal compiled at, where a toggle contract names the on
     # value (#1113): both sides compile there. Absent everywhere else.
     proposed_vars: dict[str, Any] | None = None
+    # The latest build of the compared model's upstream models, ordinary or
+    # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
+    # so `cold` does not mean every input was built cold. None with no build.
+    inputs_built_by: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
@@ -585,6 +589,7 @@ class RefactorComparisonResult(Result):
             "baseline_compiled": self.baseline_compiled,
             "proposed_compiled": self.proposed_compiled,
             "input_scope": self.input_scope,
+            "inputs_built_by": self.inputs_built_by,
             "schema": self.schema_diff,
             "multiset": self.multiset,
             "key_columns": self.key_columns,

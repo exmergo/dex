@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "team_member_summary"
+  ],
+  "prompt": "Refactor `team_member_summary`: move its per-team member counting into a new intermediate model, `int_team_members` under `models/intermediate/`, and have the mart read it. This is a pure refactor for maintainability: the mart's output must not change. The raw tables are delivered by our ingestion vendor and we cannot change them. Do not install or upgrade any tools. The work is done when the refactored mart is built on dev."
+}

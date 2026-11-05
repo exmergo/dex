@@ -1373,7 +1373,10 @@ class MissingPackagesError(PrerequisiteError):
             f"this build may not install dependencies, and {detail}. "
             "Run `transform deps` "
             "where the network is available, or bake dbt_packages/ into the "
-            "environment before the build"
+            "environment before the build. `transform deps` installs the "
+            "packages the project already declares (at the versions "
+            "package-lock.yml pins, where it matches packages.yml): it is not "
+            "installing or upgrading a tool"
         )
 
 

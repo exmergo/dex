@@ -302,6 +302,28 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
             else "if this change should keep the existing results, run"
         )
         step = f"{lead} {commands} before applying; {step}"
+        blocked = sorted(
+            {
+                b["model"]
+                for m in offer["per_model"]
+                for b in m.get("blocked_inputs") or []
+            }
+        )
+        if blocked and not offer.get("mixed_with_repair"):
+            # The comparison cannot run until its baseline builds (#1114).
+            step = (
+                f"the baseline does not build ({', '.join(blocked)}): repair it in "
+                "its own plan, apply and build that plan (`--cold-deps` where a "
+                "package owns the node), and leave this plan unapplied; then " + step
+            )
+        elif offer.get("mixed_with_repair"):
+            step = (
+                "this plan carries a repair of "
+                + ", ".join(offer["mixed_with_repair"])
+                + " beside the rewrite, so it cannot be compared: plan the repair "
+                "on its own, apply and build it, then plan the rewrite again and "
+                "compare that plan before applying"
+            )
     return {"next": step}
 
 
