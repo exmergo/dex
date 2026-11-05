@@ -233,14 +233,14 @@ serve the prerequisite tasks:
   apply may sit between them. `not_checked` and a comparison that never ran are
   not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
   `rebuilt_before_compare` passes when that usable comparison also follows an
-  earlier apply (the prerequisite repair, its own plan) and a build after it that
-  did not fail (#1114): a repair bundled into the refactor's own plan leaves
+  earlier apply (the prerequisite repair, its own plan) and a build after the
+  latest such apply that did not fail (#1114): a repair bundled into the refactor's own plan leaves
   nothing for the comparison to read, so it is a miss. Each build's outcome is
   read from its envelope (`data.completion.outcome`, or `failed` for an error
   envelope and `not_run` for a cost handshake) where the Bash call held exactly
   one build; one the agent's pipe hid gets the benefit of the doubt.
-  `cold_deps_after_repair` passes when a `--cold-deps` build follows any apply,
-  before the refactor's comparison or after its apply.
+  `cold_deps_after_repair` passes when a `--cold-deps` build that did not fail
+  follows any apply, before the refactor's comparison or after its apply.
   `build_after_apply` passes when a `transform build` follows the last apply, and
   `cold_deps_after_apply` when one carrying `--cold-deps` does, and
   `incremental_build_after_apply` when a build without `--full-refresh` follows

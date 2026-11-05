@@ -426,9 +426,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      or --cold-deps, whichever ran last) left it error or skipped is
                                      inputs_unsynchronized before anything compiles, and the detail
                                      names the repair as its own plan, built, then this plan compared
-                                     unapplied. Every verdict carries inputs_built_by (invocation_id,
+                                     unapplied. A recorded verdict carries inputs_built_by (invocation_id,
                                      generated_at, cold): the latest build among the model's upstream
-                                     models, one run, recorded with it (#1114)
+                                     models, one run, recorded with it; null where no build
+                                     attempted them (#1114)
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until

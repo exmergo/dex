@@ -2382,6 +2382,17 @@ def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
             ],
             False,
         ),
+        # The repair built, then another apply that no build followed.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="validated"),
+                _step("apply", "p2"),
+                _step("compare", "p3", "equivalent"),
+                _step("apply", "p3"),
+            ],
+            False,
+        ),
         # A failed build, then one that built: the second counts.
         (
             [
@@ -2429,6 +2440,7 @@ def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
         "bundled",
         "repair-build-failed",
         "unrelated-build",
+        "apply-after-the-build",
         "retried-build",
         "hidden-build",
         "not-checked",
@@ -2469,8 +2481,22 @@ def test_the_comparison_must_follow_a_built_repair(calls, passed):
         ),
         ([_step("build", flags=["cold-deps"]), _step("apply", "p1")], False),
         ([_step("apply", "p1"), _step("build", flags=["verify"])], False),
+        # A cold build that failed shows nothing survives a reinstall.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="failed", flags=["cold-deps"]),
+            ],
+            False,
+        ),
     ],
-    ids=["before-compare", "after-refactor", "before-any-apply", "never-cold"],
+    ids=[
+        "before-compare",
+        "after-refactor",
+        "before-any-apply",
+        "never-cold",
+        "cold-build-failed",
+    ],
 )
 def test_cold_deps_after_repair_counts_after_any_apply(calls, passed):
     """``cold_deps_after_repair`` accepts a cold build after any apply, and none before."""

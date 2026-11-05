@@ -737,10 +737,11 @@ def _rebuilt_before(
     """Whether an earlier apply was built, successfully, before ``compare``."""
 
     earlier = [i for i in applies if i < compare]
-    return any(
+    # After the latest apply before the comparison: an apply changes the tree,
+    # so a build of an earlier one does not build what the comparison reads.
+    return bool(earlier) and any(
         call["label"] == "transform build"
-        and earlier
-        and earlier[0] < i < compare
+        and earlier[-1] < i < compare
         and call.get("outcome") not in _UNBUILT_OUTCOMES
         for i, call in enumerate(calls)
     )
@@ -774,13 +775,15 @@ def procedure_steps(
       ``flags``; a session recorded before flags were has none, so it is a miss.
     - ``rebuilt_before_compare``: the usable comparison
       ``compare_before_apply`` looks for comes after an earlier apply (the
-      prerequisite repair, its own plan) and a build of it that did not fail
-      (#1114). A repair bundled into the refactor's own plan has no such apply,
-      so its comparison could only ever read the blocked baseline: a miss. A
-      build whose envelope the agent's pipe hid gets the benefit of the doubt.
-    - ``cold_deps_after_repair``: a ``transform build --cold-deps`` follows any
-      apply, so a package repair is shown to survive a reinstall whether that
-      build ran before the refactor's comparison or after its apply (#1114).
+      prerequisite repair, its own plan) and a build after the latest such
+      apply that did not fail (#1114). A repair bundled into the refactor's own
+      plan has no such apply, so its comparison could only ever read the
+      blocked baseline: a miss. A build whose envelope the agent's pipe hid
+      gets the benefit of the doubt.
+    - ``cold_deps_after_repair``: a ``transform build --cold-deps`` that did not
+      fail follows any apply, so a package repair is shown to survive a
+      reinstall whether that build ran before the refactor's comparison or after
+      its apply (#1114).
     - ``incremental_build_after_apply``: a ``transform build`` without
       ``--full-refresh`` follows the last ``transform apply`` and every
       ``--full-refresh`` build after it, so an incremental model's next run, not
@@ -820,7 +823,9 @@ def procedure_steps(
         )
     if "cold_deps_after_repair" in required:
         results["cold_deps_after_repair"] = bool(applies) and any(
-            i > applies[0] and "cold-deps" in (calls[i].get("flags") or [])
+            i > applies[0]
+            and "cold-deps" in (calls[i].get("flags") or [])
+            and calls[i].get("outcome") not in _UNBUILT_OUTCOMES
             for i in builds
         )
     if "incremental_build_after_apply" in required:

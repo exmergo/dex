@@ -79,7 +79,8 @@ the project edits, migrations and dev builds described below.
    `baseline_ready: false`, the baseline itself does not build: repair the input
    it names in a plan of its own, apply and build that plan (with `--cold-deps`
    where a package owns the node), and only then compare the refactor's plan,
-   which stays unapplied until it is compared. Never put the repair in the
+   which stays unapplied until it is compared; if the repair changed a file
+   that plan edits, plan the refactor again first (`plan_stale`). Never put the repair in the
    refactor's plan: its comparison would have nothing built to read
    (`mixed_with_repair`). Equivalence is about
    the results the request keeps, not an intermediate's layout. A change meant

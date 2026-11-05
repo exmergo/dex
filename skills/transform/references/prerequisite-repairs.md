@@ -157,7 +157,11 @@ Limits:
 Installing the packages the project already declares is not installing a tool.
 `dex transform deps`, the build's own install and `--cold-deps` fetch what
 `packages.yml` names, at the versions `package-lock.yml` pins where it matches
-(dbt resolves them again where it does not). A request not to
+(dbt resolves them again where it does not). A cold build of a project with a
+relative `local:` package rewrites that path in its copy and drops the lockfile
+there, so it resolves every package afresh: read `data.cold_verification`
+(`packages`, `lock_digest`, `notes`) for the versions it actually installed.
+A request not to
 install or upgrade tools (dbt, Dex, Python packages) does not rule them out.
 
 ## 5. A refactor whose baseline is blocked
@@ -179,12 +183,17 @@ whatever an earlier build left, so the comparison is `not_checked`
    dex transform build --target dev --verify --for-plan <repair plan> --cold-deps
    ```
 
-   For a project model, a plain build with `--select` is enough.
-   `transform compare` reads the latest attempt of each input, a cold build's
-   included.
-4. **Compare the refactor's plan** (the one from step 1, still unapplied; it is
-   not stale unless the repair edited the same files). `equivalent` carries
-   `inputs_built_by`, the latest build among the model's upstream models.
+   For a project model, a plain build is enough. Either way, build every input
+   the offer lists under `blocked_inputs`, the `skipped` ones too, or leave the
+   build unnarrowed: a later build rewrites the run results, so an input it
+   leaves out loses its `skipped` status and the comparison would read that
+   input's stale relation. `transform compare` reads the latest attempt of each
+   input, a cold build's included.
+4. **Compare the refactor's plan** (the one from step 1, still unapplied). If the
+   repair changed a file that plan edits, the comparison is `plan_stale`: plan
+   the refactor again first. `equivalent` carries `inputs_built_by`, where an
+   upstream build exists, naming the latest build among the model's upstream
+   models.
    Other inputs may come from earlier builds, so `cold: true` does not mean
    every input came from that cold build. Relay it with `input_scope` and
    `compared_at`.
