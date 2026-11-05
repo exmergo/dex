@@ -577,14 +577,9 @@ def _check_moving_consumers(
             stripped = strip_jinja(text)
             if stripped:
                 parsed = sqlglot.parse_one(stripped, read=dialect or "duckdb")
-                for select_node in parsed.find_all(exp.Select):
-                    for proj in select_node.expressions:
-                        if isinstance(proj, exp.Alias) and isinstance(
-                            proj.this, exp.Column
-                        ):
-                            consumer_cols.add(proj.this.name.lower())
-                        elif isinstance(proj, exp.Column) and proj.name:
-                            consumer_cols.add(proj.name.lower())
+                for col in parsed.find_all(exp.Column):
+                    if col.name:
+                        consumer_cols.add(col.name.lower())
 
         after_built = next(
             (b for b in builds_after.values() if b["model"] == after_model),
@@ -594,9 +589,21 @@ def _check_moving_consumers(
         if not new_cols:
             after_file = _file_of(after_model, builds_after)
             if after_file and after_file in after:
-                res_after = resolve_select_list(after[after_file], dialect=dialect)
+                res_after = resolve_select_list(
+                    after[after_file],
+                    dialect=dialect,
+                    relation_columns=_relation_columns,
+                )
                 if res_after.columns:
                     new_cols = {col.lower() for col in res_after.columns}
+
+        if not new_cols:
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but the columns of {after_model} could not be read; "
+                "consumer was unchecked"
+            )
+            continue
 
         before_built = next(
             (b for b in builds_before.values() if b["model"] == before_model),
@@ -606,17 +613,24 @@ def _check_moving_consumers(
         if not old_cols:
             before_file = _file_of(before_model, builds_before)
             if before_file and before_file in before:
-                res_before = resolve_select_list(before[before_file], dialect=dialect)
+                res_before = resolve_select_list(
+                    before[before_file],
+                    dialect=dialect,
+                    relation_columns=_relation_columns,
+                )
                 if res_before.columns:
                     old_cols = {col.lower() for col in res_before.columns}
 
-        if old_cols:
-            dropped = old_cols - new_cols
-            lacks = sorted(col for col in dropped if col in consumer_cols)
-        elif new_cols:
-            lacks = sorted(col for col in consumer_cols if col not in new_cols)
-        else:
-            lacks = []
+        if not old_cols:
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but the columns of {before_model} could not be read; "
+                "consumer was unchecked"
+            )
+            continue
+
+        dropped = old_cols - new_cols
+        lacks = sorted(col for col in dropped if col in consumer_cols)
 
         if lacks:
             col_str = ", ".join(lacks)

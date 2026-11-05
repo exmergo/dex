@@ -525,3 +525,50 @@ def test_promotion_consumer_reading_lacking_column_via_cte_warns():
         "dim_teams.v1, which dim_teams.v2 (the new default) lacks" in w
         for w in warnings
     )
+
+
+def test_promotion_consumer_reading_column_in_expression_warns():
+    """a moving consumer reading a lacking column inside an expression warns."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_teams.sql"] = (
+        "select upper(team_label) as display from {{ ref('dim_teams') }}\n"
+    )
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' reads column(s) team_label from "
+        "dim_teams.v1, which dim_teams.v2 (the new default) lacks" in w
+        for w in warnings
+    )
+
+
+def test_promotion_new_default_unreadable_columns_warns_unchecked():
+    """when the new default columns cannot be read, consumer is unchecked."""
+    unresolvable_yml = """\
+version: 2
+models:
+  - name: dim_teams
+    latest_version: 1
+    versions:
+      - v: 1
+        defined_in: dim_teams
+        columns:
+          - name: team_id
+          - name: team_label
+      - v: 2
+"""
+    files = _project()
+    files["models/_models.yml"] = unresolvable_yml
+    files["models/dim_teams_v2.sql"] = "select {{ unresolvable() }}\n"
+    promoted = unresolvable_yml.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' moves from dim_teams.v1 to "
+        "dim_teams.v2, but the columns of dim_teams.v2 could not be read; "
+        "consumer was unchecked" in w
+        for w in warnings
+    )
