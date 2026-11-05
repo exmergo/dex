@@ -147,6 +147,10 @@ def test_a_correct_scoped_retirement_is_checked_end_to_end(jinja_repo, capsys):
     assert again["status"] == "ok", again
     assert again["data"]["plan_id"] is None
     assert again["data"]["retirement"]["status"] == "already_complete"
+    # It names the plan that carries the contract, since only a build for that
+    # plan checks the outputs again.
+    assert again["data"]["retirement"]["retired_by_plan"] == plan_id
+    assert any(f"--for-plan {plan_id}" in note for note in again["data"]["notes"])
 
 
 def test_a_retired_column_that_survives_is_caught(jinja_repo, capsys):

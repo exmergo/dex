@@ -1345,9 +1345,17 @@ def _retire(
     # keeps it from being recognised unless an applied plan already retired
     # this flag: without that evidence the dynamic read may be the one reader
     # left, and the request goes on to be checked.
+    retired_by = _retired_before(engine, name)
     if retirement_mod.is_already_complete(
-        view, name, edits, allow_dynamic=scoped and _retired_before(engine, name)
+        view, name, edits, allow_dynamic=scoped and retired_by is not None
     ):
+        # A build answers for a contract only through the plan that carries it,
+        # so the plan that retired the flag is named for the check to run on.
+        verify = (
+            f"`transform build --target dev --verify --for-plan {retired_by}`"
+            if retired_by
+            else "`transform build --target dev --verify` and `explore profile`"
+        )
         return PropagationResult(
             change=f"{name} already removed",
             kind="var",
@@ -1356,12 +1364,12 @@ def _retire(
                 "contract": stated,
                 "package_scope": scope,
                 **({"discovery": discovery} if discovery is not None else {}),
+                **({"retired_by_plan": retired_by} if retired_by else {}),
             },
             notes=[
                 f"nothing in this project reads or defines '{name}' and this "
                 "payload changes no file, so no plan was stored. To check the "
-                "outputs the contract names, run `transform build --target dev "
-                "--verify` and `explore profile`"
+                f"outputs the contract names, run {verify}"
             ],
             decisions=retirement_mod.decisions(stated),
         )
@@ -1411,20 +1419,25 @@ def _retire(
     return result
 
 
-def _retired_before(engine: DexEngine, name: str) -> bool:
-    """Whether an applied plan carried a retirement contract for ``name``."""
+def _retired_before(engine: DexEngine, name: str) -> str | None:
+    """The latest applied plan carrying a retirement contract for ``name``."""
 
     store = engine.store
     if store is None or not hasattr(store, "list_plans"):
-        return False
+        return None
     try:
         plans = store.list_plans()
     except Exception:
-        return False
-    return any(
-        plan.applied_at is not None and (plan.retirement or {}).get("variable") == name
+        return None
+    applied = [
+        plan
         for plan in plans
-    )
+        if plan.applied_at is not None
+        and (plan.retirement or {}).get("variable") == name
+    ]
+    if not applied:
+        return None
+    return str(max(applied, key=lambda plan: plan.applied_at or "").plan_id)
 
 
 def _propagate(
