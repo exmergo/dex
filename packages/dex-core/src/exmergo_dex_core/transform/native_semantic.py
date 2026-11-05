@@ -333,13 +333,40 @@ def removal_payload(edits_file: str | None) -> tuple[list[PlanEdit], Any]:
     read is a change that looks checked and was not.
     """
 
-    edits, declarations, retirement = _payload_parts(edits_file, None)
+    edits, declarations, retirement, toggle = _payload_parts(edits_file, None)
     if declarations is not None:
         raise ValueError(
             "this command does not take declarations; pass them to `transform "
             "plan` or `semantic define|update|plan` instead"
         )
+    if toggle is not None:
+        raise ValueError(_TOGGLE_ONLY_ON_PLAN)
     return edits, retirement
+
+
+#: A live toggle keeps both behaviors, so its contract rides on the one command
+#: that plans an edit without removing anything (#1113).
+_TOGGLE_ONLY_ON_PLAN = (
+    "only `transform plan` takes a toggle contract; this command would drop it "
+    "unread. A flag being removed takes a `retirement` contract on `transform "
+    "remove var` instead"
+)
+
+
+def plan_payload(
+    edits_file: str | None,
+) -> tuple[list[PlanEdit], list[Any] | None, Any]:
+    """``transform plan``'s payload: its edits, raw ``declarations`` and raw
+    ``toggle`` (#1113). The one reader of ``toggle``; every other command refuses
+    it through :func:`payload_from_file`, as ``retirement`` is refused."""
+
+    edits, declarations, retirement, toggle = _payload_parts(edits_file, None)
+    if retirement is not None:
+        raise ValueError(
+            "only `transform remove var` takes a retirement contract; this command "
+            "would drop it unread. A flag that stays live takes a `toggle` contract"
+        )
+    return edits, declarations, toggle
 
 
 def payload_from_file(
@@ -359,22 +386,24 @@ def payload_from_file(
     :mod:`.declarations` is what knows its shape.
     """
 
-    edits, declarations, retirement = _payload_parts(edits_file, default_kind)
+    edits, declarations, retirement, toggle = _payload_parts(edits_file, default_kind)
     if retirement is not None:
         raise ValueError(
             "only `transform remove var` takes a retirement contract; this command "
             "would drop it unread"
         )
+    if toggle is not None:
+        raise ValueError(_TOGGLE_ONLY_ON_PLAN)
     return edits, declarations
 
 
 def _payload_parts(
     edits_file: str | None, default_kind: EditKind | None
-) -> tuple[list[PlanEdit], list[Any] | None, Any]:
-    """The one read of a payload, stdin included, split into its three keys."""
+) -> tuple[list[PlanEdit], list[Any] | None, Any, Any]:
+    """The one read of a payload, stdin included, split into its four keys."""
 
     if edits_file is None:
-        return [], None, None
+        return [], None, None, None
     raw = sys.stdin.read() if edits_file == "-" else read_payload_file(edits_file)
     try:
         payload = json.loads(raw)
@@ -383,6 +412,12 @@ def _payload_parts(
     if not isinstance(payload, dict):
         raise ValueError('edits payload must be {"edits": [...]}')
     declarations = payload.get("declarations")
+    if payload.get("retirement") is not None and payload.get("toggle") is not None:
+        raise ValueError(
+            "a payload carries a retirement or a toggle contract, not both: a "
+            "retirement removes the flag and keeps one behavior, a toggle keeps the "
+            "flag and both behaviors"
+        )
     entries = payload.get("edits")
     if entries is None and (
         declarations is not None or payload.get("retirement") is not None
@@ -421,7 +456,7 @@ def _payload_parts(
                 new_content=entry.get("content"),
             )
         )
-    return edits, declarations, payload.get("retirement")
+    return edits, declarations, payload.get("retirement"), payload.get("toggle")
 
 
 def read_payload_file(path: str) -> str:

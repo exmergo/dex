@@ -170,6 +170,36 @@ Then build again without `--full-refresh`.
 
 </Accordion>
 
+<Accordion title="Add or change a feature flag">
+
+A flag that stays live, as in "hide the fee columns when `enable_fees` is
+false", has to hold on both values in every model of the project. That includes
+models that do not feed the mart you changed, such as a ledger nothing else
+reads, a model that inherits a column through `select *`, or a model whose
+table is empty. State it with a `toggle` key beside the edits in the
+`transform plan` payload:
+
+```json
+{"edits": [...],
+ "toggle": {"variable": "enable_fees", "on_value": true, "off_value": false,
+            "columns": ["fee_amount"], "exempt_models": ["stg_orders"]}}
+```
+
+Dex compiles every model at each value without probing any table's rows (a
+compile-time macro such as `run_query` can still query the warehouse), and
+`data.toggle`
+names each model that still outputs a governed column with the flag off or loses
+one with it on. `transform compare` checks the on value against today's results.
+After `transform build --verify --for-plan <plan-id>`,
+`data.verification.toggle` judges each built relation's columns at the value
+that build used, so an empty table is checked too. The other value is reported
+as not built.
+
+Removing a flag is a different change: use a `retirement` contract on
+`dex transform remove var`, which states which behavior survives.
+
+</Accordion>
+
 <Accordion title="Find the dbt artifacts">
 
 By default, Dex writes dbt artifacts under `target/dex/<dbt-version>/` rather

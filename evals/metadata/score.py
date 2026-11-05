@@ -24,7 +24,10 @@ Truth (``truth.json``), per task::
      "incomplete_allowed": {"blocked_by": ["tasks_task"]},
      "procedure": {"build_after_apply": true, "cold_deps_after_apply": true,
                    "incremental_build_after_apply": true,
-                   "mutate_after_tests": true},
+                   "mutate_after_tests": true,
+                   "toggle_contract_before_apply": true},
+     "var_builds": [{"name": "fees_off", "vars": {"enable_fees": false},
+                     "checks": [{"name": "...", "sql": "...", "expect": 0}]}],
      "replays": [{"name": "next_batch", "select": "fct_x",
                   "setup": ["delete from raw.x"],
                   "steps": [["insert into raw.x ..."], []],
@@ -49,6 +52,13 @@ source rows, never the agent's) and ``dbt run --select <select>`` without
 named ``<replay>: <check>``. ``incremental_test`` grades, from the workspace's
 YAML alone, whether the model has a unit test that overrides ``is_incremental``
 to true: the verification step, graded apart from the data the replays judge.
+``var_builds`` grade a project that has to hold on more than one value of a
+variable, which the gate's single build at the default never shows (#1113):
+each starts from its own fresh copy of the workspace and grading warehouse and
+runs ``dbt build --vars <vars>``, then its ``checks``, named
+``<build>: <check>``. A check over ``information_schema.columns`` judges a
+relation by its columns, so an empty table counts. A build that fails fails
+every check it carries.
 ``incomplete_allowed`` accepts a deliverable left blocked by the named
 prerequisite, where the build failed on nothing else and the final message
 reports it (status ``blocked_reported``): a request the agent cannot carry out
@@ -97,6 +107,8 @@ GATE_TIMEOUT_S = 600
 
 
 def _yaml_files(project: Path) -> list[Path]:
+    """Every YAML file under the project's ``models/`` directory, sorted."""
+
     models = project / "models"
     if not models.is_dir():
         return []
@@ -136,6 +148,8 @@ def _dex_meta(node: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class Declared:
+    """What a model's YAML declares, read independently of the engine."""
+
     description: str | None = None
     grain: list[str] | None = None
     population: dict[str, Any] | None = None
@@ -144,6 +158,8 @@ class Declared:
 
 
 def declared(entry: dict[str, Any] | None) -> Declared:
+    """The declaration one YAML model entry states, ``meta`` merged as dbt merges it."""
+
     if not entry:
         return Declared()
     dex = _dex_meta(entry)
@@ -171,6 +187,8 @@ def declared(entry: dict[str, Any] | None) -> Declared:
 
 
 def _model_sql(project: Path) -> dict[str, str]:
+    """Every model's SQL under ``models/``, by file stem."""
+
     models = project / "models"
     if not models.is_dir():
         return {}
@@ -223,6 +241,8 @@ def touched_models(baseline: Path, workspace: Path) -> list[str]:
 
 
 def _dbt() -> str:
+    """The dbt executable beside this interpreter, else the one on ``PATH``."""
+
     beside = Path(sys.executable).parent / "dbt"
     if beside.exists():
         return str(beside)
@@ -234,6 +254,8 @@ def _dbt() -> str:
 
 @dataclass
 class Gate:
+    """Whether the build gate passed, the stage that decided it and what failed."""
+
     passed: bool
     stage: str  # "duplicates", "deps", "parse", "build" or "ok"
     detail: list[str] = field(default_factory=list)
@@ -265,6 +287,8 @@ def _failed_nodes(project: Path) -> list[str]:
 
 
 def _tail(output: str, lines: int = 25) -> list[str]:
+    """The last ``lines`` non-blank lines of a process's output."""
+
     return [line for line in output.strip().splitlines()[-lines:] if line.strip()]
 
 
@@ -291,6 +315,8 @@ def _dbt_stage(
 
 
 def _declares_packages(project: Path) -> bool:
+    """Whether the project declares dbt packages, so a copy needs ``dbt deps``."""
+
     return (project / "packages.yml").is_file() or (
         project / "dependencies.yml"
     ).is_file()
@@ -343,6 +369,8 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
 
 
 def _execute(database: Path, statements: list[str]) -> None:
+    """Run ``statements`` against a scratch DuckDB warehouse and checkpoint it."""
+
     import duckdb
 
     con = duckdb.connect(str(database))
@@ -388,6 +416,44 @@ def run_replays(
             proc = _dbt_stage(scratch, args)
             if proc is None or proc.returncode != 0:
                 failed = f"dbt {stage} failed"
+                break
+        if failed is not None:
+            results += [
+                {"name": f"{name}: {c['name']}", "passed": False, "error": failed}
+                for c in checks
+            ]
+            continue
+        results += [
+            {**result, "name": f"{name}: {result['name']}"}
+            for result in run_checks(scratch, checks)
+        ]
+    return results
+
+
+def run_var_builds(
+    workspace: Path, fixture: Fixture, root: Path, builds: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build the workspace once per entry with its ``vars`` and run its checks
+    (see the module docstring), named ``<build>: <check>``."""
+
+    import json
+
+    results: list[dict[str, Any]] = []
+    for build in builds:
+        name = build["name"]
+        checks = build.get("checks") or []
+        scratch = root / f"vars-{name}"
+        shutil.copytree(workspace, scratch, ignore=_GATE_IGNORE)
+        build_warehouse(scratch / WAREHOUSE_FILE, fixture.grading_tables())
+        stages: list[tuple[str, list[str]]] = []
+        if _declares_packages(scratch):
+            stages.append(("deps", ["deps"]))
+        stages.append(("build", ["build", "--vars", json.dumps(build["vars"])]))
+        failed = None
+        for stage, args in stages:
+            proc = _dbt_stage(scratch, args)
+            if proc is None or proc.returncode != 0:
+                failed = f"dbt {stage} failed with {json.dumps(build['vars'])}"
                 break
         if failed is not None:
             results += [
@@ -495,6 +561,8 @@ def planted_defects(
 
 
 def relation_columns(scratch: Path, model: str) -> list[str] | None:
+    """A built model's columns in order, lowercased; ``None`` when it was not built."""
+
     import duckdb
 
     con = duckdb.connect(str(scratch / WAREHOUSE_FILE), read_only=True)
@@ -576,6 +644,8 @@ def completeness(decl: Declared, columns: list[str] | None) -> dict[str, Any]:
 
 
 def _norm(value: Any) -> str:
+    """A value as a trimmed, lowercased string, for comparing declared facts."""
+
     return str(value).strip().lower()
 
 
@@ -602,6 +672,10 @@ def _effective_excluded(
 
 
 def _unit_matches(expected: str, got: Any) -> bool:
+    """Whether a declared unit matches the expected one; a trailing ``*`` matches by
+    prefix.
+    """
+
     if got is None:
         return False
     if expected.endswith("*"):
@@ -610,6 +684,8 @@ def _unit_matches(expected: str, got: Any) -> bool:
 
 
 def correctness(decl: Declared, truth: dict[str, Any]) -> dict[str, bool]:
+    """Which declared fields with a known answer match it, field by field."""
+
     fields: dict[str, bool] = {}
     if "grain" in truth:
         fields["grain"] = {_norm(g) for g in decl.grain or []} == {
@@ -697,10 +773,13 @@ PROCEDURE_STEPS = (
     "cold_deps_after_apply",
     "incremental_build_after_apply",
     "mutate_after_tests",
+    "toggle_contract_before_apply",
 )
 
 
 def _is_mutation(call: dict[str, Any]) -> bool:
+    """Whether a recorded Dex call is a ``transform test --mutate`` run."""
+
     return call["label"] == "transform test" and "mutate" in (call.get("flags") or [])
 
 
@@ -716,6 +795,31 @@ def _compared_the_apply(
     if compared and applied:
         return compared == applied
     return not any(compare < i < last for i in applies)
+
+
+def _toggled_the_apply(
+    calls: list[dict[str, Any]], plans: list[int], last: int
+) -> bool:
+    """Whether the plan the last apply wrote carried a toggle check (#1113).
+
+    The plan is the one whose recorded ``plan_id`` the apply names. Where the
+    apply names none, or names one no readable plan result recorded, it is the
+    latest plan before the apply that stored a plan (a refused plan stores
+    none), as an apply with no id resolves the latest unapplied plan. A toggle
+    on an earlier plan that was never applied does not count.
+    """
+
+    stored = [i for i in plans if i < last and calls[i].get("toggle") != "error"]
+    applied = calls[last].get("plan")
+    named = [i for i in stored if applied and calls[i].get("plan_id") == applied]
+    if not named and applied:
+        # The apply names a plan no readable result recorded: only a plan whose
+        # id the transcript hid can be it.
+        named = [i for i in stored if calls[i].get("plan_id") is None]
+    candidates = named or ([] if applied else stored)
+    if not candidates:
+        return False
+    return calls[candidates[-1]].get("toggle", "absent") not in ("absent", "error")
 
 
 def procedure_steps(
@@ -752,6 +856,14 @@ def procedure_steps(
       ``transform apply``, so the tests that were measured are the ones that
       ship (#1112). Measuring, strengthening and stopping leaves the strengthened
       tests unmeasured, so it is a miss.
+    - ``toggle_contract_before_apply``: the plan the last ``transform apply``
+      wrote carried a ``toggle`` check, so the change that went in was held on
+      both values of its flag in every model (#1113). The plan is matched by
+      the id the apply names, or else is the latest stored plan before it (see
+      ``_toggled_the_apply``). Read from the call's ``toggle`` (see
+      ``live._plan_toggle``): a plan whose result the agent's own pipe hid is
+      given the benefit of the doubt, as a hidden comparison verdict is; a
+      readable result with no toggle, or a failed plan, is a miss.
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
@@ -782,6 +894,11 @@ def procedure_steps(
         ]
         results["incremental_build_after_apply"] = any(
             i not in refreshes and all(i > r for r in refreshes) for i in after
+        )
+    if "toggle_contract_before_apply" in required:
+        plans = [i for i, label in enumerate(labels) if label == "transform plan"]
+        results["toggle_contract_before_apply"] = bool(applies) and _toggled_the_apply(
+            calls, plans, applies[-1]
         )
     if "mutate_after_tests" in required:
         results["mutate_after_tests"] = bool(applies) and any(
@@ -896,6 +1013,8 @@ def report_rubric(
 
 @dataclass
 class TaskScore:
+    """Every grade for one task, as the report and the CLI summary show it."""
+
     task: str
     #: "scored", "gate_failed", "no_models", or "blocked_reported": the gate
     #: failed only on a prerequisite the task allows to stay blocked, and the
@@ -935,6 +1054,8 @@ class TaskScore:
     mutation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """The score as a plain dictionary, for the JSON report."""
+
         return asdict(self)
 
 
@@ -1083,6 +1204,9 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         checks = run_checks(tmp_path / "built", task.truth.get("checks") or [])
         checks += run_replays(
             workspace, fixture, tmp_path, task.truth.get("replays") or []
+        )
+        checks += run_var_builds(
+            workspace, fixture, tmp_path, task.truth.get("var_builds") or []
         )
         defects = (
             planted_defects(tmp_path / "built", task.truth["planted_defects"], tmp_path)

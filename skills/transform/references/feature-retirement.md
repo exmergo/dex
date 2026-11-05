@@ -17,6 +17,9 @@ has to be checked.
 A flag's default says what the project did, not what the request wants. A
 `True` default never means the enabled branch survives.
 
+A flag that stays, with both behaviors kept, is a toggle rather than a
+retirement: [feature-toggles.md](feature-toggles.md).
+
 ## 1. Find every read
 
 ```bash

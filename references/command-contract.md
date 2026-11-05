@@ -244,7 +244,13 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      entry beside a version is refused by code; a promotion is a
                                      warning naming each consumer it moves; independent_models
                                      names a <model>_v<N> copy that is not a version (#859;
-                                     skills/transform/references/model-versions.md)
+                                     skills/transform/references/model-versions.md). A `toggle`
+                                     key in the payload (only this command takes one; #1113) states
+                                     a flag that stays live: variable, on_value and off_value (both
+                                     required), the governed columns and exempt_models. data.toggle
+                                     compiles every project model at each value and names each one
+                                     still outputting a governed column off, or losing one on, from
+                                     compiled SQL alone (skills/transform/references/feature-toggles.md)
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind, named in
                                      data.resolved_plan and a warnings line, and an empty id is refused
@@ -364,7 +370,14 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      unknown with no plan) and what blocked each, the failing nodes,
                                      which deliverables anything checked, what verification ran and
                                      suppressed, the declared obligations by status, and where the
-                                     full evidence is, so a truncated read still has the answer
+                                     full evidence is, so a truncated read still has the answer.
+                                     With --verify and a plan carrying a toggle (#1113),
+                                     data.verification.toggle judges the built relations' columns from
+                                     metadata at the value this build gave the flag: every model when
+                                     off (toggle_column_present_when_off, an empty table included),
+                                     every producer when on (toggle_column_missing_when_on); the other
+                                     value is unchecked (branch_not_built). Each record reaches
+                                     data.completion.obligations
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
 dex transform export [plan-id]    -> one stored plan as a portable document a second process can check
                                      and apply: every edit's operation, kind, preimage hash, content
@@ -417,6 +430,8 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      data.status is equivalent, different or not_checked with
                                      data.reason_code; equivalent holds for data.input_scope at
                                      data.compared_at only. Priced before spend on metered connectors.
+                                     A plan with a toggle compiles both sides at its on_value
+                                     (data.baseline_vars, data.proposed_vars).
                                      The verdict is recorded on the stored plan for apply and a
                                      --for-plan build; a parent the last build left error or skipped
                                      is inputs_unsynchronized before anything compiles

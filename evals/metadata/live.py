@@ -74,6 +74,8 @@ def provenance(
     """
 
     def git(*args: str) -> str:
+        """One git command in the repository, its trimmed standard output."""
+
         return subprocess.run(
             ["git", *args], cwd=REPO, capture_output=True, text=True
         ).stdout.strip()
@@ -106,6 +108,10 @@ def provenance(
 
 @dataclass
 class Session:
+    """What one live agent session did: its cost, turns and outcome, the plugins and
+    skills it loaded, and the Dex calls it made in order.
+    """
+
     cost_usd: float | None = None
     turns: int | None = None
     duration_s: float = 0.0
@@ -122,8 +128,9 @@ class Session:
     #: The same calls with what the transcript shows about each: ``label``,
     #: ``plan`` (the literal id named, or ``None``), ``flags`` (the ``--flag``
     #: names the call passed, without their dashes or values, see ``_flags``)
-    #: and, on a comparison, ``verdict`` (see ``_compare_verdict``). A procedure
-    #: step reads these.
+    #: and, on a comparison, ``verdict`` (see ``_compare_verdict``), and on a
+    #: plan, ``toggle`` and ``plan_id`` (see ``_plan_toggle``). A procedure step
+    #: reads these.
     dex_calls: list[dict[str, Any]] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
@@ -165,6 +172,8 @@ def _aliases(command: str) -> list[str]:
 
 
 def _alias_call(name: str) -> re.Pattern:
+    """A pattern for a Dex call made through the shell alias or variable ``name``."""
+
     return re.compile(
         rf"(?<!--script\s)(?<!--script\s\$)\$?\b{re.escape(name)}\b(?!\s*[=(])"
         r"(?:\s+(?:--[\w-]+(?:[ =]\S+)?\s+)*)?"
@@ -286,6 +295,8 @@ _VERDICTS = ("equivalent", "different", "not_checked")
 
 
 def _result_text(block: dict[str, Any]) -> str:
+    """A tool result block's text, its content parts joined when it has several."""
+
     content = block.get("content")
     if isinstance(content, list):
         return "\n".join(str(part.get("text") or "") for part in content)
@@ -307,6 +318,38 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
     if block.get("is_error") or {"error", "needs_confirmation"} & set(statuses):
         return "not_run"
     return None
+
+
+_TOGGLE = re.compile(r'"toggle"\s*:\s*\{[^{}]*?"verdict"\s*:\s*"(\w+)"')
+
+
+_PLAN_ID = re.compile(r'"plan_id"\s*:\s*"([\w.-]+)"')
+
+
+def _plan_toggle(block: dict[str, Any]) -> str | None:
+    """What one ``transform plan`` said about a toggle contract (#1113): the
+    ``data.toggle`` verdict, ``error`` when the plan failed (a tool error or an
+    error envelope, which stores no plan), ``absent`` when a readable plan
+    result carried no toggle, or ``None`` only when the agent's pipe left
+    nothing to read."""
+
+    text = _result_text(block)
+    found = _TOGGLE.findall(text)
+    if found:
+        return found[0]
+    statuses = _STATUS.findall(text)
+    if block.get("is_error") or "error" in statuses:
+        return "error"
+    if '"plan_id"' in text or statuses:
+        return "absent"
+    return None
+
+
+def _plan_id(block: dict[str, Any]) -> str | None:
+    """The plan id a ``transform plan`` result names, if it is readable."""
+
+    found = _PLAN_ID.findall(_result_text(block))
+    return found[0] if found else None
 
 
 _SURVIVED = re.compile(r'"survived"\s*:\s*(\d+)')
@@ -332,6 +375,7 @@ def summarize(
     calls: list[dict[str, Any]] = []
     pending_compares: dict[str, dict[str, Any]] = {}
     pending_mutations: dict[str, dict[str, Any]] = {}
+    pending_plans: dict[str, dict[str, Any]] = {}
     for event in events:
         if event.get("type") == "user":
             content = (event.get("message") or {}).get("content")
@@ -343,6 +387,10 @@ def summarize(
                     run = pending_mutations.pop(str(block.get("tool_use_id")), None)
                     if run is not None:
                         run["survived"] = _mutation_survivors(block)
+                    planned = pending_plans.pop(str(block.get("tool_use_id")), None)
+                    if planned is not None:
+                        planned["toggle"] = _plan_toggle(block)
+                        planned["plan_id"] = _plan_id(block)
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
             session.model = event.get("model")
@@ -402,6 +450,12 @@ def summarize(
                     ]
                     if len(mutations) == 1 and block.get("id"):
                         pending_mutations[str(block["id"])] = mutations[0]
+                    # And for what a plan said about a toggle contract (#1113).
+                    plans = [
+                        call for call in ordered if call["label"] == "transform plan"
+                    ]
+                    if len(plans) == 1 and block.get("id"):
+                        pending_plans[str(block["id"])] = plans[0]
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")
@@ -430,6 +484,10 @@ def run_session(
     timeout: int,
     plugin_dir: Path | None = None,
 ) -> Session:
+    """Run one agent session on ``prompt`` in ``workspace``, recording its events to
+    ``transcript``.
+    """
+
     plugin_dir = resolve_plugin_dir(plugin_dir)
     binary = _require_claude("claude")
     env = _child_env()

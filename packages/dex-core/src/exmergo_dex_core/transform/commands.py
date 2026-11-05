@@ -48,6 +48,7 @@ from .native_semantic import (
     edits_from_payload,
     payload_from_file,
     plan_hint,
+    plan_payload,
     read_payload_file,
     removal_payload,
 )
@@ -276,6 +277,7 @@ def plan(
     declarations: list[Any] | None = None,
     scaffold: list[str] | None = None,
     attribute_rows: bool | None = None,
+    toggle: Any = None,
 ) -> PlanResult:
     """Turn authored edits into a stored plan of reviewable diffs.
 
@@ -295,6 +297,9 @@ def plan(
     ``attribute_rows`` controls the row-population report (see
     :mod:`.row_attribution`), which runs after the plan is stored so that nothing
     it finds, and no way it fails, can stop a plan from existing.
+
+    ``toggle`` is the payload's raw ``toggle`` contract (#1113): a flag that stays
+    live, held on both of its values by :mod:`.toggle` once the plan is stored.
     """
 
     edits = list(edits or [])
@@ -317,6 +322,8 @@ def plan(
         edits = generated + edits
     else:
         scaffold_notes = []
+
+    toggle_stated = _parse_toggle(engine, edits, toggle)
 
     declared, declaration_notes, drafts = _declare(engine, edits, declarations)
     edits = declared
@@ -457,7 +464,76 @@ def plan(
     _attribute_rows(engine, result, edits, requested=attribute_rows)
     _contradiction_warnings(result)
     _offer_refactor_comparison(engine, result, edits)
+    if toggle_stated is not None:
+        _check_toggle(engine, result, toggle_stated)
     return result
+
+
+def _parse_toggle(
+    engine: DexEngine, edits: list[PlanEdit], raw: Any
+) -> tuple[str, Any] | None:
+    """The payload's toggle as (variable, contract), refused before anything is
+    stored when it is malformed or names a flag the plan's tree never reads."""
+
+    if raw is None:
+        return None
+    from ..dbt_project import load as load_project
+    from . import toggle as toggle_mod
+
+    variable, contract = toggle_mod.parse_contract(raw)
+    if not _has_dbt_project(engine):
+        raise ValueError(
+            "a toggle contract is checked by compiling the dbt project, and no dbt "
+            "project resolves here"
+        )
+    toggle_mod.require_read(load_project(engine.project_dir()), edits, variable)
+    return variable, contract
+
+
+def _check_toggle(
+    engine: DexEngine, result: PlanResult, stated: tuple[str, Any]
+) -> None:
+    """Record the toggle on the stored plan and hold every model to it (#1113)."""
+
+    from ..dbt_project import load as load_project
+    from . import toggle as toggle_mod
+
+    variable, contract = stated
+    project = Path(engine.project_dir())
+    view = load_project(project)
+    from ..guards.cost_guard import CostGuardError
+
+    store = engine.require_full_store("recording a toggle contract")
+    stored = store.load_plan(result.plan_id)
+    form = toggle_mod.stored_form(variable, contract)
+    # The contract is recorded before the analysis runs: the plan is already
+    # stored, so a defect in the analysis must neither turn it into an error nor
+    # leave it carrying no contract for apply and a `--for-plan` build to read.
+    form["producers"] = {}
+    stored.toggle = form
+    store.save_plan(stored)
+    try:
+        analysis = toggle_mod.analyze(engine, stored, project, view, variable, contract)
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        analysis = toggle_mod.analysis_failed(type(exc).__name__)
+    # The producers travel with the contract, so a `--for-plan` build (or a
+    # plan document) can hold the on branch to them without compiling again.
+    form["producers"] = analysis.get("producers") or {}
+    if analysis.get("analysis_failed"):
+        form["analysis_failed"] = analysis["analysis_failed"]
+    gaps = toggle_mod.plan_gaps(analysis)
+    if gaps:
+        form["plan_gaps"] = gaps
+    stored.toggle = form
+    store.save_plan(stored)
+    result.toggle = {**analysis, "contract": form}
+    result.warnings[:0] = toggle_mod.plan_warnings(variable, analysis)
+    result.decisions = [
+        *(result.decisions or []),
+        *toggle_mod.decisions(form),
+    ]
 
 
 def _confirm_versions(
@@ -1101,7 +1177,7 @@ def _attribution_for(
 
 def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
-        edits, declarations = payload_from_file(getattr(args, "edits_file", None))
+        edits, declarations, toggle = plan_payload(getattr(args, "edits_file", None))
         result = plan(
             engine,
             getattr(args, "argument", None) or "",
@@ -1109,6 +1185,7 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             declarations=declarations,
             scaffold=getattr(args, "scaffold", None),
             attribute_rows=getattr(args, "attribute_rows", None),
+            toggle=toggle,
         )
         return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
@@ -3341,9 +3418,16 @@ def _apply_stored(
                     or []
                 ),
                 *_retirement_decisions(stored.retirement),
+                *_toggle_decisions(stored.toggle),
             ]
         ),
     )
+
+
+def _toggle_decisions(stored: dict[str, Any] | None) -> list[dict[str, Any]]:
+    from .toggle import decisions
+
+    return decisions(stored)
 
 
 def _retirement_decisions(stored: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -3353,11 +3437,13 @@ def _retirement_decisions(stored: dict[str, Any] | None) -> list[dict[str, Any]]
 
 
 def _with_retirement(
-    declared: list[dict[str, Any]] | None, stored: dict[str, Any] | None
+    declared: list[dict[str, Any]] | None,
+    stored: dict[str, Any] | None,
+    toggle: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """The build's decisions plus the contract's, keeping ``None`` where neither."""
+    """The build's decisions plus the contracts', keeping ``None`` where none."""
 
-    extra = _retirement_decisions(stored)
+    extra = [*_retirement_decisions(stored), *_toggle_decisions(toggle)]
     return [*(declared or []), *extra] if extra else declared
 
 
@@ -4199,6 +4285,7 @@ def _build_project(
             artifact_directory=artifacts_dir,
             invocation_id=logged_id,
             retirement=_plan_retirement(engine, for_plan, for_plan_document),
+            toggle=_plan_toggle(engine, for_plan, for_plan_document),
             plan_edits=_plan_edits(engine, for_plan, for_plan_document),
             select=select,
         )
@@ -4224,6 +4311,7 @@ def _build_project(
             decisions=_with_retirement(
                 _built_decisions(engine, summary),
                 _plan_retirement(engine, for_plan, for_plan_document),
+                _plan_toggle(engine, for_plan, for_plan_document),
             ),
             engine=engine,
             completion_inputs=_completion_inputs(
@@ -4350,12 +4438,14 @@ def _build_project(
         artifact_directory=artifacts_dir,
         invocation_id=logged_id,
         retirement=_plan_retirement(engine, for_plan, for_plan_document),
+        toggle=_plan_toggle(engine, for_plan, for_plan_document),
         plan_edits=_plan_edits(engine, for_plan, for_plan_document),
         select=select,
     )
     decisions = _with_retirement(
         _built_decisions(engine, summary),
         _plan_retirement(engine, for_plan, for_plan_document),
+        _plan_toggle(engine, for_plan, for_plan_document),
     )
     return _shape_build_result(
         summary,
@@ -4420,14 +4510,28 @@ def _plan_retirement(
 ) -> dict[str, Any] | None:
     """The retirement contract of the plan this build answers for (#858)."""
 
+    return _plan_contract(engine, for_plan, for_plan_document, "retirement")
+
+
+def _plan_toggle(
+    engine: DexEngine, for_plan: str | None, for_plan_document: Any
+) -> dict[str, Any] | None:
+    """The toggle contract of the plan this build answers for (#1113)."""
+
+    return _plan_contract(engine, for_plan, for_plan_document, "toggle")
+
+
+def _plan_contract(
+    engine: DexEngine, for_plan: str | None, for_plan_document: Any, key: str
+) -> dict[str, Any] | None:
     with contextlib.suppress(Exception):
         if for_plan:
             store = engine.require_full_store("reading a plan")
-            return store.load_plan(for_plan).retirement
+            return getattr(store.load_plan(for_plan), key)
         if for_plan_document is not None:
             from .portable import verify_plan_document
 
-            return verify_plan_document(for_plan_document).retirement
+            return getattr(verify_plan_document(for_plan_document), key)
     return None
 
 
@@ -4441,6 +4545,7 @@ def _verify_build(
     artifact_directory: Path | None = None,
     invocation_id: str | None = None,
     retirement: dict[str, Any] | None = None,
+    toggle: dict[str, Any] | None = None,
     plan_edits: list[PlanEdit] | None = None,
     select: str | None = None,
 ) -> BuildVerification:
@@ -4484,6 +4589,7 @@ def _verify_build(
             summary,
             resolve_adapter=opener,
             retirement=retirement,
+            toggle=toggle,
             plan_edits=plan_edits,
             selection=select,
         )
@@ -4494,6 +4600,7 @@ def _verify_build(
             summary,
             resolve_adapter=opener,
             retirement=retirement,
+            toggle=toggle,
             plan_edits=plan_edits,
             selection=select,
         )

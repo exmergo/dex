@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: fct_orders
+    description: One row per marketplace order.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+  - name: rpt_merchant_revenue
+    description: One row per merchant, with its order revenue.
+    columns:
+      - name: merchant_id
+        tests:
+          - unique
+          - not_null
+  - name: rpt_fee_disputes
+    description: One row per fee dispute a merchant opened.

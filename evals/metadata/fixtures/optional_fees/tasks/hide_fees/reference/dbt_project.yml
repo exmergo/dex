@@ -1,0 +1,18 @@
+name: marketplace
+version: "1.0.0"
+profile: marketplace
+model-paths: ["models"]
+
+vars:
+  # Off for deployments that charge merchants no platform fee: every fee column
+  # outside staging goes, and every other column and row stays.
+  enable_platform_fees: true
+
+models:
+  marketplace:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+    finance:
+      +materialized: table
