@@ -237,10 +237,10 @@ def test_a_rows_frame_or_an_unbounded_range_is_left_as_it_was(dbt_project_dir: P
 @pytest.mark.parametrize(
     "frame,order,code",
     [
-        # BigQuery's day window: a numeric RANGE over a day number.
+        # Bare numeric RANGE over a non-date column keeps numeric_range_offset.
         (
             "range between 6 preceding and current row",
-            "unix_date(pickup_date)",
+            "parcels",
             "numeric_range_offset",
         ),
         (
@@ -264,6 +264,86 @@ def test_a_range_boundary_it_cannot_reach_is_noted_rather_than_silent(
     assert len(test["given"][0]["rows"]) == 1
     assert scaffold.window_boundaries == []
     assert [n["reason_code"] for n in scaffold.window_notes] == [code]
+
+
+def test_bigquery_unix_date_window_gets_day_boundaries(dbt_project_dir: Path):
+    sql = (
+        "select depot, pickup_date, sum(parcels) over (partition by depot "
+        "order by unix_date(pickup_date) range between 6 preceding and current row) "
+        "as trailing from {{ ref('stg_pickups') }}\n"
+    )
+    scaffold, test = _scaffold(dbt_project_dir, sql)
+    rows = test["given"][0]["rows"]
+    assert _dates(rows) == ["2024-01-17", "2024-01-24", "2024-01-25", "2024-01-31"]
+    assert scaffold.window_notes == []
+    (boundary,) = scaffold.window_boundaries
+    assert boundary["input"] == "stg_pickups"
+    assert boundary["order_by"] == "pickup_date"
+    assert boundary["bound"]["value"] == 6 and boundary["bound"]["unit"] == "day"
+
+
+def test_date_diff_day_window_gets_day_boundaries(dbt_project_dir: Path):
+    sql = (
+        "select depot, pickup_date, sum(parcels) over (partition by depot "
+        "order by date_diff('day', date '1970-01-01', pickup_date) "
+        "range between 6 preceding and current row) as trailing "
+        "from {{ ref('stg_pickups') }}\n"
+    )
+    scaffold, test = _scaffold(dbt_project_dir, sql)
+    rows = test["given"][0]["rows"]
+    assert _dates(rows) == ["2024-01-17", "2024-01-24", "2024-01-25", "2024-01-31"]
+    assert scaffold.window_notes == []
+    (boundary,) = scaffold.window_boundaries
+    assert boundary["input"] == "stg_pickups"
+    assert boundary["order_by"] == "pickup_date"
+    assert boundary["bound"]["value"] == 6 and boundary["bound"]["unit"] == "day"
+
+
+def test_bigquery_dialect_parser_level_unix_date_window():
+    import sqlglot
+
+    from exmergo_dex_core.transform.window_fixture import boundary_rows
+
+    for order_by in (
+        "unix_date(pickup_date)",
+        "date_diff(pickup_date, date '1970-01-01', day)",
+    ):
+        sql = (
+            "select depot, pickup_date, parcels, "  # noqa: S608
+            f"sum(parcels) over (partition by depot order by {order_by} "
+            "range between 6 preceding and current row) as t "
+            "from stg_pickups"
+        )
+        tree = sqlglot.parse_one(sql, read="bigquery")
+        res = boundary_rows(
+            tree=tree,
+            inputs_by_lower={"stg_pickups": "stg_pickups"},
+            reads={"stg_pickups": {"depot", "pickup_date", "parcels"}},
+            types={
+                "stg_pickups": {
+                    "depot": "STRING",
+                    "pickup_date": "DATE",
+                    "parcels": "INT64",
+                }
+            },
+            example_value=lambda t: (
+                1 if "INT" in t else ("2024-01-01" if "DATE" in t else "example")
+            ),
+        )
+        assert res.notes == []
+        assert len(res.boundaries) == 1
+        boundary = res.boundaries[0]
+        assert boundary["input"] == "stg_pickups"
+        assert boundary["order_by"] == "pickup_date"
+        assert boundary["bound"]["value"] == 6 and boundary["bound"]["unit"] == "day"
+        rows = res.rows["stg_pickups"]
+        assert len(rows) == 4
+        assert [str(r["pickup_date"]) for r in rows] == [
+            "2024-01-17",
+            "2024-01-24",
+            "2024-01-25",
+            "2024-01-31",
+        ]
 
 
 def test_the_scaffold_parses_under_dbt_and_reports_its_boundaries(

@@ -83,6 +83,90 @@ class BoundaryRows:
     notes: list[dict[str, str]] = field(default_factory=list)
 
 
+def _unwrap_column(node: exp.Expression | None) -> exp.Column | None:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Cast):
+        node = node.this
+        while isinstance(node, exp.Paren):
+            node = node.this
+    if isinstance(node, exp.Column):
+        return node
+    return None
+
+
+def _is_constant(node: exp.Expression | None) -> bool:
+    if node is None:
+        return False
+    return len(list(node.find_all(exp.Column))) == 0
+
+
+def _extract_whole_day_column(expr: exp.Expression | None) -> exp.Column | None:
+    """If expr is a whole-day function of one date column, return that column."""
+    if expr is None:
+        return None
+    while isinstance(expr, exp.Paren):
+        expr = expr.this
+
+    if isinstance(expr, exp.UnixDate):
+        return _unwrap_column(expr.this)
+
+    if (
+        isinstance(expr, exp.Anonymous)
+        and expr.name.lower() == "unix_date"
+        and len(expr.expressions) == 1
+    ):
+        return _unwrap_column(expr.expressions[0])
+
+    if isinstance(expr, exp.DateDiff):
+        unit = expr.args.get("unit")
+        unit_str = ""
+        if isinstance(unit, (exp.Var, exp.Identifier)):
+            unit_str = unit.name.lower()
+        elif isinstance(unit, exp.Literal):
+            unit_str = str(unit.this).lower()
+        elif unit is not None:
+            unit_str = str(unit).lower()
+
+        if unit_str in {"day", "days"}:
+            col1 = _unwrap_column(expr.this)
+            col2 = _unwrap_column(expr.expression)
+            if col1 is not None and _is_constant(expr.expression):
+                return col1
+            if col2 is not None and _is_constant(expr.this):
+                return col2
+
+    if isinstance(expr, exp.Anonymous) and expr.name.lower() in {
+        "date_diff",
+        "datediff",
+    }:
+        args = list(expr.expressions)
+        if len(args) == 3:
+
+            def is_day(u: exp.Expression) -> bool:
+                if isinstance(u, (exp.Var, exp.Identifier)):
+                    return u.name.lower() in {"day", "days"}
+                if isinstance(u, exp.Literal):
+                    return str(u.this).lower() in {"day", "days"}
+                return str(u).lower() in {"day", "days"}
+
+            dates: list[exp.Expression] = []
+            if is_day(args[0]):
+                dates = [args[1], args[2]]
+            elif is_day(args[2]):
+                dates = [args[0], args[1]]
+
+            if dates:
+                col1 = _unwrap_column(dates[0])
+                col2 = _unwrap_column(dates[1])
+                if col1 is not None and _is_constant(dates[1]):
+                    return col1
+                if col2 is not None and _is_constant(dates[0]):
+                    return col2
+
+    return None
+
+
 def boundary_rows(
     tree: exp.Expression,
     inputs_by_lower: dict[str, str],
@@ -122,26 +206,52 @@ def boundary_rows(
                 {"frame": frame_text, "reason_code": code, "reason": REASONS[code]}
             )
 
-        if offset is None:
-            # A RANGE frame with an offset dex cannot place rows around still
-            # has a boundary, and a fixture of one example row cannot reach it.
-            # Silence would read as "no boundary here".
-            if any(isinstance(o, window_frames.FrameOffset) for o in bounds):
-                note("numeric_range_offset")
-            elif bounds:
-                note("unsupported_interval_bound")
-            continue
-
-        if offset.unit not in DAYS_PER_UNIT:
-            note("unit_not_supported_for_fixture")
-            continue
         order = window.args.get("order")
         keys = list(order.expressions) if order is not None else []
-        column = (
+        order_target = (
             keys[0].this
             if len(keys) == 1 and isinstance(keys[0], exp.Ordered)
             else None
         )
+        epoch_day_column = (
+            _extract_whole_day_column(order_target)
+            if order_target is not None
+            else None
+        )
+
+        if offset is None:
+            numeric_offset = next(
+                (
+                    o
+                    for o in bounds
+                    if isinstance(o, window_frames.FrameOffset) and not o.is_interval
+                ),
+                None,
+            )
+            if numeric_offset is not None and epoch_day_column is not None:
+                offset = window_frames.FrameOffset(
+                    spec=numeric_offset.spec,
+                    bound=numeric_offset.bound,
+                    kind=numeric_offset.kind,
+                    side=numeric_offset.side,
+                    value=numeric_offset.value,
+                    unit="day",
+                    unit_text="day",
+                )
+            else:
+                # A RANGE frame with an offset dex cannot place rows around still
+                # has a boundary, and a fixture of one example row cannot reach it.
+                # Silence would read as "no boundary here".
+                if any(isinstance(o, window_frames.FrameOffset) for o in bounds):
+                    note("numeric_range_offset")
+                elif bounds:
+                    note("unsupported_interval_bound")
+                continue
+
+        if offset.unit not in DAYS_PER_UNIT:
+            note("unit_not_supported_for_fixture")
+            continue
+        column = epoch_day_column if epoch_day_column is not None else order_target
         traced = (
             _trace(column, window, inputs_by_lower)
             if isinstance(column, exp.Column)
