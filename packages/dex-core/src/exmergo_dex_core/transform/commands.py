@@ -1328,7 +1328,18 @@ def _retire(
     project = engine.project_dir()
     view = load_project(project)
     scope = retirement_mod.package_scope(view, Path(project), name)
-    stated = retirement_mod.stored_form(name, contract)
+    scoped = contract.scope == "authored"
+    discovery = None
+    if scoped:
+        # Judged before anything is stored: a scoped contract is admitted only
+        # where the full check cannot run, and only over models it can hold
+        # to what the author wrote (#1086).
+        discovery = {
+            "scope": "authored",
+            **retirement_mod.discovery_report(view, Path(project), name, edits),
+        }
+        retirement_mod.validate_scope(view, edits, contract, discovery)
+    stated = retirement_mod.stored_form(name, contract, discovery)
     if retirement_mod.is_already_complete(view, name, edits):
         return PropagationResult(
             change=f"{name} already removed",
@@ -1353,6 +1364,7 @@ def _retire(
         None,
         extra_edits=edits,
         retirement=True,
+        scoped=scoped,
         intent=(
             f"{contract.behavior} var {name}, keeping the behavior of "
             f"{contract.retained_value!r}"
@@ -1369,10 +1381,16 @@ def _retire(
         **analysis,
         "contract": stated,
         "package_scope": scope,
+        **({"discovery": discovery} if discovery is not None else {}),
     }
     # First: these answer what this command was asked, and the plan's own notes
     # about undeclared models would otherwise bury them.
     result.warnings[:0] = [
+        *(
+            retirement_mod.scope_warnings(name, contract, discovery)
+            if discovery is not None
+            else []
+        ),
         *retirement_mod.plan_warnings(name, analysis),
         *retirement_mod.package_warnings(name, scope),
     ]
@@ -1391,6 +1409,7 @@ def _propagate(
     *,
     extra_edits: list[PlanEdit],
     retirement: bool = False,
+    scoped: bool = False,
     intent: str | None = None,
 ) -> PropagationResult:
     from ..dbt_project import load as load_project
@@ -1405,6 +1424,7 @@ def _propagate(
         new,
         extra_edits=extra_edits,
         retirement=retirement,
+        scoped=scoped,
     )
     planned = plan(
         engine, intent or outcome.intent, edits=outcome.edits, attribute_rows=False

@@ -74,6 +74,11 @@ class RetirementContract(_Strict):
     outputs: dict[str, RetirementOutput] = Field(min_length=1)
     metrics: RetirementMetrics = Field(default_factory=RetirementMetrics)
     assumptions: list[Assumption] = Field(default_factory=list)
+    #: ``complete`` (the default) needs a reference scan Dex can finish.
+    #: ``authored`` checks the outputs and metrics named here and reports global
+    #: reference discovery as unchecked, for a project the scan cannot finish
+    #: (#1086). Never inferred: the author opts in.
+    scope: Literal["complete", "authored"] = "complete"
 
     @field_validator("retained_value", mode="before")
     @classmethod
@@ -103,14 +108,38 @@ def parse_contract(raw: Any) -> RetirementContract:
             f"the retirement contract is not valid: {problems}. It takes behavior "
             "(retire or permanent), retained_value, packages (out_of_scope), "
             "outputs ({model: {expected: [...], removed: [...]}}), metrics "
-            "({retained: [...], removed: [...]}) and assumptions"
+            "({retained: [...], removed: [...]}), assumptions and scope (complete "
+            "or authored)"
         ) from exc
 
 
-def stored_form(variable: str, contract: RetirementContract) -> dict[str, Any]:
-    """What a stored plan and a plan document carry."""
+def stored_form(
+    variable: str,
+    contract: RetirementContract,
+    discovery: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What a stored plan and a plan document carry.
 
-    return {"variable": variable, **contract.model_dump(mode="json")}
+    ``scope`` is written only when it is ``authored``, so a complete retirement
+    stores, exports and digests exactly as it did before #1086. A scoped one
+    also carries the discovery summary it was planned under, so a build and a
+    plan document can say what stayed unchecked without scanning again.
+    """
+
+    form = {"variable": variable, **contract.model_dump(mode="json")}
+    if contract.scope == "complete":
+        form.pop("scope")
+    if discovery is not None:
+        form["discovery"] = dict(discovery)
+    return form
+
+
+def contract_of(stored: Mapping[str, Any]) -> RetirementContract:
+    """The contract a stored form carries, without its bookkeeping keys."""
+
+    return RetirementContract.model_validate(
+        {k: v for k, v in stored.items() if k not in ("variable", "discovery")}
+    )
 
 
 def decisions(stored: Mapping[str, Any] | None) -> list[dict[str, Any]]:
@@ -253,6 +282,119 @@ def package_scope(view: DbtProjectView, project: Path, name: str) -> dict[str, A
         "scoped_definitions": [scope for scope in scoped if scope != own],
     }
     return report
+
+
+#: How many project-local limits a discovery summary names; the rest are counted.
+MAX_LIMITS = 10
+
+
+def discovery_report(
+    view: DbtProjectView, project: Path, name: str, edits: list[PlanEdit]
+) -> dict[str, Any]:
+    """Why a complete reference scan cannot be promised for this flag (#1086).
+
+    The same reasons ``transform remove var`` refuses on, judged the same way:
+    the scan's limits and unread YAML on the project as it stands, and dynamic
+    var reads on the project after the payload, so a dynamic read the payload
+    rewrites is not counted. ``status`` is ``complete`` only when none of them
+    stands, in which case the full check can run and a scoped contract is
+    refused. Package limits are counted per package rather than listed, since
+    a package is outside the change and its internals are not the author's to
+    resolve.
+    """
+
+    from ..references import ReferenceIndex
+    from .build import packages_dir
+
+    index = ReferenceIndex(view)
+    _, query_limits = index.references_to(name, "var")
+    limits = list(dict.fromkeys([*index.limits, *query_limits]))
+    unread = sorted(dict.fromkeys(index.unread))
+    try:
+        install = (
+            packages_dir(project).resolve().relative_to(project.resolve()).as_posix()
+        )
+    except (OSError, ValueError):
+        install = "dbt_packages"
+    package_limits: dict[str, int] = {}
+    local: list[str] = []
+    for limit in limits:
+        if limit.startswith(f"{install}/"):
+            package = limit[len(install) + 1 :].split("/", 1)[0]
+            package_limits[package] = package_limits.get(package, 0) + 1
+        elif limit.startswith("package '"):
+            package = limit.split("'")[1]
+            package_limits[package] = package_limits.get(package, 0) + 1
+        else:
+            local.append(limit)
+    after = ReferenceIndex(_project_after_edits(view, edits), scan_packages=False)
+    dynamic = sorted(f"{ref.path}:{ref.line}" for ref in after.indeterminate_for("var"))
+    incomplete = bool(limits or unread or dynamic)
+    report: dict[str, Any] = {
+        "status": "unchecked" if incomplete else "complete",
+        "limits": local[:MAX_LIMITS],
+        "limits_elided": max(0, len(local) - MAX_LIMITS),
+        "package_limits": dict(sorted(package_limits.items())),
+        "unread": unread[:MAX_LIMITS],
+        "unread_elided": max(0, len(unread) - MAX_LIMITS),
+        "dynamic_reads": dynamic[:MAX_READERS],
+        "dynamic_reads_elided": max(0, len(dynamic) - MAX_READERS),
+    }
+    if incomplete:
+        report["reason_code"] = "discovery_incomplete"
+    return report
+
+
+def validate_scope(
+    view: DbtProjectView,
+    edits: list[PlanEdit],
+    contract: RetirementContract,
+    discovery: Mapping[str, Any],
+) -> None:
+    """Refuse a scoped contract whose scope Dex cannot hold it to (#1086).
+
+    A scoped retirement is admitted only where the full one cannot run, names
+    only models this project defines, and covers every model the payload
+    rewrites, so its assertions are bounded by what the author wrote and never
+    silently narrower.
+    """
+
+    from ..references import ReferenceIndex
+
+    if discovery.get("status") == "complete":
+        raise ValueError(
+            "this retirement's reference discovery is complete, so the full check "
+            "can run: drop `scope` from the contract (or set it to `complete`). "
+            "`scope: authored` is for a project whose scan Dex cannot finish"
+        )
+    index = ReferenceIndex(_project_after_edits(view, edits), scan_packages=False)
+    outside = sorted(
+        model
+        for model in contract.outputs
+        if not any(not d.package for d in index.definitions_of(model, "model"))
+    )
+    if outside:
+        raise ValueError(
+            f"a scoped retirement names only models this project defines, and "
+            f"{', '.join(outside)} is not one after this payload (a package's "
+            "model is out of scope, since Dex never edits it). Name the project "
+            "model that outputs the feature's columns, or fix the spelling"
+        )
+    written = sorted(
+        {
+            Path(edit.path).stem
+            for edit in edits
+            if edit.kind is EditKind.MODEL_SQL and edit.op is EditOp.UPSERT
+        }
+        - set(contract.outputs)
+    )
+    if written:
+        raise ValueError(
+            f"a scoped retirement checks only the outputs it names, and this "
+            f"payload rewrites {', '.join(written)} without an `outputs` entry. "
+            "State what each one outputs afterwards (`expected`, and `removed` "
+            "for what goes), so no authored model goes unchecked"
+        )
 
 
 def _has_default(project: Path, path: str, line: int, name: str) -> bool | None:
@@ -759,6 +901,47 @@ def plan_warnings(variable: str, analysis: Mapping[str, Any]) -> list[str]:
     return out
 
 
+def scope_warnings(
+    variable: str, contract: RetirementContract, discovery: Mapping[str, Any]
+) -> list[str]:
+    """What a scoped retirement checked, and what it leaves unchecked."""
+
+    reasons = []
+    metrics = [*contract.metrics.retained, *contract.metrics.removed]
+    local = len(discovery.get("limits") or []) + int(
+        discovery.get("limits_elided") or 0
+    )
+    if local:
+        reasons.append(f"{local} project file(s) the scan could not read")
+    packages = discovery.get("package_limits") or {}
+    if packages:
+        reasons.append(
+            f"{sum(packages.values())} limit(s) in package(s) "
+            + ", ".join(sorted(packages))
+        )
+    unread = len(discovery.get("unread") or []) + int(
+        discovery.get("unread_elided") or 0
+    )
+    if unread:
+        reasons.append(f"{unread} unread file(s) or package(s)")
+    dynamic = list(discovery.get("dynamic_reads") or [])
+    if dynamic:
+        reasons.append(
+            f"{len(dynamic) + int(discovery.get('dynamic_reads_elided') or 0)} "
+            f"dynamic var read(s) that may read it ({', '.join(dynamic[:5])})"
+        )
+    return [
+        f"retirement of '{variable}' is scoped to the outputs it names "
+        f"({', '.join(sorted(contract.outputs))}"
+        + (f"; metrics {', '.join(metrics)}" if metrics else "")
+        + "). Reference discovery is unchecked ("
+        + "; ".join(reasons or ["discovery_incomplete"])
+        + "), so passing these checks does not show every reader was found or "
+        "the feature retired everywhere: `data.retirement.discovery` lists what "
+        "was not read"
+    ]
+
+
 # --- after a build -----------------------------------------------------------
 
 
@@ -783,9 +966,7 @@ def verify_outputs(
     from ..guards.cost_guard import CostGuardError
     from ..maintain.drift import DriftFinding
 
-    contract = RetirementContract.model_validate(
-        {k: v for k, v in stored.items() if k != "variable"}
-    )
+    contract = contract_of(stored)
     labels = {built[uid] for uid in scope}
     findings: list[Any] = []
     records: list[dict[str, Any]] = []
@@ -856,4 +1037,23 @@ def verify_outputs(
                 )
             )
     records.extend(metric_records(index, contract))
+    if contract.scope == "authored":
+        records.append(discovery_record(str(stored.get("variable")), stored))
     return findings, records
+
+
+def discovery_record(variable: str, stored: Mapping[str, Any]) -> dict[str, Any]:
+    """Global reference discovery for a scoped retirement: never passed.
+
+    The outputs above say what the authored models hold; this says that nothing
+    established every reader was found and retired, so a completion summary
+    keeps it among its unchecked obligations however the outputs turned out.
+    """
+
+    discovery = stored.get("discovery") or {}
+    return {
+        "model": variable,
+        "check": "reference_discovery",
+        "status": "unchecked",
+        "reason_code": discovery.get("reason_code") or "discovery_incomplete",
+    }

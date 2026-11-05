@@ -213,7 +213,11 @@ that build used, so an empty table is checked too. The other value is reported
 as not built.
 
 Removing a flag is a different change: use a `retirement` contract on
-`dex transform remove var`, which states which behavior survives.
+`dex transform remove var`, which states which behavior survives. Where Dex
+cannot finish scanning the project for the flag's readers (Jinja-heavy macros,
+packages such as `dbt_utils`), add `"scope": "authored"` to that contract: the
+outputs it names are still checked, and reference discovery is reported as
+unchecked rather than complete.
 
 </Accordion>
 

@@ -164,6 +164,9 @@ declares is `contract`.
   tests and semantic references, while "make it permanent" keeps them and drops
   only the conditionals. A flag's default decides neither. State the behavior
   that survives with a `retirement` contract on `dex transform remove var`.
+  Where it refuses because the reference scan cannot finish, add
+  `"scope": "authored"` to the contract rather than falling back to a plain
+  plan, and relay its discovery as unchecked.
   Recipe: `skills/transform/references/feature-retirement.md`.
 - Adding or changing a flag that stays ("hide the fee columns when it is
   false") has to hold on both values in every model of the project, not only

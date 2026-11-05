@@ -274,7 +274,10 @@ directly above it at its own indent; a comment set apart by a blank line stays.
 
 On `var`, a `retirement` key in the payload states which behavior survives the
 flag, and the plan, `transform compare` and `build --verify --for-plan` hold the
-change to it: [feature-retirement.md](feature-retirement.md).
+change to it: [feature-retirement.md](feature-retirement.md). Where the reference
+scan cannot finish, `"scope": "authored"` in that contract keeps the output and
+metric checks and reports discovery as `unchecked` under
+`data.retirement.discovery`.
 
 ## `transform place <column> --targets <a,b> --expr "<sql>" [--explain]`
 
