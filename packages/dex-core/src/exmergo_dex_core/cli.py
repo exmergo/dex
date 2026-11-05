@@ -360,7 +360,10 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
     ),
     ("transform", "deps"): (
         "install or refresh dbt packages",
-        "Run dbt deps inside the project. Repo-confined, with no warehouse spend.",
+        "Run dbt deps inside the project. It installs the packages the project "
+        "already declares in packages.yml, at the versions its lockfile pins; it "
+        "does not install or upgrade a tool. Repo-confined, with no warehouse "
+        "spend.",
     ),
     ("transform", "plans"): (
         "list stored plans, newest first",

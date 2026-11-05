@@ -1,0 +1,4 @@
+version: 2
+models:
+  - name: roster_member
+    description: One row per member, with the team they belong to and when they joined.

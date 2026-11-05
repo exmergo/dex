@@ -61,7 +61,8 @@ DIGESTS = {
     "season_to_date": "b6823415982716617f2b66134364bb8b0ebadcc3fcca7eeeaf5d682033049794",
     "attribution_population": "ba15c217210c02aa20001c8c240b96e4e6cbd34a797572e703cc584b6197688b",
     "share": "749c9be906d4bd3df2cbe7a83bc7bc66689ed82ba9c3f298ebcaca64335bd558",
-    "refactor_compare": "e8321bce6e29261a950dc01d7a48e77b2d5e77b13ac8c99e1240324296b04018",
+    "refactor_compare": "310cee5c8fb7389185704b78c676eee854230e64a11daf8c6327b5ee475d3cb7",
+    "refactor_prerequisite": "40725c31869202fcc9b5924e0f76ecd428bbe43b5630e6458bd71aa0e1260789",
     "blocked_report": "6c46e98e73a69412987fdf82e697ef1d70d42b7b4d4445e1ffc7a5d288fe1535",
     "identifier_repair": "3cfd248dd23ef971b9bb0685c251b7d47997484097ab8bbf9da0750e6abf84e5",
     "package_prerequisite": "9248955fe78992155b30b8f22f10280e5ef746d3ba78155704854607dc68616b",
@@ -2100,3 +2101,447 @@ def test_a_mutation_run_records_how_many_survived(result, survived):
     assert call["label"] == "transform test"
     assert call["flags"] == ["mutate"]
     assert call["survived"] == survived
+
+
+# --- #1114: a refactor whose baseline a package prerequisite blocks ----------
+
+REFACTOR_PREREQUISITE = "refactor_prerequisite/package_blocked_refactor"
+
+
+def _refactor_only(task, workspace: Path) -> None:
+    """The refactor the task asks for, with no repair of the prerequisite."""
+
+    for name in (
+        "models/intermediate/int_team_members.sql",
+        "models/marts/team_member_summary.sql",
+    ):
+        target = workspace / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(task.directory / "reference" / name, target)
+
+
+def test_the_package_blocked_refactor_never_accepts_a_blocked_result():
+    """The prerequisite is the project's to repair here: the request settles the
+    layer (the raw tables cannot change), so a report of the block is not an
+    allowed outcome, unlike a request only a loader could carry out."""
+
+    task = _task(REFACTOR_PREREQUISITE)
+    assert "incomplete_allowed" not in task.truth
+    assert task.truth["procedure"] == {
+        "compare_before_apply": True,
+        "build_after_apply": True,
+        "rebuilt_before_compare": True,
+        "cold_deps_after_repair": True,
+    }
+
+
+def test_the_refactor_prerequisite_data_has_empty_parents_and_orphan_children():
+    """Teams with no members and handles of members the roster does not have,
+    the two populations a refactor of the summary must keep and must not count."""
+
+    task = _task(REFACTOR_PREREQUISITE)
+    tables = {t.name: t for t in fixture_of(task, FIXTURES).tables()}
+    members = tables["raw.members"].rows
+    ids = {row[0] for row in members}
+    assert len(tables["raw.teams"].rows) - len({row[1] for row in members}) == 3
+    assert sum(row[0] not in ids for row in tables["raw.handles"].rows) == 3
+    assert all(row[4] is None for row in members), "joined_at arrives all NULL"
+    names = {
+        t.name: t
+        for t in fixture_of(
+            _task("refactor_compare/blocked_baseline"), FIXTURES
+        ).tables()
+    }
+    users = {row[0] for row in names["raw.users"].rows}
+    assert sum(row[0] not in users for row in names["raw.display_names"].rows) == 3
+
+
+@needs_dbt
+def test_the_refactor_without_its_prerequisite_fails_the_gate(tmp_path):
+    task = _task(REFACTOR_PREREQUISITE)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    assert (workspace / "dbt_packages/tiny_roster/models/roster_member.sql").is_file()
+    _refactor_only(task, workspace)
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "gate_failed"
+    assert score.gate["stage"] == "build", score.gate
+
+
+@needs_dbt
+def test_a_refactor_repaired_under_dbt_packages_fails_the_gate(tmp_path):
+    task = _task(REFACTOR_PREREQUISITE)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    _refactor_only(task, workspace)
+    installed = workspace / "dbt_packages/tiny_roster/models/roster_member.sql"
+    installed.write_text(
+        installed.read_text().replace(
+            "coalesce(joined_at, joined_on)",
+            "coalesce(cast(cast(joined_at as varchar) as timestamp), joined_on)",
+        )
+    )
+    assert _dbt_in(workspace, "build").returncode == 0
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "gate_failed"
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("path", "old", "new", "fails"),
+    [
+        # The mart driven from the intermediate: the teams with no members go.
+        (
+            "models/marts/team_member_summary.sql",
+            "left join",
+            "inner join",
+            {"every team is present", "teams with no members count zero"},
+        ),
+        # Handles joined before counting: members with no handle go.
+        (
+            "models/intermediate/int_team_members.sql",
+            "left join",
+            "inner join",
+            {
+                "counts and first join are what they were before the refactor",
+                "no member was dropped to make the build pass",
+            },
+        ),
+        # A repair that drops the rows the cast cannot take.
+        (
+            "models/overrides/roster_member.sql",
+            "from {{ ref('member_data') }}",
+            "from {{ ref('member_data') }}\nwhere joined_on is not null",
+            {"no member was dropped to make the build pass"},
+        ),
+    ],
+    ids=["mart-inner-join", "intermediate-inner-join", "repair-drops-rows"],
+)
+def test_the_package_blocked_refactor_checks_catch_the_wrong_answers(
+    tmp_path, path, old, new, fails
+):
+    task, fixture, workspace = _reference(tmp_path, REFACTOR_PREREQUISITE)
+    target = workspace / path
+    text = target.read_text(encoding="utf-8")
+    assert text.count(old) == 1
+    target.write_text(text.replace(old, new), encoding="utf-8")
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored", score.gate
+    failed = {c["name"] for c in score.checks if not c["passed"]}
+    assert fails <= failed, failed
+
+
+def _tool_use(command, use_id):
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": use_id,
+                    "name": "Bash",
+                    "input": {"command": command},
+                }
+            ]
+        },
+    }
+
+
+def _tool_result(use_id, text, is_error=False):
+    return {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": use_id,
+                    "content": text,
+                    "is_error": is_error,
+                }
+            ]
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("result", "is_error", "outcome"),
+    [
+        (
+            '{"status": "ok", "data": {"completion": {"outcome": "validated"}}}',
+            False,
+            "validated",
+        ),
+        (
+            '{"status": "error", "data": {"completion": {"outcome": "failed"}}}',
+            False,
+            "failed",
+        ),
+        ('{"status": "error", "errors": ["dbt failed"]}', False, "failed"),
+        ('{"status": "needs_confirmation", "data": {}}', False, "not_run"),
+        ("Exit code 1", True, "failed"),
+        ("built 3 models", False, None),
+    ],
+    ids=["validated", "failed", "error-envelope", "handshake", "shell-error", "hidden"],
+)
+def test_the_transcript_summary_records_what_a_build_established(
+    result, is_error, outcome
+):
+    from evals.metadata.live import Session, summarize
+
+    events = [
+        _tool_use("dex transform build --target dev --cold-deps", "b1"),
+        _tool_result("b1", result, is_error),
+    ]
+    (call,) = summarize(events, Session()).dex_calls
+    assert call["outcome"] == outcome
+
+
+def test_two_builds_in_one_command_share_no_outcome():
+    from evals.metadata.live import Session, summarize
+
+    events = [
+        _tool_use(
+            "dex transform build --target dev && dex transform build --target dev --cold-deps",
+            "b1",
+        ),
+        _tool_result(
+            "b1", '{"status": "ok", "data": {"completion": {"outcome": "validated"}}}'
+        ),
+    ]
+    calls = summarize(events, Session()).dex_calls
+    assert [call.get("outcome") for call in calls] == [None, None]
+
+
+def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
+    return {
+        "label": f"transform {verb}",
+        "plan": plan,
+        "verdict": verdict,
+        "outcome": outcome,
+        "flags": flags,
+    }
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        # The repair applied and built, then the refactor compared and applied.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="validated"),
+                _step("compare", "p2", "equivalent"),
+                _step("apply", "p2"),
+            ],
+            True,
+        ),
+        # The repair bundled into the refactor's own plan: nothing was built first.
+        (
+            [
+                _step("build", outcome="failed"),
+                _step("compare", "p1", None),
+                _step("apply", "p1"),
+                _step("build", outcome="validated"),
+            ],
+            False,
+        ),
+        # The repair applied, but its build failed before the comparison.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="failed"),
+                _step("compare", "p2", "equivalent"),
+                _step("apply", "p2"),
+            ],
+            False,
+        ),
+        # A failed build, then one that built: the second counts.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="failed"),
+                _step("build", outcome="validated"),
+                _step("compare", "p2", "equivalent"),
+                _step("apply", "p2"),
+            ],
+            True,
+        ),
+        # A build whose envelope the agent's pipe hid.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build"),
+                _step("compare", "p2", "equivalent"),
+                _step("apply", "p2"),
+            ],
+            True,
+        ),
+        # Repaired and built, but the comparison came back not_checked.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="validated"),
+                _step("compare", "p2", "not_checked"),
+                _step("apply", "p2"),
+            ],
+            False,
+        ),
+        # Repaired and built, then the comparison of another plan.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="validated"),
+                _step("compare", "p3", "equivalent"),
+                _step("apply", "p2"),
+            ],
+            False,
+        ),
+    ],
+    ids=[
+        "repair-built-then-compared",
+        "bundled",
+        "repair-build-failed",
+        "retried-build",
+        "hidden-build",
+        "not-checked",
+        "other-plan",
+    ],
+)
+def test_the_comparison_must_follow_a_built_repair(calls, passed):
+    from evals.metadata.score import procedure_steps
+
+    graded = procedure_steps({"rebuilt_before_compare": True}, calls)
+    assert graded["passed"] is passed
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        # Proven cold after the repair, before the refactor was compared.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", flags=["cold-deps"]),
+                _step("compare", "p2", "equivalent"),
+                _step("apply", "p2"),
+                _step("build", flags=["verify"]),
+            ],
+            True,
+        ),
+        # Or after the refactor went in.
+        (
+            [
+                _step("apply", "p1"),
+                _step("apply", "p2"),
+                _step("build", flags=["cold-deps"]),
+            ],
+            True,
+        ),
+        ([_step("build", flags=["cold-deps"]), _step("apply", "p1")], False),
+        ([_step("apply", "p1"), _step("build", flags=["verify"])], False),
+    ],
+    ids=["before-compare", "after-refactor", "before-any-apply", "never-cold"],
+)
+def test_cold_deps_after_repair_counts_after_any_apply(calls, passed):
+    from evals.metadata.score import procedure_steps
+
+    graded = procedure_steps({"cold_deps_after_repair": True}, calls)
+    assert graded["passed"] is passed
+
+
+@needs_dbt
+def test_package_blocked_refactor_flow(tmp_path, monkeypatch, capsys):
+    """Real CLI, the sequence #1114 asks agents to follow: the blocked build, the
+    refactor planned while blocked (the offer says so, the comparison is
+    `not_checked`), the repair as its own plan proven by a `--cold-deps` build
+    alone, then the refactor compared `equivalent` against that build, applied
+    and built. Before #1114 the comparison after a cold-only build was still
+    `inputs_unsynchronized`."""
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(REFACTOR_PREREQUISITE)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+
+    def dex(*args, expected="ok"):
+        """Run the fixture CLI and check its expected envelope status."""
+
+        main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        return envelope
+
+    def plan(name, edits):
+        path = workspace / f"{name}.json"
+        path.write_text(json.dumps({"edits": edits}))
+        return dex("transform", "plan", name, "--edits-file", str(path))
+
+    reference = task.directory / "reference"
+
+    def edit(path, kind="model_sql"):
+        return {"path": path, "kind": kind, "content": (reference / path).read_text()}
+
+    blocked = dex("transform", "build", "--target", "dev", expected="error")
+    first = blocked["data"]["prerequisites"][0]
+    assert (first["owner"], first["package"]) == ("package", "tiny_roster")
+
+    refactor = plan(
+        "refactor",
+        [
+            edit("models/intermediate/int_team_members.sql"),
+            edit("models/marts/team_member_summary.sql"),
+        ],
+    )
+    refactor_id = refactor["data"]["plan_id"]
+    offer = refactor["data"]["refactor_comparison_offer"]
+    assert offer["baseline_ready"] is False
+    (inputs,) = {
+        (b["model"], b["owner"])
+        for m in offer["per_model"]
+        for b in m["blocked_inputs"]
+    }
+    assert inputs == ("roster_member", "package")
+    waiting = dex(
+        "transform", "compare", refactor_id, "--model", "team_member_summary"
+    )["data"]
+    assert waiting["reason_code"] == "inputs_unsynchronized"
+    assert "--cold-deps" in waiting["detail"]
+
+    repair = plan(
+        "repair",
+        [
+            edit("models/overrides/roster_member.sql"),
+            edit("dbt_project.yml", "project_yml"),
+        ],
+    )["data"]["plan_id"]
+    dex("transform", "apply", repair)
+    cold = dex(
+        "transform", "build", "--target", "dev", "--cold-deps", "--for-plan", repair
+    )
+    assert cold["data"]["completion"]["outcome"] == "validated"
+
+    compared = dex(
+        "transform", "compare", refactor_id, "--model", "team_member_summary"
+    )["data"]
+    assert compared["status"] == "equivalent", compared["detail"]
+    assert compared["inputs_built_by"]["cold"] is True
+
+    applied = dex("transform", "apply", refactor_id)["data"]
+    (state,) = [
+        s for s in applied["refactor_comparison"] if s["model"] == "team_member_summary"
+    ]
+    assert state["status"] == "equivalent"
+    assert state["inputs_built_by"]["cold"] is True
+    built = dex(
+        "transform", "build", "--target", "dev", "--verify", "--for-plan", refactor_id
+    )
+    completion = built["data"]["completion"]
+    assert completion["outcome"] == "validated"
+    assert any(
+        r["model"] == "team_member_summary" and r["status"] == "equivalent"
+        for r in completion["refactor_comparison"]
+    )

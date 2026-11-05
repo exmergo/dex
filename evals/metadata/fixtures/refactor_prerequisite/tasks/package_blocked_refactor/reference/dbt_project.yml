@@ -1,0 +1,17 @@
+name: team_roster
+version: "1.0.0"
+profile: team_roster
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+models:
+  team_roster:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+  tiny_roster:
+    roster_member:
+      +enabled: false

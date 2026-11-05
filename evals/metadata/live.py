@@ -309,6 +309,28 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
     return None
 
 
+_OUTCOME = re.compile(r'"outcome"\s*:\s*"(\w+)"')
+
+
+def _build_outcome(block: dict[str, Any]) -> str | None:
+    """What one ``transform build`` established: ``data.completion.outcome``
+    (``validated``, ``failed``, ``skipped``, ...), the first one the envelope
+    carries since completion leads the payload; ``failed`` for an error
+    envelope that carries none, ``not_run`` for a cost handshake; ``None`` when
+    the agent's own pipe left nothing to read (#1114)."""
+
+    text = _result_text(block)
+    found = _OUTCOME.findall(text)
+    if found:
+        return found[0]
+    statuses = set(_STATUS.findall(text))
+    if "needs_confirmation" in statuses:
+        return "not_run"
+    if block.get("is_error") or "error" in statuses:
+        return "failed"
+    return None
+
+
 _SURVIVED = re.compile(r'"survived"\s*:\s*(\d+)')
 
 
@@ -332,6 +354,7 @@ def summarize(
     calls: list[dict[str, Any]] = []
     pending_compares: dict[str, dict[str, Any]] = {}
     pending_mutations: dict[str, dict[str, Any]] = {}
+    pending_builds: dict[str, dict[str, Any]] = {}
     for event in events:
         if event.get("type") == "user":
             content = (event.get("message") or {}).get("content")
@@ -343,6 +366,9 @@ def summarize(
                     run = pending_mutations.pop(str(block.get("tool_use_id")), None)
                     if run is not None:
                         run["survived"] = _mutation_survivors(block)
+                    built = pending_builds.pop(str(block.get("tool_use_id")), None)
+                    if built is not None:
+                        built["outcome"] = _build_outcome(block)
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
             session.model = event.get("model")
@@ -402,6 +428,13 @@ def summarize(
                     ]
                     if len(mutations) == 1 and block.get("id"):
                         pending_mutations[str(block["id"])] = mutations[0]
+                    # And for a build's outcome, which says whether a repair
+                    # built before the comparison that relies on it (#1114).
+                    builds = [
+                        call for call in ordered if call["label"] == "transform build"
+                    ]
+                    if len(builds) == 1 and block.get("id"):
+                        pending_builds[str(block["id"])] = builds[0]
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")

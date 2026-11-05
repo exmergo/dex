@@ -818,41 +818,91 @@ def _offer_refactor_comparison(
     ``--for-plan`` build can report whether each rewrite was compared.
     """
 
-    from .refactor_compare import edited_existing_models
+    from .refactor_compare import (
+        _GLOBAL_KINDS,
+        BlockedInput,
+        _blocked_parents,
+        edited_existing_models,
+        repair_first,
+    )
 
     try:
-        models = edited_existing_models(edits, engine.project_dir())
+        project = engine.project_dir()
+        models = edited_existing_models(edits, project)
     except (OSError, ValueError, DexError):
         # A format with no dbt project has nothing this command could compile.
         return
     if not models or not result.plan_id:
         return
     ordered = sorted(models)
+    touched = {
+        Path(edit.path).stem for edit in edits if edit.kind == EditKind.MODEL_SQL
+    }
     per_model = []
+    blocked_all: list[BlockedInput] = []
     for model in ordered:
         static = _static_attribution(_attribution_for(result.row_attribution, model))
-        per_model.append(
-            {
-                "model": model,
-                "static_attribution": static,
-                "command": (
-                    f"transform compare {result.plan_id} --model {shlex.quote(model)}"
-                ),
-            }
-        )
+        entry: dict[str, Any] = {
+            "model": model,
+            "static_attribution": static,
+            "command": (
+                f"transform compare {result.plan_id} --model {shlex.quote(model)}"
+            ),
+        }
+        # Free: the latest run results and the manifest beside them (#1114).
+        # Judged with nothing excluded, so a repair this plan carries still
+        # names the input it repairs.
+        with contextlib.suppress(Exception):
+            blocked = _blocked_parents(project, model, set())
+            if blocked:
+                blocked_all.extend(blocked)
+                entry["blocked_inputs"] = [
+                    {
+                        "model": b.model,
+                        "status": b.status,
+                        "owner": "package" if b.package else "project",
+                        **({"package": b.package} if b.package else {}),
+                    }
+                    for b in blocked
+                ]
+        per_model.append(entry)
     recommended = any(m["static_attribution"] != "attributed" for m in per_model)
-    result.refactor_comparison_offer = {
+    blocked_names = sorted({b.model for b in blocked_all})
+    # A plan that edits a blocked input, or the project, packages or a macro
+    # while one is blocked, carries the repair beside the rewrite: its baseline
+    # is the failed build, so its comparison can never be usable (#1114).
+    mixed = sorted(
+        {b.model for b in blocked_all if b.model.split(".v")[0] in touched}
+        | (
+            set(blocked_names)
+            if blocked_all and any(edit.kind in _GLOBAL_KINDS for edit in edits)
+            else set()
+        )
+    )
+    why = (
+        "static row attribution did not establish that "
+        + ("this rewrite keeps" if len(ordered) == 1 else "these rewrites keep")
+        + " the model's results; if the change is meant to keep them, compare "
+        "before `transform apply`"
+        if recommended
+        else "row counts were attributed, values were not; if the change is "
+        "meant to keep the model's results, compare before `transform apply`"
+    )
+    if blocked_all:
+        unique = sorted(set(blocked_all))
+        why = (
+            "the baseline does not build: the last attempt left "
+            + ", ".join(f"{b.model} ({b.status})" for b in unique)
+            + ", so a comparison now is `not_checked`. "
+            + repair_first(unique)
+            + " Keep this plan unapplied until it is compared: applying it "
+            "discards the baseline. " + why[0].upper() + why[1:]
+        )
+    offer: dict[str, Any] = {
         "plan_id": result.plan_id,
         "recommended_before_apply": recommended,
-        "why": (
-            "static row attribution did not establish that "
-            + ("this rewrite keeps" if len(ordered) == 1 else "these rewrites keep")
-            + " the model's results; if the change is meant to keep them, compare "
-            "before `transform apply`"
-            if recommended
-            else "row counts were attributed, values were not; if the change is "
-            "meant to keep the model's results, compare before `transform apply`"
-        ),
+        "baseline_ready": not blocked_all,
+        "why": why,
         "per_model": per_model,
         "models": ordered,
         "command": (
@@ -860,6 +910,19 @@ def _offer_refactor_comparison(
             "[--map old=new] [--key column]"
         ),
     }
+    if mixed:
+        offer["mixed_with_repair"] = mixed
+        result.warnings.append(
+            "this plan both repairs "
+            + ", ".join(mixed)
+            + ", which the last build failed on, and rewrites "
+            + ", ".join(ordered)
+            + "; its comparison can only read that failed build, so it cannot "
+            "show the rewrite keeps its results. Put the repair in its own plan, "
+            "apply and build it, then plan the rewrite and compare it before "
+            "applying"
+        )
+    result.refactor_comparison_offer = offer
     _record_refactor_models(engine, result.plan_id, per_model)
 
 
@@ -928,6 +991,8 @@ def refactor_comparison_states(stored: Any) -> list[dict[str, Any]] | None:
                 reason_code=verdict.get("reason_code"),
                 compared_at=verdict.get("compared_at"),
             )
+            if verdict.get("inputs_built_by"):
+                state["inputs_built_by"] = verdict["inputs_built_by"]
         else:
             state["status"] = "not_compared"
         states.append(state)

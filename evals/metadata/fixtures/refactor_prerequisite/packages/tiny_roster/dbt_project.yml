@@ -1,0 +1,7 @@
+name: tiny_roster
+version: "3.0.0"
+config-version: 2
+model-paths: ["models"]
+models:
+  tiny_roster:
+    +materialized: table

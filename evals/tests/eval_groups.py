@@ -53,6 +53,11 @@ GROUPS: dict[str, tuple[str, ...]] = {
             "test_an_edit_under_dbt_packages_passes_warm_and_fails_the_gate",
             "test_a_project_override_does_not_fulfil_a_request_to_modify_the_data",
             "test_changing_the_seed_fails_a_request_to_leave_the_data_alone",
+            # #1114: a refactor whose baseline a package prerequisite blocks.
+            "test_package_blocked_refactor_flow",
+            "test_the_refactor_without_its_prerequisite_fails_the_gate",
+            "test_a_refactor_repaired_under_dbt_packages_fails_the_gate",
+            "test_the_package_blocked_refactor_checks_catch_the_wrong_answers",
         )
     ),
     # Blocked deliverables, identifier repairs and holdouts.

@@ -63,7 +63,23 @@ dex transform compare PLAN_ID --model account_summary
 `different` means the rewrite changed the rows or the schema: fix it, or state an
 intended rename with `--map` or type change with `--accept-type`. `not_checked`
 is not a pass: its `reason_code` names what to repair, such as a parent whose last
-build failed. The offer's `static_attribution` says when this comparison is the
+build failed. The offer says so before you compare: `baseline_ready: false`
+names each blocked input and its owner. Repair it in a plan of its own, apply
+and build that plan (with `--cold-deps` where a package owns the failing model),
+then compare the refactor's plan, which you have not applied yet:
+
+```bash
+dex transform plan "override the package model" --edits-file repair.json
+dex transform apply REPAIR_PLAN_ID
+dex transform build --target dev --verify --cold-deps --for-plan REPAIR_PLAN_ID
+dex transform compare PLAN_ID --model account_summary
+```
+
+Putting the repair in the refactor's own plan leaves the comparison nothing
+built to read, so Dex warns and names the split (`mixed_with_repair`). The
+verdict's `inputs_built_by` names the build its inputs came from.
+`transform deps` installs the packages the project already declares, at its
+pinned versions; that is not installing or upgrading a tool. The offer's `static_attribution` says when this comparison is the
 only evidence a refactor kept its results, for example when the model's SQL
 calls a macro. A change meant to alter results needs no comparison. The verdict
 is recorded on the plan, and `transform apply` reports it.

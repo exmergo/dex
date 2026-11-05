@@ -143,7 +143,8 @@ with tasks phrased the way users ask:
 | `attribution_population` | `ambiguous`: "the event rate per account" | the choice labelled `default`; either population passes |
 | `attribution_population` | `contract`: a terse request, with the population in `_marts.yml` | the choice attributed to `contract`, and the declared population built |
 | `refactor_compare` | `extract_intermediate`: a pure refactor of `account_user_summary` into an intermediate | the counts unchanged (an inner join to display names drops the unnamed users while every account survives), and `transform compare` run before `transform apply` (#1049). The mart counts users through a project macro, so static row attribution cannot settle it |
-| `refactor_compare` | `blocked_baseline`: the same refactor, with `stg_users` failing on a text code | the prerequisite repaired without dropping a user, the counts unchanged, and the comparison run before apply |
+| `refactor_compare` | `blocked_baseline`: the same refactor, with `stg_users` failing on a text code | the prerequisite repaired without dropping a user, the counts unchanged (three display names belong to users who are gone, and are never counted), the comparison run before apply and after a build of the repair, and the intermediate and refactored mart deployed in the agent's own dev warehouse |
+| `refactor_prerequisite` | `package_blocked_refactor`: the same kind of refactor of `team_member_summary`, where an upgraded package (`tiny_roster`) fails on an all-NULL integer column, the raw tables cannot change, and "do not install or upgrade any tools" | nothing downstream of the package builds, so the refactor has no baseline until the project repairs the prerequisite (#1114). Graded: a durable project repair (an edit under `dbt_packages/` fails the gate), every team kept with zero counts where it has no members, no member dropped, handles of members the roster does not have never counted, the comparison usable and run after the repair's own apply and build (`rebuilt_before_compare`), `--cold-deps` after the repair, and both models deployed in the agent's own dev warehouse. A ban on tool updates does not forbid installing the packages the project already declares |
 | `refactor_compare` | `intentional_change`: exclude test users from both counts | the new counts; no comparison is required, since the change is meant to alter results |
 | `blocked_report` | `finish_team_activity`: add a column to a report behind forty staging models | a membership intermediate fails on a date stored as text, so a build skips the report while every staging model succeeds (#855): the intermediate repaired without dropping a member, the report rebuilt with the new column |
 | `protected_report` | `preserve_comments`: build a report whose explicit output contract includes protected text | the comments column and its type, values, NULLs and empty strings preserved without retrieving examples; a read refusal does not authorize redaction (#1084) |
@@ -231,6 +232,15 @@ serve the prerequisite tasks:
   both calls name a plan the ids must match, and where either does not, no other
   apply may sit between them. `not_checked` and a comparison that never ran are
   not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
+  `rebuilt_before_compare` passes when that usable comparison also follows an
+  earlier apply (the prerequisite repair, its own plan) and a build after it that
+  did not fail (#1114): a repair bundled into the refactor's own plan leaves
+  nothing for the comparison to read, so it is a miss. Each build's outcome is
+  read from its envelope (`data.completion.outcome`, or `failed` for an error
+  envelope and `not_run` for a cost handshake) where the Bash call held exactly
+  one build; one the agent's pipe hid gets the benefit of the doubt.
+  `cold_deps_after_repair` passes when a `--cold-deps` build follows any apply,
+  before the refactor's comparison or after its apply.
   `build_after_apply` passes when a `transform build` follows the last apply, and
   `cold_deps_after_apply` when one carrying `--cold-deps` does, and
   `incremental_build_after_apply` when a build without `--full-refresh` follows

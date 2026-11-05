@@ -553,6 +553,9 @@ class RefactorComparisonResult(Result):
     # The values the baseline compiled at, where a retirement contract chose a
     # branch (#858). Absent everywhere else.
     baseline_vars: dict[str, Any] | None = None
+    # The latest build of the compared model's upstream models, ordinary or
+    # `--cold-deps`: what the baseline's inputs are (#1114). None with no build.
+    inputs_built_by: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
@@ -574,6 +577,7 @@ class RefactorComparisonResult(Result):
             "baseline_compiled": self.baseline_compiled,
             "proposed_compiled": self.proposed_compiled,
             "input_scope": self.input_scope,
+            "inputs_built_by": self.inputs_built_by,
             "schema": self.schema_diff,
             "multiset": self.multiset,
             "key_columns": self.key_columns,

@@ -154,9 +154,45 @@ Limits:
   back to the installed tree.
 - With no package lockfile, the reinstall resolves versions afresh, and a note says so.
 
-## 5. When no repair is in scope
+Installing the packages the project already declares is not installing a tool.
+`dex transform deps`, the build's own install and `--cold-deps` fetch what
+`packages.yml` names, at the versions `package-lock.yml` pins. A request not to
+install or upgrade tools (dbt, Dex, Python packages) does not rule them out.
+
+## 5. A refactor whose baseline is blocked
+
+A refactor is proven by `transform compare`, which compiles the old and new SQL
+over the inputs the dev target holds. When a prerequisite fails, those inputs are
+whatever an earlier build left, so the comparison is `not_checked`
+(`inputs_unsynchronized`) until the repair is built. The order matters:
+
+1. **Plan the refactor and read the offer.** `data.refactor_comparison_offer`
+   says `baseline_ready: false` and lists each blocked input under
+   `per_model[].blocked_inputs` with its `owner` (and `package`). Do not apply
+   this plan: applying it discards the baseline (`plan_applied`).
+2. **Repair the prerequisite in a plan of its own**, through a supported route
+   from `data.prerequisites` (above). Apply it.
+3. **Build the repair.** `dex transform build --target dev --verify --for-plan
+   <repair plan> --cold-deps` where a package owns the node; a plain build with
+   `--select` for a project model. `transform compare` reads the latest attempt
+   of each input, a cold build's included.
+4. **Compare the refactor's plan** (the one from step 1, still unapplied; it is
+   not stale unless the repair edited the same files). `equivalent` carries
+   `inputs_built_by`, the build its inputs came from. Relay it with
+   `input_scope` and `compared_at`.
+5. **Apply and build the refactor** with `--for-plan`. `data.completion`
+   carries the recorded verdict.
+
+Never put the repair in the refactor's plan. Its comparison would read the
+failed build for the baseline, so it can never be usable: the plan carries
+`mixed_with_repair`, a warning names the split, and `data.next` asks for it.
+
+## 6. When no repair is in scope
 
 Report the deliverable as incomplete and name the exact prerequisite (`node`, `owner`,
 `message`) and the remedy you tried. Writing the requested SQL file does not complete
-it. For a refactor, repair the prerequisite first so the baseline builds, then run
-`transform compare`.
+it. A refactor left blocked has no comparison: say so, rather than citing a
+`not_checked` verdict or a manual spot check as equivalence. Where the request
+needs a change to data only its loader can make, that part stays incomplete
+however the build turns out: a project override does not fulfil it (doing both
+is fine where you say which part is which), and nothing routes around the guard.
