@@ -1,0 +1,8 @@
+{
+  "kind": "fix",
+  "models": [
+    "account_usage_daily",
+    "region_account_summary"
+  ],
+  "prompt": "Our account metrics should not count sandbox tenants (accounts flagged `is_sandbox`). Please fix the marts and build them on dev."
+}

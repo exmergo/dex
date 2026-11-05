@@ -120,6 +120,12 @@ class TransformPlan(BaseModel):
     # digest, so a `--for-plan` build can carry an undeclared loss or an
     # unchecked conversion into its completion obligations.
     identifier_conversions: dict[str, list[dict[str, Any]]] | None = None
+    # Per model, the changes the plan makes beside its request that an
+    # assumption must record (#1115): a population change, a removed output,
+    # a changed cast, aggregate or NULL treatment, each `declared` or
+    # `undeclared`, plus `unchecked` where the edit could not be read.
+    # Bookkeeping outside the digest, read by a `--for-plan` build.
+    change_scope: dict[str, list[dict[str, Any]]] | None = None
     # The retirement contract (#858): which flag value's behavior survives and
     # what each output must hold. Intent rather than bookkeeping, so unlike the
     # two above it travels in the plan document and, where present, its digest.

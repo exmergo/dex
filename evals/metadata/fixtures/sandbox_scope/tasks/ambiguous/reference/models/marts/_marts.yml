@@ -1,0 +1,55 @@
+version: 2
+models:
+  - name: dim_accounts
+    description: The account directory, one row per account.
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+      - name: account_name
+      - name: region
+      - name: is_sandbox
+  - name: account_usage_daily
+    description: Usage per account per day.
+    config:
+      meta:
+        dex:
+          grain: [account_id, used_on]
+          population:
+            rule: "Usage of customer accounts; sandbox tenants' usage is excluded."
+          assumptions:
+            - decision: Whether sandbox usage counts
+              chosen: sandbox usage excluded
+              evidence: request
+              column: is_sandbox
+              detail: usage is an account metric the request names
+    columns:
+      - name: account_id
+        config: {meta: {dex: {role: foreign_key, references: dim_accounts.account_id}}}
+      - name: used_on
+        config: {meta: {dex: {role: time}}}
+      - name: units
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+      - name: usage_records
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+  - name: region_account_summary
+    description: Customer accounts and their usage per region; every region is listed.
+    config:
+      meta:
+        dex:
+          grain: [region]
+          population:
+            rule: "Every region; sandbox tenants are left out of both counts."
+          assumptions:
+            - decision: Whether sandbox accounts count in the regional totals
+              chosen: sandbox accounts excluded
+              evidence: request
+              column: is_sandbox
+              detail: the regional counts are account metrics the request names
+    columns:
+      - name: region
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key}}}
+      - name: accounts
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+      - name: units
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}

@@ -1,0 +1,5 @@
+{
+  "name": "sandbox_scope",
+  "description": "Accounts, some of them internal sandbox tenants, read by a directory, a daily usage table and a regional summary: which of them a sandbox exclusion reaches is what the request settles, or leaves to a recorded choice.",
+  "seed": 1115
+}

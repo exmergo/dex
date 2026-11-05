@@ -95,6 +95,12 @@ class PlanResult(Result):
     # holds: counts with their denominator, and a status of lossless,
     # declared, undeclared or unchecked (#861). Absent when the plan adds none.
     identifier_conversions: list[dict[str, Any]] | None = None
+    # Per existing model the plan rewrites (#1115): whether its row population
+    # is changed, kept or unchecked, and which outputs it removes, adds,
+    # retypes, re-aggregates or re-NULLs, each judged change `declared` by an
+    # assumption naming its column or `undeclared`. Absent when the plan
+    # rewrites no existing model.
+    change_scope: dict[str, Any] | None = None
     # Per versioned model the plan touches (#859): each version's file and
     # relation, the default before and after, every consumer's ref and what it
     # resolves to, relation and contract changes, and dbt's own manifest
@@ -123,6 +129,8 @@ class PlanResult(Result):
             payload["refactor_comparison_offer"] = self.refactor_comparison_offer
         if self.identifier_conversions is not None:
             payload["identifier_conversions"] = self.identifier_conversions
+        if self.change_scope is not None:
+            payload["change_scope"] = self.change_scope
         if self.model_versions is not None:
             payload["model_versions"] = self.model_versions
         if self.decisions is not None:

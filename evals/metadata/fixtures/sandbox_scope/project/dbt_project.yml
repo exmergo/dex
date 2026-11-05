@@ -1,0 +1,11 @@
+name: tenants
+version: "1.0.0"
+profile: tenants
+model-paths: ["models"]
+
+models:
+  tenants:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

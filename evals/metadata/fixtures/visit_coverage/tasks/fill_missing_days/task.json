@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "daily_visits"
+  ],
+  "prompt": "The clinic dashboard shows gaps: `daily_visits` has no row for days when nobody came in. Every day from the first to the last visit date in the data should have a row. Build it on dev when you are done."
+}

@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "region_account_summary"
+  ],
+  "prompt": "Sandbox tenants are inflating `region_account_summary`. Leave accounts flagged `is_sandbox` out of that model's account and unit counts; every region should still be listed. Build it on dev when you are done."
+}

@@ -190,8 +190,12 @@ class Obligation(BaseModel):
     model: str
     kind: str
     status: str
-    #: The column an identifier-conversion obligation is about (#861).
+    #: The column an identifier-conversion or change-scope obligation is about
+    #: (#861, #1115).
     column: str | None = None
+    #: What a change-scope obligation changed (`column_removed`,
+    #: `aggregate_changed`, `predicate_added`, ...) (#1115).
+    change: str | None = None
     #: The finding a contradicted record raised (`join_orphans`, ...), so the
     #: block says what was wrong without a trip to ``data.verification``.
     finding: str | None = None
@@ -217,6 +221,11 @@ class Obligations(BaseModel):
     #: model holds with nothing declared recording it (`undeclared`), or that
     #: dex could not measure (`unchecked`), as the plan recorded them (#861).
     identifier_conversions: list[Obligation] | None = None
+    #: Changes the plan made beside its request with no assumption recording
+    #: them (`undeclared`: a population change, a removed output, a changed
+    #: cast, aggregate or NULL treatment), or an edit dex could not read
+    #: (`unchecked`), as the plan recorded them (#1115).
+    change_scope: list[Obligation] | None = None
 
 
 class ColdSummary(BaseModel):
@@ -620,6 +629,7 @@ def summarize_completion(
     cold: Mapping[str, Any] | None = None,
     prose_population: Iterable[str] = (),
     identifier_conversions: Mapping[str, list[Mapping[str, Any]]] | None = None,
+    change_scope: Mapping[str, list[Mapping[str, Any]]] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -672,6 +682,9 @@ def summarize_completion(
     completion.obligations.identifier_conversions = (
         _conversion_obligations(identifier_conversions, evidence) or None
     )
+    completion.obligations.change_scope = (
+        _scope_obligations(change_scope, evidence) or None
+    )
     if prerequisites:
         completion.details = ["data.prerequisites", *completion.details]
     if cold is not None:
@@ -713,6 +726,37 @@ def _conversion_obligations(
     return out
 
 
+def _scope_obligations(
+    recorded: Mapping[str, list[Mapping[str, Any]]] | None,
+    evidence: BuildEvidence,
+) -> list[Obligation]:
+    """The plan's change-scope entries no assumption settles, on the models the
+    change requires (every recorded model where coverage is unknown)."""
+
+    if not recorded:
+        return []
+    coverage = evidence.coverage
+    required = set(coverage.required) if coverage is not None else None
+    out = []
+    for model, changes in sorted(recorded.items()):
+        if required and model not in required:
+            continue
+        for change in changes:
+            status = str(change.get("status") or "unknown")
+            if status == "declared":
+                continue
+            out.append(
+                Obligation(
+                    model=model,
+                    kind="change_scope",
+                    status=status,
+                    column=change.get("column"),
+                    change=change.get("kind"),
+                )
+            )
+    return out
+
+
 def _bounded_change(change: ChangeRef) -> ChangeRef:
     selector = change.selector
     if selector is not None and len(selector) > _SELECTOR:
@@ -747,6 +791,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         _NAMES,
         "obligations.identifier_conversions",
     )
+    cap_list(
+        completion.obligations,
+        "change_scope",
+        _NAMES,
+        "obligations.change_scope",
+    )
     if completion.refactor_comparison is not None:
         cap_list(completion, "refactor_comparison", _NAMES, "refactor_comparison")
     completion.elided = dict(elided)
@@ -772,6 +822,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             "identifier_conversions",
             max(keep, 1),
             "obligations.identifier_conversions",
+        )
+        cap_list(
+            completion.obligations,
+            "change_scope",
+            max(keep, 1),
+            "obligations.change_scope",
         )
         cap_list(completion.verification, "top", keep, "verification.top")
         # The first blocked deliverable is the last thing to go: it is the

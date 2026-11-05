@@ -1,0 +1,13 @@
+version: 2
+models:
+  - name: daily_visits
+    description: Visits per day.
+    columns:
+      - name: visit_date
+        data_type: date
+        data_tests: [unique, not_null]
+      - name: visits
+        data_type: bigint
+      - name: avg_duration_minutes
+        data_type: double
+        description: Average recorded duration; NULL when no visit that day has one.
