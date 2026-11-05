@@ -476,6 +476,24 @@ def _retirement_contract(
             {"model": str(model), "status": "unchecked", "reason_code": "unreadable"}
             for model in stored.get("outputs") or {}
         ]
+        metrics = stored.get("metrics") or {}
+        result.retirement.extend(
+            {
+                "model": str(metric),
+                "metric": True,
+                "expected": expected,
+                "status": "unchecked",
+                "reason_code": "unreadable",
+            }
+            for expected in ("retained", "removed")
+            for metric in metrics.get(expected) or []
+        )
+        if stored.get("scope") == "authored":
+            from .retirement import discovery_record
+
+            result.retirement.append(
+                discovery_record(str(stored.get("variable")), stored)
+            )
         return
     result.findings.extend(findings)
     result.retirement = records

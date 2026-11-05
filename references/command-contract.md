@@ -300,6 +300,10 @@ dex transform remove <kind> <name>   -> the definition removed, and every read v
                                      compiled SQL, transform compare compiles its baseline at that value,
                                      and build --verify --for-plan checks the built columns
                                      (skills/transform/references/feature-retirement.md).
+                                     Where the reference scan cannot finish, `scope: authored`
+                                     keeps those checks for the outputs the contract names and
+                                     reports discovery unchecked (data.retirement.discovery, and a
+                                     reference_discovery record in the build's verification).
                                      dex authors the removal of the
                                      definition and REFUSES while any read survives, naming each with
                                      a file and a line. For a scaffolded model ending in a

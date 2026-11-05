@@ -1328,8 +1328,34 @@ def _retire(
     project = engine.project_dir()
     view = load_project(project)
     scope = retirement_mod.package_scope(view, Path(project), name)
-    stated = retirement_mod.stored_form(name, contract)
-    if retirement_mod.is_already_complete(view, name, edits):
+    scoped = contract.scope == "authored"
+    discovery = None
+    if scoped:
+        # Judged before anything is stored: a scoped contract is admitted only
+        # where the full check cannot run, and only over models it can hold
+        # to what the author wrote (#1086).
+        discovery = {
+            "scope": "authored",
+            **retirement_mod.discovery_report(view, Path(project), name, edits),
+        }
+    stated = retirement_mod.stored_form(name, contract, discovery)
+    # Checked before the scope is validated, so repeating a finished scoped
+    # retirement is the same no-op as a full one: the metrics it removed are
+    # gone by then, and the scan may have become complete. A dynamic read
+    # keeps it from being recognised unless an applied plan already retired
+    # this flag: without that evidence the dynamic read may be the one reader
+    # left, and the request goes on to be checked.
+    retired_by = _retired_before(engine, name)
+    if retirement_mod.is_already_complete(
+        view, name, edits, allow_dynamic=scoped and retired_by is not None
+    ):
+        # A build answers for a contract only through the plan that carries it,
+        # so the plan that retired the flag is named for the check to run on.
+        verify = (
+            f"`transform build --target dev --verify --for-plan {retired_by}`"
+            if retired_by
+            else "`transform build --target dev --verify` and `explore profile`"
+        )
         return PropagationResult(
             change=f"{name} already removed",
             kind="var",
@@ -1337,15 +1363,18 @@ def _retire(
                 "status": "already_complete",
                 "contract": stated,
                 "package_scope": scope,
+                **({"discovery": discovery} if discovery is not None else {}),
+                **({"retired_by_plan": retired_by} if retired_by else {}),
             },
             notes=[
                 f"nothing in this project reads or defines '{name}' and this "
                 "payload changes no file, so no plan was stored. To check the "
-                "outputs the contract names, run `transform build --target dev "
-                "--verify` and `explore profile`"
+                f"outputs the contract names, run {verify}"
             ],
             decisions=retirement_mod.decisions(stated),
         )
+    if discovery is not None:
+        retirement_mod.validate_scope(view, edits, contract, discovery)
     result = _propagate(
         engine,
         "var",
@@ -1353,6 +1382,7 @@ def _retire(
         None,
         extra_edits=edits,
         retirement=True,
+        scoped=scoped,
         intent=(
             f"{contract.behavior} var {name}, keeping the behavior of "
             f"{contract.retained_value!r}"
@@ -1369,10 +1399,16 @@ def _retire(
         **analysis,
         "contract": stated,
         "package_scope": scope,
+        **({"discovery": discovery} if discovery is not None else {}),
     }
     # First: these answer what this command was asked, and the plan's own notes
     # about undeclared models would otherwise bury them.
     result.warnings[:0] = [
+        *(
+            retirement_mod.scope_warnings(name, contract, discovery)
+            if discovery is not None
+            else []
+        ),
         *retirement_mod.plan_warnings(name, analysis),
         *retirement_mod.package_warnings(name, scope),
     ]
@@ -1383,6 +1419,27 @@ def _retire(
     return result
 
 
+def _retired_before(engine: DexEngine, name: str) -> str | None:
+    """The latest applied plan carrying a retirement contract for ``name``."""
+
+    store = engine.store
+    if store is None or not hasattr(store, "list_plans"):
+        return None
+    try:
+        plans = store.list_plans()
+    except Exception:
+        return None
+    applied = [
+        plan
+        for plan in plans
+        if plan.applied_at is not None
+        and (plan.retirement or {}).get("variable") == name
+    ]
+    if not applied:
+        return None
+    return str(max(applied, key=lambda plan: plan.applied_at or "").plan_id)
+
+
 def _propagate(
     engine: DexEngine,
     kind: str,
@@ -1391,6 +1448,7 @@ def _propagate(
     *,
     extra_edits: list[PlanEdit],
     retirement: bool = False,
+    scoped: bool = False,
     intent: str | None = None,
 ) -> PropagationResult:
     from ..dbt_project import load as load_project
@@ -1405,6 +1463,7 @@ def _propagate(
         new,
         extra_edits=extra_edits,
         retirement=retirement,
+        scoped=scoped,
     )
     planned = plan(
         engine, intent or outcome.intent, edits=outcome.edits, attribute_rows=False

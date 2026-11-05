@@ -120,6 +120,52 @@ the built relation's columns, with no added statement. `retirement_output_presen
 findings, and each record reaches `data.completion.obligations`. `not_built` means
 the relation in dev predates this run and proves nothing.
 
+## When discovery cannot finish: `scope: authored`
+
+The full retirement refuses while the reference scan has a limit, because a
+reader it could not see would survive the change unchecked. A project with
+Jinja-heavy macros, or installed packages such as `dbt_utils`, can hold SQL the
+column scan cannot parse, and a macro such as
+`var('using_' ~ name, true)` names its variable at run time. The refusal names
+each file.
+
+Do not fall back to a plain `transform plan` there: it refuses a `retirement` key,
+so nothing would check the outputs. Add `"scope": "authored"` to the same contract
+and run the same command:
+
+```json
+{"retirement": {"behavior": "retire", "retained_value": false,
+                "scope": "authored",
+                "outputs": {"rpt_orders": {"expected": ["order_id", "amount"],
+                                           "removed": ["region_label"]}}}}
+```
+
+What changes, and what does not:
+
+| | Full (`scope` omitted) | `scope: authored` |
+|---|---|---|
+| Admitted when | the scan finishes | the scan cannot finish; a scoped contract on a project whose scan finishes is refused, so drop `scope` there |
+| Outputs and metrics | checked at plan, compare and build | the same checks |
+| Literal reads the scan found, reads in YAML | refused until edited | refused until edited |
+| Dynamic var reads in this project | refused until rewritten | listed under `data.retirement.discovery.dynamic_reads`, not refused |
+| `outputs` models | any | must be models this project defines; a package model or a misspelling is refused |
+| `metrics.removed` | any | must be metrics this project defines before the payload; a package metric or a misspelling is refused |
+| Models the payload rewrites | unchecked without an `outputs` entry | refused without one |
+| Global reference discovery | complete | `unchecked`, with `reason_code: discovery_incomplete` |
+
+`data.retirement.discovery` says what was not read: `limits` (project files, the
+first 10, with `limits_elided`), `package_limits` (a count per package), `unread`,
+and `dynamic_reads`. The first warning names the outputs the checks cover and says
+the plan does not show the feature retired everywhere. `removed_column_still_read`
+covers only the files the scan read.
+
+After the build, `data.verification.retirement` carries one more record,
+`check: reference_discovery`, which is always `unchecked` and reaches
+`data.completion.obligations.unchecked`. A satisfied output record says that
+output is right. It does not say every reader of the flag was found. Relay both.
+The scope and the discovery summary travel in the stored plan and in the plan
+document, inside its digest.
+
 ## Dynamic readers and repeats
 
 - A read in this project that names no literal variable (`var(flag_name)`) is
