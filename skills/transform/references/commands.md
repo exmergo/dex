@@ -66,7 +66,12 @@ See the cost-controls reference for the shared budget mechanism.
   `DISTINCT` or `GROUP BY` can move rows (row attribution's own reading), `kept`
   when nothing can, `unchecked` when the model could not be rendered (a macro, an
   `{% if %}`). `outputs` is `changed`, `kept`, or `unchecked` where the final
-  select projects a star (CTE columns are still compared). Each entry in
+  select projects a star and nothing else changed. A star with a changed CTE
+  column is `changed` and still carries a `reason` saying removals and
+  additions could not be read, so read `reason` whatever the state. Both states
+  describe this model's own SQL: `kept` is not proof a roster kept its rows, since
+  a model the plan does not edit is not listed and one reading a filtered model
+  loses those rows anyway. Each entry in
   `changes` has an `axis` (`population` or `output`), a `kind` and a `scope`:
   `column_removed`, `column_added`, `type_changed` (the outer cast target),
   `aggregate_changed` (`count(*)` to `count(col)`, a changed function or
@@ -81,7 +86,8 @@ See the cost-controls reference for the shared budget mechanism.
   without one. `population` at the top lists the models by state, so a broad
   filter shows which rosters kept every row. Capped at 25 models and 8 changes a
   model, undeclared first, with cuts counted in `elided`. A `--for-plan` build
-  carries the unsettled entries into `data.completion.obligations.change_scope`.
+  carries the unsettled entries into `data.completion.obligations.change_scope`,
+  with an `unread` entry (`unchecked`) for a model either axis could not read.
   Advisory: nothing here refuses a plan.
 - `data.identifier_conversions` (#861): each conversion the plan adds to an
   identifier column, on a new model or an edited one. A conversion is a `cast`, a

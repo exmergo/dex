@@ -111,8 +111,9 @@ request asked for it, record it as an assumption naming its `column`. If not,
 undo it.
 
 For a request such as "exclude sandbox accounts from our metrics", the
-`population` lists show which models now filter and which ones still list every
-account. Whether the account directory filters too is a decision to record
+`population` lists show which edited models now filter and which ones the edit
+leaves alone. They read each model's own SQL, so check a roster's rows on the
+build as well. Whether the account directory filters too is a decision to record
 rather than a side effect, and when the request leaves it open it is a `default`.
 
 Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)

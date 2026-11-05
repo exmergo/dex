@@ -149,8 +149,13 @@ model had. Then read `data.change_scope` on the plan: each model's population is
 aggregate or NULL treatment is `declared` (an assumption names its `column`) or
 `undeclared`. An `undeclared` change the request asks for gets an assumption
 naming that `column`, with the tier that settles it; one it does not ask for is
-undone. A `kept` model is the evidence that a roster survived, and a population a
-declaration states is the scope `--verify` checks the rows against.
+undone. `kept` says only that this edit adds nothing to that model's own SQL that
+moves rows: a roster the plan does not edit is not listed, and one that reads a
+model the plan filters still loses those rows, so check a roster's rows on the
+build. `--verify` checks rows only against a population declared as `filters` or
+a `parent`; a `rule` alone is prose (`obligations.prose_population`), so declare
+the checkable form where the model carries the column, and read
+`data.verification` before saying the rows were checked.
 
 **Correct rows, not only a green build.**
 

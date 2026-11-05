@@ -84,6 +84,8 @@ class ScopeChange(BaseModel):
 
 
 class ModelScope(BaseModel):
+    """One rewritten model's change scope, as ``data.change_scope`` lists it."""
+
     model: str
     path: str
     population: str  # changed | kept | unchecked
@@ -207,6 +209,9 @@ def scope_for(
 def _population(
     prior: str, authored: str, dialect: str, out: list[ScopeChange]
 ) -> tuple[str, str | None]:
+    """Append each row-moving change row attribution classifies, and return the
+    population state with the reason it could not be read, if any."""
+
     isolable, unresolved = classify(prior, authored, dialect)
     out.extend(
         ScopeChange(
@@ -228,6 +233,8 @@ def _population(
 
 
 def _columns_of(prior: str | None, authored: str | None, dialect: str) -> list[str]:
+    """The column names a change's prior and authored fragments read, lowercased."""
+
     names: set[str] = set()
     for fragment in (prior, authored):
         if not fragment:
@@ -240,6 +247,8 @@ def _columns_of(prior: str | None, authored: str | None, dialect: str) -> list[s
 
 
 def _parse_fragment(fragment: str, dialect: str) -> exp.Expression | None:
+    """A predicate or join label as an expression, or ``None`` when unreadable."""
+
     try:
         return sqlglot.parse_one(fragment, dialect=dialect)
     except sqlglot.errors.ParseError:
@@ -283,6 +292,11 @@ def _projections(select: exp.Expression) -> tuple[dict[str, exp.Expression], boo
 def _outputs(
     prior: exp.Expression, authored: exp.Expression, out: list[ScopeChange]
 ) -> tuple[str, str | None]:
+    """Append the removed, added and re-expressed output columns, and return the
+    output state with the reason removals could not be read, if any. A star in
+    the final select leaves removals unread while shared CTEs are still
+    compared, so ``changed`` can carry a reason too."""
+
     before_scopes, after_scopes = sql_shape.scopes(prior), sql_shape.scopes(authored)
     reason: str | None = None
     changed = False
@@ -352,6 +366,8 @@ def _normal(node: exp.Expression) -> str:
 
 
 def _cast_target(node: exp.Expression) -> str | None:
+    """The type an expression is cast to at its outermost level, if it is cast."""
+
     while isinstance(node, exp.Paren):
         node = node.this
     if isinstance(node, (exp.Cast, exp.TryCast)):
@@ -360,6 +376,9 @@ def _cast_target(node: exp.Expression) -> str | None:
 
 
 def _aggregates(node: exp.Expression) -> Counter[str]:
+    """Each aggregate in an expression as ``func([distinct ]arg)``, counted, with
+    ``*`` for a bare ``count(*)``."""
+
     found: Counter[str] = Counter()
     for agg in node.find_all(exp.AggFunc):
         arg = agg.this
@@ -372,6 +391,8 @@ def _aggregates(node: exp.Expression) -> Counter[str]:
 
 
 def _null_handling(node: exp.Expression) -> Counter[str]:
+    """The NULL-handling functions in an expression, counted by kind."""
+
     found: Counter[str] = Counter()
     for func in node.find_all(exp.Func):
         name = (func.sql_name() or "").lower()
@@ -383,12 +404,16 @@ def _null_handling(node: exp.Expression) -> Counter[str]:
 def _expression_changes(
     scope: str, name: str, prior: exp.Expression, authored: exp.Expression
 ) -> list[ScopeChange]:
+    """How one column's expression changed: a cast, an aggregate, a NULL
+    treatment, or, failing all three, the expression itself."""
+
     if _normal(prior) == _normal(authored):
         return []
     shown = (sql_shape.text(prior), sql_shape.text(authored))
     where = "" if scope == sql_shape.MAIN_SCOPE else f" in `{scope}`"
 
     def change(kind: str, detail: str) -> ScopeChange:
+        """One output change on this column, with both expressions shown."""
         return ScopeChange(
             axis="output",
             kind=kind,
@@ -436,6 +461,8 @@ def _expression_changes(
 
 
 def _describe(found: Counter[str]) -> str:
+    """A counted set of functions as words, ``none`` when empty."""
+
     if not found:
         return "none"
     return ", ".join(f"{n} x {k}" if n > 1 else k for k, n in sorted(found.items()))
@@ -445,6 +472,9 @@ def _describe(found: Counter[str]) -> str:
 
 
 def _settle(change: ScopeChange, assumptions: list[Mapping[str, Any]]) -> None:
+    """Mark a judged change ``declared`` by the first assumption naming a column it
+    governs, copying that assumption, or ``undeclared``."""
+
     if change.axis == "output" and change.kind not in JUDGED:
         return
     if change.axis == "population":
@@ -520,7 +550,10 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
             for c in entry.get("changes") or []
             if c.get("status") is not None
         ]
-        if entry.get("population") == "unchecked":
+        # Either axis left unread is unchecked, never clean: a final `select *`
+        # whose removals could not be read is as unfinished as an unrenderable
+        # model.
+        if "unchecked" in (entry.get("population"), entry.get("outputs")):
             judged.append({"kind": "unread", "status": "unchecked"})
         if judged:
             out[entry["model"]] = judged

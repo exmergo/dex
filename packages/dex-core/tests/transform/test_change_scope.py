@@ -248,6 +248,18 @@ def test_a_star_leaves_removal_unread_but_still_compares_the_ctes():
     assert _kinds(scope) == [("aggregate_changed", "visits", "undeclared")]
 
 
+def test_an_unread_star_with_nothing_else_changed_is_stored_unchecked():
+    prior = PRIOR.replace(
+        "select visit_date, visits, avg_duration, cast(site_id as integer) as site_id",
+        "select *",
+    )
+    scope = _scope(prior + "-- reviewed\n", prior=prior)
+    assert (scope.population, scope.outputs) == ("kept", "unchecked")
+    assert cs.stored_form(
+        {"models": [scope.model_dump(mode="json", exclude_none=True)]}
+    ) == {"site_daily": [{"kind": "unread", "status": "unchecked"}]}
+
+
 def test_the_caps_count_what_they_cut():
     columns = ", ".join(f"cast(c{i} as integer) as c{i}" for i in range(12))
     prior = "select " + columns + " from {{ ref('t') }}"
