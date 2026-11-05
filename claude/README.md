@@ -351,6 +351,7 @@ For a repo that must not publish data values, ignore the rest:
 .dex/drift.json
 .dex/spend.jsonl
 .dex/spend.lock
+.dex/cache.lock
 ```
 
 `.dex/dex.db` is the SQLite backend's equivalent of `cache.json`, so it gets

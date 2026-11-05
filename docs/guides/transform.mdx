@@ -141,8 +141,9 @@ On a metered connector, review the estimate and follow the
 is only part of the result. Read `data.completion` first. It is the first key
 of the payload and is held to 4 KiB, so it survives a cut-off read even when
 hundreds of nodes follow it. With `--for-plan`, its `deliverables` say which of
-the nodes the plan changed were built, failed, skipped, missing or stale, and
-`blocked` names what stopped each one. A skipped report is not done, even if dev
+the nodes the plan changed were built, failed, skipped, missing or stale (and,
+when dbt reports a status Dex does not recognize, such as a microbatch model's
+`partial success`, `unrecognized`), and `blocked` names what stopped each one. A skipped report is not done, even if dev
 still holds a table from an earlier run. `assurance.build_only` lists what built
 with nothing checking its rows. Without `--for-plan`, `coverage` is `unknown`.
 
@@ -150,6 +151,8 @@ with nothing checking its rows. Without `--for-plan`, `coverage` is `unknown`.
 `scope_not_built` names the other reported models. In the evidence block,
 `coverage.covered` includes failed and skipped nodes present in run results.
 Use `coverage.built` and `coverage.not_built` to distinguish successful execution.
+`generated` lists only the relations this run's successful nodes produced, and
+an unrecognized node status makes the outcome `indeterminate`, never `validated`.
 
 When something upstream stopped the build, `data.prerequisites` names the failed
 node's owner (your project or an installed package), whether the plan could have

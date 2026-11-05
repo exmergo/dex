@@ -39,6 +39,7 @@ from ..errors import DexError
 from ..guards.sql_guard import referenced_relations
 from ..storage import readable_cache
 from .build import DbtRunError, ShadowRun, assert_dev_target
+from .evidence import BUILT_STATUS
 from .multiset_compare import (
     ReasonCode,
     RefactorCompareResult,
@@ -855,8 +856,11 @@ def _compile_side(
     )
 
 
-#: Statuses dbt gives a node that did not produce this run's relation.
-_NOT_REBUILT = frozenset({"error", "runtime error", "fail", "failed", "skipped"})
+def _not_rebuilt(status: str) -> bool:
+    """Whether a node's latest attempt left its dev relation from an earlier
+    run: anything but ``success``, an unrecognized status included (#1105)."""
+
+    return status.lower() != BUILT_STATUS
 
 
 def _blocked_key(blocked: BlockedInput) -> tuple[str, str, str]:
@@ -989,7 +993,7 @@ def _blocked_parents(
         if graph["names"](node) & touched:
             continue
         run = runs.nodes.get(uid)
-        if run is not None and run.status in _NOT_REBUILT:
+        if run is not None and _not_rebuilt(run.status):
             package = str(node.get("package_name") or "")
             blocked.append(
                 BlockedInput(

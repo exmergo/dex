@@ -1,7 +1,7 @@
 {
   "name": "build-skipped",
   "contract": "build-evidence",
-  "description": "Every node skipped, which usually means a parent failed somewhere the selector excluded. Never a pass.",
+  "description": "Every node skipped, which usually means a parent failed somewhere the selector excluded. Never a pass, and a skipped node's surviving relation is never listed as generated.",
   "payload": {
     "run_results": [
       {
@@ -44,10 +44,7 @@
         "source_digest": null,
         "plan_digest": null
       },
-      "generated": [
-        "dev.main.mart",
-        "dev.main.other"
-      ],
+      "generated": [],
       "errors": [],
       "stale_artifacts": false,
       "plan_drift": [],

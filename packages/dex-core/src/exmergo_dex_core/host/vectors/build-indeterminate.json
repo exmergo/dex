@@ -1,0 +1,90 @@
+{
+  "name": "build-indeterminate",
+  "contract": "build-evidence",
+  "description": "The required model reported a status dex does not recognize (`partial success`, from a microbatch model with a failed batch), and nothing failed. Not built, not a failure, never validated.",
+  "payload": {
+    "run_results": [
+      {
+        "unique_id": "model.dex_test.mart",
+        "status": "partial success"
+      },
+      {
+        "unique_id": "model.dex_test.other",
+        "status": "success"
+      }
+    ],
+    "select": null
+  },
+  "expect": {
+    "outcome": "indeterminate",
+    "result": {
+      "outcome": "indeterminate",
+      "invocation": {
+        "invocation_id": "conformance",
+        "generated_at": "2026-09-08T01:04:26.731076+00:00",
+        "dbt_version": "1.11.11",
+        "command": "build",
+        "target": "dev",
+        "select": null,
+        "elapsed_seconds": null
+      },
+      "selection": {
+        "requested": null,
+        "matched": [
+          "mart",
+          "other"
+        ],
+        "empty": false,
+        "complete": true,
+        "unmatched": []
+      },
+      "digests": {
+        "manifest_sha256": "sha256:1ec72846b43af6a798f532fc15c66811c7ada95cb25b1e4a7c433a6df8797ce0",
+        "run_results_sha256": "sha256:edf9a8f94da9c53fe4e35993c9b3dd6c6c28a340de465d1b291950a6f3e67e6d",
+        "source_digest": null,
+        "plan_digest": null
+      },
+      "generated": [
+        "dev.main.other"
+      ],
+      "errors": [],
+      "stale_artifacts": false,
+      "plan_drift": [],
+      "nodes": [
+        {
+          "unique_id": "model.dex_test.mart",
+          "name": "mart",
+          "resource_type": "model",
+          "status": "partial success",
+          "materialization": "view",
+          "relation": "dev.main.mart"
+        },
+        {
+          "unique_id": "model.dex_test.other",
+          "name": "other",
+          "resource_type": "model",
+          "status": "success",
+          "materialization": "table",
+          "relation": "dev.main.other"
+        }
+      ],
+      "coverage": {
+        "required": [
+          "mart"
+        ],
+        "covered": [
+          "mart"
+        ],
+        "missing": [],
+        "basis": [
+          "models/staging/mart.sql: builds 'mart'",
+          "models/staging/mart.yml: documents mart"
+        ],
+        "built": [],
+        "not_built": [
+          "mart"
+        ]
+      }
+    }
+  }
+}

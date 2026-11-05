@@ -269,9 +269,10 @@ change never touched. `evidence.outcome` is what tells them apart.
 | `validated` | everything required ran and passed, against current artifacts |
 | `empty_selection` | the selection matched nothing |
 | `unrelated` | nodes ran, and none of them was required by this change |
-| `partial` | some required nodes ran and some did not |
+| `partial` | some required nodes built and some did not (absent from run results, or present without succeeding) |
 | `failed` | a node errored, or a test returned rows |
 | `skipped` | every node was skipped, usually behind a failed parent |
+| `indeterminate` | nothing failed, and a node reported a status dex does not recognize |
 | `stale` | it passed, and the tree it validated is not the one the plan describes |
 | `not_run` | dbt never reached node execution |
 
@@ -280,6 +281,20 @@ edit requires its own node, a `schema.yml` requires the nodes it documents, and 
 semantic YAML requires the dbt model its semantic model sits on. It is absent
 rather than empty when no plan was named, because an empty coverage block reads
 as "nothing required was built", which is the opposite of "nobody asked".
+
+Node statuses are read against an allow-list. `success` (a model, seed or
+snapshot) and `pass` or `warn` (a test) succeeded; `error`, `runtime error`,
+`fail` and `failed` failed; `skipped` was not attempted. Any other status
+(`partial success` from a microbatch model with a failed batch, `no-op`, or the
+`unknown` a node without a status defaults to) is unrecognized: it never counts
+as built, never lets a run read `validated`, and is not reported as a failure.
+The outcome is `indeterminate`, and `data.completion.deliverables.unrecognized`
+names such a deliverable. A document that claims `validated` over one is refused
+by `verify_build_evidence`.
+
+`generated` lists the relations of the models, seeds and snapshots that
+succeeded in this run. A skipped or failed node's relation is never listed,
+whatever an earlier run left of it in the target.
 
 `coverage.covered` records presence in run results, including failed and skipped
 nodes. Use `coverage.built` and `coverage.not_built` for successful execution:
@@ -493,11 +508,14 @@ for vector in conformance_vectors():
     vector["expect"]  # the verdict it should reach
 ```
 
-Twenty-three fixtures ship in the wheel beside the reader: a valid plan and the
-same plan exported from a second checkout, tampered content, a repinned digest, a
-future schema version, a delete; a declarative, executable, authority-bearing,
-unknown, and filtered-metric classification; a complete, unresolved, ambiguous,
-and missing grounding; and one per build outcome. A grounding vector carries the
+The fixtures ship in the wheel beside the reader: a valid plan and the same plan
+exported from a second checkout, tampered content, a repinned digest, a future
+schema version, a delete; a declarative, executable, authority-bearing, unknown,
+and filtered-metric classification; a complete, unresolved, ambiguous, and missing
+grounding; one per build outcome; and a forged build document claiming
+`validated` over a node whose status dex does not recognize. A vector a reader
+must refuse says `"verifies": false` under `expect`, with the outcome its fields
+actually support and the error a refusal carries. A grounding vector carries the
 project it was grounded against in `payload.project`, as relative paths and their
 content.
 

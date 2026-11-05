@@ -85,11 +85,28 @@ def test_coverage_distinguishes_observation_from_execution(project, edits, statu
     assert evidence.coverage.missing == []
     assert evidence.coverage.built == (["mart"] if status == "success" else [])
     assert evidence.coverage.not_built == ([] if status == "success" else ["mart"])
+    # The outcome and `generated` agree with the partition (#1104, #1105).
+    assert (
+        evidence.outcome
+        is {
+            "success": BuildOutcome.VALIDATED,
+            "error": BuildOutcome.FAILED,
+            "failed": BuildOutcome.FAILED,
+            "skipped": BuildOutcome.PARTIAL,
+            "unknown": BuildOutcome.INDETERMINATE,
+        }[status]
+    )
+    assert ("dev.main.mart" in evidence.generated) is (status == "success")
     assert host.recompute_outcome(evidence.data()) == evidence.outcome
     assert host.verify_build_evidence(evidence.data()).outcome == evidence.outcome
     legacy = evidence.data()
     del legacy["coverage"]["built"]
     del legacy["coverage"]["not_built"]
+    if status == "skipped":
+        # A producer from before the partition could not tell a skipped
+        # requirement beside passing nodes from a built one, and said so.
+        assert host.recompute_outcome(legacy) is BuildOutcome.VALIDATED
+        legacy["outcome"] = "validated"
     assert host.verify_build_evidence(legacy).coverage.built is None
     assert host.verify_build_evidence(legacy).digests == evidence.digests
 
@@ -652,3 +669,113 @@ def test_a_macro_only_plan_is_coverage_undetermined(project):
     evidence = build_evidence(project, target="dev", edits=edits)
     assert evidence.outcome is BuildOutcome.COVERAGE_UNDETERMINED
     assert evidence.coverage.undetermined is True
+
+
+def test_a_skipped_model_over_a_surviving_relation_is_not_generated(project, edits):
+    """#1104: the manifest still names the skipped model's relation, which an
+    earlier run left in the target; this run did not produce it."""
+
+    write_run_results(
+        project, [node("other", "error", message="boom"), node("mart", "skipped")]
+    )
+    evidence = build_evidence(project, target="dev", edits=edits)
+
+    assert evidence.outcome is BuildOutcome.FAILED
+    assert evidence.nodes[1].relation == "dev.main.mart"
+    assert evidence.generated == []
+    assert evidence.coverage.not_built == ["mart"]
+
+
+def test_an_all_skipped_run_generates_nothing(project, edits):
+    write_run_results(project, [node("mart", "skipped"), node("other", "skipped")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+
+    assert evidence.outcome is BuildOutcome.SKIPPED
+    assert evidence.generated == []
+
+
+@pytest.mark.parametrize("status", ["partial success", "no-op", "unknown", "Weird"])
+@pytest.mark.parametrize("with_plan", [True, False])
+def test_an_unrecognized_status_is_indeterminate(project, edits, status, with_plan):
+    """#1105: a status outside the known sets is neither a pass nor a failure,
+    with a plan or without one, and its relation is not generated."""
+
+    from exmergo_dex_core import host
+
+    write_run_results(project, [node("mart", status), node("other")])
+    evidence = build_evidence(project, target="dev", edits=edits if with_plan else None)
+
+    assert evidence.outcome is BuildOutcome.INDETERMINATE
+    assert evidence.errors == []
+    assert evidence.generated == ["dev.main.other"]
+    if with_plan:
+        assert evidence.coverage.built == []
+        assert evidence.coverage.not_built == ["mart"]
+    forged = evidence.data()
+    forged["outcome"] = "validated"
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence(forged)
+
+
+def test_a_failure_outranks_an_unrecognized_status(project, edits):
+    write_run_results(
+        project, [node("mart", "partial success"), node("other", "error")]
+    )
+    assert build_evidence(project, target="dev", edits=edits).outcome is (
+        BuildOutcome.FAILED
+    )
+
+
+def test_passing_and_warning_tests_still_validate(project, edits):
+    """A test says `pass` or `warn`, never `success`; the allow-list must keep
+    a build with tests validated."""
+
+    write_run_results(
+        project,
+        [
+            node("mart"),
+            {"unique_id": "test.dex_test.unique_mart_id", "status": "pass"},
+            {"unique_id": "test.dex_test.not_null_mart_id", "status": "warn"},
+            {"unique_id": "unit_test.dex_test.mart.test_mart", "status": "pass"},
+        ],
+    )
+    evidence = build_evidence(project, target="dev", edits=edits)
+
+    assert evidence.outcome is BuildOutcome.VALIDATED
+    assert evidence.generated == ["dev.main.mart"]
+
+
+def test_the_issue_document_recomputes_to_indeterminate():
+    """The reproduction on #1105, verbatim but for the expected outcome."""
+
+    from exmergo_dex_core import host
+
+    document = {
+        "outcome": "validated",
+        "nodes": [{"unique_id": "model.p.mart", "name": "mart", "status": "unknown"}],
+        "coverage": {
+            "required": ["mart"],
+            "covered": ["mart"],
+            "built": [],
+            "not_built": ["mart"],
+        },
+    }
+    assert host.recompute_outcome(document) is host.BuildOutcome.INDETERMINATE
+    with pytest.raises(host.BuildEvidenceError, match="indeterminate"):
+        host.verify_build_evidence(document)
+    document["outcome"] = "indeterminate"
+    assert host.verify_build_evidence(document).outcome is (
+        host.BuildOutcome.INDETERMINATE
+    )
+
+
+def test_status_kind_is_an_allow_list():
+    from exmergo_dex_core.transform.evidence import status_kind
+
+    assert status_kind("success") == "succeeded"
+    assert status_kind("PASS") == "succeeded"
+    assert status_kind("warn") == "succeeded"
+    assert status_kind("runtime error") == "failed"
+    assert status_kind("skipped") == "skipped"
+    assert status_kind("partial success") == "unrecognized"
+    assert status_kind("") == "unrecognized"
