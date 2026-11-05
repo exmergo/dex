@@ -126,3 +126,51 @@ def test_yaml_and_manifest_agree_on_versioned_relationship_edge(
     _write_matching_manifest(dbt_project_dir, to=to)
     manifest_fk = definitions(dbt_project_dir).foreign_keys[0]
     assert manifest_fk.to_model == yaml_fk.to_model == "dim_teams.v2"
+
+
+def test_yaml_relationship_ref_keeps_decimal_version(dbt_project_dir: Path):
+    """Unquoted ``v=1.5`` must keep the full token, not stop at ``1`` (#1141 CR)."""
+    _write_versioned_project(dbt_project_dir, to="ref('dim_teams', v=1.5)")
+    # Declare 1.5 as a real version so resolution keeps the label.
+    schema = (dbt_project_dir / "models" / "teams.yml").read_text(encoding="utf-8")
+    schema = schema.replace(
+        "      - v: 1\n        defined_in: dim_teams\n",
+        "      - v: 1\n        defined_in: dim_teams\n"
+        "      - v: 1.5\n        defined_in: dim_teams\n",
+    )
+    (dbt_project_dir / "models" / "teams.yml").write_text(schema, encoding="utf-8")
+    (fk,) = definitions(dbt_project_dir).foreign_keys
+    assert fk.to_model == "dim_teams.v1.5"
+
+
+def test_yaml_relationship_mixed_versions_default_is_alphabetical(
+    dbt_project_dir: Path,
+):
+    """Without latest_version, mixed ids use alphabetical max (dbt parity)."""
+    models = dbt_project_dir / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    (models / "dim_teams.sql").write_text("select 1 as team_id\n", encoding="utf-8")
+    (models / "dim_teams_v2.sql").write_text("select 1 as team_id\n", encoding="utf-8")
+    (models / "fct_games.sql").write_text(
+        "select 1 as game_id, 1 as team_id\n", encoding="utf-8"
+    )
+    (models / "teams.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: dim_teams\n"
+        "    versions:\n"
+        "      - v: 2\n"
+        "        defined_in: dim_teams_v2\n"
+        "      - v: 1-beta\n"
+        "        defined_in: dim_teams\n"
+        "  - name: fct_games\n"
+        "    columns:\n"
+        "      - name: team_id\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('dim_teams')\n"
+        "              field: team_id\n",
+        encoding="utf-8",
+    )
+    (fk,) = definitions(dbt_project_dir).foreign_keys
+    assert fk.to_model == "dim_teams.v2"

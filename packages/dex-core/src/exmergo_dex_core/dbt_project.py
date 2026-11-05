@@ -107,7 +107,7 @@ def semantic_manifest_file(project: Path | str) -> Path:
 # traces a dbt-level name, so they can never disagree on what counts as a ref.
 REF_PATTERN = re.compile(
     r"ref\(\s*['\"]([^'\"]+)['\"]"
-    r"(?:\s*,\s*(?:v|version)\s*=\s*(?:['\"]([^'\"]+)['\"]|(\w+)))?"
+    r"(?:\s*,\s*(?:v|version)\s*=\s*(?:['\"]([^'\"]+)['\"]|([^\s,)]+)))?"
 )
 SOURCE_PATTERN = re.compile(r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]")
 
