@@ -400,3 +400,42 @@ def test_a_failed_analysis_keeps_the_plan_and_its_contract(
     exported = _run(repo, capsys, "transform", "export", out["data"]["plan_id"])
     assert exported["data"]["plan"]["toggle"]["variable"] == FLAG
     assert exported["data"]["plan"]["toggle"]["analysis_failed"] == "KeyError"
+
+
+def test_compare_refuses_a_parent_that_moves_with_the_flag(repo: Path, capsys) -> None:
+    """A parent the plan leaves alone that reads the flag compiles differently at
+    the on value than the dev relation it was built as, so a comparison there
+    cannot rest on it."""
+
+    first = _plan(
+        repo,
+        capsys,
+        {
+            "stg_orders": STG.replace(
+                "3 as fee_amount",
+                "{% if var('"
+                + FLAG
+                + "', true) %}3{% else %}0{% endif %} as fee_amount",
+            )
+        },
+        toggle={**TOGGLE, "exempt_models": ["stg_orders"]},
+    )
+    assert first["status"] == "ok", first
+    assert (
+        _run(repo, capsys, "transform", "apply", first["data"]["plan_id"])["status"]
+        == "ok"
+    )
+    assert _run(repo, capsys, "transform", "build", "--target", "dev")["status"] == "ok"
+    out = _plan(repo, capsys, GATED)
+    compared = _run(
+        repo,
+        capsys,
+        "transform",
+        "compare",
+        out["data"]["plan_id"],
+        "--model",
+        "fct_order_lines",
+    )
+    assert compared["data"]["status"] == "not_checked", compared
+    assert compared["data"]["reason_code"] == "inputs_unsynchronized"
+    assert "stg_orders" in compared["data"]["detail"]

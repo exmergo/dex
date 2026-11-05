@@ -181,6 +181,11 @@
           "sql": "select count(*) from main.fct_orders"
         },
         {
+          "name": "every order keeps its date",
+          "expect": 0,
+          "sql": "select count(*) from raw.orders as r join main.fct_orders as f on r.order_id = f.order_id where r.ordered_on is distinct from f.ordered_on"
+        },
+        {
           "name": "the merchant report keeps one row per merchant",
           "expect": true,
           "sql": "select (select count(*) from main.rpt_merchant_revenue) = (select count(distinct merchant_id) from raw.orders)"

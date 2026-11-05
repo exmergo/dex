@@ -528,7 +528,7 @@ def _toggle_contract(
         result.toggle = [
             {"model": str(model), "status": "unchecked", "reason_code": "unreadable"}
             for model in stored.get("producers") or {}
-        ]
+        ] + toggle_mod.gap_records(stored)
         return
     result.findings, notes = toggle_mod.absorb_column_contract(
         result.findings, stored, branch

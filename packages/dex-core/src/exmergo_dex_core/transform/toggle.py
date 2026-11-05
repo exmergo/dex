@@ -140,7 +140,14 @@ def contract_of(stored: Mapping[str, Any]) -> ToggleContract:
         {
             k: v
             for k, v in stored.items()
-            if k not in ("variable", "producers", "judged_models", "analysis_failed")
+            if k
+            not in (
+                "variable",
+                "producers",
+                "judged_models",
+                "analysis_failed",
+                "plan_gaps",
+            )
         }
     )
 
@@ -808,6 +815,69 @@ def analysis_failed(reason: str) -> dict[str, Any]:
     return report
 
 
+def plan_gaps(analysis: Mapping[str, Any]) -> dict[str, Any] | None:
+    """What the plan's analysis could not judge, kept with the stored contract.
+
+    A model whose SELECT could not be read is never a known producer, so a later
+    build would hold nothing to it and say nothing; the same goes for a limit on
+    the whole reading (both branches failing to compile, a dynamic ``var()``
+    read). Stored, they come back as unchecked records on every build.
+    """
+
+    models = {
+        str(record["model"]): str(record.get("reason_code") or "unchecked")
+        for record in analysis.get("models") or []
+        if record.get("status") == "unchecked"
+    }
+    limits = [str(limit) for limit in analysis.get("limits") or []]
+    if not models and not limits:
+        return None
+    return {"models": models, "limits": limits}
+
+
+def gap_records(stored: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The unchecked records a build owes for what the plan could not judge."""
+
+    variable = str(stored.get("variable"))
+    records: list[dict[str, Any]] = []
+    if stored.get("analysis_failed"):
+        records.append(
+            {
+                "model": f"var:{variable}",
+                "status": "unchecked",
+                "reason_code": "analysis_failed",
+                "reason": (
+                    "the plan's toggle analysis failed "
+                    f"({stored['analysis_failed']}), so the producers of the "
+                    "governed columns are unknown; plan again to check them"
+                ),
+            }
+        )
+    gaps = stored.get("plan_gaps") or {}
+    for model, code in sorted((gaps.get("models") or {}).items())[:MAX_MODELS]:
+        records.append(
+            {
+                "model": model,
+                "status": "unchecked",
+                "reason_code": "unchecked_at_plan",
+                "reason": (
+                    f"the plan could not judge this model ({code}), so whether it "
+                    "produces a governed column is unknown"
+                ),
+            }
+        )
+    if gaps.get("limits") and not stored.get("analysis_failed"):
+        records.append(
+            {
+                "model": f"var:{variable}",
+                "status": "unchecked",
+                "reason_code": "plan_incomplete",
+                "reason": "; ".join(gaps["limits"][:3]),
+            }
+        )
+    return records
+
+
 def plan_warnings(variable: str, analysis: Mapping[str, Any]) -> list[str]:
     """One warning per contradiction, and one for everything not judged."""
 
@@ -879,21 +949,9 @@ def verify_outputs(
     labels = {own[uid] for uid in scope if uid in own}
     findings: list[Any] = []
     records: list[dict[str, Any]] = []
-    if stored.get("analysis_failed"):
-        # The plan never learned the producers, so the on value has nothing to
-        # be held to: say so, whatever this build judges below.
-        records.append(
-            {
-                "model": f"var:{variable}",
-                "status": "unchecked",
-                "reason_code": "analysis_failed",
-                "reason": (
-                    "the plan's toggle analysis failed "
-                    f"({stored['analysis_failed']}), so the producers of the "
-                    "governed columns are unknown; plan again to check them"
-                ),
-            }
-        )
+    # What the plan could not judge is owed whatever this build judges below:
+    # a model it never read is no known producer, so nothing else names it.
+    records.extend(gap_records(stored))
     if branch is None:
         why = (
             f"this build gave '{variable}' the value {current!r}, which is neither "

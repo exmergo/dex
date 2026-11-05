@@ -523,6 +523,9 @@ def _check_toggle(
     form["producers"] = analysis.get("producers") or {}
     if analysis.get("analysis_failed"):
         form["analysis_failed"] = analysis["analysis_failed"]
+    gaps = toggle_mod.plan_gaps(analysis)
+    if gaps:
+        form["plan_gaps"] = gaps
     stored.toggle = form
     store.save_plan(stored)
     result.toggle = {**analysis, "contract": form}

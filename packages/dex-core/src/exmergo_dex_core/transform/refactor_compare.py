@@ -369,17 +369,50 @@ def _compare(
             through_ancestors,
             vars_=proposed_vars,
         )
-        if proposed_vars and through_ancestors:
-            # The parents' guard reads the project's current values, as the
-            # baseline's does above: those are what the dev relations hold.
-            proposed = replace(
-                proposed,
-                parents=_compile_proposed(
-                    engine, stored, project, chosen, target, connector, True
-                ).parents,
+        toggled_parents: list[str] = []
+        if proposed_vars:
+            # Both statements read the untouched parents' dev relations, which
+            # were built at the project's current values. A parent that compiles
+            # differently at the on value holds rows the on branch would not
+            # write, so no verdict at the on value can rest on it.
+            at_on = (
+                proposed.parents
+                if through_ancestors
+                else _compile_proposed(
+                    engine,
+                    stored,
+                    project,
+                    chosen,
+                    target,
+                    connector,
+                    True,
+                    vars_=proposed_vars,
+                ).parents
             )
+            current = _compile_proposed(
+                engine, stored, project, chosen, target, connector, True
+            ).parents
+            toggled_parents = sorted(
+                name
+                for name in at_on.keys() & current.keys()
+                if at_on[name] != current[name]
+            )
+            if through_ancestors:
+                # The parents' guard reads the project's current values, as the
+                # baseline's does above: those are what the dev relations hold.
+                proposed = replace(proposed, parents=current)
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
+    if toggled_parents and proposed_vars:
+        variable, value = next(iter(proposed_vars.items()))
+        return not_checked(
+            "inputs_unsynchronized",
+            f"these untouched parents compile differently with {variable}="
+            f"{value!r} than at the value their dev relations were built with, so "
+            "a comparison at the on value would read rows the on branch does not "
+            "write: " + ", ".join(toggled_parents) + ". Build them at the on value "
+            "first, or compare after flipping the default",
+        )
 
     moved = sorted(
         name

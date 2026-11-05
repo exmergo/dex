@@ -431,3 +431,66 @@ def test_a_build_after_a_failed_analysis_keeps_an_unchecked_obligation() -> None
         }
     ]
     assert "KeyError" in records[0]["reason"]
+
+
+def test_what_the_plan_could_not_judge_is_owed_by_every_build() -> None:
+    """A model the plan could not read is no known producer, so without the
+    stored gaps a build would hold nothing to it and say nothing."""
+
+    analysis = toggle._report(
+        [
+            {
+                "model": "wide",
+                "status": "unchecked",
+                "reason_code": "unreadable_select",
+            },
+            {"model": "fct", "status": "satisfied", "produces": ["fee_amount"]},
+        ],
+        ["a dynamic var() read"],
+        [],
+        2,
+    )
+    gaps = toggle.plan_gaps(analysis)
+    assert gaps == {
+        "models": {"wide": "unreadable_select"},
+        "limits": ["a dynamic var() read"],
+    }
+    assert toggle.plan_gaps(toggle._report([toggle._record("fct")], [], [], 1)) is None
+    stored = {**CONTRACT, "producers": {"fct": ["fee_amount"]}, "plan_gaps": gaps}
+    assert toggle.contract_of(stored).columns == ["fee_amount"]
+    adapter = _Adapter({"fct": ["id", "fee_amount"]})
+    _findings, records, branch = toggle.verify_outputs(
+        stored,
+        {"model.shop.fct": "fct"},
+        {"model.shop.fct"},
+        {"fct": "dev.main.fct"},
+        ["dev.main.fct"],
+        lambda: adapter,
+        (True, True),
+        "shop",
+    )
+    by = {
+        (r["model"], r.get("reason_code"))
+        for r in records
+        if r["status"] == "unchecked"
+    }
+    assert ("wide", "unchecked_at_plan") in by
+    assert ("var:enable_fees", "plan_incomplete") in by
+    assert branch == "on"
+
+
+def test_a_verification_failure_still_owes_the_plan_gaps(tmp_path: Path) -> None:
+    from exmergo_dex_core.transform.verify import BuildVerification, _toggle_contract
+
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0"\nprofile: shop\n', encoding="utf-8"
+    )
+
+    def broken_adapter():
+        raise RuntimeError("driver went away")
+
+    result = BuildVerification(ran=True)
+    stored = {**CONTRACT, "producers": {}, "analysis_failed": "KeyError"}
+    _toggle_contract(tmp_path, stored, {}, set(), broken_adapter, result)
+    assert [r["reason_code"] for r in result.toggle] == ["analysis_failed"]
+    assert result.toggle[0]["model"] == "var:enable_fees"
