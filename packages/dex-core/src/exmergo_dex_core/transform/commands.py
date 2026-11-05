@@ -1341,10 +1341,13 @@ def _retire(
     stated = retirement_mod.stored_form(name, contract, discovery)
     # Checked before the scope is validated, so repeating a finished scoped
     # retirement is the same no-op as a full one: the metrics it removed are
-    # gone by then, and the scan may have become complete. A dynamic read is
-    # already reported as unchecked under a scoped contract, so it does not
-    # keep a finished one from being recognised.
-    if retirement_mod.is_already_complete(view, name, edits, allow_dynamic=scoped):
+    # gone by then, and the scan may have become complete. A dynamic read
+    # keeps it from being recognised unless an applied plan already retired
+    # this flag: without that evidence the dynamic read may be the one reader
+    # left, and the request goes on to be checked.
+    if retirement_mod.is_already_complete(
+        view, name, edits, allow_dynamic=scoped and _retired_before(engine, name)
+    ):
         return PropagationResult(
             change=f"{name} already removed",
             kind="var",
@@ -1406,6 +1409,22 @@ def _retire(
         *retirement_mod.decisions(stated),
     ]
     return result
+
+
+def _retired_before(engine: DexEngine, name: str) -> bool:
+    """Whether an applied plan carried a retirement contract for ``name``."""
+
+    store = engine.store
+    if store is None or not hasattr(store, "list_plans"):
+        return False
+    try:
+        plans = store.list_plans()
+    except Exception:
+        return False
+    return any(
+        plan.applied_at is not None and (plan.retirement or {}).get("variable") == name
+        for plan in plans
+    )
 
 
 def _propagate(

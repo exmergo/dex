@@ -248,3 +248,17 @@ def test_a_scoped_plan_document_carries_the_scope_to_the_build(jinja_repo, capsy
     records = _verification(built)
     assert records[FLAG]["check"] == "reference_discovery"
     assert records["rpt_orders"]["status"] == "satisfied"
+
+
+def test_a_flag_read_only_dynamically_is_not_taken_as_retired(jinja_repo, capsys):
+    """No applied plan retired it, so the dynamic read may be its last reader."""
+
+    shop = jinja_repo / "shop"
+    for name, sql in RETIRE_SQL.items():
+        _write(shop / f"models/{name}.sql", sql)
+    project = (shop / "dbt_project.yml").read_text(encoding="utf-8")
+    _write(shop / "dbt_project.yml", project.replace(f"vars:\n  {FLAG}: true\n", ""))
+    planned = _remove(jinja_repo, capsys, RETIRE_SQL, SCOPED)
+    assert (planned.get("data") or {}).get("retirement", {}).get(
+        "status"
+    ) != "already_complete", planned
