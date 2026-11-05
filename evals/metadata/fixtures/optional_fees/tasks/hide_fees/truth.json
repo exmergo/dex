@@ -62,7 +62,7 @@
     {
       "name": "the default keeps every fee column",
       "expect": 6,
-      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'fee_amount', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name || '.' || lower(column_name) in ('fct_orders.platform_fee', 'fct_orders.net_amount', 'rpt_merchant_revenue.platform_fees', 'rpt_merchant_revenue.net_revenue', 'rpt_fee_disputes.disputed_fee', 'ledger_daily.total_fees')"
     }
   ],
   "var_builds": [
@@ -75,7 +75,7 @@
         {
           "name": "every reporting fee column is there",
           "expect": 6,
-          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'fee_amount', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name || '.' || lower(column_name) in ('fct_orders.platform_fee', 'fct_orders.net_amount', 'rpt_merchant_revenue.platform_fees', 'rpt_merchant_revenue.net_revenue', 'rpt_fee_disputes.disputed_fee', 'ledger_daily.total_fees')"
         },
         {
           "name": "the order fact has exactly its fee and other columns",

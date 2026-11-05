@@ -140,7 +140,7 @@ def contract_of(stored: Mapping[str, Any]) -> ToggleContract:
         {
             k: v
             for k, v in stored.items()
-            if k not in ("variable", "producers", "judged_models")
+            if k not in ("variable", "producers", "judged_models", "analysis_failed")
         }
     )
 
@@ -798,6 +798,10 @@ def analysis_failed(reason: str) -> dict[str, Any]:
     """
 
     report = _report([], [f"the toggle could not be analysed ({reason})"], [], 0)
+    # Stored with the contract, so a later build reports the producers it never
+    # learned as an unchecked obligation instead of judging none and saying
+    # nothing (an empty producer map alone reads as "nothing produces it").
+    report["analysis_failed"] = reason
     report["producers"] = {}
     report["exempt_models"] = []
     report["package_scope"] = {}
@@ -875,6 +879,21 @@ def verify_outputs(
     labels = {own[uid] for uid in scope if uid in own}
     findings: list[Any] = []
     records: list[dict[str, Any]] = []
+    if stored.get("analysis_failed"):
+        # The plan never learned the producers, so the on value has nothing to
+        # be held to: say so, whatever this build judges below.
+        records.append(
+            {
+                "model": f"var:{variable}",
+                "status": "unchecked",
+                "reason_code": "analysis_failed",
+                "reason": (
+                    "the plan's toggle analysis failed "
+                    f"({stored['analysis_failed']}), so the producers of the "
+                    "governed columns are unknown; plan again to check them"
+                ),
+            }
+        )
     if branch is None:
         why = (
             f"this build gave '{variable}' the value {current!r}, which is neither "

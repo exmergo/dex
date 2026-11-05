@@ -399,3 +399,4 @@ def test_a_failed_analysis_keeps_the_plan_and_its_contract(
     assert "KeyError" in out["data"]["toggle"]["limits"][0]
     exported = _run(repo, capsys, "transform", "export", out["data"]["plan_id"])
     assert exported["data"]["plan"]["toggle"]["variable"] == FLAG
+    assert exported["data"]["plan"]["toggle"]["analysis_failed"] == "KeyError"

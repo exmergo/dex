@@ -2182,6 +2182,26 @@ def test_a_staging_fee_column_passed_through_off_is_caught(tmp_path):
 
 
 @needs_dbt
+def test_another_gated_fee_producer_passes(tmp_path):
+    """An extra model exposing a fee column with the flag on, and not off, is a
+    valid answer: the on checks count the expected columns in their own models,
+    not every fee column in the project."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/int_ledger_fees.sql": (
+                "select posting_id\n"
+                "    {% if var('enable_platform_fees') %}, fee_amount{% endif %}\n"
+                "from {{ ref('stg_ledger_postings') }}\n"
+            )
+        },
+    )
+    assert score.status == "scored"
+    assert _failed(score) == []
+
+
+@needs_dbt
 def test_dropping_an_unrelated_column_fails_on_both_values(tmp_path):
     """Every row check passes and the fee columns behave; the ledger lost a
     column the request keeps, which only the column sets show."""

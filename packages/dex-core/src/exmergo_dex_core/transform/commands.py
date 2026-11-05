@@ -521,6 +521,8 @@ def _check_toggle(
     # The producers travel with the contract, so a `--for-plan` build (or a
     # plan document) can hold the on branch to them without compiling again.
     form["producers"] = analysis.get("producers") or {}
+    if analysis.get("analysis_failed"):
+        form["analysis_failed"] = analysis["analysis_failed"]
     stored.toggle = form
     store.save_plan(stored)
     result.toggle = {**analysis, "contract": form}

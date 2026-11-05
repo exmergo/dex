@@ -399,4 +399,35 @@ def test_an_analysis_failure_reads_as_unchecked() -> None:
     assert report["verdict"] == "unchecked"
     assert report["completeness"] == "incomplete"
     assert report["producers"] == {}
+    assert report["analysis_failed"] == "KeyError"
     assert "KeyError" in report["limits"][0]
+
+
+def test_a_build_after_a_failed_analysis_keeps_an_unchecked_obligation() -> None:
+    """With no producers recorded, an on build would judge nothing and say
+    nothing; the marker turns that into an unchecked record."""
+
+    stored = {**CONTRACT, "producers": {}, "analysis_failed": "KeyError"}
+    assert toggle.contract_of(stored).columns == ["fee_amount"]
+    adapter = _Adapter({"fct": ["id", "fee_amount"]})
+    findings, records, branch = toggle.verify_outputs(
+        stored,
+        {"model.shop.fct": "fct"},
+        {"model.shop.fct"},
+        {"fct": "dev.main.fct"},
+        ["dev.main.fct"],
+        lambda: adapter,
+        (True, True),
+        "shop",
+    )
+    assert branch == "on"
+    assert findings == []
+    assert records == [
+        {
+            "model": "var:enable_fees",
+            "status": "unchecked",
+            "reason_code": "analysis_failed",
+            "reason": records[0]["reason"],
+        }
+    ]
+    assert "KeyError" in records[0]["reason"]
