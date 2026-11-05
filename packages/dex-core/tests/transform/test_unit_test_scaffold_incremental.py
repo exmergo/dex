@@ -330,3 +330,105 @@ def test_the_incremental_test_catches_a_strict_watermark_a_full_refresh_passes(
         "test_fct_scans_incremental": "pass",
         "fct_scans": "success",
     }
+
+
+def test_incremental_model_without_branch_scaffolds_false_override(
+    mapped: Path, capsys
+):
+    """An incremental model without an is_incremental() branch scaffolds ONE
+    test with an is_incremental: false override (#1131).
+
+    dbt requires `overrides: macros: is_incremental: false` for unit tests on
+    any model materialized as incremental, even when the model body does not
+    contain an is_incremental() branch.
+    """
+    pytest.importorskip("dbt.cli.main")
+    model = mapped / "proj" / "models" / "fct_scans.sql"
+    model.write_text(
+        "{{ config(materialized='incremental') }}\n"
+        "select scan_id, hub from {{ source('wh', 'scans') }}\n",
+        encoding="utf-8",
+    )
+
+    envelope = _scaffold(mapped, capsys)
+
+    data = envelope["data"]
+    assert data.get("incremental") is None
+
+    plan = json.loads(
+        (mapped / ".dex" / "plans" / f"{data['plan_id']}.json").read_text()
+    )
+    content = next(e for e in plan["edits"] if e["path"].endswith(".yml"))
+    tests = yaml.safe_load(content["new_content"])["unit_tests"]
+    assert len(tests) == 1
+    (test,) = tests
+    assert test["name"] == "test_fct_scans"
+    assert test.get("overrides") == {"macros": {"is_incremental": False}}
+
+
+def test_project_level_incremental_model_without_branch_scaffolds_false_override(
+    mapped: Path, capsys
+):
+    """A model materialized as incremental via dbt_project.yml without an
+    is_incremental() branch scaffolds ONE test with is_incremental: false (#1131).
+    """
+    pytest.importorskip("dbt.cli.main")
+    dbt_project = mapped / "proj" / "dbt_project.yml"
+    dbt_project.write_text(
+        'name: scans\nversion: "1.0.0"\nprofile: scans\nmodel-paths: ["models"]\n'
+        "models:\n"
+        "  scans:\n"
+        "    +materialized: incremental\n",
+        encoding="utf-8",
+    )
+    model = mapped / "proj" / "models" / "fct_scans.sql"
+    model.write_text(
+        "select scan_id, hub from {{ source('wh', 'scans') }}\n",
+        encoding="utf-8",
+    )
+
+    envelope = _scaffold(mapped, capsys)
+
+    data = envelope["data"]
+    assert data.get("incremental") is None
+
+    plan = json.loads(
+        (mapped / ".dex" / "plans" / f"{data['plan_id']}.json").read_text()
+    )
+    content = next(e for e in plan["edits"] if e["path"].endswith(".yml"))
+    tests = yaml.safe_load(content["new_content"])["unit_tests"]
+    assert len(tests) == 1
+    (test,) = tests
+    assert test["name"] == "test_fct_scans"
+    assert test.get("overrides") == {"macros": {"is_incremental": False}}
+
+
+@pytest.mark.parametrize(
+    "config_line",
+    [
+        "{{ config(materialized='table') }}\n",
+        "{{ config(materialized='view') }}\n",
+        "",
+    ],
+)
+def test_table_and_view_models_do_not_get_incremental_override(
+    mapped: Path, capsys, config_line: str
+):
+    """Table and view models do not get an is_incremental override (#1131)."""
+    pytest.importorskip("dbt.cli.main")
+    model = mapped / "proj" / "models" / "fct_scans.sql"
+    model.write_text(
+        config_line + "select scan_id, hub from {{ source('wh', 'scans') }}\n",  # noqa: S608
+        encoding="utf-8",
+    )
+
+    envelope = _scaffold(mapped, capsys)
+
+    plan = json.loads(
+        (mapped / ".dex" / "plans" / f"{envelope['data']['plan_id']}.json").read_text()
+    )
+    content = next(e for e in plan["edits"] if e["path"].endswith(".yml"))
+    tests = yaml.safe_load(content["new_content"])["unit_tests"]
+    assert len(tests) == 1
+    (test,) = tests
+    assert "overrides" not in test
