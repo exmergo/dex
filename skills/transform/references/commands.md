@@ -593,9 +593,10 @@ stub that fails until filled in.
   row-count frame would cross. The partition is held constant and the aggregated
   column is numbered 1, 10, 100, 1000. `data.window_boundaries` says what each
   date tests; you still write `expect:`.
-- A window it cannot reach (an ordering expression, a month unit, a non-temporal
-  column, a bare-number `RANGE` bound such as BigQuery's over `unix_date`) is a
-  warning with a reason code, and the input keeps one example row.
+- A window it cannot reach (an ordering expression other than a whole-day
+  function of a date column, a month unit, a non-temporal column, or a
+  bare-number `RANGE` bound over an arbitrary expression) is a warning with a
+  reason code, and the input keeps one example row.
 - The full loop, with a worked example: `${CLAUDE_SKILL_DIR}/references/test-strength.md`.
 
 On a model whose only jinja control flow is `{% if is_incremental() %}` (with an
