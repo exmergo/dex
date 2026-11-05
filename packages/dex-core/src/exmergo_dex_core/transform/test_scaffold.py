@@ -33,6 +33,7 @@ from ..dbt_project import (
     SOURCE_PATTERN,
     DbtProjectView,
     jinja_regions,
+    manifest_node_label,
     model_file,
 )
 from ..errors import DexError
@@ -208,11 +209,16 @@ def unit_test_scaffold(
     for i in inputs:
         rows = windows.rows.get(i.name) or [_example_row(types[i.name], reads[i.name])]
         full_given.append(_Given(i.literal, rows, [None] * len(rows)))
+    is_incremental_model = (
+        _model_materialization(view, model_name, sql, path) == "incremental"
+    )
     full_test = _test_block(
         f"test_{model_name}",
         model_name,
         full_given,
-        is_incremental=False if variants is not None else None,
+        is_incremental=False
+        if (variants is not None or is_incremental_model)
+        else None,
     )
     if variants is None:
         edit = PlanEdit(
@@ -286,6 +292,217 @@ def _parse_model(model_name: str, sql: str) -> exp.Expression:
 THIS_PLACEHOLDER = "__dex_this"
 #: How a dbt unit test names the model's own relation in ``given``.
 THIS = "this"
+
+_CONFIG_CALL = re.compile(r"\{\{-?\s*config\s*\(", re.DOTALL)
+
+
+def _extract_in_model_materialization(sql: str) -> str | None:
+    """Read `materialized` from in-model `config(...)` calls in SQL.
+
+    Handles single and double-quoted strings and nested parens so that
+    complex arguments do not close the call early. When multiple config()
+    calls are present, the last scalar assignment wins.
+    """
+
+    last_mat: str | None = None
+    for m in _CONFIG_CALL.finditer(sql):
+        pos = m.end()
+        depth = 1
+        in_quote: str | None = None
+        escape = False
+        while pos < len(sql) and depth > 0:
+            ch = sql[pos]
+            if in_quote:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == in_quote:
+                    in_quote = None
+            else:
+                if ch in ("'", '"'):
+                    in_quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            pos += 1
+        if depth != 0:
+            continue
+        inner = sql[m.end() : pos - 1]
+        depth = 0
+        in_quote = None
+        escape = False
+        start = 0
+        args: list[str] = []
+        for i, ch in enumerate(inner):
+            if in_quote:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == in_quote:
+                    in_quote = None
+            else:
+                if ch in ("'", '"'):
+                    in_quote = ch
+                elif ch in ("(", "[", "{"):
+                    depth += 1
+                elif ch in (")", "]", "}"):
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    args.append(inner[start:i])
+                    start = i + 1
+        args.append(inner[start:])
+        for arg in args:
+            if "=" not in arg:
+                continue
+            key, val = arg.split("=", 1)
+            if key.strip() == "materialized":
+                cleaned = val.strip()
+                if (cleaned.startswith("'") and cleaned.endswith("'")) or (
+                    cleaned.startswith('"') and cleaned.endswith('"')
+                ):
+                    cleaned = cleaned[1:-1].strip()
+                last_mat = cleaned.lower()
+    return last_mat
+
+
+def _manifest_model_materialization(
+    view: DbtProjectView, model_name: str, path: str
+) -> str | None:
+    """Read the model's materialization from compiled manifest nodes."""
+    if not view.manifest or not isinstance(view.manifest.get("nodes"), dict):
+        return None
+    for uid, node in view.manifest["nodes"].items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        if node.get("package_name") != view.project_name:
+            continue
+        name_match = node.get("name") == model_name
+        if not name_match and manifest_node_label(uid, node) != model_name:
+            continue
+        orig = node.get("original_file_path")
+        if orig and orig != path:
+            continue
+        config = node.get("config")
+        mat = config.get("materialized") if isinstance(config, dict) else None
+        if isinstance(mat, str) and mat.strip():
+            return mat.strip().lower()
+    return None
+
+
+def _schema_yaml_model_materialization(
+    view: DbtProjectView, model_name: str
+) -> str | None:
+    """Read the model's materialization from authored schema YAML files."""
+    for rel_path, file in view.files.items():
+        if not rel_path.endswith((".yml", ".yaml")):
+            continue
+        if not any(
+            rel_path.startswith(f"{mp}/") or rel_path == mp for mp in view.model_paths
+        ):
+            continue
+        try:
+            parsed = yaml.safe_load(file.content)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        models_entries = parsed.get("models")
+        if not isinstance(models_entries, list):
+            continue
+        for entry in models_entries:
+            if not isinstance(entry, dict) or entry.get("name") != model_name:
+                continue
+            config = entry.get("config")
+            mat = (
+                config.get("materialized") if isinstance(config, dict) else None
+            ) or entry.get("materialized")
+            if isinstance(mat, str) and mat.strip():
+                return mat.strip().lower()
+    return None
+
+
+def _dbt_project_model_materialization(
+    view: DbtProjectView, model_name: str, path: str
+) -> str | None:
+    """Read the model's materialization from dbt_project.yml model path hierarchies."""
+    proj_file = view.files.get("dbt_project.yml")
+    if not proj_file:
+        return None
+    try:
+        raw = yaml.safe_load(proj_file.content)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    models_root = raw.get("models")
+    if not isinstance(models_root, dict):
+        return None
+    proj_models = models_root.get(view.project_name)
+    if not isinstance(proj_models, dict):
+        return None
+
+    rel_parts: list[str] = []
+    for mp in view.model_paths:
+        prefix = f"{mp}/"
+        if path.startswith(prefix):
+            without_mp = path[len(prefix) :]
+            rel_parts = without_mp.split("/")
+            if rel_parts and rel_parts[-1].endswith(".sql"):
+                rel_parts[-1] = rel_parts[-1][:-4]
+            break
+    if not rel_parts:
+        rel_parts = [model_name]
+
+    resolved: str | None = None
+
+    def check_mat(curr: dict) -> str | None:
+        val = curr.get("+materialized") or curr.get("materialized")
+        return val.strip().lower() if isinstance(val, str) and val.strip() else None
+
+    mat = check_mat(proj_models)
+    if mat:
+        resolved = mat
+
+    curr = proj_models
+    for part in rel_parts:
+        if not isinstance(curr, dict) or part not in curr:
+            break
+        curr = curr[part]
+        if isinstance(curr, dict):
+            mat = check_mat(curr)
+            if mat:
+                resolved = mat
+
+    return resolved
+
+
+def _model_materialization(
+    view: DbtProjectView, model_name: str, sql: str, path: str
+) -> str:
+    """Resolve the model's materialization across in-model config(), schema YAML,
+    dbt_project.yml settings, and compiled manifest nodes."""
+
+    in_model = _extract_in_model_materialization(sql)
+    if in_model:
+        return in_model
+
+    yaml_mat = _schema_yaml_model_materialization(view, model_name)
+    if yaml_mat:
+        return yaml_mat
+
+    proj_mat = _dbt_project_model_materialization(view, model_name, path)
+    if proj_mat:
+        return proj_mat
+
+    manifest_mat = _manifest_model_materialization(view, model_name, path)
+    if manifest_mat:
+        return manifest_mat
+
+    return "view"
+
 
 _IF_INCREMENTAL = re.compile(r"if\s+is_incremental\s*\(\s*\)")
 

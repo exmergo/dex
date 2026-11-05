@@ -801,6 +801,58 @@ def test_a_plan_over_a_table_no_cube_names_is_refused(shop, cube, capsys):
     assert "prod_pre_aggregations.orders_by_status" in envelope["errors"][0]
 
 
+def _swap_tables(sql: str) -> str:
+    """The plan of a Cube server whose `orders` and `products` cubes swapped
+    tables: both tables are still ones the repository's cubes sit on."""
+
+    swapped = (
+        sql.replace("app.orders  AS", "app.@  AS")
+        .replace("app.products  AS", "app.orders  AS")
+        .replace("app.@  AS", "app.products  AS")
+    )
+    assert swapped != sql
+    return swapped
+
+
+def test_a_cube_read_from_another_cube_s_table_is_refused(shop, cube, capsys):
+    body = json.loads(json.dumps(cube.recordings["two_hops"]["response"]))
+    body["sql"]["sql"][0] = _swap_tables(body["sql"]["sql"][0])
+    cube.responses["two_hops"] = body
+    envelope = _query(capsys, shop, "two_hops")
+
+    assert envelope["reason"] == "guard"
+    assert "cube 'products' over app.orders" in envelope["errors"][0]
+    assert "sql_table as app.products" in envelope["errors"][0]
+
+
+@pytest.mark.parametrize(
+    "connector", ["bigquery", "duckdb", "postgres", "redshift", "snowflake"]
+)
+def test_each_cube_is_held_to_its_own_table_in_every_dialect(tmp_path, connector):
+    from exmergo_dex_core.adapters import get_dialect
+    from exmergo_dex_core.cube.project import CubeSemanticLayer
+    from exmergo_dex_core.cube.query import CubeRefusalError
+    from exmergo_dex_core.explore.semantic.cube import LocalCubeLayer
+    from exmergo_dex_core.semantic_source import SemanticSourceContext
+
+    shutil.copytree(MODEL, tmp_path / "model")
+    layer = LocalCubeLayer(
+        CubeSemanticLayer.from_context(
+            SemanticSourceContext(
+                repo_root=str(tmp_path),
+                connector=connector,
+                options={"files": [f"model/{name}" for name in MODEL_FILES]},
+            )
+        )
+    )
+    sql = recorded(connector)["two_hops"]["response"]["sql"]["sql"][0]
+    dialect = get_dialect(connector)
+
+    layer._check_relations(sql, dialect)
+    with pytest.raises(CubeRefusalError, match=r"cube 'products' over app\.orders"):
+        layer._check_relations(_swap_tables(sql), dialect)
+
+
 def test_sql_rendered_for_another_warehouse_is_refused(shop, cube, capsys):
     cube.responses["golden"] = recorded("postgres")["golden"]["response"]
     envelope = _query(capsys, shop, "golden")

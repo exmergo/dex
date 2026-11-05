@@ -92,6 +92,18 @@ CUBE_CATALOG_GAPS: dict[str, list[str]] = {
 _RECOMPILE_HINT = "correct the Cube model's `sql_table`"
 
 
+def _declared_table(sql_table: str | None) -> str | None:
+    """A cube's ``sql_table`` as its file spells it, unquoted, or None where it
+    cannot be read: no ``sql_table``, or a templated one."""
+
+    if sql_table is None:
+        return None
+    table = sql_table.strip()
+    if "{" in table or "\\" in table:
+        return None
+    return table.replace('"', "").replace("`", "")
+
+
 class LocalCubeLayer:
     """The Cube model files committed to this repository."""
 
@@ -388,6 +400,7 @@ class LocalCubeLayer:
         from ...cube.query import CubeRefusalError
         from ...guards.sql_guard import referenced_relations
 
+        self._check_cube_tables(sql, dialect)
         allowed = self._repository_relations(dialect)
         if allowed is None:
             return
@@ -406,6 +419,36 @@ class LocalCubeLayer:
                 "current files"
             )
 
+    def _check_cube_tables(self, sql: str, dialect: str) -> None:
+        """Refuse a plan that reads a cube from another table than its own.
+
+        ``/v1/meta`` carries no ``sql_table``, so a server whose cubes swapped
+        tables passes every other check. Cube writes each cube's relation as
+        ``FROM <table> AS "<cube>"``, so the alias says which cube a table is
+        read for, and that table has to be the cube's own ``sql_table``.
+        """
+
+        from ...cache import match_identifier
+        from ...cube.query import CubeRefusalError
+        from ...guards.sql_guard import aliased_relations
+
+        declared: dict[str, str] = {}
+        for cube in self._source.loaded().cubes:
+            table = _declared_table(cube.sql_table)
+            if table is not None:
+                declared[cube.name] = table
+        for alias, name in aliased_relations(sql, dialect=dialect):
+            own = declared.get(alias)
+            if own is None:
+                continue
+            if not match_identifier(name, [own]) and not match_identifier(own, [name]):
+                raise CubeRefusalError(
+                    f"refused: Cube planned cube {alias!r} over {name}, but "
+                    f"this repository's models declare its sql_table as {own}: "
+                    "the Cube server holds another model than the repository. "
+                    "Restart the Cube server on the repository's current files"
+                )
+
     def _repository_relations(self, dialect: str) -> list[str] | None:
         """Every relation the repository's cubes read, as their files spell it,
         or None where one cannot be read (a templated ``sql_table``, a ``sql``
@@ -417,10 +460,10 @@ class LocalCubeLayer:
         relations: list[str] = []
         for cube in self._source.loaded().cubes:
             if cube.sql_table is not None:
-                table = cube.sql_table.strip()
-                if "{" in table or "\\" in table:
+                table = _declared_table(cube.sql_table)
+                if table is None:
                     return None
-                relations.append(table.replace('"', "").replace("`", ""))
+                relations.append(table)
                 continue
             try:
                 relations += referenced_relations(cube.sql or "", dialect=dialect)
