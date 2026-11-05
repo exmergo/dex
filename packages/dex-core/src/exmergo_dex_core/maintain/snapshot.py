@@ -473,7 +473,9 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
                 for name, table in SOURCE_PATTERN.findall(source.content)
             }
         )
-        ref_calls = sorted(set(REF_PATTERN.findall(source.content)) - {model})
+        ref_calls = sorted(
+            {name for name, *_ in REF_PATTERN.findall(source.content)} - {model}
+        )
         if source_calls:
             model_sources[model] = source_calls
         if ref_calls:

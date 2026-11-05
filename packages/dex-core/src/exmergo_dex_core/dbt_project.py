@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -118,7 +118,10 @@ def semantic_manifest_file(project: Path | str) -> Path:
 # The ref()/source() call shapes as they appear in model SQL, schema YAML test
 # arguments, and semantic-model `model:` fields. Shared by every reader that
 # traces a dbt-level name, so they can never disagree on what counts as a ref.
-REF_PATTERN = re.compile(r"ref\(\s*['\"]([^'\"]+)['\"]")
+REF_PATTERN = re.compile(
+    r"ref\(\s*['\"]([^'\"]+)['\"]"
+    r"(?:\s*,\s*(?:v|version)\s*=\s*(?:['\"]([^'\"]+)['\"]|([^\s,)]+)))?"
+)
 SOURCE_PATTERN = re.compile(r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]")
 
 # dbt project-root files dex may author outside the model paths: the package
@@ -1955,14 +1958,33 @@ def declared_meaning(
     )
 
 
-def _parse_relation_ref(value: Any) -> str | None:
-    """A ``ref('x')`` / ``source('a', 'b')`` argument as a referable name."""
+def _parse_relation_ref(
+    value: Any, *, vmap: Mapping[str, Any] | None = None
+) -> str | None:
+    """A ``ref('x')`` / ``source('a', 'b')`` argument as a referable name.
+
+    When the ref carries ``v=`` / ``version=``, the version label
+    (``dim_teams.v2``) is returned. A bare ``ref('x')`` resolves through
+    ``vmap`` to the version an unversioned ``ref()`` would read
+    (``latest_version``), matching the manifest reader (#1125).
+    """
 
     if not isinstance(value, str):
         return None
     ref = REF_PATTERN.search(value)
     if ref:
-        return ref.group(1)
+        from .model_versions import ref_target, version_text
+
+        name = ref.group(1)
+        raw_version = ref.group(2) or ref.group(3)
+        version = version_text(raw_version) if raw_version is not None else None
+        if vmap is not None:
+            resolved = ref_target(name, version, vmap)
+            if resolved is not None:
+                return resolved
+        if version is not None:
+            return f"{name}.v{version}"
+        return name
     src = SOURCE_PATTERN.search(value)
     if src:
         return f"{src.group(1)}.{src.group(2)}"
@@ -2219,7 +2241,10 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
 
     keys: dict[tuple[str, str], DeclaredKey] = {}
     composite_keys: dict[tuple[str, tuple[str, ...]], DeclaredCompositeKey] = {}
-    from .model_versions import entry_variants
+    from .model_versions import cached_version_map, entry_variants
+
+    file_contents = {path: sf.content for path, sf in view.files.items()}
+    vmap = cached_version_map(file_contents, view.model_paths)
 
     for parsed, _path in yaml_documents(view):
         # A versioned model is read per version, under the label the manifest
@@ -2274,7 +2299,7 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
                         named = dict(_named_tests(test))
                         if "relationships" in named:
                             cfg = _test_arguments(named["relationships"])
-                            to_model = _parse_relation_ref(cfg.get("to"))
+                            to_model = _parse_relation_ref(cfg.get("to"), vmap=vmap)
                             field = cfg.get("field")
                             if to_model and isinstance(field, str) and field:
                                 defs.foreign_keys.append(

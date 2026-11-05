@@ -92,9 +92,17 @@ def test_only_the_latest_version_may_live_in_the_unsuffixed_file():
 
 @pytest.mark.parametrize(
     ("versions", "latest", "default"),
-    [(["1", "2"], None, "2"), (["1", "2", "10"], None, "10"), (["1", "2"], 1, "1")],
+    [
+        (["1", "2"], None, "2"),
+        (["1", "2", "10"], None, "10"),
+        (["1", "2"], 1, "1"),
+        # Mixed identifiers: dbt falls back to alphabetical, so ``2`` beats ``1-beta``.
+        (["2", "1-beta"], None, "2"),
+        (["1-beta", "2"], None, "2"),
+        (["beta", "alpha"], None, "beta"),
+    ],
 )
-def test_the_default_is_latest_version_else_the_greatest_numerically(
+def test_the_default_is_latest_version_else_dbt_version_order(
     versions, latest, default
 ):
     entry = {"name": "m", "versions": [{"v": v} for v in versions]}

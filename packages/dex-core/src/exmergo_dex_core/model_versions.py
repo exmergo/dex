@@ -116,7 +116,12 @@ def default_version(entry: Mapping[str, Any]) -> str | None:
     latest = entry.get("latest_version")
     if latest is not None:
         return version_text(latest)
-    return max((version_text(i["v"]) for i in items), key=_order_key)
+    # dbt: numeric order only when every identifier is numeric; otherwise
+    # alphabetical (so mixed ``2`` / ``1-beta`` picks ``2``, not ``1-beta``).
+    versions = [version_text(i["v"]) for i in items]
+    if all(_order_key(v)[0] == 0 for v in versions):
+        return max(versions, key=_order_key)
+    return max(versions)
 
 
 # --- reading the files ------------------------------------------------------------
