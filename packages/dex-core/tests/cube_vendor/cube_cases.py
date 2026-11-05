@@ -82,6 +82,17 @@ QUERIES: dict[str, dict] = {
             ' "values": ["2026-01-01", "2026-01-10"]}'
         ],
     },
+    # A relative date range on the grouped time dimension is moved to its
+    # `dateRange` and resolved to timestamps by Cube at render time, using the
+    # Cube server's clock (#972).
+    "relative_range": {
+        "metrics": ["orders.revenue"],
+        "group_by": ["orders.ordered_at__day"],
+        "where": [
+            '{"member": "orders.ordered_at", "operator": "inDateRange",'
+            ' "values": ["last 7 days"]}'
+        ],
+    },
     # The golden: every clause dex sends, rendered for each connector.
     "golden": {
         "metrics": ["orders.revenue", "orders.count"],

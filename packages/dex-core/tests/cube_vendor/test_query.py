@@ -254,6 +254,22 @@ def test_a_rolling_window_is_bounded_by_the_date_range(shop, cube, capsys):
     assert got == want
 
 
+def test_a_relative_date_range_is_resolved_by_the_cube_server_clock(shop, cube, capsys):
+    """An `inDateRange` with a relative value ('last 7 days') reaches Cube as
+    `dateRange`, which Cube resolves to timestamps using its own clock (#972)."""
+
+    envelope = _query(capsys, shop, "relative_range")
+    sent = json.loads(cube.calls[-1].content)["query"]
+
+    assert sent["timeDimensions"][0]["dateRange"] == "last 7 days"
+    assert "filters" not in sent
+    cells = _cells(envelope)
+    assert len(cells) >= 1
+    assert [(str(day)[:10], _num(total or 0)) for day, total in cells] == [
+        ("2026-01-03", 10.0)
+    ]
+
+
 def test_limit_is_sent_to_cube_and_the_cap_still_binds(shop, cube, capsys):
     envelope = _query(capsys, shop, "average")
     sent = json.loads(cube.calls[-1].content)["query"]
