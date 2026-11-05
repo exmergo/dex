@@ -152,6 +152,14 @@ declares is `contract`.
   only the conditionals. A flag's default decides neither. State the behavior
   that survives with a `retirement` contract on `dex transform remove var`.
   Recipe: `skills/transform/references/feature-retirement.md`.
+- Adding or changing a flag that stays ("hide the fee columns when it is
+  false") has to hold on both values in every model of the project, not only
+  the models that feed one mart. State it with a `toggle` contract on
+  `dex transform plan` (`variable`, `on_value`, `off_value`, the governed
+  `columns`): `data.toggle` compiles every model at each value and names each
+  producer still outputting a governed column with the flag off. An empty
+  table proves nothing by its rows; the build judges its columns.
+  Recipe: `skills/transform/references/feature-toggles.md`.
 - A new version of an existing model ("v2", a future replacement) is a native
   dbt version: a `versions:` list on the model's YAML entry, with
   `latest_version` keeping the current default, never an independent

@@ -71,6 +71,7 @@ DIGESTS = {
     "subscription_activity": "4000c9999bb1e8dc18cee579b87b74f1ac2d21fb70cfeea17e65fc01ff5cc457",
     "incremental_watermark": "708724ae33e4abd42360c359667364542bbf75beac5b3bd7a385cac1f8b15d0f",
     "trailing_window": "9bc38c6d85e6e7bcfa81ad11926d7c7207ce20265dc699b9c1f9f4f444c37a74",
+    "optional_fees": "4becda5d5ad945ba188d20567e2a874f66c6de1df6c370b3403739839ed5f10d",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -819,7 +820,6 @@ def _relabel(workspace: Path, evidence: str, detail: str | None = None) -> None:
         path = workspace / "models" / "marts" / "_marts.yml"
 
     def edit(document):
-
         dex = document["models"][0]["config"]["meta"]["dex"]
         dex["assumptions"][0]["evidence"] = evidence
         if detail:
@@ -2102,6 +2102,248 @@ def test_a_mutation_run_records_how_many_survived(result, survived):
     assert call["label"] == "transform test"
     assert call["flags"] == ["mutate"]
     assert call["survived"] == survived
+
+
+# --- a live feature toggle across every producer (#1113) --------------------
+
+_FEES = "optional_fees/hide_fees"
+
+
+def _fees_with(tmp_path: Path, replacements: dict[str, str]):
+    """The reference answer with each file in ``replacements`` rewritten."""
+
+    task, fixture, workspace = _reference(tmp_path, _FEES)
+    for path, text in replacements.items():
+        (workspace / path).write_text(text, encoding="utf-8")
+    return score_workspace(task, fixture, workspace)
+
+
+def _starting(path: str) -> str:
+    """A file of the fixture's starting project."""
+
+    fixture = fixture_of(_task(_FEES), FIXTURES)
+    return (fixture.project / path).read_text(encoding="utf-8")
+
+
+@needs_dbt
+def test_gating_only_the_order_models_leaves_fees_in_the_ledger_and_empty_report(
+    tmp_path,
+):
+    """The negative control the issue describes: the order models and the mart
+    are gated, the ledger nothing in the marts reads and the report over an
+    empty table are not. Every row check passes on both values and the default
+    build is right; only the off build's columns show the defect, and the empty
+    report is caught by its columns alone."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/ledger_daily.sql": _starting(
+                "models/finance/ledger_daily.sql"
+            ),
+            "models/marts/rpt_fee_disputes.sql": _starting(
+                "models/marts/rpt_fee_disputes.sql"
+            ),
+        },
+    )
+    assert score.status == "scored"
+    assert _failed(score) == [
+        "fees_off: no reporting model exposes a fee column",
+        "fees_off: the empty dispute report has exactly its other columns",
+        "fees_off: the ledger has exactly its other columns",
+    ]
+
+
+_LEDGER_GATED = """select
+    posted_on,
+    account,
+    {columns}
+    {{% if var('enable_platform_fees') %}}
+    , sum(fee_amount) as total_fees
+    {{% endif %}}
+from {{{{ ref('stg_ledger_postings') }}}}
+group by posted_on, account
+"""
+
+
+@needs_dbt
+def test_a_staging_fee_column_passed_through_off_is_caught(tmp_path):
+    """Hiding the fee total while passing the staging fee column through, under
+    a name the six reporting names do not include, still fails the off build."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/ledger_daily.sql": _LEDGER_GATED.format(
+                columns="count(*) as posting_count, sum(amount) as total_amount,\n"
+                "    max(fee_amount) as fee_amount"
+            )
+        },
+    )
+    assert "fees_off: no reporting model exposes a fee column" in _failed(score)
+    assert "fees_off: the ledger has exactly its other columns" in _failed(score)
+
+
+@needs_dbt
+def test_another_gated_fee_producer_passes(tmp_path):
+    """An extra model exposing a fee column with the flag on, and not off, is a
+    valid answer: the on checks count the expected columns in their own models,
+    not every fee column in the project."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/int_ledger_fees.sql": (
+                "select posting_id\n"
+                "    {% if var('enable_platform_fees') %}, fee_amount{% endif %}\n"
+                "from {{ ref('stg_ledger_postings') }}\n"
+            )
+        },
+    )
+    assert score.status == "scored"
+    assert _failed(score) == []
+
+
+@needs_dbt
+def test_dropping_an_unrelated_column_fails_on_both_values(tmp_path):
+    """Every row check passes and the fee columns behave; the ledger lost a
+    column the request keeps, which only the column sets show."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/ledger_daily.sql": _LEDGER_GATED.format(
+                columns="sum(amount) as total_amount"
+            )
+        },
+    )
+    assert sorted(_failed(score)) == [
+        "fees_off: the ledger has exactly its other columns",
+        "fees_on: the ledger has exactly its fee and other columns",
+    ]
+
+
+@needs_dbt
+def test_dropping_the_fees_outright_fails_the_on_value(tmp_path):
+    """Hiding the fee columns for good is not a toggle: the default and the on
+    build lose them, and the off build alone cannot tell."""
+
+    score = _fees_with(
+        tmp_path,
+        {
+            "models/finance/ledger_daily.sql": (
+                "select posted_on, account, count(*) as posting_count,\n"
+                "    sum(amount) as total_amount\n"
+                "from {{ ref('stg_ledger_postings') }}\ngroup by posted_on, account\n"
+            ),
+        },
+    )
+    assert sorted(_failed(score)) == [
+        "fees_on: every reporting fee column is there",
+        "fees_on: ledger fees match the postings",
+        "fees_on: the ledger has exactly its fee and other columns",
+        "the default keeps every fee column",
+    ]
+
+
+@needs_dbt
+def test_a_default_of_off_changes_todays_deployments(tmp_path):
+    """A default of off changes todays deployments."""
+
+    task, fixture, workspace = _reference(tmp_path, _FEES)
+    project = workspace / "dbt_project.yml"
+    text = project.read_text(encoding="utf-8")
+    assert "enable_platform_fees: true" in text
+    project.write_text(
+        text.replace("enable_platform_fees: true", "enable_platform_fees: false"),
+        encoding="utf-8",
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert _failed(score) == ["the default keeps every fee column"]
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        ([("plan", "satisfied"), ("apply", None)], True),
+        # A contradicted check was still a check of both values.
+        ([("plan", "contradicted"), ("apply", None)], True),
+        # The agent's pipe hid the result: the benefit of the doubt.
+        ([("plan", None), ("apply", None)], True),
+        # A readable plan with no toggle, and a plan with no result at all.
+        ([("plan", "absent"), ("apply", None)], False),
+        ([("plan",), ("apply", None)], False),
+        # Checked only after the change went in.
+        ([("apply", None), ("plan", "satisfied")], False),
+        ([("plan", "satisfied")], False),
+        # A toggled plan A, then an untoggled plan B that is the one applied.
+        ([("plan", "satisfied", "A"), ("plan", "absent", "B"), ("apply", "B")], False),
+        ([("plan", "satisfied", "A"), ("plan", "absent", "B"), ("apply", None)], False),
+        # The apply names the toggled plan, with another planned after it.
+        ([("plan", "satisfied", "A"), ("plan", "absent", "B"), ("apply", "A")], True),
+        # A refused plan stores nothing, so an apply with no id writes the
+        # earlier one.
+        ([("plan", "satisfied", "A"), ("plan", "error"), ("apply", None)], True),
+        ([("plan", "error"), ("apply", None)], False),
+        # The apply names a plan whose result was hidden.
+        ([("plan", "absent", "A"), ("plan", None), ("apply", "X")], True),
+    ],
+)
+def test_a_toggle_check_must_precede_the_apply(calls, passed):
+    """A toggle check must precede the apply."""
+
+    from evals.metadata.score import procedure_steps
+
+    def call(verb, *details):
+        """One recorded Dex call, shaped as the transcript summary records it."""
+
+        entry = {"label": f"transform {verb}", "flags": []}
+        if verb == "plan" and details:
+            entry["toggle"] = details[0]
+            entry["plan_id"] = details[1] if len(details) > 1 else None
+        if verb == "apply":
+            entry["plan"] = details[0] if details else None
+        return entry
+
+    graded = procedure_steps(
+        {"toggle_contract_before_apply": True}, [call(*spec) for spec in calls]
+    )
+    assert graded["passed"] is passed
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            '{"status": "ok", "data": {"plan_id": "p1", "toggle": '
+            '{"status": "planned", "verdict": "contradicted", "models": []}}}',
+            "contradicted",
+        ),
+        ('{"status": "ok", "data": {"plan_id": "p1", "paths": []}}', "absent"),
+        ("satisfied", None),
+        ("", None),
+        ('{"status": "error", "errors": ["toggle needs off_value"]}', "error"),
+    ],
+)
+def test_a_plans_toggle_verdict_is_read_from_its_result(text, expected):
+    """A plans toggle verdict is read from its result."""
+
+    from evals.metadata.live import _plan_toggle
+
+    assert _plan_toggle({"content": text}) == expected
+
+
+def test_a_readable_plan_failure_is_not_a_hidden_result():
+    """A readable plan failure is not a hidden result."""
+
+    from evals.metadata.live import _plan_id, _plan_toggle
+
+    assert _plan_toggle({"content": "Error: invalid toggle", "is_error": True}) == (
+        "error"
+    )
+    assert _plan_id({"content": '{"data": {"plan_id": "20261105-ab12"}}'}) == (
+        "20261105-ab12"
+    )
 
 
 # --- #1114: a refactor whose baseline a package prerequisite blocks ----------

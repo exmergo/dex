@@ -1,0 +1,9 @@
+version: 2
+sources:
+  - name: raw
+    schema: raw
+    description: Loaded by the order, ledger and dispute feeds.
+    tables:
+      - name: orders
+      - name: ledger_postings
+      - name: fee_disputes

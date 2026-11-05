@@ -319,7 +319,10 @@ The server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
 
 A filter Dex cannot read (an unknown operator or key, a value that is not a
 string, number or boolean, an empty group) is refused rather than screened by
-half. Result columns carry the tokens the caller wrote.
+half. Result columns carry the tokens the caller wrote. A relative date range on
+a grouped time dimension (`"last 7 days"`) is turned into timestamps by Cube at
+render time using the Cube server's clock, and returned as parameters; a server
+in another time zone or with a skewed clock resolves it differently.
 
 `explore semantic values` is a dimension-only query rooted at the dimension's
 own cube (`scoped_to` empty); `--metric` adds that measure and names it in

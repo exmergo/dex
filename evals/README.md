@@ -157,6 +157,7 @@ with tasks phrased the way users ask:
 | `subscription_activity` | `build_last_activity`: a report the project declares as one row per subscription (`population.parent`) | on the agent's data every subscription has one activity, so a report driven from the activity table passes every runtime check; only `transform plan`'s `population_parent` contradiction catches it (#1029). The gate grades on a holdout with a subscription that has no activity and one with two |
 | `trailing_window` | `author`: add unit tests that pin a trailing seven-day count written as `RANGE BETWEEN INTERVAL '6 day' PRECEDING` | the tests catch three planted defects (the window a day wider, a day narrower, and counted in rows), which needs fixture rows on the last included day, the first excluded day and across a gap in the dates; and `transform test --mutate` after the last apply (#1112) |
 | `trailing_window` | `strengthen`: the same model, starting from a unit test on consecutive days | the same. The starting test catches none of the three, which is the negative control |
+| `optional_fees` | `hide_fees`: put the platform fee behind a variable, on by default; off, no model outside staging exposes a fee column, and every other column and row stays | both values of the variable, which the gate's single build at the default never shows. `var_builds` build a fresh copy with each value and check columns through `information_schema`, so the dispute report over an empty table is judged by its columns. Gating only the order models and the mart passes every row check and fails the off build on the ledger nothing in the marts reads and on the empty report; dropping the fees outright fails the on build. A plan carrying a `toggle` check before the apply is graded apart from the columns (#1113) |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -197,7 +198,10 @@ serve the prerequisite tasks:
   `<replay>: <check>`: a fresh copy of the workspace and grading data, a cold
   build, then steps that each insert rows into that copy's source and run the
   incremental model without `--full-refresh`, so an incremental model's next run
-  is graded and not only its full build (#1111).
+  is graded and not only its full build (#1111). A task with `var_builds` adds
+  the checks of each variant build, named `<build>: <check>`: a fresh copy and
+  grading data built with `dbt build --vars <vars>`, so a project that has to
+  hold on both values of a variable is graded on both (#1113).
 - **Incremental test** (pass or fail, only on tasks that grade it, `-`
   otherwise): whether the model has a dbt unit test overriding `is_incremental`
   to true, read from the workspace's YAML. It is the verification step, graded
@@ -249,7 +253,10 @@ serve the prerequisite tasks:
   shell's next command separator, outside quotes). `mutate_after_tests` passes
   when a `transform test --mutate` follows the last apply, so the tests that were
   measured are the ones that ship: measuring, strengthening and stopping is a miss
-  (#1112). A step a task does not
+  (#1112). `toggle_contract_before_apply` passes when a `transform plan` whose
+  result carried a `toggle` check (`dex_calls[].toggle`, its verdict) comes
+  before the last apply; a plan result the agent's pipe hid gets the benefit of
+  the doubt, and a readable one with no toggle is a miss (#1113). A step a task does not
   require is never graded, so comparing an intentional
   change costs nothing. A reference run has no session and reports none. One
   trial per task can show whether agents take a step at all; it cannot measure a

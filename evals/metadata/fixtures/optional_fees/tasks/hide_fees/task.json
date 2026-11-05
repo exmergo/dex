@@ -1,0 +1,8 @@
+{
+  "kind": "fix",
+  "models": [
+    "fct_orders",
+    "ledger_daily"
+  ],
+  "prompt": "Some of our marketplace deployments won't charge merchants a platform fee. Add a dbt variable `enable_platform_fees`, on by default so nothing changes for the deployments we run today. When it is set to false, no model outside staging should expose anything about platform fees: the fee itself and anything computed from it, like net amounts or fee totals. Staging mirrors the raw feeds and can stay as it is. Every other column, and every row, should stay the same whichever way the variable is set."
+}

@@ -81,6 +81,7 @@ _RECORD_KINDS = (
     "parent_population",
     "temporal_contracts",
     "retirement",
+    "toggle",
     "model_versions",
 )
 

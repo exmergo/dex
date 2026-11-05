@@ -336,6 +336,15 @@ def _compare(
         if retirement
         else None
     )
+    # A live toggle compares at its on value, on both sides (#1113), so
+    # `equivalent` means "with the feature on, the proposal returns today's
+    # results"; the off branch is the toggle check's to judge, not this one's.
+    toggle = stored.toggle or None
+    proposed_vars = None
+    if toggle and not baseline_vars:
+        baseline_vars = {str(toggle["variable"]): toggle.get("on_value")}
+        proposed_vars = dict(baseline_vars)
+        identity["proposed_vars"] = proposed_vars
     if baseline_vars:
         identity["baseline_vars"] = baseline_vars
     try:
@@ -360,11 +369,70 @@ def _compare(
         return not_checked(exc.code, exc.detail)
     try:
         proposed = _compile_proposed(
-            engine, stored, project, chosen, target, connector, through_ancestors
+            engine,
+            stored,
+            project,
+            chosen,
+            target,
+            connector,
+            through_ancestors,
+            vars_=proposed_vars,
         )
+        toggled_parents: list[str] = []
+        on_only: list[str] = []
+        if proposed_vars:
+            # Both statements read the untouched parents' dev relations, which
+            # were built at the project's current values. A parent that compiles
+            # differently at the on value holds rows the on branch would not
+            # write, so no verdict at the on value can rest on it.
+            at_on = (
+                proposed.parents
+                if through_ancestors
+                else _compile_proposed(
+                    engine,
+                    stored,
+                    project,
+                    chosen,
+                    target,
+                    connector,
+                    True,
+                    vars_=proposed_vars,
+                ).parents
+            )
+            # What the dev relations hold is the tree before this plan at the
+            # project's current values: a plan that moves the flag's default
+            # has not been built yet, so its own default is not what dev holds.
+            built = (
+                baseline.parents
+                if through_ancestors
+                else _compile_baseline(
+                    engine, stored, project, chosen, target, connector, True
+                ).parents
+            )
+            # The proposal at the current values tells a parent the flag reaches
+            # from one the plan's own edits add: a parent read only at the on
+            # value was never built from this graph, so whatever relation an
+            # earlier build left under its name proves nothing.
+            current = _compile_proposed(
+                engine, stored, project, chosen, target, connector, True
+            ).parents
+            on_only = sorted(set(at_on) - set(current))
+            toggled_parents = sorted(
+                {
+                    *on_only,
+                    *(
+                        name
+                        for name in at_on.keys() & built.keys()
+                        if at_on[name] != built[name]
+                    ),
+                }
+            )
+            if through_ancestors:
+                # The parents' guard reads the project's current values, as the
+                # baseline's does above: those are what the dev relations hold.
+                proposed = replace(proposed, parents=current)
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
-
     moved = sorted(
         name
         for name in baseline.parents.keys() & proposed.parents.keys()
@@ -375,6 +443,31 @@ def _compare(
             "inputs_unsynchronized",
             "this plan changes how these untouched parents compile, and their dev "
             "relations hold what the last build wrote: " + ", ".join(moved),
+        )
+    # After the guard above, so a parent this plan's own edits move is named
+    # as that, not as the flag.
+    if toggled_parents and proposed_vars:
+        variable, value = next(iter(proposed_vars.items()))
+        absent = [name for name in toggled_parents if name in on_only]
+        differ = [name for name in toggled_parents if name not in on_only]
+        parts = []
+        if differ:
+            parts.append(
+                f"these untouched parents compile differently with {variable}="
+                f"{value!r} than at the value their dev relations were built with, "
+                "so a comparison at the on value would read rows the on branch "
+                "does not write: " + ", ".join(differ)
+            )
+        if absent:
+            parts.append(
+                f"these parents are read only with {variable}={value!r}, so the "
+                "current values never built them and no dev relation can stand "
+                "for them: " + ", ".join(absent)
+            )
+        return not_checked(
+            "inputs_unsynchronized",
+            "; ".join(parts) + ". Build them at the on value first, or compare "
+            "after flipping the default",
         )
 
     dialect = get_dialect(connector)
@@ -667,6 +760,8 @@ def _compile_proposed(
     target: str,
     connector: str,
     through_ancestors: bool = False,
+    *,
+    vars_: Mapping[str, Any] | None = None,
 ) -> _Side:
     view = load_project(project)
     paths: dict[str, str] = {}
@@ -697,7 +792,12 @@ def _compile_proposed(
                 ) from exc
             paths[chosen_path] = view.files[chosen_path].content
         return _compile_side(
-            shadow, paths, model, "proposed_not_compilable", through_ancestors
+            shadow,
+            paths,
+            model,
+            "proposed_not_compilable",
+            through_ancestors,
+            vars_=vars_,
         )
 
 
@@ -1050,6 +1150,7 @@ def _identity_fields(identity: dict[str, Any]) -> dict[str, Any]:
         "key_columns": identity.get("key_columns"),
         "key_source": identity.get("key_source"),
         "baseline_vars": identity.get("baseline_vars"),
+        "proposed_vars": identity.get("proposed_vars"),
     }
 
 

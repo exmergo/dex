@@ -157,6 +157,24 @@ See the cost-controls reference for the shared budget mechanism.
   entry beside a version is refused by code. A promotion and a moved relation
   are warnings. `independent_models` names a new `<model>_v<N>` copy that is not
   a version. Recipe: [model-versions.md](model-versions.md).
+- `data.toggle`: present when the payload carries a `toggle` contract
+  (`variable`, `on_value`, `off_value`, `columns`, `exempt_models`, `packages`,
+  `assumptions`). It is the one command that takes one. Every model of the
+  project is compiled in a throwaway copy at each value, and the tree before the
+  plan at `on_value`. No check probes a table's rows; compiling can still query
+  the warehouse where a macro does (`run_query`). Returned fields:
+  - `verdict`: `satisfied`, `contradicted` or `unchecked`.
+  - `completeness` and `limits`, for example a `var()` read whose name is not a
+    literal.
+  - `models`: each producer and each model with a problem, with its `branches`
+    and `checks`.
+  - `models_clean`, `contract.producers` and `package_scope`.
+
+  The checks are `governed_column_present_when_off`,
+  `governed_column_read_when_off`, `governed_column_lost_when_on`,
+  `ungoverned_column_lost`, `ungoverned_columns_differ` and
+  `branch_compile_failed`, each also a warning. A plan whose tree never reads the
+  variable is refused. Recipe: [feature-toggles.md](feature-toggles.md).
 
 ## `transform apply [plan-id]` and `transform plans`
 
@@ -494,6 +512,19 @@ test over the smaller result.
   `version_ref_misresolved`) or `unchecked`, and each reaches
   `data.completion.obligations`. Deliverables name versions by label, so one
   version building never answers for another.
+- With a plan carrying a `toggle`, `data.verification.toggle` judges the built
+  relations' columns from metadata at the value this build gave the flag, read
+  from `dbt_project.yml` or the default every read states. An empty table is
+  judged the same way.
+  - Built off: every model, with finding `toggle_column_present_when_off` (high).
+  - Built on: every producer, with finding `toggle_column_missing_when_on` (high).
+  - The other value: one record per producer, `unchecked` with
+    `branch_not_built`.
+  - `value_unknown` where the value could not be read.
+
+  On an off build, a `column_missing` for a governed column that `schema.yml`
+  documents is the toggle working and is not reported. Each record reaches
+  `data.completion.obligations`.
 - It compares each built model's columns with its `schema.yml`, using the
   detector `maintain verify` runs: `column_missing`, `column_undeclared` and
   `column_type_mismatch`. This reads metadata only, so it adds no statement and no
@@ -601,6 +632,11 @@ The nondeterminism check knows built-in functions only. A nondeterministic UDF o
 an unordered `LIMIT` can show as `different` with no real change, so compare again
 if a `rows_differ` looks unexplained.
 
+A plan with a `toggle` compiles both sides at its `on_value`, named in
+`data.baseline_vars` and `data.proposed_vars`, so `equivalent` means "with the
+feature on, the proposal returns today's results". The off value is
+`data.toggle`'s to judge.
+
 A plan that changes a macro or project configuration compiles both sides through
 their ancestors, and is compared when no untouched parent's SQL moved. Refused in
 values-free mode.
@@ -617,9 +653,10 @@ stub that fails until filled in.
   row-count frame would cross. The partition is held constant and the aggregated
   column is numbered 1, 10, 100, 1000. `data.window_boundaries` says what each
   date tests; you still write `expect:`.
-- A window it cannot reach (an ordering expression, a month unit, a non-temporal
-  column, a bare-number `RANGE` bound such as BigQuery's over `unix_date`) is a
-  warning with a reason code, and the input keeps one example row.
+- A window it cannot reach (an ordering expression other than a whole-day
+  function of a date column, a month unit, a non-temporal column, or a
+  bare-number `RANGE` bound over an arbitrary expression) is a warning with a
+  reason code, and the input keeps one example row.
 - The full loop, with a worked example: `${CLAUDE_SKILL_DIR}/references/test-strength.md`.
 
 On a model whose only jinja control flow is `{% if is_incremental() %}` (with an
