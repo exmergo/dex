@@ -422,3 +422,153 @@ def test_a_source_parent_is_not_split_as_a_version():
         ("main.fct_orders", "raw.vendors", ["vendor_id"])
     ]
     assert not notes, notes
+
+
+# --- promotion consumer column checks (#1124) -------------------------------------
+
+
+def test_promotion_moving_consumer_reading_lacking_column_warns():
+    """a promotion moving a consumer reading a dropped column warns."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' reads column(s) team_label from "
+        "dim_teams.v1, which dim_teams.v2 (the new default) lacks" in w
+        for w in warnings
+    )
+
+
+def test_promotion_moving_consumer_reading_present_column_does_not_warn():
+    """a promotion whose moved consumers read only present columns adds no warning."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_teams.sql"] = "select team_id from {{ ref('dim_teams') }}\n"
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert not any("the new default) lacks" in w for w in warnings)
+    assert not any("consumer was unchecked" in w for w in warnings)
+
+
+def test_promotion_moving_consumer_with_star_does_not_warn():
+    """a moving consumer reading star expands against the new default
+    without warning.
+    """
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_teams.sql"] = "select * from {{ ref('dim_teams') }}\n"
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert not any("the new default) lacks" in w for w in warnings)
+    assert not any("consumer was unchecked" in w for w in warnings)
+
+
+def test_promotion_pinned_consumer_reading_dropped_column_does_not_warn():
+    """a pinned consumer is not checked even if reading dropped columns."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_pinned.sql"] = (
+        "select team_id, team_label from {{ ref('dim_teams', v=1) }}\n"
+    )
+    files["models/rpt_teams.sql"] = "select team_id from {{ ref('dim_teams') }}\n"
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert not any("rpt_pinned" in w for w in warnings)
+    assert not any("the new default) lacks" in w for w in warnings)
+
+
+def test_promotion_consumer_with_unresolvable_select_list_warns_unchecked():
+    """a consumer whose select list cannot be read is named as unchecked."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_teams.sql"] = (
+        "select {{ my_macro('team_id') }} from {{ ref('dim_teams') }}\n"
+    )
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' moves from dim_teams.v1 to "
+        "dim_teams.v2, but its SELECT list could not be read"
+        in w
+        and "consumer was unchecked" in w
+        for w in warnings
+    )
+
+
+def test_promotion_consumer_reading_lacking_column_via_cte_warns():
+    """a moving consumer reading a lacking column through a cte warns."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_teams.sql"] = (
+        "with base as (\n"
+        "    select team_id, team_label from {{ ref('dim_teams') }}\n"
+        ")\n"
+        "select team_id, team_label from base\n"
+    )
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' reads column(s) team_label from "
+        "dim_teams.v1, which dim_teams.v2 (the new default) lacks" in w
+        for w in warnings
+    )
+
+
+def test_promotion_consumer_reading_column_in_expression_warns():
+    """a moving consumer reading a lacking column inside an expression warns."""
+    files = _project()
+    files["models/_models.yml"] = VERSIONED_YML
+    files["models/dim_teams_v2.sql"] = V2
+    files["models/rpt_teams.sql"] = (
+        "select upper(team_label) as display from {{ ref('dim_teams') }}\n"
+    )
+    promoted = VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' reads column(s) team_label from "
+        "dim_teams.v1, which dim_teams.v2 (the new default) lacks" in w
+        for w in warnings
+    )
+
+
+def test_promotion_new_default_unreadable_columns_warns_unchecked():
+    """when the new default columns cannot be read, consumer is unchecked."""
+    unresolvable_yml = """\
+version: 2
+models:
+  - name: dim_teams
+    latest_version: 1
+    versions:
+      - v: 1
+        defined_in: dim_teams
+        columns:
+          - name: team_id
+          - name: team_label
+      - v: 2
+"""
+    files = _project()
+    files["models/_models.yml"] = unresolvable_yml
+    files["models/dim_teams_v2.sql"] = "select {{ unresolvable() }}\n"
+    promoted = unresolvable_yml.replace("latest_version: 1", "latest_version: 2")
+    report, warnings = versions_mod.analyze(_view(files), [_yml(promoted)])
+    assert report is not None
+    assert any(
+        "models/rpt_teams.sql: 'rpt_teams' moves from dim_teams.v1 to "
+        "dim_teams.v2, but the columns of dim_teams.v2 could not be read; "
+        "consumer was unchecked" in w
+        for w in warnings
+    )

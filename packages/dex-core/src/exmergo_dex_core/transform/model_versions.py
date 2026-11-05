@@ -29,6 +29,7 @@ promotion is never a side effect of another change.
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
@@ -259,7 +260,9 @@ def independent_models(
 
 
 def analyze(
-    view: DbtProjectView, edits: list[PlanEdit]
+    view: DbtProjectView,
+    edits: list[PlanEdit],
+    dialect: str | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """``data.model_versions`` for a plan, and its warnings.
 
@@ -294,7 +297,15 @@ def analyze(
     warnings: list[str] = []
     for base in sorted(bases):
         entry, notes = _model_report(
-            base, before, after, vb, va, builds_before, builds_after, model_paths
+            base,
+            before,
+            after,
+            vb,
+            va,
+            builds_before,
+            builds_after,
+            model_paths,
+            dialect=dialect,
         )
         report[base] = entry
         warnings.extend(notes)
@@ -322,7 +333,9 @@ def _model_report(
     builds_before: Mapping[str, dict[str, Any]],
     builds_after: Mapping[str, dict[str, Any]],
     model_paths: list[str],
+    dialect: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
+    """report version, consumer, relation and contract changes for base."""
     now = mv.lookup(va, base)
     was = mv.lookup(vb, base)
     warnings: list[str] = []
@@ -446,6 +459,18 @@ def _model_report(
                 else "no consumer in the project changes what it reads"
             )
         )
+        if changed:
+            warnings.extend(
+                _check_moving_consumers(
+                    changed,
+                    before,
+                    after,
+                    va,
+                    builds_before,
+                    builds_after,
+                    dialect=dialect,
+                )
+            )
     elif changed:
         warnings.append(
             f"'{base}': {len(changed)} consumer(s) read a different file after this "
@@ -456,6 +481,165 @@ def _model_report(
         )
     out["manifest"] = {"status": "unchecked", "reason_code": "parse_not_run"}
     return out, warnings
+
+
+def _check_moving_consumers(
+    changed: list[dict[str, Any]],
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+    va: Mapping[str, mv.VersionedModel],
+    builds_before: Mapping[str, dict[str, Any]],
+    builds_after: Mapping[str, dict[str, Any]],
+    dialect: str | None = None,
+) -> list[str]:
+    """warn when a promotion moves a consumer reading columns the
+    new default lacks (#1124).
+    """
+
+    from pathlib import PurePosixPath
+
+    import sqlglot
+    from sqlglot import expressions as exp
+
+    from .select_list import (
+        RelationColumns,
+        RelationRef,
+        _tokenize_relations,
+        resolve_select_list,
+    )
+    from .validate import strip_jinja
+
+    warnings: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _relation_columns(relation: RelationRef) -> RelationColumns:
+        if relation.kind == "ref" and len(relation.parts) == 1:
+            target = _resolves_to(relation.name, relation.version, va, builds_after)
+            if target:
+                built = next(
+                    (b for b in builds_after.values() if b["model"] == target),
+                    None,
+                )
+                if built and built.get("columns"):
+                    return RelationColumns(columns=list(built["columns"]))
+                t_file = _file_of(target, builds_after)
+                if t_file and t_file in after:
+                    res = resolve_select_list(after[t_file], dialect=dialect)
+                    if res.columns is not None:
+                        return RelationColumns(columns=list(res.columns))
+                    return RelationColumns(reason=res.reason)
+        return RelationColumns(
+            reason=f"a `*` over {relation}, which could not be resolved"
+        )
+
+    for c in changed:
+        key = (c["path"], c["model"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        path = c["path"]
+        model = c["model"]
+        before_model = c["before"]
+        after_model = c["after"]
+
+        if PurePosixPath(path).suffix != ".sql":
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but has no SQL to read; consumer was unchecked"
+            )
+            continue
+
+        consumer_sql = after.get(path)
+        if consumer_sql is None:
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but the file is absent; consumer was unchecked"
+            )
+            continue
+
+        resolved = resolve_select_list(
+            consumer_sql,
+            dialect=dialect,
+            relation_columns=_relation_columns,
+        )
+        if resolved.columns is None:
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but its SELECT list could not be read ({resolved.reason}); "
+                "consumer was unchecked"
+            )
+            continue
+
+        consumer_cols = {col.lower() for col in resolved.columns}
+        with contextlib.suppress(Exception):
+            text, _rels = _tokenize_relations(consumer_sql)
+            stripped = strip_jinja(text)
+            if stripped:
+                parsed = sqlglot.parse_one(stripped, read=dialect or "duckdb")
+                for col in parsed.find_all(exp.Column):
+                    if col.name:
+                        consumer_cols.add(col.name.lower())
+
+        after_built = next(
+            (b for b in builds_after.values() if b["model"] == after_model),
+            None,
+        )
+        new_cols = {col.lower() for col in (after_built or {}).get("columns") or []}
+        if not new_cols:
+            after_file = _file_of(after_model, builds_after)
+            if after_file and after_file in after:
+                res_after = resolve_select_list(
+                    after[after_file],
+                    dialect=dialect,
+                    relation_columns=_relation_columns,
+                )
+                if res_after.columns:
+                    new_cols = {col.lower() for col in res_after.columns}
+
+        if not new_cols:
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but the columns of {after_model} could not be read; "
+                "consumer was unchecked"
+            )
+            continue
+
+        before_built = next(
+            (b for b in builds_before.values() if b["model"] == before_model),
+            None,
+        )
+        old_cols = {col.lower() for col in (before_built or {}).get("columns") or []}
+        if not old_cols:
+            before_file = _file_of(before_model, builds_before)
+            if before_file and before_file in before:
+                res_before = resolve_select_list(
+                    before[before_file],
+                    dialect=dialect,
+                    relation_columns=_relation_columns,
+                )
+                if res_before.columns:
+                    old_cols = {col.lower() for col in res_before.columns}
+
+        if not old_cols:
+            warnings.append(
+                f"{path}: '{model}' moves from {before_model} to {after_model}, "
+                f"but the columns of {before_model} could not be read; "
+                "consumer was unchecked"
+            )
+            continue
+
+        dropped = old_cols - new_cols
+        lacks = sorted(col for col in dropped if col in consumer_cols)
+
+        if lacks:
+            col_str = ", ".join(lacks)
+            warnings.append(
+                f"{path}: '{model}' reads column(s) {col_str} from "
+                f"{before_model}, which {after_model} (the new default) lacks"
+            )
+
+    return warnings
 
 
 def _plain_name(base: str, builds: Mapping[str, dict[str, Any]]) -> str | None:
