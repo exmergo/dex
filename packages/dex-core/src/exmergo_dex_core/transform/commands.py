@@ -400,8 +400,13 @@ def plan(
         # Native model versions (#859): what dbt would build wrong or drop
         # silently is refused here, before the parse, since dbt only warns
         # about a version with no file. What survives is confirmed against the
-        # parse's own manifest below.
-        version_report, version_notes = versions_mod.analyze(view, edits)
+        from ..adapters import get_dialect
+
+        connector = engine.connector or engine.config.connector
+        dialect = get_dialect(connector) if connector else None
+        version_report, version_notes = versions_mod.analyze(
+            view, edits, dialect=dialect
+        )
         # After the guards above, because a derivation is checked by dbt's
         # parse of a copy of the project with these edits in it.
         derived = _derive_semantic(engine, view, edits)
