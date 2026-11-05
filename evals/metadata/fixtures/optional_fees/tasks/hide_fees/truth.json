@@ -118,6 +118,21 @@
           "sql": "select count(*) from main.fct_orders"
         },
         {
+          "name": "the order fact holds one row per order",
+          "expect": 0,
+          "sql": "select count(*) - count(distinct order_id) from main.fct_orders"
+        },
+        {
+          "name": "every source order is in the order fact, unchanged",
+          "expect": 0,
+          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on from raw.orders except select order_id, merchant_id, gross_amount, ordered_on from main.fct_orders)"
+        },
+        {
+          "name": "every order in the order fact is a source order, unchanged",
+          "expect": 0,
+          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on from main.fct_orders except select order_id, merchant_id, gross_amount, ordered_on from raw.orders)"
+        },
+        {
           "name": "the merchant report keeps one row per merchant",
           "expect": true,
           "sql": "select (select count(*) from main.rpt_merchant_revenue) = (select count(distinct merchant_id) from raw.orders)"
@@ -181,9 +196,19 @@
           "sql": "select count(*) from main.fct_orders"
         },
         {
-          "name": "every order keeps its date",
+          "name": "the order fact holds one row per order",
           "expect": 0,
-          "sql": "select count(*) from raw.orders as r join main.fct_orders as f on r.order_id = f.order_id where r.ordered_on is distinct from f.ordered_on"
+          "sql": "select count(*) - count(distinct order_id) from main.fct_orders"
+        },
+        {
+          "name": "every source order is in the order fact, unchanged",
+          "expect": 0,
+          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on from raw.orders except select order_id, merchant_id, gross_amount, ordered_on from main.fct_orders)"
+        },
+        {
+          "name": "every order in the order fact is a source order, unchanged",
+          "expect": 0,
+          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on from main.fct_orders except select order_id, merchant_id, gross_amount, ordered_on from raw.orders)"
         },
         {
           "name": "the merchant report keeps one row per merchant",

@@ -389,31 +389,30 @@ def _compare(
                     vars_=proposed_vars,
                 ).parents
             )
-            current = _compile_proposed(
-                engine, stored, project, chosen, target, connector, True
-            ).parents
+            # What the dev relations hold is the tree before this plan at the
+            # project's current values: a plan that moves the flag's default
+            # has not been built yet, so its own default is not what dev holds.
+            built = (
+                baseline.parents
+                if through_ancestors
+                else _compile_baseline(
+                    engine, stored, project, chosen, target, connector, True
+                ).parents
+            )
             toggled_parents = sorted(
                 name
-                for name in at_on.keys() & current.keys()
-                if at_on[name] != current[name]
+                for name in at_on.keys() & built.keys()
+                if at_on[name] != built[name]
             )
             if through_ancestors:
+                current = _compile_proposed(
+                    engine, stored, project, chosen, target, connector, True
+                ).parents
                 # The parents' guard reads the project's current values, as the
                 # baseline's does above: those are what the dev relations hold.
                 proposed = replace(proposed, parents=current)
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
-    if toggled_parents and proposed_vars:
-        variable, value = next(iter(proposed_vars.items()))
-        return not_checked(
-            "inputs_unsynchronized",
-            f"these untouched parents compile differently with {variable}="
-            f"{value!r} than at the value their dev relations were built with, so "
-            "a comparison at the on value would read rows the on branch does not "
-            "write: " + ", ".join(toggled_parents) + ". Build them at the on value "
-            "first, or compare after flipping the default",
-        )
-
     moved = sorted(
         name
         for name in baseline.parents.keys() & proposed.parents.keys()
@@ -424,6 +423,18 @@ def _compare(
             "inputs_unsynchronized",
             "this plan changes how these untouched parents compile, and their dev "
             "relations hold what the last build wrote: " + ", ".join(moved),
+        )
+    # After the guard above, so a parent this plan's own edits move is named
+    # as that, not as the flag.
+    if toggled_parents and proposed_vars:
+        variable, value = next(iter(proposed_vars.items()))
+        return not_checked(
+            "inputs_unsynchronized",
+            f"these untouched parents compile differently with {variable}="
+            f"{value!r} than at the value their dev relations were built with, so "
+            "a comparison at the on value would read rows the on branch does not "
+            "write: " + ", ".join(toggled_parents) + ". Build them at the on value "
+            "first, or compare after flipping the default",
         )
 
     dialect = get_dialect(connector)
