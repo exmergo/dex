@@ -104,9 +104,9 @@
       "sql": "select (select count(distinct (u.account_id, u.used_on)) from raw.usage u join raw.accounts a using (account_id) where not a.is_sandbox) - (select count(*) from main.account_usage_daily)"
     },
     {
-      "name": "the directory keeps all or none of the sandbox accounts",
+      "name": "the directory keeps every customer account and all or none of the sandbox ones",
       "expect": 0,
-      "sql": "select case when count(*) in (0, (select count(*) from raw.accounts where is_sandbox)) then 0 else 1 end from main.dim_accounts where is_sandbox"
+      "sql": "select (select count(*) from raw.accounts a where not a.is_sandbox and a.account_id not in (select account_id from main.dim_accounts)) + (select count(*) from main.dim_accounts d where d.account_id not in (select account_id from raw.accounts)) + (select case when count(*) in (0, (select count(*) from raw.accounts where is_sandbox)) then 0 else 1 end from main.dim_accounts where is_sandbox)"
     }
   ]
 }

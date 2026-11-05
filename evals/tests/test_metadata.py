@@ -3091,4 +3091,28 @@ def test_a_partial_directory_filter_fails_the_ambiguous_task(tmp_path):
         "where not is_sandbox", "where not (is_sandbox and account_id % 2 = 0)"
     )
     score = _sandbox_with(tmp_path, "ambiguous", roster=partial)
-    assert _failed(score) == ["the directory keeps all or none of the sandbox accounts"]
+    assert _failed(score) == [
+        "the directory keeps every customer account and all or none of the sandbox ones"
+    ]
+
+
+@needs_dbt
+def test_a_directory_keeping_only_sandbox_accounts_fails_the_ambiguous_task(tmp_path):
+    inverted = _ROSTER_FILTER.replace("where not is_sandbox", "where is_sandbox")
+    score = _sandbox_with(tmp_path, "ambiguous", roster=inverted)
+    assert _failed(score) == [
+        "the directory keeps every customer account and all or none of the sandbox ones"
+    ]
+
+
+@needs_dbt
+def test_a_shifted_range_that_drops_a_visit_day_fails_the_unchanged_check(tmp_path):
+    """One day earlier at the start and one day short at the end: the day count
+    holds, and only comparing every source date catches the missing one."""
+
+    shifted = _visits_reference().replace(
+        "select min(visited_on) as first_day, max(visited_on) as last_day",
+        "select min(visited_on) - 1 as first_day, max(visited_on) - 1 as last_day",
+    )
+    score = _visits_with(tmp_path, shifted)
+    assert "days with visits are unchanged" in _failed(score)

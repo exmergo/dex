@@ -187,6 +187,17 @@ def scope_for(
 
     changes: list[ScopeChange] = []
     population, population_reason = _population(prior, authored, dialect, changes)
+    unread_sets = _changed_set_operations(prior_tree, authored_tree)
+    if unread_sets:
+        # Row attribution compares SELECT bodies only, so an edit inside a UNION
+        # (a branch's WHERE) reached nothing and must not read as `kept`.
+        note = (
+            f"the set operation in {', '.join(f'`{n}`' for n in unread_sets)} "
+            "changed and its branches were not compared"
+        )
+        population_reason = "; ".join(r for r in (population_reason, note) if r)
+        if population == "kept":
+            population = "unchecked"
     outputs, outputs_reason = _outputs(prior_tree, authored_tree, changes)
     unread = outputs_reason is not None
 
@@ -239,6 +250,23 @@ def _population(
     if unresolved:
         return "unchecked", "; ".join(sorted({u.detail for u in unresolved}))
     return "kept", None
+
+
+def _changed_set_operations(
+    prior: exp.Expression, authored: exp.Expression
+) -> list[str]:
+    """Scopes both versions share where either side is a set operation and the
+    two differ: changes there are invisible to the SELECT-by-SELECT reading."""
+
+    before, after = sql_shape.scopes(prior), sql_shape.scopes(authored)
+    return sorted(
+        name
+        for name in before.keys() & after.keys()
+        if not (
+            isinstance(before[name], exp.Select) and isinstance(after[name], exp.Select)
+        )
+        and _normal(before[name]) != _normal(after[name])
+    )
 
 
 def _columns_of(prior: str | None, authored: str | None, dialect: str) -> list[str]:

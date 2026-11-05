@@ -65,7 +65,8 @@ See the cost-controls reference for the shared budget mechanism.
   `population` is `changed` when an authored predicate, join, driving relation,
   `DISTINCT` or `GROUP BY` can move rows (row attribution's own reading), `kept`
   when nothing can, `unchecked` when the model could not be rendered (a macro, an
-  `{% if %}`). `outputs` is `changed`, `kept`, or `unchecked` where the final
+  `{% if %}`) or a set operation it shares with the prior version changed (a
+  `WHERE` added to one `UNION` branch), since branches are not compared. `outputs` is `changed`, `kept`, or `unchecked` where the final
   select projects a star and nothing else changed. A star with a changed CTE
   column is `changed` and still carries a `reason` saying removals and
   additions could not be read, so read `reason` whatever the state. Both states

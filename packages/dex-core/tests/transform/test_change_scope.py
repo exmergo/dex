@@ -296,6 +296,23 @@ def test_what_the_caps_cut_is_stored_unchecked():
     assert stored["m26"] == [{"kind": "elided", "status": "unchecked"}]
 
 
+def test_an_edit_inside_a_union_is_unchecked_not_kept():
+    prior = (
+        "with both as (\n"
+        "  select account_id from {{ ref('a') }}\n"
+        "  union all\n"
+        "  select account_id from {{ ref('b') }}\n"
+        ")\nselect account_id from both\n"
+    )
+    authored = prior.replace("{{ ref('b') }}", "{{ ref('b') }} where active")
+    scope = _scope(authored, prior=prior)
+    assert scope.population == "unchecked"
+    assert scope.reason and "`both`" in scope.reason
+    assert cs.stored_form(
+        {"models": [scope.model_dump(mode="json", exclude_none=True)]}
+    ) == {"site_daily": [{"kind": "unread", "status": "unchecked"}]}
+
+
 def test_the_caps_count_what_they_cut():
     columns = ", ".join(f"cast(c{i} as integer) as c{i}" for i in range(12))
     prior = "select " + columns + " from {{ ref('t') }}"
