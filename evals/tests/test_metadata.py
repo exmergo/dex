@@ -3080,3 +3080,15 @@ def test_the_sandbox_decision_pattern_skips_the_decisions_around_it():
     ]
     assert all(pattern.search(text) for text in scope)
     assert not any(pattern.search(text) for text in around)
+
+
+@needs_dbt
+def test_a_partial_directory_filter_fails_the_ambiguous_task(tmp_path):
+    """Dropping some sandbox accounts from the directory is neither documented
+    choice, and Scope alone would read the survivors as `kept`."""
+
+    partial = _ROSTER_FILTER.replace(
+        "where not is_sandbox", "where not (is_sandbox and account_id % 2 = 0)"
+    )
+    score = _sandbox_with(tmp_path, "ambiguous", roster=partial)
+    assert _failed(score) == ["the directory keeps all or none of the sandbox accounts"]

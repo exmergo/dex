@@ -55,7 +55,7 @@
     {
       "name": "days with visits are unchanged",
       "expect": 0,
-      "sql": "select count(*) from (select visited_on, count(*) as visits, avg(duration_minutes) as avg_d from raw.visits group by visited_on) r join main.daily_visits d on d.visit_date = r.visited_on where d.visits <> r.visits or d.avg_duration_minutes is distinct from r.avg_d"
+      "sql": "select count(*) from (select visited_on, count(*) as visits, avg(duration_minutes) as avg_d from raw.visits group by visited_on) r join main.daily_visits d on d.visit_date = r.visited_on where d.visits is distinct from r.visits or d.avg_duration_minutes is distinct from r.avg_d"
     },
     {
       "name": "the output columns and their types are the model's own",

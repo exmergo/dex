@@ -93,6 +93,10 @@ class ModelScope(BaseModel):
     changes: list[ScopeChange] = Field(default_factory=list)
     undeclared: int = 0
     reason: str | None = None
+    #: True where the final select's removals and additions could not be read
+    #: (a star), whatever ``outputs`` says: a changed CTE column makes it
+    #: ``changed`` without making the removals readable.
+    outputs_unread: bool | None = None
     elided: int = 0
 
 
@@ -142,6 +146,9 @@ def analyze(
         },
         "undeclared": sum(m.undeclared for m in models),
         "elided": {"models": elided},
+        # Named, so a build can carry them as unchecked rather than read a
+        # capped list as the whole plan.
+        **({"beyond_cap": [m.model for m in models[MAX_MODELS:]]} if elided else {}),
     }
 
 
@@ -181,6 +188,7 @@ def scope_for(
     changes: list[ScopeChange] = []
     population, population_reason = _population(prior, authored, dialect, changes)
     outputs, outputs_reason = _outputs(prior_tree, authored_tree, changes)
+    unread = outputs_reason is not None
 
     for change in changes:
         _settle(change, assumptions)
@@ -199,6 +207,7 @@ def scope_for(
         changes=changes[:MAX_CHANGES_PER_MODEL],
         undeclared=undeclared,
         reason="; ".join(r for r in (population_reason, outputs_reason) if r) or None,
+        outputs_unread=True if unread else None,
         elided=elided,
     )
 
@@ -552,9 +561,16 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
         ]
         # Either axis left unread is unchecked, never clean: a final `select *`
         # whose removals could not be read is as unfinished as an unrenderable
-        # model.
-        if "unchecked" in (entry.get("population"), entry.get("outputs")):
+        # model, even where a CTE change made `outputs` read `changed`.
+        if "unchecked" in (entry.get("population"), entry.get("outputs")) or entry.get(
+            "outputs_unread"
+        ):
             judged.append({"kind": "unread", "status": "unchecked"})
+        # Changes the per-model cap cut were never judged here.
+        if entry.get("elided"):
+            judged.append({"kind": "elided", "status": "unchecked"})
         if judged:
             out[entry["model"]] = judged
+    for model in (report or {}).get("beyond_cap") or []:
+        out[model] = [{"kind": "elided", "status": "unchecked"}]
     return out

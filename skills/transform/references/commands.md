@@ -87,7 +87,11 @@ See the cost-controls reference for the shared budget mechanism.
   filter shows which rosters kept every row. Capped at 25 models and 8 changes a
   model, undeclared first, with cuts counted in `elided`. A `--for-plan` build
   carries the unsettled entries into `data.completion.obligations.change_scope`,
-  with an `unread` entry (`unchecked`) for a model either axis could not read.
+  with an `unread` entry (`unchecked`) for a model either axis could not read
+  (`outputs_unread: true` marks a star whose removals were not read even where
+  `outputs` is `changed`), and an `elided` entry (`unchecked`) for a model whose
+  changes the cap cut or that `beyond_cap` names, so a capped report never reads
+  as complete.
   Advisory: nothing here refuses a plan.
 - `data.identifier_conversions` (#861): each conversion the plan adds to an
   identifier column, on a new model or an edited one. A conversion is a `cast`, a

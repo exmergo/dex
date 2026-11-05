@@ -260,6 +260,42 @@ def test_an_unread_star_with_nothing_else_changed_is_stored_unchecked():
     ) == {"site_daily": [{"kind": "unread", "status": "unchecked"}]}
 
 
+def test_a_star_with_a_changed_cte_is_still_stored_unread():
+    prior = PRIOR.replace(
+        "select visit_date, visits, avg_duration, cast(site_id as integer) as site_id",
+        "select *",
+    )
+    scope = _scope(
+        prior.replace("count(*)", "count(visit_id)"),
+        [{"decision": "d", "chosen": "c", "evidence": "request", "column": "visits"}],
+        prior=prior,
+    )
+    assert scope.outputs == "changed" and scope.outputs_unread is True
+    assert cs.stored_form(
+        {"models": [scope.model_dump(mode="json", exclude_none=True)]}
+    ) == {
+        "site_daily": [
+            {"kind": "aggregate_changed", "column": "visits", "status": "declared"},
+            {"kind": "unread", "status": "unchecked"},
+        ]
+    }
+
+
+def test_what_the_caps_cut_is_stored_unchecked():
+    columns = ", ".join(f"cast(c{i} as integer) as c{i}" for i in range(12))
+    prior = "select " + columns + " from {{ ref('t') }}"
+    edits = [
+        (f"models/m{i:02d}.sql", prior, prior.replace("as integer", "as varchar"))
+        for i in range(cs.MAX_MODELS + 2)
+    ]
+    report = cs.analyze(edits, [], "duckdb")
+    assert report["elided"] == {"models": 2}
+    assert report["beyond_cap"] == ["m25", "m26"]
+    stored = cs.stored_form(report)
+    assert stored["m00"][-1] == {"kind": "elided", "status": "unchecked"}
+    assert stored["m26"] == [{"kind": "elided", "status": "unchecked"}]
+
+
 def test_the_caps_count_what_they_cut():
     columns = ", ".join(f"cast(c{i} as integer) as c{i}" for i in range(12))
     prior = "select " + columns + " from {{ ref('t') }}"
