@@ -101,6 +101,10 @@ class PlanResult(Result):
     # confirmation; plus `independent_models`, a `<model>_v<N>` copy the plan
     # writes that is not a version. Absent when the plan touches neither.
     model_versions: dict[str, Any] | None = None
+    # The toggle contract's check from compiled SQL (#1113): every model of the
+    # project on both values, the producers of the governed columns, and what
+    # could not be judged. Absent when the plan carries no toggle.
+    toggle: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         """The plan envelope's ``data``, carrying each optional section only where it
@@ -113,6 +117,8 @@ class PlanResult(Result):
             "paths": self.paths,
             "plan_path": self.plan_path,
         }
+        if self.toggle is not None:
+            payload["toggle"] = self.toggle
         if self.refactor_comparison_offer is not None:
             payload["refactor_comparison_offer"] = self.refactor_comparison_offer
         if self.identifier_conversions is not None:
@@ -553,9 +559,14 @@ class RefactorComparisonResult(Result):
     # The values the baseline compiled at, where a retirement contract chose a
     # branch (#858). Absent everywhere else.
     baseline_vars: dict[str, Any] | None = None
+    # The values the proposal compiled at, where a toggle contract names the on
+    # value (#1113): both sides compile there. Absent everywhere else.
+    proposed_vars: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
+        if self.proposed_vars:
+            branch["proposed_vars"] = self.proposed_vars
         resolution = (
             {"resolved_plan": self.resolved_plan}
             if self.resolved_plan is not None

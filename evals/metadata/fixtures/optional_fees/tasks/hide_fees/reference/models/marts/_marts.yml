@@ -1,0 +1,69 @@
+version: 2
+models:
+  - name: fct_orders
+    description: >-
+      One row per marketplace order. With enable_platform_fees off, the fee and
+      the net amount are not output.
+    config:
+      meta:
+        dex:
+          grain: [order_id]
+          population:
+            rule: Every order the order feed delivered; nothing is filtered.
+          assumptions:
+            - decision: Which columns count as fee columns
+              chosen: platform_fee and net_amount, which is computed from it
+              evidence: request
+              detail: the request names the fee and anything computed from it
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+        config:
+          meta:
+            dex:
+              role: key
+      - name: merchant_id
+        config:
+          meta:
+            dex:
+              role: foreign_key
+      - name: ordered_on
+        config:
+          meta:
+            dex:
+              role: time
+      - name: gross_amount
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: currency:EUR
+      - name: platform_fee
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: currency:EUR
+      - name: net_amount
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: currency:EUR
+  - name: rpt_merchant_revenue
+    description: One row per merchant, with its order revenue.
+    columns:
+      - name: merchant_id
+        tests:
+          - unique
+          - not_null
+  - name: rpt_fee_disputes
+    description: One row per fee dispute a merchant opened.

@@ -1,0 +1,185 @@
+{
+  "models": {
+    "fct_orders": {
+      "grain": [
+        "order_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "order_id": {
+          "role": "key"
+        },
+        "merchant_id": {
+          "role": "foreign_key"
+        },
+        "ordered_on": {
+          "role": [
+            "time",
+            "dimension"
+          ]
+        },
+        "gross_amount": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "currency:*"
+        }
+      }
+    },
+    "ledger_daily": {
+      "grain": [
+        "posted_on",
+        "account"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "posted_on": {
+          "role": [
+            "time",
+            "key"
+          ]
+        },
+        "account": {
+          "role": [
+            "dimension",
+            "key"
+          ]
+        },
+        "posting_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "the default keeps every fee column",
+      "expect": 6,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+    }
+  ],
+  "var_builds": [
+    {
+      "name": "fees_on",
+      "vars": {
+        "enable_platform_fees": true
+      },
+      "checks": [
+        {
+          "name": "every reporting fee column is there",
+          "expect": 6,
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+        },
+        {
+          "name": "platform fees match the orders",
+          "expect": true,
+          "sql": "select (select sum(platform_fees) from main.rpt_merchant_revenue) = (select sum(platform_fee) from raw.orders)"
+        },
+        {
+          "name": "net revenue is gross minus the fee",
+          "expect": true,
+          "sql": "select (select sum(net_revenue) from main.rpt_merchant_revenue) = (select sum(gross_amount - platform_fee) from raw.orders)"
+        },
+        {
+          "name": "ledger fees match the postings",
+          "expect": true,
+          "sql": "select (select sum(total_fees) from main.ledger_daily) = (select sum(fee_amount) from raw.ledger_postings)"
+        },
+        {
+          "name": "every order is reported",
+          "expect": 48,
+          "sql": "select count(*) from main.fct_orders"
+        },
+        {
+          "name": "the merchant report keeps one row per merchant",
+          "expect": true,
+          "sql": "select (select count(*) from main.rpt_merchant_revenue) = (select count(distinct merchant_id) from raw.orders)"
+        },
+        {
+          "name": "merchant gross revenue is unchanged",
+          "expect": true,
+          "sql": "select (select sum(gross_revenue) from main.rpt_merchant_revenue) = (select sum(gross_amount) from raw.orders)"
+        },
+        {
+          "name": "the ledger keeps one row per day and account",
+          "expect": 14,
+          "sql": "select count(*) from main.ledger_daily"
+        },
+        {
+          "name": "ledger totals are unchanged",
+          "expect": true,
+          "sql": "select (select sum(total_amount) from main.ledger_daily) = (select sum(amount) from raw.ledger_postings)"
+        },
+        {
+          "name": "the dispute report is built, and empty",
+          "expect": 0,
+          "sql": "select count(*) from main.rpt_fee_disputes"
+        }
+      ]
+    },
+    {
+      "name": "fees_off",
+      "vars": {
+        "enable_platform_fees": false
+      },
+      "checks": [
+        {
+          "name": "no reporting model exposes a fee column",
+          "expect": 0,
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'net_revenue', 'disputed_fee', 'total_fees')"
+        },
+        {
+          "name": "the empty dispute report keeps its other columns",
+          "expect": 4,
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_fee_disputes'"
+        },
+        {
+          "name": "the order fact keeps its other columns",
+          "expect": 4,
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name = 'fct_orders'"
+        },
+        {
+          "name": "every order is reported",
+          "expect": 48,
+          "sql": "select count(*) from main.fct_orders"
+        },
+        {
+          "name": "the merchant report keeps one row per merchant",
+          "expect": true,
+          "sql": "select (select count(*) from main.rpt_merchant_revenue) = (select count(distinct merchant_id) from raw.orders)"
+        },
+        {
+          "name": "merchant gross revenue is unchanged",
+          "expect": true,
+          "sql": "select (select sum(gross_revenue) from main.rpt_merchant_revenue) = (select sum(gross_amount) from raw.orders)"
+        },
+        {
+          "name": "the ledger keeps one row per day and account",
+          "expect": 14,
+          "sql": "select count(*) from main.ledger_daily"
+        },
+        {
+          "name": "ledger totals are unchanged",
+          "expect": true,
+          "sql": "select (select sum(total_amount) from main.ledger_daily) = (select sum(amount) from raw.ledger_postings)"
+        },
+        {
+          "name": "the dispute report is built, and empty",
+          "expect": 0,
+          "sql": "select count(*) from main.rpt_fee_disputes"
+        }
+      ]
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true,
+    "toggle_contract_before_apply": true
+  }
+}

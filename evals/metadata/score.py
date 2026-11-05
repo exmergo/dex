@@ -24,7 +24,10 @@ Truth (``truth.json``), per task::
      "incomplete_allowed": {"blocked_by": ["tasks_task"]},
      "procedure": {"build_after_apply": true, "cold_deps_after_apply": true,
                    "incremental_build_after_apply": true,
-                   "mutate_after_tests": true},
+                   "mutate_after_tests": true,
+                   "toggle_contract_before_apply": true},
+     "var_builds": [{"name": "fees_off", "vars": {"enable_fees": false},
+                     "checks": [{"name": "...", "sql": "...", "expect": 0}]}],
      "replays": [{"name": "next_batch", "select": "fct_x",
                   "setup": ["delete from raw.x"],
                   "steps": [["insert into raw.x ..."], []],
@@ -49,6 +52,13 @@ source rows, never the agent's) and ``dbt run --select <select>`` without
 named ``<replay>: <check>``. ``incremental_test`` grades, from the workspace's
 YAML alone, whether the model has a unit test that overrides ``is_incremental``
 to true: the verification step, graded apart from the data the replays judge.
+``var_builds`` grade a project that has to hold on more than one value of a
+variable, which the gate's single build at the default never shows (#1113):
+each starts from its own fresh copy of the workspace and grading warehouse and
+runs ``dbt build --vars <vars>``, then its ``checks``, named
+``<build>: <check>``. A check over ``information_schema.columns`` judges a
+relation by its columns, so an empty table counts. A build that fails fails
+every check it carries.
 ``incomplete_allowed`` accepts a deliverable left blocked by the named
 prerequisite, where the build failed on nothing else and the final message
 reports it (status ``blocked_reported``): a request the agent cannot carry out
@@ -402,6 +412,44 @@ def run_replays(
     return results
 
 
+def run_var_builds(
+    workspace: Path, fixture: Fixture, root: Path, builds: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build the workspace once per entry with its ``vars`` and run its checks
+    (see the module docstring), named ``<build>: <check>``."""
+
+    import json
+
+    results: list[dict[str, Any]] = []
+    for build in builds:
+        name = build["name"]
+        checks = build.get("checks") or []
+        scratch = root / f"vars-{name}"
+        shutil.copytree(workspace, scratch, ignore=_GATE_IGNORE)
+        build_warehouse(scratch / WAREHOUSE_FILE, fixture.grading_tables())
+        stages: list[tuple[str, list[str]]] = []
+        if _declares_packages(scratch):
+            stages.append(("deps", ["deps"]))
+        stages.append(("build", ["build", "--vars", json.dumps(build["vars"])]))
+        failed = None
+        for stage, args in stages:
+            proc = _dbt_stage(scratch, args)
+            if proc is None or proc.returncode != 0:
+                failed = f"dbt {stage} failed with {json.dumps(build['vars'])}"
+                break
+        if failed is not None:
+            results += [
+                {"name": f"{name}: {c['name']}", "passed": False, "error": failed}
+                for c in checks
+            ]
+            continue
+        results += [
+            {**result, "name": f"{name}: {result['name']}"}
+            for result in run_checks(scratch, checks)
+        ]
+    return results
+
+
 def incremental_unit_tests(project: Path, model: str) -> list[str]:
     """The unit tests on ``model`` that override ``is_incremental`` to true, read
     from the project's YAML: the test that runs the branch a full build never
@@ -697,6 +745,7 @@ PROCEDURE_STEPS = (
     "cold_deps_after_apply",
     "incremental_build_after_apply",
     "mutate_after_tests",
+    "toggle_contract_before_apply",
 )
 
 
@@ -752,6 +801,13 @@ def procedure_steps(
       ``transform apply``, so the tests that were measured are the ones that
       ship (#1112). Measuring, strengthening and stopping leaves the strengthened
       tests unmeasured, so it is a miss.
+    - ``toggle_contract_before_apply``: a ``transform plan`` whose result carried
+      a ``toggle`` check precedes the last ``transform apply``, so the change was
+      held on both values of its flag in every model before it went in
+      (#1113). Read from the call's ``toggle`` (see ``live._plan_toggle``); a
+      plan whose result the agent's own pipe hid is given the benefit of the
+      doubt, as a hidden comparison verdict is, and one whose readable result
+      carried no toggle is a miss.
     """
 
     required = [step for step in PROCEDURE_STEPS if (truth or {}).get(step)]
@@ -782,6 +838,12 @@ def procedure_steps(
         ]
         results["incremental_build_after_apply"] = any(
             i not in refreshes and all(i > r for r in refreshes) for i in after
+        )
+    if "toggle_contract_before_apply" in required:
+        plans = [i for i, label in enumerate(labels) if label == "transform plan"]
+        results["toggle_contract_before_apply"] = bool(applies) and any(
+            i < applies[-1] and calls[i].get("toggle", "absent") != "absent"
+            for i in plans
         )
     if "mutate_after_tests" in required:
         results["mutate_after_tests"] = bool(applies) and any(
@@ -1083,6 +1145,9 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         checks = run_checks(tmp_path / "built", task.truth.get("checks") or [])
         checks += run_replays(
             workspace, fixture, tmp_path, task.truth.get("replays") or []
+        )
+        checks += run_var_builds(
+            workspace, fixture, tmp_path, task.truth.get("var_builds") or []
         )
         defects = (
             planted_defects(tmp_path / "built", task.truth["planted_defects"], tmp_path)

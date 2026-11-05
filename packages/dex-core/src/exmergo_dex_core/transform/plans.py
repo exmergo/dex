@@ -124,6 +124,10 @@ class TransformPlan(BaseModel):
     # what each output must hold. Intent rather than bookkeeping, so unlike the
     # two above it travels in the plan document and, where present, its digest.
     retirement: dict[str, Any] | None = None
+    # The toggle contract (#1113): a flag that stays live, its on and off values
+    # and the columns it governs, plus the producers the plan's compile found.
+    # Intent like `retirement`, so it travels in the plan document and digest.
+    toggle: dict[str, Any] | None = None
 
 
 def contained_key(rel_path: str, surface: list[str]) -> str:

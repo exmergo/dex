@@ -327,6 +327,15 @@ def _compare(
         if retirement
         else None
     )
+    # A live toggle compares at its on value, on both sides (#1113), so
+    # `equivalent` means "with the feature on, the proposal returns today's
+    # results"; the off branch is the toggle check's to judge, not this one's.
+    toggle = stored.toggle or None
+    proposed_vars = None
+    if toggle and not baseline_vars:
+        baseline_vars = {str(toggle["variable"]): toggle.get("on_value")}
+        proposed_vars = dict(baseline_vars)
+        identity["proposed_vars"] = proposed_vars
     if baseline_vars:
         identity["baseline_vars"] = baseline_vars
     try:
@@ -351,8 +360,24 @@ def _compare(
         return not_checked(exc.code, exc.detail)
     try:
         proposed = _compile_proposed(
-            engine, stored, project, chosen, target, connector, through_ancestors
+            engine,
+            stored,
+            project,
+            chosen,
+            target,
+            connector,
+            through_ancestors,
+            vars_=proposed_vars,
         )
+        if proposed_vars and through_ancestors:
+            # The parents' guard reads the project's current values, as the
+            # baseline's does above: those are what the dev relations hold.
+            proposed = replace(
+                proposed,
+                parents=_compile_proposed(
+                    engine, stored, project, chosen, target, connector, True
+                ).parents,
+            )
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
 
@@ -658,6 +683,8 @@ def _compile_proposed(
     target: str,
     connector: str,
     through_ancestors: bool = False,
+    *,
+    vars_: Mapping[str, Any] | None = None,
 ) -> _Side:
     view = load_project(project)
     paths: dict[str, str] = {}
@@ -688,7 +715,12 @@ def _compile_proposed(
                 ) from exc
             paths[chosen_path] = view.files[chosen_path].content
         return _compile_side(
-            shadow, paths, model, "proposed_not_compilable", through_ancestors
+            shadow,
+            paths,
+            model,
+            "proposed_not_compilable",
+            through_ancestors,
+            vars_=vars_,
         )
 
 
@@ -947,6 +979,7 @@ def _identity_fields(identity: dict[str, Any]) -> dict[str, Any]:
         "key_columns": identity.get("key_columns"),
         "key_source": identity.get("key_source"),
         "baseline_vars": identity.get("baseline_vars"),
+        "proposed_vars": identity.get("proposed_vars"),
     }
 
 

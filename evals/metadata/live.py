@@ -122,8 +122,8 @@ class Session:
     #: The same calls with what the transcript shows about each: ``label``,
     #: ``plan`` (the literal id named, or ``None``), ``flags`` (the ``--flag``
     #: names the call passed, without their dashes or values, see ``_flags``)
-    #: and, on a comparison, ``verdict`` (see ``_compare_verdict``). A procedure
-    #: step reads these.
+    #: and, on a comparison, ``verdict`` (see ``_compare_verdict``), and on a
+    #: plan, ``toggle`` (see ``_plan_toggle``). A procedure step reads these.
     dex_calls: list[dict[str, Any]] = field(default_factory=list)
     candidate_plugin_loaded: bool | None = None
 
@@ -309,6 +309,23 @@ def _compare_verdict(block: dict[str, Any]) -> str | None:
     return None
 
 
+_TOGGLE = re.compile(r'"toggle"\s*:\s*\{[^{}]*?"verdict"\s*:\s*"(\w+)"')
+
+
+def _plan_toggle(block: dict[str, Any]) -> str | None:
+    """What one ``transform plan`` said about a toggle contract (#1113): the
+    ``data.toggle`` verdict, ``absent`` when a readable plan result carried no
+    toggle, or ``None`` when the agent's pipe left nothing to read."""
+
+    text = _result_text(block)
+    found = _TOGGLE.findall(text)
+    if found:
+        return found[0]
+    if '"plan_id"' in text or _STATUS.findall(text):
+        return "absent"
+    return None
+
+
 _SURVIVED = re.compile(r'"survived"\s*:\s*(\d+)')
 
 
@@ -332,6 +349,7 @@ def summarize(
     calls: list[dict[str, Any]] = []
     pending_compares: dict[str, dict[str, Any]] = {}
     pending_mutations: dict[str, dict[str, Any]] = {}
+    pending_plans: dict[str, dict[str, Any]] = {}
     for event in events:
         if event.get("type") == "user":
             content = (event.get("message") or {}).get("content")
@@ -343,6 +361,9 @@ def summarize(
                     run = pending_mutations.pop(str(block.get("tool_use_id")), None)
                     if run is not None:
                         run["survived"] = _mutation_survivors(block)
+                    planned = pending_plans.pop(str(block.get("tool_use_id")), None)
+                    if planned is not None:
+                        planned["toggle"] = _plan_toggle(block)
         if event.get("type") == "system" and event.get("subtype") == "init":
             session.plugins = list(event.get("plugins") or [])
             session.model = event.get("model")
@@ -402,6 +423,12 @@ def summarize(
                     ]
                     if len(mutations) == 1 and block.get("id"):
                         pending_mutations[str(block["id"])] = mutations[0]
+                    # And for what a plan said about a toggle contract (#1113).
+                    plans = [
+                        call for call in ordered if call["label"] == "transform plan"
+                    ]
+                    if len(plans) == 1 and block.get("id"):
+                        pending_plans[str(block["id"])] = plans[0]
         if event.get("type") == "result":
             session.cost_usd = event.get("total_cost_usd")
             session.turns = event.get("num_turns")

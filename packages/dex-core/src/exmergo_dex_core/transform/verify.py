@@ -88,6 +88,9 @@ class BuildVerification:
     column_contract: dict[str, Any] | None = None
     #: One record per output and metric a retirement contract names (#858).
     retirement: list[dict] = field(default_factory=list)
+    #: One record per model the plan's toggle contract judges on the value this
+    #: build ran with, and one per producer for the value it did not (#1113).
+    toggle: list[dict] = field(default_factory=list)
     #: One record per version, default and consumer of each versioned model
     #: the plan named by ``--for-plan`` touches (#859).
     model_versions: list[dict] = field(default_factory=list)
@@ -118,6 +121,8 @@ class BuildVerification:
             payload["column_contract"] = self.column_contract
         if self.retirement:
             payload["retirement"] = self.retirement
+        if self.toggle:
+            payload["toggle"] = self.toggle
         if self.model_versions:
             payload["model_versions"] = self.model_versions
         return payload
@@ -219,6 +224,7 @@ def verify_build(
     *,
     resolve_adapter: Callable[[], Adapter],
     retirement: dict[str, Any] | None = None,
+    toggle: dict[str, Any] | None = None,
     plan_edits: list[Any] | None = None,
     selection: str | None = None,
 ) -> BuildVerification:
@@ -300,6 +306,9 @@ def verify_build(
         _retirement_contract(
             project_dir, retirement, built, scope, adapter_once, result
         )
+
+    if toggle:
+        _toggle_contract(project_dir, toggle, built, scope, adapter_once, result)
 
     if plan_edits:
         _model_versions_contract(project_dir, plan_edits, summary, result)
@@ -470,6 +479,61 @@ def _retirement_contract(
         return
     result.findings.extend(findings)
     result.retirement = records
+
+
+def _toggle_contract(
+    project_dir: Path,
+    stored: dict[str, Any],
+    built: dict[str, str],
+    scope: set[str],
+    resolve_adapter: Callable[[], Adapter],
+    result: BuildVerification,
+) -> None:
+    """The built relations against the plan's toggle contract (#1113).
+
+    Metadata only, as the column contract reads it, so an empty table is judged
+    like a full one. On an off build, the column contract's ``column_missing``
+    for a governed column is the toggle working and is absorbed here.
+    """
+
+    from ..dbt_project import load as load_project
+    from ..errors import DexError
+    from ..guards.cost_guard import CostGuardError
+    from ..maintain import verify as verify_mod
+    from . import toggle as toggle_mod
+
+    try:
+        view = load_project(project_dir)
+        value = toggle_mod.built_value(view, str(stored.get("variable")))
+        relations = verify_mod.built_model_relations(project_dir, scope)
+        live = [meta.identifier for meta in resolve_adapter().list_objects()]
+        findings, records, branch = toggle_mod.verify_outputs(
+            stored,
+            built,
+            scope,
+            relations,
+            live,
+            resolve_adapter,
+            value,
+            view.project_name,
+        )
+    except CostGuardError:
+        raise
+    except (DexError, ValueError, OSError) as exc:
+        result.suppressed["toggle"] = (
+            f"the toggle contract could not be read ({type(exc).__name__})"
+        )
+        result.toggle = [
+            {"model": str(model), "status": "unchecked", "reason_code": "unreadable"}
+            for model in stored.get("producers") or {}
+        ]
+        return
+    result.findings, notes = toggle_mod.absorb_column_contract(
+        result.findings, stored, branch
+    )
+    result.notes.extend(notes)
+    result.findings.extend(findings)
+    result.toggle = records
 
 
 def _column_contract(
