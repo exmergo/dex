@@ -801,8 +801,9 @@ def test_a_confirmed_metered_plan_measures_the_conversion(metered_products):
 def test_a_conversion_inside_a_cte_is_measured_where_it_sits(products_project, capsys):
     """The filter sits in `base`; `final` reads columns the probe replaces, so
     only the CTEs up to `base` are kept. The supplier filter is downstream of
-    the conversion, so the retired row does reach it: 9 rows, 8 identifiers,
-    4 that do not convert."""
+    the conversion and is carried back onto the rows counted (#1073), so the
+    retired row the model never keeps is not counted: 8 rows, 7 identifiers,
+    3 that do not convert."""
 
     repo, warehouse = products_project
     content = (
@@ -815,9 +816,10 @@ def test_a_conversion_inside_a_cte_is_measured_where_it_sits(products_project, c
     )
     found = _at(_plan(repo, warehouse, content, capsys), "filter")
     assert found["scope"] == "base"
-    assert found["measured"]["input_rows"] == 9
-    assert found["measured"]["input_entities"] == 8
-    assert found["measured"]["failed_entities"] == 4
+    assert found["measured"]["input_rows"] == 8
+    assert found["measured"]["input_entities"] == 7
+    assert found["measured"]["failed_entities"] == 3
+    assert found["later_filters_applied"] == ["final: supplier <> 'retired'"]
     assert "`base`" in found["denominator"]
 
 
@@ -942,3 +944,141 @@ def test_a_failure_reading_the_counts_back_never_fails_the_plan(
     envelope = _plan(repo, warehouse, FILTER_REPAIR, capsys)
     assert envelope["status"] == "ok" and envelope["data"]["plan_id"]
     assert any("RuntimeError" in w for w in envelope["warnings"])
+
+
+# --- the populations the counts are over (#1073) -----------------------------------
+
+
+def test_an_inner_join_matches_only_the_partner_keys_its_filter_keeps(
+    products_project, capsys
+):
+    """The partner's own WHERE (`l.price < 50`) drops the price for 13, so of the
+    four converting identifiers (7, 007, 12, 13) only three can match: counted
+    over every price, `matched_entities` would read four."""
+
+    repo, warehouse = products_project
+    sql = (
+        _HEAD + "select p.product_id, l.price\n"
+        f"from {_SRC} p\n"
+        f"inner join {_PRICES} l on try_cast(p.product_id as integer) = l.product_id\n"
+        "where p.supplier <> 'retired' and l.price < 50\n"
+    )
+    found = _at(_plan(repo, warehouse, sql, capsys), "join")
+    assert found["measured"]["retained_entities"] == 4
+    assert found["measured"]["matched_entities"] == 3
+    assert found["partner_filters"] == ["l.price < 50"]
+    assert "pass its 1 filter(s) on product_prices alone" in found["denominator"]
+
+
+def test_a_partner_only_on_conjunct_narrows_the_match_too(products_project, capsys):
+    repo, warehouse = products_project
+    sql = (
+        _HEAD + "select p.product_id, l.price\n"
+        f"from {_SRC} p\n"
+        f"left join {_PRICES} l on try_cast(p.product_id as integer) = l.product_id "
+        "and l.price > 5\n"
+        "where p.supplier <> 'retired'\n"
+    )
+    found = _at(_plan(repo, warehouse, sql, capsys), "join")
+    # 7 and 007 match 7 (10.0) and 13 matches 99.0; 12 (3.5) is excluded.
+    assert found["measured"]["matched_entities"] == 3
+    assert found["partner_filters"] == ["l.price > 5"]
+
+
+_LATER = (
+    _HEAD + "with base as (\n"
+    "  select p.product_id, p.supplier, try_cast(p.product_id as integer) as pid\n"
+    f"  from {_SRC} p\n"
+    "),\n"
+    "final as (select * from base where {where})\n"
+    "select product_id, pid from final\n"
+)
+
+
+def test_a_later_cte_filter_is_applied_to_the_rows_counted(products_project, capsys):
+    """The supplier filter sits one CTE after the conversion. Applied, the
+    retired hashed identifier is not counted as a failure the model never
+    keeps: 8 rows, 3 failing identifiers rather than 9 and 4."""
+
+    repo, warehouse = products_project
+    sql = _LATER.replace("{where}", "supplier <> 'retired'")
+    found = _at(_plan(repo, warehouse, sql, capsys), "projection")
+    assert found["later_filters_applied"] == ["final: supplier <> 'retired'"]
+    assert found["later_filters_not_applied"] == []
+    assert found["measured"]["input_rows"] == 8
+    assert found["measured"]["failed_entities"] == 3
+    assert "later filter(s) on those rows applied" in found["denominator"]
+
+
+def test_a_later_filter_on_the_converted_output_is_named_not_applied(
+    products_project, capsys
+):
+    """`pid is not null` removes exactly what the conversion fails on: that is
+    the conversion's effect, so it stays counted and is named."""
+
+    repo, warehouse = products_project
+    sql = _LATER.replace("{where}", "pid is not null")
+    found = _at(_plan(repo, warehouse, sql, capsys), "projection")
+    assert found["later_filters_applied"] == []
+    (skipped,) = found["later_filters_not_applied"]
+    assert skipped["scope"] == "final"
+    assert "conversion's effect" in skipped["reason"]
+    assert found["measured"]["failed_entities"] == 4
+    assert "not applied" in found["denominator"]
+
+
+def test_a_later_inner_join_is_named_as_not_reflected():
+    authored = _tree(
+        "with base as (select try_cast(k as int) as kid from raw) "
+        "select b.kid from base b inner join keep k on b.kid = k.id"
+    )
+    (built,) = [
+        ic.conversion_probe(authored, i, "duckdb")
+        for i, f in enumerate(ic.find_conversions(authored))
+        if f.scope == "base"
+    ]
+    assert built.sql is not None
+    (skipped,) = built.later_not_applied
+    assert skipped["scope"] == "(final select)"
+    assert "inner join" in skipped["reason"]
+
+
+def test_a_cte_read_twice_later_is_named_rather_than_followed():
+    authored = _tree(
+        "with base as (select try_cast(k as int) as kid, s from raw), "
+        "a as (select * from base where s = 'x'), "
+        "b as (select * from base where s = 'y') "
+        "select * from a union all select * from b"
+    )
+    built = ic.conversion_probe(authored, 0, "duckdb")
+    assert built.later_applied == []
+    (skipped,) = built.later_not_applied
+    assert skipped["scope"] == "a, b"
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery", "snowflake", "postgres"])
+def test_carried_filters_keep_the_probe_an_aggregate_select(dialect):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    authored = _tree(
+        "with base as (select b.k, b.s, l.v from raw b "
+        "inner join keep l on cast(b.k as int) = l.id where l.v > 1), "
+        "final as (select * from base where s = 'x') select * from final"
+    )
+    built = ic.conversion_probe(authored, 0, dialect)
+    assert built.sql is not None, built
+    assert assert_select_only(built.sql, dialect=dialect)
+    assert built.partner_filters == ["l.v > 1"]
+    assert built.later_applied == ["final: s = 'x'"]
+
+
+def test_a_bare_key_beside_another_on_conjunct_is_not_an_unsupported_rewrite():
+    # sqlglot's AND is a Func; a bare-column side of an ON equality used to walk
+    # past its holder into it and read as an identifier rewrite.
+    found = ic.find_conversions(
+        _tree(
+            "select a.k from a join b on a.account_id = b.account_id and b.ok "
+            "left join c on try_cast(a.k as int) = c.id and c.v > 5"
+        )
+    )
+    assert [(f.site, f.unsupported) for f in found] == [("join", False)]

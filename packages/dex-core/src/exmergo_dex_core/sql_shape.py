@@ -769,3 +769,169 @@ def _clickhouse_type(to: exp.Expression) -> str:
     if rendered.startswith("Nullable(") and rendered.endswith(")"):
         return rendered[len("Nullable(") : -1]
     return rendered
+
+
+# --- row predicates a probe can carry (#1085, #1073) --------------------------------
+#
+# A filter decides which rows a model reads. A probe that measures those rows has to
+# carry the same filter, and it can do so only for a filter that means the same thing
+# when it is moved: a deterministic, row-by-row condition over columns and literals.
+# One whitelist answers "is this such a filter" for the join contract (which moves a
+# CTE's filter onto the physical relation under it) and for identifier-conversion
+# counts (which move a later CTE's filter back to the conversion's scope).
+
+#: Node types a carried predicate may be built from. Anything else, a function
+#: included, is refused rather than assumed deterministic and portable.
+_PREDICATE_NODES: tuple[type, ...] = tuple(
+    c
+    for c in (
+        exp.Column,
+        exp.Identifier,
+        exp.Literal,
+        exp.Boolean,
+        exp.Null,
+        exp.Neg,
+        exp.Paren,
+        exp.And,
+        exp.Or,
+        exp.Not,
+        exp.EQ,
+        exp.NEQ,
+        exp.GT,
+        exp.GTE,
+        exp.LT,
+        exp.LTE,
+        exp.Is,
+        exp.In,
+        exp.Between,
+        exp.Like,
+        exp.ILike,
+        exp.Coalesce,
+        exp.Cast,
+        exp.TryCast,
+        exp.DataType,
+        exp.DataTypeParam,
+        exp.Lower,
+        exp.Upper,
+        exp.Trim,
+    )
+    if isinstance(c, type)
+)
+
+
+def simple_row_predicate(
+    predicate: exp.Expression | None, dialect: str | None = None
+) -> str | None:
+    """Why ``predicate`` cannot be carried into a probe as written, or None
+    where it can.
+
+    A carried predicate is a deterministic, row-by-row condition over columns
+    and literals: comparisons, ``IS``, ``IN`` over a literal list, ``BETWEEN``,
+    ``LIKE``, boolean logic, ``COALESCE``, casts and ``lower``/``upper``/``trim``.
+    ``coalesce(_fivetran_active, true)`` is one: a bare boolean expression is a
+    predicate. A subquery, an aggregate, a window, a clock or random function,
+    or any other function is refused, since moving it could change what it
+    means, and a probe that answers a different question is worse than none.
+    A safe cast is refused on a ``dialect`` with no cast that returns NULL
+    (:data:`NO_SAFE_CAST`), since the probe could not render it.
+    """
+
+    if predicate is None:
+        return "there is no predicate"
+    for node in predicate.walk():
+        if isinstance(node, (exp.Subquery, exp.Select)):
+            return "the filter holds a subquery"
+        if isinstance(node, exp.AggFunc):
+            return "the filter aggregates"
+        if isinstance(node, exp.Window):
+            return "the filter reads a window"
+        if isinstance(node, exp.TryCast) and dialect in NO_SAFE_CAST:
+            return "the filter uses a safe cast this connector cannot render"
+        if isinstance(node, exp.In) and (
+            node.args.get("query") is not None
+            or node.args.get("unnest") is not None
+            or node.args.get("field") is not None
+        ):
+            return "the filter's IN reads something other than a literal list"
+        if not isinstance(node, _PREDICATE_NODES):
+            name = type(node).__name__
+            return f"the filter uses {name}, which a probe does not carry"
+    if predicate.find(exp.Column) is None:
+        return "the filter reads no column"
+    return None
+
+
+def _projection_map(
+    select: exp.Select,
+) -> tuple[dict[str, exp.Expression], bool]:
+    """Each output name of ``select`` (lowered) mapped to the expression that
+    computes it, and whether the select projects a bare ``*``."""
+
+    named: dict[str, exp.Expression] = {}
+    star = False
+    for projection in select.expressions:
+        if isinstance(projection, exp.Star):
+            star = True
+        elif isinstance(projection, exp.Alias):
+            named[projection.alias.lower()] = projection.this
+        elif isinstance(projection, exp.Column):
+            if isinstance(projection.this, exp.Star):
+                star = True
+            else:
+                named[projection.name.lower()] = projection
+    return named, star
+
+
+def substitute_columns(
+    predicate: exp.Expression, select: exp.Select
+) -> exp.Expression | None:
+    """``predicate``, written over ``select``'s output columns, rewritten in
+    ``select``'s own input terms: every column replaced by the expression
+    ``select`` computes it with.
+
+    Filtering a scope's output rows and filtering its input rows on the
+    substituted condition keep the same rows, provided each substituted
+    expression is a row-by-row function of its input. So a projection that
+    aggregates, windows or holds a subquery is not substituted (``None``), and
+    neither is a ``select`` that groups, deduplicates or holds a set operation.
+    A bare ``*`` passes a name through unchanged, only when ``select`` reads one
+    relation, since with more the name's owner is a schema question. A column
+    ``select`` does not project is ``None``.
+    """
+
+    if not isinstance(select, exp.Select):
+        return None
+    if select.args.get("group") is not None or select.args.get("distinct"):
+        return None
+    named, star = _projection_map(select)
+    single = len(joins(select)) == 0
+    out = predicate.copy()
+    for column in list(out.find_all(exp.Column)):
+        source = named.get(column.name.lower())
+        if source is None:
+            if not (star and single):
+                return None
+            replacement: exp.Expression = exp.column(column.name)
+        else:
+            if any(
+                isinstance(n, (exp.AggFunc, exp.Window, exp.Subquery, exp.Select))
+                for n in source.walk()
+            ):
+                return None
+            replacement = source.copy()
+        if column is out:
+            out = replacement
+        else:
+            column.replace(
+                exp.Paren(this=replacement)
+                if not isinstance(replacement, (exp.Column, exp.Literal))
+                else replacement
+            )
+    return out
+
+
+def flatten_conjuncts(node: exp.Expression | None) -> list[exp.Expression]:
+    """A condition flattened across its top-level ANDs (parentheses around an
+    AND included); empty for no condition."""
+
+    return [] if node is None else _flatten_and(node)
