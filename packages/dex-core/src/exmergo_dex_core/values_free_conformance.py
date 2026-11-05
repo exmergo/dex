@@ -338,6 +338,22 @@ _DECLARATION = (
     ".columns[].unit",
     ".columns[].additivity",
     ".columns[].references",
+    ".history",
+    ".history.snapshot",
+    ".history.entity",
+    ".history.status",
+    ".history.status.column",
+    ".history.status.target",
+    ".history.initial_observation",
+    ".history.null_status",
+    ".history.population",
+    ".history.time",
+    ".history.time.column",
+    ".history.time.provenance",
+    ".history.measures",
+    ".history.measures.transition_count",
+    ".history.measures.latest_target_transition_at",
+    ".history.measures.first_target_at",
     ".elided_column_count",
     ".withheld_fields",
     ".withheld_fields[]",
@@ -674,8 +690,12 @@ def _dump(value: Any) -> str:
 
 
 def _paths(value: Any, prefix: str = "") -> set[str]:
+    """Every key and subkey path present in ``value``."""
+
     found: set[str] = set()
     if isinstance(value, dict):
+        if prefix.endswith(".history.entity"):
+            return found
         for key, sub in value.items():
             path = f"{prefix}.{key}" if prefix else str(key)
             found.add(path)

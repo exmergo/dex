@@ -19,6 +19,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_serializer
 
+from .project_definitions import DeclaredHistory
+
 # Bump when the stored cache shape changes in a way old readers cannot handle.
 #
 # 4 added `Dataset.key_evidence` and, with it, changed what `candidate_keys`
@@ -233,6 +235,7 @@ class DatasetDeclaration(BaseModel):
     columns: list[DeclaredColumn] = Field(default_factory=list)
     elided_column_count: int = 0
     withheld_fields: list[str] = Field(default_factory=list)
+    history: DeclaredHistory | None = None
 
 
 class Dataset(BaseModel):

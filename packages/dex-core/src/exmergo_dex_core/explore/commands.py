@@ -4315,9 +4315,9 @@ def _dataset_declaration(
 
     live = {c.name.lower(): c for c in dataset.columns}
     withheld: list[str] = []
+    flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
     population = None
     if declaration.population is not None:
-        flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
         rule = declaration.population.rule
         if rule is not None and (
             values_free
@@ -4352,6 +4352,13 @@ def _dataset_declaration(
             ),
         )
 
+    history = None
+    if declaration.history is not None:
+        history = declaration.history.model_copy(deep=True)
+        if values_free or history.status.column.lower() in flagged:
+            history.status.target = None
+            withheld.append("history.status.target")
+
     grain = declaration.grain
     status = None
     if grain:
@@ -4363,6 +4370,7 @@ def _dataset_declaration(
         grain=list(grain) if grain else None,
         grain_status=status,
         population=population,
+        history=history,
         columns=[
             DeclaredColumn(name=name, **meaning.model_dump())
             for name, meaning in declaration.columns.items()

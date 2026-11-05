@@ -22,6 +22,7 @@ from exmergo_dex_core.dbt_project import (
     ProjectDefinitions,
     declared_meaning,
     definitions,
+    read_history,
 )
 from exmergo_dex_core.explore.commands import _apply_declarations
 from exmergo_dex_core.values_free_conformance import _unknown_paths
@@ -171,6 +172,81 @@ def test_declared_meaning_ignores_malformed_fields_and_empty_declarations():
     }
     assert declared_meaning(entry, "m", relation=None, source="yaml") is None
     assert declared_meaning({"name": "m"}, "m", relation=None, source="yaml") is None
+
+
+def test_read_history_parses_valid_and_ignores_malformed():
+    """read_history parses valid shapes and returns None for invalid shapes."""
+    assert read_history(None) is None
+    assert read_history({}) is None
+    assert read_history({"snapshot": "  "}) is None
+    assert read_history({"snapshot": "s", "entity": {}}) is None
+    assert read_history({"snapshot": "s", "entity": {"": "x"}}) is None
+    assert read_history({"snapshot": "s", "entity": {"k": "v"}, "status": {}}) is None
+    assert (
+        read_history({"snapshot": "s", "entity": {"k": "v"}, "status": {"column": "c"}})
+        is None
+    )
+    assert (
+        read_history(
+            {
+                "snapshot": "s",
+                "entity": {"k": "v"},
+                "status": {"column": "c", "target": "  "},
+            }
+        )
+        is None
+    )
+
+    minimal = read_history(
+        {
+            "snapshot": "s",
+            "entity": {"k": "v"},
+            "status": {"column": "c", "target": 123},
+        }
+    )
+    assert minimal is not None
+    assert minimal.snapshot == "s"
+    assert minimal.entity == {"k": "v"}
+    assert minimal.status.column == "c"
+    assert minimal.status.target == 123
+    assert minimal.initial_observation is None
+    assert minimal.null_status is None
+    assert minimal.population is None
+    assert minimal.time is None
+    assert minimal.measures.transition_count is None
+
+    spaced = read_history(
+        {
+            "snapshot": "s",
+            "entity": {"k": "v"},
+            "status": {"column": "c", "target": " paid "},
+        }
+    )
+    assert spaced is not None
+    assert spaced.status.target == " paid "
+
+
+def test_declared_meaning_reads_history():
+    """declared_meaning parses dex.history into ModelDeclaration.history."""
+    entry = {
+        "name": "m",
+        "config": {
+            "meta": {
+                "dex": {
+                    "history": {
+                        "snapshot": "snp_m",
+                        "entity": {"id": "id"},
+                        "status": {"column": "st", "target": True},
+                    }
+                }
+            }
+        },
+    }
+    decl = declared_meaning(entry, "m", relation=None, source="yaml")
+    assert decl is not None
+    assert decl.history is not None
+    assert decl.history.snapshot == "snp_m"
+    assert decl.history.status.target is True
 
 
 def test_project_definitions_default_carries_no_declarations():
@@ -580,3 +656,132 @@ def test_a_declared_parent_is_carried_as_names_in_every_mode(
     }
     if values_free:
         assert _unknown_paths("profile", payload["data"]) == []
+
+
+_DECLARED_ORDERS_WITH_HISTORY = """\
+version: 2
+models:
+  - name: fct_orders
+    description: One row per order line, cancelled orders excluded.
+    config:
+      meta:
+        dex:
+          grain: [order_id, line_no]
+          history:
+            snapshot: snp_orders
+            entity:
+              order_id: id
+            status:
+              column: status
+              target: paid
+            initial_observation: baseline
+            null_status: ignore
+            population: ever_target
+            time:
+              column: order_date
+              provenance: business
+            measures:
+              transition_count: transitions
+              latest_target_transition_at: paid_at
+              first_target_at: first_paid_at
+"""
+
+
+def test_history_status_target_on_a_pii_column_is_withheld_in_full_mode():
+    """When the status column has a pii flag, history.status.target is withheld
+    in full mode.
+    """
+    ds = _dataset(id=True)
+    ds.columns.append(
+        ColumnProfile(
+            name="status",
+            data_type="VARCHAR",
+            pii=PIIFlag(category="other", confidence=0.8),
+        )
+    )
+    defs = ProjectDefinitions(
+        model_declarations={
+            "t": ModelDeclaration.model_validate(
+                {
+                    "model": "t",
+                    "source": "yaml",
+                    "history": {
+                        "snapshot": "snp_t",
+                        "entity": {"id": "id"},
+                        "status": {"column": "status", "target": "secret_state"},
+                    },
+                }
+            )
+        }
+    )
+    (out,), _ = _apply_declarations(
+        [ds], defs, high_null_fraction=0.95, values_free=False
+    )
+    assert out.declaration.history.status.target is None
+    assert out.declaration.history.status.column == "status"
+    assert "history.status.target" in out.declaration.withheld_fields
+
+
+@pytest.mark.parametrize("command", ["profile", "map"])
+def test_history_is_carried_under_use_project(
+    command: str, warehouse: Path, tmp_path: Path, capsys
+):
+    """explore profile and explore map carry declaration.history."""
+    repo = _repo(tmp_path, _DECLARED_ORDERS_WITH_HISTORY)
+    extra = ["fct_orders"] if command == "profile" else []
+    payload = _run(
+        _args(command, warehouse, repo, *extra, "--use-project"),
+        capsys,
+    )
+    key = "datasets" if command == "profile" else "objects"
+    declaration = _orders(payload, key)["declaration"]
+    assert declaration["history"] == {
+        "snapshot": "snp_orders",
+        "entity": {"order_id": "id"},
+        "status": {"column": "status", "target": "paid"},
+        "initial_observation": "baseline",
+        "null_status": "ignore",
+        "population": "ever_target",
+        "time": {"column": "order_date", "provenance": "business"},
+        "measures": {
+            "transition_count": "transitions",
+            "latest_target_transition_at": "paid_at",
+            "first_target_at": "first_paid_at",
+        },
+    }
+    assert "history.status.target" not in declaration["withheld_fields"]
+
+
+@pytest.mark.parametrize("command", ["profile", "map"])
+def test_history_status_target_is_withheld_under_values_free(
+    command: str, warehouse: Path, tmp_path: Path, capsys
+):
+    """values-free mode withholds history.status.target."""
+    repo = _repo(tmp_path, _DECLARED_ORDERS_WITH_HISTORY)
+    extra = ["fct_orders"] if command == "profile" else []
+    payload = _run(
+        _args(command, warehouse, repo, *extra, "--use-project", "--values-free"),
+        capsys,
+    )
+    key = "datasets" if command == "profile" else "objects"
+    declaration = _orders(payload, key)["declaration"]
+    assert declaration["history"]["status"] == {"column": "status", "target": None}
+    assert "history.status.target" in declaration["withheld_fields"]
+    assert _unknown_paths(command, payload["data"]) == []
+
+
+def test_removed_history_declaration_clears_on_the_next_run(
+    warehouse: Path, tmp_path: Path, capsys
+):
+    """Removing the history block from schema.yml clears it from next run."""
+    repo = _repo(tmp_path, _DECLARED_ORDERS_WITH_HISTORY)
+    first = _orders(
+        _run(_args("profile", warehouse, repo, "fct_orders", "--use-project"), capsys)
+    )
+    assert first["declaration"]["history"] is not None
+
+    (repo / "models" / "schema.yml").write_text(_DECLARED_ORDERS, encoding="utf-8")
+    second = _orders(
+        _run(_args("profile", warehouse, repo, "fct_orders", "--use-project"), capsys)
+    )
+    assert second["declaration"]["history"] is None

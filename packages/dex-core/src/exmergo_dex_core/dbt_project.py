@@ -53,7 +53,20 @@ from .project_definitions import (
     DeclaredKey,
     ModelDeclaration,
     ProjectDefinitions,
+    read_history,
     read_population,
+)
+from .project_definitions import (
+    DeclaredHistory as DeclaredHistory,
+)
+from .project_definitions import (
+    DeclaredHistoryMeasures as DeclaredHistoryMeasures,
+)
+from .project_definitions import (
+    DeclaredHistoryStatus as DeclaredHistoryStatus,
+)
+from .project_definitions import (
+    DeclaredHistoryTime as DeclaredHistoryTime,
 )
 from .semantic_catalog import (
     DIMENSIONS_PER_DECLARATION,
@@ -1892,7 +1905,7 @@ def declared_meaning(
     :func:`declared_grain` uses. Lenient by design: a field of the wrong shape is
     left out rather than raised on, because this is a read of what a human wrote,
     and the writer (`transform plan`) is where a malformed declaration is refused.
-    None when the entry declares none of grain, population or a column meaning.
+    None when the entry declares none of grain, population, columns, or history.
     """
 
     from .guards.pii_meta import entry_meta
@@ -1900,6 +1913,7 @@ def declared_meaning(
     dex = entry_meta(entry).get("dex")
     dex = dex if isinstance(dex, dict) else {}
     population = read_population(dex.get("population"))
+    history = read_history(dex.get("history"))
 
     columns: dict[str, DeclaredColumnMeaning] = {}
     raw = entry.get("columns") if isinstance(entry, dict) else None
@@ -1928,7 +1942,7 @@ def declared_meaning(
             columns[name] = DeclaredColumnMeaning(**stated)
 
     grain = declared_grain(entry)
-    if not (grain or population or columns):
+    if not (grain or population or columns or history):
         return None
     return ModelDeclaration(
         model=model,
@@ -1936,6 +1950,7 @@ def declared_meaning(
         grain=grain,
         population=population,
         columns=columns,
+        history=history,
         source=source,
     )
 
