@@ -107,6 +107,8 @@ GATE_TIMEOUT_S = 600
 
 
 def _yaml_files(project: Path) -> list[Path]:
+    """Every YAML file under the project's ``models/`` directory, sorted."""
+
     models = project / "models"
     if not models.is_dir():
         return []
@@ -146,6 +148,8 @@ def _dex_meta(node: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class Declared:
+    """What a model's YAML declares, read independently of the engine."""
+
     description: str | None = None
     grain: list[str] | None = None
     population: dict[str, Any] | None = None
@@ -154,6 +158,8 @@ class Declared:
 
 
 def declared(entry: dict[str, Any] | None) -> Declared:
+    """The declaration one YAML model entry states, ``meta`` merged as dbt merges it."""
+
     if not entry:
         return Declared()
     dex = _dex_meta(entry)
@@ -181,6 +187,8 @@ def declared(entry: dict[str, Any] | None) -> Declared:
 
 
 def _model_sql(project: Path) -> dict[str, str]:
+    """Every model's SQL under ``models/``, by file stem."""
+
     models = project / "models"
     if not models.is_dir():
         return {}
@@ -233,6 +241,8 @@ def touched_models(baseline: Path, workspace: Path) -> list[str]:
 
 
 def _dbt() -> str:
+    """The dbt executable beside this interpreter, else the one on ``PATH``."""
+
     beside = Path(sys.executable).parent / "dbt"
     if beside.exists():
         return str(beside)
@@ -244,6 +254,8 @@ def _dbt() -> str:
 
 @dataclass
 class Gate:
+    """Whether the build gate passed, the stage that decided it and what failed."""
+
     passed: bool
     stage: str  # "duplicates", "deps", "parse", "build" or "ok"
     detail: list[str] = field(default_factory=list)
@@ -275,6 +287,8 @@ def _failed_nodes(project: Path) -> list[str]:
 
 
 def _tail(output: str, lines: int = 25) -> list[str]:
+    """The last ``lines`` non-blank lines of a process's output."""
+
     return [line for line in output.strip().splitlines()[-lines:] if line.strip()]
 
 
@@ -301,6 +315,8 @@ def _dbt_stage(
 
 
 def _declares_packages(project: Path) -> bool:
+    """Whether the project declares dbt packages, so a copy needs ``dbt deps``."""
+
     return (project / "packages.yml").is_file() or (
         project / "dependencies.yml"
     ).is_file()
@@ -353,6 +369,8 @@ def build_gate(workspace: Path, fixture: Fixture, scratch: Path) -> Gate:
 
 
 def _execute(database: Path, statements: list[str]) -> None:
+    """Run ``statements`` against a scratch DuckDB warehouse and checkpoint it."""
+
     import duckdb
 
     con = duckdb.connect(str(database))
@@ -543,6 +561,8 @@ def planted_defects(
 
 
 def relation_columns(scratch: Path, model: str) -> list[str] | None:
+    """A built model's columns in order, lowercased; ``None`` when it was not built."""
+
     import duckdb
 
     con = duckdb.connect(str(scratch / WAREHOUSE_FILE), read_only=True)
@@ -624,6 +644,8 @@ def completeness(decl: Declared, columns: list[str] | None) -> dict[str, Any]:
 
 
 def _norm(value: Any) -> str:
+    """A value as a trimmed, lowercased string, for comparing declared facts."""
+
     return str(value).strip().lower()
 
 
@@ -650,6 +672,10 @@ def _effective_excluded(
 
 
 def _unit_matches(expected: str, got: Any) -> bool:
+    """Whether a declared unit matches the expected one; a trailing ``*`` matches by
+    prefix.
+    """
+
     if got is None:
         return False
     if expected.endswith("*"):
@@ -658,6 +684,8 @@ def _unit_matches(expected: str, got: Any) -> bool:
 
 
 def correctness(decl: Declared, truth: dict[str, Any]) -> dict[str, bool]:
+    """Which declared fields with a known answer match it, field by field."""
+
     fields: dict[str, bool] = {}
     if "grain" in truth:
         fields["grain"] = {_norm(g) for g in decl.grain or []} == {
@@ -750,6 +778,8 @@ PROCEDURE_STEPS = (
 
 
 def _is_mutation(call: dict[str, Any]) -> bool:
+    """Whether a recorded Dex call is a ``transform test --mutate`` run."""
+
     return call["label"] == "transform test" and "mutate" in (call.get("flags") or [])
 
 
@@ -983,6 +1013,8 @@ def report_rubric(
 
 @dataclass
 class TaskScore:
+    """Every grade for one task, as the report and the CLI summary show it."""
+
     task: str
     #: "scored", "gate_failed", "no_models", or "blocked_reported": the gate
     #: failed only on a prerequisite the task allows to stay blocked, and the
@@ -1022,6 +1054,8 @@ class TaskScore:
     mutation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """The score as a plain dictionary, for the JSON report."""
+
         return asdict(self)
 
 

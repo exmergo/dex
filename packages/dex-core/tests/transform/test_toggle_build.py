@@ -93,12 +93,16 @@ TOGGLE = {
 
 
 def _write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path``, creating its directory."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
 
 
 @pytest.fixture
 def repo(tmp_path: Path, capsys) -> Path:
+    """A shop with fee columns in every layer, built once on DuckDB."""
+
     pytest.importorskip("dbt.adapters.duckdb")
     _write(
         tmp_path / ".dex/config.yml",
@@ -132,6 +136,8 @@ def repo(tmp_path: Path, capsys) -> Path:
 
 
 def _run(repo: Path, capsys, *argv: str) -> dict:
+    """Run one CLI command in ``repo`` and return its envelope."""
+
     capsys.readouterr()
     main(["--repo-root", str(repo), *argv])
     return json.loads(capsys.readouterr().out)
@@ -146,6 +152,8 @@ def _plan(
     toggle: dict | None = None,
     extra: list[dict] | None = None,
 ) -> dict:
+    """Plan ``sql`` with the project's flag default and a toggle contract."""
+
     edits = [
         {"path": f"models/{n}.sql", "kind": "model_sql", "content": c}
         for n, c in sql.items()
@@ -162,10 +170,14 @@ def _plan(
 
 
 def _models(envelope: dict) -> dict[str, dict]:
+    """The plan's toggle records by model."""
+
     return {r["model"]: r for r in envelope["data"]["toggle"]["models"]}
 
 
 def _columns(repo: Path, relation: str) -> list[str]:
+    """A dev relation's columns, read with DuckDB directly."""
+
     import duckdb
 
     with duckdb.connect(str(repo / "dev.duckdb"), read_only=True) as con:
@@ -173,6 +185,8 @@ def _columns(repo: Path, relation: str) -> list[str]:
 
 
 def _build(repo: Path, capsys, plan_id: str) -> dict:
+    """Build on dev with ``--verify`` for ``plan_id``."""
+
     return _run(
         repo,
         capsys,
@@ -187,6 +201,8 @@ def _build(repo: Path, capsys, plan_id: str) -> dict:
 
 
 def test_gating_only_the_mart_names_every_other_producer(repo: Path, capsys) -> None:
+    """Gating only the mart names every other producer."""
+
     out = _plan(repo, capsys, MART_ONLY)
     assert out["status"] == "ok", out
     toggle = out["data"]["toggle"]
@@ -223,6 +239,8 @@ def test_gating_only_the_mart_names_every_other_producer(repo: Path, capsys) -> 
 
 
 def test_every_producer_gated_is_satisfied_and_builds_clean(repo: Path, capsys) -> None:
+    """Every producer gated is satisfied and builds clean."""
+
     out = _plan(repo, capsys, GATED)
     assert out["status"] == "ok", out
     toggle = out["data"]["toggle"]
@@ -272,6 +290,8 @@ def test_every_producer_gated_is_satisfied_and_builds_clean(repo: Path, capsys) 
 
 
 def test_an_off_build_of_the_mart_only_plan_is_contradicted(repo: Path, capsys) -> None:
+    """An off build of the mart only plan is contradicted."""
+
     out = _plan(repo, capsys, MART_ONLY)
     plan_id = out["data"]["plan_id"]
     assert _run(repo, capsys, "transform", "apply", plan_id)["status"] == "ok"
@@ -295,6 +315,8 @@ def test_an_off_build_of_the_mart_only_plan_is_contradicted(repo: Path, capsys) 
 
 
 def test_an_on_build_keeps_every_producer(repo: Path, capsys) -> None:
+    """An on build keeps every producer."""
+
     out = _plan(repo, capsys, GATED, project=PROJECT_ON)
     assert out["data"]["toggle"]["verdict"] == "satisfied"
     plan_id = out["data"]["plan_id"]
@@ -312,6 +334,8 @@ def test_an_on_build_keeps_every_producer(repo: Path, capsys) -> None:
 def test_a_dropped_on_column_and_a_dynamic_read_are_reported(
     repo: Path, capsys
 ) -> None:
+    """A dropped on column and a dynamic read are reported."""
+
     dropped = dict(GATED)
     dropped["ledger_entries"] = "select 'L1' as entry_id, 50 as debit\n"
     dynamic = {
@@ -329,9 +353,13 @@ def test_a_dropped_on_column_and_a_dynamic_read_are_reported(
 
 
 def test_refusals(repo: Path, capsys) -> None:
+    """Refusals."""
+
     payload = repo / "payload.json"
 
     def run(body: dict, *argv: str) -> dict:
+        """Run ``argv`` with ``body`` as its payload file."""
+
         payload.write_text(json.dumps(body), encoding="utf-8")
         return _run(repo, capsys, *argv, "--edits-file", str(payload))
 
@@ -368,6 +396,8 @@ def test_refusals(repo: Path, capsys) -> None:
 
 
 def test_the_plan_document_carries_the_toggle(repo: Path, capsys) -> None:
+    """The plan document carries the toggle."""
+
     out = _plan(repo, capsys, GATED)
     plan_id = out["data"]["plan_id"]
     exported = _run(repo, capsys, "transform", "export", plan_id)
@@ -390,6 +420,8 @@ def test_a_failed_analysis_keeps_the_plan_and_its_contract(
     from exmergo_dex_core.transform import toggle as toggle_mod
 
     def broken(*_args, **_kwargs):
+        """Fail the way a defect in the analysis would."""
+
         raise KeyError("boom")
 
     monkeypatch.setattr(toggle_mod, "analyze", broken)
@@ -439,3 +471,55 @@ def test_compare_refuses_a_parent_that_moves_with_the_flag(repo: Path, capsys) -
     assert compared["data"]["status"] == "not_checked", compared
     assert compared["data"]["reason_code"] == "inputs_unsynchronized"
     assert "stg_orders" in compared["data"]["detail"]
+
+
+def test_compare_refuses_a_parent_only_the_on_branch_reads(repo: Path, capsys) -> None:
+    """A parent read only with the flag on is absent from the graph the dev
+    relations were built from, so whatever relation an earlier build left under
+    its name cannot stand for it."""
+
+    rates = {
+        "path": "models/fee_rates.sql",
+        "kind": "model_sql",
+        "content": "select 0.03 as rate\n",
+    }
+    payload = repo / "rates.json"
+    payload.write_text(json.dumps({"edits": [rates]}), encoding="utf-8")
+    added = _run(
+        repo, capsys, "transform", "plan", "rates", "--edits-file", str(payload)
+    )
+    assert added["status"] == "ok", added
+    assert (
+        _run(repo, capsys, "transform", "apply", added["data"]["plan_id"])["status"]
+        == "ok"
+    )
+    assert _run(repo, capsys, "transform", "build", "--target", "dev")["status"] == "ok"
+    joined = dict(GATED)
+    joined["fct_order_lines"] = (
+        "select o.order_id, o.amount\n"
+        + ON
+        + ", o.fee_amount, r.rate as fee_rate{% endif %}\n"
+        "from {{ ref('stg_orders') }} as o\n"
+        + ON
+        + " cross join {{ ref('fee_rates') }} as r{% endif %}\n"
+    )
+    out = _plan(
+        repo,
+        capsys,
+        joined,
+        toggle={**TOGGLE, "columns": ["fee_amount", "fees", "fee_rate"]},
+    )
+    assert out["status"] == "ok", out
+    compared = _run(
+        repo,
+        capsys,
+        "transform",
+        "compare",
+        out["data"]["plan_id"],
+        "--model",
+        "fct_order_lines",
+    )
+    assert compared["data"]["status"] == "not_checked", compared
+    assert compared["data"]["reason_code"] == "inputs_unsynchronized"
+    assert "read only with" in compared["data"]["detail"]
+    assert "fee_rates" in compared["data"]["detail"]

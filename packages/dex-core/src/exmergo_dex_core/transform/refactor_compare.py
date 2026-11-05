@@ -370,6 +370,7 @@ def _compare(
             vars_=proposed_vars,
         )
         toggled_parents: list[str] = []
+        on_only: list[str] = []
         if proposed_vars:
             # Both statements read the untouched parents' dev relations, which
             # were built at the project's current values. A parent that compiles
@@ -399,15 +400,25 @@ def _compare(
                     engine, stored, project, chosen, target, connector, True
                 ).parents
             )
+            # The proposal at the current values tells a parent the flag reaches
+            # from one the plan's own edits add: a parent read only at the on
+            # value was never built from this graph, so whatever relation an
+            # earlier build left under its name proves nothing.
+            current = _compile_proposed(
+                engine, stored, project, chosen, target, connector, True
+            ).parents
+            on_only = sorted(set(at_on) - set(current))
             toggled_parents = sorted(
-                name
-                for name in at_on.keys() & built.keys()
-                if at_on[name] != built[name]
+                {
+                    *on_only,
+                    *(
+                        name
+                        for name in at_on.keys() & built.keys()
+                        if at_on[name] != built[name]
+                    ),
+                }
             )
             if through_ancestors:
-                current = _compile_proposed(
-                    engine, stored, project, chosen, target, connector, True
-                ).parents
                 # The parents' guard reads the project's current values, as the
                 # baseline's does above: those are what the dev relations hold.
                 proposed = replace(proposed, parents=current)
@@ -428,13 +439,26 @@ def _compare(
     # as that, not as the flag.
     if toggled_parents and proposed_vars:
         variable, value = next(iter(proposed_vars.items()))
+        absent = [name for name in toggled_parents if name in on_only]
+        differ = [name for name in toggled_parents if name not in on_only]
+        parts = []
+        if differ:
+            parts.append(
+                f"these untouched parents compile differently with {variable}="
+                f"{value!r} than at the value their dev relations were built with, "
+                "so a comparison at the on value would read rows the on branch "
+                "does not write: " + ", ".join(differ)
+            )
+        if absent:
+            parts.append(
+                f"these parents are read only with {variable}={value!r}, so the "
+                "current values never built them and no dev relation can stand "
+                "for them: " + ", ".join(absent)
+            )
         return not_checked(
             "inputs_unsynchronized",
-            f"these untouched parents compile differently with {variable}="
-            f"{value!r} than at the value their dev relations were built with, so "
-            "a comparison at the on value would read rows the on branch does not "
-            "write: " + ", ".join(toggled_parents) + ". Build them at the on value "
-            "first, or compare after flipping the default",
+            "; ".join(parts) + ". Build them at the on value first, or compare "
+            "after flipping the default",
         )
 
     dialect = get_dialect(connector)

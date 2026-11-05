@@ -2118,6 +2118,8 @@ def _fees_with(tmp_path: Path, replacements: dict[str, str]):
 
 
 def _starting(path: str) -> str:
+    """A file of the fixture's starting project."""
+
     fixture = fixture_of(_task(_FEES), FIXTURES)
     return (fixture.project / path).read_text(encoding="utf-8")
 
@@ -2245,6 +2247,8 @@ def test_dropping_the_fees_outright_fails_the_on_value(tmp_path):
 
 @needs_dbt
 def test_a_default_of_off_changes_todays_deployments(tmp_path):
+    """A default of off changes todays deployments."""
+
     task, fixture, workspace = _reference(tmp_path, _FEES)
     project = workspace / "dbt_project.yml"
     text = project.read_text(encoding="utf-8")
@@ -2285,9 +2289,13 @@ def test_a_default_of_off_changes_todays_deployments(tmp_path):
     ],
 )
 def test_a_toggle_check_must_precede_the_apply(calls, passed):
+    """A toggle check must precede the apply."""
+
     from evals.metadata.score import procedure_steps
 
     def call(verb, *details):
+        """One recorded Dex call, shaped as the transcript summary records it."""
+
         entry = {"label": f"transform {verb}", "flags": []}
         if verb == "plan" and details:
             entry["toggle"] = details[0]
@@ -2317,12 +2325,16 @@ def test_a_toggle_check_must_precede_the_apply(calls, passed):
     ],
 )
 def test_a_plans_toggle_verdict_is_read_from_its_result(text, expected):
+    """A plans toggle verdict is read from its result."""
+
     from evals.metadata.live import _plan_toggle
 
     assert _plan_toggle({"content": text}) == expected
 
 
 def test_a_readable_plan_failure_is_not_a_hidden_result():
+    """A readable plan failure is not a hidden result."""
+
     from evals.metadata.live import _plan_id, _plan_toggle
 
     assert _plan_toggle({"content": "Error: invalid toggle", "is_error": True}) == (

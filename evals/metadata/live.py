@@ -74,6 +74,8 @@ def provenance(
     """
 
     def git(*args: str) -> str:
+        """One git command in the repository, its trimmed standard output."""
+
         return subprocess.run(
             ["git", *args], cwd=REPO, capture_output=True, text=True
         ).stdout.strip()
@@ -106,6 +108,10 @@ def provenance(
 
 @dataclass
 class Session:
+    """What one live agent session did: its cost, turns and outcome, the plugins and
+    skills it loaded, and the Dex calls it made in order.
+    """
+
     cost_usd: float | None = None
     turns: int | None = None
     duration_s: float = 0.0
@@ -166,6 +172,8 @@ def _aliases(command: str) -> list[str]:
 
 
 def _alias_call(name: str) -> re.Pattern:
+    """A pattern for a Dex call made through the shell alias or variable ``name``."""
+
     return re.compile(
         rf"(?<!--script\s)(?<!--script\s\$)\$?\b{re.escape(name)}\b(?!\s*[=(])"
         r"(?:\s+(?:--[\w-]+(?:[ =]\S+)?\s+)*)?"
@@ -287,6 +295,8 @@ _VERDICTS = ("equivalent", "different", "not_checked")
 
 
 def _result_text(block: dict[str, Any]) -> str:
+    """A tool result block's text, its content parts joined when it has several."""
+
     content = block.get("content")
     if isinstance(content, list):
         return "\n".join(str(part.get("text") or "") for part in content)
@@ -474,6 +484,10 @@ def run_session(
     timeout: int,
     plugin_dir: Path | None = None,
 ) -> Session:
+    """Run one agent session on ``prompt`` in ``workspace``, recording its events to
+    ``transcript``.
+    """
+
     plugin_dir = resolve_plugin_dir(plugin_dir)
     binary = _require_claude("claude")
     env = _child_env()

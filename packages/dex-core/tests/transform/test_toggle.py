@@ -25,6 +25,8 @@ CONTRACT = {
 
 
 def _payload(tmp_path: Path, body: dict) -> str:
+    """Write ``body`` as a payload file and return its path."""
+
     path = tmp_path / "payload.json"
     path.write_text(json.dumps(body), encoding="utf-8")
     return str(path)
@@ -34,6 +36,8 @@ def _payload(tmp_path: Path, body: dict) -> str:
 
 
 def test_a_contract_states_both_values() -> None:
+    """A contract states both values."""
+
     variable, contract = toggle.parse_contract(CONTRACT)
     assert variable == "enable_fees"
     assert (contract.on_value, contract.off_value) == (True, False)
@@ -56,11 +60,15 @@ def test_a_contract_states_both_values() -> None:
     ],
 )
 def test_a_malformed_contract_is_refused(change: dict, message: str) -> None:
+    """A malformed contract is refused."""
+
     with pytest.raises(ValueError, match=message):
         toggle.parse_contract({**CONTRACT, **change})
 
 
 def test_the_stored_form_round_trips_with_its_producers() -> None:
+    """The stored form round trips with its producers."""
+
     variable, contract = toggle.parse_contract(CONTRACT)
     form = toggle.stored_form(variable, contract)
     form["producers"] = {"fct": ["fee_amount"]}
@@ -68,6 +76,8 @@ def test_the_stored_form_round_trips_with_its_producers() -> None:
 
 
 def test_decisions_name_the_toggle() -> None:
+    """Decisions name the toggle."""
+
     stored = {
         "variable": "enable_fees",
         "assumptions": [
@@ -98,6 +108,8 @@ def test_decisions_name_the_toggle() -> None:
     ],
 )
 def test_values_match_as_yaml_reads_them(value, wanted, same: bool) -> None:
+    """Values match as yaml reads them."""
+
     assert toggle.matches(value, wanted) is same
 
 
@@ -105,6 +117,8 @@ def test_values_match_as_yaml_reads_them(value, wanted, same: bool) -> None:
 
 
 def test_only_the_plan_reads_the_toggle(tmp_path: Path) -> None:
+    """Only the plan reads the toggle."""
+
     body = {"edits": [], "toggle": CONTRACT}
     path = _payload(tmp_path, body)
     _edits, _declarations, raw = plan_payload(path)
@@ -115,6 +129,8 @@ def test_only_the_plan_reads_the_toggle(tmp_path: Path) -> None:
 
 
 def test_a_payload_holds_one_contract(tmp_path: Path) -> None:
+    """A payload holds one contract."""
+
     path = _payload(tmp_path, {"edits": [], "toggle": CONTRACT, "retirement": {"x": 1}})
     for reader in (plan_payload, payload_from_file, removal_payload):
         with pytest.raises(ValueError, match="not both"):
@@ -122,6 +138,8 @@ def test_a_payload_holds_one_contract(tmp_path: Path) -> None:
 
 
 def test_the_plan_still_refuses_a_retirement(tmp_path: Path) -> None:
+    """The plan still refuses a retirement."""
+
     path = _payload(tmp_path, {"edits": [], "retirement": {"retained_value": 1}})
     with pytest.raises(ValueError, match="transform remove var"):
         plan_payload(path)
@@ -131,6 +149,8 @@ def test_the_plan_still_refuses_a_retirement(tmp_path: Path) -> None:
 
 
 def _model(columns: list[str] | None, sql: str = "", reason: str | None = None):
+    """A compiled model with the given columns, or none and a reason."""
+
     model = toggle._Model(sql, None, "shop", "")
     model.columns = columns
     model.reason = reason
@@ -138,6 +158,8 @@ def _model(columns: list[str] | None, sql: str = "", reason: str | None = None):
 
 
 def _branches(on=None, off=None, before=None, *, disabled_off=()):
+    """The three compiled branches a model is judged across."""
+
     out = {}
     for name, models in (("on", on), ("off", off), ("before", before)):
         branch = toggle._Branch()
@@ -148,6 +170,8 @@ def _branches(on=None, off=None, before=None, *, disabled_off=()):
 
 
 def _judge(branches, *, exempt=(), label="m") -> tuple[dict, dict]:
+    """Judge one model across ``branches`` and return its record and producers."""
+
     _variable, contract = toggle.parse_contract(
         {**CONTRACT, "columns": ["fee_amount", "fees"]}
     )
@@ -167,10 +191,14 @@ def _judge(branches, *, exempt=(), label="m") -> tuple[dict, dict]:
 
 
 def _checks(record: dict) -> list[str]:
+    """The check codes a record carries, in order."""
+
     return [c["check"] for c in record["checks"]]
 
 
 def test_a_model_gated_on_both_values_is_satisfied() -> None:
+    """A model gated on both values is satisfied."""
+
     record, producers = _judge(
         _branches(
             on={"m": _model(["id", "fee_amount"])},
@@ -184,6 +212,8 @@ def test_a_model_gated_on_both_values_is_satisfied() -> None:
 
 
 def test_a_governed_column_left_on_the_off_branch_is_contradicted() -> None:
+    """A governed column left on the off branch is contradicted."""
+
     record, _ = _judge(
         _branches(
             on={"m": _model(["id", "fee_amount"])},
@@ -194,6 +224,8 @@ def test_a_governed_column_left_on_the_off_branch_is_contradicted() -> None:
 
 
 def test_a_governed_column_read_under_another_name_is_contradicted() -> None:
+    """A governed column read under another name is contradicted."""
+
     record, _ = _judge(
         _branches(
             on={"m": _model(["id", "net"])},
@@ -208,6 +240,8 @@ def test_a_governed_column_read_under_another_name_is_contradicted() -> None:
 
 
 def test_an_exempt_model_may_keep_the_column_off() -> None:
+    """An exempt model may keep the column off."""
+
     record, producers = _judge(
         _branches(
             on={"m": _model(["id", "fee_amount"])},
@@ -221,6 +255,8 @@ def test_an_exempt_model_may_keep_the_column_off() -> None:
 
 
 def test_a_column_lost_on_the_on_branch_is_contradicted() -> None:
+    """A column lost on the on branch is contradicted."""
+
     record, _ = _judge(
         _branches(
             on={"m": _model(["id"])},
@@ -232,6 +268,8 @@ def test_a_column_lost_on_the_on_branch_is_contradicted() -> None:
 
 
 def test_an_ungoverned_column_lost_or_differing_is_contradicted() -> None:
+    """An ungoverned column lost or differing is contradicted."""
+
     record, _ = _judge(
         _branches(
             on={"m": _model(["id", "region", "fee_amount"])},
@@ -243,6 +281,8 @@ def test_an_ungoverned_column_lost_or_differing_is_contradicted() -> None:
 
 
 def test_an_unreadable_branch_is_unchecked_never_clean() -> None:
+    """An unreadable branch is unchecked never clean."""
+
     record, _ = _judge(
         _branches(
             on={"m": _model(None, reason="a `*` over raw.x")},
@@ -255,6 +295,8 @@ def test_an_unreadable_branch_is_unchecked_never_clean() -> None:
 
 
 def test_a_model_disabled_off_holds_nothing_off() -> None:
+    """A model disabled off holds nothing off."""
+
     record, _ = _judge(
         _branches(on={"m": _model(["id", "fee_amount"])}, off={}, disabled_off={"m"})
     )
@@ -263,6 +305,8 @@ def test_a_model_disabled_off_holds_nothing_off() -> None:
 
 
 def test_a_report_with_limits_is_never_satisfied() -> None:
+    """A report with limits is never satisfied."""
+
     clean = [toggle._record("m")]
     assert toggle._report(clean, [], [], 1)["verdict"] == "satisfied"
     limited = toggle._report(clean, ["a dynamic var() read"], [], 1)
@@ -275,14 +319,20 @@ def test_a_report_with_limits_is_never_satisfied() -> None:
 
 class _Adapter:
     def __init__(self, columns: dict[str, list[str]]) -> None:
+        """Serve these columns per relation name."""
+
         self.columns = columns
 
     def table_metadata(self, identifier: str):
+        """The columns of the relation ``identifier`` names, as metadata."""
+
         name = identifier.split(".")[-1]
         return None, [SimpleNamespace(name=c) for c in self.columns[name]]
 
 
 def _verify(value, columns, producers=None, exempt=()):
+    """Run the build-time check at ``value`` over relations with these columns."""
+
     stored = {
         **CONTRACT,
         "columns": ["fee_amount"],
@@ -305,6 +355,8 @@ def _verify(value, columns, producers=None, exempt=()):
 
 
 def test_an_off_build_judges_an_empty_table_by_its_columns() -> None:
+    """An off build judges an empty table by its columns."""
+
     findings, records, branch = _verify(
         (True, False), {"fct": ["id"], "empty": ["id", "fee_amount"], "other": ["id"]}
     )
@@ -319,6 +371,8 @@ def test_an_off_build_judges_an_empty_table_by_its_columns() -> None:
 
 
 def test_an_on_build_holds_every_producer() -> None:
+    """An on build holds every producer."""
+
     findings, _records, branch = _verify(
         (True, True), {"fct": ["id", "fee_amount"], "empty": ["id"]}
     )
@@ -328,6 +382,8 @@ def test_an_on_build_holds_every_producer() -> None:
 
 
 def test_an_unknown_value_judges_nothing() -> None:
+    """An unknown value judges nothing."""
+
     findings, records, branch = _verify((False, None), {"fct": ["id"]})
     assert branch is None
     assert findings == []
@@ -335,15 +391,21 @@ def test_an_unknown_value_judges_nothing() -> None:
 
 
 def test_a_producer_not_built_is_named() -> None:
+    """A producer not built is named."""
+
     _findings, records, _branch = _verify((True, False), {"fct": ["id"]})
     by = {(r["model"], r["branch"]): r for r in records}
     assert by[("empty", "off")]["reason_code"] == "not_built"
 
 
 def test_an_off_build_absorbs_the_documented_governed_columns() -> None:
+    """An off build absorbs the documented governed columns."""
+
     from exmergo_dex_core.maintain.drift import DriftFinding
 
     def missing(columns):
+        """A ``column_missing`` finding on model ``m`` naming ``columns``."""
+
         return DriftFinding(
             axis="build",
             code="column_missing",
@@ -375,6 +437,8 @@ def test_a_driver_error_while_verifying_is_reported_not_raised(tmp_path: Path) -
     )
 
     def broken_adapter():
+        """Fail the way a database driver does."""
+
         raise RuntimeError("driver went away")
 
     result = BuildVerification(ran=True)
@@ -395,6 +459,8 @@ def test_a_driver_error_while_verifying_is_reported_not_raised(tmp_path: Path) -
 
 
 def test_an_analysis_failure_reads_as_unchecked() -> None:
+    """An analysis failure reads as unchecked."""
+
     report = toggle.analysis_failed("KeyError")
     assert report["verdict"] == "unchecked"
     assert report["completeness"] == "incomplete"
@@ -480,6 +546,8 @@ def test_what_the_plan_could_not_judge_is_owed_by_every_build() -> None:
 
 
 def test_a_verification_failure_still_owes_the_plan_gaps(tmp_path: Path) -> None:
+    """A verification failure still owes the plan gaps."""
+
     from exmergo_dex_core.transform.verify import BuildVerification, _toggle_contract
 
     (tmp_path / "dbt_project.yml").write_text(
@@ -487,6 +555,8 @@ def test_a_verification_failure_still_owes_the_plan_gaps(tmp_path: Path) -> None
     )
 
     def broken_adapter():
+        """Fail the way a database driver does."""
+
         raise RuntimeError("driver went away")
 
     result = BuildVerification(ran=True)

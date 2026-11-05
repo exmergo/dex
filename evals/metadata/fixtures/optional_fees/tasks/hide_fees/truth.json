@@ -123,14 +123,14 @@
           "sql": "select count(*) - count(distinct order_id) from main.fct_orders"
         },
         {
-          "name": "every source order is in the order fact, unchanged",
+          "name": "every source order is in the order fact, fee and net amount included",
           "expect": 0,
-          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on from raw.orders except select order_id, merchant_id, gross_amount, ordered_on from main.fct_orders)"
+          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on, platform_fee, gross_amount - platform_fee as net_amount from raw.orders except select order_id, merchant_id, gross_amount, ordered_on, platform_fee, net_amount from main.fct_orders)"
         },
         {
-          "name": "every order in the order fact is a source order, unchanged",
+          "name": "every order in the order fact is a source order, fee and net amount included",
           "expect": 0,
-          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on from main.fct_orders except select order_id, merchant_id, gross_amount, ordered_on from raw.orders)"
+          "sql": "select count(*) from (select order_id, merchant_id, gross_amount, ordered_on, platform_fee, net_amount from main.fct_orders except select order_id, merchant_id, gross_amount, ordered_on, platform_fee, gross_amount - platform_fee as net_amount from raw.orders)"
         },
         {
           "name": "the merchant report keeps one row per merchant",
