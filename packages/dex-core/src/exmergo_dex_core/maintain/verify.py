@@ -2569,10 +2569,17 @@ def _model_joins(
                 if left_relation is None or right_relation is None:
                     unresolved = True
                     break
+                # Only a set operation is decided by the first hop's shape. A
+                # filtered first hop may now be carried (#1085), so whether it
+                # is the reason is the walk's to record, at any depth; a column
+                # that fails for another reason (a computed one) stays
+                # `unresolved_column`.
                 for relation in (left_relation, right_relation):
-                    shape = _cte_shape(relation, cte_scopes, sql_shape)
-                    if shape is not None:
-                        unresolved_code = shape
+                    if (
+                        _cte_shape(relation, cte_scopes, sql_shape)
+                        == "set_operation_cte"
+                    ):
+                        unresolved_code = "set_operation_cte"
                 # Each side resolves with its own walk, which carries a
                 # supported filter down to the physical relation (#1085) and
                 # records why an unsupported one stays unchecked.
@@ -3423,7 +3430,12 @@ def _side_label(dataset: str, filters: tuple[str, ...]) -> str:
 
     if not filters:
         return dataset
-    return f"{dataset} (rows where {' AND '.join(filters)})"
+    # Parenthesized when there are several, as the probe joins them: a filter
+    # may hold an OR, and `a OR b AND c` reads as a different population.
+    joined = (
+        filters[0] if len(filters) == 1 else " AND ".join(f"({f})" for f in filters)
+    )
+    return f"{dataset} (rows where {joined})"
 
 
 def _key_conversion(candidate: JoinCandidate) -> dict:

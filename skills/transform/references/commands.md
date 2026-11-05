@@ -82,8 +82,9 @@ See the cost-controls reference for the shared budget mechanism.
     CTE, on the one chain of scopes that read the conversion's scope as their
     `FROM`, carried back onto the rows counted, as `scope: predicate`. A
     conjunct reading the conversion's own output is its effect and stays
-    counted. `later_filters_not_applied` names, as `{scope, filter, reason}`,
-    whatever else a later scope does to those rows: a filtering join, `HAVING`,
+    counted. `later_filters_not_applied` names, as `{scope, reason}` plus
+    `filter` when a specific predicate was skipped (a join, `HAVING`, `QUALIFY`
+    or `LIMIT` carries none), whatever else a later scope does to those rows: a filtering join, `HAVING`,
     `QUALIFY`, `LIMIT`, a filter on the conversion's output or the join's
     other side, or a scope read twice or through a join or set operation.
   - `identity`: on an edited model, the prior and authored model's distinct keys

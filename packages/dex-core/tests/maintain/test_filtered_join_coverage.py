@@ -473,3 +473,22 @@ def test_a_declared_never_null_column_read_through_the_filter_makes_it_required(
     assert record["declared"]["derived_columns"] == ["account_name"]
     assert record["threshold_source"] == "contract"
     assert record["status"] == "contradicted"
+
+
+def test_a_computed_join_column_behind_a_carried_filter_is_unresolved_not_filtered():
+    # The filter is supported; the key is computed. The reason is the column,
+    # so the code must not claim the filter's shape stopped it.
+    candidates, (skip,) = _joins(
+        f"with c as (select id, coalesce(x, 0) as k from {W}.t where active) "
+        f"select * from {W}.o o join c on o.id = c.k"
+    )
+    assert candidates == []
+    assert skip.code == "unresolved_column"
+
+
+def test_several_filters_are_parenthesized_where_findings_name_them():
+    assert verify_mod._side_label("t", ("a OR b",)) == "t (rows where a OR b)"
+    assert (
+        verify_mod._side_label("t", ("a OR b", "c"))
+        == "t (rows where (a OR b) AND (c))"
+    )
