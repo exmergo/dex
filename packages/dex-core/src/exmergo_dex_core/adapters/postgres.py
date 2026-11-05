@@ -230,6 +230,7 @@ class PostgresAdapter:
         self._missing_stats: dict[str, set[str]] = {}
         self._exact_measured: dict[str, set[str]] = {}
         self._session_prepared = False
+        self._query_type_details: dict[int, tuple[str, bool, str | None]] = {}
 
     # --- capabilities (free) ---------------------------------------------------
 
@@ -1137,13 +1138,24 @@ class PostgresAdapter:
         """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
 
         checked = assert_select_only(sql, dialect=self.dialect)
+        type_codes: list[Any] = []
         _rows, labels, types = self._run_rows(
             f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
             fetch_rows=1,
+            type_codes=type_codes,
         )
         return [
-            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
-            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+            ColumnMeta(
+                name=label,
+                data_type=kind,
+                nullable=True,
+                ordinal=ordinal,
+                groupable=groupable,
+                comparison_type=comparison_type,
+            )
+            for ordinal, (label, kind, groupable, comparison_type) in enumerate(
+                zip(labels, *self._describe_types(types, type_codes), strict=True)
+            )
         ]
 
     def run_query(
@@ -1186,6 +1198,7 @@ class PostgresAdapter:
         *,
         timeout_seconds: float | None = None,
         fetch_rows: int | None = None,
+        type_codes: list[Any] | None = None,
     ) -> tuple[list, list[str], list[str]]:
         """The single billed door past the gate: the server-side
         statement_timeout is wound down to what remains of the budget (or the
@@ -1224,6 +1237,8 @@ class PostgresAdapter:
         self._record_elapsed(started, sql)
         labels = [str(d.name) for d in cursor.description]
         types = [self._description_type(d) for d in cursor.description]
+        if type_codes is not None:
+            type_codes.extend(getattr(d, "type_code", None) for d in cursor.description)
         return rows, labels, types
 
     def pin_utc_session(self) -> None:
@@ -1308,9 +1323,60 @@ class PostgresAdapter:
             return str(info.name)
         return str(getattr(type_code, "name", type_code))
 
+    def _describe_types(
+        self, names: list[str], type_codes: list[Any]
+    ) -> tuple[list[str], list[bool], list[str | None]]:
+        """Resolve driver-unknown OIDs and their comparison capabilities."""
+
+        resolved = list(names)
+        groupable = [True] * len(names)
+        comparison_types: list[str | None] = [None] * len(names)
+        for index, (name, type_code) in enumerate(zip(names, type_codes, strict=True)):
+            if not name.isdigit() or not isinstance(type_code, int):
+                continue
+            resolved_name, can_group, comparison_type = self._type_details(type_code)
+            resolved[index] = resolved_name
+            groupable[index] = can_group
+            comparison_types[index] = comparison_type
+        return resolved, groupable, comparison_types
+
+    def _type_details(self, oid: int) -> tuple[str, bool, str | None]:
+        """Name an extension OID and prove it has a comparison operator class."""
+
+        cached = self._query_type_details.get(oid)
+        if cached is not None:
+            return cached
+        row = self._catalog(
+            "SELECT pg_catalog.format_type(%s::oid, NULL) AS type_name, "
+            "EXISTS ("
+            "SELECT 1 FROM pg_catalog.pg_opclass AS opclass "
+            "JOIN pg_catalog.pg_am AS access_method "
+            "ON access_method.oid = opclass.opcmethod "
+            "WHERE opclass.opcintype = %s::oid "
+            "AND access_method.amname IN ('btree', 'hash')"
+            ") AS groupable, "
+            "EXISTS ("
+            "SELECT 1 FROM pg_catalog.pg_depend AS dependency "
+            "JOIN pg_catalog.pg_extension AS extension "
+            "ON extension.oid = dependency.refobjid "
+            "WHERE dependency.classid = 'pg_catalog.pg_type'::pg_catalog.regclass "
+            "AND dependency.objid = %s::oid "
+            "AND extension.extname = 'citext'"
+            ") AS is_citext",
+            (oid, oid, oid),
+        )[0]
+        name = str(row["type_name"] or oid)
+        groupable = bool(row["groupable"])
+        comparison_type = "text" if groupable and row["is_citext"] else None
+        details = (name, groupable, comparison_type)
+        self._query_type_details[oid] = details
+        return details
+
     # --- helpers ------------------------------------------------------------------
 
-    def _catalog(self, sql: str) -> list[dict]:
+    def _catalog(
+        self, sql: str, params: tuple[object, ...] | None = None
+    ) -> list[dict]:
         """Free metadata door: engine-built catalog SELECTs only (pg_catalog
         lookups and session settings, no table scans). Results come back as
         dicts keyed by the column names."""
@@ -1319,7 +1385,7 @@ class PostgresAdapter:
             raise ValueError("only SELECT statements pass through the catalog door")
         self._ensure_session()
         cursor = self._conn.cursor()
-        cursor.execute(sql)
+        cursor.execute(sql, params) if params is not None else cursor.execute(sql)
         labels = [str(d.name) for d in cursor.description]
         return [dict(zip(labels, row, strict=True)) for row in cursor.fetchall()]
 

@@ -586,6 +586,60 @@ def test_unsupported_type_is_caught_before_run():
     assert ran == []
 
 
+def test_adapter_marked_ungroupable_type_is_caught_before_run():
+    ran: list[str] = []
+
+    class _Stub:
+        dialect = "postgres"
+
+        def describe_query(self, sql: str):
+            return [ColumnMeta("payload", "app.uncomparable", True, 0, False)]
+
+        def run_query(self, sql: str, **kwargs):
+            ran.append(sql)
+            raise AssertionError("run_query was called")
+
+    result = _compare(
+        "select 1 as payload",
+        "select 1 as payload",
+        _Stub(),
+        DexCache(),
+    )
+    assert result.status == "not_checked"
+    assert result.reason_code == "unsupported_type"
+    assert result.detail == "payload (app.uncomparable)"
+    assert ran == []
+
+
+def test_adapter_requested_text_comparison_representation_is_used():
+    ran: list[str] = []
+
+    class _Stub:
+        dialect = "postgres"
+
+        def describe_query(self, sql: str):
+            return [ColumnMeta("status", "citext", True, 0, comparison_type="text")]
+
+        def run_query(self, sql: str, **kwargs):
+            ran.append(sql)
+            return QueryResult(
+                columns=["left_rows", "right_rows", "only_in_left", "only_in_right"],
+                types=["int8"] * 4,
+                cells=[[1, 1, 0, 0]],
+                truncated=False,
+            )
+
+    result = _compare(
+        "select 'Alpha' as status",
+        "select 'Alpha' as status",
+        _Stub(),
+        DexCache(),
+    )
+    assert result.status == "equivalent"
+    assert len(ran) == 1
+    assert 'CAST("status" AS TEXT) COLLATE "C"' in ran[0]
+
+
 def test_comparison_sql_is_exact_not_hashed(warehouse):
     adapter, cache = warehouse
     spy = _RecordingAdapter(adapter)

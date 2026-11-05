@@ -163,6 +163,32 @@ def test_get_adapter_constructs_postgres(fake_pg_connection):
     assert get_dialect("postgres") == "postgres"
 
 
+@pytest.mark.parametrize(
+    ("oid", "type_name", "groupable", "comparison_type"),
+    [
+        (17263, "citext", True, "text"),
+        (17264, "app.uncomparable", False, None),
+    ],
+)
+def test_describe_query_resolves_unknown_type_oids(
+    fake_pg_connection, oid, type_name, groupable, comparison_type
+):
+    fake_pg_connection.type_metadata[oid] = (type_name, groupable, comparison_type)
+    fake_pg_connection.row_resolver = lambda _sql: FakeResult(
+        rows=[], columns=["value"], type_codes=[oid]
+    )
+    adapter = make_adapter(fake_pg_connection)
+
+    (column,) = adapter.describe_query("SELECT 1 AS value")
+
+    assert column.data_type == type_name
+    assert column.groupable is groupable
+    assert column.comparison_type == comparison_type
+    catalog = [s.sql for s in fake_pg_connection.statements if "format_type" in s.sql]
+    assert len(catalog) == 1
+    assert "%s::oid" in catalog[0]
+
+
 # --- estimation (free) --------------------------------------------------------------
 
 

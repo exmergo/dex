@@ -92,6 +92,8 @@ class FakeResult:
 
     rows: list[dict]
     seconds: float = DEFAULT_STATEMENT_SECONDS
+    columns: list[str] | None = None
+    type_codes: list[int] | None = None
 
 
 class FakeCursor:
@@ -100,7 +102,7 @@ class FakeCursor:
         self._rows: list[tuple] = []
         self.description: list[FakeColumnDescription] = []
 
-    def execute(self, sql: str):
+    def execute(self, sql: str, params: tuple[object, ...] | None = None):
         stripped = sql.strip()
         upper = stripped.upper()
         self._record(sql)
@@ -118,7 +120,7 @@ class FakeCursor:
             or "current_database()" in sql
             or "has_schema_privilege" in sql
         ):
-            self._serve_catalog(stripped)
+            self._serve_catalog(stripped, params)
             return self
 
         # A data statement: simulate duration, enforce the session timeout the
@@ -131,7 +133,7 @@ class FakeCursor:
                 "canceling statement due to statement timeout"
             )
         self._conn.clock.now += result.seconds
-        self._emit(result.rows)
+        self._emit(result.rows, columns=result.columns, type_codes=result.type_codes)
         return self
 
     def fetchall(self) -> list[tuple]:
@@ -164,11 +166,25 @@ class FakeCursor:
         except (IndexError, ValueError):
             pass
 
-    def _serve_catalog(self, sql: str) -> None:
+    def _serve_catalog(self, sql: str, params: tuple[object, ...] | None) -> None:
         # The privilege predicates come first: has_database_privilege names
         # current_database() too, and would otherwise be answered as the
         # capabilities probe.
-        if "has_database_privilege" in sql:
+        if "format_type" in sql and params:
+            oid = int(params[0])
+            type_name, groupable, comparison_type = self._conn.type_metadata.get(
+                oid, (str(oid), False, None)
+            )
+            self._emit(
+                [
+                    {
+                        "type_name": type_name,
+                        "groupable": groupable,
+                        "is_citext": comparison_type == "text",
+                    }
+                ]
+            )
+        elif "has_database_privilege" in sql:
             role = self._conn.roles.get(_first_literal(sql))
             self._emit([{"may_create": bool(role and role.may_create_in_database)}])
         elif "has_schema_privilege" in sql:
@@ -251,9 +267,18 @@ class FakeCursor:
                 return t
         return None
 
-    def _emit(self, rows: list[dict], columns: list[str] | None = None) -> None:
+    def _emit(
+        self,
+        rows: list[dict],
+        columns: list[str] | None = None,
+        type_codes: list[int] | None = None,
+    ) -> None:
         keys = columns or (list(rows[0].keys()) if rows else ["name"])
-        self.description = [FakeColumnDescription(name=key) for key in keys]
+        codes = type_codes or [25] * len(keys)
+        self.description = [
+            FakeColumnDescription(name=key, type_code=code)
+            for key, code in zip(keys, codes, strict=True)
+        ]
         self._rows = [tuple(row[key] for key in keys) for row in rows]
 
 
@@ -284,6 +309,7 @@ class FakePostgresConnection:
         plan_costs: Callable[[str], float | None] | None = None,
         roles: list[FakeRole] | None = None,
         empty_schemas: list[str] | None = None,
+        type_metadata: dict[int, tuple[str, bool, str | None]] | None = None,
     ):
         self.tables = tables or []
         # Roles the database knows, and their privileges: what the dev-target
@@ -292,6 +318,7 @@ class FakePostgresConnection:
         # declared here.
         self.roles = {role.name: role for role in (roles or [])}
         self.empty_schemas = set(empty_schemas or [])
+        self.type_metadata = type_metadata or {}
         self.database = database
         self.server_version = server_version
         self.clock = clock or FakeClock()

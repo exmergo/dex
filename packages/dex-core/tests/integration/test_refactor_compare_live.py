@@ -142,6 +142,70 @@ def test_describe_reports_a_known_statement_in_order(connector, engine_for):
     assert [column.name.lower() for column in columns] == ["first_col", "second_col"]
 
 
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_postgres_citext_is_named_and_compared_exactly(engine_for):
+    """The seed enables citext because the integration role is read-only."""
+
+    adapter = engine_for("postgres")._adapter("transform compare")
+    builtin = adapter.describe_query("select 1::integer as id, 'x'::text as name")
+    assert [(column.name, column.data_type) for column in builtin] == [
+        ("id", "int4"),
+        ("name", "text"),
+    ]
+    columns = adapter.describe_query("select 'Alpha'::citext as status")
+    assert [(column.name, column.data_type) for column in columns] == [
+        ("status", "citext")
+    ]
+
+    def compare(left: str, right: str):
+        return compare_refactors(
+            f"select '{left}'::citext as status",
+            f"select '{right}'::citext as status",
+            adapter=adapter,
+            cache=DexCache(),
+            limits=QueryLimits(),
+            command="transform compare",
+        )
+
+    equivalent = compare("Alpha", "Alpha")
+    assert equivalent.status == "equivalent", equivalent.detail
+    assert equivalent.schema is not None
+    assert equivalent.schema.only_in_left == ()
+    assert equivalent.schema.only_in_right == ()
+
+    different = compare("Alpha", "Beta")
+    assert different.status == "different", different.detail
+
+    # citext equality ignores case. Comparisons intentionally read it as text,
+    # so a case-only rewrite remains a real row change.
+    case_only = compare("Alpha", "alpha")
+    assert case_only.status == "different", case_only.detail
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_postgres_ungroupable_user_type_is_named_and_refused(engine_for):
+    adapter = engine_for("postgres")._adapter("transform compare")
+    sql = "select row('{\"value\": 1}'::json)::app.uncomparable as payload"
+    columns = adapter.describe_query(sql)
+    assert [(column.name, column.data_type) for column in columns] == [
+        ("payload", "app.uncomparable")
+    ]
+
+    result = compare_refactors(
+        sql,
+        sql,
+        adapter=adapter,
+        cache=DexCache(),
+        limits=QueryLimits(),
+        command="transform compare",
+    )
+    assert result.status == "not_checked"
+    assert result.reason_code == "unsupported_type"
+    assert result.detail == "payload (app.uncomparable)"
+
+
 @pytest.mark.parametrize("connector", _CONNECTORS)
 def test_an_ungroupable_type_stops_before_it_runs(connector, engine_for):
     adapter = engine_for(connector)._adapter("transform compare")
