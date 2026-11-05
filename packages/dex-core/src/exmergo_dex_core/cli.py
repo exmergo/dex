@@ -1139,9 +1139,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     )
                     sp.add_argument(
                         "--select",
+                        nargs="+",
                         default=None,
                         metavar="SELECTOR",
-                        help="dbt node selection, passed through to dbt",
+                        help="dbt node selection, passed through to dbt (accepts several values)",
                     )
                     # Opt-in on every connector, free ones included. Verifying
                     # on DuckDB costs nothing, so defaulting it on there was

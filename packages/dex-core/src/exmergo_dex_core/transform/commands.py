@@ -4515,11 +4515,14 @@ def _for_plan_document(args: argparse.Namespace) -> Any:
 
 def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
+        select = getattr(args, "select", None)
+        if select:
+            select = " ".join(select)
         return to_envelope(
             build(
                 engine,
                 target=getattr(args, "target", None),
-                select=getattr(args, "select", None),
+                select=select,
                 verify=getattr(args, "verify", False),
                 for_plan=getattr(args, "for_plan", None),
                 for_plan_document=_for_plan_document(args),
