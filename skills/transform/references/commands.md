@@ -75,8 +75,18 @@ See the cost-controls reference for the shared budget mechanism.
     measured as its safe form), `retained_entities`, `converted_entities`,
     `collided_keys` and `colliding_source_entities` (`7` and `007` become one
     key), `representation_changed_entities` (`007` read back as `7`), and on a
-    join `matched_entities` against the other side's distinct keys.
+    join `matched_entities` against the other side's distinct keys that pass
+    its own `WHERE` and `ON` conjuncts (`partner_filters`, #1073).
     `denominator` states the population in words.
+  - `later_filters_applied` (#1073): a row-by-row `WHERE` conjunct in a later
+    CTE, on the one chain of scopes that read the conversion's scope as their
+    `FROM`, carried back onto the rows counted, as `scope: predicate`. A
+    conjunct reading the conversion's own output is its effect and stays
+    counted. `later_filters_not_applied` names, as `{scope, reason}` plus
+    `filter` when a specific predicate was skipped (a join, `HAVING`, `QUALIFY`
+    or `LIMIT` carries none), whatever else a later scope does to those rows: a filtering join, `HAVING`,
+    `QUALIFY`, `LIMIT`, a filter on the conversion's output or the join's
+    other side, or a scope read twice or through a join or set operation.
   - `identity`: on an edited model, the prior and authored model's distinct keys
     in one output column, as text: `kept`, `lost`, `gained` and both row counts.
     `identity_changed` holds even when the row counts are equal.

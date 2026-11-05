@@ -1433,12 +1433,18 @@ class JoinCoverageCounts(NamedTuple):
 #: None for the bare column (#861).
 KeyExprs = dict[int, tuple[tuple[str | None, ...], tuple[str | None, ...]]]
 
+#: Per relationship (by ``id``), the row filter each side's relation is read
+#: through before the join, a DuckDB predicate over the relation's own columns,
+#: or None for the whole relation (#1085).
+ScopeFilters = dict[int, tuple[str | None, str | None]]
+
 
 def coverage_probe_sql(
     batch: list[Relationship],
     *,
     key_cast: str | None = None,
     key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
 ) -> str:
     """One aggregate statement measuring every edge of ``batch``'s coverage.
 
@@ -1459,6 +1465,13 @@ def coverage_probe_sql(
     on the side that writes it (#861). The NULL test stays on the raw key, so
     a key the conversion fails on is eligible and unmatched, and is counted
     apart as a failed conversion.
+
+    ``scope_filters`` reads a side through the filter the model applies before
+    joining it (#1085): the child as ``(SELECT * FROM child WHERE f) c``, so its
+    row and key counts are the filtered population's, and the parent's distinct
+    keys from its filtered rows, so a key present only in rows the filter drops
+    is not a match. Children are grouped by relation *and* filter, since the
+    same table read through two filters is two populations.
     """
 
     def _cast_key(expr: str) -> str:
@@ -1470,13 +1483,19 @@ def coverage_probe_sql(
         """
         return expr if template is None else template.format(expr)
 
-    by_child: dict[str, list[tuple[int, Relationship]]] = {}
+    def _filters(rel: Relationship) -> tuple[str | None, str | None]:
+        return (scope_filters or {}).get(id(rel), (None, None))
+
+    by_child: dict[tuple[str, str | None], list[tuple[int, Relationship]]] = {}
     for index, rel in enumerate(batch):
-        by_child.setdefault(rel.from_dataset, []).append((index, rel))
+        key = (rel.from_dataset, _filters(rel)[0])
+        by_child.setdefault(key, []).append((index, rel))
 
     aggregates: list[str] = []
-    for child, edges in by_child.items():
+    for (child, child_filter), edges in by_child.items():
         child_sql = _quote_identifier(child)
+        if child_filter is not None:
+            child_sql = f"(SELECT * FROM {child_sql} WHERE {child_filter})"  # noqa: S608
         counts: list[str] = []
         joins: list[str] = []
         for index, rel in edges:
@@ -1486,6 +1505,8 @@ def coverage_probe_sql(
             from_exprs = tuple(from_exprs) or (None,) * len(fks)
             to_exprs = tuple(to_exprs) or (None,) * len(keys)
             parent = _quote_identifier(rel.to_dataset)
+            parent_filter = _filters(rel)[1]
+            parent_where = f" WHERE {parent_filter}" if parent_filter else ""
             nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
             parent_keys = ", ".join(
                 f"{_cast_key(_apply(to_exprs[pair], key))} AS pk{pair}"
@@ -1501,7 +1522,8 @@ def coverage_probe_sql(
                 if template is not None
             )
             distinct_parent = (
-                f"(SELECT DISTINCT {parent_keys}, 1 AS dex_hit FROM {parent})"  # noqa: S608
+                f"(SELECT DISTINCT {parent_keys}, 1 AS dex_hit "  # noqa: S608
+                f"FROM {parent}{parent_where})"
             )
             counts.append(
                 f"COUNT(*) AS dex_cov_rows_{index}, "
@@ -1551,11 +1573,15 @@ def coverage_statements(
     dialect: str,
     *,
     key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
 ) -> list[str]:
     """The exact statements :func:`measure_coverage` runs, for pricing first."""
 
     return [
-        _transpile_probe(coverage_probe_sql(batch, key_exprs=key_exprs), dialect)
+        _transpile_probe(
+            coverage_probe_sql(batch, key_exprs=key_exprs, scope_filters=scope_filters),
+            dialect,
+        )
         for batch in probe_batches(probe_candidates(relationships))
     ]
 
@@ -1567,12 +1593,15 @@ def _run_coverage_batch(
     timeout_seconds: float,
     key_cast: str | None = None,
     key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
 ) -> list[tuple[Relationship, JoinCoverageCounts]]:
     """Run one batched coverage probe and read each relationship's counts back from its
     single aggregate row.
     """
     sql = _transpile_probe(
-        coverage_probe_sql(batch, key_cast=key_cast, key_exprs=key_exprs),
+        coverage_probe_sql(
+            batch, key_cast=key_cast, key_exprs=key_exprs, scope_filters=scope_filters
+        ),
         adapter.dialect,
     )
     result = adapter.run_query(
@@ -1618,6 +1647,7 @@ def measure_coverage(
     *,
     timeout_seconds: float = 30.0,
     key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
 ) -> tuple[
     list[tuple[Relationship, JoinCoverageCounts]], list[tuple[Relationship, str]]
 ]:
@@ -1629,13 +1659,22 @@ def measure_coverage(
     than raised. Budget, timeout and connection failures still raise.
     """
 
+    def _withheld(rel: Relationship) -> bool:
+        # A converted key or a carried filter can make the warehouse quote a
+        # value in its refusal, so its words are withheld (#861, #1085).
+        return id(rel) in (key_exprs or {}) or id(rel) in (scope_filters or {})
+
     measured: list[tuple[Relationship, JoinCoverageCounts]] = []
     refused: list[tuple[Relationship, str]] = []
     for batch in probe_batches(probe_candidates(relationships)):
         try:
             measured.extend(
                 _run_coverage_batch(
-                    adapter, batch, timeout_seconds=timeout_seconds, key_exprs=key_exprs
+                    adapter,
+                    batch,
+                    timeout_seconds=timeout_seconds,
+                    key_exprs=key_exprs,
+                    scope_filters=scope_filters,
                 )
             )
             continue
@@ -1649,6 +1688,7 @@ def measure_coverage(
                         [rel],
                         timeout_seconds=timeout_seconds,
                         key_exprs=key_exprs,
+                        scope_filters=scope_filters,
                     )
                 )
                 continue
@@ -1657,9 +1697,7 @@ def measure_coverage(
                     refused.append(
                         (
                             rel,
-                            _refusal_text(
-                                rel, exc, withhold=id(rel) in (key_exprs or {})
-                            ),
+                            _refusal_text(rel, exc, withhold=_withheld(rel)),
                         )
                     )
                     continue
@@ -1671,15 +1709,14 @@ def measure_coverage(
                         timeout_seconds=timeout_seconds,
                         key_cast=_CLICKHOUSE_INT128,
                         key_exprs=key_exprs,
+                        scope_filters=scope_filters,
                     )
                 )
             except WarehouseQueryError as cast_exc:
                 refused.append(
                     (
                         rel,
-                        _refusal_text(
-                            rel, cast_exc, withhold=id(rel) in (key_exprs or {})
-                        ),
+                        _refusal_text(rel, cast_exc, withhold=_withheld(rel)),
                     )
                 )
     return measured, refused

@@ -2912,10 +2912,12 @@ def test_a_column_read_through_a_union_cte_is_unresolvable():
     assert skipped[0].code == "set_operation_cte"
 
 
-def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
+def test_a_filtered_cte_is_measured_with_its_filter_not_unfiltered():
     # `where active = true` means the real join is against only the active
     # subset; probing the whole physical table instead can report a join
-    # healthy that has zero overlap once the filter is honored.
+    # healthy that has zero overlap once the filter is honored. A simple
+    # filter is carried onto the probe (#1085); any other reducer is still
+    # skipped as `filtered_cte` (tests/maintain/test_filtered_join_coverage.py).
     candidates, skipped = verify_mod._model_joins(
         _parsed(
             "with active_customers as ("
@@ -2926,9 +2928,11 @@ def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
         ),
         sql_shape,
     )
-    assert candidates == []
-    assert len(skipped) == 1
-    assert skipped[0].code == "filtered_cte"
+    assert skipped == []
+    (candidate,) = candidates
+    assert candidate.to_relation == "wh.main.customers"
+    assert candidate.to_filters == ('"active" = TRUE',)
+    assert candidate.from_filters == ()
 
 
 def test_a_cross_join_is_silently_excluded():

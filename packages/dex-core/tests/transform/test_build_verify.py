@@ -1818,3 +1818,69 @@ def test_a_rebuilt_models_view_parent_is_priced_with_the_build(tmp_path: Path):
     price, _ = price_verification(adapter, tmp_path, scope=scope, recomputed=["events"])
     assert price == 1024.0
     assert "stg_events" in adapter.sql[0]
+
+
+_FILTERED_SQL = (
+    'with active_accounts as (select * from "wh"."dbt_dev"."account_history" '
+    "where is_active) "
+    'select e.event_id, a.account_name from "wh"."dbt_dev"."events" e '
+    "left join active_accounts a on e.account_id = a.account_id"
+)
+
+
+def test_a_build_measures_a_join_through_a_filtered_cte_over_its_filter(
+    tmp_path: Path,
+):
+    """The same filtered-CTE support `maintain verify` has, through the build
+    sweep (#1085): every event key exists in account history, but only in
+    inactive rows, so over the rows the model joins nothing matches."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.account_history AS SELECT * FROM (VALUES "
+        "('acc_a', 'Alder', FALSE), ('acc_b', 'Birch', TRUE)) "
+        "t(account_id, account_name, is_active)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.events AS SELECT * FROM (VALUES "
+        "(1, 'acc_a'), (2, 'acc_a')) t(event_id, account_id)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_events AS " + _FILTERED_SQL.replace('"wh".', "")
+    )
+    conn.close()
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.rpt_events": {
+                "name": "rpt_events",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."rpt_events"',
+                "compiled_code": _FILTERED_SQL,
+                "config": {"materialized": "table"},
+            }
+        },
+        results=[{"unique_id": "model.p.rpt_events", "status": "success"}],
+    )
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_events")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    codes = {f.code: f for f in result.findings}
+    assert codes["join_no_match"].data["eligible_rows"] == 2
+    (record,) = result.payload()["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["measured"]["matched_rows"] == 0
+    assert record["effective_input"]["to"]["filters"] == ['"is_active"']

@@ -237,7 +237,9 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      each cast/try_cast/lower/upper/trim the plan adds to an identifier
                                      and, gated like row attribution, counts what it does to entities
                                      (failed, merged, respelled, matched, prior identities lost), with
-                                     a status of lossless, declared, undeclared or unchecked (#861);
+                                     a status of lossless, declared, undeclared or unchecked (#861),
+                                     matching only partner keys its filters keep and carrying a later
+                                     CTE's row filters back, naming the rest (#1073);
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref
@@ -569,7 +571,9 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      contract: every equality join's coverage, rows and distinct keys
                                      apart, one data.join_coverage record per join (satisfied,
                                      contradicted, not_applicable for an empty input, unchecked with a
-                                     reason_code); join_no_match for a nonempty population matching
+                                     reason_code), a side read through a simple WHERE-only CTE measured
+                                     over its filtered rows with effective_input on the record (#1085),
+                                     any other filtering CTE unchecked as filtered_cte; join_no_match for a nonempty population matching
                                      nothing, join_orphans and join_zero_overlap against the contract or
                                      the stated defaults, join_field_all_null and join_field_newly_null
                                      for a column the join supplies that came back all NULL. A project that fails

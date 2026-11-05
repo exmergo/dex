@@ -1953,6 +1953,27 @@ class JoinCandidate:
     #: neither side converts anything, which is every join written before this.
     from_keys: tuple[str | None, ...] = ()
     to_keys: tuple[str | None, ...] = ()
+    #: Per side, the row filters a CTE or subquery applies before the join reads
+    #: it, carried down to the physical relation in DuckDB SQL (#1085). Part of
+    #: equality: the same keys read through a different filter are a different
+    #: input. Empty where the side reads its relation unfiltered.
+    from_filters: tuple[str, ...] = ()
+    to_filters: tuple[str, ...] = ()
+    #: The filtering scopes behind each side, as the model writes them.
+    from_scopes: tuple[str, ...] = field(default=(), compare=False)
+    to_scopes: tuple[str, ...] = field(default=(), compare=False)
+
+    def scope_filters(self) -> tuple[str | None, str | None] | None:
+        """Each side's filters joined into one predicate, or None where neither
+        side is filtered (#1085)."""
+
+        if not self.from_filters and not self.to_filters:
+            return None
+
+        def joined(filters: tuple[str, ...]) -> str | None:
+            return " AND ".join(f"({f})" for f in filters) if filters else None
+
+        return joined(self.from_filters), joined(self.to_filters)
 
     def key_exprs(self) -> tuple[tuple[str | None, ...], tuple[str | None, ...]] | None:
         """The conversion templates applied to each side's keys, or None where the join
@@ -1977,6 +1998,144 @@ class JoinSkip:
 
     def __str__(self) -> str:
         return f"{self.join}: {self.reason}" if self.join else self.reason
+
+
+@dataclass
+class _FilterWalk:
+    """What one join side's column resolution collected on its way to the
+    physical relation (#1085): the filters of every scope it resolved through,
+    carried down to that relation, or the reason it could not carry one.
+
+    ``filters`` holds ``(physical relation name, predicate)`` pairs, the
+    predicate in DuckDB SQL over the physical column names, unqualified and
+    quoted, the form the coverage probe is authored in before it is transpiled
+    to the connector's dialect. ``scopes`` names each filtering scope as the
+    model writes it, for the record. ``code``/``reason`` is the first failure.
+    """
+
+    dialect: str | None = None
+    filters: list[tuple[str, str]] = field(default_factory=list)
+    scopes: list[str] = field(default_factory=list)
+    code: str | None = None
+    reason: str | None = None
+
+    def fail(self, code: str, reason: str) -> None:
+        if self.code is None:
+            self.code, self.reason = code, reason
+
+    def carry(self, select, cte_scopes: dict, sql_shape, seen) -> bool:
+        """Collect a reducing scope's filters if it has the one supported shape,
+        or record why not; return whether resolution may continue through it."""
+
+        name = _scope_label(select)
+        reducing = sql_shape.reducing_clauses(select)
+        if reducing != ["a WHERE filter"]:
+            others = [r for r in reducing if r != "a WHERE filter"]
+            return self._refuse(name, ", ".join(others) or "its shape")
+        if sql_shape.joins(select):
+            return self._refuse(name, "a join beside its filter")
+        source = sql_shape.from_relation(select)
+        if source is None:
+            return self._refuse(name, "no relation to filter")
+        for predicate in sql_shape.predicates(select, "where"):
+            why = sql_shape.simple_row_predicate(predicate, self.dialect)
+            if why is not None:
+                return self._refuse(name, why)
+            lowered = _lower_predicate(predicate, source, cte_scopes, sql_shape, seen)
+            if lowered is None:
+                return self._refuse(
+                    name,
+                    "the filter reads a column the CTE chain computes, aggregates "
+                    "or cannot trace to one relation",
+                )
+            table, condition = lowered
+            if sql_shape.simple_row_predicate(condition, self.dialect) is not None:
+                return self._refuse(
+                    name,
+                    "the filter reads a column the CTE chain computes with an "
+                    "expression dex does not carry",
+                )
+            self.filters.append((_table_name(table), condition.sql(dialect="duckdb")))
+        if name not in self.scopes:
+            self.scopes.append(name)
+        return True
+
+    def _refuse(self, name: str, why: str) -> bool:
+        self.fail(
+            "filtered_cte",
+            f"a join column is read through {name}, which reduces its rows with "
+            f"a shape dex does not carry into a probe ({why}), so probing the "
+            "physical relation underneath would measure rows the model never "
+            "joins",
+        )
+        return False
+
+
+def _scope_label(select) -> str:
+    """How a filtering scope reads in a record: ``cte `name``` or ``a subquery``."""
+
+    from sqlglot import expressions as exp
+
+    parent = select.parent
+    if isinstance(parent, exp.CTE):
+        return f"CTE `{parent.alias_or_name}`"
+    return "a subquery"
+
+
+def _lower_predicate(predicate, relation, cte_scopes: dict, sql_shape, seen):
+    """``predicate``, written over ``relation``'s columns, rewritten over the
+    physical relation underneath it: ``(physical table node, condition)`` with
+    every column unqualified and quoted, or ``None`` where a hop computes a
+    column it reads, or its columns come from more than one relation.
+
+    Each CTE or subquery hop is crossed with
+    :func:`~..sql_shape.substitute_columns`, which keeps the rows a filter
+    keeps when the hop is row-by-row. That hop's own filters are not collected
+    here: the join column's resolution passes through the same hop and
+    collects them (:meth:`_FilterWalk.carry`).
+    """
+
+    from sqlglot import expressions as exp
+
+    current, condition, visited = relation, predicate.copy(), set(seen)
+    for _ in range(16):
+        if isinstance(current, exp.Subquery):
+            body = current.this
+        elif isinstance(current, exp.Table):
+            name = _cte_name(current, cte_scopes)
+            if name is None:
+                bare = condition.copy()
+                for column in list(bare.find_all(exp.Column)):
+                    replacement = exp.column(column.name, quoted=True)
+                    if column is bare:
+                        bare = replacement
+                    else:
+                        column.replace(replacement)
+                return current, bare
+            if name in visited:  # pragma: no cover - a cycle needs invalid SQL
+                return None
+            visited.add(name)
+            body = cte_scopes[name]
+        else:
+            return None
+        if not isinstance(body, exp.Select):
+            return None
+        condition = sql_shape.substitute_columns(condition, body)
+        if condition is None:
+            return None
+        relations = _scope_relations(body, sql_shape)
+        sources = {
+            id(src): src
+            for column in condition.find_all(exp.Column)
+            if (src := _qualified_source(column, relations)) is not None
+        }
+        if len(sources) != 1 or any(
+            _qualified_source(column, relations) is None
+            for column in condition.find_all(exp.Column)
+        ):
+            return None
+        (current,) = sources.values()
+    return None  # pragma: no cover - a chain deeper than any compiled model
 
 
 def _scope_relations(select, sql_shape) -> dict[str, object]:
@@ -2012,7 +2171,9 @@ def _qualified_source(column, scope_relations: dict[str, object]):
     return None
 
 
-def _resolve_within_scope(select, column_name: str, cte_scopes: dict, sql_shape, seen):
+def _resolve_within_scope(
+    select, column_name: str, cte_scopes: dict, sql_shape, seen, walk=None
+):
     """Find ``column_name``'s own projection inside ``select``, and recurse
     into *whichever of that scope's own relations it actually reads from*
     -- its FROM, or one of its own JOINs, determined by
@@ -2039,11 +2200,21 @@ def _resolve_within_scope(select, column_name: str, cte_scopes: dict, sql_shape,
     join healthy that has zero real overlap once the filter is honored. The
     join is skipped instead, not measured against semantics it does not
     have.
+
+    With a ``walk`` (:class:`_FilterWalk`, the join contract's own resolution,
+    #1085), one reducing shape is resolved through instead: a scope reading one
+    relation whose only reducing clause is a WHERE of simple row predicates
+    (:func:`~..sql_shape.simple_row_predicate`). Each predicate is carried down
+    to the physical relation and collected on the walk, so the probe can
+    measure the rows the model actually joins rather than the whole table.
+    Every other shape is recorded on the walk as the reason it stays unchecked.
     """
 
     from sqlglot import expressions as exp
 
-    if sql_shape.reducing_clauses(select):
+    if sql_shape.reducing_clauses(select) and (
+        walk is None or not walk.carry(select, cte_scopes, sql_shape, seen)
+    ):
         return None
 
     scope_relations = _scope_relations(select, sql_shape)
@@ -2063,7 +2234,7 @@ def _resolve_within_scope(select, column_name: str, cte_scopes: dict, sql_shape,
                 None
                 if source is None
                 else _resolve_join_column(
-                    source, inner.name, cte_scopes, sql_shape, seen
+                    source, inner.name, cte_scopes, sql_shape, seen, walk
                 )
             )
         if (
@@ -2075,19 +2246,19 @@ def _resolve_within_scope(select, column_name: str, cte_scopes: dict, sql_shape,
                 None
                 if source is None
                 else _resolve_join_column(
-                    source, proj.name, cte_scopes, sql_shape, seen
+                    source, proj.name, cte_scopes, sql_shape, seen, walk
                 )
             )
     if saw_unqualified_star and len(scope_relations) == 1:
         (only_source,) = scope_relations.values()
         return _resolve_join_column(
-            only_source, column_name, cte_scopes, sql_shape, seen
+            only_source, column_name, cte_scopes, sql_shape, seen, walk
         )
     return None
 
 
 def _resolve_join_column(
-    node, column_name: str, cte_scopes: dict, sql_shape, seen=None
+    node, column_name: str, cte_scopes: dict, sql_shape, seen=None, walk=None
 ):
     """Follow one column from ``node`` (the raw relation a join predicate
     qualified it with) through as many CTE or inline-subquery hops as it
@@ -2120,7 +2291,9 @@ def _resolve_join_column(
         inner = node.this
         if not isinstance(inner, exp.Select):
             return None
-        return _resolve_within_scope(inner, column_name, cte_scopes, sql_shape, seen)
+        return _resolve_within_scope(
+            inner, column_name, cte_scopes, sql_shape, seen, walk
+        )
 
     if not isinstance(node, exp.Table):
         return None
@@ -2131,13 +2304,15 @@ def _resolve_join_column(
         return None
     definition = cte_scopes[cte_name]
     if not isinstance(definition, exp.Select):
+        if walk is not None:
+            walk.fail("set_operation_cte", _UNRESOLVED_REASONS["set_operation_cte"])
         # A set-operation CTE (a UNION and friends): its output column has
         # no single physical source to resolve to -- each branch can read
         # from an entirely different relation for the "same" column -- so
         # this is unresolvable rather than a guess at which branch answers.
         return None
     return _resolve_within_scope(
-        definition, column_name, cte_scopes, sql_shape, seen | {cte_name}
+        definition, column_name, cte_scopes, sql_shape, seen | {cte_name}, walk
     )
 
 
@@ -2271,7 +2446,9 @@ def _select_branches(tree, sql_shape) -> list:
     return sql_shape.select_branches(tree)
 
 
-def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
+def _model_joins(
+    tree, sql_shape, dialect: str | None = None
+) -> tuple[list[JoinCandidate], list[JoinSkip]]:
     """Every equality join reachable from a model's compiled SQL (#228),
     both sides resolved past their CTE aliases to the physical relation and
     column each reads.
@@ -2380,42 +2557,90 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
             # between the same two relations is one composite key, not one
             # candidate per pair (see JoinCandidate's own docstring).
             grouped: dict[
-                tuple[str, str], list[tuple[str, str, str | None, str | None]]
+                tuple[str, str, tuple, tuple, tuple, tuple],
+                list[tuple[str, str, str | None, str | None]],
             ] = {}
             unresolved = False
             unresolved_code = "unresolved_column"
+            unresolved_reason: str | None = None
             for left, right, left_tpl, right_tpl in pairs:
                 left_relation = alias_map.get((left.table or "").lower())
                 right_relation = alias_map.get((right.table or "").lower())
                 if left_relation is None or right_relation is None:
                     unresolved = True
                     break
+                # Only a set operation is decided by the first hop's shape. A
+                # filtered first hop may now be carried (#1085), so whether it
+                # is the reason is the walk's to record, at any depth; a column
+                # that fails for another reason (a computed one) stays
+                # `unresolved_column`.
                 for relation in (left_relation, right_relation):
-                    shape = _cte_shape(relation, cte_scopes, sql_shape)
-                    if shape is not None:
-                        unresolved_code = shape
+                    if (
+                        _cte_shape(relation, cte_scopes, sql_shape)
+                        == "set_operation_cte"
+                    ):
+                        unresolved_code = "set_operation_cte"
+                # Each side resolves with its own walk, which carries a
+                # supported filter down to the physical relation (#1085) and
+                # records why an unsupported one stays unchecked.
+                left_walk, right_walk = _FilterWalk(dialect), _FilterWalk(dialect)
                 left_resolved = _resolve_join_column(
-                    left_relation, left.name, cte_scopes, sql_shape
+                    left_relation, left.name, cte_scopes, sql_shape, walk=left_walk
                 )
                 right_resolved = _resolve_join_column(
-                    right_relation, right.name, cte_scopes, sql_shape
+                    right_relation, right.name, cte_scopes, sql_shape, walk=right_walk
                 )
                 if left_resolved is None or right_resolved is None:
+                    failed = left_walk if left_resolved is None else right_walk
+                    if failed.code is not None:
+                        unresolved_code, unresolved_reason = failed.code, failed.reason
                     unresolved = True
+                    break
+                mismatch = next(
+                    (
+                        walk
+                        for walk, (table, _c) in (
+                            (left_walk, left_resolved),
+                            (right_walk, right_resolved),
+                        )
+                        if any(name != _table_name(table) for name, _f in walk.filters)
+                    ),
+                    None,
+                )
+                if mismatch is not None:
+                    unresolved = True
+                    unresolved_code = "filtered_cte"
+                    unresolved_reason = (
+                        "a join column is read through "
+                        + " and ".join(mismatch.scopes)
+                        + ", whose filter reads a different relation than the "
+                        "join key, so it cannot be carried onto the relation the "
+                        "probe reads"
+                    )
                     break
                 left_table, left_col = left_resolved
                 right_table, right_col = right_resolved
+                left_side = (left_walk, left_table, left_col, left_tpl)
+                right_side = (right_walk, right_table, right_col, right_tpl)
                 if (left.table or "").lower() == join_alias:
-                    to_table, to_col, to_tpl = left_table, left_col, left_tpl
-                    from_table, from_col, from_tpl = right_table, right_col, right_tpl
+                    to_side, from_side = left_side, right_side
                 elif (right.table or "").lower() == join_alias:
-                    to_table, to_col, to_tpl = right_table, right_col, right_tpl
-                    from_table, from_col, from_tpl = left_table, left_col, left_tpl
+                    to_side, from_side = right_side, left_side
                 else:
                     unresolved = True
                     break
+                from_walk, from_table, from_col, from_tpl = from_side
+                to_walk, to_table, to_col, to_tpl = to_side
                 from_name, to_name = _table_name(from_table), _table_name(to_table)
-                grouped.setdefault((from_name, to_name), []).append(
+                group_key = (
+                    from_name,
+                    to_name,
+                    _distinct(f for _n, f in from_walk.filters),
+                    _distinct(f for _n, f in to_walk.filters),
+                    tuple(from_walk.scopes),
+                    tuple(to_walk.scopes),
+                )
+                grouped.setdefault(group_key, []).append(
                     (from_col, to_col, from_tpl, to_tpl)
                 )
             if unresolved:
@@ -2428,7 +2653,8 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
                     JoinSkip(
                         join.label,
                         unresolved_code,
-                        _UNRESOLVED_REASONS.get(
+                        unresolved_reason
+                        or _UNRESOLVED_REASONS.get(
                             unresolved_code,
                             "a join column could not be resolved to a physical "
                             "relation and column",
@@ -2436,13 +2662,20 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
                     )
                 )
                 continue
-            for (from_name, to_name), column_pairs in grouped.items():
+            for group_key, column_pairs in grouped.items():
+                from_name, to_name, from_filters, to_filters = group_key[:4]
+                from_scopes, to_scopes = group_key[4:]
                 from_cols = tuple(c for c, _t, _f, _g in column_pairs)
                 to_cols = tuple(c for _c, c, _f, _g in column_pairs)
                 from_keys = tuple(f for _c, _t, f, _g in column_pairs)
                 to_keys = tuple(g for _c, _t, _f, g in column_pairs)
                 converts = any(from_keys) or any(to_keys)
-                if from_name == to_name and from_cols == to_cols and not converts:
+                if (
+                    from_name == to_name
+                    and from_cols == to_cols
+                    and not converts
+                    and from_filters == to_filters
+                ):
                     # The literal same key read twice off the same relation
                     # (t.col = t.col): every row matches itself, always --
                     # nothing to orphan-check. A self-join on *different*
@@ -2460,10 +2693,24 @@ def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[JoinSkip]]:
                         label=join.label,
                         from_keys=from_keys if converts else (),
                         to_keys=to_keys if converts else (),
+                        from_filters=from_filters,
+                        to_filters=to_filters,
+                        from_scopes=from_scopes,
+                        to_scopes=to_scopes,
                     )
                 )
 
     return candidates, skipped
+
+
+def _distinct(items) -> tuple[str, ...]:
+    """``items`` in first-seen order with repeats dropped."""
+
+    out: list[str] = []
+    for item in items:
+        if item not in out:
+            out.append(item)
+    return tuple(out)
 
 
 #: Why a join's columns did not resolve, by the shape of the CTE it reads.
@@ -2475,8 +2722,8 @@ _UNRESOLVED_REASONS = {
     ),
     "filtered_cte": (
         "a join column is read through a CTE that filters, groups or limits its "
-        "rows, so probing the physical relation underneath would measure rows "
-        "the model never joins"
+        "rows in a shape dex does not carry into a probe, so probing the "
+        "physical relation underneath would measure rows the model never joins"
     ),
 }
 
@@ -2484,8 +2731,10 @@ _UNRESOLVED_REASONS = {
 def _cte_shape(relation, cte_scopes: dict, sql_shape) -> str | None:
     """Why a join side that names a CTE cannot be probed physically, if the
     CTE's own shape is the reason: a set operation (#840: never mistaken for
-    a warehouse table) or a scope that reduces rows. First hop only; a deeper
-    hop that fails reads as ``unresolved_column``."""
+    a warehouse table) or a scope that reduces rows. First hop only. The join
+    contract's own resolution (:class:`_FilterWalk`) overrides this with a more
+    precise answer: a supported filter is carried rather than refused (#1085),
+    and an unsupported one at any depth is named with its shape."""
 
     from sqlglot import expressions as exp
 
@@ -2598,7 +2847,7 @@ def plan_join_contract(
                 )
             ]
             continue
-        candidates, skipped = _model_joins(tree, sql_shape)
+        candidates, skipped = _model_joins(tree, sql_shape, dialect)
         if candidates:
             plan.candidates[name] = candidates
         if skipped:
@@ -2692,7 +2941,12 @@ def _select_lineage(select, cte_scopes, sql_shape, depth, root) -> dict:
         source = _qualified_source(inner, scope_relations)
         if source is None:
             continue
-        resolved = _resolve_join_column(source, inner.name, cte_scopes, sql_shape)
+        # Through a filter the join contract carries (#1085): an output read
+        # through a filtered CTE is still that physical column, so a declared
+        # `null_rule: never` on it still makes the join required.
+        resolved = _resolve_join_column(
+            source, inner.name, cte_scopes, sql_shape, walk=_FilterWalk()
+        )
         if resolved is None:
             continue
         table, column = resolved
@@ -2971,8 +3225,22 @@ def _key_exprs(pairs) -> dict[int, tuple]:
     }
 
 
+def _scope_filters(pairs) -> dict[int, tuple]:
+    """The filters each probed relationship reads its sides through (#1085), by
+    the relationship's identity, the twin of :func:`_key_exprs`."""
+
+    return {
+        id(rel): filters
+        for _m, candidate, rel in pairs
+        if (filters := candidate.scope_filters()) is not None
+    }
+
+
 def join_probe_cost(
-    adapter, relationships: list, key_exprs: dict | None = None
+    adapter,
+    relationships: list,
+    key_exprs: dict | None = None,
+    scope_filters: dict | None = None,
 ) -> tuple[float, int]:
     """``(estimate, probe_count)`` for measuring every relationship's coverage,
     without running it. Pure pricing, split out so a caller combining this axis
@@ -2988,7 +3256,7 @@ def join_probe_cost(
     if estimator is None:
         return 0.0, len(to_probe)
     statements = rel_mod.coverage_statements(
-        relationships, adapter.dialect, key_exprs=key_exprs
+        relationships, adapter.dialect, key_exprs=key_exprs, scope_filters=scope_filters
     )
     return sum(estimator(stmt) for stmt in statements), len(to_probe)
 
@@ -3025,16 +3293,21 @@ def join_contract_cost(
     pairs, _unsafe = _split_unsafe(pairs, adapter.dialect)
     relationships = [rel for _m, _c, rel in pairs]
     exprs = _key_exprs(pairs)
-    estimate, _joins = join_probe_cost(adapter, relationships, exprs)
+    filters = _scope_filters(pairs)
+    estimate, _joins = join_probe_cost(adapter, relationships, exprs, filters)
     checks, _notes = (
         _null_checks(adapter, plan, live_identifiers) if pairs else ([], [])
     )
     estimate += _statements_cost(adapter, [c.sql for c in checks])
-    return estimate, _statement_count(adapter, relationships, checks, exprs)
+    return estimate, _statement_count(adapter, relationships, checks, exprs, filters)
 
 
 def _statement_count(
-    adapter, relationships: list, checks: list, key_exprs: dict | None = None
+    adapter,
+    relationships: list,
+    checks: list,
+    key_exprs: dict | None = None,
+    scope_filters: dict | None = None,
 ) -> int:
     """How many statements the axis would issue: the batched coverage probes
     and one NULL count per model, which is what a handshake states it buys."""
@@ -3042,7 +3315,7 @@ def _statement_count(
     from ..explore import relationships as rel_mod
 
     probes = rel_mod.coverage_statements(
-        relationships, adapter.dialect, key_exprs=key_exprs
+        relationships, adapter.dialect, key_exprs=key_exprs, scope_filters=scope_filters
     )
     return len(probes) + len(checks) if probes else 0
 
@@ -3119,7 +3392,50 @@ def _candidate_record(model: str, candidate: JoinCandidate, policy: JoinPolicy) 
             if candidate.key_exprs() is not None
             else {}
         ),
+        **(
+            {"effective_input": _effective_input(candidate)}
+            if candidate.scope_filters() is not None
+            else {}
+        ),
     }
+
+
+def _effective_input(candidate: JoinCandidate) -> dict:
+    """Per filtered side, the scopes the join reads it through and the filters
+    the probe applied to the physical relation, as the probe ran them (#1085).
+    The measured counts are over these rows, not the whole relation."""
+
+    out: dict[str, dict] = {}
+    for side, relation, scopes, filters in (
+        (
+            "from",
+            candidate.from_relation,
+            candidate.from_scopes,
+            candidate.from_filters,
+        ),
+        ("to", candidate.to_relation, candidate.to_scopes, candidate.to_filters),
+    ):
+        if filters:
+            out[side] = {
+                "relation": relation,
+                "through": list(scopes),
+                "filters": list(filters),
+            }
+    return out
+
+
+def _side_label(dataset: str, filters: tuple[str, ...]) -> str:
+    """A relation as a finding names it: with the filter the probe read it
+    through, so a count is never mistaken for the whole table's (#1085)."""
+
+    if not filters:
+        return dataset
+    # Parenthesized when there are several, as the probe joins them: a filter
+    # may hold an OR, and `a OR b AND c` reads as a different population.
+    joined = (
+        filters[0] if len(filters) == 1 else " AND ".join(f"({f})" for f in filters)
+    )
+    return f"{dataset} (rows where {joined})"
 
 
 def _key_conversion(candidate: JoinCandidate) -> dict:
@@ -3221,11 +3537,12 @@ def join_coverage(
 
     relationships = [rel for _m, _c, rel in pairs]
     exprs = _key_exprs(pairs)
+    filters = _scope_filters(pairs)
     checks, check_notes = _null_checks(adapter, plan, live_identifiers)
     result.notes.extend(check_notes)
-    estimate, probe_count = join_probe_cost(adapter, relationships, exprs)
+    estimate, probe_count = join_probe_cost(adapter, relationships, exprs, filters)
     estimate += _statements_cost(adapter, [c.sql for c in checks])
-    statement_count = _statement_count(adapter, relationships, checks, exprs)
+    statement_count = _statement_count(adapter, relationships, checks, exprs, filters)
     if statement_count == 0:
         return result
 
@@ -3249,13 +3566,15 @@ def join_coverage(
         result.offer = offer
         return result
 
-    # Only a join that converts a key passes the conversions, so the call is
-    # the one every other join has always made.
+    # Only a join that converts a key passes the conversions, and only one
+    # read through a filter passes the filters (#1085), so the call is the one
+    # every other join has always made.
     measured, refused = rel_mod.measure_coverage(
         adapter,
         relationships,
         timeout_seconds=timeout_seconds,
         **({"key_exprs": exprs} if exprs else {}),
+        **({"scope_filters": filters} if filters else {}),
     )
     counts_of = {id(rel): counts for rel, counts in measured}
     refused_of = {id(rel): text for rel, text in refused}
@@ -3364,15 +3683,17 @@ def _judge_coverage(
             "join_orphans": _JOIN_ORPHANS_THRESHOLD,
         }
     )
+    child = _side_label(rel.from_dataset, candidate.from_filters)
+    parent = _side_label(rel.to_dataset, candidate.to_filters)
     if eligible_rows == 0:
         record.update(
             status="not_applicable",
             reason_code="empty_input" if counts.rows == 0 else "all_keys_null",
             reason=(
-                f"{rel.from_dataset} has no rows, so the join has no coverage to "
+                f"{child} has no rows, so the join has no coverage to "
                 "judge (undefined, not complete)"
                 if counts.rows == 0
-                else f"every {rel.from_dataset} row has a NULL key, and the "
+                else f"every {child} row has a NULL key, and the "
                 "declaration does not count NULL keys, so nothing is eligible"
             ),
         )
@@ -3382,9 +3703,9 @@ def _judge_coverage(
     from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in rel.from_columns)
     to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in rel.to_columns)
     measured = (
-        f"{unmatched_rows} of {eligible_rows} eligible {rel.from_dataset} row(s) "
+        f"{unmatched_rows} of {eligible_rows} eligible {child} row(s) "
         f"({orphan_fraction:.0%}) and {eligible_keys - matched_keys} of "
-        f"{eligible_keys} distinct key(s) have no match in {rel.to_dataset}"
+        f"{eligible_keys} distinct key(s) have no match in {parent}"
     )
     if counts.null_key_rows:
         measured += f"; {counts.null_key_rows} row(s) with a NULL key are " + (
@@ -3404,7 +3725,17 @@ def _judge_coverage(
         "coverage_keys": coverage_keys,
         "threshold_source": threshold_source,
         "required_by": policy.required_by,
+        **(
+            {"effective_input": record["effective_input"]}
+            if "effective_input" in record
+            else {}
+        ),
     }
+    scoped = (
+        f" (counted over {child} against {parent})"
+        if candidate.scope_filters() is not None
+        else ""
+    )
 
     if matched_rows == 0:
         code = "join_no_match"
@@ -3412,8 +3743,8 @@ def _judge_coverage(
         detail = (
             f"'{model}' joins ({from_key}) to ({to_key}), and none of its "
             f"{eligible_rows} eligible row(s) ({eligible_keys} distinct key(s)) "
-            f"match: every column the join supplies is NULL or every row is "
-            "dropped. The keys share no value; check the join columns and the "
+            f"match{scoped}: every column the join supplies is NULL or every row "
+            "is dropped. The keys share no value; check the join columns and the "
             "relation the model is driven from"
         )
         if policy.declared_optional and not required:

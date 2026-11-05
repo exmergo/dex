@@ -150,6 +150,16 @@ class IdentifierConversion(BaseModel):
     reason: str | None = None
     denominator: str | None = None
     partner: str | None = None
+    #: The join partner's own filters applied to the keys it is matched against
+    #: (#1073): the scope's WHERE and the join's ON conjuncts that read only the
+    #: partner side.
+    partner_filters: list[str] = []
+    #: Filters in scopes that read the conversion's rows later in the model,
+    #: carried back onto the rows counted (#1073), as ``scope: predicate``.
+    later_filters_applied: list[str] = []
+    #: What a later scope does to those rows that the counts do not reflect, each
+    #: ``{scope, filter?, reason}``, so a count is never read as the model's own.
+    later_filters_not_applied: list[dict[str, str]] = []
     measured: ConversionCounts | None = None
     identity: IdentityChange | None = None
     identity_reason_code: str | None = None
@@ -363,6 +373,11 @@ def _unsupported(scope: str, select: exp.Select, known: list[_Found]) -> list[_F
     out: list[_Found] = []
     for site, holder, alias in _holders(select):
         for column in holder.find_all(exp.Column):
+            if column is holder:
+                # A bare column (one side of an ON equality) rewrites nothing.
+                # Walking up from it would never meet its holder and would read
+                # the ON's own AND (a Func in sqlglot) as a rewrite.
+                continue
             outer: exp.Expression | None = None
             aggregated = False
             current = column.parent
@@ -564,6 +579,215 @@ class _Built:
     reason: str | None = None
     denominator: str | None = None
     partner: str | None = None
+    partner_filters: list[str] = field(default_factory=list)
+    later_applied: list[str] = field(default_factory=list)
+    later_not_applied: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class _Later:
+    """What the scopes reading a conversion's scope later do to its rows (#1073).
+
+    ``applied`` are their WHERE conjuncts rewritten in the conversion scope's own
+    input terms, ready to add to the rows the probe counts. ``labels`` names
+    each as ``scope: predicate``. ``not_applied`` is everything else that can
+    drop rows downstream, each with the reason it was not carried.
+    """
+
+    applied: list[exp.Expression] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
+    not_applied: list[dict[str, str]] = field(default_factory=list)
+
+    def skip(self, scope: str, reason: str, predicate=None) -> None:
+        entry = {"scope": scope, "reason": reason}
+        if predicate is not None:
+            entry["filter"] = sql_shape.text(predicate)
+        self.not_applied.append(entry)
+
+
+def _row_wise(predicate: exp.Expression) -> bool:
+    """Whether a predicate is evaluated row by row, so it can be moved to the
+    rows a scope reads without changing which rows it keeps."""
+
+    return not any(
+        isinstance(n, (exp.Subquery, exp.Select, exp.AggFunc, exp.Window))
+        for n in predicate.walk()
+    )
+
+
+def _converts_key(predicate: exp.Expression, key: str) -> bool:
+    """Whether ``predicate`` reads the identifier through a conversion: then it
+    is the conversion's own effect, which the counts exist to measure."""
+
+    return any(
+        (peeled := sql_shape.peel_key_conversion(node)) is not None
+        and sql_shape.match_key(peeled[0]) == key
+        for node in predicate.walk()
+        if isinstance(node, exp.Expression)
+    )
+
+
+def _readers(tree: exp.Expression, name: str, after: list[tuple[str, Any]]):
+    """Every later scope that names CTE ``name``, with whether it reads it as
+    the FROM of a plain SELECT (the one shape a filter can be carried back
+    through) or otherwise (a join, a subquery, a set-operation branch)."""
+
+    found = []
+    for scope, body in after:
+        # The final select's tree holds the WITH clause too: a table named
+        # inside a CTE belongs to that CTE, not to the final select.
+        hits = [
+            t
+            for t in body.find_all(exp.Table)
+            if t.name.lower() == name
+            and not t.args.get("db")
+            and (scope != sql_shape.MAIN_SCOPE or t.find_ancestor(exp.CTE) is None)
+        ]
+        if not hits:
+            continue
+        plain = (
+            isinstance(body, exp.Select)
+            and len(hits) == 1
+            and sql_shape.from_relation(body) is hits[0]
+        )
+        found.append((scope, body, plain))
+    return found
+
+
+def _alias_of(select: exp.Select) -> str:
+    relation = sql_shape.from_relation(select)
+    return (relation.alias_or_name if relation is not None else "").lower()
+
+
+def _reads_only(predicate: exp.Expression, alias: str, single: bool) -> bool:
+    """Whether every column ``predicate`` reads belongs to the relation aliased
+    ``alias``: qualified with it, or unqualified where only one relation is in
+    scope."""
+
+    for column in predicate.find_all(exp.Column):
+        qualifier = (column.table or "").lower()
+        if qualifier != alias and not (not qualifier and single):
+            return False
+    return True
+
+
+def _later_filters(
+    tree: exp.Expression, target: _Found, own_alias: str | None
+) -> _Later:
+    """The WHERE conjuncts of the scopes that read ``target``'s scope later,
+    carried back onto the rows the conversion reads, where that keeps the same
+    rows (#1073).
+
+    Walks the one chain of scopes that each read the previous one as the FROM
+    of a plain SELECT, to the final select. A conjunct is carried when it is
+    row-by-row, reads only that FROM, and substitutes back through every hop
+    (:func:`~..sql_shape.substitute_columns`); and on a join conversion
+    (``own_alias``) only when it reads the converted side alone. A conjunct
+    reading the converted key through a conversion is the conversion's own
+    effect and is left out, the rule :func:`_own_side_filters` follows. Every
+    other way a later scope can drop rows (an unsupported or other-side
+    predicate, a filtering join, HAVING, QUALIFY, LIMIT, a scope read twice or
+    through a join or a set operation) is named in ``not_applied``.
+    """
+
+    later = _Later()
+    if target.scope in (sql_shape.MAIN_SCOPE, UNALIGNED):
+        return later
+    key = sql_shape.match_key(target.column)
+    scopes = list(sql_shape.scopes(tree).items())
+    names = [name for name, _b in scopes]
+    if target.scope not in names:
+        return later
+    chain: list[exp.Select] = [target.select]
+    current = target.scope
+    while current != sql_shape.MAIN_SCOPE:
+        after = scopes[names.index(current) + 1 :]
+        readers = _readers(tree, current, after)
+        if not readers:
+            return later
+        if len(readers) > 1 or not readers[0][2]:
+            later.skip(
+                ", ".join(r[0] for r in readers),
+                f"`{current}` is read through a join, a subquery, a set operation "
+                "or by more than one scope, so what happens to its rows there "
+                "was not carried back",
+            )
+            return later
+        scope, reader, _plain = readers[0]
+        alias = _alias_of(reader)
+        reader_joins = sql_shape.joins(reader)
+        single = not reader_joins
+        for join in reader_joins:
+            if not join.side.startswith(("left", "full")):
+                later.skip(
+                    scope,
+                    f"its {join.side} join can drop rows, which the counts do not "
+                    "reflect",
+                )
+        for clause, label in (("having", "HAVING"), ("qualify", "QUALIFY")):
+            if reader.args.get(clause) is not None:
+                later.skip(
+                    scope,
+                    f"its {label} filter was not carried back to the rows counted",
+                )
+        if reader.args.get("limit") is not None:
+            later.skip(scope, "its LIMIT drops rows the counts include")
+        for predicate in sql_shape.predicates(reader, "where"):
+            carried = _carry_back(predicate, alias, single, chain)
+            if carried is None:
+                later.skip(
+                    scope,
+                    "the filter is not row-by-row, reads another relation, or reads "
+                    "a column computed on the way, so it was not carried back",
+                    predicate,
+                )
+                continue
+            if _converts_key(carried, key):
+                later.skip(
+                    scope,
+                    "the filter reads what the conversion produces, so what it "
+                    "removes is the conversion's effect and stays counted",
+                    predicate,
+                )
+                continue
+            if own_alias is not None and not _reads_only(carried, own_alias, False):
+                later.skip(
+                    scope,
+                    "the filter reads the join's other side, so it was not carried "
+                    "onto the converted side's rows",
+                    predicate,
+                )
+                continue
+            later.applied.append(carried)
+            later.labels.append(f"{scope}: {sql_shape.text(predicate)}")
+        chain.insert(0, reader)
+        current = scope
+    return later
+
+
+def _carry_back(
+    predicate: exp.Expression, alias: str, single: bool, chain: list[exp.Select]
+) -> exp.Expression | None:
+    """``predicate``, read in the scope after ``chain[0]``, rewritten in the
+    input terms of the conversion's scope (``chain[-1]``), or None.
+
+    Each hop is crossed with :func:`~..sql_shape.substitute_columns`; between
+    hops the rewritten predicate must read only the hop's FROM, since a column
+    from a relation it joins is not one the conversion's rows carry.
+    """
+
+    if not _row_wise(predicate) or not _reads_only(predicate, alias, single):
+        return None
+    current = predicate
+    for index, hop in enumerate(chain):
+        current = sql_shape.substitute_columns(current, hop)
+        if current is None or not _row_wise(current):
+            return None
+        if index < len(chain) - 1 and not _reads_only(
+            current, _alias_of(hop), not sql_shape.joins(hop)
+        ):
+            return None
+    return current
 
 
 def conversion_probe(
@@ -600,6 +824,16 @@ def conversion_probe(
     select = target.select
     if (blocker := _scope_unsupported(select)) is not None:
         return _Built(code="unsupported_scope", reason=blocker)
+    own_relation = (
+        _relation_of(select, target.column) if target.site == "join" else None
+    )
+    later = _later_filters(
+        copy,
+        target,
+        (own_relation.alias_or_name or "").lower()
+        if own_relation is not None
+        else ("" if target.site == "join" else None),
+    )
     raw = target.column.copy()
     try:
         conv = _measuring_conv(target.node, dialect)
@@ -640,35 +874,43 @@ def conversion_probe(
         inner = exp.select(
             exp.alias_(raw, "dex_raw"), exp.alias_(conv, "dex_conv")
         ).from_(relation.copy())
-        if own:
-            inner = inner.where(*own)
-        partner_sql = (
+        if own or later.applied:
+            inner = inner.where(*own, *(p.copy() for p in later.applied))
+        partner_filters = _partner_side_filters(
+            select, partner_relation, target.node, own_relation
+        )
+        partner_query = (
             exp.select(exp.alias_(partner_conv, "dex_pk"))
             .distinct()
             .from_(partner_relation.copy())
             .where(
-                exp.Not(this=exp.Is(this=partner_conv.copy(), expression=exp.Null()))
+                exp.Not(this=exp.Is(this=partner_conv.copy(), expression=exp.Null())),
+                *partner_filters,
             )
-            .sql(dialect=dialect)
         )
+        partner_sql = partner_query.sql(dialect=dialect)
         partner_label = sql_shape.text(partner)
         own_label = labels[0] or sql_shape.relation_key(relation)
+        partner_name = labels[1] or sql_shape.relation_key(partner_relation)
         denominator = (
             f"rows of {own_label} that pass the scope's "
             f"{len(own)} filter(s) on {own_label} alone (a filter converting "
             "this key is left out), against the distinct keys of "
-            f"{labels[1] or sql_shape.relation_key(partner_relation)}"
+            f"{partner_name} that pass its {len(partner_filters)} filter(s) on "
+            f"{partner_name} alone"
         )
         ctes = _detach_with(copy)
         inner_sql = inner.sql(dialect=dialect)
     else:
-        if target.site == "filter":
-            kept = [
-                p
-                for p in sql_shape.predicates(select, "where")
-                if not _within(target.node, p)
-            ]
-            sql_shape.set_predicates(select, "where", kept)
+        partner_filters = []
+        kept = [
+            p
+            for p in sql_shape.predicates(select, "where")
+            if target.site != "filter" or not _within(target.node, p)
+        ]
+        sql_shape.set_predicates(
+            select, "where", kept + [p.copy() for p in later.applied]
+        )
         select.set(
             "expressions",
             [exp.alias_(raw, "dex_raw"), exp.alias_(conv, "dex_conv")],
@@ -694,6 +936,17 @@ def conversion_probe(
             else "with the scope's filters applied"
         )
         denominator = f"rows reaching the conversion in `{target.scope}`, {where}"
+    if later.labels:
+        denominator += (
+            f", and the {len(later.labels)} later filter(s) on those rows applied "
+            f"({'; '.join(later.labels)})"
+        )
+    if later.not_applied:
+        denominator += (
+            "; not applied: what "
+            + ", ".join(sorted({n["scope"] for n in later.not_applied}))
+            + " later does to these rows (see later_filters_not_applied)"
+        )
 
     raw_text = f"CAST(d.dex_raw AS {text.sql(dialect=dialect)})"
     conv_text = f"CAST(d.dex_conv AS {text.sql(dialect=dialect)})"
@@ -747,7 +1000,51 @@ def conversion_probe(
         return _Built(
             code="probe_failed", reason="the measuring statement did not parse"
         )
-    return _Built(sql=sql, denominator=denominator, partner=partner_label)
+    return _Built(
+        sql=sql,
+        denominator=denominator,
+        partner=partner_label,
+        partner_filters=[sql_shape.text(f) for f in partner_filters],
+        later_applied=list(later.labels),
+        later_not_applied=list(later.not_applied),
+    )
+
+
+def _partner_side_filters(
+    select: exp.Select,
+    partner_relation: exp.Expression,
+    node: exp.Expression,
+    own_relation: exp.Expression | None,
+) -> list[exp.Expression]:
+    """The conditions that decide which of the join partner's rows a converted
+    key can match (#1073): the scope's WHERE conjuncts and the join's own ON
+    conjuncts that read only the partner side. Without them ``matched_entities``
+    counts keys the model never matches, which on an inner join overstates it.
+
+    A conjunct reading both sides, or an unqualified column where more than one
+    relation is in scope, is left out: which side it narrows is not a question
+    the SQL text answers alone.
+    """
+
+    alias = (partner_relation.alias_or_name or "").lower()
+    if own_relation is not None and (own_relation.alias_or_name or "").lower() == alias:
+        return []
+    conjuncts = list(sql_shape.predicates(select, "where"))
+    join = node.find_ancestor(exp.Join)
+    if join is not None and join.args.get("on") is not None:
+        conjuncts.extend(
+            c
+            for c in sql_shape.flatten_conjuncts(join.args["on"])
+            if not _within(node, c)
+        )
+    kept = []
+    for predicate in conjuncts:
+        if predicate.find(exp.Column) is None:
+            continue
+        if not _reads_only(predicate, alias, False):
+            continue
+        kept.append(predicate.copy())
+    return kept
 
 
 def _own_side_filters(
@@ -1055,6 +1352,9 @@ def diagnose(
                 continue
             record.denominator = built.denominator
             record.partner = built.partner
+            record.partner_filters = built.partner_filters
+            record.later_filters_applied = built.later_applied
+            record.later_filters_not_applied = built.later_not_applied
             entry.probe = ExtraProbe(sql=built.sql, label=LABEL)
             _plan_identity(
                 entry, conversion, prior_tree, authored_tree, declared, dialect, shared
