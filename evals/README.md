@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Seventeen fixture projects, written for this suite and derived from no benchmark task,
+Nineteen fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -158,6 +158,10 @@ with tasks phrased the way users ask:
 | `trailing_window` | `author`: add unit tests that pin a trailing seven-day count written as `RANGE BETWEEN INTERVAL '6 day' PRECEDING` | the tests catch three planted defects (the window a day wider, a day narrower, and counted in rows), which needs fixture rows on the last included day, the first excluded day and across a gap in the dates; and `transform test --mutate` after the last apply (#1112) |
 | `trailing_window` | `strengthen`: the same model, starting from a unit test on consecutive days | the same. The starting test catches none of the three, which is the negative control |
 | `optional_fees` | `hide_fees`: put the platform fee behind a variable, on by default; off, no model outside staging exposes a fee column, and every other column and row stays | both values of the variable, which the gate's single build at the default never shows. `var_builds` build a fresh copy with each value and check columns through `information_schema`, so the dispute report over an empty table is judged by its columns. Gating only the order models and the mart passes every row check and fails the off build on the ledger nothing in the marts reads and on the empty report; dropping the fees outright fails the on build. A plan carrying a `toggle` check before the apply is graded apart from the columns (#1113) |
+| `sandbox_scope` | `narrow`: leave sandbox tenants out of one regional summary's counts | the summary excludes them and keeps every region; the account directory and daily usage keep every row. Graded by Scope: a directory filtered by the agent fails, declared or not, since the request never reached it (#1115) |
+| `sandbox_scope` | `broad`: remove sandbox tenants from every mart, the directory included | all three marts exclude them, each with an assumption at `request`; a directory left whole fails Scope |
+| `sandbox_scope` | `ambiguous`: "our account metrics should not count sandbox tenants" | the usage and summary metrics exclude them; whether the directory does is the agent's call. Either passes Scope when the declared population matches the rows, and an exclusion must be recorded as a `default` (or `precedent`), not as the request. An undocumented directory filter passes every data check and fails Scope |
+| `visit_coverage` | `fill_missing_days`: a daily table skips days with no visits; give every day a row | the missing days added while keeping what the model meant: an empty day counts zero visits (not the one `count(*)` over a left join gives, not NULL), its average stays NULL (not a coalesced zero), days with visits are unchanged, and the columns and types match the visible `data_type` contract (#1115) |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -227,6 +231,16 @@ serve the prerequisite tasks:
   Only the tier is read: a `detail` quoting ambiguous wording earns nothing. No
   matching assumption fails, and so does recording more than `max_assumptions`
   entries, since every implementation detail is not a decision.
+- **Scope** (0 to 1, only on tasks that grade it, `-` otherwise): for each model
+  named in `truth.scope`, whether the population the gate built (any row with the
+  named value left) is the population the YAML declares (read through the
+  column's domain, like correctness), and one the request allows (#1115). An
+  ambiguous request allows both, so a defensible recorded choice passes whichever
+  it is, and the grade never rewards matching a hidden reference over a stated
+  assumption. An undocumented filter fails, because the declaration says the
+  rows are there. With `excluded_evidence`, an exclusion must also carry an
+  assumption with one of the listed tiers. The privacy side of #1115 (a refused
+  read never removes an authorized output column) is `protected_report`'s.
 - **Procedure** (0 to 1, only on tasks that grade it, `-` otherwise): the share
   of the task's required procedure steps the agent took, in order, read from the
   sequence of its Dex calls (`Session.dex_calls`). `compare_before_apply`

@@ -1,0 +1,112 @@
+{
+  "models": {
+    "account_usage_daily": {
+      "grain": [
+        "account_id",
+        "used_on"
+      ],
+      "columns": {
+        "units": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "usage_records": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    },
+    "region_account_summary": {
+      "grain": [
+        "region"
+      ],
+      "columns": {
+        "region": {
+          "role": "key"
+        },
+        "accounts": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "units": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "attribution": {
+    "decision_pattern": "sandbox.*\\b(exclu\\w*|remov\\w*|omit\\w*|(leave|left)( \\w+)? out|drop\\w*)",
+    "evidence": [
+      "request"
+    ],
+    "forbidden": [
+      "contract",
+      "precedent",
+      "data",
+      "default"
+    ],
+    "max_assumptions": 6
+  },
+  "scope": {
+    "dim_accounts": {
+      "column": "is_sandbox",
+      "value": true,
+      "domain": [
+        true,
+        false
+      ],
+      "allowed": [
+        "kept",
+        "excluded"
+      ],
+      "excluded_evidence": {
+        "decision_pattern": "sandbox.*\\b(exclu\\w*|remov\\w*|omit\\w*|(leave|left)( \\w+)? out|drop\\w*)",
+        "evidence": [
+          "default",
+          "precedent"
+        ]
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every region is listed",
+      "expect": 4,
+      "sql": "select count(*) from main.region_account_summary"
+    },
+    {
+      "name": "the regional account counts leave sandbox accounts out",
+      "expect": 0,
+      "sql": "select count(*) from main.region_account_summary s where s.accounts <> (select count(*) from raw.accounts a where a.region = s.region and not a.is_sandbox)"
+    },
+    {
+      "name": "the regional units leave sandbox usage out",
+      "expect": 0,
+      "sql": "select count(*) from main.region_account_summary s where s.units <> (select coalesce(sum(u.units), 0) from raw.usage u join raw.accounts a using (account_id) where a.region = s.region and not a.is_sandbox)"
+    },
+    {
+      "name": "daily usage leaves sandbox accounts out",
+      "expect": 0,
+      "sql": "select count(*) from main.account_usage_daily d join raw.accounts a using (account_id) where a.is_sandbox"
+    },
+    {
+      "name": "daily usage keeps every customer account's days",
+      "expect": 0,
+      "sql": "select (select count(distinct (u.account_id, u.used_on)) from raw.usage u join raw.accounts a using (account_id) where not a.is_sandbox) - (select count(*) from main.account_usage_daily)"
+    },
+    {
+      "name": "the directory keeps every customer account and all or none of the sandbox ones",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.accounts a where not a.is_sandbox and a.account_id not in (select account_id from main.dim_accounts)) + (select count(*) from main.dim_accounts d where d.account_id not in (select account_id from raw.accounts)) + (select case when count(*) in (0, (select count(*) from raw.accounts where is_sandbox)) then 0 else 1 end from main.dim_accounts where is_sandbox)"
+    }
+  ]
+}

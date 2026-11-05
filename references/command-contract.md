@@ -240,6 +240,13 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      a status of lossless, declared, undeclared or unchecked (#861),
                                      matching only partner keys its filters keep and carrying a later
                                      CTE's row filters back, naming the rest (#1073);
+                                     data.change_scope (#1115), static and free: per existing
+                                     model the plan rewrites, population changed / kept /
+                                     unchecked and each output removed, added, retyped,
+                                     re-aggregated or re-NULLed, every judged change declared
+                                     (an assumption names its column) or undeclared (a warning),
+                                     carried to a --for-plan build's
+                                     completion.obligations.change_scope;
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref

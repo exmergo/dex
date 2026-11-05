@@ -1,0 +1,7 @@
+version: 2
+models:
+  - name: stg_visits
+    description: One row per visit.
+    columns:
+      - name: visit_id
+        data_tests: [unique, not_null]

@@ -35,6 +35,11 @@ Truth (``truth.json``), per task::
                   "steps": [["insert into raw.x ..."], []],
                   "checks": [{"name": "...", "sql": "...", "expect": 0}]}],
      "incremental_test": {"model": "fct_x"},
+     "scope": {"dim_accounts": {"column": "is_sandbox", "value": true,
+                                "domain": [true, false],
+                                "allowed": ["kept", "excluded"],
+                                "excluded_evidence": {"decision_pattern": "sandbox",
+                                                      "evidence": ["default"]}}},
      "planted_defects": [{"name": "window one day wider",
                           "path": "models/marts/fct_x.sql",
                           "replace": ["'6 day'", "'7 day'"], "select": "fct_x"}]}
@@ -72,6 +77,16 @@ least one test, unit or data. A defect whose text is not found exactly once is
 ``planted: false`` and not caught. The grade is the share caught, apart from
 every other score, and says only that these defects could not ship, never that
 the model is right.
+
+``scope`` grades whether a model's population, where the request leaves it to
+the agent or settles it, is the one its declaration states (#1115): ``measured``
+is whether the gate's build still holds rows with ``column = value``,
+``declared`` whether the YAML population excludes that value (read through the
+domain like correctness), and it passes when the two agree and the state is in
+``allowed``. An ambiguous request allows both, so a defensible documented choice
+passes whichever it is, and an undocumented filter on a roster fails. With
+``excluded_evidence``, an exclusion must also carry an assumption matching
+``decision_pattern`` with one of those tiers.
 
 A ``unit`` ending in ``*`` matches by prefix (``currency:*`` accepts any ISO code),
 and a list accepts any of its values, for a field where more than one answer is
@@ -764,6 +779,75 @@ def attribution(decl: Declared, truth: dict[str, Any] | None) -> dict[str, Any] 
     }
 
 
+# --- scope (#1115) -------------------------------------------------------------
+
+
+def _literal(value: Any) -> str:
+    """A truth value as a DuckDB literal: booleans and numbers bare, text quoted."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def scope_grades(
+    scratch: Path,
+    entries: dict[str, list[tuple[str, dict[str, Any]]]],
+    truth: dict[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    """Per model in ``truth``, whether the population built is the population
+    declared, and one the task allows (see the module docstring)."""
+
+    if not truth:
+        return None
+    import duckdb
+
+    database = scratch / WAREHOUSE_FILE
+    graded = []
+    for model, spec in sorted(truth.items()):
+        column, value = spec["column"], spec["value"]
+        found = entries.get(model)
+        decl = declared(found[0][1] if found else None)
+        domain = [str(v) for v in spec.get("domain") or [value]]
+        excluded = _effective_excluded(decl.population, column, domain)
+        stated = "excluded" if excluded and _norm(value) in excluded else "kept"
+        record: dict[str, Any] = {"model": model, "declared": stated}
+        try:
+            con = duckdb.connect(str(database), read_only=True)
+            try:
+                present = con.execute(
+                    f'select count(*) from main."{model}" '
+                    f'where "{column}" = {_literal(value)}'
+                ).fetchone()[0]
+            finally:
+                con.close()
+        except Exception as exc:  # a missing relation or column fails the grade
+            record.update(measured=None, passed=False, error=type(exc).__name__)
+            graded.append(record)
+            continue
+        measured = "kept" if present else "excluded"
+        evidence_ok = True
+        wanted = spec.get("excluded_evidence")
+        if measured == "excluded" and wanted:
+            pattern = re.compile(wanted["decision_pattern"], re.IGNORECASE)
+            tiers = [
+                str(a.get("evidence"))
+                for a in decl.assumptions
+                if pattern.search(f"{a.get('decision') or ''} {a.get('chosen') or ''}")
+            ]
+            evidence_ok = bool(tiers) and all(t in wanted["evidence"] for t in tiers)
+            record["tiers"] = tiers
+        record.update(
+            measured=measured,
+            allowed=list(spec["allowed"]),
+            passed=measured == stated and measured in spec["allowed"] and evidence_ok,
+        )
+        graded.append(record)
+    return graded
+
+
 # --- procedure steps ---------------------------------------------------------
 
 
@@ -1105,6 +1189,10 @@ class TaskScore:
     defects_caught: float | None = None
     #: What the agent did with ``transform test --mutate`` (``mutation_record``).
     mutation: dict[str, Any] | None = None
+    #: Share of the ``truth.scope`` models whose built population is the one
+    #: declared and allowed (#1115); ``None`` when the task grades none.
+    scope: float | None = None
+    scope_models: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """The score as a plain dictionary, for the JSON report."""
@@ -1255,6 +1343,7 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
                 "description": decl.description,
             }
         checks = run_checks(tmp_path / "built", task.truth.get("checks") or [])
+        scoped = scope_grades(tmp_path / "built", entries, task.truth.get("scope"))
         checks += run_replays(
             workspace, fixture, tmp_path, task.truth.get("replays") or []
         )
@@ -1285,4 +1374,6 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         defects_caught=(
             sum(d["caught"] for d in defects) / len(defects) if defects else None
         ),
+        scope=(sum(g["passed"] for g in scoped) / len(scoped)) if scoped else None,
+        scope_models=scoped,
     )

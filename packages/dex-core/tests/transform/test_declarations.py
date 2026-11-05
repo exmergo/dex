@@ -458,6 +458,8 @@ def test_decisions_are_read_back_from_the_rendered_yaml():
             "decision": "Which order statuses count as revenue",
             "chosen": "completed and shipped",
             "evidence": "precedent",
+            # The one-line justification travels with the decision (#1115).
+            "detail": "every model reading stg_orders.status excludes them",
         }
     ]
     assert decisions(files, {"dim_customers"}) == []

@@ -43,6 +43,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if r.get("session") and r["session"]["cost_usd"]
     ]
     attributed = [s["attribution"] for s in scored if s.get("attribution") is not None]
+    scoped = [s["scope"] for s in scored if s.get("scope") is not None]
     procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
     private = [s for s in scored if s.get("privacy") is not None]
     reported = [s["report"]["passed"] for s in scored if s.get("report") is not None]
@@ -71,6 +72,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "procedure": (
             round(sum(procedural) / len(procedural), 4) if procedural else None
         ),
+        # Over the tasks that grade it (#1115): the population built is the one
+        # declared, and one the request allows.
+        "scope": round(sum(scoped) / len(scoped), 4) if scoped else None,
         "cost_usd": round(sum(costs), 4) if costs else None,
         "privacy_failed": [s["task"] for s in private if not s["privacy"]["passed"]],
         "privacy_pass_rate": (
@@ -106,8 +110,8 @@ def _print_table(report: dict[str, Any]) -> None:
 
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
-        f"{'attrib':>7} {'proc':>5} {'privacy':>7} {'wspace':>6} {'report':>6} "
-        f"{'inctest':>7} {'defects':>7}"
+        f"{'attrib':>7} {'scope':>5} {'proc':>5} {'privacy':>7} {'wspace':>6} "
+        f"{'report':>6} {'inctest':>7} {'defects':>7}"
     )
     for row in report["results"]:
         s = row["score"]
@@ -119,6 +123,7 @@ def _print_table(report: dict[str, Any]) -> None:
                 if s.get("attribution") is not None
                 else f"{'-':>7}"
             )
+            + (f" {s['scope']:5.2f}" if s.get("scope") is not None else f" {'-':>5}")
             + (
                 f" {s['procedure']:5.2f}"
                 if s.get("procedure") is not None
@@ -161,6 +166,7 @@ def _print_table(report: dict[str, Any]) -> None:
             if agg.get("attribution") is not None
             else ""
         )
+        + (f"; scope {agg['scope']:.2f}" if agg.get("scope") is not None else "")
         + (
             f"; procedure {agg['procedure']:.2f}"
             if agg.get("procedure") is not None
@@ -330,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             r["score"]["correctness"],
             r["score"]["checks_passed"],
             1 if r["score"]["attribution"] is None else r["score"]["attribution"],
+            1 if r["score"].get("scope") is None else r["score"]["scope"],
             1
             if r["score"].get("defects_caught") is None
             else r["score"]["defects_caught"],

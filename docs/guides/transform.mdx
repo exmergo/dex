@@ -98,6 +98,24 @@ record the exclusion as an assumption naming its `column`. On DuckDB the counts
 are free. Elsewhere they need `--attribute-rows` and are priced with row
 attribution.
 
+A repair is meant to change some behavior and keep the rest, and
+`data.change_scope` shows where those lines fall. For each existing model the
+plan rewrites, it says whether the row population is `changed`, `kept` or
+`unchecked`, and it names each output the plan removes, retypes, re-aggregates or
+re-NULLs. Re-aggregating covers `count(*)` becoming `count(visit_id)`, and
+re-NULLing covers a `coalesce` added to an average. The report is free and reads
+no data.
+
+A change no assumption records is `undeclared` and raises a warning. If the
+request asked for it, record it as an assumption naming its `column`. If not,
+undo it.
+
+For a request such as "exclude sandbox accounts from our metrics", the
+`population` lists show which edited models now filter and which ones the edit
+leaves alone. They read each model's own SQL, so check a roster's rows on the
+build as well. Whether the account directory filters too is a decision to record
+rather than a side effect, and when the request leaves it open it is a `default`.
+
 Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)
 when you need to construct the edits payload yourself.
 

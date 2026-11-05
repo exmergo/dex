@@ -1,0 +1,66 @@
+{
+  "models": {
+    "daily_visits": {
+      "grain": [
+        "visit_date"
+      ],
+      "columns": {
+        "visit_date": {
+          "role": [
+            "key",
+            "time"
+          ]
+        },
+        "visits": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "avg_duration_minutes": {
+          "role": "measure",
+          "additivity": "non_additive"
+        }
+      }
+    }
+  },
+  "attribution": {
+    "decision_pattern": "no visit|empty|zero|quiet|missing day|without visits|gap",
+    "evidence": [
+      "default",
+      "contract",
+      "request"
+    ],
+    "forbidden": [
+      "data"
+    ],
+    "max_assumptions": 6
+  },
+  "checks": [
+    {
+      "name": "every day from the first to the last visit has one row",
+      "expect": 0,
+      "sql": "select (select date_diff('day', min(visited_on), max(visited_on)) + 1 from raw.visits) - (select count(distinct visit_date) from main.daily_visits) + (select count(*) - count(distinct visit_date) from main.daily_visits)"
+    },
+    {
+      "name": "a day with no visits counts zero, not one and not NULL",
+      "expect": 0,
+      "sql": "select count(*) from main.daily_visits d where not exists (select 1 from raw.visits v where v.visited_on = d.visit_date) and (d.visits is null or d.visits <> 0)"
+    },
+    {
+      "name": "a day with no visits keeps a NULL average, not zero",
+      "expect": 0,
+      "sql": "select count(*) from main.daily_visits d where not exists (select 1 from raw.visits v where v.visited_on = d.visit_date) and d.avg_duration_minutes is not null"
+    },
+    {
+      "name": "days with visits are unchanged",
+      "expect": 0,
+      "sql": "select count(*) from (select visited_on, count(*) as visits, avg(duration_minutes) as avg_d from raw.visits group by visited_on) r left join main.daily_visits d on d.visit_date = r.visited_on where d.visits is distinct from r.visits or d.avg_duration_minutes is distinct from r.avg_d"
+    },
+    {
+      "name": "the output columns and their types are the model's own",
+      "expect": 0,
+      "sql": "select count(*) filter (where (column_name, data_type) not in (('visit_date', 'DATE'), ('visits', 'BIGINT'), ('avg_duration_minutes', 'DOUBLE'))) + 3 - count(*) filter (where (column_name, data_type) in (('visit_date', 'DATE'), ('visits', 'BIGINT'), ('avg_duration_minutes', 'DOUBLE'))) from information_schema.columns where table_schema = 'main' and table_name = 'daily_visits'"
+    }
+  ]
+}

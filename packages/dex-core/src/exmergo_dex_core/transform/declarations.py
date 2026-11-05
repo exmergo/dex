@@ -1434,6 +1434,12 @@ def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str,
                         if isinstance(assumption.get("column"), str)
                         else {}
                     ),
+                    **(
+                        {"detail": assumption["detail"]}
+                        if isinstance(assumption.get("detail"), str)
+                        and assumption["detail"].strip()
+                        else {}
+                    ),
                 }
             )
     return out

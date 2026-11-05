@@ -463,6 +463,7 @@ def plan(
         _store_companion(engine, intent, derived, result)
     _attribute_rows(engine, result, edits, requested=attribute_rows)
     _contradiction_warnings(result)
+    _report_change_scope(engine, result, edits)
     _offer_refactor_comparison(engine, result, edits)
     if toggle_stated is not None:
         _check_toggle(engine, result, toggle_stated)
@@ -1210,6 +1211,61 @@ def _settle_conversions(engine: DexEngine, result: PlanResult, diagnosis: Any) -
         store = engine.require_full_store("recording identifier conversions")
         stored = store.load_plan(result.plan_id)
         stored.identifier_conversions = per_model
+        store.save_plan(stored)
+
+
+def _report_change_scope(
+    engine: DexEngine, result: PlanResult, edits: list[PlanEdit]
+) -> None:
+    """Say what the plan changes about each model it rewrites beyond what an
+    assumption records (#1115): which populations move and which stay, and
+    which outputs are removed, retyped, re-aggregated or re-NULLed.
+
+    Static and free: both versions are rendered and read, nothing runs. The plan
+    is already stored, so a defect here is a warning and never an error.
+    """
+
+    from ..adapters import get_dialect
+    from ..dbt_project import load as load_project
+    from . import change_scope
+
+    if not _has_dbt_project(engine):
+        return
+    try:
+        view = load_project(engine.project_dir())
+        rewrites = [
+            (edit.path, view.files[edit.path].content, edit.new_content)
+            for edit in edits
+            if edit.kind is EditKind.MODEL_SQL
+            and edit.op is EditOp.UPSERT
+            and edit.new_content is not None
+            and edit.path in view.files
+        ]
+        if not rewrites:
+            return
+        report = change_scope.analyze(
+            rewrites,
+            result.decisions or [],
+            get_dialect(engine.connector or engine.config.connector),
+            view.vars,
+        )
+    except Exception as exc:
+        result.warnings.append(
+            "could not read what this plan changes beside its request "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+        return
+    if report is None:
+        return
+    result.change_scope = report
+    result.warnings.extend(change_scope.warnings(report))
+    per_model = change_scope.stored_form(report)
+    if not per_model:
+        return
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("recording a plan's change scope")
+        stored = store.load_plan(result.plan_id)
+        stored.change_scope = per_model
         store.save_plan(stored)
 
 
@@ -5884,6 +5940,7 @@ def _attach_completion(
             cold=result.cold_verification,
             prose_population=_prose_population(result, inputs),
             identifier_conversions=inputs.get("identifier_conversions"),
+            change_scope=inputs.get("change_scope"),
         )
     except Exception as exc:
         result.notes.append(
@@ -5919,6 +5976,7 @@ def _completion_inputs(
             inputs["identifier_conversions"] = (
                 getattr(stored, "identifier_conversions", None) or {}
             )
+            inputs["change_scope"] = getattr(stored, "change_scope", None) or {}
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):

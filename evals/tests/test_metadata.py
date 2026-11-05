@@ -72,6 +72,8 @@ DIGESTS = {
     "incremental_watermark": "708724ae33e4abd42360c359667364542bbf75beac5b3bd7a385cac1f8b15d0f",
     "trailing_window": "9bc38c6d85e6e7bcfa81ad11926d7c7207ce20265dc699b9c1f9f4f444c37a74",
     "optional_fees": "4becda5d5ad945ba188d20567e2a874f66c6de1df6c370b3403739839ed5f10d",
+    "sandbox_scope": "c39e1d55a470611137dcbd0b62fdbd617ea8abc183f202b06e51b7d46ea2a07a",
+    "visit_coverage": "89f49a8cfb57454f2bccea7e679f82bdecddb20494fb4822077249ee8190c124",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -2849,3 +2851,268 @@ def test_package_blocked_refactor_flow(tmp_path, monkeypatch, capsys):
         r["model"] == "team_member_summary" and r["status"] == "equivalent"
         for r in completion["refactor_comparison"]
     )
+
+
+# --- scope (#1115): which populations a repair changes, and what it keeps -------
+
+_SANDBOX = "sandbox_scope"
+_DIM_SQL = "models/marts/dim_accounts.sql"
+_MARTS_YML = "models/marts/_marts.yml"
+_ROSTER_FILTER = (
+    "select account_id, account_name, region, is_sandbox\n"
+    "from {{ ref('stg_accounts') }}\nwhere not is_sandbox\n"
+)
+
+
+def _roster_declared(document: dict, evidence: str) -> None:
+    """Declare the directory's sandbox exclusion, with ``evidence``."""
+
+    entry = next(m for m in document["models"] if m["name"] == "dim_accounts")
+    entry["config"] = {
+        "meta": {
+            "dex": {
+                "grain": ["account_id"],
+                "population": {
+                    "rule": "Customer accounts only.",
+                    "filters": [{"column": "is_sandbox", "excludes": [True]}],
+                },
+                "assumptions": [
+                    {
+                        "decision": "Whether sandbox accounts stay in the directory",
+                        "chosen": "sandbox accounts excluded",
+                        "evidence": evidence,
+                        "column": "is_sandbox",
+                    }
+                ],
+            }
+        }
+    }
+
+
+def _sandbox_with(tmp_path: Path, task: str, *, roster: str | None, declared=None):
+    """A sandbox task's reference answer, with the directory rewritten."""
+
+    task_, fixture, workspace = _reference(tmp_path, f"{_SANDBOX}/{task}")
+    if roster is not None:
+        (workspace / _DIM_SQL).write_text(roster, encoding="utf-8")
+    if declared is not None:
+        _edit_yaml(workspace / _MARTS_YML, lambda d: _roster_declared(d, declared))
+    return score_workspace(task_, fixture, workspace)
+
+
+def test_the_scope_fixture_covers_narrow_broad_and_ambiguous_requests():
+    keys = {t.key for t in TASKS if t.key.startswith(_SANDBOX)}
+    assert keys == {f"{_SANDBOX}/{k}" for k in ("narrow", "broad", "ambiguous")}
+    allowed = {
+        k: _task(f"{_SANDBOX}/{k}").truth["scope"]["dim_accounts"]["allowed"]
+        for k in ("narrow", "broad", "ambiguous")
+    }
+    assert allowed == {
+        "narrow": ["kept"],
+        "broad": ["excluded"],
+        "ambiguous": ["kept", "excluded"],
+    }
+
+
+@needs_dbt
+def test_a_narrow_request_that_also_filters_the_roster_fails_scope(tmp_path):
+    score = _sandbox_with(tmp_path, "narrow", roster=_ROSTER_FILTER)
+    assert score.scope == 0.0
+    assert score.scope_models[0]["measured"] == "excluded"
+    assert score.scope_models[0]["declared"] == "kept"
+    assert _failed(score) == ["the directory still lists every account"]
+
+
+@needs_dbt
+def test_declaring_a_roster_filter_the_narrow_request_never_asked_for_still_fails(
+    tmp_path,
+):
+    score = _sandbox_with(tmp_path, "narrow", roster=_ROSTER_FILTER, declared="default")
+    assert score.scope == 0.0
+    assert score.scope_models[0]["declared"] == "excluded"
+
+
+@needs_dbt
+def test_a_broad_request_that_leaves_the_roster_fails_scope(tmp_path):
+    task, fixture, workspace = _reference(tmp_path, f"{_SANDBOX}/broad")
+    start = fixture_of(task, FIXTURES).project / _DIM_SQL
+    (workspace / _DIM_SQL).write_text(start.read_text(encoding="utf-8"))
+    score = score_workspace(task, fixture, workspace)
+    assert score.scope == 0.0
+    assert "the directory lists every customer account" in _failed(score)
+
+
+@needs_dbt
+def test_the_ambiguous_roster_passes_either_way_when_the_choice_is_recorded(tmp_path):
+    kept = _sandbox_with(tmp_path / "kept", "ambiguous", roster=None)
+    assert kept.scope == 1.0
+    excluded = _sandbox_with(
+        tmp_path / "excluded", "ambiguous", roster=_ROSTER_FILTER, declared="default"
+    )
+    assert excluded.scope == 1.0
+    assert excluded.checks_passed == 1.0
+
+
+@needs_dbt
+def test_an_undocumented_roster_filter_fails_the_ambiguous_scope(tmp_path):
+    score = _sandbox_with(tmp_path, "ambiguous", roster=_ROSTER_FILTER)
+    assert score.scope == 0.0
+    # Every data check still passes: only the scope grade sees it.
+    assert score.checks_passed == 1.0
+
+
+@needs_dbt
+def test_an_ambiguous_roster_exclusion_claimed_as_the_request_fails_scope(tmp_path):
+    score = _sandbox_with(
+        tmp_path, "ambiguous", roster=_ROSTER_FILTER, declared="request"
+    )
+    assert score.scope == 0.0
+    assert score.scope_models[0]["tiers"] == ["request"]
+
+
+def test_a_scope_model_that_was_not_built_fails_rather_than_passing(tmp_path):
+    from evals.metadata.fixtures import WAREHOUSE_FILE
+    from evals.metadata.score import scope_grades
+
+    (tmp_path / WAREHOUSE_FILE).write_bytes(b"")
+    graded = scope_grades(
+        tmp_path,
+        {},
+        {"dim_x": {"column": "flag", "value": True, "allowed": ["kept", "excluded"]}},
+    )
+    assert graded[0]["passed"] is False
+    assert graded[0]["measured"] is None
+
+
+def test_a_task_grading_no_scope_reports_none():
+    from evals.metadata.score import scope_grades
+
+    assert scope_grades(Path(), {}, None) is None
+
+
+_VISITS = "visit_coverage/fill_missing_days"
+_VISITS_SQL = "models/marts/daily_visits.sql"
+
+
+def _visits_with(tmp_path: Path, sql: str):
+    task, fixture, workspace = _reference(tmp_path, _VISITS)
+    (workspace / _VISITS_SQL).write_text(sql, encoding="utf-8")
+    return score_workspace(task, fixture, workspace)
+
+
+def _visits_reference() -> str:
+    task = _task(_VISITS)
+    return (task.directory / "reference" / _VISITS_SQL).read_text(encoding="utf-8")
+
+
+@needs_dbt
+def test_filling_the_days_with_count_star_counts_one_on_an_empty_day(tmp_path):
+    score = _visits_with(
+        tmp_path, _visits_reference().replace("count(v.visit_id)", "count(*)")
+    )
+    assert _failed(score) == ["a day with no visits counts zero, not one and not NULL"]
+
+
+@needs_dbt
+def test_filling_the_days_with_a_zero_average_changes_what_null_meant(tmp_path):
+    score = _visits_with(
+        tmp_path,
+        _visits_reference().replace(
+            "avg(v.duration_minutes)", "coalesce(avg(v.duration_minutes), 0)"
+        ),
+    )
+    assert _failed(score) == ["a day with no visits keeps a NULL average, not zero"]
+
+
+@needs_dbt
+def test_filling_the_days_and_dropping_a_column_fails_the_schema_check(tmp_path):
+    score = _visits_with(
+        tmp_path,
+        _visits_reference().replace(
+            ",\n    avg(v.duration_minutes) as avg_duration_minutes", ""
+        ),
+    )
+    assert "the output columns and their types are the model's own" in _failed(score)
+
+
+@needs_dbt
+def test_the_starting_daily_visits_misses_the_quiet_days(tmp_path):
+    task = _task(_VISITS)
+    start = fixture_of(task, FIXTURES).project / _VISITS_SQL
+    score = _visits_with(tmp_path, start.read_text(encoding="utf-8"))
+    assert _failed(score) == ["every day from the first to the last visit has one row"]
+
+
+@needs_dbt
+def test_filling_the_days_and_retyping_a_count_fails_the_schema_check(tmp_path):
+    score = _visits_with(
+        tmp_path,
+        _visits_reference().replace(
+            "count(v.visit_id) as visits",
+            "cast(count(v.visit_id) as integer) as visits",
+        ),
+    )
+    assert _failed(score) == ["the output columns and their types are the model's own"]
+
+
+def test_the_sandbox_decision_pattern_skips_the_decisions_around_it():
+    """The attribution reads the exclusion the task turns on, not the conventional
+    choices recorded beside it (a NULL flag read as false, the join that reads the
+    flag, a region left with no customer account), which are rightly `default` or
+    `data` (#1115)."""
+
+    import re
+
+    pattern = re.compile(
+        _task(f"{_SANDBOX}/narrow").truth["attribution"]["decision_pattern"],
+        re.IGNORECASE,
+    )
+    scope = [
+        "Sandbox tenants in the summary leave them out of both counts",
+        "Whether sandbox usage counts excluded",
+        "Sandbox accounts in the directory removed",
+        "Region list with the sandbox filter keep every region; exclude sandbox counts",
+    ]
+    around = [
+        "A NULL is_sandbox flag read as a customer account, not a sandbox one",
+        "Join usage to accounts to read is_sandbox inner join on account_id",
+        "Regions whose only accounts are sandbox ones kept with zero counts",
+    ]
+    assert all(pattern.search(text) for text in scope)
+    assert not any(pattern.search(text) for text in around)
+
+
+@needs_dbt
+def test_a_partial_directory_filter_fails_the_ambiguous_task(tmp_path):
+    """Dropping some sandbox accounts from the directory is neither documented
+    choice, and Scope alone would read the survivors as `kept`."""
+
+    partial = _ROSTER_FILTER.replace(
+        "where not is_sandbox", "where not (is_sandbox and account_id % 2 = 0)"
+    )
+    score = _sandbox_with(tmp_path, "ambiguous", roster=partial)
+    assert _failed(score) == [
+        "the directory keeps every customer account and all or none of the sandbox ones"
+    ]
+
+
+@needs_dbt
+def test_a_directory_keeping_only_sandbox_accounts_fails_the_ambiguous_task(tmp_path):
+    inverted = _ROSTER_FILTER.replace("where not is_sandbox", "where is_sandbox")
+    score = _sandbox_with(tmp_path, "ambiguous", roster=inverted)
+    assert _failed(score) == [
+        "the directory keeps every customer account and all or none of the sandbox ones"
+    ]
+
+
+@needs_dbt
+def test_a_shifted_range_that_drops_a_visit_day_fails_the_unchanged_check(tmp_path):
+    """One day earlier at the start and one day short at the end: the day count
+    holds, and only comparing every source date catches the missing one."""
+
+    shifted = _visits_reference().replace(
+        "select min(visited_on) as first_day, max(visited_on) as last_day",
+        "select min(visited_on) - 1 as first_day, max(visited_on) - 1 as last_day",
+    )
+    score = _visits_with(tmp_path, shifted)
+    assert "days with visits are unchanged" in _failed(score)
