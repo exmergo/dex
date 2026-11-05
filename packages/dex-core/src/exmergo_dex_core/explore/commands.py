@@ -83,10 +83,6 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..guards.values_free_shape import assert_values_free_shape
 from ..progress import ProgressReporter
-from ..project_definitions import (
-    DeclaredHistory,
-    DeclaredHistoryStatus,
-)
 from ..reserved_words import reserved_column_names
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..semantic_catalog import (
@@ -4358,24 +4354,10 @@ def _dataset_declaration(
 
     history = None
     if declaration.history is not None:
-        target = declaration.history.status.target
-        if values_free or declaration.history.status.column.lower() in flagged:
-            target = None
+        history = declaration.history.model_copy(deep=True)
+        if values_free or history.status.column.lower() in flagged:
+            history.status.target = None
             withheld.append("history.status.target")
-        history_status = DeclaredHistoryStatus(
-            column=declaration.history.status.column,
-            target=target,
-        )
-        history = DeclaredHistory(
-            snapshot=declaration.history.snapshot,
-            entity=dict(declaration.history.entity),
-            status=history_status,
-            initial_observation=declaration.history.initial_observation,
-            null_status=declaration.history.null_status,
-            population=declaration.history.population,
-            time=declaration.history.time,
-            measures=declaration.history.measures,
-        )
 
     grain = declaration.grain
     status = None
