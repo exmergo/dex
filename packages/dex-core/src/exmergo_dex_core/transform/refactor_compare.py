@@ -759,6 +759,13 @@ def _compile_side(
 _NOT_REBUILT = frozenset({"error", "runtime error", "fail", "failed", "skipped"})
 
 
+def _blocked_key(blocked: BlockedInput) -> tuple[str, str, str]:
+    """Sort key for blocked inputs: a project model's ``package`` is ``None``,
+    and a project model and a package's model can share a name and status."""
+
+    return (blocked.model, blocked.status, blocked.package or "")
+
+
 def repair_first(blocked: Sequence[BlockedInput]) -> str:
     """The sequence that gives a blocked comparison a baseline (#1114).
 
@@ -891,14 +898,16 @@ def _blocked_parents(
                     package if package and package != graph["root"] else None,
                 )
             )
-    return sorted(blocked)
+    return sorted(blocked, key=_blocked_key)
 
 
 def inputs_built_by(project: Path, model: str) -> dict[str, Any] | None:
     """The latest building run among the model's upstream models (#1114).
 
-    What a comparison's baseline read: the invocation, when it ran, and whether
-    it was a ``--cold-deps`` build. ``None`` when no run attempted any of them.
+    The invocation, when it ran, and whether it was a ``--cold-deps`` build.
+    It names one run: other upstream models may have last been built by an
+    earlier one, so ``cold`` does not say every input was built cold. ``None``
+    when no run attempted any of them.
     """
 
     upstream = _upstream(project, model)

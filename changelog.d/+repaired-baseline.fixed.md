@@ -8,9 +8,10 @@ ordinary or cold, with the manifest of the newest; a compile no longer counts as
 one. The `inputs_unsynchronized` detail names the order that clears it: the
 repair in a plan of its own, applied and built (`--cold-deps` for a package's
 model), then the refactor's plan compared while still unapplied. Every verdict
-carries `inputs_built_by` (`invocation_id`, `generated_at`, `cold`), recorded on
-the plan and reported by `transform apply` and a `--for-plan` build, so an
-`equivalent` is tied to the build it read. `data.refactor_comparison_offer` on
+carries `inputs_built_by` (`invocation_id`, `generated_at`, `cold`), the latest
+build among the compared model's upstream models, recorded on the plan and
+reported by `transform apply` and a `--for-plan` build. It names one run; other
+inputs may come from earlier builds. `data.refactor_comparison_offer` on
 `transform plan` now says before any comparison whether the baseline builds:
 `baseline_ready`, and `per_model[].blocked_inputs` with each input's status and
 owner, with `data.next` leading with the repair. A plan that carries the repair

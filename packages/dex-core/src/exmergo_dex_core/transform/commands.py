@@ -821,6 +821,7 @@ def _offer_refactor_comparison(
     from .refactor_compare import (
         _GLOBAL_KINDS,
         BlockedInput,
+        _blocked_key,
         _blocked_parents,
         edited_existing_models,
         repair_first,
@@ -889,7 +890,7 @@ def _offer_refactor_comparison(
         "meant to keep the model's results, compare before `transform apply`"
     )
     if blocked_all:
-        unique = sorted(set(blocked_all))
+        unique = sorted(set(blocked_all), key=_blocked_key)
         why = (
             "the baseline does not build: the last attempt left "
             + ", ".join(f"{b.model} ({b.status})" for b in unique)

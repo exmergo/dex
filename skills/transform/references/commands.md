@@ -187,7 +187,8 @@ A plan that rewrote existing models also returns `data.refactor_comparison`: one
 entry per rewritten model with its `static_attribution`, and per model compared on
 the plan (a downstream mart counts), with the last `transform compare` verdict
 recorded (`status`, `reason_code`, `compared_at`, and `inputs_built_by`: the
-invocation, time and kind of the build the compared inputs came from), or
+invocation, time and kind of the latest build among the compared model's
+upstream models), or
 `status: not_compared`. It is reported, never enforced. A `notes` line names the rewrites when nothing on the
 plan was compared and static attribution established nothing, and any model whose
 last comparison was `different` or `not_checked`, so a refactor that went in
@@ -547,8 +548,9 @@ inline and not judged this way, and no run results at all changes nothing.
 
 Every verdict carries `inputs_built_by` (`invocation_id`, `generated_at`, `cold`):
 the latest build among the compared model's upstream models, so an `equivalent`
-can be tied to the repaired state it read. It is recorded on the plan with the
-verdict.
+can be tied to the repaired state it read. It names one run: other inputs may
+come from earlier builds, so `cold: true` does not mean every input came from a
+cold build. It is recorded on the plan with the verdict.
 
 - Read `data.status`, then `data.reason_code`. `equivalent` holds for
   `data.input_scope` at `data.compared_at`, on the dev relations as they stand. Say
@@ -688,6 +690,7 @@ the model's own tests against each, and reports which defects nothing caught.
 
 Installs or refreshes dbt packages. No confirmation needed: it writes only inside
 the project and never touches the warehouse. It installs the packages the project
-already declares in `packages.yml`, at the versions `package-lock.yml` pins: that is
+already declares in `packages.yml`, at the versions `package-lock.yml` pins where
+the lockfile matches it (dbt resolves them again where it does not): that is
 not installing or upgrading a tool, and a request not to update tools does not rule
 it out.

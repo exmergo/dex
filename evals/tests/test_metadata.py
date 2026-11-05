@@ -819,6 +819,7 @@ def _relabel(workspace: Path, evidence: str, detail: str | None = None) -> None:
         path = workspace / "models" / "marts" / "_marts.yml"
 
     def edit(document):
+
         dex = document["models"][0]["config"]["meta"]["dex"]
         dex["assumptions"][0]["evidence"] = evidence
         if detail:
@@ -2158,6 +2159,8 @@ def test_the_refactor_prerequisite_data_has_empty_parents_and_orphan_children():
 
 @needs_dbt
 def test_the_refactor_without_its_prerequisite_fails_the_gate(tmp_path):
+    """The refactor alone, with the package prerequisite unrepaired, fails the build gate."""
+
     task = _task(REFACTOR_PREREQUISITE)
     fixture = fixture_of(task, FIXTURES)
     workspace = materialize(task, fixture, tmp_path / "ws")
@@ -2170,6 +2173,8 @@ def test_the_refactor_without_its_prerequisite_fails_the_gate(tmp_path):
 
 @needs_dbt
 def test_a_refactor_repaired_under_dbt_packages_fails_the_gate(tmp_path):
+    """A repair made in the installed package passes warm and is gone after the gate reinstalls it."""
+
     task = _task(REFACTOR_PREREQUISITE)
     fixture = fixture_of(task, FIXTURES)
     workspace = materialize(task, fixture, tmp_path / "ws")
@@ -2220,6 +2225,8 @@ def test_a_refactor_repaired_under_dbt_packages_fails_the_gate(tmp_path):
 def test_the_package_blocked_refactor_checks_catch_the_wrong_answers(
     tmp_path, path, old, new, fails
 ):
+    """Each wrong refactor or row-dropping repair fails the checks that name its defect."""
+
     task, fixture, workspace = _reference(tmp_path, REFACTOR_PREREQUISITE)
     target = workspace / path
     text = target.read_text(encoding="utf-8")
@@ -2232,6 +2239,8 @@ def test_the_package_blocked_refactor_checks_catch_the_wrong_answers(
 
 
 def _tool_use(command, use_id):
+    """One assistant event that runs ``command`` through Bash under ``use_id``."""
+
     return {
         "type": "assistant",
         "message": {
@@ -2248,6 +2257,8 @@ def _tool_use(command, use_id):
 
 
 def _tool_result(use_id, text, is_error=False):
+    """The tool result event for ``use_id``, carrying ``text``."""
+
     return {
         "type": "user",
         "message": {
@@ -2286,6 +2297,8 @@ def _tool_result(use_id, text, is_error=False):
 def test_the_transcript_summary_records_what_a_build_established(
     result, is_error, outcome
 ):
+    """A build's outcome is read from its envelope, or ``None`` where the pipe hid it."""
+
     from evals.metadata.live import Session, summarize
 
     events = [
@@ -2297,6 +2310,8 @@ def test_the_transcript_summary_records_what_a_build_established(
 
 
 def test_two_builds_in_one_command_share_no_outcome():
+    """One result cannot be split between two builds, so neither gets an outcome."""
+
     from evals.metadata.live import Session, summarize
 
     events = [
@@ -2313,6 +2328,8 @@ def test_two_builds_in_one_command_share_no_outcome():
 
 
 def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
+    """A recorded transform call with the fields the procedure steps read."""
+
     return {
         "label": f"transform {verb}",
         "plan": plan,
@@ -2350,6 +2367,16 @@ def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
             [
                 _step("apply", "p1"),
                 _step("build", outcome="failed"),
+                _step("compare", "p2", "equivalent"),
+                _step("apply", "p2"),
+            ],
+            False,
+        ),
+        # A build that ran none of the repair's nodes did not build it.
+        (
+            [
+                _step("apply", "p1"),
+                _step("build", outcome="unrelated"),
                 _step("compare", "p2", "equivalent"),
                 _step("apply", "p2"),
             ],
@@ -2401,6 +2428,7 @@ def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
         "repair-built-then-compared",
         "bundled",
         "repair-build-failed",
+        "unrelated-build",
         "retried-build",
         "hidden-build",
         "not-checked",
@@ -2408,6 +2436,8 @@ def _step(verb, plan=None, verdict=None, outcome=None, flags=None):
     ],
 )
 def test_the_comparison_must_follow_a_built_repair(calls, passed):
+    """``rebuilt_before_compare`` needs a usable comparison after a repair's apply and a build of it that did not fail."""
+
     from evals.metadata.score import procedure_steps
 
     graded = procedure_steps({"rebuilt_before_compare": True}, calls)
@@ -2443,6 +2473,8 @@ def test_the_comparison_must_follow_a_built_repair(calls, passed):
     ids=["before-compare", "after-refactor", "before-any-apply", "never-cold"],
 )
 def test_cold_deps_after_repair_counts_after_any_apply(calls, passed):
+    """``cold_deps_after_repair`` accepts a cold build after any apply, and none before."""
+
     from evals.metadata.score import procedure_steps
 
     graded = procedure_steps({"cold_deps_after_repair": True}, calls)
@@ -2476,6 +2508,8 @@ def test_package_blocked_refactor_flow(tmp_path, monkeypatch, capsys):
         return envelope
 
     def plan(name, edits):
+        """Plan ``edits`` through the CLI, as a payload file named for the step."""
+
         path = workspace / f"{name}.json"
         path.write_text(json.dumps({"edits": edits}))
         return dex("transform", "plan", name, "--edits-file", str(path))
@@ -2483,6 +2517,8 @@ def test_package_blocked_refactor_flow(tmp_path, monkeypatch, capsys):
     reference = task.directory / "reference"
 
     def edit(path, kind="model_sql"):
+        """One edit carrying the reference answer's content at ``path``."""
+
         return {"path": path, "kind": kind, "content": (reference / path).read_text()}
 
     blocked = dex("transform", "build", "--target", "dev", expected="error")

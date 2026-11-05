@@ -554,7 +554,8 @@ class RefactorComparisonResult(Result):
     # branch (#858). Absent everywhere else.
     baseline_vars: dict[str, Any] | None = None
     # The latest build of the compared model's upstream models, ordinary or
-    # `--cold-deps`: what the baseline's inputs are (#1114). None with no build.
+    # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
+    # so `cold` does not mean every input was built cold. None with no build.
     inputs_built_by: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:

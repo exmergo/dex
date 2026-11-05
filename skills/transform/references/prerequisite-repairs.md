@@ -156,7 +156,8 @@ Limits:
 
 Installing the packages the project already declares is not installing a tool.
 `dex transform deps`, the build's own install and `--cold-deps` fetch what
-`packages.yml` names, at the versions `package-lock.yml` pins. A request not to
+`packages.yml` names, at the versions `package-lock.yml` pins where it matches
+(dbt resolves them again where it does not). A request not to
 install or upgrade tools (dbt, Dex, Python packages) does not rule them out.
 
 ## 5. A refactor whose baseline is blocked
@@ -172,14 +173,21 @@ whatever an earlier build left, so the comparison is `not_checked`
    this plan: applying it discards the baseline (`plan_applied`).
 2. **Repair the prerequisite in a plan of its own**, through a supported route
    from `data.prerequisites` (above). Apply it.
-3. **Build the repair.** `dex transform build --target dev --verify --for-plan
-   <repair plan> --cold-deps` where a package owns the node; a plain build with
-   `--select` for a project model. `transform compare` reads the latest attempt
-   of each input, a cold build's included.
+3. **Build the repair.** Where a package owns the node, build it cold:
+
+   ```bash
+   dex transform build --target dev --verify --for-plan <repair plan> --cold-deps
+   ```
+
+   For a project model, a plain build with `--select` is enough.
+   `transform compare` reads the latest attempt of each input, a cold build's
+   included.
 4. **Compare the refactor's plan** (the one from step 1, still unapplied; it is
    not stale unless the repair edited the same files). `equivalent` carries
-   `inputs_built_by`, the build its inputs came from. Relay it with
-   `input_scope` and `compared_at`.
+   `inputs_built_by`, the latest build among the model's upstream models.
+   Other inputs may come from earlier builds, so `cold: true` does not mean
+   every input came from that cold build. Relay it with `input_scope` and
+   `compared_at`.
 5. **Apply and build the refactor** with `--for-plan`. `data.completion`
    carries the recorded verdict.
 

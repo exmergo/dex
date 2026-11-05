@@ -427,7 +427,8 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      inputs_unsynchronized before anything compiles, and the detail
                                      names the repair as its own plan, built, then this plan compared
                                      unapplied. Every verdict carries inputs_built_by (invocation_id,
-                                     generated_at, cold), recorded with it (#1114)
+                                     generated_at, cold): the latest build among the model's upstream
+                                     models, one run, recorded with it (#1114)
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
@@ -716,7 +717,8 @@ would change, computes the diffs, and stores the plan under
 `packages_yml` is the guarded way to declare dbt package dependencies: a
 reviewable diff like any other edit, then `transform deps` (or the automatic
 deps step in `transform build`) installs them. Installing the packages a project
-declares, at its pinned versions, is not installing or upgrading a tool. `macro_sql` is how a macro is
+declares (at the versions `package-lock.yml` pins, where it matches) is not
+installing or upgrading a tool. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path
 for the macros dex ships. `snapshot_sql` and `seed_csv` bring slowly-changing
 dimension capture and small reference tables into the same flow, each confined to

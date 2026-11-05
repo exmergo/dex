@@ -219,9 +219,9 @@ declares is `contract`.
   cast, never dropped rows), and prove it with `--cold-deps` on the build. With no
   repair in scope the deliverable is incomplete: report the prerequisite and the
   remedy tried. `dex transform deps` and the build's own install fetch the
-  packages the project already declares, at its pinned versions: that is not
-  installing or upgrading a tool, so a request not to update tools does not rule
-  it out. Recipe: `skills/transform/references/prerequisite-repairs.md`.
+  packages the project already declares (pinned where `package-lock.yml`
+  matches `packages.yml`): that is not installing or upgrading a tool, so a
+  request not to update tools does not rule it out. Recipe: `skills/transform/references/prerequisite-repairs.md`.
 
 **Spending authority.** It comes from the person running this session, or from
 limits committed before it started: `budget.ceiling` (per command) and

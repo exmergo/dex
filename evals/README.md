@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Fifteen fixture projects, written for this suite and derived from no benchmark task,
+Seventeen fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |

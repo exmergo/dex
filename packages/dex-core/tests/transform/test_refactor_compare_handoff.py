@@ -394,6 +394,8 @@ def test_the_offered_command_quotes_a_model_name_the_shell_would_read(monkeypatc
 def _artifacts(
     directory: Path, manifest: dict, results: list, when: str, which: str = "build"
 ) -> None:
+    """Write a manifest and the run results of one build into ``directory``."""
+
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "manifest.json").write_text(json.dumps(manifest))
     (directory / "run_results.json").write_text(
@@ -445,6 +447,9 @@ _OVERRIDE_MANIFEST = {
 def test_a_package_parent_that_failed_is_blocked_and_named_with_its_package(
     dbt_project_dir,
 ):
+    """A package's failed model is blocked and named with its package, and the
+    advice names the cold build."""
+
     from tests.dbt_artifacts import dex_target
 
     from exmergo_dex_core.transform.refactor_compare import (
@@ -508,6 +513,8 @@ def test_a_cold_build_that_repaired_the_parent_unblocks_the_comparison(
 
 
 def test_a_later_ordinary_failure_blocks_again(dbt_project_dir):
+    """An ordinary build newer than the cold one wins, so its failure blocks again."""
+
     from tests.dbt_artifacts import dex_target
 
     from exmergo_dex_core.transform.refactor_compare import _blocked_parents
@@ -558,6 +565,8 @@ def test_a_compile_is_not_a_rebuild(dbt_project_dir):
 
 
 def _fail(project: Path, unique_id: str) -> None:
+    """Mark ``unique_id`` as errored in the last build's run results."""
+
     run_results = artifact_paths(readable_artifact_dir(project)).run_results
     document = json.loads(run_results.read_text(encoding="utf-8"))
     for row in document["results"]:
@@ -567,6 +576,8 @@ def _fail(project: Path, unique_id: str) -> None:
 
 
 def test_the_offer_says_the_baseline_does_not_build_and_how_to_repair_it(accounts):
+    """The offer reports the blocked input and leads ``data.next`` with the repair."""
+
     engine = _engine(accounts)
     _fail(accounts, "model.p.users")
     planned = _extraction(engine, _LEFT_INT)
@@ -586,6 +597,8 @@ def test_the_offer_says_the_baseline_does_not_build_and_how_to_repair_it(account
 
 
 def test_a_ready_baseline_says_so(accounts):
+    """With nothing blocked the offer says the baseline is ready and names no input."""
+
     planned = _extraction(_engine(accounts), _LEFT_INT)
     offer = planned.data()["refactor_comparison_offer"]
     assert offer["baseline_ready"] is True
@@ -616,6 +629,9 @@ def test_a_repair_bundled_with_the_refactor_is_named_and_warned(accounts):
 
 
 def test_a_comparison_after_the_repair_records_what_built_its_inputs(accounts):
+    """Blocked, repaired and built: the comparison is equivalent and records the
+    build it read."""
+
     engine = _engine(accounts)
     planned = _extraction(engine, _LEFT_INT)
     _fail(accounts, "model.p.users")

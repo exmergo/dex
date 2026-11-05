@@ -77,9 +77,10 @@ dex transform compare PLAN_ID --model account_summary
 
 Putting the repair in the refactor's own plan leaves the comparison nothing
 built to read, so Dex warns and names the split (`mixed_with_repair`). The
-verdict's `inputs_built_by` names the build its inputs came from.
-`transform deps` installs the packages the project already declares, at its
-pinned versions; that is not installing or upgrading a tool. The offer's `static_attribution` says when this comparison is the
+verdict's `inputs_built_by` names the latest build among its upstream models;
+other inputs may come from earlier builds. `transform deps` installs the packages
+the project already declares, at the versions `package-lock.yml` pins where it
+matches `packages.yml`; that is not installing or upgrading a tool. The offer's `static_attribution` says when this comparison is the
 only evidence a refactor kept its results, for example when the model's SQL
 calls a macro. A change meant to alter results needs no comparison. The verdict
 is recorded on the plan, and `transform apply` reports it.

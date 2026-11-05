@@ -706,7 +706,11 @@ PROCEDURE_STEPS = (
 #: Build outcomes that establish nothing was built (#1114). ``None`` (the
 #: agent's own pipe hid the envelope) is given the benefit of the doubt, as a
 #: hidden comparison verdict is.
-_UNBUILT_OUTCOMES = frozenset({"failed", "skipped", "not_run", "empty_selection"})
+#: ``unrelated`` ran nodes, none of them one the change required, so the repair
+#: it was meant to build was not built.
+_UNBUILT_OUTCOMES = frozenset(
+    {"failed", "skipped", "not_run", "empty_selection", "unrelated"}
+)
 
 
 def _is_mutation(call: dict[str, Any]) -> bool:
