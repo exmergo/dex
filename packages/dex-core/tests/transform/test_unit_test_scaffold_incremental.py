@@ -432,4 +432,3 @@ def test_table_and_view_models_do_not_get_incremental_override(
     assert len(tests) == 1
     (test,) = tests
     assert "overrides" not in test
-

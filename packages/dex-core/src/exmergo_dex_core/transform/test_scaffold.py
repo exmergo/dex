@@ -371,6 +371,7 @@ def _extract_in_model_materialization(sql: str) -> str | None:
 def _manifest_model_materialization(
     view: DbtProjectView, model_name: str, path: str
 ) -> str | None:
+    """Read the model's materialization from compiled manifest nodes."""
     if not view.manifest or not isinstance(view.manifest.get("nodes"), dict):
         return None
     for uid, node in view.manifest["nodes"].items():
@@ -394,6 +395,7 @@ def _manifest_model_materialization(
 def _schema_yaml_model_materialization(
     view: DbtProjectView, model_name: str
 ) -> str | None:
+    """Read the model's materialization from authored schema YAML files."""
     for rel_path, file in view.files.items():
         if not rel_path.endswith((".yml", ".yaml")):
             continue
@@ -425,6 +427,7 @@ def _schema_yaml_model_materialization(
 def _dbt_project_model_materialization(
     view: DbtProjectView, model_name: str, path: str
 ) -> str | None:
+    """Read the model's materialization from dbt_project.yml model path hierarchies."""
     proj_file = view.files.get("dbt_project.yml")
     if not proj_file:
         return None
@@ -479,16 +482,12 @@ def _dbt_project_model_materialization(
 def _model_materialization(
     view: DbtProjectView, model_name: str, sql: str, path: str
 ) -> str:
-    """Resolve the model's materialization across in-model config(), manifest,
-    schema YAML, and dbt_project.yml settings."""
+    """Resolve the model's materialization across in-model config(), schema YAML,
+    dbt_project.yml settings, and compiled manifest nodes."""
 
     in_model = _extract_in_model_materialization(sql)
     if in_model:
         return in_model
-
-    manifest_mat = _manifest_model_materialization(view, model_name, path)
-    if manifest_mat:
-        return manifest_mat
 
     yaml_mat = _schema_yaml_model_materialization(view, model_name)
     if yaml_mat:
@@ -497,6 +496,10 @@ def _model_materialization(
     proj_mat = _dbt_project_model_materialization(view, model_name, path)
     if proj_mat:
         return proj_mat
+
+    manifest_mat = _manifest_model_materialization(view, model_name, path)
+    if manifest_mat:
+        return manifest_mat
 
     return "view"
 
