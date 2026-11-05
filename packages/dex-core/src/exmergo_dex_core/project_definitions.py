@@ -34,12 +34,17 @@ __all__ = [
     "DeclaredColumnMeaning",
     "DeclaredCompositeKey",
     "DeclaredForeignKey",
+    "DeclaredHistory",
+    "DeclaredHistoryMeasures",
+    "DeclaredHistoryStatus",
+    "DeclaredHistoryTime",
     "DeclaredKey",
     "DeclaredPopulation",
     "DeclaredPopulationFilter",
     "DeclaredRelationship",
     "ModelDeclaration",
     "ProjectDefinitions",
+    "read_history",
     "read_population",
 ]
 
@@ -160,6 +165,41 @@ class DeclaredPopulation(BaseModel):
     parent: DeclaredPopulationParent | None = None
 
 
+class DeclaredHistoryStatus(BaseModel):
+    """The status column and target value a history declaration tracks (#1039)."""
+
+    column: str
+    target: str | int | float | bool | None = None
+
+
+class DeclaredHistoryTime(BaseModel):
+    """The business or capture timestamp column of a history declaration (#1039)."""
+
+    column: str
+    provenance: Literal["business", "capture"] | None = None
+
+
+class DeclaredHistoryMeasures(BaseModel):
+    """The output measure columns a history declaration names (#1039)."""
+
+    transition_count: str | None = None
+    latest_target_transition_at: str | None = None
+    first_target_at: str | None = None
+
+
+class DeclaredHistory(BaseModel):
+    """A model's history declaration as the project states it (#1039)."""
+
+    snapshot: str
+    entity: dict[str, str]
+    status: DeclaredHistoryStatus
+    initial_observation: Literal["baseline", "transition"] | None = None
+    null_status: Literal["ignore", "state"] | None = None
+    population: Literal["ever_target", "all_observed"] | None = None
+    time: DeclaredHistoryTime | None = None
+    measures: DeclaredHistoryMeasures = Field(default_factory=DeclaredHistoryMeasures)
+
+
 def read_population_parent(raw: Any) -> DeclaredPopulationParent | None:
     """A declared ``population.parent`` from repository text, or None when it is
     absent or not shaped as ``{model: <name>, key: {<output>: <parent>}}``."""
@@ -218,14 +258,102 @@ def _scalar_values(raw: Any) -> list[str | int | float | bool] | None:
     return kept or None
 
 
+def read_history(raw: Any) -> DeclaredHistory | None:
+    """A declared history contract from repository text, or None.
+
+    Lenient by design: this reads what a human or a tool wrote, so an absent or
+    malformed declaration is left out rather than raised on.
+    """
+    if not isinstance(raw, dict):
+        return None
+    snapshot = raw.get("snapshot")
+    if not isinstance(snapshot, str) or not snapshot.strip():
+        return None
+
+    raw_entity = raw.get("entity")
+    if not isinstance(raw_entity, dict):
+        return None
+    entity = {
+        k.strip(): v.strip()
+        for k, v in raw_entity.items()
+        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+    }
+    if not entity or len(entity) != len(raw_entity):
+        return None
+
+    raw_status = raw.get("status")
+    if not isinstance(raw_status, dict):
+        return None
+    status_column = raw_status.get("column")
+    if not isinstance(status_column, str) or not status_column.strip():
+        return None
+    target = raw_status.get("target")
+    if not isinstance(target, str | int | float | bool):
+        return None
+    if isinstance(target, str):
+        if not target.strip():
+            return None
+        target = target.strip()
+    status = DeclaredHistoryStatus(column=status_column.strip(), target=target)
+
+    raw_init = raw.get("initial_observation")
+    initial_observation = raw_init if raw_init in ("baseline", "transition") else None
+
+    raw_null = raw.get("null_status")
+    null_status = raw_null if raw_null in ("ignore", "state") else None
+
+    raw_pop = raw.get("population")
+    history_population = raw_pop if raw_pop in ("ever_target", "all_observed") else None
+
+    raw_time = raw.get("time")
+    time_decl: DeclaredHistoryTime | None = None
+    if isinstance(raw_time, dict):
+        time_column = raw_time.get("column")
+        if isinstance(time_column, str) and time_column.strip():
+            raw_prov = raw_time.get("provenance")
+            provenance = raw_prov if raw_prov in ("business", "capture") else None
+            time_decl = DeclaredHistoryTime(
+                column=time_column.strip(), provenance=provenance
+            )
+
+    raw_measures = raw.get("measures")
+    measures_decl = DeclaredHistoryMeasures()
+    if isinstance(raw_measures, dict):
+        tc = raw_measures.get("transition_count")
+        lt = raw_measures.get("latest_target_transition_at")
+        ft = raw_measures.get("first_target_at")
+        measures_decl = DeclaredHistoryMeasures(
+            transition_count=(
+                tc.strip() if isinstance(tc, str) and tc.strip() else None
+            ),
+            latest_target_transition_at=(
+                lt.strip() if isinstance(lt, str) and lt.strip() else None
+            ),
+            first_target_at=(
+                ft.strip() if isinstance(ft, str) and ft.strip() else None
+            ),
+        )
+
+    return DeclaredHistory(
+        snapshot=snapshot.strip(),
+        entity=entity,
+        status=status,
+        initial_observation=initial_observation,
+        null_status=null_status,
+        population=history_population,
+        time=time_decl,
+        measures=measures_decl,
+    )
+
+
 class ModelDeclaration(BaseModel):
     """A model's declaration as the project states it (#491), read back (#498).
 
     The model's own statement of what one row is (``grain``), which rows are in
-    (``population``) and what each column means (``columns``). ``source`` is the
-    channel it was read from, as on every other declared object here. A format
-    with no declarations leaves :attr:`ProjectDefinitions.model_declarations`
-    empty rather than inventing one.
+    (``population``), what each column means (``columns``) and history contract
+    (``history``). ``source`` is the channel it was read from, as on every other
+    declared object here. A format with no declarations leaves
+    :attr:`ProjectDefinitions.model_declarations` empty rather than inventing one.
     """
 
     model: str
@@ -233,6 +361,7 @@ class ModelDeclaration(BaseModel):
     grain: list[str] | None = None
     population: DeclaredPopulation | None = None
     columns: dict[str, DeclaredColumnMeaning] = Field(default_factory=dict)
+    history: DeclaredHistory | None = None
     source: str
 
 

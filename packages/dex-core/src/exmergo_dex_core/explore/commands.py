@@ -83,6 +83,10 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..guards.values_free_shape import assert_values_free_shape
 from ..progress import ProgressReporter
+from ..project_definitions import (
+    DeclaredHistory,
+    DeclaredHistoryStatus,
+)
 from ..reserved_words import reserved_column_names
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..semantic_catalog import (
@@ -4315,9 +4319,9 @@ def _dataset_declaration(
 
     live = {c.name.lower(): c for c in dataset.columns}
     withheld: list[str] = []
+    flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
     population = None
     if declaration.population is not None:
-        flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
         rule = declaration.population.rule
         if rule is not None and (
             values_free
@@ -4352,6 +4356,27 @@ def _dataset_declaration(
             ),
         )
 
+    history = None
+    if declaration.history is not None:
+        target = declaration.history.status.target
+        if values_free or declaration.history.status.column.lower() in flagged:
+            target = None
+            withheld.append("history.status.target")
+        history_status = DeclaredHistoryStatus(
+            column=declaration.history.status.column,
+            target=target,
+        )
+        history = DeclaredHistory(
+            snapshot=declaration.history.snapshot,
+            entity=dict(declaration.history.entity),
+            status=history_status,
+            initial_observation=declaration.history.initial_observation,
+            null_status=declaration.history.null_status,
+            population=declaration.history.population,
+            time=declaration.history.time,
+            measures=declaration.history.measures,
+        )
+
     grain = declaration.grain
     status = None
     if grain:
@@ -4363,6 +4388,7 @@ def _dataset_declaration(
         grain=list(grain) if grain else None,
         grain_status=status,
         population=population,
+        history=history,
         columns=[
             DeclaredColumn(name=name, **meaning.model_dump())
             for name, meaning in declaration.columns.items()
