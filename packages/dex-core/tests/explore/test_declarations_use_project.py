@@ -215,6 +215,16 @@ def test_read_history_parses_valid_and_ignores_malformed():
     assert minimal.time is None
     assert minimal.measures.transition_count is None
 
+    spaced = read_history(
+        {
+            "snapshot": "s",
+            "entity": {"k": "v"},
+            "status": {"column": "c", "target": " paid "},
+        }
+    )
+    assert spaced is not None
+    assert spaced.status.target == " paid "
+
 
 def test_declared_meaning_reads_history():
     """declared_meaning parses dex.history into ModelDeclaration.history."""

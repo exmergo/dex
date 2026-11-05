@@ -290,10 +290,8 @@ def read_history(raw: Any) -> DeclaredHistory | None:
     target = raw_status.get("target")
     if not isinstance(target, str | int | float | bool):
         return None
-    if isinstance(target, str):
-        if not target.strip():
-            return None
-        target = target.strip()
+    if isinstance(target, str) and not target.strip():
+        return None
     status = DeclaredHistoryStatus(column=status_column.strip(), target=target)
 
     raw_init = raw.get("initial_observation")
