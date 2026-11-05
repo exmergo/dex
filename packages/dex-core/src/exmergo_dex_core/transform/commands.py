@@ -1338,9 +1338,13 @@ def _retire(
             "scope": "authored",
             **retirement_mod.discovery_report(view, Path(project), name, edits),
         }
-        retirement_mod.validate_scope(view, edits, contract, discovery)
     stated = retirement_mod.stored_form(name, contract, discovery)
-    if retirement_mod.is_already_complete(view, name, edits):
+    # Checked before the scope is validated, so repeating a finished scoped
+    # retirement is the same no-op as a full one: the metrics it removed are
+    # gone by then, and the scan may have become complete. A dynamic read is
+    # already reported as unchecked under a scoped contract, so it does not
+    # keep a finished one from being recognised.
+    if retirement_mod.is_already_complete(view, name, edits, allow_dynamic=scoped):
         return PropagationResult(
             change=f"{name} already removed",
             kind="var",
@@ -1348,6 +1352,7 @@ def _retire(
                 "status": "already_complete",
                 "contract": stated,
                 "package_scope": scope,
+                **({"discovery": discovery} if discovery is not None else {}),
             },
             notes=[
                 f"nothing in this project reads or defines '{name}' and this "
@@ -1357,6 +1362,8 @@ def _retire(
             ],
             decisions=retirement_mod.decisions(stated),
         )
+    if discovery is not None:
+        retirement_mod.validate_scope(view, edits, contract, discovery)
     result = _propagate(
         engine,
         "var",

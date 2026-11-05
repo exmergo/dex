@@ -141,6 +141,13 @@ def test_a_correct_scoped_retirement_is_checked_end_to_end(jinja_repo, capsys):
     ]
     assert FLAG in (jinja_repo / "shop/pkgs/tiny/models/pkg_reader.sql").read_text()
 
+    # Repeating the finished scoped change is the same no-op as a full one,
+    # although the dynamic read is still there.
+    again = _remove(jinja_repo, capsys, RETIRE_SQL, SCOPED)
+    assert again["status"] == "ok", again
+    assert again["data"]["plan_id"] is None
+    assert again["data"]["retirement"]["status"] == "already_complete"
+
 
 def test_a_retired_column_that_survives_is_caught(jinja_repo, capsys):
     planned = _remove(jinja_repo, capsys, PERMANENT_SQL, SCOPED)

@@ -349,3 +349,55 @@ def test_the_build_record_for_discovery_is_never_satisfied():
         "status": "unchecked",
         "reason_code": "discovery_incomplete",
     }
+
+
+def test_a_finished_retirement_is_recognised_despite_a_dynamic_read(root: Path):
+    from exmergo_dex_core.transform.retirement import is_already_complete
+
+    _write(root / "macros/enabled.sql", DYNAMIC)
+    _write(root / "models/rpt.sql", PLAIN)
+    _write(
+        root / "dbt_project.yml",
+        'name: shop\nprofile: shop\nversion: "1.0"\nmodel-paths: [models]\n'
+        "macro-paths: [macros]\n",
+    )
+    view = load_project(root)
+    assert not is_already_complete(view, FLAG, [_edit()])
+    assert is_already_complete(view, FLAG, [_edit()], allow_dynamic=True)
+
+
+def test_an_unreadable_contract_keeps_every_obligation(tmp_path: Path):
+    from exmergo_dex_core.transform.verify import (
+        BuildVerification,
+        _retirement_contract,
+    )
+
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0"\nprofile: shop\n', encoding="utf-8"
+    )
+
+    def broken_adapter():
+        raise OSError("driver went away")
+
+    stored = stored_form(
+        FLAG,
+        parse_contract(
+            {**SCOPED, "metrics": {"retained": ["revenue"], "removed": ["by_region"]}}
+        ),
+        {"status": "unchecked", "reason_code": "discovery_incomplete"},
+    )
+    result = BuildVerification(ran=True)
+    _retirement_contract(
+        tmp_path,
+        stored,
+        {"model.shop.rpt": "rpt"},
+        {"model.shop.rpt"},
+        broken_adapter,
+        result,
+    )
+    assert "retirement" in result.suppressed
+    by_model = {r["model"]: r for r in result.retirement}
+    assert set(by_model) == {"rpt", "revenue", "by_region", FLAG}
+    assert {r["status"] for r in result.retirement} == {"unchecked"}
+    assert by_model["by_region"]["expected"] == "removed"
+    assert by_model[FLAG]["check"] == "reference_discovery"

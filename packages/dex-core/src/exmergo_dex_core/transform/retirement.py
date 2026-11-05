@@ -220,9 +220,17 @@ def yaml_reads(files: Mapping[str, str], name: str) -> list[str]:
 
 
 def is_already_complete(
-    view: DbtProjectView, name: str, edits: Iterable[PlanEdit]
+    view: DbtProjectView,
+    name: str,
+    edits: Iterable[PlanEdit],
+    *,
+    allow_dynamic: bool = False,
 ) -> bool:
-    """Nothing local names the flag, and the payload would change no file."""
+    """Nothing local names the flag, and the payload would change no file.
+
+    ``allow_dynamic`` is for a scoped contract (#1086), which reports a
+    dynamic var read as unchecked rather than resolving it.
+    """
 
     from ..references import ReferenceIndex
 
@@ -236,7 +244,7 @@ def is_already_complete(
     index = ReferenceIndex(view, scan_packages=False)
     if index.references_to(name, "var")[0] or index.definitions_of(name, "var"):
         return False
-    if index.indeterminate_for("var"):
+    if index.indeterminate_for("var") and not allow_dynamic:
         return False
     if _project_name(view) in scoped_definitions(view, name):
         return False
