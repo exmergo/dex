@@ -120,6 +120,13 @@ class CompileQueries:
         answer: dict[str, Any] = {
             "columns": [[column.name, column.data_type] for column in found]
         }
+        # A connector whose dbt lists columns with DESCRIBE (Snowflake) hands
+        # over the type as DESCRIBE prints it, precision and scale included, and
+        # the worker builds each column with ``from_description`` as dbt does.
+        described = getattr(self.adapter, "dbt_column_types", None)
+        if callable(described):
+            answer["columns"] = described(match)
+            answer["described"] = True
         # A connector whose dbt column class needs more than a name and a type
         # (BigQuery's nested fields and mode) hands over its column tree too, so
         # a macro's `data_type` is the one dbt itself would render.

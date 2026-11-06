@@ -64,7 +64,10 @@ def dbt_columns(column, answer: dict) -> list:
     ``column`` is the adapter's dbt ``Column`` class. Where the answer carries a
     column tree and the class builds from BigQuery ``SchemaField``s, the tree is
     used, so a nested column's ``data_type`` is ``STRUCT<...>`` as dbt-bigquery
-    renders it; otherwise each column is ``Column.create(name, type)``.
+    renders it. Where the answer is ``described`` (types as ``DESCRIBE TABLE``
+    prints them, Snowflake's), each column is ``Column.from_description``, as
+    dbt-snowflake builds it, so ``NUMBER(10,2)`` keeps its precision and scale;
+    otherwise each column is ``Column.create(name, type)``.
     """
 
     if answer.get("schema") is not None and hasattr(column, "create_from_field"):
@@ -81,6 +84,10 @@ def dbt_columns(column, answer: dict) -> list:
             )
 
         return [column.create_from_field(field(spec)) for spec in answer["schema"]]
+    if answer.get("described") and hasattr(column, "from_description"):
+        return [
+            column.from_description(name, dtype) for name, dtype in answer["columns"]
+        ]
     return [column.create(name, dtype) for name, dtype in answer["columns"]]
 
 

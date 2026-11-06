@@ -804,6 +804,81 @@ def test_flat_columns_are_built_with_create():
     assert [(c.name, c.data_type) for c in built] == [("total", "DECIMAL(10,2)")]
 
 
+def test_snowflake_columns_are_built_as_dbt_builds_them_from_describe():
+    """A NUMBER(10,2) keeps its precision and scale, as a real build sees it."""
+
+    pytest.importorskip("dbt.adapters.snowflake")
+    from dbt.adapters.snowflake import SnowflakeColumn
+
+    from exmergo_dex_core.transform.compile_worker import dbt_columns
+
+    answer = {
+        "columns": [["amount", "NUMBER(10,2)"], ["note", "VARCHAR(16777216)"]],
+        "described": True,
+    }
+    amount, note = dbt_columns(SnowflakeColumn, answer)
+    assert (amount.dtype, amount.numeric_precision, amount.numeric_scale) == (
+        "NUMBER",
+        10,
+        2,
+    )
+    assert amount.data_type == "NUMBER(10,2)"
+    assert note.char_size == 16777216
+    expected = SnowflakeColumn.from_description("note", "VARCHAR(16777216)")
+    assert note.data_type == expected.data_type
+
+
+@pytest.mark.parametrize(
+    ("document", "described"),
+    [
+        ({"type": "FIXED", "precision": 10, "scale": 2}, "NUMBER(10,2)"),
+        ({"type": "TEXT", "length": 16777216}, "VARCHAR(16777216)"),
+        ({"type": "BINARY", "length": 8388608}, "BINARY(8388608)"),
+        ({"type": "REAL"}, "FLOAT"),
+        ({"type": "TIMESTAMP_NTZ", "precision": 0, "scale": 9}, "TIMESTAMP_NTZ(9)"),
+        ({"type": "TIME", "precision": 0, "scale": 9}, "TIME(9)"),
+        ({"type": "FIXED"}, "NUMBER"),
+        ({"type": "VARIANT"}, "VARIANT"),
+    ],
+)
+def test_snowflake_types_are_rendered_as_describe_prints_them(document, described):
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+
+    assert SnowflakeAdapter._describe_type(json.dumps(document)) == described
+
+
+def test_snowflake_dbt_column_types_read_the_show_columns_documents():
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+
+    adapter = SnowflakeAdapter.__new__(SnowflakeAdapter)
+    adapter._objects = {"DB.S.T": {"identifier": "DB.S.T"}}
+    adapter._type_documents = {
+        "DB.S.T": [("AMOUNT", '{"type":"FIXED","precision":10,"scale":2}')]
+    }
+    adapter.table_metadata = lambda identifier: (None, [])
+    assert adapter.dbt_column_types("DB.S.T") == [["AMOUNT", "NUMBER(10,2)"]]
+
+
+def test_columns_broker_hands_over_described_types_where_the_adapter_has_them():
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    adapter = SimpleNamespace(
+        list_objects=lambda: [
+            SimpleNamespace(identifier="DB.S.T", object_type="TABLE")
+        ],
+        table_metadata=lambda i: (None, [ColumnMeta("AMOUNT", "FIXED", True, 0)]),
+        dbt_column_types=lambda i: [["AMOUNT", "NUMBER(10,2)"]],
+    )
+    engine = SimpleNamespace(
+        config=SimpleNamespace(query=SimpleNamespace(max_statements=5)),
+        _adapter=lambda *a, **k: adapter,
+    )
+    assert CompileQueries(engine).columns({"identifier": "T"}) == {
+        "columns": [["AMOUNT", "NUMBER(10,2)"]],
+        "described": True,
+    }
+
+
 def test_bigquery_column_schema_keeps_only_what_dbt_reads():
     from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 
