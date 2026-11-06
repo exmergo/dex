@@ -322,6 +322,29 @@ class BigQueryAdapter:
         ]
         return self._object_meta(table, object_type), columns
 
+    def column_schema(self, identifier: str) -> list[dict]:
+        """One table's column tree as dbt-bigquery reads it: name, type, mode and
+        nested fields, nothing else (#1154).
+
+        ``table_metadata`` renders a RECORD as a bare ``STRUCT``, which is right
+        for profiling but not for a dbt macro: dbt-bigquery builds its columns
+        from the whole ``SchemaField`` tree, so ``data_type`` reads
+        ``STRUCT<...>`` and a cast built from it is valid SQL. Planning hands this
+        tree to dbt's own ``BigQueryColumn`` so a macro sees what it would see on
+        a real build. Free metadata (the same cached ``get_table``); descriptions
+        and policy tags are left out, since a macro never needs them.
+        """
+
+        def spec(field: Any) -> dict:
+            return {
+                "name": field.name,
+                "type": field.field_type,
+                "mode": field.mode or "NULLABLE",
+                "fields": [spec(sub) for sub in (field.fields or ())],
+            }
+
+        return [spec(field) for field in self._get_table(identifier).schema]
+
     def _object_meta(self, table: Any, object_type: str) -> ObjectMeta:
         identifier = f"{table.project}.{table.dataset_id}.{table.table_id}"
         # An exact count from a profiling scan supersedes the metadata for the

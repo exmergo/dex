@@ -711,8 +711,11 @@ and no edit the caller could make would settle it.
 Control-flow model compilation requires dbt and a dev profile. Dex compiles a
 throwaway copy containing every proposed edit, validates fresh SQL, and keeps the
 original Jinja in the stored plan. Compile-time SELECTs are governed through
-Dex's query path; direct warehouse handles and unsupported adapter introspection
-refuse. Dynamic queries share the command ceiling, with partial estimates and
+Dex's query path. `adapter.get_columns_in_relation`, which `dbt_utils.star` and
+Fivetran's `fill_staging_columns` call, is answered from Dex's scoped metadata
+(names and types, no rows) and counts toward `query.max_statements`; a raw
+`DESCRIBE`, `SUMMARIZE` or `information_schema` read stays refused, naming that
+method. Direct warehouse handles and other adapter introspection refuse. Dynamic queries share the command ceiling, with partial estimates and
 completed spend disclosed. See [dbt projects](dbt-project.md#compiling-authored-control-flow)
 and [cost controls](cost-controls.md#queries-discovered-during-model-compilation).
 

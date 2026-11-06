@@ -623,7 +623,11 @@ Model edits containing Jinja `for` or `if` control flow are validated against
 fresh dbt-compiled SQL in a throwaway project, rather than SQL with Jinja deleted.
 They require dbt and a dev profile. Compile-time `run_query`, statement blocks and
 `adapter.execute` SELECTs run through Dex's query firewall and existing cost
-controls; direct database handles and unsupported introspection refuse. Later
+controls. `adapter.get_columns_in_relation` (`dbt_utils.star`, Fivetran's
+`fill_staging_columns`) is answered from scoped metadata, names and types with no
+rows, and counts toward `query.max_statements`; a raw `DESCRIBE`, `SUMMARIZE` or
+`information_schema` read stays refused. Direct database handles and other
+introspection refuse. Later
 queries share the command ceiling; a dynamically discovered estimate is partial.
 Native semantic catalogs and the local dbt catalog omit Dex-generated population
 sentences in every mode, including from existing documents and compiled

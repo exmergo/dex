@@ -58,6 +58,30 @@ def guard_unopened_connections(manager, lazy, states) -> None:
     manager.cleanup_all = cleanup_all
 
 
+def dbt_columns(column, answer: dict) -> list:
+    """Build the adapter's own dbt columns from the parent's answer (#1154).
+
+    ``column`` is the adapter's dbt ``Column`` class. Where the answer carries a
+    column tree and the class builds from BigQuery ``SchemaField``s, the tree is
+    used, so a nested column's ``data_type`` is ``STRUCT<...>`` as dbt-bigquery
+    renders it; otherwise each column is ``Column.create(name, type)``.
+    """
+
+    if answer.get("schema") is not None and hasattr(column, "create_from_field"):
+        from google.cloud.bigquery import SchemaField
+
+        def field(spec):
+            return SchemaField(
+                spec["name"],
+                spec["type"],
+                mode=spec["mode"],
+                fields=[field(sub) for sub in spec["fields"]],
+            )
+
+        return [column.create_from_field(field(spec)) for spec in answer["schema"]]
+    return [column.create(name, dtype) for name, dtype in answer["columns"]]
+
+
 def main() -> int:
     import agate
     from dbt.adapters.base.connections import BaseConnectionManager
@@ -114,6 +138,35 @@ def main() -> int:
         )
         return AdapterResponse("SELECT", rows_affected=len(table.rows)), table
 
+    def columns_in_relation(wrapper):
+        """Answer ``adapter.get_columns_in_relation`` from Dex's metadata (#1154).
+
+        dbt-duckdb lists columns with a ``DESCRIBE`` the query firewall refuses,
+        and dbt-bigquery with a direct API handle this process does not have.
+        Both are schema reads, not data reads, so the parent answers them from
+        the same scoped inventory ``get_relation`` uses: names and types, no row.
+        """
+
+        def columns(relation):
+            identifier = getattr(relation, "identifier", None)
+            if not identifier:
+                # A CTE or ephemeral relation has no warehouse object; dbt itself
+                # answers a relation it cannot find with no columns.
+                return []
+            with lock:
+                send(
+                    {
+                        "type": "columns",
+                        "database": getattr(relation, "database", None),
+                        "schema": getattr(relation, "schema", None),
+                        "identifier": identifier,
+                    }
+                )
+                answer = json.loads(sys.stdin.readline())
+            return dbt_columns(wrapper._adapter.Column, answer)
+
+        return columns
+
     def guarded_getattr(original):
         def get(self, name):
             if name == "execute":
@@ -141,6 +194,10 @@ def main() -> int:
                     )
 
                 return relation
+            if name == "get_columns_in_relation" and isinstance(
+                self, RuntimeDatabaseWrapper
+            ):
+                return columns_in_relation(self)
             return original(self, name)
 
         return get

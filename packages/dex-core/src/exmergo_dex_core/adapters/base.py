@@ -1047,6 +1047,13 @@ class Adapter(Protocol):
     - ``describe_query_free``: ``False`` where ``describe_query`` runs on paid
       compute (it can start a stopped warehouse), so a comparison prices first.
       Absent reads as free.
+    - ``column_schema(identifier)``: one relation's column tree as the
+      connector's dbt adapter builds its columns from it (a list of
+      ``{name, type, mode, fields}`` dicts), from free metadata. Planning hands
+      it to dbt's column class when a compile-time macro calls
+      ``adapter.get_columns_in_relation`` (#1154), so a nested type renders as
+      dbt renders it. Absent, the macro gets ``table_metadata``'s names and
+      types, which is exact for every connector whose dbt columns are flat.
     - ``in_scope(namespace)``: whether a dotted namespace lies inside the
       scope this command examined (issue #984). Tells carry-forward whether
       an object missing from this run's inventory was looked for and is gone

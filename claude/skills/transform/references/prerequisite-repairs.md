@@ -88,6 +88,12 @@ can tell:
 An override without the disable fails to parse: dbt refuses two resources with one
 database representation.
 
+Copy the package model's SQL as it stands, column-listing macros included: a Fivetran
+staging model's `fill_staging_columns(adapter.get_columns_in_relation(...))` or a
+`dbt_utils.star(ref(...))` plans through `transform plan` like any other model, since
+Dex answers the column listing from metadata. Never apply the override outside Dex
+because a plan refused it: relay the refusal instead.
+
 `dispatch` and a dependency source or pin go through `transform classify` and any
 admission a host applies, like every other executable edit. Describing a repair does
 not authorize an unrelated dependency change.

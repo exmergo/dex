@@ -68,7 +68,10 @@ Nested metadata statements such as `DESCRIBE` are refused before connection
 discovery, profiling or execution, including in scalar expressions and unused
 CTEs. The typed refusal names the unsupported shape and points to
 `explore inventory` or `explore profile` for introspection. This also applies
-to compile-time queries run through `transform plan`.
+to compile-time queries run through `transform plan`, where the refusal of a
+`DESCRIBE`, `SUMMARIZE` or `information_schema` read names
+`adapter.get_columns_in_relation` instead: dbt's column listing is answered from
+metadata (names and types, no values), never run as SQL.
 
 Output may carry values only from profiled columns whose flag is absent or below
 the threshold. Every value path from a blocking column must pass through a
