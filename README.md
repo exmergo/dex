@@ -177,7 +177,7 @@ flowchart TB
   engine -->|"SELECT-only, cost-capped<br/>dbt builds on dev only"| db
   engine -->|"plans as<br/>reviewable diffs"| repo
   engine -->|"one sanitized<br/>JSON envelope"| agent
-  engine --> cache
+  engine <--> cache
 
   linkStyle default stroke:#51a2ff,stroke-width:1.5px,color:#51a2ff
 

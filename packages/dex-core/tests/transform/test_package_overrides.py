@@ -195,3 +195,14 @@ def test_disabling_the_package_model_under_an_existing_entry_is_refused(tmp_path
     )
     with pytest.raises(DeclarationError, match=r"models/mine\.yml"):
         refuse_package_documented_entries(view, [disable])
+
+
+def test_an_existing_python_override_with_an_entry_is_refused(tmp_path):
+    """A Python override is not on dex's editable surface, but it is one."""
+
+    root = _project(tmp_path / "p", project_models=DISABLED)
+    (root / "models" / "pkg_task.sql").unlink()
+    (root / "models" / "pkg_task.py").write_text("def model(dbt, session):\n    pass\n")
+    view = load_project(root)
+    with pytest.raises(DeclarationError, match=r"models/mine\.yml"):
+        refuse_package_documented_entries(view, [_entry_edit("models/mine.yml")])

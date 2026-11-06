@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -141,15 +141,30 @@ def package_documented_overrides(
     root = getattr(view, "root", None)
     if not root:
         return {}
+    wanted = {m for m in models if mv.split_label(m)[1] is None}
     candidates = {
-        m
-        for m in models
-        if mv.split_label(m)[1] is None
-        and model_sql_path(files, view.model_paths, m) is not None
+        m for m in wanted if model_sql_path(files, view.model_paths, m) is not None
     }
+    # A Python model is not on dex's editable surface, but an existing one is an
+    # override all the same, and its YAML entry collides just as a SQL one's does.
+    candidates |= _python_models(Path(root), view.model_paths, wanted - candidates)
     if not candidates:
         return {}
     return documented_overrides(root, candidates, files.get("dbt_project.yml"))
+
+
+def _python_models(root: Path, model_paths: Iterable[str], names: set[str]) -> set[str]:
+    """The names in ``names`` a ``.py`` file under the project's model paths defines."""
+
+    found: set[str] = set()
+    if not names:
+        return found
+    for model_path in model_paths:
+        base = root / model_path
+        if not base.is_dir():
+            continue
+        found.update(p.stem for p in base.rglob("*.py") if p.stem in names)
+    return found
 
 
 def refuse_package_documented_entries(
