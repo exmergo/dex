@@ -51,6 +51,9 @@ _SHAPES: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         # DuckDB: `Could not convert string 'x' to INT32`
         rf"could not convert string (?P<value>{_QUOTED})",
+        # DuckDB JSON: `Failed to cast value to numerical: {"k":"x"}`; the value is
+        # printed unquoted and runs to the end, so it is masked whole.
+        rf"failed to cast value to [\w ()]+?: (?P<value>{_NOT_MASKED}.+)$",
         # DuckDB: `invalid date field format: "x", expected format is ...`
         rf"field format: (?P<value>{_QUOTED})",
         # DuckDB: `Type INT32 with value 300 can't be cast ...`

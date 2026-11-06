@@ -173,6 +173,11 @@ _DUCKDB_FAILURES = [
     f"select cast('{SENTINEL}' as timestamp)",
     f"select cast('{SENTINEL}' as boolean)",
     f"select json_extract('{SENTINEL}', '$.a')",
+    # A JSON value is printed unquoted, whole objects included (CodeRabbit).
+    f"""select cast('{{"secret": "{SENTINEL}"}}'::json as integer)""",
+    """select cast('{"secret": 1234567}'::json as double)""",
+    f"""select cast('["{SENTINEL}"]'::json as integer)""",
+    f"""select cast('"{SENTINEL}"'::json as integer)""",
     "select cast(1234567 as tinyint)",
     # No cast written at all: comparing a VARCHAR key to an INTEGER key casts
     # implicitly, and the failure quotes the key it could not convert.
