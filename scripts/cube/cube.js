@@ -1,3 +1,3 @@
 module.exports = {
-  contextToApiScopes: async (ctx, defaults) => ctx.securityContext.dex_scopes ?? defaults,
+  contextToApiScopes: async (ctx, defaults) => ctx.dex_scopes ?? defaults,
 };
