@@ -255,3 +255,33 @@ def test_a_bare_parse_or_cast_word_does_not_mask_identifiers(message):
     """dbt's `Parsing Error` and a binder's cast hint quote names, not values."""
 
     assert mask_values(message) == message
+
+
+def test_a_json_cast_keeps_the_column_it_was_casting_from(tmp_path):
+    """The value is masked whole and the column clause after it is kept."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE t AS SELECT ?::JSON AS payload", [f'{{"secret": "{SENTINEL}"}}']
+    )
+    conn.close()
+    adapter = DuckDBAdapter(path)
+    try:
+        with pytest.raises(WarehouseQueryError) as raised:
+            adapter.run_query(
+                "select cast(payload as integer) from t",
+                max_rows=5,
+                timeout_seconds=30,
+            )
+    finally:
+        adapter.close()
+    detail = raised.value.detail
+    assert SENTINEL not in detail
+    assert detail.endswith(
+        f"Failed to cast value to numerical: {VALUE_WITHHELD} "
+        "when casting from source column payload"
+    )

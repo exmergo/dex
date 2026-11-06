@@ -52,8 +52,10 @@ _SHAPES: tuple[re.Pattern[str], ...] = tuple(
         # DuckDB: `Could not convert string 'x' to INT32`
         rf"could not convert string (?P<value>{_QUOTED})",
         # DuckDB JSON: `Failed to cast value to numerical: {"k":"x"}`; the value is
-        # printed unquoted and runs to the end, so it is masked whole.
-        rf"failed to cast value to [\w ()]+?: (?P<value>{_NOT_MASKED}.+)$",
+        # printed unquoted, so it is masked whole, up to the `when casting from
+        # source column <name>` clause that names the column (kept) or the end.
+        rf"failed to cast value to [\w ()]+?: (?P<value>{_NOT_MASKED}.+?)"
+        r"(?=\s+when casting from source column\b|$)",
         # DuckDB: `invalid date field format: "x", expected format is ...`
         rf"field format: (?P<value>{_QUOTED})",
         # DuckDB: `Type INT32 with value 300 can't be cast ...`
