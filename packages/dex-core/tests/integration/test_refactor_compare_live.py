@@ -159,6 +159,8 @@ def test_postgres_citext_is_named_and_compared_exactly(engine_for):
     ]
 
     def compare(left: str, right: str):
+        """Compare two citext values through the refactor comparator."""
+
         return compare_refactors(
             f"select '{left}'::citext as status",
             f"select '{right}'::citext as status",
@@ -186,6 +188,8 @@ def test_postgres_citext_is_named_and_compared_exactly(engine_for):
 @pytest.mark.integration
 @pytest.mark.postgres
 def test_postgres_ungroupable_user_type_is_named_and_refused(engine_for):
+    """Ungroupable PostgreSQL extension types are named and refused."""
+
     adapter = engine_for("postgres")._adapter("transform compare")
     sql = "select row('{\"value\": 1}'::json)::app.uncomparable as payload"
     columns = adapter.describe_query(sql)

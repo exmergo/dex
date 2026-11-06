@@ -173,6 +173,8 @@ def test_get_adapter_constructs_postgres(fake_pg_connection):
 def test_describe_query_resolves_unknown_type_oids(
     fake_pg_connection, oid, type_name, groupable, comparison_type
 ):
+    """Unknown PostgreSQL OIDs retain their comparable type metadata."""
+
     fake_pg_connection.type_metadata[oid] = (type_name, groupable, comparison_type)
     fake_pg_connection.row_resolver = lambda _sql: FakeResult(
         rows=[], columns=["value"], type_codes=[oid]

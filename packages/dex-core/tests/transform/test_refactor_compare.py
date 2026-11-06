@@ -587,6 +587,8 @@ def test_unsupported_type_is_caught_before_run():
 
 
 def test_adapter_marked_ungroupable_type_is_caught_before_run():
+    """Adapter metadata stops ungroupable columns before comparison queries run."""
+
     ran: list[str] = []
 
     class _Stub:
@@ -612,6 +614,8 @@ def test_adapter_marked_ungroupable_type_is_caught_before_run():
 
 
 def test_adapter_requested_text_comparison_representation_is_used():
+    """Adapter metadata supplies the canonical representation for comparison."""
+
     ran: list[str] = []
 
     class _Stub:

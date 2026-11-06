@@ -103,6 +103,8 @@ class FakeCursor:
         self.description: list[FakeColumnDescription] = []
 
     def execute(self, sql: str, params: tuple[object, ...] | None = None):
+        """Execute a fake statement and expose its result metadata."""
+
         stripped = sql.strip()
         upper = stripped.upper()
         self._record(sql)
@@ -167,6 +169,8 @@ class FakeCursor:
             pass
 
     def _serve_catalog(self, sql: str, params: tuple[object, ...] | None) -> None:
+        """Serve a fake response for a PostgreSQL catalog query."""
+
         # The privilege predicates come first: has_database_privilege names
         # current_database() too, and would otherwise be answered as the
         # capabilities probe.
@@ -273,6 +277,8 @@ class FakeCursor:
         columns: list[str] | None = None,
         type_codes: list[int] | None = None,
     ) -> None:
+        """Populate DB-API-style rows and column descriptions."""
+
         keys = columns or (list(rows[0].keys()) if rows else ["name"])
         codes = type_codes or [25] * len(keys)
         self.description = [
@@ -311,6 +317,8 @@ class FakePostgresConnection:
         empty_schemas: list[str] | None = None,
         type_metadata: dict[int, tuple[str, bool, str | None]] | None = None,
     ):
+        """Initialize a configurable fake PostgreSQL connection."""
+
         self.tables = tables or []
         # Roles the database knows, and their privileges: what the dev-target
         # preflight interrogates. Schemas holding no table (a scratch dev schema
