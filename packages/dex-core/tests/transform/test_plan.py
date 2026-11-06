@@ -1644,3 +1644,207 @@ def test_reserved_column_quoted_or_untested_is_silent(
     dbt_project_dir: Path, schema: str
 ):
     assert _reserved_plan(dbt_project_dir, schema) == []
+
+
+# --- #1166: the package check reads the post-edit tree --------------------------
+
+_DBT_UTILS = 'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n'
+_LOCAL_PKG = "packages:\n  - local: ../shared_pkg\n"
+_SCHEMA_EDIT = {
+    "path": "models/staging/schema.yml",
+    "kind": "schema_yml",
+    "content": (
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n      - name: id\n"
+    ),
+}
+
+
+def _plan(tmp_path: Path, edits: list[dict], capsys) -> tuple[int, dict]:
+    payload = _write_payload(tmp_path, edits)
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare and use a package",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def _install(project: Path, directory: str, name: str) -> None:
+    package = project / "dbt_packages" / directory
+    package.mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        f"name: {name}\nversion: '1.0.0'\nconfig-version: 2\n", encoding="utf-8"
+    )
+
+
+def _parse_passes(monkeypatch) -> list[list]:
+    """Stand in for dbt's parse, recording each call, so a test can say the
+    package gate let the plan through without depending on a real install."""
+
+    import importlib
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls: list[list] = []
+
+    def fake(project_dir, edits, **_kwargs):
+        calls.append(list(edits))
+        return {"available": True, "reason": None, "success": True, "messages": []}
+
+    monkeypatch.setattr(build_module, "shadow_parse", fake)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("spec", "named"),
+    [(_DBT_UTILS, "dbt-labs/dbt_utils@1.3.0"), (_LOCAL_PKG, "../shared_pkg")],
+    ids=["hub", "local"],
+)
+def test_plan_refuses_a_package_its_own_edit_declares_before_dbt_parses(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch, spec: str, named: str
+):
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": spec},
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    message = envelope["errors"][0]
+    assert "this plan declares dbt packages that are not installed" in message
+    assert named in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    assert "packages.yml change on its own" in message
+    # Refused before dbt ran, and planning installed nothing.
+    assert calls == []
+    assert not (dbt_project_dir / "dbt_packages").exists()
+
+
+@pytest.mark.parametrize(
+    ("spec", "directory", "name"),
+    [(_DBT_UTILS, "dbt_utils", "dbt_utils"), (_LOCAL_PKG, "shared_pkg", "shared")],
+    ids=["hub", "local"],
+)
+def test_plan_declaring_an_installed_package_reaches_the_parse(
+    dbt_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    spec: str,
+    directory: str,
+    name: str,
+):
+    _install(dbt_project_dir, directory, name)
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": spec},
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert len(calls) == 1
+
+
+def test_a_packages_only_plan_is_stored_so_the_two_step_route_works(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The refusal's own advice has to be followable: a plan carrying only the
+    `packages_yml` edit needs no parse, so it is stored even though the package
+    is not installed yet."""
+
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [{"path": "packages.yml", "kind": "packages_yml", "content": _DBT_UTILS}],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert envelope["data"]["paths"] == ["packages.yml"]
+    assert calls == []
+
+
+def test_a_plan_that_stops_declaring_an_uninstalled_package_is_not_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    (dbt_project_dir / "packages.yml").write_text(_DBT_UTILS, encoding="utf-8")
+    _install(dbt_project_dir, "shared_pkg", "shared")
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": _LOCAL_PKG},
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert len(calls) == 1
+
+
+def test_a_plan_adding_a_package_names_the_already_missing_ones_apart(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    (dbt_project_dir / "packages.yml").write_text(_LOCAL_PKG, encoding="utf-8")
+    _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {
+                "path": "packages.yml",
+                "kind": "packages_yml",
+                "content": _LOCAL_PKG
+                + '  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+            },
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 1
+    message = envelope["errors"][0]
+    declared, _, already = message.partition("already declares")
+    assert "dbt-labs/dbt_utils@1.3.0" in declared
+    assert "../shared_pkg" not in declared
+    assert "../shared_pkg" in already
+
+
+def test_a_control_flow_model_with_a_new_package_is_refused_before_compile(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    import importlib
+
+    compile_module = importlib.import_module("exmergo_dex_core.transform.compile")
+
+    def must_not_compile(*_args, **_kwargs):
+        raise AssertionError("dbt compile ran before the package check")
+
+    monkeypatch.setattr(compile_module, "compile_models", must_not_compile)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": _DBT_UTILS},
+            {
+                "path": "models/staging/stg_flagged.sql",
+                "kind": "model_sql",
+                "content": "{% if true %}select 1 as id{% else %}select 2 as id"
+                "{% endif %}\n",
+            },
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    message = envelope["errors"][0]
+    assert "dbt-labs/dbt_utils@1.3.0" in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message

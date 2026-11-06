@@ -370,6 +370,17 @@ contents, `transform build --cold-deps` reinstalls into an isolated copy, builds
 it, and reports `data.cold_verification.installed_edits`; it may reach the network,
 so a host selects it explicitly, and it is refused together with `--no-install-deps`.
 
+`transform plan` never installs either. Where the plan needs dbt's parse or a
+control-flow compile, it runs the same presence check against the tree as the
+plan leaves it, and refuses with `MissingPackagesError` (lead: "a plan installs
+nothing"). A package the plan's own `packages_yml` edit declares is refused as
+its subclass `PlanDeclaresMissingPackagesError`, whose `declared_by_plan` names
+them and whose message gives the route: the `packages_yml` edit as a plan of its
+own (it needs no parse), applied, `transform deps`, then the rest (#1166). Both
+are `PrerequisiteError`s, but only the parent clears with `transform deps` and a
+retry: the subclass needs the `packages_yml` plan applied first, which is why it
+is a type of its own.
+
 ```bash
 dex transform preflight
 ```

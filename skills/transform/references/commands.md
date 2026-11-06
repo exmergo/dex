@@ -29,6 +29,16 @@ refuses, naming `adapter.get_columns_in_relation`. Direct database handles and
 other unsupported adapter introspection refuse. A truncated
 macro result refuses rather than producing an incomplete model.
 
+Packages: dbt parses or compiles nothing whose declared packages are not
+installed, so a plan that needs dbt's parse (a `schema_yml`, `project_yml`,
+snapshot, seed or semantic edit, a declaration, a delete) or a control-flow
+compile is refused first, in Dex's words, naming each missing package and
+`transform deps`. The check reads the tree as the plan leaves it (#1166): a
+package the plan's own `packages_yml` edit declares is checked too, and one it
+stops declaring is not. A plan never installs anything, so declaring a package
+and using it is two plans: the `packages_yml` edit on its own (it needs no parse,
+so it is stored), applied, then `transform deps`, then the plan that uses it.
+
 Compilation that reads no warehouse data needs no spend confirmation. For
 compile-time queries on billed connectors, the first discovered work is quoted
 through the existing `--confirm --budget` handshake. Its estimate is partial:
@@ -795,3 +805,5 @@ already declares in `packages.yml`, at the versions `package-lock.yml` pins wher
 the lockfile matches it (dbt resolves them again where it does not): that is
 not installing or upgrading a tool, and a request not to update tools does not rule
 it out.
+It is the step between a plan that declares a package and a plan that uses it,
+since `transform plan` installs nothing.
