@@ -285,3 +285,16 @@ def test_a_json_cast_keeps_the_column_it_was_casting_from(tmp_path):
         f"Failed to cast value to numerical: {VALUE_WITHHELD} "
         "when casting from source column payload"
     )
+
+
+def test_a_json_value_containing_the_column_clause_is_masked_whole():
+    """The clause is the column only where it ends the line (CodeRabbit risk)."""
+
+    masked = mask_values(
+        "Conversion Error: Failed to cast value to numerical: "
+        f'{{"a":"x when casting from source column {SENTINEL}","b":"tail"}} '
+        "when casting from source column j"
+    )
+    assert SENTINEL not in masked
+    assert "tail" not in masked
+    assert masked.endswith(f"{VALUE_WITHHELD} when casting from source column j")

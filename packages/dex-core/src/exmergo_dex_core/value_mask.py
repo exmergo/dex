@@ -54,8 +54,10 @@ _SHAPES: tuple[re.Pattern[str], ...] = tuple(
         # DuckDB JSON: `Failed to cast value to numerical: {"k":"x"}`; the value is
         # printed unquoted, so it is masked whole, up to the `when casting from
         # source column <name>` clause that names the column (kept) or the end.
+        # The clause counts only where it ends the line with one name, so a
+        # value that itself contains the phrase is still masked whole.
         rf"failed to cast value to [\w ()]+?: (?P<value>{_NOT_MASKED}.+?)"
-        r"(?=\s+when casting from source column\b|$)",
+        r"(?=\s+when casting from source column [^\s\"',{}\[\]]+$|$)",
         # DuckDB: `invalid date field format: "x", expected format is ...`
         rf"field format: (?P<value>{_QUOTED})",
         # DuckDB: `Type INT32 with value 300 can't be cast ...`
