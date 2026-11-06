@@ -1895,3 +1895,58 @@ def test_a_mart_declaration_with_a_new_package_is_refused_before_any_parse(
     assert "this plan declares dbt packages that are not installed" in message
     assert "dbt deps" not in message
     assert calls == []
+
+
+def test_a_sql_only_mart_edit_with_packages_missing_skips_the_derivation_parse(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A SQL-only edit to a declared mart needs no dbt parse of its own, so the
+    plan is stored; the derivation it triggers is left unvalidated in Dex's words
+    instead of spending two parses that dbt would refuse."""
+
+    (dbt_project_dir / "models" / "marts").mkdir(parents=True)
+    (dbt_project_dir / "models" / "marts" / "fct_orders.sql").write_text(
+        "select 1 as order_id, current_date as ordered_at, 2.0 as amount\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "marts" / "fct_orders.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    description: One row per order.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [order_id]\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        config: {meta: {dex: {role: key}}}\n"
+        "      - name: ordered_at\n"
+        "        config: {meta: {dex: {role: time}}}\n"
+        "      - name: amount\n"
+        "        config: {meta: {dex: {role: measure, aggregation: sum}}}\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "packages.yml").write_text(_DBT_UTILS, encoding="utf-8")
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {
+                "path": "models/marts/fct_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as order_id, current_date as ordered_at, "
+                "3.0 as amount\n",
+            }
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert calls == []
+    derived = envelope["data"]["semantic_proposal"]["models"]["fct_orders"]
+    assert derived["status"] == "unvalidated"
+    parse = derived["validation"]["parse"]
+    assert parse["result"] == "not_run"
+    assert "transform deps" in parse["detail"]
+    assert "dbt deps" not in parse["detail"]
+    assert envelope["data"]["paths"] == ["models/marts/fct_orders.sql"]
