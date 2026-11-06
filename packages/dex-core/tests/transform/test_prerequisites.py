@@ -225,6 +225,36 @@ def test_a_package_test_cannot_be_overridden():
     assert _option(entry, "project_override")["supported"] is False
 
 
+def test_an_undocumented_package_model_names_no_package_entry():
+    option = _option(_one(_manifest()), "project_override")
+    assert option["supported"] is True
+    assert "package_entry" not in option
+    assert "declaration" not in option["how"]
+
+
+@pytest.mark.parametrize(
+    ("install_dir", "expected"),
+    [
+        ("dbt_packages", "dbt_packages/pkg/models/pkg_task.yml"),
+        ("vendor/pkgs/", "vendor/pkgs/pkg/models/pkg_task.yml"),
+        (None, "pkg://models/pkg_task.yml"),
+    ],
+)
+def test_a_documented_package_model_names_its_entry_on_the_override(
+    install_dir, expected
+):
+    """dbt gives the package's entry to the override and refuses a second (#1161)."""
+
+    manifest = _manifest(**{PKG: _node(PKG, patch_path="pkg://models/pkg_task.yml")})
+    [entry] = diagnose([(PKG, "error", "boom")], manifest, install_dir=install_dir)
+    option = _option(entry, "project_override")
+    assert option["supported"] is True
+    assert option["package_entry"] == expected
+    assert expected in option["how"]
+    assert "no YAML entry or declaration of its own" in option["how"]
+    assert "+enabled: false" in option["how"]
+
+
 def test_a_dispatching_macro_is_named_and_a_plain_one_is_not():
     manifest = _manifest()
     manifest["nodes"][PKG]["depends_on"]["macros"] = [

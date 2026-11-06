@@ -397,6 +397,11 @@ def plan(
         # hard gate; the parse below is the authoritative backstop.
         if has_delete:
             plans_mod.validate_deletions(view, edits)
+        # A project YAML entry on an override of a model its package documents is
+        # a duplicate dbt's parse refuses; say so with both files named (#1161).
+        from . import declarations as declarations_mod
+
+        declarations_mod.refuse_package_documented_entries(view, edits)
         # Native model versions (#859): what dbt would build wrong or drop
         # silently is refused here, before the parse, since dbt only warns
         # about a version with no file. What survives is confirmed against the
@@ -782,6 +787,7 @@ def _draft(
         return {}, []
 
     try:
+        documented = declarations_mod.package_documented_overrides(view, files, models)
         return drafting.draft(
             models,
             files,
@@ -789,6 +795,10 @@ def _draft(
             **_drafting_inputs(engine, view),
             index=lambda: _post_change_index(view, edits),
             prior={path: source.content for path, source in view.files.items()},
+            package_documented={
+                name: {"package": o.package, "package_entry": o.package_entry}
+                for name, o in documented.items()
+            },
         )
     except Exception as exc:
         return {}, [
@@ -5827,6 +5837,19 @@ def _cold_with_outcome(
     }
 
 
+def _install_dir(project: Any) -> str | None:
+    """Where the project installs packages, relative to it, or ``None``."""
+
+    if not project:
+        return None
+    from .build import packages_dir
+
+    try:
+        return packages_dir(project).relative_to(Path(project)).as_posix()
+    except (ValueError, OSError, TypeError):
+        return None
+
+
 def _attach_prerequisites(
     result: BuildResult, inputs: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -5861,6 +5884,7 @@ def _attach_prerequisites(
         ),
         edits=inputs.get("edits"),
         previous_run=inputs.get("previous_run"),
+        install_dir=_install_dir(inputs.get("project")),
     )
     found.sort(
         key=lambda entry: (

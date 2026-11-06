@@ -134,7 +134,27 @@ def select_models(
                 selection.skipped.append(_unmatched(name, view, root))
             elif found not in names:
                 names.append(found)
-    selection.models.extend(names)
+    # An override of a model its package documents takes the package's YAML
+    # entry, and dbt allows it no entry of its own, so nothing is proposed for
+    # it (#1161).
+    overrides = declarations_mod.package_documented_overrides(view, files, names)
+    for name in names:
+        override = overrides.get(name)
+        if override is None:
+            selection.models.append(name)
+            continue
+        selection.skipped.append(
+            {
+                "model": name,
+                "reason": "package_documented",
+                "detail": (
+                    f"it overrides the model {override.package} documents in "
+                    f"{override.package_entry}; dbt applies that entry to the "
+                    "override and allows it no YAML entry of its own, so it "
+                    "takes no declaration"
+                ),
+            }
+        )
     return selection
 
 

@@ -58,6 +58,8 @@ GROUPS: dict[str, tuple[str, ...]] = {
             "test_the_refactor_without_its_prerequisite_fails_the_gate",
             "test_a_refactor_repaired_under_dbt_packages_fails_the_gate",
             "test_the_package_blocked_refactor_checks_catch_the_wrong_answers",
+            # #1161: a declaration on an override of a documented package model.
+            "test_declaring_a_documented_override_is_refused_and_its_readers_are_not",
         )
     ),
     # Blocked deliverables, identifier repairs and holdouts.

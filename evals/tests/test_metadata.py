@@ -2853,6 +2853,117 @@ def test_package_blocked_refactor_flow(tmp_path, monkeypatch, capsys):
     )
 
 
+# --- #1161: an override of a model its package documents ---------------------
+
+_OVERRIDE_TASKS = (
+    "package_prerequisite/adapt_project",
+    REFACTOR_PREREQUISITE,
+)
+
+
+@pytest.mark.parametrize("name", _OVERRIDE_TASKS)
+def test_the_package_documents_the_model_the_reference_overrides(name):
+    """dbt gives a package's entry to the project's override and refuses a
+    second, so these fixtures keep the condition #1161 is about: the model the
+    agent has to override is documented by its package."""
+
+    task = _task(name)
+    fixture_dir = task.directory.parent.parent
+    overridden = {
+        p.stem
+        for p in (task.directory / "reference" / "models" / "overrides").glob("*.sql")
+    }
+    assert overridden
+    documented = {
+        entry["name"]
+        for path in (fixture_dir / "packages").glob("*/models/**/*.yml")
+        for entry in (yaml.safe_load(path.read_text()) or {}).get("models", [])
+    }
+    assert overridden <= documented
+
+
+def test_declaring_a_documented_override_is_refused_and_its_readers_are_not(
+    tmp_path, monkeypatch, capsys
+):
+    """Real CLI on the #1114 fixture: the override route names the package's
+    entry, a declaration on the override is refused in dex's words naming both
+    files, and the same repair without it plans with no declaration owed."""
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(REFACTOR_PREREQUISITE)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    entry = "dbt_packages/tiny_roster/models/roster_member.yml"
+
+    def dex(*args, expected="ok"):
+        main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        return envelope
+
+    blocked = dex("transform", "build", "--target", "dev", expected="error")
+    [override] = [
+        o
+        for p in blocked["data"]["prerequisites"]
+        if p["node"] == "roster_member"
+        for o in p["options"]
+        if o["kind"] == "project_override"
+    ]
+    assert override["package_entry"] == entry
+
+    reference = task.directory / "reference"
+    edits = [
+        {
+            "path": path,
+            "kind": kind,
+            "content": (reference / path).read_text(),
+        }
+        for path, kind in (
+            ("models/overrides/roster_member.sql", "model_sql"),
+            ("dbt_project.yml", "project_yml"),
+        )
+    ]
+    declared = workspace / "declared.json"
+    declared.write_text(
+        json.dumps(
+            {
+                "edits": edits,
+                "declarations": [
+                    {
+                        "model": "roster_member",
+                        "description": "One row per member.",
+                        "grain": ["member_id"],
+                    }
+                ],
+            }
+        )
+    )
+    refused = dex(
+        "transform", "plan", "repair", "--edits-file", str(declared), expected="error"
+    )
+    [message] = refused["errors"]
+    assert entry in message
+    assert "models/overrides/roster_member.yml" in message
+
+    plain = workspace / "plain.json"
+    plain.write_text(json.dumps({"edits": edits}))
+    planned = dex("transform", "plan", "repair", "--edits-file", str(plain))
+    owed = [
+        w
+        for w in planned["warnings"]
+        if "roster_member" in w and ("declares nothing" in w or "declares no " in w)
+    ]
+    assert owed == []
+    assert planned["data"]["declarations"]["roster_member"]["package_documented"] == {
+        "package": "tiny_roster",
+        "package_entry": entry,
+    }
+
+
 # --- scope (#1115): which populations a repair changes, and what it keeps -------
 
 _SANDBOX = "sandbox_scope"
