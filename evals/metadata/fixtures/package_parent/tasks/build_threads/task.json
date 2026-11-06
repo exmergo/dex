@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "inbox__threads"
+  ],
+  "prompt": "Build inbox__threads on dev: one row per conversation, from the tiny_inbox package's staging models, with conversation_id, state, part_count (how many parts it has) and last_part_at (when its latest part was created)."
+}

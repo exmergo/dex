@@ -74,6 +74,7 @@ DIGESTS = {
     "optional_fees": "4becda5d5ad945ba188d20567e2a874f66c6de1df6c370b3403739839ed5f10d",
     "sandbox_scope": "c39e1d55a470611137dcbd0b62fdbd617ea8abc183f202b06e51b7d46ea2a07a",
     "visit_coverage": "89f49a8cfb57454f2bccea7e679f82bdecddb20494fb4822077249ee8190c124",
+    "package_parent": "ba531ac5af7723884ac87e3d665d2e802efa79b0ed969723b6295a6de723c6bf",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -1437,6 +1438,53 @@ def test_a_report_driven_from_the_child_passes_on_dev_and_fails_the_holdout(tmp_
         "every subscription is present, including one with no activity",
         "a subscription with no activity counts zero, not NULL",
     }
+
+
+def test_a_mart_driven_from_the_package_parts_holds_the_wrong_conversations(tmp_path):
+    """Driven from the package's parts table, the mart builds, keeps two deleted
+    conversations and misses three real ones, though the counts it does hold
+    are right (#1155)."""
+
+    task, fixture, workspace = _reference(tmp_path, "package_parent/build_threads")
+    assert (workspace / "dbt_packages/tiny_inbox/models").is_dir(), (
+        "the agent starts with the package installed"
+    )
+    (workspace / "models/marts/inbox__threads.sql").write_text(
+        "select p.conversation_id, max(c.state) as state, count(*) as part_count,\n"
+        "    max(p.part_created_at) as last_part_at\n"
+        "from {{ ref('stg_inbox__conversation_parts') }} p\n"
+        "left join {{ ref('stg_inbox__conversations') }} c\n"
+        "  on c.conversation_id = p.conversation_id\n"
+        "group by p.conversation_id\n"
+    )
+    _edit_yaml(
+        workspace / "models/marts/inbox__threads.yml",
+        lambda doc: doc["models"][0]["columns"][0].update(data_tests=["not_null"]),
+    )
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored"
+    assert set(_failed(score)) == {
+        "every conversation is in the mart, including the three with no parts",
+        "no deleted conversation is in the mart",
+        "a conversation with no parts counts zero, not NULL",
+    }
+
+
+def test_a_declared_parts_parent_is_graded_wrong(tmp_path):
+    """The declared population.parent is graded against truth's parent."""
+
+    task, fixture, workspace = _reference(tmp_path, "package_parent/build_threads")
+
+    def swap(doc):
+        """Declare the parts table as the mart's parent."""
+        population = doc["models"][0]["config"]["meta"]["dex"]["population"]
+        population["parent"]["model"] = "stg_inbox__conversation_parts"
+
+    _edit_yaml(workspace / "models/marts/inbox__threads.yml", swap)
+    score = score_workspace(task, fixture, workspace, reference=True)
+    fields = score.models["inbox__threads"]["correctness"]
+    assert fields["population_parent"] is False
+    assert score.correctness < 1
 
 
 def test_each_dex_call_records_its_flags():

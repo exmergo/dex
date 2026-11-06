@@ -28,9 +28,11 @@ instead and degrades to proposal-only when a format declines it.
 from __future__ import annotations
 
 import argparse
+import contextlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
@@ -910,6 +912,20 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
     return asker("row_population"), asker("join_contract"), asker("declared_facts")
 
 
+def _dev_relations(model_relations: Mapping[str, str], project_dir: Any) -> list[str]:
+    """Every relation the project builds for the dev target: its models, and
+    the manifest's seeds and snapshots, which a declared parent may name too
+    (#1155)."""
+
+    relations = list(model_relations.values())
+    if project_dir is not None:
+        from ..transform.verify import _manifest_relations
+
+        with contextlib.suppress(OSError, ValueError):
+            relations.extend(_manifest_relations(Path(project_dir)))
+    return relations
+
+
 def verify(
     engine: DexEngine,
     objects: list[str] | None = None,
@@ -1106,6 +1122,20 @@ def verify(
         try:
             if reads_dev_target:
                 adapter = engine._adapter("maintain verify", reads_dev_target=True)
+                # The namespaces dbt derives from the dev namespace (a package's
+                # `+schema`) hold this target's own output too (#1155).
+                from .. import connect as _connect
+
+                derived = _connect.widen_dev_reads(
+                    adapter,
+                    engine.config,
+                    _dev_relations(model_relations, project_dir),
+                )
+                if derived:
+                    notes.append(
+                        "also read the namespace(s) dbt derived from the dev "
+                        f"namespace for this project's models: {', '.join(derived)}"
+                    )
             else:
                 adapter = engine._adapter("maintain verify")
         except DexError as exc:

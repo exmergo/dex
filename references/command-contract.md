@@ -336,7 +336,8 @@ dex transform place <column>      -> where a derived column shared by several mo
 dex transform declare [<model>]   -> declarations for models that already exist, opt-in. One stored
   [--edits-file <f>] [--limit N]     plan proposing, per selected model, only the measured facts its
   [--intent "<text>"]                YAML does not state: the grain, a key or foreign_key role, a
-                                     references to a model/seed/snapshot of this project, and
+                                     references to a model/seed/snapshot of this project or an
+                                     installed package (#1155), and
                                      semi_additive for a running total, each under data.proposed with
                                      its evidence. Selector as `maintain verify` (names, repeatable,
                                      comma-separated; none = every model), read from the repo alone;
@@ -1496,10 +1497,15 @@ default, or a filter or operator after it is refused. A key naming a location
     allowlist) reads it once.
 
   The dev namespace shows in the envelope's `connection.target` while it is
-  read, and nothing is written back to `.dex/config.yml`. Where the built
-  relations still cannot be seen (a model built into a custom schema lands
-  outside the configured dev namespace), row population is suppressed with a
-  reason that names the gap rather than comparing nothing and reporting clean.
+  read, and nothing is written back to `.dex/config.yml`. A model or package
+  that sets `+schema` builds into `<dev schema>_<name>` under dbt's default
+  schema naming; the manifest's relations in such a namespace, in the dev
+  namespace's own container, are this target's output, so `--verify` (and
+  `maintain verify --target dev`) reads those namespaces too and says so in
+  `notes` (#1155). Where the built relations still cannot be seen (a custom
+  `generate_schema_name` that lands outside the dev namespace's naming), row
+  population is suppressed with a reason that names the gap rather than
+  comparing nothing and reporting clean.
 - `semantic define` refuses names that already exist in the project (use
   `update`); `update` refuses names that do not (use `define`); `semantic plan`
   accepts a mix and classifies per name, reporting `defined`, `updated`,

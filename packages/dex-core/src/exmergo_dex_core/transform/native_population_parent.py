@@ -5,7 +5,7 @@ The dbt route checks a parent against the project in ``transform.declarations``.
 named nothing was written into a reviewed document. This module is the one check
 the native route runs for every vendor: a parent must name the declared model's
 own columns, and either a model the layer (or the same payload) defines or a
-dbt model/seed/snapshot the project can resolve.
+dbt model/seed/snapshot the project, or a package it installs, can resolve.
 """
 
 from __future__ import annotations
@@ -124,7 +124,24 @@ def _dbt_parent_resolvable(
         if produced is None:
             return True
         return all(c.lower() in produced for c in parent_columns)
-    return _is_seed_or_snapshot(files, view, parent_model)
+    if _is_seed_or_snapshot(files, view, parent_model):
+        return True
+    # An installed package's model, seed or snapshot, when the project has none
+    # of that name (#1155). Columns that cannot be read are accepted, as an
+    # unparseable project SELECT is.
+    from .package_targets import find_package_target
+
+    packaged = find_package_target(
+        view.root,
+        parent_model,
+        project_yml=files.get("dbt_project.yml"),
+        manifest=view.manifest,
+    )
+    if packaged is None or not packaged.enabled:
+        return False
+    if packaged.columns is None:
+        return True
+    return all(c.lower() in packaged.columns for c in parent_columns)
 
 
 def _model_sql_path(

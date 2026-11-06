@@ -17,7 +17,7 @@ simply calls no mutating client API, and the docs recommend read-only roles
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +36,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_parts,
     distinct_combination_sql,
     is_blob_type,
@@ -218,7 +219,7 @@ class BigQueryAdapter:
         self._client = client or bigquery.Client(
             project=project, credentials=credentials
         )
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._notes: dict[str, list[str]] = {}
         # What the last profile estimate was made of, so the handshake and the
@@ -277,7 +278,7 @@ class BigQueryAdapter:
         self._exact_rows: dict[str, int] = {}
         self._resolved_datasets: list[str] | None = None
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_dataset``, the dataset this command's build writes into,
         or stop reading it with ``None``. A bare name qualifies against
         ``self.project``, as allowlist entries do.
@@ -289,9 +290,9 @@ class BigQueryAdapter:
         changed.
         """
 
-        token = scope.strip() if scope else None
-        if token and "." not in token:
-            token = f"{self.project}.{token}"
+        token = dev_target_entries(
+            scope, lambda entry: entry if "." in entry else f"{self.project}.{entry}"
+        )
         if token != self._dev_target:
             self._dev_target = token
             self.forget_metadata()

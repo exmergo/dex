@@ -4299,14 +4299,26 @@ def test_cli_build_timeout_populates_envelope_spend(
     assert envelope["data"]["spend"]["unknown_settlement"] is True
 
 
+@pytest.mark.parametrize(
+    "dataset",
+    [
+        # A custom `generate_schema_name` that lands outside the dev naming.
+        pytest.param("marts", id="outside-the-dev-naming"),
+        # dbt's default naming for `+schema: marts` (#1155).
+        pytest.param("dbt_dev_marts", id="derived-from-the-dev-dataset"),
+    ],
+)
 def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
-    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch, dataset
 ):
     """BigQuery prices with a dry run that never resolves the scope, and lists
     afresh each time, so a dev dataset dbt creates reads after the build. The
     one case left is a build that writes nothing into it (every model in a
     custom schema), so it is never created. That listing once raised after the
-    build had billed; it is the out-of-scope suppression it should have been."""
+    build had billed; it is the out-of-scope suppression it should have been.
+
+    A custom schema dbt derives from the dev dataset (``dbt_dev_marts``) is this
+    target's own output, so it is read and judged instead (#1155)."""
 
     pytest.importorskip("google.cloud.bigquery")
     from fakes.bigquery import FakeBigQueryClient, FakeTable
@@ -4368,7 +4380,7 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
                     "model.dex_test.fct_orders": {
                         "name": "fct_orders",
                         "resource_type": "model",
-                        "relation_name": "`dex-test`.`dbt_dev_marts`.`fct_orders`",
+                        "relation_name": f"`dex-test`.`{dataset}`.`fct_orders`",
                         "config": {"materialized": "table"},
                         "compiled_code": "select o.id from `dex-test`.`raw`.`orders` o",
                     }
@@ -4380,8 +4392,8 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
 
     def dbt_writes(argv: list[str]) -> None:
         if "build" in argv:
-            client.tables["dex-test.dbt_dev_marts.fct_orders"] = table(
-                "dbt_dev_marts", "fct_orders", 5
+            client.tables[f"dex-test.{dataset}.fct_orders"] = table(
+                dataset, "fct_orders", 5
             )
 
     _fake_runner_factory(
@@ -4405,9 +4417,15 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
     )
     assert rc == 0, envelope
     assert envelope["status"] == "ok"
-    reason = envelope["data"]["verification"]["suppressed"]["row_population"]
-    assert "outside dex's read scope" in reason
-    assert "custom schema" in reason
+    verification = envelope["data"]["verification"]
+    if dataset == "marts":
+        reason = verification["suppressed"]["row_population"]
+        assert "outside dex's read scope" in reason
+        assert "custom schema" in reason
+    else:
+        assert "row_population" not in verification["suppressed"]
+        notes = envelope["data"].get("notes") or []
+        assert any("dbt_dev_marts" in n for n in notes), notes
 
 
 # --- ShadowRun.show ------------------------------------------------------------

@@ -1,0 +1,8 @@
+name: tiny_inbox
+version: "1.4.0"
+config-version: 2
+model-paths: ["models"]
+models:
+  tiny_inbox:
+    +materialized: table
+    +schema: inbox
