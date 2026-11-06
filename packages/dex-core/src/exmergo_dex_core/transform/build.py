@@ -76,6 +76,9 @@ _PARSE_TIMEOUT_SECONDS = 120.0
 # Envelope hygiene for dbt output: enough of each message to act on, never a
 # multi-KB traceback, never the same message twice.
 _MESSAGE_MAX_CHARS = 400
+# Appended when a message is cut at the cap, so a reader knows the rest exists
+# rather than taking the cut for the whole of what dbt said.
+_MESSAGE_CUT_NOTE = f"... (cut at {_MESSAGE_MAX_CHARS} characters)"
 _MESSAGE_CAP = 20
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -2394,6 +2397,23 @@ _VALIDATION_HEADER = re.compile(r"^\d+ validation errors? for .+$")
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def _detail_lines(lines: list[str]) -> list[str]:
+    """The lines that continue a cause, up to a blank line, another generic
+    header, or the traceback and compiled-code pointers that follow it."""
+
+    details: list[str] = []
+    for candidate in lines:
+        s = candidate.strip()
+        if (
+            not s
+            or _GENERIC_HEADER.match(s)
+            or s.startswith(("Traceback", "compiled code at", "compiled SQL at"))
+        ):
+            break
+        details.append(s)
+    return details
+
+
 def _collect_messages(
     completed: subprocess.CompletedProcess, log_hint: Path | None = None
 ) -> list[str]:
@@ -2429,18 +2449,7 @@ def _collect_messages(
         # first line with something on it is the one that names the failure.
         first_line = next((ln.strip() for ln in msg_lines if ln.strip()), msg.strip())
         if _VALIDATION_HEADER.match(first_line):
-            details = []
-            for candidate in msg_lines[1:]:
-                s = candidate.strip()
-                if (
-                    not s
-                    or _GENERIC_HEADER.match(s)
-                    or s.startswith(
-                        ("Traceback", "compiled code at", "compiled SQL at")
-                    )
-                ):
-                    break
-                details.append(s)
+            details = _detail_lines(msg_lines[1:])
             if details:
                 first_line = f"{first_line}: {': '.join(details)}"
         elif _GENERIC_HEADER.match(first_line):
@@ -2452,21 +2461,16 @@ def _collect_messages(
                     break
             if idx is not None:
                 cause = msg_lines[idx].strip()
+                details = _detail_lines(msg_lines[idx + 1 :])
                 if _VALIDATION_HEADER.match(cause):
-                    details = []
-                    for candidate in msg_lines[idx + 1 :]:
-                        s = candidate.strip()
-                        if (
-                            not s
-                            or _GENERIC_HEADER.match(s)
-                            or s.startswith(
-                                ("Traceback", "compiled code at", "compiled SQL at")
-                            )
-                        ):
-                            break
-                        details.append(s)
                     if details:
                         cause = f"{cause}: {': '.join(details)}"
+                elif details:
+                    # The cause can go on: a duplicate schema.yml entry names
+                    # the files to fix on the lines after "in one of these
+                    # files:", and the first line alone sends the reader
+                    # looking for them (#1160).
+                    cause = " ".join([cause, *details])
                 sep = "" if first_line.endswith(":") else ":"
                 first_line = f"{first_line}{sep} {cause}"
         # A model that fails on a cast fails in the warehouse's words, which
@@ -2474,7 +2478,7 @@ def _collect_messages(
         # strand a value without its closing quote (#1070).
         first_line = mask_values(first_line)
         if len(first_line) > _MESSAGE_MAX_CHARS:
-            first_line = first_line[:_MESSAGE_MAX_CHARS] + "..."
+            first_line = first_line[:_MESSAGE_MAX_CHARS] + _MESSAGE_CUT_NOTE
             trimmed = True
         if first_line != msg:
             trimmed = True

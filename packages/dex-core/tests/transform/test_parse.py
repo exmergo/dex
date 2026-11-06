@@ -184,6 +184,101 @@ def test_parse_failure_names_the_cause_behind_a_dbt_1_12_level_tagged_header(
     assert _plans_on_disk(tmp_path) == []
 
 
+def test_parse_failure_keeps_every_file_of_a_duplicate_entry_error(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Regression for #1160: dbt names the files to fix on the lines after
+    "in one of these files:", and the envelope kept only the first of them.
+    The event is what dbt-core 1.12 prints for two schema.yml entries naming
+    the same model, colour codes included."""
+
+    _add_time_spine(dbt_project_dir)
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    line = json.dumps(
+        {
+            "info": {
+                "level": "error",
+                "name": "MainEncounteredError",
+                "msg": (
+                    "[\x1b[31mERROR\x1b[0m]: Encountered an error:\n"
+                    "Compilation Error\n"
+                    "  dbt found two schema.yml entries for the same resource named "
+                    "roster_member. Resources and their associated columns may only "
+                    "be described a single time. To fix this, remove the resource "
+                    "entry for roster_member in one of these files:\n"
+                    "   - models/marts/_marts__models.yml\n"
+                    "  models/staging/_staging__models.yml"
+                ),
+            }
+        }
+    )
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            return subprocess.CompletedProcess(
+                args=argv, returncode=2, stdout=line, stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+    rc, envelope = _define(tmp_path, _payload_file(tmp_path, _SEMANTIC_YAML), capsys)
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt parse failed: [ERROR]: Encountered an error: dbt found two schema.yml "
+        "entries for the same resource named roster_member. Resources and their "
+        "associated columns may only be described a single time. To fix this, "
+        "remove the resource entry for roster_member in one of these files: "
+        "- models/marts/_marts__models.yml models/staging/_staging__models.yml"
+    )
+    assert _plans_on_disk(tmp_path) == []
+
+
+def test_parse_failure_over_the_cap_says_it_was_cut(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _add_time_spine(dbt_project_dir)
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    files = "\n".join(
+        f"  - models/area_{i:02d}/_area_{i:02d}__models.yml" for i in range(40)
+    )
+    line = json.dumps(
+        {
+            "info": {
+                "level": "error",
+                "name": "MainEncounteredError",
+                "msg": (
+                    "[ERROR]: Encountered an error:\n"
+                    "Compilation Error\n"
+                    "  dbt found two schema.yml entries for the same resource named "
+                    "roster_member. To fix this, remove the resource entry for "
+                    f"roster_member in one of these files:\n{files}"
+                ),
+            }
+        }
+    )
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            return subprocess.CompletedProcess(
+                args=argv, returncode=2, stdout=line, stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+    rc, envelope = _define(tmp_path, _payload_file(tmp_path, _SEMANTIC_YAML), capsys)
+    assert rc == 1
+    error = envelope["errors"][0]
+    cap = build_module._MESSAGE_MAX_CHARS
+    assert error.endswith(f"... (cut at {cap} characters)")
+    assert "models/area_00/_area_00__models.yml" in error
+    assert len(error) <= len("dbt parse failed: ") + cap + len(
+        build_module._MESSAGE_CUT_NOTE
+    )
+    assert _plans_on_disk(tmp_path) == []
+
+
 def test_shadow_parse_never_touches_the_real_project(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
