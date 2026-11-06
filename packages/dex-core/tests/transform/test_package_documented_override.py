@@ -286,6 +286,7 @@ def test_the_undeclared_override_plans_builds_and_keeps_the_package_entry(
     assert skipped["status"] == "ok", skipped["errors"]
     [entry] = skipped["data"]["skipped"]
     assert entry["reason"] == "package_documented"
+    assert entry["missing"] == []
     assert PACKAGE_ENTRY in entry["detail"]
 
 

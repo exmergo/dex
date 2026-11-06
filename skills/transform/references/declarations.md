@@ -370,8 +370,8 @@ paths the payload stated). `data.skipped` lists every other selected model:
 | `not_writable` | its YAML cannot be spliced predictably (a flow-style entry), or a drafted fact does not fit the SELECT list; the rest of the batch still plans |
 | `package_documented` | it overrides a package model the package documents; dbt gives the package's entry to the override and allows it none of its own (`detail` names the file), so it takes no declaration |
 
-A skipped model also carries `missing`, the intent it still owes (none for
-`package_documented`).
+Where present, `missing` lists the intent a skipped model still owes; a
+`package_documented` model owes none and carries it empty.
 
 **The cap.** At most 25 models are proposed per plan; `--limit N` narrows that and
 never widens it. Skipped models do not count. The models left over are counted in

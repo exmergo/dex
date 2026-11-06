@@ -147,6 +147,7 @@ def select_models(
             {
                 "model": name,
                 "reason": "package_documented",
+                "missing": [],
                 "detail": (
                     f"it overrides the model {override.package} documents in "
                     f"{override.package_entry}; dbt applies that entry to the "
