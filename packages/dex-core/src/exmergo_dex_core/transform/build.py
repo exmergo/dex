@@ -1535,6 +1535,8 @@ class PlanDeclaresMissingPackagesError(MissingPackagesError):
 
 
 def _package_key(package: DeclaredPackage) -> tuple[str, str]:
+    """What makes two declarations the same package across the two trees."""
+
     return package.source, package.name
 
 

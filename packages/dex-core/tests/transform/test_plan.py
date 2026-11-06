@@ -1659,8 +1659,16 @@ _SCHEMA_EDIT = {
 }
 
 
-def _plan(tmp_path: Path, edits: list[dict], capsys) -> tuple[int, dict]:
-    payload = _write_payload(tmp_path, edits)
+def _plan(
+    tmp_path: Path, edits: list[dict], capsys, declarations: list[dict] | None = None
+) -> tuple[int, dict]:
+    """Plan ``edits`` (and any ``declarations``) through the CLI."""
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps({"edits": edits, "declarations": declarations or []}),
+        encoding="utf-8",
+    )
     return _run(
         [
             "--repo-root",
@@ -1676,6 +1684,8 @@ def _plan(tmp_path: Path, edits: list[dict], capsys) -> tuple[int, dict]:
 
 
 def _install(project: Path, directory: str, name: str) -> None:
+    """Lay down a package directory the way `dbt deps` would leave it."""
+
     package = project / "dbt_packages" / directory
     package.mkdir(parents=True)
     (package / "dbt_project.yml").write_text(
@@ -1848,3 +1858,40 @@ def test_a_control_flow_model_with_a_new_package_is_refused_before_compile(
     assert "dbt-labs/dbt_utils@1.3.0" in message
     assert "transform deps" in message
     assert "dbt deps" not in message
+
+
+def test_a_mart_declaration_with_a_new_package_is_refused_before_any_parse(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The derivation of a declared mart runs dbt's parse too; the package check
+    comes before it, so no dbt run is spent on a plan that cannot parse."""
+
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": _DBT_UTILS},
+            {
+                "path": "models/marts/fct_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as order_id, 2.0 as amount\n",
+            },
+        ],
+        capsys,
+        declarations=[
+            {
+                "model": "fct_orders",
+                "description": "One row per order.",
+                "grain": ["order_id"],
+                "columns": {
+                    "order_id": {"role": "key"},
+                    "amount": {"role": "measure", "aggregation": "sum"},
+                },
+            }
+        ],
+    )
+    assert rc == 1 and envelope["status"] == "error", envelope
+    message = envelope["errors"][0]
+    assert "this plan declares dbt packages that are not installed" in message
+    assert "dbt deps" not in message
+    assert calls == []
