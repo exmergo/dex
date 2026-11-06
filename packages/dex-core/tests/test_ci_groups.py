@@ -68,8 +68,14 @@ def test_the_longest_prefix_decides():
     assert ci_groups.group_of("tests/transform/test_retirement_plan.py") == (
         "transform-contracts"
     )
-    assert ci_groups.group_of("tests/transform/test_toggle_build.py") == (
+    assert ci_groups.group_of("tests/transform/test_retirement_scoped.py") == (
+        "transform-retirement-scoped"
+    )
+    assert ci_groups.group_of("tests/transform/test_retirement_scope.py") == (
         "transform-retirement"
+    )
+    assert ci_groups.group_of("tests/transform/test_toggle_build.py") == (
+        "transform-toggle"
     )
     assert ci_groups.group_of("tests/transform/test_toggle.py") == "transform"
 

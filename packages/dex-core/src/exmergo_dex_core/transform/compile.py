@@ -38,9 +38,15 @@ class CompileQueries:
         self.estimate = 0.0
         self.warnings: list[str] = []
         self.inventory = None
+        self.introspected: list[str] = []
 
-    def relation(self, request: dict) -> dict:
-        """Resolve dbt's get_relation/is_incremental through scoped free metadata."""
+    def _resolve(self, request: dict) -> tuple[str, str | None]:
+        """The relation dbt named, matched against the scoped free inventory.
+
+        Returns the dotted name dbt asked for and the one inventory identifier
+        it matches, or ``None`` where nothing in scope matches. Two matches are
+        refused: answering either would let dbt compile against a guess.
+        """
 
         from ..cache import match_identifier
 
@@ -58,11 +64,76 @@ class CompileQueries:
         matches = match_identifier(name, list(self.inventory))
         if len(matches) > 1:
             raise EditValidationError(f"dbt relation lookup is ambiguous: {name}")
+        return name, matches[0] if matches else None
+
+    def relation(self, request: dict) -> dict:
+        """Resolve dbt's get_relation/is_incremental through scoped free metadata."""
+
+        _name, match = self._resolve(request)
         return {
-            "relation_type": self.inventory[matches[0]].object_type.lower()
-            if matches
+            "relation_type": self.inventory[match].object_type.lower()
+            if match is not None
             else None
         }
+
+    def columns(self, request: dict) -> dict:
+        """Answer dbt's ``get_columns_in_relation`` from scoped metadata (#1154).
+
+        Column names and types are a schema read, never a row: they come from
+        ``table_metadata``, the free metadata read every other command uses for
+        a relation's columns, never through the query firewall, which keeps
+        refusing ``DESCRIBE`` and every other non-SELECT shape. Each lookup
+        counts toward ``query.max_statements`` like a compile-time query, and
+        is named once in the plan's warnings. A relation the scoped inventory
+        does not hold is answered as dbt answers a missing relation, with no
+        columns, and the warning says so rather than letting it pass quietly.
+        """
+
+        if self.queries >= self.engine.config.query.max_statements:
+            raise EditValidationError("compile-time SQL exceeds query.max_statements")
+        self.queries += 1
+        name, match = self._resolve(request)
+        if match is None:
+            note = (
+                f"dbt compilation asked for the columns of {name}, which is not in "
+                "the scoped inventory (outside the source scope, or not built "
+                "yet); it was answered with no columns, as dbt answers a missing "
+                "relation"
+            )
+            if note not in self.warnings:
+                self.warnings.append(note)
+            return {"columns": []}
+        # Columns alone where the adapter can read them without counting rows
+        # (DuckDB's table_metadata adds a COUNT(*), which scans a view); every
+        # other connector answers table_metadata from its metadata inventory.
+        columns_only = getattr(self.adapter, "table_columns", None)
+        if callable(columns_only):
+            found = columns_only(match)
+        else:
+            _meta, found = self.adapter.table_metadata(match)
+        if match not in self.introspected:
+            self.introspected.append(match)
+            self.warnings.append(
+                f"dbt compilation listed the columns of {match} from metadata "
+                "(names and types; no rows read)"
+            )
+        answer: dict[str, Any] = {
+            "columns": [[column.name, column.data_type] for column in found]
+        }
+        # A connector whose dbt lists columns with DESCRIBE (Snowflake) hands
+        # over the type as DESCRIBE prints it, precision and scale included, and
+        # the worker builds each column with ``from_description`` as dbt does.
+        described = getattr(self.adapter, "dbt_column_types", None)
+        if callable(described):
+            answer["columns"] = described(match)
+            answer["described"] = True
+        # A connector whose dbt column class needs more than a name and a type
+        # (BigQuery's nested fields and mode) hands over its column tree too, so
+        # a macro's `data_type` is the one dbt itself would render.
+        schema = getattr(self.adapter, "column_schema", None)
+        if callable(schema):
+            answer["schema"] = schema(match)
+        return answer
 
     def handshake(self, command, adapter, estimate, **kwargs):
         note = (
@@ -107,14 +178,25 @@ class CompileQueries:
 
     def query(self, sql: str) -> dict[str, Any]:
         from ..explore.commands import _run_statements
-        from ..guards.query_firewall import assert_query_shape
+        from ..guards.query_firewall import QueryRefusedError, assert_query_shape
 
+        dialect = get_dialect(self.engine.connector or self.engine.config.connector)
+        # A raw schema read is refused before the generic shape check can point
+        # the caller at `explore profile`, which cannot help a macro (#1154).
+        shape = introspection_shape(sql, dialect)
+        if shape is not None:
+            raise QueryRefusedError(
+                f"compile-time {shape} is not run as SQL; dbt compilation lists a "
+                "relation's columns only through adapter.get_columns_in_relation"
+                "(relation), which Dex answers from scoped metadata (names and "
+                "types, no rows). A macro that issues the statement itself, such "
+                "as a direct call to the dispatched get_columns_in_relation macro "
+                "or a hand-written describe, is unsupported during planning: call "
+                "adapter.get_columns_in_relation instead"
+            )
         # Before opening even a read-only adapter. Direct macro DML never
         # reaches connection discovery or warehouse metadata.
-        assert_query_shape(
-            sql,
-            dialect=get_dialect(self.engine.connector or self.engine.config.connector),
-        )
+        assert_query_shape(sql, dialect=dialect)
         if self.queries >= self.engine.config.query.max_statements:
             raise EditValidationError("compile-time SQL exceeds query.max_statements")
         self.queries += 1
@@ -149,6 +231,49 @@ class CompileQueries:
                     result.cost.estimate_quality = EstimateQuality.APPROXIMATE
             else:
                 self.engine._last_spend = command_args.settled_spend(self.adapter)
+
+
+# The statement shapes that read a catalog rather than rows: a column listing
+# by any other spelling than the adapter method Dex brokers (#1154).
+_INTROSPECTION_NODES = {
+    "Describe": "DESCRIBE",
+    "Summarize": "SUMMARIZE",
+    "Show": "SHOW",
+    "Pragma": "PRAGMA",
+}
+
+
+def introspection_shape(sql: str, dialect: str) -> str | None:
+    """Name the catalog read a compile-time statement makes, or ``None``.
+
+    Covers a top-level or nested ``DESCRIBE``/``SUMMARIZE``/``SHOW``/``PRAGMA``
+    and a read of ``information_schema``. Only the refusal's wording depends on
+    it: every one of these is refused either way, and a statement that does not
+    parse is left to the firewall, which refuses it on its own terms.
+    """
+
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        root = sqlglot.parse_one(sql, dialect=dialect)
+    except Exception:
+        return None
+    if root is None:
+        return None
+    for node in root.walk():
+        label = _INTROSPECTION_NODES.get(type(node).__name__)
+        if label is not None:
+            return label
+        # BigQuery keeps `INFORMATION_SCHEMA.COLUMNS` as one dotted table name,
+        # so every dotted part is looked at, not only the schema slot.
+        if isinstance(node, exp.Table) and "information_schema" in {
+            part.lower()
+            for slot in (node.catalog, node.db, node.name)
+            for part in (slot or "").split(".")
+        }:
+            return "information_schema read"
+    return None
 
 
 def compile_models(
@@ -312,6 +437,8 @@ def _worker(
                     response = broker.query(request["sql"])
                 elif request.get("type") == "relation":
                     response = broker.relation(request)
+                elif request.get("type") == "columns":
+                    response = broker.columns(request)
                 elif request.get("type") == "complete":
                     reply = request
                     break

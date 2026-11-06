@@ -220,25 +220,8 @@ class DuckDBAdapter:
         return sorted(str(name) for (name,) in rows)
 
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
-        db, schema, name = self._split(identifier)
-        col_rows = self._run_select(
-            """
-            SELECT column_name, data_type, is_nullable, column_index
-            FROM duckdb_columns()
-            WHERE database_name = ? AND schema_name = ? AND table_name = ?
-            ORDER BY column_index
-            """,
-            [db, schema, name],
-        )
-        columns = [
-            ColumnMeta(
-                name=cname,
-                data_type=str(dtype),
-                nullable=bool(is_nullable),
-                ordinal=int(idx),
-            )
-            for cname, dtype, is_nullable, idx in col_rows
-        ]
+        _db, schema, name = self._split(identifier)
+        columns = self.table_columns(identifier)
         # Exact row count (one cheap aggregate), unlike the estimate in inventory.
         # The only interpolation is the quoted+escaped identifier (never a value);
         # the statement is parsed and refused if not a read-only SELECT.
@@ -255,6 +238,34 @@ class DuckDBAdapter:
             column_count=len(columns),
         )
         return meta, columns
+
+    def table_columns(self, identifier: str) -> list[ColumnMeta]:
+        """One object's columns from the catalog alone, with no row count.
+
+        ``table_metadata`` adds an exact ``COUNT(*)``, which scans a view; a
+        caller that needs only names and types (dbt's compile-time column
+        listing, #1154) reads this instead.
+        """
+
+        db, schema, name = self._split(identifier)
+        col_rows = self._run_select(
+            """
+            SELECT column_name, data_type, is_nullable, column_index
+            FROM duckdb_columns()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?
+            ORDER BY column_index
+            """,
+            [db, schema, name],
+        )
+        return [
+            ColumnMeta(
+                name=cname,
+                data_type=str(dtype),
+                nullable=bool(is_nullable),
+                ordinal=int(idx),
+            )
+            for cname, dtype, is_nullable, idx in col_rows
+        ]
 
     def column_aggregates(
         self,
