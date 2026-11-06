@@ -418,6 +418,30 @@ def test_a_real_group_by_change_is_reported_by_classify():
     )
 
 
+def test_swapping_joined_table_group_by_keys_is_reported_as_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select a.id from t_a a join t_b b on a.x = b.x group by a.id"
+    authored = "select b.id from t_a a join t_b b on a.x = b.x group by b.id"
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+
+
+def test_literal_case_difference_in_group_by_is_reported_as_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select count(*) from t group by case when status = 'US' then 1 else 0 end"
+    authored = (
+        "select count(*) from t group by case when status = 'us' then 1 else 0 end"
+    )
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+
+
 def test_authoring_a_new_model_produces_no_findings_and_opens_nothing(
     attributable_project, plan_edit, capsys, monkeypatch
 ):

@@ -252,18 +252,54 @@ def joins(select: exp.Select) -> list[Join]:
     return out
 
 
-def unqualified_key(node: exp.Expression | None) -> str:
-    """The matching form of :func:`text` with table qualifiers dropped and case
-    folded, so qualifying a column or renaming an alias is not a change."""
+def unqualified_key(
+    node: exp.Expression | None, select: exp.Select | None = None
+) -> str:
+    """The matching form of :func:`text` with case folded on identifiers (preserving
+    string literals) and table qualifiers normalized.
+
+    When ``select`` has no joins, table qualifiers are dropped entirely so single-table
+    qualifications or alias renames are not changes. When ``select`` has joined
+    relations, table qualifiers are resolved to their canonical relation key so
+    swapping columns between different joined tables remains a change while relation
+    alias renames remain silent.
+    """
 
     if node is None:
         return ""
     bare = node.copy()
+    has_joins = False
+    rel_map: dict[str, str] = {}
+    if select is not None:
+        from_rel = from_relation(select)
+        if from_rel is not None:
+            key = relation_key(from_rel)
+            if key:
+                rel_map[key.lower()] = key
+                if from_rel.alias:
+                    rel_map[from_rel.alias.lower()] = key
+        j_list = joins(select)
+        has_joins = bool(j_list)
+        for j in j_list:
+            key = j.key
+            if key:
+                rel_map[key.lower()] = key
+                if j.relation.alias:
+                    rel_map[j.relation.alias.lower()] = key
+
     for column in bare.find_all(exp.Column):
-        column.set("table", None)
         column.set("db", None)
         column.set("catalog", None)
-    return match_key(bare)
+        if not has_joins:
+            column.set("table", None)
+        elif column.table:
+            canonical = rel_map.get(column.table.lower(), column.table.lower())
+            column.set("table", canonical)
+
+    for ident in bare.find_all(exp.Identifier):
+        ident.set("this", ident.name.lower())
+
+    return bare.sql(comments=False).strip()
 
 
 def group_by(select: exp.Select) -> list[str]:
@@ -272,10 +308,12 @@ def group_by(select: exp.Select) -> list[str]:
 
 
 def group_by_keys(select: exp.Select) -> list[str]:
-    """GROUP BY keys with table qualifiers dropped and case folded for comparison."""
+    """GROUP BY keys with table qualifiers normalized and identifier case folded."""
 
     group = select.args.get("group")
-    return [] if group is None else [unqualified_key(e) for e in group.expressions]
+    return (
+        [] if group is None else [unqualified_key(e, select) for e in group.expressions]
+    )
 
 
 #: Constructs that turn one input row into several by design. A query holding
