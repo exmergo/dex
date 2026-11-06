@@ -1703,6 +1703,8 @@ def _parse_passes(monkeypatch) -> list[list]:
     calls: list[list] = []
 
     def fake(project_dir, edits, **_kwargs):
+        """Record the call and report a passing parse."""
+
         calls.append(list(edits))
         return {"available": True, "reason": None, "success": True, "messages": []}
 
@@ -1718,6 +1720,8 @@ def _parse_passes(monkeypatch) -> list[list]:
 def test_plan_refuses_a_package_its_own_edit_declares_before_dbt_parses(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch, spec: str, named: str
 ):
+    """A package the plan declares is refused in Dex's words before dbt runs (#1166)."""
+
     calls = _parse_passes(monkeypatch)
     rc, envelope = _plan(
         tmp_path,
@@ -1753,6 +1757,8 @@ def test_plan_declaring_an_installed_package_reaches_the_parse(
     directory: str,
     name: str,
 ):
+    """A declared package that is installed passes the gate to dbt's parse."""
+
     _install(dbt_project_dir, directory, name)
     calls = _parse_passes(monkeypatch)
     rc, envelope = _plan(
@@ -1788,6 +1794,8 @@ def test_a_packages_only_plan_is_stored_so_the_two_step_route_works(
 def test_a_plan_that_stops_declaring_an_uninstalled_package_is_not_refused(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """The post-edit tree no longer declares the missing package: not refused."""
+
     (dbt_project_dir / "packages.yml").write_text(_DBT_UTILS, encoding="utf-8")
     _install(dbt_project_dir, "shared_pkg", "shared")
     calls = _parse_passes(monkeypatch)
@@ -1806,6 +1814,8 @@ def test_a_plan_that_stops_declaring_an_uninstalled_package_is_not_refused(
 def test_a_plan_adding_a_package_names_the_already_missing_ones_apart(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """The plan's new package and the project's missing one are named apart."""
+
     (dbt_project_dir / "packages.yml").write_text(_LOCAL_PKG, encoding="utf-8")
     _parse_passes(monkeypatch)
     rc, envelope = _plan(
@@ -1832,11 +1842,15 @@ def test_a_plan_adding_a_package_names_the_already_missing_ones_apart(
 def test_a_control_flow_model_with_a_new_package_is_refused_before_compile(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """The control-flow compile path gets the same refusal, before dbt compiles."""
+
     import importlib
 
     compile_module = importlib.import_module("exmergo_dex_core.transform.compile")
 
     def must_not_compile(*_args, **_kwargs):
+        """Fail the test if the compile is reached."""
+
         raise AssertionError("dbt compile ran before the package check")
 
     monkeypatch.setattr(compile_module, "compile_models", must_not_compile)
