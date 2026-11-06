@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -59,6 +59,11 @@ from ..semantic_declarations import Population as Population
 from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
+from .package_overrides import (
+    DocumentedOverride,
+    documented_overrides,
+    override_refusal,
+)
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     RewriteError,
@@ -103,6 +108,121 @@ def schema_path(files: Mapping[str, str], model: str) -> str | None:
             if block.form == "yaml_model_entry" and block.name == model:
                 return path
     return None
+
+
+def yaml_entry_paths(files: Mapping[str, str], model: str) -> list[str]:
+    """Every YAML file whose ``models:`` list has an entry named ``model``.
+
+    :func:`schema_path` stops at the first; this names them all, for a refusal
+    that has to point at every file dbt would read (#1161).
+    """
+
+    found: list[str] = []
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        if any(
+            block.form == "yaml_model_entry" and block.name == model
+            for block in yaml_blocks(files[path])
+        ):
+            found.append(path)
+    return found
+
+
+def package_documented_overrides(
+    view: DbtProjectView, files: Mapping[str, str], models: Iterable[str]
+) -> dict[str, DocumentedOverride]:
+    """The models in ``models`` that are, after the plan, project overrides of a
+    package model the package documents (see :mod:`.package_overrides`).
+
+    A version label is never one: a versioned package model is not overridable.
+    """
+
+    root = getattr(view, "root", None)
+    if not root:
+        return {}
+    wanted = {m for m in models if mv.split_label(m)[1] is None}
+    paths = _planned_model_paths(view.model_paths, files.get("dbt_project.yml"))
+    candidates = {m for m in wanted if model_sql_path(files, paths, m) is not None}
+    # A Python model is not on dex's editable surface, but an existing one is an
+    # override all the same, and its YAML entry collides just as a SQL one's does.
+    candidates |= _python_models(Path(root), paths, wanted - candidates)
+    if not candidates:
+        return {}
+    return documented_overrides(root, candidates, files.get("dbt_project.yml"))
+
+
+def _planned_model_paths(current: Iterable[str], project_yml: str | None) -> list[str]:
+    """The model paths now and as the plan's ``dbt_project.yml`` leaves them."""
+
+    paths = list(current)
+    try:
+        loaded = yaml.safe_load(project_yml or "") or {}
+    except yaml.YAMLError:
+        return paths
+    planned = loaded.get("model-paths") if isinstance(loaded, dict) else None
+    for path in planned if isinstance(planned, list) else []:
+        if isinstance(path, str) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _python_models(root: Path, model_paths: Iterable[str], names: set[str]) -> set[str]:
+    """The names in ``names`` a ``.py`` file under the project's model paths defines."""
+
+    found: set[str] = set()
+    if not names:
+        return found
+    for model_path in model_paths:
+        base = root / model_path
+        if not base.is_dir():
+            continue
+        found.update(p.stem for p in base.rglob("*.py") if p.stem in names)
+    return found
+
+
+def refuse_package_documented_entries(
+    view: DbtProjectView, edits: list[PlanEdit]
+) -> None:
+    """Refuse a plan that leaves a project YAML entry dbt would apply on top of
+    a package's.
+
+    An override of a model its package documents takes the package's entry, so
+    any project entry for the same name fails dbt's parse as a duplicate. This
+    says so in dex's words, naming both files, before dbt runs (#1161). Only the
+    names this plan touches are judged (a model it writes, an entry in a YAML
+    file it writes, or every entry once it edits ``dbt_project.yml``), so a plan
+    elsewhere in the project is not refused for a conflict it did not make.
+    """
+
+    files = post_change_files(view, edits)
+    touched_project = any(e.path == "dbt_project.yml" for e in edits)
+    touched_yaml = {
+        e.path
+        for e in edits
+        if e.op is EditOp.UPSERT and e.path.endswith((".yml", ".yaml"))
+    }
+    touched = {
+        PurePosixPath(e.path).stem
+        for e in edits
+        if e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT
+    }
+    entries: dict[str, list[str]] = {}
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        for block in yaml_blocks(files[path]):
+            if block.form != "yaml_model_entry" or not block.name:
+                continue
+            entries.setdefault(block.name, []).append(path)
+            if path in touched_yaml:
+                touched.add(block.name)
+    judged = set(entries) if touched_project else set(entries) & touched
+    overrides = package_documented_overrides(view, files, judged)
+    for model in sorted(overrides):
+        raise DeclarationError(
+            override_refusal(overrides[model], sorted(set(entries[model])))
+        )
 
 
 def model_sql_path(
@@ -166,6 +286,17 @@ def apply_declarations(
     """
 
     files = post_change_files(view, edits)
+    overrides = package_documented_overrides(
+        view, files, [d.model for d in declarations]
+    )
+    for declaration in declarations:
+        override = overrides.get(declaration.model)
+        if override is not None:
+            sql_path = model_sql_path(files, view.model_paths, declaration.model)
+            paths = yaml_entry_paths(files, declaration.model) or [
+                _default_schema_path(sql_path or "", declaration.model)
+            ]
+            raise DeclarationError(override_refusal(override, paths, declaring=True))
     warnings: list[str] = []
     for declaration in declarations:
         warnings.extend(
@@ -222,6 +353,17 @@ def undeclared_model_warnings(
     files = post_change_files(view, edits)
     vmap = mv.cached_version_map(files, view.model_paths)
     named = mv.expand(declared, vmap)
+    # An override of a model its package documents takes the package's entry
+    # and can carry no declaration of its own, so none is owed (#1161).
+    overrides = package_documented_overrides(
+        view,
+        files,
+        [
+            PurePosixPath(e.path).stem
+            for e in edits
+            if e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT
+        ],
+    )
     warnings: list[str] = []
     for edit in edits:
         if (
@@ -231,7 +373,7 @@ def undeclared_model_warnings(
         ):
             continue
         model = mv.label_for_file(edit.path, vmap) or PurePosixPath(edit.path).stem
-        if model in named or _carries_declaration(files, model):
+        if model in named or model in overrides or _carries_declaration(files, model):
             continue
         warnings.append(
             f"{edit.path}: this plan writes '{model}' and declares nothing about what "

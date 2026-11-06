@@ -88,6 +88,20 @@ can tell:
 An override without the disable fails to parse: dbt refuses two resources with one
 database representation.
 
+When the package also documents the model in a YAML entry, `project_override`
+names that file as `package_entry`. dbt gives the package's entry to your override:
+the package's lookup misses its disabled model and falls back to the project's model
+of the same name, so the override takes the package's description, columns and tests.
+A second entry for the same name, in any project file, fails dbt's parse as two
+entries for one resource. That holds on every dbt version Dex supports, and no YAML
+construct gets around it. So the override carries no declaration and no YAML entry
+of its own. `transform plan` refuses either one before dbt runs, naming both files.
+Plan the override without it, and declare the models that read it instead; the
+procedure owes no declaration for the override, `transform plan` does not warn that
+it declares nothing, and `transform declare` skips it as `package_documented`. The
+package's own tests run against the override, so a test that fails there is a
+finding about your repair.
+
 Copy the package model's SQL as it stands, column-listing macros included: a Fivetran
 staging model's `fill_staging_columns(adapter.get_columns_in_relation(...))` or a
 `dbt_utils.star(ref(...))` plans through `transform plan` like any other model, since

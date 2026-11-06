@@ -824,59 +824,16 @@ def _package_models_restored(
 
     if not names:
         return {}
-    from .build import packages_dir
+    from .package_overrides import package_models
 
-    project_config: dict[str, Any] = {}
     text = project_yml
     if text is None:
         with contextlib.suppress(OSError, UnicodeError):
             text = (root / "dbt_project.yml").read_text(encoding="utf-8")
-    with contextlib.suppress(yaml.YAMLError, AttributeError, TypeError):
-        loaded = yaml.safe_load(text or "") or {}
-        if isinstance(loaded, dict) and isinstance(loaded.get("models"), dict):
-            project_config = loaded["models"]
-
-    def enabled(package: str, parts: list[str]) -> bool:
-        """Resolve package enablement from broad settings to the specific model."""
-
-        state = True
-        level: Any = project_config.get(package)
-        for part in [None, *parts]:
-            if part is not None:
-                level = level.get(part) if isinstance(level, dict) else None
-            if not isinstance(level, dict):
-                break
-            for key in ("+enabled", "enabled"):
-                if isinstance(level.get(key), bool):
-                    state = level[key]
-        return state
-
     restored: dict[str, str] = {}
-    install = packages_dir(root)
-    if not install.is_dir():
-        return restored
-    for directory in sorted(p for p in install.iterdir() if p.is_dir()):
-        manifest: dict[str, Any] = {}
-        with contextlib.suppress(OSError, yaml.YAMLError):
-            loaded = yaml.safe_load(
-                (directory / "dbt_project.yml").read_text(encoding="utf-8")
-            )
-            manifest = loaded if isinstance(loaded, dict) else {}
-        package = (
-            manifest.get("name") if isinstance(manifest.get("name"), str) else None
-        )
-        package = package or directory.name
-        paths = manifest.get("model-paths") or ["models"]
-        for model_path in paths if isinstance(paths, list) else ["models"]:
-            base = directory / str(model_path)
-            if not base.is_dir():
-                continue
-            for sql in base.rglob("*"):
-                if sql.suffix not in (".sql", ".py") or sql.stem not in names:
-                    continue
-                folders = list(sql.relative_to(base).parent.parts)
-                if enabled(package, [*folders, sql.stem]):
-                    restored.setdefault(sql.stem, package)
+    for model in package_models(root, names, text):
+        if model.enabled:
+            restored.setdefault(model.name, model.package)
     return restored
 
 

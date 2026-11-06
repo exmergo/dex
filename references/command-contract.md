@@ -351,7 +351,9 @@ dex transform declare [<model>]   -> declarations for models that already exist,
                                      sql_unreadable, unprofiled_inputs + a profile
                                      command that can reach the input, --target dev for a
                                      dev-only build outside the allowlist, none with the reason
-                                     for a name matching several profiled relations, nothing_drafted, complete, not_writable). Capped at 25
+                                     for a name matching several profiled relations, nothing_drafted, complete, not_writable,
+                                     package_documented for an override of a model its package
+                                     documents). Capped at 25
                                      proposals (--limit only narrows); skipped models do not count,
                                      the rest are data.elided_count and a note. Nothing to propose
                                      stores no plan (plan_id null). Rendered, parse-gated and stored as

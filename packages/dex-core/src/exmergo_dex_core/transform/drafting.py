@@ -155,6 +155,7 @@ def draft(
     dev_namespace: str | None = None,
     index: Callable[[], ReferenceIndex] | None = None,
     prior: Mapping[str, str] | None = None,
+    package_documented: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
 
@@ -170,6 +171,10 @@ def draft(
     ``prior`` is the project as it reads before the plan; with it, a model that
     already exists also carries ``contradictions`` (see :mod:`.contradictions`),
     whose warnings the caller renders once row attribution has run.
+    ``package_documented`` names, by model, the overrides of a package model
+    the package documents (``package`` and ``package_entry``): dbt gives such an
+    override the package's YAML entry and allows it none of its own, so it owes
+    no intent and its entry says where its documentation lives (#1161).
     """
 
     model_paths = list(model_paths)
@@ -215,7 +220,8 @@ def draft(
             )
             if precedent:
                 drafted["precedent"] = precedent
-        missing = _missing(declared, reading)
+        documented = (package_documented or {}).get(model)
+        missing = [] if documented else _missing(declared, reading)
         found = _contradictions(
             model,
             reading,
@@ -239,8 +245,10 @@ def draft(
             grain_judged=any(c["check"] == "grain" for c in found or []),
         )
         model_warnings.extend(_literal_warnings(model, reading, cache))
-        if not declared.get("history") and _reads_snapshot_history(
-            files[sql_path], files
+        if (
+            not documented
+            and not declared.get("history")
+            and _reads_snapshot_history(files[sql_path], files)
         ):
             missing.append("history")
             model_warnings.append(
@@ -254,6 +262,8 @@ def draft(
             "declared": declared,
             "missing": _untoken(missing, reading.tokens),
         }
+        if documented:
+            out[model]["package_documented"] = dict(documented)
         if isinstance(declared.get("population"), dict):
             out[model]["population_contract"] = population_contract(declared)
         if found is not None:
