@@ -284,9 +284,11 @@ class ReferenceIndex:
 
         return [ref for ref in self._indeterminate if ref.kind == kind]
 
-    def readers_of(self, relation: str) -> list[str]:
+    def readers_of(self, relation: str, *, packages: bool = False) -> list[str]:
         """Files in this project that read ``relation`` through ``ref()`` or
-        ``source()``, sorted.
+        ``source()``, sorted. ``packages`` also counts the files of installed
+        packages, where the index scanned them, for a lineage question that
+        crosses into a package (#1155).
 
         ``relation`` is matched the way a model's SQL is rendered for reading:
         by the last argument, so ``orders`` is read by ``ref('orders')``,
@@ -306,7 +308,7 @@ class ReferenceIndex:
                 reference.path
                 for reference in references
                 if reference.form in ("ref_call", "source_call")
-                and reference.package is None
+                and (packages or reference.package is None)
             )
         return sorted(paths)
 
@@ -365,6 +367,36 @@ class ReferenceIndex:
         """
 
         return self._node_kinds.get(node)
+
+    def package_node_kind(self, node: str) -> tuple[str, str] | None:
+        """``(kind, package)`` for a node only an installed package defines.
+
+        The counterpart of :meth:`node_kind` for a lineage question (#1155): a
+        packaged model is no node dex edits, but it is one the project reads, so
+        its ``ref()`` edges are walked the same way. ``None`` where the project
+        defines the name itself (its override wins) or nothing does, and always
+        when the index was built without scanning packages.
+        """
+
+        if node in self._node_kinds:
+            return None
+        for kind in ("model", "seed", "snapshot"):
+            for reference in self.definitions_of(node, kind):
+                if reference.package is not None:
+                    return kind, reference.package
+        return None
+
+    def package_file_of(self, node: str) -> str | None:
+        """The file an installed package defines ``node`` in, relative to the
+        project, or ``None``."""
+
+        found = self.package_node_kind(node)
+        if found is None:
+            return None
+        for reference in self.definitions_of(node, found[0]):
+            if reference.package == found[1]:
+                return reference.path
+        return None
 
     def definitions_of(self, name: str, kind: str) -> list[Reference]:
         """Every place ``name`` is *defined* as ``kind``, project and packages.

@@ -286,6 +286,33 @@ def test_a_verified_join_edge_is_drafted_as_a_reference():
     assert "not a model of this project" in column["references"]["evidence"]
 
 
+def test_a_verified_join_to_a_package_model_is_drafted_naming_the_package():
+    """A parent an installed package builds is a ``references`` dex can write
+    (#1155), so the draft names the package rather than the caveat."""
+
+    files = {
+        "models/marts/fct.sql": (
+            "select order_id, customer_id from {{ ref('stg_orders') }}\n"
+        )
+    }
+    drafts, _ = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="duckdb",
+        cumulative={},
+        domain_cap=25,
+        packaged=lambda name: "crm" if name == "customers" else None,
+    )
+
+    column = drafts["fct"]["drafted"]["columns"]["customer_id"]
+    assert column["references"]["value"] == "customers.id"
+    evidence = column["references"]["evidence"]
+    assert "defined by the installed package crm" in evidence
+    assert "not a model of this project" not in evidence
+
+
 def test_pii_and_null_facts_follow_the_column_lineage():
     entry, _ = _draft(
         "select order_id, email as contact from {{ ref('stg_orders') }}\n"

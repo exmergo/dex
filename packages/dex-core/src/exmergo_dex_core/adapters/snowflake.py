@@ -38,7 +38,7 @@ import contextlib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -55,6 +55,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -903,7 +904,7 @@ class SnowflakeAdapter:
 
         self._sf_errors = sf_errors
         self._visible_databases: set[str] | None = None
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
@@ -1051,7 +1052,7 @@ class SnowflakeAdapter:
         self._resolved_scopes: list[str] | None = None
         self._schemas_by_database: dict[str, set[str]] = {}
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``DATABASE.SCHEMA``, the namespace this command's build
         writes into, or stop reading it with ``None``.
 
@@ -1061,7 +1062,7 @@ class SnowflakeAdapter:
         what was listed, since the scope that produced it has changed.
         """
 
-        scope = scope.strip().upper() if scope else None
+        scope = dev_target_entries(scope, str.upper)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()

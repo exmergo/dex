@@ -312,7 +312,7 @@ def test_a_declaration_folds_into_the_schema_edit_the_payload_already_carries():
                 "model": "fct_orders",
                 "columns": {"customer_id": {"references": "dim_people.id"}},
             },
-            "no model, seed or snapshot named 'dim_people'",
+            "an installed package has a model, seed or snapshot named 'dim_people'",
         ),
         (
             {
@@ -855,7 +855,7 @@ def test_a_malformed_population_parent_is_refused_naming_the_field(parent, expec
     [
         (
             {"model": "dim_people", "key": {"customer_id": "customer_id"}},
-            "no model, seed or snapshot named 'dim_people'",
+            "an installed package has a model, seed or snapshot named 'dim_people'",
         ),
         (
             {"model": "dim_customers", "key": {"customer_id": "cust_key"}},

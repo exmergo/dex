@@ -39,7 +39,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import jinja_regions
@@ -394,7 +394,8 @@ def _in_lineage(
         # A source is no node of the ref() graph, so what links it to the parent
         # is a model upstream of the parent reading it.
         readers = {
-            PurePosixPath(path).stem.lower() for path in graph.readers_of(driver)
+            PurePosixPath(path).stem.lower()
+            for path in graph.readers_of(driver, packages=True)
         }
         if (readers - {model.lower()}) & upstream:
             return True
@@ -405,6 +406,74 @@ def _in_lineage(
 _TRANSPARENT_CALLS = frozenset(
     {"ref", "source", "config", "var", "is_incremental", "this", "env_var"}
 )
+
+#: Macros that shape columns or values and read no relation of their own: a
+#: relation they are handed arrives through ``ref()``, ``source()`` or a column
+#: listing, which names nothing new. Package staging models (Fivetran's, the
+#: dbt-labs packages') are written with these, so without them every package
+#: parent's lineage would read as hidden (#1155). A region whose outermost call
+#: is one of these is read as a whole, since its arguments (a package's own
+#: ``get_<table>_columns()`` list) only describe columns.
+_CROSS_DATABASE = (
+    "type_string",
+    "type_timestamp",
+    "type_int",
+    "type_bigint",
+    "type_numeric",
+    "type_float",
+    "type_boolean",
+    "current_timestamp",
+    "current_timestamp_backcompat",
+    "dateadd",
+    "datediff",
+    "date_trunc",
+    "last_day",
+    "safe_cast",
+    "cast_bool_to_text",
+    "concat",
+    "hash",
+    "length",
+    "replace",
+    "right",
+    "position",
+    "split_part",
+    "string_literal",
+    "escape_single_quotes",
+    "any_value",
+    "bool_or",
+    "listagg",
+)
+_COLUMN_ONLY_CALLS = frozenset(
+    {
+        "adapter.get_columns_in_relation",
+        "adapter.quote",
+        "dbt_utils.star",
+        "dbt_utils.generate_surrogate_key",
+        "dbt_utils.surrogate_key",
+        "dbt_utils.safe_add",
+        "fivetran_utils.fill_staging_columns",
+        "fivetran_utils.source_relation",
+        "fivetran_utils.timestamp_add",
+        "fivetran_utils.timestamp_diff",
+        "fivetran_utils.json_parse",
+        "fivetran_utils.string_agg",
+        *_CROSS_DATABASE,
+        *(f"dbt.{name}" for name in _CROSS_DATABASE),
+        *(f"dbt_utils.{name}" for name in _CROSS_DATABASE),
+    }
+)
+
+
+def _hidden_call(regions: list[Any]) -> str | None:
+    """The first call in ``regions`` that may read a relation dex cannot see."""
+
+    for region in regions:
+        if region.calls and region.calls[0].callee in _COLUMN_ONLY_CALLS:
+            continue
+        for call in region.calls:
+            if call.callee not in _TRANSPARENT_CALLS | _COLUMN_ONLY_CALLS:
+                return call.callee
+    return None
 
 
 def _unsettled(
@@ -427,19 +496,20 @@ def _unsettled(
         for call in region.calls
         if call.callee == "source" and call.args
     }
-    if graph.node_kind(parent) is None:
+    if graph.node_kind(parent) is None and graph.package_node_kind(parent) is None:
         return (
-            f"the declared parent '{parent}' is not defined in this project, so its "
-            "lineage cannot be read"
+            f"the declared parent '{parent}' is not defined in this project or an "
+            "installed package, so its lineage cannot be read"
         )
     lineage = set(graph.ancestors_of(parent))
     for driver in drivers:
         if driver.lower() in sources:
             continue
-        if graph.node_kind(driver) is None:
+        if graph.node_kind(driver) is None and graph.package_node_kind(driver) is None:
             return (
-                f"'{driver}' is not defined in this project (an installed package, or "
-                "a name nothing defines), so its lineage cannot be read"
+                f"'{driver}' is not defined in this project or an installed package "
+                "(packages not installed yet, or a name nothing defines), so its "
+                "lineage cannot be read"
             )
         lineage |= graph.ancestors_of(driver)
     stems = _lowered(lineage)
@@ -451,17 +521,28 @@ def _unsettled(
             )
     for name in sorted(lineage):
         path = model_sql_path(side.files, model_paths, name)
-        if path is None:
+        text = side.files[path] if path is not None else _package_sql(graph, name)
+        if text is None:
             continue
-        regions, _ = jinja_regions(side.files[path])
-        for region in regions:
-            for call in region.calls:
-                if call.callee not in _TRANSPARENT_CALLS:
-                    return (
-                        f"'{name}' calls {call.callee}(), which may read a relation "
-                        "dex cannot see"
-                    )
+        regions, _ = jinja_regions(text)
+        hidden = _hidden_call(regions)
+        if hidden is not None:
+            return (
+                f"'{name}' calls {hidden}(), which may read a relation dex cannot see"
+            )
     return None
+
+
+def _package_sql(graph: ReferenceIndex, name: str) -> str | None:
+    """The SQL of a model only an installed package defines, read from disk."""
+
+    path = graph.package_file_of(name)
+    if path is None or not path.endswith(".sql"):
+        return None
+    try:
+        return (Path(graph.view.root) / path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
 
 
 def _describe_filter(entry: dict[str, Any]) -> str:

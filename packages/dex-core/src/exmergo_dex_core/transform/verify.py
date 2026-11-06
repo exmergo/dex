@@ -217,6 +217,57 @@ def price_verification(
         ]
 
 
+def _manifest_relations(project_dir: Path) -> list[str]:
+    """Every model, seed and snapshot relation the build's manifest names."""
+
+    from ..maintain import verify as verify_mod
+
+    nodes = verify_mod._manifest_nodes(project_dir) or {}
+    return [
+        node["relation_name"]
+        for node in nodes.values()
+        if isinstance(node, dict)
+        and node.get("resource_type") in ("model", "seed", "snapshot")
+        and isinstance(node.get("relation_name"), str)
+    ]
+
+
+def _widen_dev_reads(
+    engine: DexEngine,
+    adapter: Adapter,
+    relations: Callable[[], list[str]],
+    result: BuildVerification,
+) -> None:
+    """Also read the namespaces dbt derived from the dev namespace (#1155).
+
+    A package that sets ``+schema`` builds into ``<dev schema>_<name>``, and a
+    declared parent or a joined relation there is this target's own output, so
+    the sweep judges it rather than reporting it unbuilt. Read from the manifest
+    this build wrote; never raises, since a build that ran must still report.
+    """
+
+    from .. import connect
+
+    try:
+        derived = connect.widen_dev_reads(adapter, engine.config, relations())
+    except Exception as exc:  # pragma: no cover - defensive, reported not raised
+        warning = (
+            f"the namespaces dbt derived from the dev namespace could not be read "
+            f"({type(exc).__name__}); relations a package builds there are judged "
+            "unbuilt"
+        )
+        if warning not in result.warnings:
+            result.warnings.append(warning)
+        return
+    if derived and not any(
+        n.startswith("also read the namespace") for n in result.notes
+    ):
+        result.notes.append(
+            "also read the namespace(s) dbt derived from the dev namespace for "
+            f"this build's models: {', '.join(derived)}"
+        )
+
+
 def verify_build(
     engine: DexEngine,
     project_dir: Path,
@@ -268,6 +319,21 @@ def verify_build(
             label for uid, label in built.items() if uid not in successful
         ),
     )
+
+    # Every sweep below reads the namespaces dbt derived from the dev namespace
+    # too, however it reaches the adapter (#1155).
+    opener = resolve_adapter
+    read: list[list[str]] = []
+
+    def relations() -> list[str]:
+        if not read:
+            read.append(_manifest_relations(project_dir))
+        return read[0]
+
+    def resolve_adapter() -> Adapter:
+        adapter = opener()
+        _widen_dev_reads(engine, adapter, relations, result)
+        return adapter
 
     # Both halves below need the adapter, and only the first may open it: a
     # second open would rebuild the gate holding this command's reservation.

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import PostgresTarget
@@ -51,6 +51,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_parts,
     is_blob_type,
     is_integer_type,
@@ -219,7 +220,7 @@ class PostgresAdapter:
         from psycopg import errors as pg_errors
 
         self._pg_errors = pg_errors
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._database: str | None = None
         self._notes: dict[str, list[str]] = {}
@@ -446,7 +447,7 @@ class PostgresAdapter:
         self._resolved_schemas: list[str] | None = None
         self._visible_schemas: set[str] | None = None
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_schema``, the schema this command's build writes into,
         or stop reading it with ``None``.
 
@@ -457,7 +458,7 @@ class PostgresAdapter:
         changed.
         """
 
-        scope = scope.strip() if scope else None
+        scope = dev_target_entries(scope, str)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()

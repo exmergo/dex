@@ -353,7 +353,8 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
 
     A join to a raw source table is verified evidence, but a declaration's
     ``references`` renders ``ref('<parent>')``, so it is proposed only once a
-    model, seed or snapshot of this project stands for the parent.
+    model, seed or snapshot of this project, or of a package it installs
+    (#1155), stands for the parent.
     """
 
     parent, _, column = reference.rpartition(".")
@@ -361,7 +362,21 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
         return False
     if declarations_mod.model_sql_path(files, view.model_paths, parent) is not None:
         return True
-    return declarations_mod._is_seed_or_snapshot(files, view, parent)
+    if declarations_mod._is_seed_or_snapshot(files, view, parent):
+        return True
+    from .package_targets import find_package_target
+
+    packaged = find_package_target(
+        view.root,
+        parent,
+        project_yml=files.get("dbt_project.yml"),
+        manifest=getattr(view, "manifest", None),
+    )
+    return (
+        packaged is not None
+        and packaged.enabled
+        and (packaged.columns is None or column.lower() in packaged.columns)
+    )
 
 
 def _merge(

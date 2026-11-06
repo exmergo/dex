@@ -14,6 +14,8 @@ Truth (``truth.json``), per task::
                         "domain": [...],                 # every value the column holds
                         "excluded": ["cancelled"]}       # the ones the model drops
                      | {"filters": "none"},              # or: nothing is filtered
+                       # either may add "parent": "<model>", the declared
+                       # population.parent, a package model included (#1155)
          "columns": {"<col>": {"role": "measure", "aggregation": "max",
                                "additivity": "semi_additive", "unit": "count"}},
          "assumption_evidence": "precedent"},            # the tier the convention needs
@@ -709,7 +711,13 @@ def correctness(decl: Declared, truth: dict[str, Any]) -> dict[str, bool]:
             _norm(g) for g in truth["grain"]
         }
     population = truth.get("population")
-    if population is not None:
+    if population is not None and population.get("parent"):
+        declared = (decl.population or {}).get("parent")
+        named = declared.get("model") if isinstance(declared, dict) else None
+        fields["population_parent"] = _norm(named) == _norm(population["parent"])
+    if population is not None and (
+        population.get("filters") == "none" or "column" in population
+    ):
         if population.get("filters") == "none":
             fields["population"] = not any(
                 (f.get("excludes") or f.get("includes"))

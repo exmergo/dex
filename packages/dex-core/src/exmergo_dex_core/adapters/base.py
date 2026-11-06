@@ -18,7 +18,7 @@ caps and truncates them before the envelope.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -234,8 +234,33 @@ def scope_within(scope: str, committed: list[str]) -> bool:
     )
 
 
+def dev_target_entries(
+    scope: str | Sequence[str] | None, normalize: Callable[[str], str] = str
+) -> tuple[str, ...] | None:
+    """The dev namespaces one command reads, each spelled by ``normalize``.
+
+    The dev namespace itself, plus any namespace dbt derives from it for this
+    target (``<dev schema>_<custom>``, where a package or a folder sets
+    ``+schema``), which a verified build judges as its own output too (#1155).
+    ``None`` for no entry at all, so a command that reads nothing compares equal
+    however it was cleared.
+    """
+
+    if not scope:
+        return None
+    items = [scope] if isinstance(scope, str) else list(scope)
+    entries = tuple(
+        dict.fromkeys(
+            normalize(item.strip()) for item in items if item and item.strip()
+        )
+    )
+    return entries or None
+
+
 def with_dev_target(
-    scopes: list[str], dev_target: str | None, exists: Callable[[str], bool]
+    scopes: list[str],
+    dev_target: str | Sequence[str] | None,
+    exists: Callable[[str], bool],
 ) -> list[str]:
     """The resolved source scope, plus the dev namespace when this command reads it.
 
@@ -259,9 +284,15 @@ def with_dev_target(
     normalized it.
     """
 
-    if not dev_target or scope_within(dev_target, scopes) or not exists(dev_target):
+    entries = [dev_target] if isinstance(dev_target, str) else list(dev_target or ())
+    added = [
+        entry
+        for entry in entries
+        if entry and not scope_within(entry, scopes) and exists(entry)
+    ]
+    if not added:
         return scopes
-    return sorted({*scopes, dev_target})
+    return sorted({*scopes, *added})
 
 
 SUGGESTION_CAP = 12

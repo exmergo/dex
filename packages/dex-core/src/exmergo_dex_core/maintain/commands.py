@@ -1106,6 +1106,18 @@ def verify(
         try:
             if reads_dev_target:
                 adapter = engine._adapter("maintain verify", reads_dev_target=True)
+                # The namespaces dbt derives from the dev namespace (a package's
+                # `+schema`) hold this target's own output too (#1155).
+                from .. import connect as _connect
+
+                derived = _connect.widen_dev_reads(
+                    adapter, engine.config, model_relations.values()
+                )
+                if derived:
+                    notes.append(
+                        "also read the namespace(s) dbt derived from the dev "
+                        f"namespace for this project's models: {', '.join(derived)}"
+                    )
             else:
                 adapter = engine._adapter("maintain verify")
         except DexError as exc:

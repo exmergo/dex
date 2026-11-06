@@ -24,6 +24,7 @@ import json
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -836,7 +837,30 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         },
         "cache_note": note,
         "dev_namespace": _dev_namespace(engine),
+        "packaged": _package_lookup(view),
     }
+
+
+def _package_lookup(view: Any) -> Callable[[str], str | None]:
+    """The installed package that builds a name, for a drafted ``references``
+    whose parent the project itself does not define (#1155). Read from the
+    repository on first use and remembered per name; opens nothing."""
+
+    from .package_targets import find_package_target
+
+    project_yml = view.files.get("dbt_project.yml")
+    text = project_yml.content if project_yml is not None else None
+    seen: dict[str, str | None] = {}
+
+    def lookup(name: str) -> str | None:
+        if name not in seen:
+            found = find_package_target(
+                view.root, name, project_yml=text, manifest=view.manifest
+            )
+            seen[name] = found.package if found is not None and found.enabled else None
+        return seen[name]
+
+    return lookup
 
 
 def _dev_namespace(engine: DexEngine) -> str | None:
@@ -854,12 +878,17 @@ def _dev_namespace(engine: DexEngine) -> str | None:
 
 
 def _post_change_index(view: Any, edits: list[PlanEdit]) -> Any:
-    """The reference index of the project as it reads once ``edits`` land."""
+    """The reference index of the project as it reads once ``edits`` land.
+
+    Installed packages are scanned too, so a declared parent that is a package
+    model has its ``ref()`` lineage read (#1155); the project queries drafting
+    asks (precedent's readers) leave package files out on their own.
+    """
 
     from ..references import ReferenceIndex
     from .propagate import _project_after_edits
 
-    return ReferenceIndex(_project_after_edits(view, edits), scan_packages=False)
+    return ReferenceIndex(_project_after_edits(view, edits))
 
 
 def _plan_decisions(

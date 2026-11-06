@@ -64,6 +64,7 @@ from .package_overrides import (
     documented_overrides,
     override_refusal,
 )
+from .package_targets import find_package_target
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     RewriteError,
@@ -451,7 +452,9 @@ def _check(
 
     for name, column in declaration.columns.items():
         if column.references is not None:
-            _check_reference(model, name, column.references, files, view)
+            warnings.extend(
+                _check_reference(model, name, column.references, files, view)
+            )
         elif column.role is Role.FOREIGN_KEY:
             warnings.append(
                 f"'{model}.{name}' is a foreign_key with no `references`, so no "
@@ -601,8 +604,17 @@ def _check_reference(
     view: DbtProjectView,
     *,
     claim: str | None = None,
-) -> None:
-    """Refuse a reference whose parent or parent column the project lacks.
+) -> list[str]:
+    """Refuse a reference whose parent or parent column neither the project nor
+    an installed package has, and return the warnings for what could not be
+    checked.
+
+    The project is looked up first, so a project override of a package model is
+    the parent, as it is for ``ref()``. A package model, seed or snapshot is the
+    parent only when the project defines none of that name (#1155): its column
+    is checked against the package's SQL where that can be read, and is
+    reported as unchecked where it cannot, since a staging model that lists its
+    columns through a macro is no reason to refuse a real parent.
 
     ``claim`` is how the refusal names what made the reference, so a
     ``population.parent`` key reads as that rather than as a column's
@@ -619,12 +631,62 @@ def _check_reference(
             raise DeclarationError(
                 f"{said}, and {parent_sql} does not produce a column '{parent_column}'"
             )
-        return
+        return []
     if _is_seed_or_snapshot(files, view, parent):
-        return
-    raise DeclarationError(
-        f"{said}, and the project has no model, seed or snapshot named '{parent}'"
+        return []
+    packaged = find_package_target(
+        view.root,
+        parent,
+        project_yml=files.get("dbt_project.yml"),
+        manifest=view.manifest,
     )
+    if packaged is not None:
+        if not packaged.enabled:
+            raise DeclarationError(
+                f"{said}, and {packaged.described()} is disabled in this project's "
+                "dbt_project.yml with no project model of that name, so dbt builds "
+                "no node called that; name the model that replaces it"
+            )
+        if packaged.columns is None:
+            return [
+                f"{said}: the columns of {packaged.described()} could not be read "
+                f"({packaged.unread}), so whether it produces '{parent_column}' was "
+                "not checked here; `transform build --verify` reads the built "
+                "relation"
+            ]
+        if parent_column.lower() not in packaged.columns:
+            raise DeclarationError(
+                f"{said}, and {packaged.described()} does not produce a column "
+                f"'{parent_column}'"
+            )
+        return []
+    raise DeclarationError(
+        f"{said}, and neither the project nor an installed package has a model, "
+        f"seed or snapshot named '{parent}'{_source_hint(files, parent)}"
+    )
+
+
+def _source_hint(files: Mapping[str, str], name: str) -> str:
+    """A clause saying ``name`` is a source, which a declaration cannot name."""
+
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        try:
+            loaded = yaml.safe_load(files[path])
+        except yaml.YAMLError:
+            continue
+        sources = loaded.get("sources") if isinstance(loaded, dict) else None
+        for source in sources if isinstance(sources, list) else []:
+            tables = source.get("tables") if isinstance(source, dict) else None
+            for table in tables if isinstance(tables, list) else []:
+                if isinstance(table, dict) and table.get("name") == name:
+                    return (
+                        f" ('{name}' is a table of source '{source.get('name')}', "
+                        "and a source is not a supported parent: name the staging "
+                        "model that selects from it)"
+                    )
+    return ""
 
 
 def _check_parent(
@@ -658,8 +720,9 @@ def _check_parent(
                 f"{', '.join(unknown)} that its SELECT list does not produce; the "
                 "key maps output columns to the parent's"
             )
+    warnings: list[str] = []
     for output_column, parent_column in parent.key.items():
-        _check_reference(
+        warnings += _check_reference(
             model,
             output_column,
             f"{parent.model}.{parent_column}",
@@ -674,12 +737,13 @@ def _check_parent(
     keys = [k.lower() for k in parent.key]
     if grain and sorted(grain) != sorted(keys):
         return [
+            *warnings,
             f"'{model}' declares population.parent keyed on {', '.join(parent.key)} "
             f"but its grain is {', '.join(declaration.grain or [])}; the parent "
             "check counts entities by the key, so the two describe different rows "
-            "unless the key is the grain"
+            "unless the key is the grain",
         ]
-    return []
+    return warnings
 
 
 def _check_history(

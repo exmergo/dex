@@ -156,6 +156,7 @@ def draft(
     index: Callable[[], ReferenceIndex] | None = None,
     prior: Mapping[str, str] | None = None,
     package_documented: Mapping[str, Mapping[str, str]] | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
 
@@ -213,6 +214,7 @@ def draft(
             cumulative=cumulative,
             cache_note=cache_note,
             dev_namespace=dev_namespace,
+            packaged=packaged,
         )
         if reading.usages and (found := reference_index()) is not None:
             precedent = _precedent(
@@ -1437,6 +1439,7 @@ def _drafted(
     cache_note: str | None,
     model: str | None = None,
     dev_namespace: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1458,6 +1461,7 @@ def _drafted(
             model_paths,
             cumulative=cumulative,
             model=model,
+            packaged=packaged,
         )
         if facts:
             columns[name] = facts
@@ -1530,6 +1534,7 @@ def _column_facts(
     *,
     cumulative: Mapping[str, set[str]],
     model: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if origin is not None:
@@ -1549,18 +1554,32 @@ def _column_facts(
         }
     elif origin is not None and dataset is not None and cache is not None:
         reference = _verified_reference(
-            cache, dataset, origin.column, files, model_paths, model=model
+            cache,
+            dataset,
+            origin.column,
+            files,
+            model_paths,
+            model=model,
+            packaged=packaged,
         )
-        if model is not None and not _reachable(reference, files, model_paths):
+        if model is not None and not _reachable(
+            reference, files, model_paths, packaged
+        ):
             # A staging model's column comes from a raw table, whose joins on a
             # warehouse reach only other raw tables (#892). Once the model is
             # built, its own relation's joins reach the models beside it.
             built = _dataset_for_model(cache, model, files, model_paths)
             if built is not None and built is not dataset:
                 own = _verified_reference(
-                    cache, built, name, files, model_paths, model=model
+                    cache,
+                    built,
+                    name,
+                    files,
+                    model_paths,
+                    model=model,
+                    packaged=packaged,
                 )
-                if _reachable(own, files, model_paths):
+                if _reachable(own, files, model_paths, packaged):
                     reference = own
         if reference is not None and reference[0] is not None:
             facts["role"] = {"value": "foreign_key", "evidence": reference[1]}
@@ -1715,6 +1734,7 @@ def _verified_reference(
     model_paths: list[str],
     *,
     model: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> tuple[str | None, str] | None:
     """The reference a verified join supports: ``(target, evidence)``, or
     ``(None, why)`` for a join that was measured and did not hold.
@@ -1730,8 +1750,10 @@ def _verified_reference(
     measured not unique is no key to reference, and the model itself is no
     parent. Of the clean joins left, a model of this project comes first (a
     ``references`` names something ``ref()`` can reach), then a seed or snapshot,
-    then the model nearest this one in the project tree, so a mart references
-    the dimension beside it and a staging model the staging model beside it.
+    then a model, seed or snapshot of an installed package (``packaged`` names
+    its package, #1155), then the model nearest this one in the project tree,
+    so a mart references the dimension beside it and a staging model the
+    staging model beside it.
     """
 
     candidates = [
@@ -1759,8 +1781,10 @@ def _verified_reference(
             kind = 0
         elif _is_seed_or_snapshot(files, model_paths, parent):
             kind = 1
-        else:
+        elif packaged is not None and packaged(parent) is not None:
             kind = 2
+        else:
+            kind = 3
         shared = 0
         if path is not None and here is not None:
             for a, b in zip(
@@ -1812,7 +1836,10 @@ def _verified_reference(
         parent_column = parent_column.lower()
     target = f"{parent}.{parent_column}"
     evidence = f"{joined(edge)} was verified, no orphans"
-    if model_sql_path(files, model_paths, parent) is None:
+    package = packaged(parent) if packaged is not None else None
+    if package is not None and model_sql_path(files, model_paths, parent) is None:
+        evidence += f"; {parent} is defined by the installed package {package}"
+    elif model_sql_path(files, model_paths, parent) is None:
         evidence += (
             f"; {parent} is not a model of this project, so declare `references` "
             "only once one stands for it"
@@ -1829,16 +1856,20 @@ def _reachable(
     reference: tuple[str | None, str] | None,
     files: Mapping[str, str],
     model_paths: list[str],
+    packaged: Callable[[str], str | None] | None = None,
 ) -> bool:
     """Whether a drafted reference names something ``ref()`` reaches: a model,
-    seed or snapshot of this project, rather than a raw table."""
+    seed or snapshot of this project or of an installed package, rather than a
+    raw table."""
 
     if reference is None or reference[0] is None:
         return False
     parent = reference[0].rsplit(".", 1)[0]
-    return model_sql_path(
-        files, model_paths, parent
-    ) is not None or _is_seed_or_snapshot(files, model_paths, parent)
+    return (
+        model_sql_path(files, model_paths, parent) is not None
+        or _is_seed_or_snapshot(files, model_paths, parent)
+        or (packaged is not None and packaged(parent) is not None)
+    )
 
 
 def _project_name(
