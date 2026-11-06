@@ -53,13 +53,14 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "tests/transform/test_singular_test_edit.py",
         "tests/transform/test_control_flow_compile.py",
     ),
-    # Multi-build feature-flag cases (a retirement, #858, and a live toggle,
-    # #1113) run apart from both refactor comparisons and plan-only retirement
-    # contracts (assigned to contracts below).
-    "transform-retirement": (
-        "tests/transform/test_retirement",
-        "tests/transform/test_toggle_build.py",
-    ),
+    # Multi-build feature-flag cases run apart from both refactor comparisons
+    # and plan-only retirement contracts (assigned to contracts below). Each
+    # real-dbt file is its own job: together they took 13m30s on 2026-11-06
+    # (toggle 5m53s, retirement 4m07s, scoped retirement 3m06s), and the
+    # plan-only retirement files beside them run in under a second.
+    "transform-retirement": ("tests/transform/test_retirement",),
+    "transform-retirement-scoped": ("tests/transform/test_retirement_scoped.py",),
+    "transform-toggle": ("tests/transform/test_toggle_build.py",),
     # Native model versions on real dbt: several cold builds and a promotion.
     "transform-versions": ("tests/transform/test_model_versions_build.py",),
     "transform-refactor": (
