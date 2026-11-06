@@ -95,6 +95,7 @@ def test_the_full_retirement_refuses_and_names_the_scoped_route(jinja_repo, caps
     assert refused["status"] == "error"
     message = " ".join(map(str, refused["errors"]))
     assert "macros/unioned.sql" in message
+    assert "a removal applied to most of a project still compiles" in message
     assert '"scope": "authored"' in message
 
 
