@@ -142,15 +142,29 @@ def package_documented_overrides(
     if not root:
         return {}
     wanted = {m for m in models if mv.split_label(m)[1] is None}
-    candidates = {
-        m for m in wanted if model_sql_path(files, view.model_paths, m) is not None
-    }
+    paths = _planned_model_paths(view.model_paths, files.get("dbt_project.yml"))
+    candidates = {m for m in wanted if model_sql_path(files, paths, m) is not None}
     # A Python model is not on dex's editable surface, but an existing one is an
     # override all the same, and its YAML entry collides just as a SQL one's does.
-    candidates |= _python_models(Path(root), view.model_paths, wanted - candidates)
+    candidates |= _python_models(Path(root), paths, wanted - candidates)
     if not candidates:
         return {}
     return documented_overrides(root, candidates, files.get("dbt_project.yml"))
+
+
+def _planned_model_paths(current: Iterable[str], project_yml: str | None) -> list[str]:
+    """The model paths now and as the plan's ``dbt_project.yml`` leaves them."""
+
+    paths = list(current)
+    try:
+        loaded = yaml.safe_load(project_yml or "") or {}
+    except yaml.YAMLError:
+        return paths
+    planned = loaded.get("model-paths") if isinstance(loaded, dict) else None
+    for path in planned if isinstance(planned, list) else []:
+        if isinstance(path, str) and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def _python_models(root: Path, model_paths: Iterable[str], names: set[str]) -> set[str]:

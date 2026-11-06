@@ -206,3 +206,25 @@ def test_an_existing_python_override_with_an_entry_is_refused(tmp_path):
     view = load_project(root)
     with pytest.raises(DeclarationError, match=r"models/mine\.yml"):
         refuse_package_documented_entries(view, [_entry_edit("models/mine.yml")])
+
+
+def test_a_python_override_under_a_model_path_the_plan_adds_is_found(tmp_path):
+    """The model paths the plan's ``dbt_project.yml`` adds are searched too."""
+
+    root = _project(tmp_path / "p", project_models=DISABLED)
+    (root / "models" / "pkg_task.sql").unlink()
+    (root / "py_models").mkdir()
+    (root / "py_models" / "pkg_task.py").write_text(
+        "def model(dbt, session):\n    pass\n"
+    )
+    view = load_project(root)
+    widened = _yml(root).replace(
+        "model-paths: [models]", "model-paths: [models, py_models]"
+    )
+    project = PlanEdit(
+        path="dbt_project.yml", kind=EditKind.PROJECT_YML, new_content=widened
+    )
+    with pytest.raises(DeclarationError, match=r"models/mine\.yml"):
+        refuse_package_documented_entries(
+            view, [project, _entry_edit("models/mine.yml")]
+        )
