@@ -46,10 +46,12 @@ from pathlib import Path
 
 from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
+from ..envelope import failure_text
 from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
+from ..value_mask import mask_values
 from .drift import DriftFinding, _grain_severity
 
 #: dbt's own run_results.json status strings that mean the node did not build.
@@ -236,7 +238,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             continue
         name = name_of(uid)
         if status in _WARNING_STATUSES:
-            message = result.get("message") or status
+            message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -249,7 +251,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             )
             continue
         if status in _FAILURE_STATUSES:
-            message = result.get("message") or status
+            message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -280,6 +282,14 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             )
         )
     return findings, []
+
+
+def _dbt_message(result: dict, status: str) -> str:
+    """dbt's message on one node, with any value a warehouse conversion error
+    quotes masked: a model that fails on a cast fails in the warehouse's words,
+    and those quote the row's value (#1070)."""
+
+    return mask_values(str(result.get("message") or status))
 
 
 def missing_relation_findings(
@@ -529,7 +539,6 @@ def column_contract_check(
     """
 
     from ..dbt_project import column_contract_divergence
-    from ..envelope import redact
     from ..guards.cost_guard import CostGuardError
 
     check = ColumnContractCheck()
@@ -554,10 +563,8 @@ def column_contract_check(
             raise
         except Exception as exc:
             unreadable.append(
-                redact(
-                    f"the column contract was not checked for {model}: its "
-                    f"metadata could not be read ({type(exc).__name__}: {exc})"
-                )
+                f"the column contract was not checked for {model}: its "
+                f"metadata could not be read ({failure_text(exc)})"
             )
             check.unchecked[model] = "metadata_unreadable"
             continue
@@ -1116,7 +1123,7 @@ def grain_findings(
 
             finding, reason = _heuristic_candidate(adapter, model, identifier, min_rows)
         except WarehouseQueryError as exc:
-            refused[model] = exc.detail
+            refused[model] = failure_text(exc, detail_only=True)
             continue
         if finding is not None:
             findings.append(finding)
@@ -4098,7 +4105,7 @@ def relation_counts(
             absent,
             set(to_count),
             None,
-            [f"the row counts could not be read ({type(exc).__name__}: {exc})"],
+            [f"the row counts could not be read ({failure_text(exc)})"],
         )
     row = dict(zip(result.columns, result.cells[0], strict=True))
     counted = set()

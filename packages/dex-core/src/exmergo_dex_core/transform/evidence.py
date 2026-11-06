@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from ..edits import EditOp
 from ..model_versions import expand, label_for_file, version_map
+from ..value_mask import mask_values
 from .plans import EditKind, PlanEdit, PlanError
 
 #: dbt node statuses that mean the node did not produce a good relation. `fail`
@@ -85,13 +86,14 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _node_message(message: object) -> str | None:
-    """dbt's message on one node, bounded, with its color codes removed and
-    the blank lines a unit test diff opens with trimmed (#1111)."""
+    """dbt's message on one node, bounded, with its color codes removed, the
+    blank lines a unit test diff opens with trimmed (#1111), and any value a
+    warehouse conversion error quotes masked (#1070)."""
 
     if not message:
         return None
     text = _ANSI_ESCAPE.sub("", str(message)).replace("\r\n", "\n").strip()
-    return text[:400] or None
+    return mask_values(text)[:400] or None
 
 
 class BuildOutcome(str, Enum):

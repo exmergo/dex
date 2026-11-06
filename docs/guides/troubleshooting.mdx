@@ -49,6 +49,16 @@ If an aggregate answers the question, ask for the aggregate instead of returning
 individual values. Do not alter flags to make a query pass.
 
   </Accordion>
+  <Accordion title="An error says a value was withheld">
+
+The warehouse refused a statement on a conversion, parse or range failure, and
+its message quoted the value it could not handle. Dex keeps the message and
+masks that value, because it comes from a row. The rest of the message still
+says what failed: often a text key compared to an integer key, which the
+warehouse casts implicitly. Profile the column to see its shapes, then fix the
+cast or the join. See the [PII policy](/dex/guardrails/pii-policy).
+
+  </Accordion>
   <Accordion title="The demo refuses to create its files">
 
 Use a fresh directory outside an existing Dex project. The demo is create-only

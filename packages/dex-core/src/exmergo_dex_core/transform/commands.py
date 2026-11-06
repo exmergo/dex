@@ -5553,7 +5553,7 @@ def _price_build(
         if cloud_capacity_required and not cloud_capacity_proved:
             raise
         note = (
-            f"could not price this build upfront ({type(exc).__name__}: {exc}); "
+            f"could not price this build upfront ({env.failure_text(exc)}); "
             "the budget and the server-side per-statement cap still bind"
         )
         return None, {}, [env.redact(note)], {}, adapter

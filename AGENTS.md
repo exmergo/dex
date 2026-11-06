@@ -758,7 +758,9 @@ them.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped, and none at all in values-free mode, which a host
-   selects and the repository cannot (`references/values-free-mode.md`).
+   selects and the repository cannot (`references/values-free-mode.md`). A
+   warehouse error keeps its words and masks the value a conversion failure
+   quotes (`references/pii-policy.md`).
 6. PII is flagged (column, category, confidence), never surfaced, and a flag is
    never removed by evidence: value-shape statistics computed in the profiling
    scan only move its confidence, in both directions and fail-closed. Only a

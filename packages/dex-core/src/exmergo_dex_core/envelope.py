@@ -21,6 +21,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .errors import DexError, StatementStage, WarehouseQueryError
+from .value_mask import mask_values
 from .values_free import ValuesFreeError, error_code
 
 
@@ -588,3 +589,27 @@ def redact(text: str) -> str:
     text = _QUERY_SECRET.sub(r"\1***", text)
     text = _KEY_VALUE.sub(r"\1\2***", text)
     return text
+
+
+def failure_text(exc: BaseException, *, detail_only: bool = False) -> str:
+    """How a caught failure reads when it is folded into a note, a warning, a
+    ``suppressed`` reason or a record's ``reason`` or ``detail``.
+
+    ``Type: message``, with secrets redacted and any data value a conversion
+    failure quotes masked (:func:`~.value_mask.mask_values`, #1070). An adapter's
+    :class:`~.errors.WarehouseQueryError` is already masked where it is built;
+    this covers every other exception a statement can raise (a driver error
+    that escaped translation, a dry run's own exception), so a call site that
+    reports a failure through here cannot put a row's value into the envelope.
+
+    ``detail_only`` returns a :class:`~.errors.WarehouseQueryError`'s server
+    words alone, for a site that already says the warehouse refused.
+
+    Use it for any statement that read rows. A site that must carry nothing
+    row-level at all (a count, a conversion probe) withholds the message and
+    reports only the exception type, as #861 does.
+    """
+
+    if detail_only and isinstance(exc, WarehouseQueryError):
+        return redact(mask_values(exc.detail))
+    return redact(mask_values(f"{type(exc).__name__}: {exc}"))

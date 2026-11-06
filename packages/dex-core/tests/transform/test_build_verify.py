@@ -1884,3 +1884,143 @@ def test_a_build_measures_a_join_through_a_filtered_cte_over_its_filter(
     assert record["status"] == "contradicted"
     assert record["measured"]["matched_rows"] == 0
     assert record["effective_input"]["to"]["filters"] == ['"is_active"']
+
+
+# --- a check that fails on a value says so without the value (#1070) ----------
+
+_SENTINEL = "zq_sentinel_7"
+_MASKED = "Could not convert string <value withheld> to INT32"
+
+
+def test_a_built_view_that_fails_on_a_cast_names_the_failure_not_the_value(
+    tmp_path: Path,
+):
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.raw_orders AS SELECT CAST(i AS VARCHAR) AS ref, "
+        "'paid' AS status FROM range(5) t(i)"
+    )
+    conn.execute("INSERT INTO dbt_dev.raw_orders VALUES (?, 'paid')", [_SENTINEL])
+    conn.execute(
+        "CREATE VIEW dbt_dev.fct_orders AS SELECT CAST(ref AS INTEGER) AS order_id, "
+        "1 AS line, status, 0.5 AS share FROM dbt_dev.raw_orders"
+    )
+    conn.close()
+    _declared_manifest(tmp_path)
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.fct_orders")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+    said = json.dumps(
+        {
+            "payload": result.payload(),
+            "warnings": result.warnings,
+            "suppressed": result.suppressed,
+        },
+        default=str,
+    )
+    assert _SENTINEL not in said
+    assert _MASKED in said
+
+
+class _DriverErrorAdapter(_StubAdapter):
+    """A count whose driver error escaped the adapter's translation."""
+
+    def run_query(self, sql, max_rows=None, timeout_seconds=None):
+        raise RuntimeError(f"Bad int64 value: {_SENTINEL}; error in writing field")
+
+
+def test_a_driver_error_on_the_row_counts_is_masked(tmp_path: Path):
+    project = tmp_path
+    _artifacts(
+        project,
+        nodes={
+            "model.p.stg": {
+                "name": "stg",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.src",
+            }
+        },
+        results=[{"unique_id": "model.p.stg", "status": "success"}],
+    )
+    adapter = _DriverErrorAdapter(
+        [_Meta("wh.dbt_dev.stg"), _Meta("wh.raw.src", row_count=None)]
+    )
+    result = _sweep(project, _summary([_node("model.p.stg")]), adapter)
+    said = json.dumps(
+        {"warnings": result.warnings, "suppressed": result.suppressed}, default=str
+    )
+    assert _SENTINEL not in said
+    assert "Bad int64 value: <value withheld>" in said
+
+
+def test_a_node_that_failed_on_a_cast_is_named_without_the_value(tmp_path: Path):
+    """Found by the dogfood: `node_failed` relays dbt's message, which for a
+    model that failed on a cast quotes the row's value (#1070)."""
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.fct_orders": {"name": "fct_orders", "resource_type": "model"}
+        },
+        results=[
+            {
+                "unique_id": "model.shop.fct_orders",
+                "status": "error",
+                "message": "Runtime Error in model fct_orders\n  Conversion Error: "
+                f"Could not convert string '{_SENTINEL}' to INT32",
+            }
+        ],
+    )
+    result = _sweep(tmp_path, _summary([_node("model.shop.fct_orders")]))
+    (failed,) = [f for f in result.findings if f.code == "node_failed"]
+    assert _SENTINEL not in failed.detail
+    assert _MASKED in failed.detail
+
+
+def test_a_row_count_failure_that_escapes_the_counter_is_suppressed_masked(
+    tmp_path: Path, monkeypatch
+):
+    """A failure `relation_counts` does not catch itself (a pricing or guard
+    error) reaches the sweep's own handler, which names it masked (#1070)."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError(f"Bad int64 value: {_SENTINEL}")
+
+    monkeypatch.setattr(verify_mod, "relation_counts", refuse)
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.stg": {
+                "name": "stg",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.src",
+            }
+        },
+        results=[{"unique_id": "model.p.stg", "status": "success"}],
+    )
+    adapter = _StubAdapter([_Meta("wh.dbt_dev.stg"), _Meta("wh.raw.src")])
+    result = _sweep(tmp_path, _summary([_node("model.p.stg")]), adapter)
+    said = json.dumps({"w": result.warnings, "s": result.suppressed}, default=str)
+    assert _SENTINEL not in said
+    assert (
+        "the row counts could not be read "
+        "(RuntimeError: Bad int64 value: <value withheld>)" in said
+    )

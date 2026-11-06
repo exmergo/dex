@@ -926,3 +926,99 @@ def test_postgres_holds_back_only_the_casts_it_cannot_guard():
     assert keep == [integer, plain]
     assert unsafe == [dated]
     assert verify_mod._split_unsafe([dated], "duckdb") == ([dated], [])
+
+
+# --- a probe that fails on a value says so without the value (#1070) -------------
+
+_SENTINEL = "zq_sentinel_7"
+_MASKED = "Could not convert string <value withheld> to INT32"
+
+
+def _mixed_keys(repo) -> None:
+    repo.sql(
+        "CREATE TABLE raw_events (event_id INTEGER, account_ref VARCHAR)",
+        f"INSERT INTO raw_events VALUES (1, '7'), (2, '12'), (3, '{_SENTINEL}')",
+    )
+    repo.sql(
+        "CREATE TABLE raw_accounts (account_id INTEGER, region VARCHAR)",
+        "INSERT INTO raw_accounts VALUES (7, 'north'), (12, 'south')",
+    )
+
+
+def test_a_plain_join_that_casts_implicitly_does_not_quote_the_key(
+    maintain_repo, _assume_the_project_compiles
+):
+    """No cast is written: DuckDB compares the VARCHAR key to the INTEGER key by
+    casting it, and the probe fails on the key that does not convert. The
+    record keeps the warehouse's words and loses the key."""
+
+    _mixed_keys(maintain_repo)
+    _build(
+        maintain_repo,
+        "fct_events",
+        f"select event_id, account_ref from {W}.raw_events",
+    )
+    sql = (
+        "select e.event_id, e.account_ref, a.region "
+        f"from {W}.raw_events e left join {W}.raw_accounts a "
+        "on e.account_ref = a.account_id"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={"model.maintain_test.fct_events": _node("fct_events", sql)},
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify", "fct_events")
+    assert rc == 0, payload
+    text = json.dumps(payload)
+    assert _SENTINEL not in text
+    (record,) = _records(payload["data"], "fct_events")
+    assert record["status"] == "unchecked"
+    assert _MASKED in record["reason"]
+
+
+def test_every_declared_check_over_a_failing_view_names_the_failure_only(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A view whose SQL casts the sentinel fails every statement that reads it:
+    the row count, the declared grain, the declared population and parent. Each
+    check goes unmeasured with the warehouse's words, never the value."""
+
+    _mixed_keys(maintain_repo)
+    maintain_repo.sql(
+        "CREATE VIEW fct_accounts AS SELECT CAST(account_ref AS INTEGER) "
+        f"AS account_id, 'north' AS region FROM {W}.raw_events"
+    )
+    _build(maintain_repo, "accounts", f"select * from {W}.raw_accounts")
+    nodes = {
+        "model.maintain_test.accounts": _node(
+            "accounts", f"select * from {W}.raw_accounts"
+        ),
+        "model.maintain_test.fct_accounts": _node(
+            "fct_accounts",
+            f"select cast(account_ref as integer) as account_id from {W}.raw_events",
+            columns={"account_id": {"role": "key"}},
+            dex={
+                "grain": ["account_id"],
+                "population": {
+                    "filters": [{"column": "region", "excludes": ["south"]}],
+                    "parent": {
+                        "model": "accounts",
+                        "key": {"account_id": "account_id"},
+                    },
+                },
+            },
+        ),
+    }
+    _write_artifacts(maintain_repo.project_dir, nodes=nodes, results=[])
+    rc, payload = maintain_repo.dex("maintain", "verify", "fct_accounts")
+    assert rc == 0, payload
+    assert _SENTINEL not in json.dumps(payload)
+    said = json.dumps(
+        {
+            "warnings": payload["warnings"],
+            "suppressed": payload["data"].get("suppressed"),
+            "parent_population": payload["data"].get("parent_population"),
+        }
+    )
+    assert _MASKED in said

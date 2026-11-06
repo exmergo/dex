@@ -51,6 +51,7 @@ from ..dbt_project import load as load_project
 from ..envelope import Cost, EstimateQuality, Paradigm, redact
 from ..errors import DexError, PrerequisiteError
 from ..guards.cost_guard import UPTIME_LINE, preflight
+from ..value_mask import mask_values
 from .artifact_runtime import (
     DEFAULT_ARTIFACT_POLICY,
     artifact_paths,
@@ -2468,6 +2469,10 @@ def _collect_messages(
                         cause = f"{cause}: {': '.join(details)}"
                 sep = "" if first_line.endswith(":") else ":"
                 first_line = f"{first_line}{sep} {cause}"
+        # A model that fails on a cast fails in the warehouse's words, which
+        # can quote the row's value; masked before the cap so a cut cannot
+        # strand a value without its closing quote (#1070).
+        first_line = mask_values(first_line)
         if len(first_line) > _MESSAGE_MAX_CHARS:
             first_line = first_line[:_MESSAGE_MAX_CHARS] + "..."
             trimmed = True
@@ -2496,7 +2501,7 @@ def _collect_messages(
     messages = primary + deprecations
 
     if not messages and completed.stderr:
-        messages.append(redact(completed.stderr.strip().splitlines()[-1]))
+        messages.append(redact(mask_values(completed.stderr.strip().splitlines()[-1])))
     if len(messages) > _MESSAGE_CAP:
         messages = messages[:_MESSAGE_CAP]
         trimmed = True

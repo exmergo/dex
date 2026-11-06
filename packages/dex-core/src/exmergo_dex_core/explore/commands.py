@@ -1197,6 +1197,7 @@ def relationships(
                     verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
+                    withhold=values_free,
                 )
                 verify_reporter.done()
             except OverCeilingError:
@@ -2648,6 +2649,7 @@ def map(
                     verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
+                    withhold=values_free,
                 )
                 verify_reporter.done()
             except OverCeilingError:
