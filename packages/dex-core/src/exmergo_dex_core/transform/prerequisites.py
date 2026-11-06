@@ -207,10 +207,14 @@ def _override_option(
     nodes: Mapping[str, Any],
     install_dir: str | None = None,
 ) -> dict[str, Any]:
+    """The ``project_override`` route for a failed package node, or why not."""
+
     name = str(node.get("name") or _name_of(unique_id))
     package = node.get("package_name")
 
     def refused(reason: str) -> dict[str, Any]:
+        """The route, refused for ``reason``."""
+
         return {"kind": "project_override", "supported": False, "reason": reason}
 
     if node.get("resource_type") != "model":

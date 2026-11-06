@@ -45,6 +45,8 @@ DECLARATION = {
 
 
 def _git(cwd: Path, *argv: str) -> str:
+    """Run git in ``cwd`` with a throwaway identity, returning stdout."""
+
     return subprocess.run(  # noqa: S603
         [  # noqa: S607
             "git",
@@ -62,6 +64,8 @@ def _git(cwd: Path, *argv: str) -> str:
 
 
 def _make_project(tmp_path: Path, *, documented: bool) -> Path:
+    """A DuckDB project reading a local git package whose model fails."""
+
     package = tmp_path / "tiny_pkg"
     (package / "models").mkdir(parents=True)
     (package / "dbt_project.yml").write_text(
@@ -137,6 +141,8 @@ def _make_project(tmp_path: Path, *, documented: bool) -> Path:
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
+    """The project, with a package that documents its broken model."""
+
     root = _make_project(tmp_path, documented=True)
     monkeypatch.chdir(root)
     monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
@@ -145,6 +151,8 @@ def project(tmp_path, monkeypatch):
 
 @pytest.fixture
 def undocumented(tmp_path, monkeypatch):
+    """The project, with a package that ships no YAML entry."""
+
     root = _make_project(tmp_path, documented=False)
     monkeypatch.chdir(root)
     monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
@@ -152,11 +160,15 @@ def undocumented(tmp_path, monkeypatch):
 
 
 def _dex(capsys, *argv: str) -> dict:
+    """Run the CLI and return its envelope."""
+
     main(list(argv))
     return json.loads(capsys.readouterr().out)
 
 
 def _override_edits(root: Path, **extra) -> Path:
+    """Write the override, its disable and ``extra`` keys to a payload file."""
+
     config = yaml.safe_load((root / "dbt_project.yml").read_text())
     config["models"] = {"tiny_pkg": {"pkg_task": {"+enabled": False}}}
     payload = {
@@ -177,6 +189,8 @@ def _override_edits(root: Path, **extra) -> Path:
 
 
 def _plan(capsys, edits: Path) -> dict:
+    """Plan the payload at ``edits``."""
+
     return _dex(
         capsys, "transform", "plan", "Override pkg_task", "--edits-file", str(edits)
     )
@@ -185,6 +199,8 @@ def _plan(capsys, edits: Path) -> dict:
 def test_the_failed_build_names_the_package_entry_on_the_override_route(
     project, capsys
 ):
+    """The diagnosis names the package's file on the override route."""
+
     failed = _dex(capsys, "transform", "build", "--target", "dev")
     assert failed["status"] == "error"
     [entry] = failed["data"]["prerequisites"]
@@ -196,6 +212,8 @@ def test_the_failed_build_names_the_package_entry_on_the_override_route(
 
 
 def test_declaring_the_override_is_refused_naming_both_files(project, capsys):
+    """A declaration is refused before dbt, naming both files."""
+
     assert _dex(capsys, "transform", "deps")["status"] == "ok"
     planned = _plan(capsys, _override_edits(project, declarations=[DECLARATION]))
     assert planned["status"] == "error"
@@ -209,6 +227,8 @@ def test_declaring_the_override_is_refused_naming_both_files(project, capsys):
 
 
 def test_a_hand_written_entry_for_the_override_is_refused_the_same_way(project, capsys):
+    """A hand-written entry is refused the same way."""
+
     assert _dex(capsys, "transform", "deps")["status"] == "ok"
     entry = {
         "path": "models/overrides.yml",
@@ -225,6 +245,8 @@ def test_a_hand_written_entry_for_the_override_is_refused_the_same_way(project, 
 def test_the_undeclared_override_plans_builds_and_keeps_the_package_entry(
     project, capsys
 ):
+    """The undeclared repair plans, builds and carries the package's entry."""
+
     assert _dex(capsys, "transform", "deps")["status"] == "ok"
     planned = _plan(capsys, _override_edits(project))
     assert planned["status"] == "ok", planned["errors"]
@@ -293,6 +315,8 @@ def test_the_undeclared_override_plans_builds_and_keeps_the_package_entry(
 def test_an_override_the_package_does_not_document_still_takes_a_declaration(
     undocumented, capsys
 ):
+    """The control: no package entry, so the declaration plans."""
+
     assert _dex(capsys, "transform", "deps")["status"] == "ok"
     planned = _plan(capsys, _override_edits(undocumented, declarations=[DECLARATION]))
     assert planned["status"] == "ok", planned["errors"]

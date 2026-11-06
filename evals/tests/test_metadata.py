@@ -2900,6 +2900,8 @@ def test_declaring_a_documented_override_is_refused_and_its_readers_are_not(
     entry = "dbt_packages/tiny_roster/models/roster_member.yml"
 
     def dex(*args, expected="ok"):
+        """Run the fixture CLI and check its expected envelope status."""
+
         main(["--repo-root", str(workspace), *args])
         envelope = json.loads(capsys.readouterr().out)
         assert envelope["status"] == expected, envelope.get("errors")

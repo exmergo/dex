@@ -33,6 +33,8 @@ def _project(
     package_paths: str = "[models]",
     folder: str = "",
 ) -> Path:
+    """A project and an installed package that both define ``pkg_task``."""
+
     root.mkdir(parents=True, exist_ok=True)
     install_line = (
         f"packages-install-path: {install}\n" if install != "dbt_packages" else ""
@@ -56,10 +58,14 @@ def _project(
 
 
 def _yml(root: Path) -> str:
+    """The project's ``dbt_project.yml`` as it stands."""
+
     return (root / "dbt_project.yml").read_text()
 
 
 def test_a_disabled_documented_package_model_is_a_documented_override(tmp_path):
+    """Disabled and documented: an override that takes the package's entry."""
+
     root = _project(tmp_path / "p", project_models=DISABLED)
     [found] = documented_overrides(root, {"pkg_task"}, _yml(root)).values()
     assert (found.model, found.package) == ("pkg_task", "tiny_pkg")
@@ -67,16 +73,22 @@ def test_a_disabled_documented_package_model_is_a_documented_override(tmp_path):
 
 
 def test_a_package_model_left_enabled_is_not_one(tmp_path):
+    """An enabled package model keeps its own entry, so nothing is overridden."""
+
     root = _project(tmp_path / "p")
     assert documented_overrides(root, {"pkg_task"}, _yml(root)) == {}
 
 
 def test_an_undocumented_package_model_is_not_one(tmp_path):
+    """A package that documents nothing leaves the override free to declare."""
+
     root = _project(tmp_path / "p", project_models=DISABLED, package_yml=None)
     assert documented_overrides(root, {"pkg_task"}, _yml(root)) == {}
 
 
 def test_a_folder_level_disable_counts(tmp_path):
+    """dbt reads ``enabled`` at every level, a folder included."""
+
     folder_disabled = "models:\n  tiny_pkg:\n    staging:\n      +enabled: false\n"
     root = _project(tmp_path / "p", project_models=folder_disabled, folder="staging")
     [found] = documented_overrides(root, {"pkg_task"}, _yml(root)).values()
@@ -84,6 +96,8 @@ def test_a_folder_level_disable_counts(tmp_path):
 
 
 def test_a_custom_install_path_and_model_path_are_followed(tmp_path):
+    """``packages-install-path`` and a package's ``model-paths`` are honoured."""
+
     root = _project(
         tmp_path / "p",
         project_models=DISABLED,
@@ -105,11 +119,15 @@ def test_a_custom_install_path_and_model_path_are_followed(tmp_path):
     ],
 )
 def test_an_unreadable_or_versioned_package_entry_is_not_one(tmp_path, package_yml):
+    """Unreadable YAML and a versioned entry claim nothing."""
+
     root = _project(tmp_path / "p", project_models=DISABLED, package_yml=package_yml)
     assert documented_overrides(root, {"pkg_task"}, _yml(root)) == {}
 
 
 def test_the_plan_s_dbt_project_decides_what_is_disabled(tmp_path):
+    """The disable a plan writes is what is judged, not the one on disk."""
+
     root = _project(tmp_path / "p")
     after = _yml(root) + DISABLED
     assert "pkg_task" in documented_overrides(root, {"pkg_task"}, after)
@@ -120,6 +138,8 @@ def test_the_plan_s_dbt_project_decides_what_is_disabled(tmp_path):
 
 
 def _entry_edit(path: str, name: str = "pkg_task") -> PlanEdit:
+    """A ``schema_yml`` edit holding one entry for ``name``."""
+
     return PlanEdit(
         path=path,
         kind=EditKind.SCHEMA_YML,
@@ -128,6 +148,8 @@ def _entry_edit(path: str, name: str = "pkg_task") -> PlanEdit:
 
 
 def test_a_plan_writing_an_entry_for_a_documented_override_is_refused(tmp_path):
+    """A new project entry is refused, naming both files."""
+
     root = _project(tmp_path / "p", project_models=DISABLED)
     view = load_project(root)
     with pytest.raises(DeclarationError) as raised:
@@ -138,6 +160,8 @@ def test_a_plan_writing_an_entry_for_a_documented_override_is_refused(tmp_path):
 
 
 def test_a_plan_elsewhere_is_not_refused_for_an_existing_entry(tmp_path):
+    """Only names the plan touches are judged."""
+
     root = _project(tmp_path / "p", project_models=DISABLED)
     (root / "models" / "mine.yml").write_text(
         "version: 2\nmodels:\n  - name: pkg_task\n"
@@ -157,6 +181,8 @@ def test_a_plan_elsewhere_is_not_refused_for_an_existing_entry(tmp_path):
 
 
 def test_disabling_the_package_model_under_an_existing_entry_is_refused(tmp_path):
+    """Disabling the package model makes an existing entry a duplicate."""
+
     root = _project(tmp_path / "p")
     (root / "models" / "mine.yml").write_text(
         "version: 2\nmodels:\n  - name: pkg_task\n"
