@@ -61,6 +61,7 @@ from .engine import DexEngine
 from .errors import WarehouseQueryError
 from .results import Result, to_envelope
 from .storage import MemoryStore
+from .value_mask import VALUE_WITHHELD
 from .values_free import ResultMode, ValuesFreeCode, ValuesFreeError
 
 __all__ = [
@@ -921,18 +922,23 @@ class ValuesFreeContract:
         assert envelope.reason is env.Reason.EXECUTION_FAILURE
         assert envelope.data["code"] == ValuesFreeCode.WAREHOUSE_REFUSED.value
 
-    def test_the_same_cast_error_does_quote_the_value_outside_the_mode(
+    def test_the_same_cast_error_fails_outside_the_mode_with_its_words(
         self, full_engine
     ) -> None:
-        """The control: without it, a DuckDB release that stopped quoting the value
-        would pass the test above while proving nothing."""
+        """The control: without it, a release in which the cast stopped failing
+        would pass the test above while proving nothing. Outside the mode the
+        failure keeps the warehouse's words (a conversion failure, with the type
+        it expected) and the value they quote is masked (#1070)."""
 
         full_engine.profile(SENTINEL_TABLE)
 
         with pytest.raises(WarehouseQueryError) as failed:
             full_engine.query(CAST_FAILURE_QUERY)
 
-        assert find_sentinels(str(failed.value))
+        message = str(failed.value)
+        assert "convert" in message.lower()
+        assert VALUE_WITHHELD in message
+        assert not find_sentinels(message)
 
     # --- the mode itself ------------------------------------------------------
 

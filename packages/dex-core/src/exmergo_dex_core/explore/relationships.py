@@ -34,6 +34,7 @@ from ..cache import (
 )
 from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
+from ..envelope import failure_text
 from ..errors import WarehouseQueryError
 from ..model_versions import split_label
 from ..progress import ProgressReporter
@@ -1071,6 +1072,7 @@ def verify_relationships(
     *,
     timeout_seconds: float = 30.0,
     progress: ProgressReporter | None = None,
+    withhold: bool = False,
 ) -> list[tuple[Relationship, str]]:
     """Measure each join with one overlap probe and adjust in place.
 
@@ -1105,6 +1107,10 @@ def verify_relationships(
     (:class:`~exmergo_dex_core.errors.WarehouseQueryError`) is retried this
     way; a budget, timeout, or connection failure still raises, exactly as
     before, so the cost gate keeps its veto over the extra retry statements.
+
+    A refused edge's text keeps the warehouse's words with any value they
+    quote masked; ``withhold`` (values-free mode) drops the words and keeps the
+    exception type (#1070).
     """
 
     refused: list[tuple[Relationship, str]] = []
@@ -1113,7 +1119,7 @@ def verify_relationships(
             results = _run_probe_batch(adapter, batch, timeout_seconds=timeout_seconds)
         except WarehouseQueryError:
             results, batch_refused = _probe_batch_with_fallback(
-                adapter, batch, timeout_seconds=timeout_seconds
+                adapter, batch, timeout_seconds=timeout_seconds, withhold=withhold
             )
             refused.extend(batch_refused)
             if progress is not None:
@@ -1294,7 +1300,9 @@ def _is_clickhouse_supertype_refusal(adapter: Adapter, exc: Exception) -> bool:
 
 def _refusal_text(rel: Relationship, exc: Exception, *, withhold: bool = False) -> str:
     """Why an edge went unmeasured. ``withhold`` drops the warehouse's words,
-    for a probe that converts a key: a failed cast quotes the value (#861)."""
+    for a probe that converts a key, where a failed cast quotes the value
+    (#861), and in values-free mode. Otherwise the words are kept with any value
+    they quote masked (#1070)."""
 
     edge = (
         f"{rel.from_dataset}.{rel.from_columns[0]} -> "
@@ -1304,7 +1312,7 @@ def _refusal_text(rel: Relationship, exc: Exception, *, withhold: bool = False) 
         f"{type(exc).__name__}; the warehouse's message is withheld because it "
         "can quote a value"
         if withhold
-        else str(exc)
+        else failure_text(exc, detail_only=True)
     )
     return (
         f"{edge} could not be probed: the warehouse refused the probe "
@@ -1317,6 +1325,7 @@ def _probe_batch_with_fallback(
     batch: list[Relationship],
     *,
     timeout_seconds: float,
+    withhold: bool = False,
 ) -> tuple[list[tuple[Relationship, int, int]], list[tuple[Relationship, str]]]:
     """Retry a refused batch edge by edge, keeping what measures.
 
@@ -1345,7 +1354,7 @@ def _probe_batch_with_fallback(
             continue
         except WarehouseQueryError as exc:
             if not _is_clickhouse_supertype_refusal(adapter, exc):
-                refused.append((rel, _refusal_text(rel, exc)))
+                refused.append((rel, _refusal_text(rel, exc, withhold=withhold)))
                 continue
             try:
                 results.extend(
@@ -1357,7 +1366,7 @@ def _probe_batch_with_fallback(
                     )
                 )
             except WarehouseQueryError as cast_exc:
-                refused.append((rel, _refusal_text(rel, cast_exc)))
+                refused.append((rel, _refusal_text(rel, cast_exc, withhold=withhold)))
     return results, refused
 
 

@@ -53,7 +53,6 @@ from typing import Any
 
 from ..cache import match_identifier
 from ..dbt_project import manifest_node_label, strip_relation_quoting
-from ..errors import WarehouseQueryError
 from ..guards.pii_meta import entry_meta
 from . import temporal_contracts as temporal_mod
 from .drift import DriftFinding
@@ -1351,14 +1350,13 @@ def _suppression_reason(reasons: list[str]) -> str:
 
 
 def _refusal(exc: Exception) -> str:
-    """A refused statement's reason, redacted: one check going unmeasured is
-    that check's note, never the sweep's failure, whatever the driver raised."""
+    """A refused statement's reason, redacted and with any value it quotes
+    masked (#1070): one check going unmeasured is that check's note, never the
+    sweep's failure, whatever the driver raised."""
 
-    from ..envelope import redact
+    from ..envelope import failure_text
 
-    if isinstance(exc, WarehouseQueryError):
-        return exc.detail
-    return redact(f"{type(exc).__name__}: {exc}")
+    return failure_text(exc, detail_only=True)
 
 
 def _number(value: Any) -> float | None:

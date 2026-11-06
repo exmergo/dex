@@ -779,3 +779,18 @@ def test_status_kind_is_an_allow_list():
     assert status_kind("skipped") == "skipped"
     assert status_kind("partial success") == "unrecognized"
     assert status_kind("") == "unrecognized"
+
+
+def test_a_node_message_never_carries_the_value_a_cast_failed_on():
+    """dbt relays the warehouse's words for a model that fails on a cast, and
+    those words quote the row's value (#1070)."""
+
+    from exmergo_dex_core.transform.evidence import _node_message
+
+    message = _node_message(
+        "Runtime Error in model fct_orders (models/fct_orders.sql)\n"
+        "  Conversion Error: Could not convert string 'zq_sentinel_7' to INT32"
+    )
+    assert message is not None
+    assert "zq_sentinel_7" not in message
+    assert "Could not convert string <value withheld> to INT32" in message

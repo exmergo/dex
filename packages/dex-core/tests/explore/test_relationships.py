@@ -3045,3 +3045,50 @@ def test_mixed_identifier_shapes_preserves_whitespace_column_names():
     (mixed,) = [f for f in findings if f.code == "mixed_identifier_shapes"]
     assert mixed.column == "product line_id"
     assert mixed.detail == note
+
+
+# --- a refused probe's words, without the value they quote (#1070) ------------
+
+_SENTINEL = "zq_sentinel_7"
+
+
+def _conversion_refusal(sql):
+    from exmergo_dex_core.adapters.base import warehouse_refusal
+
+    raise warehouse_refusal(
+        f"Conversion Error: Could not convert string '{_SENTINEL}' to INT32"
+    )
+
+
+def test_a_refused_edge_keeps_the_warehouse_words_without_the_value():
+    """A VARCHAR key joined to an INTEGER key fails on an implicit cast that
+    quotes the key; the note says what failed and drops the key."""
+
+    adapter = _RefusingProbeAdapter("duckdb", _conversion_refusal)
+    rel = _probe_rel("events", "account_id", "accounts", "account_id")
+    ((_rel, text),) = verify_relationships(adapter, [rel])
+    assert _SENTINEL not in text
+    assert "Could not convert string <value withheld> to INT32" in text
+
+
+def test_a_refused_edge_in_values_free_mode_carries_the_type_only():
+    adapter = _RefusingProbeAdapter("duckdb", _conversion_refusal)
+    rel = _probe_rel("events", "account_id", "accounts", "account_id")
+    ((_rel, text),) = verify_relationships(adapter, [rel], withhold=True)
+    assert _SENTINEL not in text
+    assert "Could not convert" not in text
+    assert "WarehouseQueryError" in text
+    assert "could not be probed" in text
+
+
+def test_a_driver_error_on_a_refused_edge_is_masked_too():
+    """`_refusal_text` is also reached with a message no adapter translated."""
+
+    from exmergo_dex_core.explore.relationships import _refusal_text
+
+    rel = _probe_rel("events", "account_id", "accounts", "account_id")
+    text = _refusal_text(
+        rel, RuntimeError(f"Bad int64 value: {_SENTINEL}; error in writing field")
+    )
+    assert _SENTINEL not in text
+    assert "Bad int64 value: <value withheld>" in text

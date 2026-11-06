@@ -28,6 +28,7 @@ from typing import Protocol, runtime_checkable
 
 from ..envelope import Paradigm
 from ..errors import StatementStage, WarehouseQueryError
+from ..value_mask import mask_values
 
 
 @dataclass(frozen=True)
@@ -314,8 +315,10 @@ def warehouse_refusal(
     Every adapter funnels through here so the envelope reads the same whichever
     warehouse said no, and so the server's words get the same trim: first line
     only (drivers append the statement, a caret diagram, or their whole error
-    payload after it) and capped. ``code`` is the connector's own error code
-    where it has one, which is what a caller looking the failure up needs.
+    payload after it), the data value a conversion failure quotes masked (see
+    :mod:`~exmergo_dex_core.value_mask`), and capped. ``code`` is the
+    connector's own error code where it has one, which is what a caller looking
+    the failure up needs.
 
     ``stage`` is which door the refusal came through, for an adapter that can
     tell (see :class:`~exmergo_dex_core.errors.StatementStage`). It is kept as a
@@ -325,7 +328,9 @@ def warehouse_refusal(
     """
 
     first = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
-    detail = first or "the server gave no message"
+    # Masked before the cap: a cap that cut through a quoted value would leave
+    # it without the closing quote the mask reads its end from (#1070).
+    detail = mask_values(first) or "the server gave no message"
     if len(detail) > _SERVER_DETAIL_CAP:
         detail = detail[:_SERVER_DETAIL_CAP].rstrip() + "..."
     return WarehouseQueryError(f"{detail} [{code}]" if code else detail, stage=stage)

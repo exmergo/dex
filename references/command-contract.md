@@ -2174,6 +2174,12 @@ null where the command resolved no connector. Without a cap the key is absent.
 
 Rules the envelope enforces, all of them Tier-2 eval targets:
 
+- **A warehouse's words, never a row's value.** An error, note, warning,
+  `suppressed` reason or record that relays a warehouse's refusal keeps its
+  words and masks the value a conversion, parse or range failure quotes
+  (`Could not convert string <value withheld> to INT32`), on every connector
+  and every surface. The policy and its limit are in
+  [`pii-policy.md`](pii-policy.md#warehouse-error-text).
 - **Cost before spend.** `cost` is a preflight estimate, and any command that
   would spend returns `needs_confirmation` until it is confirmed and budgeted.
   The handshake in full is in [`cost-controls.md`](cost-controls.md).

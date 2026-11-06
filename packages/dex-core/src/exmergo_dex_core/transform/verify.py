@@ -205,12 +205,12 @@ def price_verification(
         sql = verify_mod.count_relations_sql(sorted(countable), adapter.dialect)
         return float(estimator(sql)), []
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         return 0.0, [
             redact(
                 "could not price this build's verification upfront "
-                f"({type(exc).__name__}: {exc}); the row counts are priced "
+                f"({failure_text(exc)}); the row counts are priced "
                 "again after the build and offered if they do not fit the "
                 "confirmed budget"
             )
@@ -573,7 +573,7 @@ def _column_contract(
     than compared. Returns the suppression reason when no model was compared.
     """
 
-    from ..envelope import redact
+    from ..envelope import failure_text, redact
     from ..errors import DexError
     from ..guards.cost_guard import CostGuardError
     from ..maintain import verify as verify_mod
@@ -625,8 +625,7 @@ def _column_contract(
         raise
     except Exception as exc:
         return redact(
-            "the relations this build wrote could not be listed "
-            f"({type(exc).__name__}: {exc})"
+            f"the relations this build wrote could not be listed ({failure_text(exc)})"
         )
 
     relations = verify_mod.built_model_relations(project_dir, scope)
@@ -714,11 +713,10 @@ def _row_population(
     except CostGuardError:
         raise
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         return redact(
-            "the relations this build wrote could not be listed "
-            f"({type(exc).__name__}: {exc})"
+            f"the relations this build wrote could not be listed ({failure_text(exc)})"
         )
     identifiers = [meta.identifier for meta in live]
     if not any(match_identifier(check.relations[0], identifiers) for check in checks):
@@ -742,7 +740,7 @@ def _row_population(
     except CostGuardError:
         raise
     except Exception as exc:
-        return f"the row counts could not be read ({type(exc).__name__}: {exc})"
+        return f"the row counts could not be read ({failure_text(exc)})"
 
     findings, finding_notes = verify_mod.row_population_findings(
         checks,
@@ -806,11 +804,10 @@ def _join_contract(
     except CostGuardError:
         raise
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         return redact(
-            "the relations this build wrote could not be listed "
-            f"({type(exc).__name__}: {exc})"
+            f"the relations this build wrote could not be listed ({failure_text(exc)})"
         )
     try:
         joined = verify_mod.join_coverage(
@@ -825,11 +822,9 @@ def _join_contract(
     except CostGuardError:
         raise
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
-        return redact(
-            f"the join coverage could not be measured ({type(exc).__name__}: {exc})"
-        )
+        return redact(f"the join coverage could not be measured ({failure_text(exc)})")
     result.findings.extend(joined.findings)
     result.warnings.extend(joined.notes)
     result.join_coverage = joined.records
@@ -856,12 +851,12 @@ def price_join_contract(
         )
         return estimate, []
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         return 0.0, [
             redact(
                 "could not price this build's join coverage upfront "
-                f"({type(exc).__name__}: {exc}); it is priced again after the "
+                f"({failure_text(exc)}); it is priced again after the "
                 "build and offered if it does not fit the confirmed budget"
             )
         ]
@@ -972,12 +967,12 @@ def _declared_facts(
     except CostGuardError:
         raise
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         suppress(
             redact(
                 "the relations this build wrote could not be listed "
-                f"({type(exc).__name__}: {exc})"
+                f"({failure_text(exc)})"
             )
         )
         return {}
@@ -1005,12 +1000,10 @@ def _declared_facts(
     except CostGuardError:
         raise
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         suppress(
-            redact(
-                f"the declared facts could not be checked ({type(exc).__name__}: {exc})"
-            )
+            redact(f"the declared facts could not be checked ({failure_text(exc)})")
         )
         return {}
 
@@ -1059,12 +1052,12 @@ def price_declared_facts(
         estimate, _count = facts_mod.cost(adapter, prepared)
         return estimate, []
     except Exception as exc:
-        from ..envelope import redact
+        from ..envelope import failure_text, redact
 
         return 0.0, [
             redact(
                 "could not price this build's declared-fact checks upfront "
-                f"({type(exc).__name__}: {exc}); they are priced again after the "
+                f"({failure_text(exc)}); they are priced again after the "
                 "build and offered if they do not fit the confirmed budget"
             )
         ]

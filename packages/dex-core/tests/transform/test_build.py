@@ -4516,3 +4516,38 @@ def test_show_without_a_readable_preview_returns_no_rows(
     with ShadowRun(dbt_project_dir, target="dev", runner=runner) as shadow:
         _summary, rows = shadow.show("dex_mutation_equivalence")
     assert rows is None
+
+
+def test_a_failed_build_message_never_carries_the_value_a_cast_failed_on():
+    """A model that fails on a cast fails in the warehouse's words, which quote
+    the row's value; the build keeps the words and masks the value (#1070)."""
+
+    import subprocess
+
+    from exmergo_dex_core.transform.build import _collect_messages
+
+    line = json.dumps(
+        {
+            "info": {
+                "name": "RunResultError",
+                "level": "error",
+                "msg": "Conversion Error: Could not convert string "
+                "'zq_sentinel_7' to INT32",
+            },
+            "data": {},
+        }
+    )
+    completed = subprocess.CompletedProcess(
+        ["dbt"], 1, stdout=line + "\n", stderr="Bad int64 value: zq_sentinel_7"
+    )
+    messages = _collect_messages(completed)
+    assert "zq_sentinel_7" not in json.dumps(messages)
+    assert any(
+        "Could not convert string <value withheld> to INT32" in m for m in messages
+    )
+    stderr_only = _collect_messages(
+        subprocess.CompletedProcess(
+            ["dbt"], 1, stdout="", stderr="Bad int64 value: zq_sentinel_7"
+        )
+    )
+    assert stderr_only == ["Bad int64 value: <value withheld>"]
