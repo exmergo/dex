@@ -88,13 +88,34 @@ def test_reformatting_and_renaming_an_alias_are_silent():
     authored = (
         "WITH v AS (SELECT s.visit_date, COUNT(*) AS visits,\n"
         "  AVG(s.duration) AS avg_duration FROM {{ ref('stg_visits') }} AS s\n"
-        "  GROUP BY visit_date)\n"
+        "  GROUP BY s.visit_date)\n"
         "SELECT visit_date, visits, avg_duration, CAST(site_id AS INTEGER) AS site_id "
         "FROM v"
     )
     scope = _scope(authored)
     assert scope.changes == []
     assert (scope.population, scope.outputs) == ("kept", "kept")
+
+
+def test_qualifying_a_group_by_key_leaves_population_kept():
+    authored = (
+        "with v as (\n"
+        "  select s.visit_date, count(*) as visits, avg(s.duration) as avg_duration\n"
+        "  from {{ ref('stg_visits') }} as s group by s.visit_date\n"
+        ")\n"
+        "select visit_date, visits, avg_duration, cast(site_id as integer) as site_id\n"
+        "from v\n"
+    )
+    scope = _scope(authored)
+    assert not any(c.kind == "group_by_changed" for c in scope.changes)
+    assert scope.population == "kept"
+
+
+def test_a_real_group_by_change_is_reported_as_population_changed():
+    authored = PRIOR.replace("group by visit_date", "group by visit_date, site_id")
+    scope = _scope(authored)
+    assert any(c.kind == "group_by_changed" for c in scope.changes)
+    assert scope.population == "changed"
 
 
 # --- population ------------------------------------------------------------------

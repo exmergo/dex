@@ -252,9 +252,30 @@ def joins(select: exp.Select) -> list[Join]:
     return out
 
 
+def unqualified_key(node: exp.Expression | None) -> str:
+    """The matching form of :func:`text` with table qualifiers dropped and case
+    folded, so qualifying a column or renaming an alias is not a change."""
+
+    if node is None:
+        return ""
+    bare = node.copy()
+    for column in bare.find_all(exp.Column):
+        column.set("table", None)
+        column.set("db", None)
+        column.set("catalog", None)
+    return match_key(bare)
+
+
 def group_by(select: exp.Select) -> list[str]:
     group = select.args.get("group")
     return [] if group is None else [text(e) for e in group.expressions]
+
+
+def group_by_keys(select: exp.Select) -> list[str]:
+    """GROUP BY keys with table qualifiers dropped and case folded for comparison."""
+
+    group = select.args.get("group")
+    return [] if group is None else [unqualified_key(e) for e in group.expressions]
 
 
 #: Constructs that turn one input row into several by design. A query holding

@@ -394,12 +394,7 @@ def _normal(node: exp.Expression) -> str:
     """The comparison form: table qualifiers dropped, case folded, so renaming an
     alias or re-casing an identifier is not a change."""
 
-    bare = node.copy()
-    for column in bare.find_all(exp.Column):
-        column.set("table", None)
-        column.set("db", None)
-        column.set("catalog", None)
-    return sql_shape.match_key(bare)
+    return sql_shape.unqualified_key(node)
 
 
 def _cast_target(node: exp.Expression) -> str | None:

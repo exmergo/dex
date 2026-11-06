@@ -390,6 +390,34 @@ def test_re_aliasing_a_relation_is_not_a_source_change(
     )
 
 
+def test_qualifying_a_group_by_key_is_not_reported_as_a_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select visit_date, count(*) from stg_visits group by visit_date"
+    authored = "select s.visit_date, count(*) from stg_visits s group by s.visit_date"
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert unattr == []
+
+
+def test_a_real_group_by_change_is_reported_by_classify():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select visit_date, count(*) from stg_visits group by visit_date"
+    authored = (
+        "select s.visit_date, count(*) from stg_visits s "
+        "group by s.visit_date, s.channel"
+    )
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+    assert (
+        "the GROUP BY changed from (visit_date) to (s.visit_date, s.channel)"
+        in changes[0].detail
+    )
+
+
 def test_authoring_a_new_model_produces_no_findings_and_opens_nothing(
     attributable_project, plan_edit, capsys, monkeypatch
 ):

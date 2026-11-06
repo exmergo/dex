@@ -221,6 +221,12 @@ def test_group_by_reports_its_expressions_as_written():
     assert sql_shape.group_by(tree) == ["a"]
 
 
+def test_group_by_keys_drops_table_qualifiers_and_folds_case():
+    tree = _parse("select s.a, count(*) from t as s group by s.a, t.B")
+    assert sql_shape.group_by_keys(tree) == ["a", "b"]
+    assert sql_shape.group_by(tree) == ["s.a", "t.B"]
+
+
 def test_scopes_includes_set_operation_ctes():
     sql = (
         "with named as (select 1 as a), "
