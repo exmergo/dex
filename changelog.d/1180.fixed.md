@@ -1,0 +1,1 @@
+`transform plan` reports a failed dbt parse whole: the lines that continue the cause, such as the files named by a duplicate schema.yml entry, now reach the envelope, and a message cut at the length cap says so instead of ending silently.
