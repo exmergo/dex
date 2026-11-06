@@ -963,7 +963,9 @@ def test_mid_verify_budget_exhaustion_degrades_to_a_warning(
     # warning instead of the generic error it used to die with.
     from exmergo_dex_core.guards.cost_guard import OverCeilingError
 
-    def exhaust(adapter, relationships, *, timeout_seconds=None, progress=None):
+    def exhaust(
+        adapter, relationships, *, timeout_seconds=None, progress=None, withhold=False
+    ):
         relationships[0].verified = True
         raise OverCeilingError("drifted past the ceiling")
 

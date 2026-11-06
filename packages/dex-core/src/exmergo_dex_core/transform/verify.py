@@ -740,6 +740,10 @@ def _row_population(
     except CostGuardError:
         raise
     except Exception as exc:
+        # Imported here, not only in the listing handler above: an import in one
+        # `except` binds the name for the whole function, unbound on this path.
+        from ..envelope import failure_text
+
         return f"the row counts could not be read ({failure_text(exc)})"
 
     findings, finding_notes = verify_mod.row_population_findings(

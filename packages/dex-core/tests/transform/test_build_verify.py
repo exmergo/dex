@@ -1989,3 +1989,38 @@ def test_a_node_that_failed_on_a_cast_is_named_without_the_value(tmp_path: Path)
     (failed,) = [f for f in result.findings if f.code == "node_failed"]
     assert _SENTINEL not in failed.detail
     assert _MASKED in failed.detail
+
+
+def test_a_row_count_failure_that_escapes_the_counter_is_suppressed_masked(
+    tmp_path: Path, monkeypatch
+):
+    """A failure `relation_counts` does not catch itself (a pricing or guard
+    error) reaches the sweep's own handler, which names it masked (#1070)."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError(f"Bad int64 value: {_SENTINEL}")
+
+    monkeypatch.setattr(verify_mod, "relation_counts", refuse)
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.stg": {
+                "name": "stg",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.src",
+            }
+        },
+        results=[{"unique_id": "model.p.stg", "status": "success"}],
+    )
+    adapter = _StubAdapter([_Meta("wh.dbt_dev.stg"), _Meta("wh.raw.src")])
+    result = _sweep(tmp_path, _summary([_node("model.p.stg")]), adapter)
+    said = json.dumps({"w": result.warnings, "s": result.suppressed}, default=str)
+    assert _SENTINEL not in said
+    assert (
+        "the row counts could not be read "
+        "(RuntimeError: Bad int64 value: <value withheld>)" in said
+    )

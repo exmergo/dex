@@ -236,3 +236,17 @@ def test_failure_text_detail_only_is_the_server_words():
 def test_failure_text_still_redacts_secrets():
     exc = RuntimeError("could not connect: password=hunter2")
     assert "hunter2" not in failure_text(exc)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Parsing Error: The metric 'dnf_count' does not exist",
+        "Binder Error: Cannot compare values of type VARCHAR and type INTEGER - "
+        "an explicit cast is required on column 'k'",
+    ],
+)
+def test_a_bare_parse_or_cast_word_does_not_mask_identifiers(message):
+    """dbt's `Parsing Error` and a binder's cast hint quote names, not values."""
+
+    assert mask_values(message) == message

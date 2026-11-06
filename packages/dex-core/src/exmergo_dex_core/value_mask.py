@@ -99,10 +99,14 @@ _SHAPES: tuple[re.Pattern[str], ...] = tuple(
 # Words that mark a message as a conversion, parse or range failure, the family
 # that quotes its input. A message carrying one has every remaining quoted
 # segment masked.
+# Only phrases a value-quoting failure uses: a bare `parse` or `cast` also
+# appears in dbt's `Parsing Error` and in a binder's "explicit cast required",
+# whose quoted names are identifiers, not values.
 _CONVERSION_MARKER = re.compile(
-    r"convert|\bcast|pars(?:e|ing)|not recognized|invalid input|malformed|"
-    r"out of range|\bbad [\w ]+? value|invalid (?:digit|date|datetime|time|"
-    r"timestamp|numeric|boolean|format)",
+    r"conversion error|could not convert|(?:could not|cannot|can't|unable to) "
+    r"cast|cannot be cast|(?:could not|cannot|can't|failed to|unable to) parse|"
+    r"not recognized|invalid input|malformed|out of range|\bbad [\w ]+? value|"
+    r"invalid (?:digit|date|datetime|time|timestamp|numeric|boolean|format)",
     re.IGNORECASE,
 )
 _ANY_QUOTED = re.compile(_QUOTED)
