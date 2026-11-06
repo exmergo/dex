@@ -1047,6 +1047,11 @@ class Adapter(Protocol):
     - ``describe_query_free``: ``False`` where ``describe_query`` runs on paid
       compute (it can start a stopped warehouse), so a comparison prices first.
       Absent reads as free.
+    - ``table_columns(identifier)``: one object's columns, as
+      ``table_metadata`` returns them, without the exact row count. An adapter
+      whose ``table_metadata`` runs a ``COUNT(*)`` (DuckDB) offers it, so a
+      caller that needs only names and types does not scan the relation.
+      Absent, ``table_metadata`` answers from metadata alone.
     - ``column_schema(identifier)``: one relation's column tree as the
       connector's dbt adapter builds its columns from it (a list of
       ``{name, type, mode, fields}`` dicts), from free metadata. Planning hands

@@ -336,6 +336,8 @@ class BigQueryAdapter:
         """
 
         def spec(field: Any) -> dict:
+            """One field and its sub-fields, keeping only what dbt reads."""
+
             return {
                 "name": field.name,
                 "type": field.field_type,

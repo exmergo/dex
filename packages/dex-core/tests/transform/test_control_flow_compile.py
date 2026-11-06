@@ -842,3 +842,49 @@ def test_columns_broker_hands_over_a_column_tree_where_the_adapter_has_one():
     )
     answer = CompileQueries(engine).columns({"identifier": "t"})
     assert answer == {"columns": [["owner", "STRUCT"]], "schema": tree}
+
+
+def test_columns_broker_prefers_a_read_that_counts_no_rows():
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    def counting(identifier):
+        pytest.fail("a column listing must not count the relation's rows")
+
+    adapter = SimpleNamespace(
+        list_objects=lambda: [
+            SimpleNamespace(identifier="db.main.v", object_type="VIEW")
+        ],
+        table_metadata=counting,
+        table_columns=lambda i: [ColumnMeta("id", "INTEGER", True, 0)],
+    )
+    engine = SimpleNamespace(
+        config=SimpleNamespace(query=SimpleNamespace(max_statements=5)),
+        _adapter=lambda *a, **k: adapter,
+    )
+    assert CompileQueries(engine).columns({"identifier": "v"}) == {
+        "columns": [["id", "INTEGER"]]
+    }
+
+
+def test_duckdb_table_columns_reads_the_catalog_only(duckdb_file, monkeypatch):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter(str(duckdb_file))
+    statements = []
+    original = adapter._run_select
+
+    def recording(sql, *args, **kwargs):
+        statements.append(sql)
+        return original(sql, *args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_run_select", recording)
+    try:
+        identifier = next(
+            o.identifier for o in adapter.list_objects() if o.name == "customers"
+        )
+        statements.clear()
+        columns = adapter.table_columns(identifier)
+    finally:
+        adapter.close()
+    assert [c.name for c in columns] == ["id", "email"]
+    assert not any("count(" in sql.lower() for sql in statements)

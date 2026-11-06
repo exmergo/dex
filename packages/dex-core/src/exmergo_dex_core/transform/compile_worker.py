@@ -71,6 +71,8 @@ def dbt_columns(column, answer: dict) -> list:
         from google.cloud.bigquery import SchemaField
 
         def field(spec):
+            """One ``SchemaField``, its nested fields rebuilt recursively."""
+
             return SchemaField(
                 spec["name"],
                 spec["type"],
@@ -148,6 +150,8 @@ def main() -> int:
         """
 
         def columns(relation):
+            """The relation's columns, asked of the parent over the private channel."""
+
             identifier = getattr(relation, "identifier", None)
             if not identifier:
                 # A CTE or ephemeral relation has no warehouse object; dbt itself

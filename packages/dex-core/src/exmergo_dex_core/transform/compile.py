@@ -103,7 +103,14 @@ class CompileQueries:
             if note not in self.warnings:
                 self.warnings.append(note)
             return {"columns": []}
-        _meta, found = self.adapter.table_metadata(match)
+        # Columns alone where the adapter can read them without counting rows
+        # (DuckDB's table_metadata adds a COUNT(*), which scans a view); every
+        # other connector answers table_metadata from its metadata inventory.
+        columns_only = getattr(self.adapter, "table_columns", None)
+        if callable(columns_only):
+            found = columns_only(match)
+        else:
+            _meta, found = self.adapter.table_metadata(match)
         if match not in self.introspected:
             self.introspected.append(match)
             self.warnings.append(
