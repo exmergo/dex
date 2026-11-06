@@ -15,6 +15,7 @@ from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.row_attribution import (
     MAX_CHANGES_PER_MODEL,
     UnattributableError,
+    cache_resolver,
     classify,
     naming_resolver,
     render_model_sql,
@@ -842,7 +843,10 @@ def test_a_set_operation_beside_an_isolable_change_keeps_both():
     [
         ("{{ config(materialized='view') }}\nselect 1", "select 1"),
         ("select * from {{ ref('stg_orders') }}", "select * from stg_orders"),
-        ("select * from {{ source('raw', 'orders') }}", "select * from orders"),
+        # A source keeps its qualifier: the pair is what the resolver keys on,
+        # so a table `identifier` can be looked up instead of the logical name
+        # (#1158). A `ref()` needs no qualifier -- model names are unique.
+        ("select * from {{ source('raw', 'orders') }}", "select * from raw.orders"),
         ("select * from {{ ref('pkg', 'stg_orders') }}", "select * from stg_orders"),
     ],
 )
@@ -1208,3 +1212,119 @@ def test_an_over_ceiling_attribution_is_refused_and_confirm_cannot_override(
     envelope, _opened = metered_project(attribute_rows=True, confirm=True, budget=1)
     assert envelope.status.value == "error"
     assert "ceiling" in " ".join(envelope.errors).lower()
+
+
+# --- sources resolved by their declared relation (#1158) -------------------------
+
+
+def test_a_source_is_resolved_through_its_declared_relation():
+    """`source('feed', 'events')` over a table whose `identifier` is
+    `raw_events` resolves to the physical relation, not the logical name."""
+
+    cache = DexCache(datasets=[Dataset(identifier="analytics.main.raw_events")])
+    resolve = cache_resolver(cache, "duckdb", {("feed", "events"): "feed.raw_events"})
+    rendered = render_model_sql("select * from {{ source('feed', 'events') }}", resolve)
+    assert "raw_events" in rendered
+
+
+def test_an_unplaceable_source_refusal_names_the_physical_identifier():
+    cache = DexCache(datasets=[Dataset(identifier="elsewhere.main.other")])
+    resolve = cache_resolver(cache, "duckdb", {("feed", "events"): "feed.raw_events"})
+    with pytest.raises(UnattributableError) as excinfo:
+        render_model_sql("select * from {{ source('feed', 'events') }}", resolve)
+    assert "raw_events" in str(excinfo.value)
+    assert "explore profile raw_events" in str(excinfo.value)
+
+
+def test_a_source_without_a_declared_relation_keeps_the_name_lookup():
+    """No sources.yml entry: the written table name stays the lookup, as it
+    always was for a project whose sources dex cannot see."""
+
+    cache = DexCache(datasets=[Dataset(identifier="main.raw_orders")])
+    resolve = cache_resolver(cache, "duckdb", {})
+    rendered = render_model_sql(
+        "select * from {{ source('raw', 'raw_orders') }}", resolve
+    )
+    assert "raw_orders" in rendered
+
+
+def test_a_source_renamed_by_identifier_still_gets_its_rows_counted(tmp_path, capsys):
+    """The acceptance case from #1158, end to end on DuckDB: the cache holds
+    the table's identifier, so attribution must count the source rather than
+    report `unprofiled_input` under a name nothing on the warehouse carries."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "shop.duckdb"
+    conn = duckdb.connect(str(warehouse))
+    conn.execute("CREATE TABLE raw_events (id INTEGER, kind VARCHAR, amount DOUBLE)")
+    conn.execute(
+        "INSERT INTO raw_events VALUES (1, 'a', 1.0), (2, 'b', 2.0), (3, 'a', 3.0)"
+    )
+    conn.close()
+
+    project = tmp_path / "analytics"
+    (project / "models" / "marts").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (project / "profiles.yml").write_text(
+        "shop:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "marts" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: feed\n    tables:\n"
+        "      - name: events\n        identifier: raw_events\n",
+        encoding="utf-8",
+    )
+    model_path = "models/marts/fct_events.sql"
+    prior = (
+        "{{ config(materialized='table') }}\n"
+        "select id, amount from {{ source('feed', 'events') }}\n"
+        "where kind != 'a'\n"
+    )
+    (project / model_path).write_text(prior, encoding="utf-8")
+
+    rc = main(
+        [
+            "explore",
+            "map",
+            "--full",
+            "--connector",
+            "duckdb",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(tmp_path),
+        ]
+    )
+    capsys.readouterr()
+    assert rc == 0, "the fixture's exploration cache must build"
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": model_path,
+                        "kind": "model_sql",
+                        "content": prior.replace("kind != 'a'", "kind = 'a'"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = _attribution(_plan(tmp_path, warehouse, payload, capsys))
+    assert model["changes"], model["changes"]
+    assert not any(
+        "unprofiled_input" in (change.get("reason") or "")
+        for change in model["changes"]
+    ), model["changes"]
+    assert any(change["attributed"] is True for change in model["changes"]), model[
+        "changes"
+    ]
+    assert model["baseline_rows"] is not None

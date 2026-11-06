@@ -38,7 +38,7 @@ from sqlglot import expressions as exp
 from .. import sql_shape
 from ..adapters import get_dialect, is_free_connector
 from ..cache import DexCache, match_identifier
-from ..dbt_project import EditOp, jinja_regions
+from ..dbt_project import EditOp, declared_source_relations, jinja_regions
 from ..dbt_project import load as load_project
 from ..errors import DexError
 from ..guards.query_firewall import QueryRefusedError, inspect_query
@@ -187,11 +187,22 @@ def naming_resolver(name: str) -> str:
     return name
 
 
-def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
+def cache_resolver(
+    cache: DexCache | None,
+    dialect: str,
+    source_relations: Mapping[tuple[str, str], str] | None = None,
+) -> Resolver:
     """Resolve through the same :func:`~..cache.match_identifier` the query
     firewall and ``explore profile`` use, so nothing here reimplements dbt's own
     resolution and a name dex cannot place fails the way it fails everywhere
-    else."""
+    else.
+
+    ``source_relations`` is what the project declares its sources resolve to
+    (``declared_source_relations``). A ``source()`` key is looked up there first,
+    because a source's table ``identifier`` -- not its logical name -- is what
+    the warehouse holds; the written table name stays the fallback, and both are
+    tried before a key counts as unplaceable. The bare identifier is what the
+    refusal names, since it is what ``explore profile`` can be pointed at."""
 
     known = [d.identifier for d in cache.datasets] if cache is not None else []
 
@@ -201,15 +212,33 @@ def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
                 f"there is no exploration cache, so '{name}' cannot be resolved to "
                 "a warehouse relation; run `explore map` first"
             )
-        matches = match_identifier(name, known)
+        # The dotted key order is most-literal first: the declared relation as
+        # written, then its bare object name. `ref()` keys carry no dot and fall
+        # straight through to the written model name.
+        targets: list[str] = []
+        relation = None
+        if "." in name:
+            relation = (source_relations or {}).get(tuple(name.split(".", 1)))
+        if relation:
+            targets.append(relation)
+            targets.append(relation.rsplit(".", 1)[-1])
+        else:
+            targets.append(name.rsplit(".", 1)[-1])
+        matches: list[str] = []
+        for target in targets:
+            matches = match_identifier(target, known)
+            if matches:
+                break
         if not matches:
+            looked_for = targets[-1]
             raise UnattributableError(
-                f"'{name}' is not in the exploration cache, so the rows it "
-                f"contributes cannot be counted; run `explore profile {name}` first"
+                f"'{looked_for}' is not in the exploration cache, so the rows it "
+                "contributes cannot be counted; run "
+                f"`explore profile {looked_for}` first"
             )
         if len(matches) > 1:
             raise UnattributableError(
-                f"'{name}' is ambiguous in the exploration cache "
+                f"'{targets[-1]}' is ambiguous in the exploration cache "
                 f"({', '.join(matches)}); qualify it in the model"
             )
         return exp.to_table(matches[0]).sql(dialect=dialect, identify=True)
@@ -272,9 +301,7 @@ def render_model_sql(
                 f"the model calls {{{{ {_clip(region.body.strip())} }}}}, which "
                 "only dbt can render; dex cannot isolate a change against it"
             )
-        # ref('pkg', 'model') and source('name', 'table') both name the relation
-        # last, so the trailing argument is the one to resolve either way. A
-        # non-literal there (`ref(var('x'))`) is a name only dbt knows, and
+        # A non-literal argument (`ref(var('x'))`) is a name only dbt knows, and
         # resolving the var's own argument instead would silently attribute the
         # delta to whichever relation that string happens to name.
         if not call.args or call.args[-1] is None or None in call.args:
@@ -282,7 +309,15 @@ def render_model_sql(
                 f"could not read a relation name out of "
                 f"{{{{ {_clip(region.body.strip())} }}}}"
             )
-        rendered.append(resolve(call.args[-1]))
+        # ref('pkg', 'model') names the model last. A source names its table the
+        # same way, but the pair is the key: a source's physical relation can
+        # differ from its logical name and from the table's own (a table
+        # `identifier`), and only the project knows which. `source()` always has
+        # exactly two literal arguments here, both checked above.
+        if call.callee == "source" and len(call.args) >= 2:
+            rendered.append(resolve(f"{call.args[0]}.{call.args[-1]}"))
+        else:
+            rendered.append(resolve(call.args[-1]))
     rendered.append(text[cursor:])
 
     joined = "".join(rendered).strip()
@@ -979,7 +1014,9 @@ def attribute(
     # reading the same SQL. The cache is loaded only when counting, so the
     # named-only path stays free of both the store read and the connection.
     resolver = (
-        cache_resolver(readable_cache(engine.store), dialect)
+        cache_resolver(
+            readable_cache(engine.store), dialect, declared_source_relations(view)
+        )
         if counting
         else naming_resolver
     )

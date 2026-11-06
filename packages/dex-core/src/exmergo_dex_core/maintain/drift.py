@@ -370,9 +370,13 @@ def schema_drift(
             else None
         )
         for source in snap.transform_layer.sources:
-            if scoped_tables is not None and source.table.lower() not in scoped_tables:
+            # The warehouse holds the table's `identifier` when the declaration
+            # renames it; matching the logical name instead reports a live table
+            # as dangling and points the analyst at a name nothing can rename.
+            looked_for = source.identifier or source.table
+            if scoped_tables is not None and looked_for.lower() not in scoped_tables:
                 continue
-            if not match_identifier(source.table, current_identifiers):
+            if not match_identifier(looked_for, current_identifiers):
                 findings.append(
                     DriftFinding(
                         axis="schema",
@@ -381,6 +385,10 @@ def schema_drift(
                         severity="high",
                         detail=(
                             f"declared source {source.source_name}.{source.table} "
+                            f"(physical name {looked_for}) has no matching "
+                            "warehouse object"
+                            if source.identifier
+                            else f"declared source {source.source_name}.{source.table} "
                             "has no matching warehouse object"
                         ),
                         # The key is omitted rather than null when the format has

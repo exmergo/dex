@@ -126,6 +126,10 @@ class SourceTable(BaseModel):
     source_name: str
     schema_name: str | None = None
     table: str
+    #: The table's physical ``identifier`` when the declaration renames it, so
+    #: ``dangling_source`` matches the object the warehouse actually holds.
+    #: ``None`` means the declaration does not rename it, not "named None".
+    identifier: str | None = None
     columns: list[str] = Field(default_factory=list)
     path: str | None = None
 
@@ -495,6 +499,12 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
                         source_name=src["name"],
                         schema_name=src.get("schema"),
                         table=table["name"],
+                        identifier=(
+                            table["identifier"]
+                            if isinstance(table.get("identifier"), str)
+                            and table["identifier"]
+                            else None
+                        ),
                         columns=[
                             col["name"]
                             for col in table.get("columns") or []

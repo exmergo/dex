@@ -374,6 +374,43 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
     )
 
 
+def declared_source_relations(view: DbtProjectView) -> dict[tuple[str, str], str]:
+    """``(source, table)`` -> the dotted relation it declares, for every source
+    the project's YAML declares. dbt's own defaults apply: ``schema`` is the
+    source's name when unset, and a table's ``identifier`` overrides its name.
+    A file that does not parse declares nothing here.
+
+    The manifest's own ``relation_name`` map is exact and wins when one is
+    available (``ProjectDefinitions.source_relations``); this is the same mapping
+    derived from the authored files, for the paths that run without a compiled
+    artifact -- which is every path that counts rows, since `explore map` needs
+    no manifest."""
+
+    relations: dict[tuple[str, str], str] = {}
+    for path, file in view.files.items():
+        if not path.endswith((".yml", ".yaml")) or "sources:" not in file.content:
+            continue
+        try:
+            doc = yaml.safe_load(file.content) or {}
+        except yaml.YAMLError:
+            continue
+        for source in doc.get("sources") or [] if isinstance(doc, dict) else []:
+            if not isinstance(source, dict) or not source.get("name"):
+                continue
+            name = str(source["name"])
+            schema = str(source.get("schema") or name)
+            database = source.get("database")
+            for table in source.get("tables") or []:
+                if not isinstance(table, dict) or not table.get("name"):
+                    continue
+                identifier = str(table.get("identifier") or table["name"])
+                parts = [str(database)] if database else []
+                relations[(name, str(table["name"]))] = ".".join(
+                    [*parts, schema, identifier]
+                )
+    return relations
+
+
 def _project_vars(raw: dict[str, Any], project_name: str) -> dict[str, Any]:
     """Static ``vars:`` declared in ``dbt_project.yml`` for ``project_name``.
 

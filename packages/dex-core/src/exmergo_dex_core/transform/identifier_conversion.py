@@ -42,7 +42,7 @@ from sqlglot import expressions as exp
 from .. import sql_shape
 from ..adapters import get_dialect
 from ..cache import DexCache, match_identifier
-from ..dbt_project import EditOp
+from ..dbt_project import EditOp, declared_source_relations
 from ..storage import readable_cache
 from .plans import EditKind
 from .row_attribution import (
@@ -1202,7 +1202,11 @@ def diagnose(
     dialect = get_dialect(connector)
     cache = readable_cache(engine.store) if counting else None
     detection_cache = cache if cache is not None else readable_cache(engine.store)
-    resolver = cache_resolver(cache, dialect) if counting else naming_resolver
+    resolver = (
+        cache_resolver(cache, dialect, declared_source_relations(view))
+        if counting
+        else naming_resolver
+    )
     total = 0
     for edit in edits:
         if edit.kind is not EditKind.MODEL_SQL or edit.op is not EditOp.UPSERT:

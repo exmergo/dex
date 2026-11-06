@@ -144,6 +144,25 @@ def test_a_host_supplied_pathless_baseline_omits_declared_in_and_carries_its_not
     ), payload["warnings"]
 
 
+def test_a_renamed_source_is_not_dangling_while_its_table_exists(maintain_repo):
+    """A source whose declaration gives the table an `identifier` names the
+    physical object the warehouse holds; matching the logical name instead
+    reports a live table as dangling and points at a name nothing can rename
+    (#1158)."""
+
+    maintain_repo.snapshot()
+    store = FilesystemStore(maintain_repo.root)
+    snap = store.load_snapshot()
+    snap.transform_layer = TransformLayer(
+        models=[],
+        sources=[SourceTable(source_name="raw", table="events", identifier="orders")],
+    )
+    store.save_snapshot(snap)
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    assert "dangling_source" not in _by_code(payload)
+
+
 def test_new_table_is_reported_added(maintain_repo):
     maintain_repo.snapshot()
     maintain_repo.sql("CREATE TABLE payments (id INTEGER, amount DOUBLE)")
