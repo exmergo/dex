@@ -218,3 +218,27 @@ def test_a_live_cube_serving_an_edited_model_is_refused_as_stale(
 
     assert envelope["reason"] == "guard", envelope
     assert "orders.revenue has different SQL there" in envelope["errors"][0]
+
+
+def test_a_live_cube_enforces_dex_scopes_and_refuses_load():
+    """The server was started mounting scripts/cube/cube.js; its contextToApiScopes
+    restricts endpoints to the token's dex_scopes, so /v1/load returns 403 (#971)."""
+
+    import httpx
+
+    from exmergo_dex_core.cube.transport import mint_token
+
+    url = os.environ["DEX_TEST_CUBE_URL_DUCKDB"]
+    token = mint_token(os.environ["CUBEJS_API_SECRET"])
+    headers = {"Authorization": token}
+
+    meta = httpx.get(f"{url}/v1/meta", headers=headers, timeout=10.0)
+    assert meta.status_code == 200
+
+    load = httpx.post(
+        f"{url}/v1/load",
+        headers=headers,
+        json={"query": {"measures": ["orders.count"]}},
+        timeout=10.0,
+    )
+    assert load.status_code == 403

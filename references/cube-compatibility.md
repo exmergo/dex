@@ -338,7 +338,17 @@ name in `DEX_CUBE_ALLOWED_HOSTS`, over https, because the URL comes from a
 committed file and the secret is yours. The token claims `dex_scopes: [meta,
 sql]`; Cube enforces API scopes only through the deployment's own
 `contextToApiScopes`, so on a default server the claim restricts nothing, and
-what binds is that Dex calls nothing else.
+what binds is that Dex calls nothing else. A deployment that wants Cube to
+enforce the claim can adopt `scripts/cube/cube.js`:
+
+```js
+module.exports = {
+  contextToApiScopes: async (ctx, defaults) => ctx.securityContext.dex_scopes ?? defaults,
+};
+```
+
+On a server running this configuration, `/v1/load` is refused with a 403 to Dex's
+token while `/v1/meta` and `/v1/sql` remain accessible.
 
 ### What this release does not do
 
