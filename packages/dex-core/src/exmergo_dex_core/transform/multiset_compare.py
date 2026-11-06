@@ -1016,6 +1016,8 @@ def _project(
 
 
 def _comparison_expression(name: str, comparison_type: str | None, dialect: str) -> str:
+    """Render a column using its adapter-required comparison representation."""
+
     column = _quote(name, dialect)
     if comparison_type == "text" and dialect == "postgres":
         return f'({column}::text COLLATE "C")'
