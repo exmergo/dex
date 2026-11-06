@@ -4132,6 +4132,123 @@ def test_maintain_verify_target_dev_reads_dev_namespace(tmp_path: Path):
     assert data_dev["judged_namespace"] == "dbt_dev"
 
 
+def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
+    tmp_path: Path,
+):
+    """#1155: a declared parent that is a package seed built into
+    ``<dev schema>_<name>`` (a package's ``+schema``) is read by
+    ``maintain verify --target dev`` and judged, not reported unbuilt."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+    from exmergo_dex_core.config import DexConfig, PostgresTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.storage import MemoryStore
+
+    def meta(schema: str, name: str) -> ObjectMeta:
+        return ObjectMeta(
+            identifier=f"dexdb.{schema}.{name}",
+            object_type="table",
+            schema=schema,
+            name=name,
+            row_count=4,
+            byte_size=1024,
+            column_count=1,
+        )
+
+    class _DevAdapter:
+        name = "postgres"
+        dialect = "postgres"
+        paradigm = Paradigm.DB_LOAD
+        cost_gate = None
+        target = PostgresTarget(schemas=["shop"], dev_schema="dbt_dev")
+
+        def __init__(self):
+            self.reads: list = []
+
+        def read_dev_target(self, scope) -> None:
+            self.reads.append(scope)
+
+        def _namespaces(self) -> set[str]:
+            scope = self.reads[-1] if self.reads else None
+            return {scope} if isinstance(scope, str) else set(scope or ())
+
+        def list_objects(self, *, include_views: bool = True):
+            objects = [meta("shop", "customers")]
+            if "dbt_dev" in self._namespaces():
+                objects.append(meta("dbt_dev", "threads"))
+            if "dbt_dev_inbox" in self._namespaces():
+                objects.append(meta("dbt_dev_inbox", "inbox_states"))
+            return objects
+
+        def table_metadata(self, identifier: str):
+            return (
+                meta(*identifier.split(".")[1:]),
+                [ColumnMeta(name="state", data_type="text", nullable=False, ordinal=1)],
+            )
+
+        def exact_distinct_counts(self, identifier: str, columns: list[str]):
+            return dict.fromkeys(columns, 4)
+
+        def distinct_combination_counts(self, identifier, combinations):
+            return {tuple(c): 4 for c in combinations}
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    (project_dir / "dbt_project.yml").write_text("name: test_proj\nversion: '1.0'\n")
+    parent = {"model": "inbox_states", "key": {"state": "state"}}
+    _write_artifacts(
+        project_dir,
+        nodes={
+            "model.test_proj.threads": {
+                "name": "threads",
+                "resource_type": "model",
+                "relation_name": '"dexdb"."dbt_dev"."threads"',
+                "config": {"meta": {"dex": {"population": {"parent": parent}}}},
+                "columns": {"state": {"name": "state", "data_type": "text"}},
+            },
+            "seed.tiny_inbox.inbox_states": {
+                "name": "inbox_states",
+                "resource_type": "seed",
+                "package_name": "tiny_inbox",
+                "relation_name": '"dexdb"."dbt_dev_inbox"."inbox_states"',
+            },
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+    adapter = _DevAdapter()
+    config = DexConfig(
+        connector="postgres",
+        dbt_project_dir=str(project_dir),
+        postgres=PostgresTarget(schemas=["shop"], dev_schema="dbt_dev"),
+    )
+    engine = DexEngine(config=config, store=MemoryStore(), repo_root=str(tmp_path))
+    engine._adapter_instance = adapter
+
+    result = maintain_cmds.verify(engine, target="dev")
+
+    assert adapter.reads[-1] == ["dbt_dev", "dbt_dev_inbox"], adapter.reads
+    assert any("dbt_dev_inbox" in note for note in result.notes)
+    unbuilt = [
+        reason
+        for reason in [
+            result.suppressed.get("parent_population", ""),
+            *(
+                r.get("reason") or ""
+                for r in result.data().get("parent_population") or []
+            ),
+        ]
+        if "was not built" in reason
+    ]
+    assert unbuilt == [], unbuilt
+    records = result.data().get("parent_population") or []
+    assert [r["parent_relation"] for r in records] == [
+        "dexdb.dbt_dev_inbox.inbox_states"
+    ]
+
+
 def test_a_model_whose_final_cte_is_a_union_is_unfollowable_not_unbuilt(tmp_path: Path):
     sql = (
         'with named as (select * from "wh"."main"."named"), '
