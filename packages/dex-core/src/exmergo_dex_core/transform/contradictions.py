@@ -507,9 +507,10 @@ def _unsettled(
             continue
         if graph.node_kind(driver) is None and graph.package_node_kind(driver) is None:
             return (
-                f"'{driver}' is not defined in this project or an installed package "
-                "(packages not installed yet, or a name nothing defines), so its "
-                "lineage cannot be read"
+                f"'{driver}' is not a SQL model of this project or an installed "
+                "package (a Python model, a versioned model's base name, packages "
+                "not installed yet, or a name nothing defines), so its lineage "
+                "cannot be read"
             )
         lineage |= graph.ancestors_of(driver)
     stems = _lowered(lineage)

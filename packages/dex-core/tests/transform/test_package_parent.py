@@ -646,19 +646,64 @@ def test_an_install_path_outside_the_project_is_read_for_lineage(
         assert "union_data" in found["reason"]
 
 
+LINKED_PARTS = (
+    "select p.part_id, p.conversation_id\n"
+    "from {{ source('inbox', 'conversation_part_history') }} p\n"
+    "join {{ ref('stg_inbox__conversations') }} c using (conversation_id)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            {
+                "models/overrides/stg_inbox__conversation_parts.py": (
+                    "def model(dbt, session):\n"
+                    "    return dbt.source('inbox', 'conversation_part_history')\n"
+                )
+            },
+            id="python-model",
+        ),
+        pytest.param(
+            {
+                "models/overrides/stg_inbox__conversation_parts_v1.sql": PARTS,
+                "models/overrides/_parts.yml": (
+                    "version: 2\nmodels:\n  - name: stg_inbox__conversation_parts\n"
+                    "    latest_version: 1\n    versions:\n      - v: 1\n"
+                ),
+            },
+            id="versioned-model",
+        ),
+    ],
+)
+def test_a_project_override_dex_cannot_read_still_shadows_the_package(
+    tmp_path, override
+):
+    """A Python or versioned project model of the package model's name shadows
+    it too: the package file's lineage to the parent is not the project's, so
+    the check cannot hold on it and reads ``unchecked``."""
+
+    root = _project(tmp_path / "p", parts=LINKED_PARTS, extra=override)
+
+    index = ReferenceIndex(load_project(root))
+    assert index.package_node_kind("stg_inbox__conversation_parts") is None
+    assert "stg_inbox__conversations" not in index.ancestors_of(
+        "stg_inbox__conversation_parts"
+    )
+    [found] = _parent_rows(root, FROM_PARTS)
+    assert found["status"] == "unchecked"
+    assert "stg_inbox__conversation_parts" in found["reason"]
+
+
 def test_a_shadowed_package_models_lineage_is_not_the_overrides(tmp_path):
     """A project override replaces the package model: the disabled package
     file's ``ref()`` to the parent links nothing, so a mart driven from the
     override, which reads only a source, still contradicts the parent."""
 
-    linked = (
-        "select p.part_id, p.conversation_id\n"
-        "from {{ source('inbox', 'conversation_part_history') }} p\n"
-        "join {{ ref('stg_inbox__conversations') }} c using (conversation_id)\n"
-    )
     root = _project(
         tmp_path / "p",
-        parts=linked,
+        parts=LINKED_PARTS,
         project_extra=(
             "models:\n  tiny_inbox:\n    stg_inbox__conversation_parts:\n"
             "      +enabled: false\n"

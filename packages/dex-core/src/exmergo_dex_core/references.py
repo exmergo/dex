@@ -312,7 +312,10 @@ class ReferenceIndex:
                     reference.package is None
                     # A package file reads for the project only where the
                     # project does not shadow the model it defines.
-                    or (packages and node_name(reference.path) not in self._node_kinds)
+                    or (
+                        packages
+                        and not self._project_defines(node_name(reference.path))
+                    )
                 )
             )
         return sorted(paths)
@@ -386,9 +389,26 @@ class ReferenceIndex:
         source = node_name(path)
         if source == target:
             return
-        if package is not None and source in self._node_kinds:
+        if package is not None and self._project_defines(source):
             return
         self._model_refs[source].add(target)
+
+    def _project_defines(self, name: str) -> bool:
+        """Whether this project, rather than an installed package, defines the
+        node ``name``: a model, seed or snapshot file, or a Python model, a
+        versioned model's base name or a snapshot declared in YAML (#1155).
+
+        A package model of that name is then shadowed, so it is no node dbt
+        builds, and nothing it reads or ``ref()``s is the project's lineage.
+        """
+
+        if name in self._node_kinds:
+            return True
+        return any(
+            reference.package is None
+            for kind in ("model", "seed", "snapshot")
+            for reference in self._declared.get((kind, name), ())
+        )
 
     def package_node_kind(self, node: str) -> tuple[str, str] | None:
         """``(kind, package)`` for a node only an installed package defines.
@@ -396,11 +416,12 @@ class ReferenceIndex:
         The counterpart of :meth:`node_kind` for a lineage question (#1155): a
         packaged model is no node dex edits, but it is one the project reads, so
         its ``ref()`` edges are walked the same way. ``None`` where the project
-        defines the name itself (its override wins) or nothing does, and always
-        when the index was built without scanning packages.
+        defines the name itself (its override wins, a Python model or a versioned
+        base name included) or nothing does, and always when the index was built
+        without scanning packages.
         """
 
-        if node in self._node_kinds:
+        if self._project_defines(node):
             return None
         for kind in ("model", "seed", "snapshot"):
             for reference in self.definitions_of(node, kind):

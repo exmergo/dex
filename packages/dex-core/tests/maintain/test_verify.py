@@ -4167,6 +4167,7 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
 
         def __init__(self):
             self.reads: list = []
+            self.probes: list[str] = []
 
         def read_dev_target(self, scope) -> None:
             self.reads.append(scope)
@@ -4203,6 +4204,7 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
 
             if "dex_parents_present" not in sql:
                 raise RuntimeError("only the parent probe is answered here")
+            self.probes.append(sql)
             counts = {
                 "dex_out_rows": 4,
                 "dex_out_keys": 4,
@@ -4268,6 +4270,10 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
         if "was not built" in reason
     ]
     assert unbuilt == [], unbuilt
+    [probe] = adapter.probes
+    normalized = probe.replace('"', "").lower()
+    assert "dexdb.dbt_dev.threads" in normalized, probe
+    assert "dexdb.dbt_dev_inbox.inbox_states" in normalized, probe
     [record] = result.data().get("parent_population") or []
     assert record["parent_relation"] == "dexdb.dbt_dev_inbox.inbox_states"
     assert record["status"] == "satisfied", record
