@@ -308,7 +308,12 @@ class ReferenceIndex:
                 reference.path
                 for reference in references
                 if reference.form in ("ref_call", "source_call")
-                and (packages or reference.package is None)
+                and (
+                    reference.package is None
+                    # A package file reads for the project only where the
+                    # project does not shadow the model it defines.
+                    or (packages and node_name(reference.path) not in self._node_kinds)
+                )
             )
         return sorted(paths)
 
@@ -367,6 +372,23 @@ class ReferenceIndex:
         """
 
         return self._node_kinds.get(node)
+
+    def _add_edge(self, path: str, target: str, *, package: str | None) -> None:
+        """Record that the node ``path`` defines reads ``target`` through ``ref()``.
+
+        A package model the project shadows with its own of the same name is
+        not the node dbt builds (#1155): its edges would otherwise merge into
+        the project's node, which is keyed by the same name, and claim lineage
+        the project's SQL never states. The project is scanned first, so its
+        nodes are known by the time a package's are read.
+        """
+
+        source = node_name(path)
+        if source == target:
+            return
+        if package is not None and source in self._node_kinds:
+            return
+        self._model_refs[source].add(target)
 
     def package_node_kind(self, node: str) -> tuple[str, str] | None:
         """``(kind, package)`` for a node only an installed package defines.
@@ -611,8 +633,8 @@ class ReferenceIndex:
                     qualifier=args[0] if target and len(args) > 1 else None,
                 )
             )
-            if target and node_name(path) != target:
-                self._model_refs[node_name(path)].add(target)
+            if target:
+                self._add_edge(path, target, package=package)
             return
         resolved = len(args) >= 2 and None not in args[-2:]
         self._record(
@@ -715,8 +737,8 @@ class ReferenceIndex:
                     qualifier=call.args[0] if target and len(call.args) > 1 else None,
                 )
             )
-            if target and node_name(path) != target:
-                self._model_refs[node_name(path)].add(target)
+            if target:
+                self._add_edge(path, target, package=package)
             return
         if call.callee == "source":
             resolved = len(call.args) >= 2 and None not in call.args[-2:]

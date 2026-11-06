@@ -868,6 +868,7 @@ def _package_lookup(
     seen: dict[str, str | None] = {}
 
     def lookup(name: str) -> str | None:
+        """The package that builds ``name``, or ``None``; remembered per name."""
         if name not in seen:
             found = find_package_target(
                 view.root, name, project_yml=text, manifest=view.manifest

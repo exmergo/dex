@@ -329,11 +329,13 @@ def verify_build(
     read: list[list[str]] = []
 
     def relations() -> list[str]:
+        """The manifest's relations, read once per sweep."""
         if not read:
             read.append(_manifest_relations(project_dir))
         return read[0]
 
     def resolve_adapter() -> Adapter:
+        """The adapter, reading the dev namespace and its derived ones."""
         adapter = opener()
         _widen_dev_reads(engine, adapter, relations, result)
         return adapter

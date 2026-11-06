@@ -1476,6 +1476,7 @@ def test_a_declared_parts_parent_is_graded_wrong(tmp_path):
     task, fixture, workspace = _reference(tmp_path, "package_parent/build_threads")
 
     def swap(doc):
+        """Declare the parts table as the mart's parent."""
         population = doc["models"][0]["config"]["meta"]["dex"]["population"]
         population["parent"]["model"] = "stg_inbox__conversation_parts"
 

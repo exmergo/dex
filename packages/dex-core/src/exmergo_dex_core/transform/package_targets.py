@@ -97,6 +97,7 @@ def _in_package(
     project_yml: str | None,
     manifest: Mapping[str, Any] | None,
 ) -> PackageTarget | None:
+    """The node called ``name`` in one installed package, or ``None``."""
     from ..dbt_project import DbtProjectError
     from ..dbt_project import load as load_project
     from .native_population_parent import (
@@ -112,6 +113,7 @@ def _in_package(
     files = {path: source.content for path, source in view.files.items()}
 
     def shown(relative: str) -> str:
+        """A package file's path, relative to the project where it can be."""
         absolute = directory / relative
         try:
             return absolute.relative_to(project).as_posix()
@@ -183,6 +185,7 @@ def _in_package(
 def _seed_path(
     files: Mapping[str, str], seed_paths: list[str], name: str
 ) -> str | None:
+    """The seed CSV called ``name`` under the package's seed paths."""
     roots = [Path(p) for p in seed_paths]
     for path in sorted(files):
         candidate = Path(path)
@@ -196,6 +199,7 @@ def _seed_path(
 
 
 def _csv_header(text: str) -> frozenset[str] | None:
+    """A seed's lowercased column names, from its header row."""
     with contextlib.suppress(csv.Error, StopIteration):
         row = next(csv.reader(io.StringIO(text)))
         names = [c.strip().lower() for c in row if c.strip()]

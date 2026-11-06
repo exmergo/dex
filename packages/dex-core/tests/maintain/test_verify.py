@@ -4147,6 +4147,7 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
     from exmergo_dex_core.storage import MemoryStore
 
     def meta(schema: str, name: str) -> ObjectMeta:
+        """Metadata for one built table."""
         return ObjectMeta(
             identifier=f"dexdb.{schema}.{name}",
             object_type="table",
@@ -4171,6 +4172,7 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
             self.reads.append(scope)
 
         def _namespaces(self) -> set[str]:
+            """The dev namespaces the last command asked to read."""
             scope = self.reads[-1] if self.reads else None
             return {scope} if isinstance(scope, str) else set(scope or ())
 
@@ -4193,6 +4195,29 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
 
         def distinct_combination_counts(self, identifier, combinations):
             return {tuple(c): 4 for c in combinations}
+
+        def run_query(self, sql: str, *, max_rows: int, timeout_seconds=None):
+            """Answer the parent probe: four parents, every one present."""
+
+            from exmergo_dex_core.adapters.base import QueryResult
+
+            if "dex_parents_present" not in sql:
+                raise RuntimeError("only the parent probe is answered here")
+            counts = {
+                "dex_out_rows": 4,
+                "dex_out_keys": 4,
+                "dex_out_null": 0,
+                "dex_out_known": 4,
+                "dex_parent_keys": 4,
+                "dex_eligible_parents": 4,
+                "dex_parents_present": 4,
+            }
+            return QueryResult(
+                columns=list(counts),
+                types=["integer"] * len(counts),
+                cells=[list(counts.values())],
+                truncated=False,
+            )
 
     project_dir = tmp_path / "project"
     project_dir.mkdir(parents=True)
@@ -4243,10 +4268,13 @@ def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
         if "was not built" in reason
     ]
     assert unbuilt == [], unbuilt
-    records = result.data().get("parent_population") or []
-    assert [r["parent_relation"] for r in records] == [
-        "dexdb.dbt_dev_inbox.inbox_states"
-    ]
+    [record] = result.data().get("parent_population") or []
+    assert record["parent_relation"] == "dexdb.dbt_dev_inbox.inbox_states"
+    assert record["status"] == "satisfied", record
+    assert "reason" not in record
+    assert record["measured"]["missing_parents"] == 0
+    assert record["measured"]["unexpected_keys"] == 0
+    assert record["measured"]["coverage"] == 1.0
 
 
 def test_a_model_whose_final_cte_is_a_union_is_unfollowable_not_unbuilt(tmp_path: Path):

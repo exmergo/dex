@@ -111,11 +111,13 @@ def project(tmp_path, monkeypatch):
 
 
 def _dex(capsys, *argv: str) -> dict:
+    """Run the CLI and return its envelope."""
     main(list(argv))
     return json.loads(capsys.readouterr().out)
 
 
 def _plan(capsys, root: Path, sql: str) -> dict:
+    """Plan the threads mart with ``sql``, declaring the package parent."""
     payload = {
         "edits": [
             {
@@ -157,6 +159,7 @@ def _plan(capsys, root: Path, sql: str) -> dict:
 
 
 def _parent_rows(planned: dict) -> list[dict]:
+    """The population_parent contradictions on a plan envelope."""
     entry = planned["data"]["declarations"]["inbox__threads"]
     return [
         c
@@ -166,6 +169,7 @@ def _parent_rows(planned: dict) -> list[dict]:
 
 
 def _build(capsys, plan_id: str) -> dict:
+    """Build the plan on dev with --verify."""
     return _dex(
         capsys,
         "transform",
@@ -179,6 +183,7 @@ def _build(capsys, plan_id: str) -> dict:
 
 
 def test_a_package_parent_is_planned_built_and_verified(project, capsys):
+    """Plan, apply, build twice: the wrong driver contradicts, the right holds."""
     assert _dex(capsys, "transform", "deps")["status"] == "ok"
     assert _dex(capsys, "transform", "build", "--target", "dev")["status"] == "ok"
     installed = sorted(

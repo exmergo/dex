@@ -107,6 +107,7 @@ def _declare(root: Path, declaration: dict) -> tuple[str, list[str]]:
 
 
 def _parent(model: str = "stg_inbox__conversations", **key: str) -> dict:
+    """A threads declaration whose population.parent is ``model``."""
     return {
         "model": "inbox__threads",
         "grain": ["conversation_id"],
@@ -121,6 +122,7 @@ def _parent(model: str = "stg_inbox__conversations", **key: str) -> dict:
 
 
 def _snapshot(root: Path) -> dict[str, str]:
+    """Every installed package file, by path, to compare before and after."""
     package = root / "dbt_packages"
     return {
         p.relative_to(root).as_posix(): p.read_text()
@@ -133,6 +135,7 @@ def _snapshot(root: Path) -> dict[str, str]:
 
 
 def test_a_package_model_is_accepted_as_population_parent(tmp_path):
+    """A package model is a parent; only the project's YAML is written."""
     root = _project(tmp_path / "p")
     before = _snapshot(root)
 
@@ -150,6 +153,7 @@ def test_a_package_model_is_accepted_as_population_parent(tmp_path):
 
 
 def test_a_package_model_is_accepted_as_a_column_reference(tmp_path):
+    """A package model is a reference, rendered as a relationships test to it."""
     root = _project(tmp_path / "p")
 
     content, _ = _declare(
@@ -174,6 +178,7 @@ def test_a_package_model_is_accepted_as_a_column_reference(tmp_path):
 
 
 def test_a_package_seed_is_accepted_and_its_header_checked(tmp_path):
+    """A package seed is a reference target, checked against its CSV header."""
     root = _project(tmp_path / "p")
     declaration = {
         "model": "inbox__threads",
@@ -190,6 +195,7 @@ def test_a_package_seed_is_accepted_and_its_header_checked(tmp_path):
 
 
 def test_a_column_the_package_model_lacks_is_refused_naming_the_package(tmp_path):
+    """A parent column the package model lacks is refused, naming it."""
     root = _project(tmp_path / "p")
 
     with pytest.raises(DeclarationError) as raised:
@@ -202,6 +208,7 @@ def test_a_column_the_package_model_lacks_is_refused_naming_the_package(tmp_path
 
 
 def test_unreadable_package_columns_are_a_warning_not_a_refusal(tmp_path):
+    """Macro-listed package columns are reported unchecked, not refused."""
     macro = (
         "select {{ fivetran_utils.fill_staging_columns(source_columns=[], "
         "staging_columns=get_columns()) }}\n"
@@ -218,6 +225,7 @@ def test_unreadable_package_columns_are_a_warning_not_a_refusal(tmp_path):
 
 
 def test_the_compiled_manifest_answers_for_a_macro_listed_package_model(tmp_path):
+    """The manifest's compiled SQL settles columns the raw SQL cannot."""
     macro = "select {{ dbt_utils.star(source('inbox', 'conversation_history')) }}\n"
     manifest = {
         "nodes": {
@@ -242,6 +250,7 @@ def test_the_compiled_manifest_answers_for_a_macro_listed_package_model(tmp_path
 
 
 def test_a_project_override_wins_over_the_package_model(tmp_path):
+    """A project model of the same name is the parent, as for ref()."""
     root = _project(
         tmp_path / "p",
         project_extra=(
@@ -263,6 +272,7 @@ def test_a_project_override_wins_over_the_package_model(tmp_path):
 
 
 def test_a_disabled_package_model_with_no_override_is_refused(tmp_path):
+    """A package model the project disables, with nothing replacing it, is refused."""
     root = _project(
         tmp_path / "p",
         project_extra=(
@@ -276,6 +286,7 @@ def test_a_disabled_package_model_with_no_override_is_refused(tmp_path):
 
 
 def test_a_custom_packages_install_path_is_followed(tmp_path):
+    """``packages-install-path`` decides where packages are read from."""
     root = _project(tmp_path / "p", install="vendor_packages")
 
     _declare(root, _parent())
@@ -289,6 +300,7 @@ def test_a_custom_packages_install_path_is_followed(tmp_path):
 
 
 def test_a_source_is_still_refused_and_says_so(tmp_path):
+    """A source table is not a parent."""
     root = _project(tmp_path / "p")
 
     with pytest.raises(DeclarationError) as raised:
@@ -298,6 +310,7 @@ def test_a_source_is_still_refused_and_says_so(tmp_path):
 
 
 def test_a_project_source_named_as_a_parent_says_a_source_is_not_one(tmp_path):
+    """The refusal names the source and the fix."""
     root = _project(
         tmp_path / "p",
         extra={
@@ -315,6 +328,7 @@ def test_a_project_source_named_as_a_parent_says_a_source_is_not_one(tmp_path):
 
 
 def test_a_name_nothing_defines_is_still_refused(tmp_path):
+    """A name nothing defines is refused."""
     root = _project(tmp_path / "p")
 
     with pytest.raises(DeclarationError, match="neither the project nor an installed"):
@@ -325,6 +339,7 @@ def test_a_name_nothing_defines_is_still_refused(tmp_path):
 
 
 def test_transform_declare_proposes_a_package_reference(tmp_path):
+    """``transform declare`` may propose a reference to a package model."""
     root = _project(tmp_path / "p")
     view = load_project(root)
     files = {path: source.content for path, source in view.files.items()}
@@ -335,6 +350,7 @@ def test_transform_declare_proposes_a_package_reference(tmp_path):
 
 
 def test_native_layers_resolve_a_package_parent(tmp_path):
+    """The native semantic routes resolve a package parent."""
     root = _project(tmp_path / "p")
     engine = SimpleNamespace(repo_root=root, project_dir=lambda: root)
 
@@ -347,6 +363,7 @@ def test_native_layers_resolve_a_package_parent(tmp_path):
 
 
 def _parent_rows(root: Path, mart: str) -> list[dict]:
+    """The population_parent contradictions the draft reports for ``mart``."""
     view = load_project(root)
     files = {path: source.content for path, source in view.files.items()}
     files["models/marts/inbox__threads.sql"] = mart
@@ -391,6 +408,7 @@ def _parent_rows(root: Path, mart: str) -> list[dict]:
 
 
 def test_a_mart_driven_from_a_package_sibling_contradicts_its_package_parent(tmp_path):
+    """The ADE case: driven from the parts, it contradicts the parent."""
     root = _project(tmp_path / "p")
 
     [found] = _parent_rows(root, FROM_PARTS)
@@ -419,11 +437,13 @@ def test_a_mart_driven_from_a_package_sibling_contradicts_its_package_parent(tmp
     ],
 )
 def test_a_mart_driven_from_its_package_parent_is_silent(tmp_path, mart):
+    """Driven from the parent, or from what the parent is built from, is silent."""
     root = _project(tmp_path / "p")
     assert _parent_rows(root, mart) == []
 
 
 def test_a_package_staging_model_written_with_column_macros_is_still_judged(tmp_path):
+    """Column-only macros in a package's lineage hide no relation."""
     fivetran = (
         "with base as (select * from {{ ref('stg_inbox__conversations_tmp') }}),\n"
         "fields as (select {{ fivetran_utils.fill_staging_columns("
@@ -449,6 +469,7 @@ def test_a_package_staging_model_written_with_column_macros_is_still_judged(tmp_
 
 
 def test_a_package_macro_that_may_read_a_relation_is_unchecked(tmp_path):
+    """A macro that may read relations leaves the check unchecked."""
     union = (
         "{{ fivetran_utils.union_data("
         "table_identifier='conversation_part_history') }}\n"
@@ -498,12 +519,14 @@ def test_a_package_macro_that_may_read_a_relation_is_unchecked(tmp_path):
     ],
 )
 def test_derived_dev_scopes(dev, relations, expected):
+    """Namespaces dbt derives from the dev one, per connector spelling."""
     from exmergo_dex_core.connect import derived_dev_scopes
 
     assert derived_dev_scopes(dev, relations) == expected
 
 
 def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
+    """Both are read; nothing changes when nothing derives."""
     from exmergo_dex_core.config import BigQueryTarget, DexConfig
     from exmergo_dex_core.connect import widen_dev_reads
 
@@ -523,6 +546,7 @@ def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
 
 
 def test_with_dev_target_folds_every_existing_entry_once():
+    """Each existing dev namespace is folded into the scope once."""
     from exmergo_dex_core.adapters.base import dev_target_entries, with_dev_target
 
     entries = dev_target_entries(["dbt_dev", " dbt_dev_inbox ", "dbt_dev"], str.upper)
@@ -580,6 +604,7 @@ def test_maintain_verify_reads_a_package_seeds_derived_namespace(tmp_path):
 
 
 def test_drafting_reads_package_models_as_the_plan_leaves_the_project(tmp_path):
+    """A package model the plan disables is no reference target."""
     from exmergo_dex_core.transform.commands import _package_lookup
 
     root = _project(tmp_path / "p")
@@ -607,18 +632,56 @@ def test_drafting_reads_package_models_as_the_plan_leaves_the_project(tmp_path):
 def test_an_install_path_outside_the_project_is_read_for_lineage(
     tmp_path, parts, status
 ):
+    """A package installed outside the project is indexed and its SQL read, so
+    the verdict comes from its lineage rather than from a missing package."""
+
     root = _project(tmp_path / "p", install="../vendor_packages", parts=parts)
+    index = ReferenceIndex(load_project(root))
+    for node in ("stg_inbox__conversations", "stg_inbox__conversation_parts"):
+        assert index.package_node_kind(node) == ("model", "tiny_inbox")
 
     [found] = _parent_rows(root, FROM_PARTS)
     assert found["status"] == status
+    if status == "unchecked":
+        assert "union_data" in found["reason"]
+
+
+def test_a_shadowed_package_models_lineage_is_not_the_overrides(tmp_path):
+    """A project override replaces the package model: the disabled package
+    file's ``ref()`` to the parent links nothing, so a mart driven from the
+    override, which reads only a source, still contradicts the parent."""
+
+    linked = (
+        "select p.part_id, p.conversation_id\n"
+        "from {{ source('inbox', 'conversation_part_history') }} p\n"
+        "join {{ ref('stg_inbox__conversations') }} c using (conversation_id)\n"
+    )
+    root = _project(
+        tmp_path / "p",
+        parts=linked,
+        project_extra=(
+            "models:\n  tiny_inbox:\n    stg_inbox__conversation_parts:\n"
+            "      +enabled: false\n"
+        ),
+        extra={"models/overrides/stg_inbox__conversation_parts.sql": PARTS},
+    )
+
+    index = ReferenceIndex(load_project(root))
+    assert "stg_inbox__conversations" not in index.ancestors_of(
+        "stg_inbox__conversation_parts"
+    )
+    [found] = _parent_rows(root, FROM_PARTS)
+    assert found["status"] == "contradicted"
 
 
 def test_a_cost_guard_refusal_while_widening_dev_reads_propagates(monkeypatch):
+    """A cost-guard refusal is re-raised, not turned into a warning."""
     from exmergo_dex_core import connect
     from exmergo_dex_core.guards.cost_guard import CostGuardError
     from exmergo_dex_core.transform.verify import BuildVerification, _widen_dev_reads
 
     def refuse(*_args, **_kwargs):
+        """Refuse as the cost guard would."""
         raise CostGuardError("over the ceiling")
 
     monkeypatch.setattr(connect, "widen_dev_reads", refuse)
