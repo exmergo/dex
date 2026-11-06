@@ -793,7 +793,12 @@ def _draft(
             models,
             files,
             view.model_paths,
-            **_drafting_inputs(engine, view),
+            **{
+                **_drafting_inputs(engine, view),
+                # Package models are enabled or disabled by the project file as
+                # the plan leaves it.
+                "packaged": _package_lookup(view, files.get("dbt_project.yml")),
+            },
             index=lambda: _post_change_index(view, edits),
             prior={path: source.content for path, source in view.files.items()},
             package_documented={
@@ -841,15 +846,25 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
     }
 
 
-def _package_lookup(view: Any) -> Callable[[str], str | None]:
+def _package_lookup(
+    view: Any, project_yml: str | None = None
+) -> Callable[[str], str | None]:
     """The installed package that builds a name, for a drafted ``references``
     whose parent the project itself does not define (#1155). Read from the
-    repository on first use and remembered per name; opens nothing."""
+    repository on first use and remembered per name; opens nothing.
+
+    ``project_yml`` is the project's ``dbt_project.yml`` as a plan leaves it,
+    which decides whether a package model is enabled; without one, the file as
+    it stands."""
 
     from .package_targets import find_package_target
 
-    project_yml = view.files.get("dbt_project.yml")
-    text = project_yml.content if project_yml is not None else None
+    current = view.files.get("dbt_project.yml")
+    text = (
+        project_yml
+        if project_yml is not None
+        else (current.content if current is not None else None)
+    )
     seen: dict[str, str | None] = {}
 
     def lookup(name: str) -> str | None:

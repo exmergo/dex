@@ -774,7 +774,9 @@ def dev_target_scope(connector: str, target) -> str | None:
     return None
 
 
-def derived_dev_scopes(dev_scope: str | None, relations: Iterable[str]) -> list[str]:
+def derived_dev_scopes(
+    dev_scope: str | None, relations: Iterable[str], *, container: str | None = None
+) -> list[str]:
     """The namespaces dbt derives from the dev namespace for ``relations``.
 
     dbt's default ``generate_schema_name`` builds a model with ``+schema: inbox``
@@ -788,7 +790,9 @@ def derived_dev_scopes(dev_scope: str | None, relations: Iterable[str]) -> list[
     ``relations`` are the manifest's relation names, compiled for the dev target.
     Each is spelled as the dev scope is (a bare dataset or schema, or
     ``container.schema``), so an adapter qualifies it the way it qualifies the
-    dev scope itself.
+    dev scope itself. ``container`` is what a bare dev scope is qualified with
+    (BigQuery's project): a relation in another one is left out, since its bare
+    name would be read in the adapter's own container instead.
     """
 
     if not dev_scope:
@@ -807,6 +811,10 @@ def derived_dev_scopes(dev_scope: str | None, relations: Iterable[str]) -> list[
             continue
         if not lowered[-1].startswith(wanted[-1] + "_"):
             continue
+        if container is not None and len(wanted) == 1:
+            above = parts[len(parts) - len(wanted) - 1 : len(parts) - len(wanted)]
+            if above and above[0].lower() != container.lower():
+                continue
         found.setdefault(".".join(candidate), None)
     return sorted(found)
 
@@ -825,7 +833,10 @@ def widen_dev_reads(
     if read_dev_target is None:
         return []
     dev_scope = dev_target_scope(adapter.name, getattr(config, adapter.name, None))
-    derived = derived_dev_scopes(dev_scope, relations)
+    project = getattr(adapter, "project", None)
+    bigquery = adapter.name == "bigquery" and isinstance(project, str)
+    container = project if bigquery else None
+    derived = derived_dev_scopes(dev_scope, relations, container=container)
     if derived:
         read_dev_target([dev_scope, *derived])
     return derived

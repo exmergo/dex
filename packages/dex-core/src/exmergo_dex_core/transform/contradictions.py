@@ -539,10 +539,18 @@ def _package_sql(graph: ReferenceIndex, name: str) -> str | None:
     path = graph.package_file_of(name)
     if path is None or not path.endswith(".sql"):
         return None
-    try:
-        return (Path(graph.view.root) / path).read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
+    from .build import packages_dir
+
+    root = Path(graph.view.root)
+    # The index spells a package file under its install directory's path
+    # relative to the project, or under the directory's bare name when the
+    # configured install path lies outside the project.
+    for candidate in (root / path, packages_dir(root).parent / path):
+        try:
+            return candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+    return None
 
 
 def _describe_filter(entry: dict[str, Any]) -> str:

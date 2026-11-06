@@ -534,3 +534,97 @@ def test_with_dev_target_folds_every_existing_entry_once():
     ]
     assert with_dev_target(["RAW"], None, lambda e: True) == ["RAW"]
     assert dev_target_entries(None) is None
+
+
+# --- review follow-ups ------------------------------------------------------------
+
+
+def test_a_derived_dataset_in_another_bigquery_project_is_not_read():
+    """A bare dev dataset is read in the adapter's project, so a derived dataset
+    a `+database` puts in another project is left out rather than read there."""
+
+    from exmergo_dex_core.connect import derived_dev_scopes
+
+    relations = [
+        "`acme-dw`.`dbt_dev_inbox`.`stg_inbox__conversations`",
+        "`other-proj`.`dbt_dev_crm`.`stg_crm__accounts`",
+    ]
+    assert derived_dev_scopes("dbt_dev", relations, container="acme-dw") == [
+        "dbt_dev_inbox"
+    ]
+
+
+def test_maintain_verify_reads_a_package_seeds_derived_namespace(tmp_path):
+    """The manifest's seeds and snapshots count, beside the models."""
+
+    from exmergo_dex_core.maintain.commands import _dev_relations
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "seed.tiny_inbox.inbox_states": {
+                        "resource_type": "seed",
+                        "relation_name": '"dev"."main_inbox"."inbox_states"',
+                    },
+                    "test.proj.t": {"resource_type": "test", "relation_name": None},
+                }
+            }
+        )
+    )
+    relations = _dev_relations({"threads": "dev.main.threads"}, tmp_path)
+    assert relations == ["dev.main.threads", '"dev"."main_inbox"."inbox_states"']
+    assert _dev_relations({"threads": "dev.main.threads"}, None) == ["dev.main.threads"]
+
+
+def test_drafting_reads_package_models_as_the_plan_leaves_the_project(tmp_path):
+    from exmergo_dex_core.transform.commands import _package_lookup
+
+    root = _project(tmp_path / "p")
+    view = load_project(root)
+    disabled = (root / "dbt_project.yml").read_text() + (
+        "models:\n  tiny_inbox:\n    stg_inbox__conversations:\n      +enabled: false\n"
+    )
+
+    assert _package_lookup(view)("stg_inbox__conversations") == "tiny_inbox"
+    assert _package_lookup(view, disabled)("stg_inbox__conversations") is None
+
+
+@pytest.mark.parametrize(
+    ("parts", "status"),
+    [
+        pytest.param(PARTS, "contradicted", id="plain-sql"),
+        pytest.param(
+            "{{ fivetran_utils.union_data("
+            "table_identifier='conversation_part_history') }}\n",
+            "unchecked",
+            id="union-data",
+        ),
+    ],
+)
+def test_an_install_path_outside_the_project_is_read_for_lineage(
+    tmp_path, parts, status
+):
+    root = _project(tmp_path / "p", install="../vendor_packages", parts=parts)
+
+    [found] = _parent_rows(root, FROM_PARTS)
+    assert found["status"] == status
+
+
+def test_a_cost_guard_refusal_while_widening_dev_reads_propagates(monkeypatch):
+    from exmergo_dex_core import connect
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+    from exmergo_dex_core.transform.verify import BuildVerification, _widen_dev_reads
+
+    def refuse(*_args, **_kwargs):
+        raise CostGuardError("over the ceiling")
+
+    monkeypatch.setattr(connect, "widen_dev_reads", refuse)
+    engine = SimpleNamespace(config=None)
+    result = BuildVerification(ran=True)
+
+    with pytest.raises(CostGuardError):
+        _widen_dev_reads(engine, object(), lambda: [], result)
+    assert result.warnings == []

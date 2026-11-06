@@ -247,9 +247,12 @@ def _widen_dev_reads(
     """
 
     from .. import connect
+    from ..guards.cost_guard import CostGuardError
 
     try:
         derived = connect.widen_dev_reads(adapter, engine.config, relations())
+    except CostGuardError:
+        raise
     except Exception as exc:  # pragma: no cover - defensive, reported not raised
         warning = (
             f"the namespaces dbt derived from the dev namespace could not be read "
