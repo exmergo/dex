@@ -143,7 +143,23 @@ def test_the_full_retirement_still_refuses_an_incomplete_scan(root: Path):
         _propagate(root, _edit())
     message = str(refused.value)
     assert "macros/unioned.sql" in message
+    assert "a removal applied to most of a project still compiles" in message
     assert '"scope": "authored"' in message
+
+
+def test_incomplete_scan_names_the_requested_verb(root: Path):
+    _write(root / "macros/unioned.sql", UNPARSEABLE)
+    with pytest.raises(PropagationRefusedError) as exc_rename:
+        propagate(load_project(root), root, "var", FLAG, "new_flag")
+    rename_msg = str(exc_rename.value)
+    assert "a rename applied to most of a project still compiles" in rename_msg
+    assert '"scope": "authored"' not in rename_msg
+
+    with pytest.raises(PropagationRefusedError) as exc_remove:
+        propagate(load_project(root), root, "var", FLAG)
+    remove_msg = str(exc_remove.value)
+    assert "a removal applied to most of a project still compiles" in remove_msg
+    assert '"scope": "authored"' not in remove_msg
 
 
 def test_a_scoped_retirement_reports_a_dynamic_read_instead_of_refusing(

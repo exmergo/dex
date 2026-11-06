@@ -144,8 +144,9 @@ def propagate(
             )
         )
     index = ReferenceIndex(view)
+    verb = "rename" if new is not None else "remove"
     if not scoped:
-        _refuse_incomplete(index, kind, old, retirement=retirement)
+        _refuse_incomplete(index, kind, old, verb=verb, retirement=retirement)
     owner, column = _resolve_target(index, kind, old)
     # Compared against the *bare* name for a column, since `old` carries the
     # model that scopes it and `new` never does: `stg_orders.order_id` renamed to
@@ -347,7 +348,12 @@ def _refuse_surviving_python_readers(
 
 
 def _refuse_incomplete(
-    index: ReferenceIndex, kind: str, name: str, *, retirement: bool = False
+    index: ReferenceIndex,
+    kind: str,
+    name: str,
+    *,
+    verb: str = "rename",
+    retirement: bool = False,
 ) -> None:
     """Refuse while any reason to doubt the reference report is still standing.
 
@@ -371,10 +377,11 @@ def _refuse_incomplete(
     )
     limits = list(dict.fromkeys([*index.limits, *query_limits]))
     if limits:
+        action = "a removal" if verb == "remove" else "a rename"
         raise PropagationRefusedError(
             "dex cannot promise it found every use of "
-            f"'{name}': {'; '.join(limits)}. Resolve that first, because a "
-            "rename applied to most of a project still compiles"
+            f"'{name}': {'; '.join(limits)}. Resolve that first, because {action} "
+            "applied to most of a project still compiles"
             + (_SCOPED_HINT if retirement else "")
         )
 
