@@ -221,6 +221,42 @@ def test_group_by_reports_its_expressions_as_written():
     assert sql_shape.group_by(tree) == ["a"]
 
 
+def test_group_by_keys_drops_table_qualifiers_and_folds_case():
+    tree = _parse("select s.a, count(*) from t as s group by s.a, s.B")
+    assert sql_shape.group_by_keys(tree) == ["a", "b"]
+    assert sql_shape.group_by(tree) == ["s.a", "s.B"]
+
+
+def test_group_by_keys_preserves_string_literal_case():
+    upper = _parse(
+        "select count(*) from t group by case when status = 'US' then 1 else 0 end"
+    )
+    lower = _parse(
+        "select count(*) from t group by case when status = 'us' then 1 else 0 end"
+    )
+    assert sql_shape.group_by_keys(upper) != sql_shape.group_by_keys(lower)
+
+
+def test_group_by_keys_distinguishes_different_joined_relations():
+    tree_a = _parse(
+        "select a.id from t_a as a join t_b as b on a.x = b.x group by a.id"
+    )
+    tree_b = _parse(
+        "select b.id from t_a as a join t_b as b on a.x = b.x group by b.id"
+    )
+    assert sql_shape.group_by_keys(tree_a) != sql_shape.group_by_keys(tree_b)
+
+
+def test_group_by_keys_normalizes_joined_relation_alias_renames():
+    tree_1 = _parse(
+        "select a1.id from t_a as a1 join t_b as b on a1.x = b.x group by a1.id"
+    )
+    tree_2 = _parse(
+        "select a2.id from t_a as a2 join t_b as b on a2.x = b.x group by a2.id"
+    )
+    assert sql_shape.group_by_keys(tree_1) == sql_shape.group_by_keys(tree_2)
+
+
 def test_scopes_includes_set_operation_ctes():
     sql = (
         "with named as (select 1 as a), "

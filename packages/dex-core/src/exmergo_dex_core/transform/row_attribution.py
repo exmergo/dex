@@ -679,7 +679,7 @@ def _grain_changes(
         )
 
     before, after = sql_shape.group_by(prior), sql_shape.group_by(authored)
-    if before != after:
+    if sql_shape.group_by_keys(prior) != sql_shape.group_by_keys(authored):
         group = authored.args.get("group")
         changes.append(
             _Change(
