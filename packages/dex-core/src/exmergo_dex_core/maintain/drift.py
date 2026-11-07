@@ -21,7 +21,7 @@ re-spending) on its own.
 from __future__ import annotations
 
 import difflib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, NamedTuple
 
 from pydantic import BaseModel, Field
@@ -30,7 +30,13 @@ from ..adapters.base import Adapter, ColumnMeta, TableProbe, distinct_combinatio
 from ..cache import Dataset, Relationship, RelationshipKind, match_identifier
 from ..dbt_project import ProjectDefinitions
 from ..explore import relationships as rel_mod
-from .snapshot import SemanticLayer, SemanticModelDef, Snapshot, TransformLayer
+from .snapshot import (
+    DeclarationFingerprint,
+    SemanticLayer,
+    SemanticModelDef,
+    Snapshot,
+    TransformLayer,
+)
 
 #: Deliberately without the supported-set gate `SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS`
 #: gives the baseline, and this is where that decision is recorded rather than
@@ -517,6 +523,42 @@ def declaration_drift_status(
     return True, None
 
 
+def native_declaration_drift_status(
+    current_semantic: SemanticLayer | None, snap: Snapshot
+) -> tuple[bool, str | None] | None:
+    """Whether a native semantic layer's declarations can be compared (#995).
+
+    ``None`` when neither side holds them: no native layer, or the dbt layer,
+    whose declarations live on the transformation layer and are judged by
+    :func:`declaration_drift_status`. Otherwise unchecked, never clean, for the
+    same reasons a transformation project's are, and also across a change of
+    vendor, whose definitions are named in another vocabulary.
+    """
+
+    baseline = snap.semantic_layer
+    base = baseline.declarations if baseline is not None else None
+    cur = current_semantic.declarations if current_semantic is not None else None
+    if base is None and cur is None:
+        return None
+    before = baseline.vendor if baseline is not None else None
+    after = current_semantic.vendor if current_semantic is not None else None
+    if before and after and before != after:
+        return False, (
+            f"the baseline's semantic layer was read as {before} and the current "
+            f"one as {after}, so their declarations are not compared"
+        )
+    if cur is None:
+        return False, "the current semantic layer's declarations could not be read"
+    if base is None:
+        return False, (
+            "the baseline was pinned before the semantic layer's declarations "
+            "were fingerprinted; re-run `maintain snapshot` (or `maintain "
+            "snapshot --project-only`, which leaves the warehouse baseline as it "
+            "is) to baseline them"
+        )
+    return True, None
+
+
 def rekeyed_versioned_declarations(
     current_transform: TransformLayer | None, snap: Snapshot
 ) -> list[str]:
@@ -568,29 +610,87 @@ def declaration_drift(
     Severity follows :data:`_DECLARATION_WEIGHT` for a change. A cleared field
     ranks one step lower, capped at ``medium``: the record of the decision is
     gone, but the rule did not turn into a different one. A newly declared field
-    is ``low``: it records intent the model already had. Returns nothing when
-    :func:`declaration_drift_status` says the sides are not comparable.
+    is ``low``: it records intent the model already had.
 
-    ``semantic`` traces each finding to the metrics built on the model, the way
-    ``annotate_impacts`` does for warehouse findings.
+    The transformation project's declarations are compared where
+    :func:`declaration_drift_status` says they can be, and a native semantic
+    layer's (Ossie, SLayer, Cube, #995) where
+    :func:`native_declaration_drift_status` does, each keyed by its own names. A
+    native finding names the definition and carries ``data.layer: semantic`` and
+    the vendor, so it is never mistaken for the dbt model of the same name.
+
+    ``semantic`` is the current semantic layer: the native side of the
+    comparison, and what traces each dbt finding to the metrics built on the
+    model, the way ``annotate_impacts`` does for warehouse findings.
     """
 
+    findings: list[DriftFinding] = []
     comparable, _ = declaration_drift_status(current_transform, snap)
-    if not comparable or snap.transform_layer is None or current_transform is None:
-        return []
-    base = dict(snap.transform_layer.declarations or {})
-    cur = dict(current_transform.declarations or {})
-    present = set(current_transform.models) | set(current_transform.versions or [])
-    # A baseline pinned before versions were read keyed a versioned model by its
-    # bare name; comparing that with today's per-version keys would report the
-    # whole declaration as removed and every version as newly declared. Those
-    # models are left out here and named by `rekeyed_versioned_declarations`.
-    for model in rekeyed_versioned_declarations(current_transform, snap):
-        base.pop(model, None)
-        for label in [k for k in cur if k.startswith(f"{model}.v")]:
-            cur.pop(label)
+    if (
+        comparable
+        and snap.transform_layer is not None
+        and current_transform is not None
+    ):
+        base = dict(snap.transform_layer.declarations or {})
+        cur = dict(current_transform.declarations or {})
+        present = set(current_transform.models) | set(current_transform.versions or [])
+        # A baseline pinned before versions were read keyed a versioned model by
+        # its bare name; comparing that with today's per-version keys would
+        # report the whole declaration as removed and every version as newly
+        # declared. Those models are left out here and named by
+        # `rekeyed_versioned_declarations`.
+        for model in rekeyed_versioned_declarations(current_transform, snap):
+            base.pop(model, None)
+            for label in [k for k in cur if k.startswith(f"{model}.v")]:
+                cur.pop(label)
+        findings.extend(
+            _compare_declarations(
+                base,
+                cur,
+                present,
+                lambda model, column: _metrics_on_model(semantic, model, column),
+            )
+        )
+    native = native_declaration_drift_status(semantic, snap)
+    if (
+        native is not None
+        and native[0]
+        and snap.semantic_layer is not None
+        and semantic is not None
+    ):
+        findings.extend(
+            _compare_declarations(
+                dict(snap.semantic_layer.declarations or {}),
+                dict(semantic.declarations or {}),
+                {sm.name for sm in semantic.semantic_models}
+                | set(semantic.declarations or {}),
+                lambda model, column: [],
+                {"layer": "semantic", "vendor": semantic.vendor},
+                noun="definition",
+            )
+        )
+    return findings
+
+
+def _compare_declarations(
+    base: dict[str, DeclarationFingerprint],
+    cur: dict[str, DeclarationFingerprint],
+    present: set[str],
+    impacted: Callable[[str, str | None], list[str]],
+    extra: dict[str, Any] | None = None,
+    *,
+    noun: str = "model",
+) -> list[DriftFinding]:
+    """The findings of :func:`declaration_drift` for one layer's declarations.
+
+    ``present`` is every model the layer still holds, so a removed declaration
+    says whether its model went with it; ``impacted`` names the metrics a
+    finding on a model (or one of its columns) can move; ``extra`` is added to
+    every finding's ``data``; ``noun`` is what the details call a model.
+    """
 
     findings: list[DriftFinding] = []
+    tags = {key: value for key, value in (extra or {}).items() if value is not None}
 
     def finding(
         code: str,
@@ -610,15 +710,16 @@ def declaration_drift(
                 detail=detail,
                 data={"model": model}
                 | ({"column": column} if column is not None else {})
-                | data,
-                impacted_metrics=_metrics_on_model(semantic, model, column),
+                | data
+                | tags,
+                impacted_metrics=impacted(model, column),
             )
         )
 
     def subject(model: str, column: str | None) -> str:
         if column is None:
-            return f"model '{model}'"
-        return f"column '{column}' of model '{model}'"
+            return f"{noun} '{model}'"
+        return f"column '{column}' of {noun} '{model}'"
 
     def removed_severity(fields: Iterable[str]) -> str:
         weights = {_declaration_weight(f) for f in fields}
@@ -649,7 +750,7 @@ def declaration_drift(
             None,
             removed_severity(set(declared.fields) | column_fields),
             f"{subject(model, None)} no longer declares what it means"
-            + ("" if still_built else ", and the model itself was removed"),
+            + ("" if still_built else f", and the {noun} itself was removed"),
             {
                 "fields": sorted(declared.fields),
                 "columns": sorted(declared.columns),

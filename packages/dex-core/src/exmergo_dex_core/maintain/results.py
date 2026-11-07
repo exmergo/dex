@@ -36,8 +36,9 @@ class LayerFingerprint(BaseModel):
     source_count: int | None = None
     semantic_model_count: int | None = None
     metric_count: int | None = None
-    #: Models whose declaration was fingerprinted (#497). ``None`` when the
-    #: format does not read declarations, so the next run reports the
+    #: Models whose declaration was fingerprinted (#497), or on a native
+    #: semantic layer the definitions whose declaration was (#995). ``None``
+    #: when the format does not read declarations, so the next run reports the
     #: declaration axis as unchecked; ``0`` when it does and none are declared.
     declared_model_count: int | None = None
 
@@ -53,6 +54,7 @@ class LayerFingerprint(BaseModel):
         return {
             "semantic_model_count": self.semantic_model_count,
             "metric_count": self.metric_count,
+            "declared_model_count": self.declared_model_count,
         }
 
 

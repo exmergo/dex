@@ -1219,3 +1219,113 @@ def test_a_removal_cuts_a_view_source_under_capitalized_cubes():
     )
 
     assert edited == ("views:\n  - name: sales\n    Cubes: []\n")
+
+
+# --- declaration drift on the native layer (#995) -----------------------------
+
+
+def _declared_orders(
+    excludes: tuple[str, ...] = ("test",), *, restated: bool = False
+) -> dict[str, Any]:
+    """The orders cube declaring its population and a member's role in
+    ``meta.dex``. ``restated`` writes the same declaration with its keys and
+    filter values reordered."""
+
+    population: dict[str, Any] = {
+        "rule": "Orders a customer placed.",
+        "filters": [{"column": "status", "excludes": list(excludes)}],
+    }
+    if restated:
+        population = {
+            "filters": [
+                {"excludes": sorted(excludes, reverse=True), "column": "status"}
+            ],
+            "rule": "Orders a customer   placed.",
+        }
+    body = _orders(meta={"dex": {"population": population}})
+    for member in body["dimensions"]:
+        if member["name"] == "customer_id":
+            member["meta"] = {"dex": {"role": "foreign_key"}}
+    return body
+
+
+def _declarations(payload: dict) -> list[dict]:
+    return [
+        f for f in payload["data"]["findings"] if f["code"].startswith("declaration_")
+    ]
+
+
+@pytest.mark.parametrize("dbt", [True, False], ids=["beside-dbt", "cube-only"])
+def test_a_changed_population_in_meta_dex_is_high_severity_drift(
+    tmp_path: Path, capsys, dbt: bool
+):
+    root = _layout(tmp_path, dbt=dbt)
+    _write(root, ORDERS_FILE, {"cubes": [_declared_orders()]}, header=HEADER)
+    _cli(root, capsys, "maintain", "snapshot")
+    _write(root, ORDERS_FILE, {"cubes": [_declared_orders(("test", "open"))]})
+
+    payload = _cli(root, capsys, "maintain", "semantic")
+
+    assert payload["_exit"] == 0, payload
+    [finding] = _declarations(payload)
+    assert finding["code"] == "declaration_changed"
+    assert (finding["identifier"], finding["severity"]) == ("orders", "high")
+    assert finding["data"]["field"] == "population"
+    status = payload["data"]["declaration_drift"]
+    assert status["checked"] is True
+    native = status["semantic_layer"] if dbt else status
+    assert native["vendor"] == "cube"
+    assert native["baseline_declared_models"] == native["declared_models"] == 2
+
+
+def test_a_restated_meta_dex_block_is_not_drift(repo: Path, capsys):
+    _write(repo, ORDERS_FILE, {"cubes": [_declared_orders(("test", "open"))]})
+    _cli(repo, capsys, "maintain", "snapshot")
+    restated = _declared_orders(("test", "open"), restated=True)
+    _write(repo, ORDERS_FILE, {"cubes": [restated]}, header=HEADER)
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    assert payload["_exit"] == 0, payload
+    assert _declarations(payload) == []
+    assert payload["data"]["declaration_drift"]["checked"] is True
+
+
+def test_a_changed_primary_key_is_a_grain_change(tmp_path: Path, capsys):
+    root = _layout(tmp_path, dbt=False)
+    _cli(root, capsys, "maintain", "snapshot")
+    orders = _orders()
+    for member in orders["dimensions"]:
+        member["primary_key"] = member["name"] in ("order_id", "customer_id")
+    _write(root, ORDERS_FILE, {"cubes": [orders]})
+
+    payload = _cli(root, capsys, "maintain", "semantic")
+
+    [finding] = _declarations(payload)
+    assert (finding["data"]["field"], finding["severity"]) == ("grain", "high")
+
+
+def test_a_pre_declaration_baseline_is_unchecked_until_project_only(
+    tmp_path: Path, capsys
+):
+    root = _layout(tmp_path, dbt=False)
+    _write(root, ORDERS_FILE, {"cubes": [_declared_orders()]})
+    _cli(root, capsys, "maintain", "snapshot")
+    path = root / ".dex" / "snapshot.json"
+    stored = json.loads(path.read_text())
+    del stored["semantic_layer"]["declarations"]
+    path.write_text(json.dumps(stored))
+
+    payload = _cli(root, capsys, "maintain", "semantic")
+
+    status = payload["data"]["declaration_drift"]
+    assert status["checked"] is False
+    assert "before the semantic layer's declarations" in status["reason"]
+    assert any(
+        w.startswith("declaration drift was not checked") for w in payload["warnings"]
+    )
+
+    assert _cli(root, capsys, "maintain", "snapshot", "--project-only")["_exit"] == 0
+    payload = _cli(root, capsys, "maintain", "semantic")
+    assert payload["data"]["declaration_drift"]["checked"] is True
+    assert _declarations(payload) == []
