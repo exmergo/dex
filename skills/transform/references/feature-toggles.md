@@ -30,9 +30,10 @@ the cap of 200 occurrences and 50 files; without it the answer can stop short
 with no file named. Read `data.completeness` and `data.limits`: `incomplete`
 means some files could not be read, so the list may be short. Resolve each entry
 under `data.indeterminate` by reading its line, since it may or may not name
-what you asked about. Dex re-checks the models from compiled SQL in step 3; it
-does not re-check tests or semantic definitions, so the search is what finds
-those.
+what you asked about. Dex re-checks the models from compiled SQL in step 3, and
+the tests and semantic definitions over a producer's governed column from the
+same index, so a test or a dimension the search turns up belongs in the payload
+too.
 
 ## 2. Write the gated edits, with a `toggle` contract
 
@@ -94,13 +95,17 @@ outputs a governed column with the flag on.
 | `ungoverned_column_lost` | A column the toggle does not govern is gone on either value | Keep it, or add it to `columns` |
 | `ungoverned_columns_differ` | The two values output different non-governed columns | Same as above |
 | `branch_compile_failed` | The project does not compile at one value (for example, a dangling ref) | Fix that branch |
+| `governed_column_tested_when_off` | A test on a producer's governed column (a column test, a model-level test naming it, a `relationships` test pointing at it) still runs with the flag off, so the off build fails it. The check names its `path`, `line`, `column` and `test` | Disable it at the off value, with an `enabled` config true at `on_value` alone: `"{{ var('enable_fees') }}"` for an on value of `true`, `"{{ not var('disable_fees') }}"` for `false`, `"{{ var('fee_mode') == 'on' }}"` for a string. The warning names the one for this contract. Or remove it |
+| `governed_column_in_semantic_layer` | A dimension, measure or entity is defined over a producer's governed column, so it stops resolving with the flag off. The check names its `path`, `line`, `kind`, `definition`, `semantic_model` and the `metrics` drawing on it | Change it and its metrics in the same payload, or disable the semantic model at the off value |
 
 `verdict: satisfied` needs every record satisfied **and** `completeness: complete`.
 `unchecked` is not clean. A record carries `reason_code` `unreadable_select` (a
 `*` over a source with no cached profile: run `dex explore profile` on it) or
 `compile_unavailable` (no dbt or no working dev profile). `limits` names what the
 reading could not cover, such as a `var()` whose name is not a literal, which may
-read this flag. `package_scope` names package models that read the flag; they are
+read this flag, a computed semantic `expr` over a producer that the index cannot
+resolve to a column, or a test naming a governed column that dbt compiled into
+no test node. `package_scope` names package models that read the flag; they are
 reported and never judged.
 
 Correct the payload and plan again until the verdict is `satisfied`.
@@ -152,5 +157,8 @@ through a reviewed plan that carries the same `toggle`, then build again with
 - The values in the on branch: `transform compare` does that, at `on_value`.
 - Package models, or a dynamic `var()` read: named under `package_scope` and
   `limits`, never judged.
-- A metric or semantic definition over a governed column: run
-  `dex transform references <column>` and change it in the same payload.
+- A semantic definition whose `expr` is computed (`fee_amount * 2`): it is
+  listed under `limits` with its file and line, not judged. Read it, and change
+  it in the same payload if it reads a governed column.
+- Tests and semantic definitions in installed packages, and singular tests
+  under `tests/`.
