@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sqlglot import expressions as exp
+from sqlglot.generator import Generator
 
 from .errors import DexError
 
@@ -210,7 +211,7 @@ def unqualified_key(node: exp.Expression) -> str:
         id(select): _source_names(select) for select in bare.find_all(exp.Select)
     }
     for column in list(bare.find_all(exp.Column)):
-        qualifier = column.table.lower()
+        qualifier = _name_key(column.args.get("table"))
         nearest = column.find_ancestor(exp.Select)
         owner = nearest
         while owner is not None and qualifier not in sources[id(owner)]:
@@ -221,7 +222,7 @@ def unqualified_key(node: exp.Expression) -> str:
         ):
             column.set("table", None)
         elif owner is None:
-            column.set("table", exp.to_identifier(qualifier))
+            pass  # A qualifier no select defines is kept, folded below.
         else:
             column.set("table", exp.to_identifier(sources[id(owner)][qualifier]))
         column.set("db", None)
@@ -232,7 +233,31 @@ def unqualified_key(node: exp.Expression) -> str:
     for identifier in bare.find_all(exp.Identifier):
         if not identifier.quoted:
             identifier.set("this", identifier.this.lower())
-    return bare.sql(comments=False, normalize_functions="lower").strip()
+    generator = _KeyGenerator(comments=False, normalize_functions="lower")
+    return generator.generate(bare).strip()
+
+
+def _name_key(name: exp.Expression | str | None) -> str:
+    """A name as SQL resolves it here: an unquoted one folded to lower case, a
+    quoted one exactly as written, since ``"A"`` and ``"a"`` can be two aliases."""
+
+    if isinstance(name, exp.Identifier):
+        return name.this if name.quoted else name.this.lower()
+    return name.lower() if isinstance(name, str) else ""
+
+
+class _KeyGenerator(Generator):
+    """The default generator, except that a quoted function name keeps its
+    case: in Postgres ``"IsActive"(id)`` and ``"isactive"(id)`` can call two
+    different functions."""
+
+    def anonymous_sql(self, expression: exp.Anonymous) -> str:
+        name = expression.this
+        if isinstance(name, exp.Identifier) and name.quoted:
+            return self.func(
+                self.sql(expression, "this"), *expression.expressions, normalize=False
+            )
+        return super().anonymous_sql(expression)
 
 
 def _source_names(select: exp.Select) -> dict[str, str]:
@@ -245,7 +270,11 @@ def _source_names(select: exp.Select) -> dict[str, str]:
     for relation in _relations(select):
         key = relation_key(relation)
         seen[key] = seen.get(key, 0) + 1
-        named[relation.alias_or_name.lower()] = f"{key}#{seen[key]}"
+        alias = relation.args.get("alias")
+        name = alias.this if isinstance(alias, exp.TableAlias) else relation.this
+        if not isinstance(name, exp.Identifier):
+            name = relation.alias_or_name
+        named[_name_key(name)] = f"{key}#{seen[key]}"
     return named
 
 
