@@ -522,6 +522,17 @@ def analyze(
     boolean = isinstance(contract.retained_value, bool)
     compiled: dict[str, dict[str, _Compiled]] = {}
     failure: str | None = None
+    cached: list[Any] = []
+
+    def cache() -> Any:
+        """the exploration cache, read once and only when a star needs it."""
+
+        if not cached:
+            from ..storage import readable_cache
+
+            cached.append(readable_cache(engine.store))
+        return cached[0]
+
     try:
         compiled["retained"] = _compile_tree(
             engine,
@@ -531,6 +542,7 @@ def analyze(
             models,
             connector,
             vars_={variable: contract.retained_value},
+            cache=cache,
         )
         if boolean:
             compiled["other"] = _compile_tree(
@@ -541,9 +553,17 @@ def analyze(
                 models,
                 connector,
                 vars_={variable: not contract.retained_value},
+                cache=cache,
             )
         compiled["proposed"] = _compile_tree(
-            engine, stored, project, view, models, connector, proposed=True
+            engine,
+            stored,
+            project,
+            view,
+            models,
+            connector,
+            proposed=True,
+            cache=cache,
         )
     except Exception as exc:
         failure = type(exc).__name__
@@ -618,20 +638,22 @@ def _compile_tree(
     *,
     vars_: Mapping[str, Any] | None = None,
     proposed: bool = False,
+    cache: Callable[[], Any] | None = None,
 ) -> dict[str, _Compiled]:
-    """Compile ``models`` from one tree, inlining what the plan touches.
-
-    Touched models are ephemeral, as in ``transform compare``, so a star over a
-    model this plan rewrites resolves to this tree's columns rather than to a
-    dev relation built from an earlier one.
-    """
+    """compile ``models`` from one tree, resolving stars through the catalog."""
 
     from ..adapters import get_dialect
-    from .mutation import EPHEMERAL_HEADER
-    from .refactor_compare import _shadow, _touched
-    from .select_list import resolve_select_list
+    from .refactor_compare import _shadow
+    from .toggle import _Branch, _Catalog, _read_manifest
 
     target = engine.config.dbt_target or "dev"
+    name = view.project_name or _project_name(view) or ""
+    if models:
+        selector = " ".join(f"+{m}" for m in models)
+    elif name:
+        selector = f"package:{name},resource_type:model"
+    else:
+        selector = "resource_type:model"
     dialect = get_dialect(connector) if connector else None
     with _shadow(engine, project, target, connector or "") as shadow:
         shadow.strip_run_hooks()
@@ -641,30 +663,35 @@ def _compile_tree(
                     shadow.remove(edit.path)
                 else:
                     shadow.write(edit.path, edit.new_content or "")
-        for edit in _touched(stored):
-            if proposed:
-                content = edit.new_content if edit.op is EditOp.UPSERT else None
-            else:
-                source = view.files.get(edit.path)
-                content = source.content if source is not None else None
-            if content is None or not edit.path.endswith(".sql"):
-                continue
-            shadow.write(edit.path, content + "\n" + EPHEMERAL_HEADER + "\n")
-            shadow.strip_semantic_models(Path(edit.path).stem)
-        manifest = shadow.compile(" ".join(models), vars_=vars_)
+        manifest = shadow.compile(selector, vars_=vars_)
+    if not name:
+        for node in (manifest.get("nodes") or {}).values():
+            if node.get("package_name"):
+                name = str(node["package_name"])
+                break
+    branch = _Branch()
+    _read_manifest(branch, manifest, name)
+    catalog = _Catalog(branch, view, dialect, cache or (lambda: None))
+    for label in branch.models:
+        if label in models or label.rsplit(".v", 1)[0] in models:
+            catalog.resolve(label)
     out: dict[str, _Compiled] = {}
     for uid, node in (manifest.get("nodes") or {}).items():
         if not uid.startswith("model.") or node.get("name") not in models:
             continue
+        model_name = str(node["name"])
+        label = model_name
+        if node.get("version") is not None:
+            label = f"{label}.v{node['version']}"
+        resolved = branch.models.get(label) or branch.models.get(model_name)
         sql = (node.get("compiled_code") or "").strip().rstrip(";")
-        read = resolve_select_list(sql, dialect=dialect) if sql else None
         reads = {
             parent.split(".")[-1]
             for parent in (node.get("depends_on") or {}).get("nodes") or []
         }
-        out[str(node["name"])] = _Compiled(
-            sorted(c.lower() for c in read.columns) if read and read.columns else None,
-            read.reason if read else "no compiled SQL",
+        out[model_name] = _Compiled(
+            resolved.columns if resolved else None,
+            resolved.reason if resolved else "no compiled SQL",
             reads,
             sql,
         )
@@ -719,6 +746,8 @@ def _judge(
                 )
         elif retained is not None:
             _uncheck(record, "unreadable_select")
+            if retained.reason and "reason" not in record:
+                record["reason"] = retained.reason
         declared = contract.outputs.get(model)
         if declared is not None:
             expected = {c.lower() for c in declared.expected}

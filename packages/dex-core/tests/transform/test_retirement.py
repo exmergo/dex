@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -15,6 +17,9 @@ from exmergo_dex_core.transform.native_semantic import (
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 from exmergo_dex_core.transform.propagate import PropagationRefusedError, propagate
 from exmergo_dex_core.transform.retirement import (
+    _Compiled,
+    _judge,
+    _record,
     decisions,
     is_already_complete,
     metric_records,
@@ -25,6 +30,7 @@ from exmergo_dex_core.transform.retirement import (
     stored_form,
     yaml_reads,
 )
+from exmergo_dex_core.transform.toggle import _Branch, _Catalog, _Model
 
 FLAG = "use_region_enrichment"
 GUARDED = (
@@ -319,3 +325,299 @@ def test_metrics_are_held_to_the_definitions_in_both_directions():
         "lost": ("contradicted", "retirement_metric_missing"),
         "left": ("contradicted", "retirement_metric_present"),
     }
+
+
+# --- relation catalog ---------------------------------------------------------
+
+
+def test_retirement_resolves_star_over_untouched_model(root: Path) -> None:
+    """a star over an untouched compiled model is judged and not unreadable."""
+
+    branch = _Branch()
+    branch.manifest = {}
+    branch.models["stg_orders"] = _Model(
+        "select 1 as order_id, 10 as amount",
+        "dev.stg_orders",
+        "shop",
+        "models/stg_orders.sql",
+    )
+    branch.models["rpt"] = _Model(
+        "select * from dev.stg_orders",
+        "dev.rpt",
+        "shop",
+        "models/rpt.sql",
+    )
+    catalog = _Catalog(branch, load_project(root), "duckdb", lambda: None)
+    catalog.resolve("rpt")
+    assert branch.models["rpt"].columns == ["amount", "order_id"]
+
+    record = _record("rpt")
+    entry = _Compiled(
+        branch.models["rpt"].columns,
+        branch.models["rpt"].reason,
+        {"stg_orders"},
+        branch.models["rpt"].sql,
+    )
+    compiled = {"proposed": {"rpt": entry}, "retained": {"rpt": entry}}
+    contract = parse_contract(
+        {
+            "behavior": "retire",
+            "retained_value": False,
+            "outputs": {"rpt": {"expected": ["order_id", "amount"], "removed": []}},
+        }
+    )
+    _judge("rpt", record, contract, compiled, "duckdb")
+    assert record["status"] == "satisfied"
+    assert not any(c["check"] == "unreadable_select" for c in record["checks"])
+
+
+def test_retirement_resolves_star_over_seed(root: Path) -> None:
+    """a star over a project seed reads its csv header and is judged."""
+
+    _write(root / "seeds/rates.csv", "currency,rate\nUSD,1.0\nEUR,0.9\n")
+    branch = _Branch()
+    branch.manifest = {
+        "nodes": {
+            "seed.shop.rates": {
+                "relation_name": "dev.rates",
+                "original_file_path": "seeds/rates.csv",
+            }
+        }
+    }
+    branch.models["rpt"] = _Model(
+        "select * from dev.rates",
+        "dev.rpt",
+        "shop",
+        "models/rpt.sql",
+    )
+    catalog = _Catalog(branch, load_project(root), "duckdb", lambda: None)
+    catalog.resolve("rpt")
+    assert branch.models["rpt"].columns == ["currency", "rate"]
+
+    record = _record("rpt")
+    entry = _Compiled(
+        branch.models["rpt"].columns,
+        branch.models["rpt"].reason,
+        set(),
+        branch.models["rpt"].sql,
+    )
+    compiled = {"proposed": {"rpt": entry}, "retained": {"rpt": entry}}
+    contract = parse_contract(
+        {
+            "behavior": "retire",
+            "retained_value": False,
+            "outputs": {"rpt": {"expected": ["currency", "rate"], "removed": []}},
+        }
+    )
+    _judge("rpt", record, contract, compiled, "duckdb")
+    assert record["status"] == "satisfied"
+    assert not any(c["check"] == "unreadable_select" for c in record["checks"])
+
+
+def test_retirement_resolves_star_over_profiled_source(root: Path) -> None:
+    """a star over a profiled source reads cached columns and is judged."""
+
+    branch = _Branch()
+    branch.manifest = {
+        "sources": {
+            "source.shop.raw.orders": {
+                "relation_name": "dev.raw_orders",
+                "schema": "raw",
+                "name": "orders",
+                "identifier": "orders",
+            }
+        }
+    }
+    branch.models["rpt"] = _Model(
+        "select * from dev.raw_orders",
+        "dev.rpt",
+        "shop",
+        "models/rpt.sql",
+    )
+    cached_dataset = SimpleNamespace(
+        identifier="raw.orders",
+        columns=[SimpleNamespace(name="order_id"), SimpleNamespace(name="total")],
+    )
+    cache = SimpleNamespace(datasets=[cached_dataset])
+    catalog = _Catalog(branch, load_project(root), "duckdb", lambda: cache)
+    catalog.resolve("rpt")
+    assert branch.models["rpt"].columns == ["order_id", "total"]
+
+    record = _record("rpt")
+    entry = _Compiled(
+        branch.models["rpt"].columns,
+        branch.models["rpt"].reason,
+        set(),
+        branch.models["rpt"].sql,
+    )
+    compiled = {"proposed": {"rpt": entry}, "retained": {"rpt": entry}}
+    contract = parse_contract(
+        {
+            "behavior": "retire",
+            "retained_value": False,
+            "outputs": {"rpt": {"expected": ["order_id", "total"], "removed": []}},
+        }
+    )
+    _judge("rpt", record, contract, compiled, "duckdb")
+    assert record["status"] == "satisfied"
+    assert not any(c["check"] == "unreadable_select" for c in record["checks"])
+
+
+def test_retirement_model_selecting_stars_from_model_seed_and_source(
+    root: Path,
+) -> None:
+    """a retirement reading stars over an untouched model, seed and source."""
+
+    _write(root / "seeds/rates.csv", "currency,rate\nUSD,1.0\n")
+    branch = _Branch()
+    branch.manifest = {
+        "nodes": {
+            "seed.shop.rates": {
+                "relation_name": "dev.rates",
+                "original_file_path": "seeds/rates.csv",
+            }
+        },
+        "sources": {
+            "source.shop.raw.orders": {
+                "relation_name": "dev.raw_orders",
+                "schema": "raw",
+                "name": "orders",
+                "identifier": "orders",
+            }
+        },
+    }
+    branch.models["stg_users"] = _Model(
+        "select 1 as user_id, 'alice' as user_name",
+        "dev.stg_users",
+        "shop",
+        "models/stg_users.sql",
+    )
+    branch.models["rpt"] = _Model(
+        (
+            "with u as (select * from dev.stg_users),\n"
+            "r as (select * from dev.rates),\n"
+            "o as (select * from dev.raw_orders)\n"
+            "select u.user_id, r.currency, o.total\n"
+            "from u cross join r cross join o\n"
+        ),
+        "dev.rpt",
+        "shop",
+        "models/rpt.sql",
+    )
+    cached_dataset = SimpleNamespace(
+        identifier="raw.orders",
+        columns=[SimpleNamespace(name="order_id"), SimpleNamespace(name="total")],
+    )
+    cache = SimpleNamespace(datasets=[cached_dataset])
+    catalog = _Catalog(branch, load_project(root), "duckdb", lambda: cache)
+    catalog.resolve("rpt")
+    assert branch.models["rpt"].columns == ["currency", "total", "user_id"]
+
+    record = _record("rpt")
+    entry = _Compiled(
+        branch.models["rpt"].columns,
+        branch.models["rpt"].reason,
+        {"stg_users"},
+        branch.models["rpt"].sql,
+    )
+    compiled = {"proposed": {"rpt": entry}, "retained": {"rpt": entry}}
+    contract = parse_contract(
+        {
+            "behavior": "retire",
+            "retained_value": False,
+            "outputs": {
+                "rpt": {
+                    "expected": ["user_id", "currency", "total"],
+                    "removed": [],
+                }
+            },
+        }
+    )
+    _judge("rpt", record, contract, compiled, "duckdb")
+    assert record["status"] == "satisfied"
+    assert not any(c["check"] == "unreadable_select" for c in record["checks"])
+
+
+def test_retirement_unprofiled_source_stays_unchecked_naming_explore_profile(
+    root: Path,
+) -> None:
+    """an unprofiled source stays unchecked and names explore profile."""
+
+    branch = _Branch()
+    branch.manifest = {
+        "sources": {
+            "source.shop.raw.orders": {
+                "relation_name": "dev.raw_orders",
+                "schema": "raw",
+                "name": "orders",
+                "identifier": "orders",
+            }
+        }
+    }
+    branch.models["rpt"] = _Model(
+        "select * from dev.raw_orders",
+        "dev.rpt",
+        "shop",
+        "models/rpt.sql",
+    )
+    catalog = _Catalog(branch, load_project(root), "duckdb", lambda: None)
+    catalog.resolve("rpt")
+    assert branch.models["rpt"].columns is None
+    assert "dex explore profile raw.orders" in str(branch.models["rpt"].reason)
+
+    record = _record("rpt")
+    entry = _Compiled(
+        branch.models["rpt"].columns,
+        branch.models["rpt"].reason,
+        set(),
+        branch.models["rpt"].sql,
+    )
+    compiled = {"proposed": {"rpt": entry}, "retained": {}}
+    contract = parse_contract(CONTRACT)
+    _judge("rpt", record, contract, compiled, "duckdb")
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "unreadable_select"
+    assert "dex explore profile raw.orders" in record["reason"]
+
+
+def test_compile_tree_selects_judged_models_and_ancestors(monkeypatch: Any) -> None:
+    """shadow compilation restricts selector to judged models and ancestors."""
+
+    from exmergo_dex_core.transform.retirement import _compile_tree
+
+    recorded: list[str] = []
+
+    class DummyShadow:
+        """dummy shadow capturing the compilation selector."""
+
+        def strip_run_hooks(self) -> None:
+            """dummy strip run hooks."""
+
+        def compile(self, selector: str, vars_: Any = None) -> dict[str, Any]:
+            """capture selector and return minimal manifest."""
+            recorded.append(selector)
+            return {"nodes": {}}
+
+        def __enter__(self) -> DummyShadow:
+            """enter context."""
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            """exit context."""
+
+    monkeypatch.setattr(
+        "exmergo_dex_core.transform.refactor_compare._shadow",
+        lambda *args, **kwargs: DummyShadow(),
+    )
+    engine = SimpleNamespace(config=SimpleNamespace(dbt_target="dev"))
+    view = SimpleNamespace(project_name="shop", files={})
+    stored = SimpleNamespace(edits=[])
+    _compile_tree(
+        engine,  # type: ignore[arg-type]
+        stored,
+        Path(),
+        view,  # type: ignore[arg-type]
+        ["rpt_orders", "rpt_summary"],
+        "duckdb",
+    )
+    assert recorded == ["+rpt_orders +rpt_summary"]
