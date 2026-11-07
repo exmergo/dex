@@ -187,6 +187,18 @@ def match_key(node: exp.Expression | None) -> str:
     return text(node).lower()
 
 
+def unqualified_key(node: exp.Expression) -> str:
+    """:func:`match_key` with table qualifiers dropped from every column, so
+    renaming an alias or re-casing an identifier is not a change."""
+
+    bare = node.copy()
+    for column in bare.find_all(exp.Column):
+        column.set("table", None)
+        column.set("db", None)
+        column.set("catalog", None)
+    return match_key(bare)
+
+
 def relation_key(node: exp.Expression | None) -> str:
     """A relation's identity with its alias removed.
 
