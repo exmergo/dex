@@ -1203,10 +1203,9 @@ def diagnose(
     cache = readable_cache(engine.store) if counting else None
     detection_cache = cache if cache is not None else readable_cache(engine.store)
     resolver = (
-        cache_resolver(cache, dialect, declared_source_relations(view))
-        if counting
-        else naming_resolver
+        cache_resolver(cache, dialect) if counting else naming_resolver
     )
+    source_relations = declared_source_relations(view)
     total = 0
     for edit in edits:
         if edit.kind is not EditKind.MODEL_SQL or edit.op is not EditOp.UPSERT:
@@ -1260,14 +1259,18 @@ def diagnose(
         if counting:
             try:
                 authored_tree = sqlglot.parse_one(
-                    render_model_sql(edit.new_content, resolver, view.vars),
+                    render_model_sql(
+                        edit.new_content, resolver, view.vars, source_relations
+                    ),
                     dialect=dialect,
                 )
                 prior_tree = None
                 if prior_sql is not None:
                     try:
                         prior_tree = sqlglot.parse_one(
-                            render_model_sql(prior_sql, resolver, view.vars),
+                            render_model_sql(
+                                prior_sql, resolver, view.vars, source_relations
+                            ),
                             dialect=dialect,
                         )
                     except (UnattributableError, sqlglot.errors.ParseError):

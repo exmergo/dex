@@ -187,22 +187,16 @@ def naming_resolver(name: str) -> str:
     return name
 
 
-def cache_resolver(
-    cache: DexCache | None,
-    dialect: str,
-    source_relations: Mapping[tuple[str, str], str] | None = None,
-) -> Resolver:
+def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
     """Resolve through the same :func:`~..cache.match_identifier` the query
     firewall and ``explore profile`` use, so nothing here reimplements dbt's own
     resolution and a name dex cannot place fails the way it fails everywhere
     else.
 
-    ``source_relations`` is what the project declares its sources resolve to
-    (``declared_source_relations``). A ``source()`` key is looked up there first,
-    because a source's table ``identifier`` -- not its logical name -- is what
-    the warehouse holds; the written table name stays the fallback, and both are
-    tried before a key counts as unplaceable. The bare identifier is what the
-    refusal names, since it is what ``explore profile`` can be pointed at."""
+    A dotted name is the physical relation the project declared its source to
+    resolve to: the whole thing is tried first, then its bare object name,
+    because that bare identifier is what the warehouse holds and what
+    ``explore profile`` can be pointed at."""
 
     known = [d.identifier for d in cache.datasets] if cache is not None else []
 
@@ -212,17 +206,11 @@ def cache_resolver(
                 f"there is no exploration cache, so '{name}' cannot be resolved to "
                 "a warehouse relation; run `explore map` first"
             )
-        # The dotted key order is most-literal first: the declared relation as
-        # written, then its bare object name. `ref()` keys carry no dot and fall
-        # straight through to the written model name.
-        targets: list[str] = []
-        relation = None
+        # Most-literal first: a declared relation as written, then the bare
+        # object name a dotted one points at. A ref() key carries no dot and
+        # matches exactly.
+        targets = [name]
         if "." in name:
-            relation = (source_relations or {}).get(tuple(name.split(".", 1)))
-        if relation:
-            targets.append(relation)
-            targets.append(relation.rsplit(".", 1)[-1])
-        else:
             targets.append(name.rsplit(".", 1)[-1])
         matches: list[str] = []
         for target in targets:
@@ -254,6 +242,7 @@ def render_model_sql(
     sql: str,
     resolve: Resolver,
     vars: Mapping[str, Any] | None = None,
+    source_relations: Mapping[tuple[str, str], str] | None = None,
 ) -> str:
     """A dbt model reduced to plain SQL over relations ``resolve`` can name.
 
@@ -264,6 +253,13 @@ def render_model_sql(
     call or an ``{% if %}`` means the rendered shape is not the shape dex can
     see, and guessing at it would attribute a delta to a statement the warehouse
     never runs.
+
+    ``source('a', 'b')`` resolves by its bare table name, the relation
+    ``explore profile`` reads -- unless the caller passes
+    ``source_relations`` (what the project's manifest declares the source to
+    resolve to), in which case a declared pair hands its physical relation to
+    ``resolve`` instead, because a source's table ``identifier``, not its
+    logical name, is what the warehouse holds.
 
     The scan is :func:`~..dbt_project.jinja_regions`; the refusals are this
     function's own. The reference index reads the same regions and reports what
@@ -310,12 +306,15 @@ def render_model_sql(
                 f"{{{{ {_clip(region.body.strip())} }}}}"
             )
         # ref('pkg', 'model') names the model last. A source names its table the
-        # same way, but the pair is the key: a source's physical relation can
-        # differ from its logical name and from the table's own (a table
-        # `identifier`), and only the project knows which. `source()` always has
-        # exactly two literal arguments here, both checked above.
+        # same way, but the pair is the key: only the project's manifest knows
+        # which relation the pair resolves to, and only when the caller chose to
+        # share it. Without that, the bare table name is the relation
+        # `explore profile` can be pointed at, so it is what resolve gets.
         if call.callee == "source" and len(call.args) >= 2:
-            rendered.append(resolve(f"{call.args[0]}.{call.args[-1]}"))
+            declared = (source_relations or {}).get(
+                (str(call.args[0]), str(call.args[-1]))
+            )
+            rendered.append(resolve(declared if declared is not None else call.args[-1]))
         else:
             rendered.append(resolve(call.args[-1]))
     rendered.append(text[cursor:])
@@ -1014,12 +1013,11 @@ def attribute(
     # reading the same SQL. The cache is loaded only when counting, so the
     # named-only path stays free of both the store read and the connection.
     resolver = (
-        cache_resolver(
-            readable_cache(engine.store), dialect, declared_source_relations(view)
-        )
+        cache_resolver(readable_cache(engine.store), dialect)
         if counting
         else naming_resolver
     )
+    source_relations = declared_source_relations(view)
 
     warnings: list[str] = []
     models: list[_Model] = []
@@ -1034,6 +1032,7 @@ def attribute(
             resolver,
             dialect,
             view.vars,
+            source_relations,
         )
         if model is not None:
             models.append(model)
@@ -1098,6 +1097,7 @@ def _prepare(
     resolve: Resolver,
     dialect: str,
     vars: Mapping[str, Any] | None = None,
+    source_relations: Mapping[tuple[str, str], str] | None = None,
 ) -> _Model | None:
     """Render both versions, classify their difference, and keep the trees.
 
@@ -1116,8 +1116,8 @@ def _prepare(
     record = ModelAttribution(path=path)
     degraded: str | None = None
     try:
-        prior = render_model_sql(prior_sql, resolve, vars)
-        authored = render_model_sql(authored_sql, resolve, vars)
+        prior = render_model_sql(prior_sql, resolve, vars, source_relations)
+        authored = render_model_sql(authored_sql, resolve, vars, source_relations)
     except UnattributableError as exc:
         degraded = str(exc)
         try:

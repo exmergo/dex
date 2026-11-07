@@ -843,10 +843,10 @@ def test_a_set_operation_beside_an_isolable_change_keeps_both():
     [
         ("{{ config(materialized='view') }}\nselect 1", "select 1"),
         ("select * from {{ ref('stg_orders') }}", "select * from stg_orders"),
-        # A source keeps its qualifier: the pair is what the resolver keys on,
-        # so a table `identifier` can be looked up instead of the logical name
-        # (#1158). A `ref()` needs no qualifier -- model names are unique.
-        ("select * from {{ source('raw', 'orders') }}", "select * from raw.orders"),
+        # A source resolves by its bare table name -- the relation `explore
+        # profile` reads -- unless the caller passes the manifest's declared
+        # relations, and a `ref()` needs no qualifier: model names are unique.
+        ("select * from {{ source('raw', 'orders') }}", "select * from orders"),
         ("select * from {{ ref('pkg', 'stg_orders') }}", "select * from stg_orders"),
     ],
 )
@@ -1222,16 +1222,24 @@ def test_a_source_is_resolved_through_its_declared_relation():
     `raw_events` resolves to the physical relation, not the logical name."""
 
     cache = DexCache(datasets=[Dataset(identifier="analytics.main.raw_events")])
-    resolve = cache_resolver(cache, "duckdb", {("feed", "events"): "feed.raw_events"})
-    rendered = render_model_sql("select * from {{ source('feed', 'events') }}", resolve)
+    resolve = cache_resolver(cache, "duckdb")
+    rendered = render_model_sql(
+        "select * from {{ source('feed', 'events') }}",
+        resolve,
+        source_relations={("feed", "events"): "analytics.main.raw_events"},
+    )
     assert "raw_events" in rendered
 
 
 def test_an_unplaceable_source_refusal_names_the_physical_identifier():
     cache = DexCache(datasets=[Dataset(identifier="elsewhere.main.other")])
-    resolve = cache_resolver(cache, "duckdb", {("feed", "events"): "feed.raw_events"})
+    resolve = cache_resolver(cache, "duckdb")
     with pytest.raises(UnattributableError) as excinfo:
-        render_model_sql("select * from {{ source('feed', 'events') }}", resolve)
+        render_model_sql(
+            "select * from {{ source('feed', 'events') }}",
+            resolve,
+            source_relations={("feed", "events"): "feed.raw_events"},
+        )
     assert "raw_events" in str(excinfo.value)
     assert "explore profile raw_events" in str(excinfo.value)
 
@@ -1241,7 +1249,7 @@ def test_a_source_without_a_declared_relation_keeps_the_name_lookup():
     always was for a project whose sources dex cannot see."""
 
     cache = DexCache(datasets=[Dataset(identifier="main.raw_orders")])
-    resolve = cache_resolver(cache, "duckdb", {})
+    resolve = cache_resolver(cache, "duckdb")
     rendered = render_model_sql(
         "select * from {{ source('raw', 'raw_orders') }}", resolve
     )
