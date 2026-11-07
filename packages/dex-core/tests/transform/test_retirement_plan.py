@@ -13,6 +13,7 @@ from .test_retirement_build import (
     PERMANENT,
     RETIRE,
     RETIRE_SQL,
+    _build_verify,
     _records,
     _remove,
     _run,
@@ -186,3 +187,71 @@ def test_a_star_over_an_untouched_model_and_unprofiled_source(repo, capsys):
     assert records["rpt_events"]["status"] == "unchecked"
     assert records["rpt_events"]["reason_code"] == "unreadable_select"
     assert "dex explore profile raw.events" in records["rpt_events"]["reason"]
+
+
+# --- column-parse limits alone run the full contract (#1172) -----------------
+
+#: A conditional group-by count: blanking the Jinja keeps both branches
+#: (``group by 1, 2 1``), so the source scan cannot parse this file, while its
+#: compiled SQL is plain. It reads no var, so only its columns are in doubt.
+UNPARSED = (
+    "select {cols}, count(*) as n\nfrom {{{{ ref('rpt_orders') }}}}\n"
+    "group by {{% if target.name == 'dev' %}}{full}{{% else %}}1{{% endif %}}\n"
+)
+
+
+def test_column_parse_limits_alone_plan_the_full_contract(repo, capsys):
+    """Judged from compiled SQL where it compiles; unchecked only where not."""
+
+    shop = repo / "shop"
+    _write(shop / "models/rpt_by_order.sql", UNPARSED.format(cols="order_id", full="1"))
+    _write(
+        shop / "models/rpt_disabled_reader.sql",
+        "{{ config(enabled=false) }}\n" + UNPARSED.format(cols="order_id", full="1"),
+    )
+    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
+    assert planned["status"] == "ok", planned["errors"]
+    retirement = planned["data"]["retirement"]
+    assert "discovery" not in retirement
+    reads = retirement["column_reads"]
+    assert reads["read_from_compiled"] == ["models/rpt_by_order.sql"]
+    assert reads["coverage"] == "partial"
+    assert reads["unchecked"] == ["models/rpt_disabled_reader.sql"]
+    assert retirement["verdict"] == "unchecked"
+    assert any(
+        "models/rpt_disabled_reader.sql" in w and "unchecked" in w
+        for w in planned["warnings"]
+    )
+    # The build owes the unread file.
+    built = _build_verify(repo, capsys, planned["data"]["plan_id"])
+    records = built["data"]["verification"]["retirement"]
+    (owed,) = [r for r in records if r.get("check") == "removed_column_reads"]
+    assert owed["status"] == "unchecked"
+    assert owed["unchecked"] == ["models/rpt_disabled_reader.sql"]
+
+
+def test_a_removed_column_read_where_the_source_does_not_parse_is_caught(repo, capsys):
+    """The compiled SQL finds the read the jinja-blanked scan could not."""
+
+    _write(
+        repo / "shop/models/rpt_by_region.sql",
+        UNPARSED.format(cols="order_id, region_label", full="1, 2"),
+    )
+    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
+    assert planned["status"] == "ok", planned["errors"]
+    retirement = planned["data"]["retirement"]
+    assert retirement["column_reads"]["coverage"] == "complete"
+    assert retirement["verdict"] == "contradicted"
+    checks = _records(planned)["rpt_orders"]["checks"]
+    (still,) = [c for c in checks if c["check"] == "removed_column_still_read"]
+    assert "models/rpt_by_region.sql" in still["detail"]
+
+
+def test_a_rename_still_refuses_on_a_column_parse_limit(repo, capsys):
+    _write(
+        repo / "shop/models/rpt_by_order.sql",
+        UNPARSED.format(cols="order_id", full="1"),
+    )
+    refused = _run(repo, capsys, "transform", "rename", "var", FLAG, "use_regions")
+    assert refused["status"] == "error"
+    assert "could not parse the SQL for columns" in " ".join(refused["errors"])

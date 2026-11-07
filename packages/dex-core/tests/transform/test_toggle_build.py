@@ -204,7 +204,7 @@ def test_gating_only_the_mart_names_every_other_producer(repo: Path, capsys) -> 
     """Gating only the mart names every other producer."""
 
     out = _plan(repo, capsys, MART_ONLY)
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     toggle = out["data"]["toggle"]
     assert toggle["verdict"] == "contradicted"
     models = _models(out)
@@ -242,7 +242,7 @@ def test_every_producer_gated_is_satisfied_and_builds_clean(repo: Path, capsys) 
     """Every producer gated is satisfied and builds clean."""
 
     out = _plan(repo, capsys, GATED)
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     toggle = out["data"]["toggle"]
     assert toggle["verdict"] == "satisfied", toggle
     assert toggle["completeness"] == "complete"
@@ -334,7 +334,12 @@ def test_an_on_build_keeps_every_producer(repo: Path, capsys) -> None:
 def test_a_dropped_on_column_and_a_dynamic_read_are_reported(
     repo: Path, capsys
 ) -> None:
-    """A dropped on column and a dynamic read are reported."""
+    """A dropped on column is contradicted; a dynamic read is attributed.
+
+    The compile passes the flag's value to every ``var()``, dynamic or not, so
+    the read is judged inside its model's compiled SQL and is not a limit
+    (#1156).
+    """
 
     dropped = dict(GATED)
     dropped["ledger_entries"] = "select 'L1' as entry_id, 50 as debit\n"
@@ -348,8 +353,10 @@ def test_a_dropped_on_column_and_a_dynamic_read_are_reported(
     toggle = out["data"]["toggle"]
     models = _models(out)
     assert models["ledger_entries"]["finding"] == "governed_column_lost_when_on"
-    assert toggle["completeness"] == "incomplete"
-    assert any("rpt_dynamic.sql" in limit for limit in toggle["limits"])
+    assert not any("rpt_dynamic.sql" in limit for limit in toggle["limits"])
+    (dynamic_read,) = toggle["dynamic_reads"]
+    assert dynamic_read["path"] == "models/rpt_dynamic.sql"
+    assert dynamic_read["models"] == ["rpt_dynamic"]
 
 
 def test_refusals(repo: Path, capsys) -> None:
@@ -426,7 +433,7 @@ def test_a_failed_analysis_keeps_the_plan_and_its_contract(
 
     monkeypatch.setattr(toggle_mod, "analyze", broken)
     out = _plan(repo, capsys, GATED)
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     assert out["data"]["toggle"]["verdict"] == "unchecked"
     assert "KeyError" in out["data"]["toggle"]["limits"][0]
     exported = _run(repo, capsys, "transform", "export", out["data"]["plan_id"])
@@ -509,7 +516,7 @@ def test_compare_refuses_a_parent_only_the_on_branch_reads(repo: Path, capsys) -
         joined,
         toggle={**TOGGLE, "columns": ["fee_amount", "fees", "fee_rate"]},
     )
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     compared = _run(
         repo,
         capsys,
@@ -523,3 +530,105 @@ def test_compare_refuses_a_parent_only_the_on_branch_reads(repo: Path, capsys) -
     assert compared["data"]["reason_code"] == "inputs_unsynchronized"
     assert "read only with" in compared["data"]["detail"]
     assert "fee_rates" in compared["data"]["detail"]
+
+
+# --- compiled SQL is the judge (#1156) -------------------------------------
+
+#: A select list and a group-by count gated together: blanking the Jinja
+#: leaves ``group by`` with nothing after it, so the source scan cannot parse
+#: the file, while the compiled SQL is plain at either value.
+BY_ORDER = (
+    "select order_id, amount\n" + ON + ", fee_amount{% endif %}\n"
+    ", count(*) as line_count\n"
+    "from {{ ref('stg_orders') }}\n"
+    "group by " + ON + "1, 2, 3{% else %}1, 2{% endif %}\n"
+)
+FEE_MACRO = "{% macro fee_columns() %}" + ON + ", fee_amount{% endif %}{% endmacro %}\n"
+VIA_MACRO = "select order_id {{ fee_columns() }}\nfrom {{ ref('stg_orders') }}\n"
+DISABLED = (
+    "{{ config(enabled=false) }}\nselect 1 as order_id\n"
+    + ON
+    + ", 1 as fee_amount{% endif %}\n"
+)
+
+
+def _extra(files: dict[str, str]) -> list[dict]:
+    """Edits writing ``files``, each as the kind its path calls for."""
+
+    return [
+        {
+            "path": path,
+            "kind": "macro_sql" if path.startswith("macros/") else "model_sql",
+            "content": text,
+        }
+        for path, text in files.items()
+    ]
+
+
+def test_a_gated_select_list_a_macro_read_and_a_disabled_model(
+    repo: Path, capsys
+) -> None:
+    """Judged from compiled SQL at both values, with only the disabled model owed.
+
+    The fixture the issue asks for: a conditional select list with its
+    conditional group-by count, a flag read inside a project macro, and a
+    disabled model that reads the flag.
+    """
+
+    out = _plan(
+        repo,
+        capsys,
+        GATED,
+        extra=_extra(
+            {
+                "models/rpt_by_order.sql": BY_ORDER,
+                "macros/fee_columns.sql": FEE_MACRO,
+                "models/rpt_via_macro.sql": VIA_MACRO,
+                "models/legacy_fees.sql": DISABLED,
+            }
+        ),
+    )
+    assert out["status"] == "ok", out["errors"]
+    toggle = out["data"]["toggle"]
+    models = _models(out)
+    # Judged at both values, not unchecked.
+    by_order = models["rpt_by_order"]
+    assert by_order["status"] == "satisfied", by_order
+    assert by_order["branches"] == {
+        "on": ["amount", "fee_amount", "line_count", "order_id"],
+        "off": ["amount", "line_count", "order_id"],
+    }
+    assert models["rpt_via_macro"]["produces"] == ["fee_amount"]
+    assert models["rpt_via_macro"]["status"] == "satisfied"
+    assert not any("could not parse" in limit for limit in toggle["limits"])
+    # The macro's read is attributed to the model that calls it.
+    (macro,) = [
+        r for r in toggle["macro_reads"] if r["path"] == "macros/fee_columns.sql"
+    ]
+    assert macro["models"] == ["rpt_via_macro"]
+    # Only the disabled model is owed.
+    assert toggle["not_compiled"] == [
+        {"model": "legacy_fees", "path": "models/legacy_fees.sql"}
+    ]
+    assert models["legacy_fees"]["reason_code"] == "not_compiled"
+    assert toggle["completeness"] == "incomplete"
+    assert toggle["verdict"] == "unchecked"
+    (limit,) = toggle["limits"]
+    assert "legacy_fees" in limit
+
+
+def test_one_model_that_does_not_compile_leaves_the_rest_judged(
+    repo: Path, capsys
+) -> None:
+    """dbt stops a compile at the first failing node; Dex sets it aside."""
+
+    broken = "select {{ no_such_macro() }} as order_id\n"
+    out = _plan(repo, capsys, GATED, extra=_extra({"models/rpt_broken.sql": broken}))
+    assert out["status"] == "ok", out["errors"]
+    models = _models(out)
+    assert models["rpt_broken"]["status"] == "unchecked"
+    assert models["rpt_broken"]["reason_code"] == "compile_failed"
+    assert "no_such_macro" in models["rpt_broken"]["reason"]
+    assert models["rpt_revenue"]["status"] == "satisfied"
+    assert models["rpt_revenue"]["produces"] == ["fees"]
+    assert models["rpt_lines_wide"]["status"] == "satisfied"

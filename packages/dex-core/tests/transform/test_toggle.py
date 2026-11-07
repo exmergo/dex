@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from exmergo_dex_core.transform import toggle
+from exmergo_dex_core.transform import compiled_tree, toggle
 from exmergo_dex_core.transform.native_semantic import (
     edits_from_payload,
     payload_from_file,
@@ -151,7 +151,7 @@ def test_the_plan_still_refuses_a_retirement(tmp_path: Path) -> None:
 def _model(columns: list[str] | None, sql: str = "", reason: str | None = None):
     """A compiled model with the given columns, or none and a reason."""
 
-    model = toggle._Model(sql, None, "shop", "")
+    model = compiled_tree.Model(sql, None, "shop", "")
     model.columns = columns
     model.reason = reason
     return model
@@ -162,10 +162,10 @@ def _branches(on=None, off=None, before=None, *, disabled_off=()):
 
     out = {}
     for name, models in (("on", on), ("off", off), ("before", before)):
-        branch = toggle._Branch()
+        branch = compiled_tree.Branch()
         branch.models = models or {}
         out[name] = branch
-    out["off"].disabled = set(disabled_off)
+    out["off"].disabled = {name: f"models/{name}.sql" for name in disabled_off}
     return out
 
 

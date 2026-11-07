@@ -276,6 +276,10 @@ def introspection_shape(sql: str, dialect: str) -> str | None:
     return None
 
 
+#: Appended to a disabled model in the throwaway copy, so dbt compiles it.
+_FORCE_ENABLED = "{{ config(enabled=true) }}"
+
+
 def compile_models(
     engine, edits: list[PlanEdit]
 ) -> tuple[dict[str, CompiledModel], CompileQueries]:
@@ -381,6 +385,31 @@ def compile_models(
                 raise EditValidationError(
                     "dbt compile failed: "
                     + (messages[0] if messages else "no compiled models")
+                )
+            # dbt compiles no SQL for a disabled model, and a model disabled
+            # today can be enabled by the next build (a flag, a config change),
+            # so its SELECT is checked anyway: compiled once more in this copy
+            # with an in-file `enabled=true`, which outranks a YAML or project
+            # setting (#1156). The project's own file is never changed.
+            disabled = sorted(set(reply.get("disabled") or ()) & set(wanted))
+            if disabled:
+                for path in disabled:
+                    (shadow / path).write_text(
+                        wanted[path].new_content + "\n" + _FORCE_ENABLED + "\n",
+                        encoding="utf-8",
+                    )
+                reply, more = _worker(project, spec, broker)
+                if not reply.get("success"):
+                    raise EditValidationError(
+                        "dbt compile failed with the disabled model(s) "
+                        f"{', '.join(disabled)} enabled to check them: "
+                        + (more[0] if more else "no compiled models")
+                    )
+                messages = [*messages, *more]
+                broker.warnings.extend(
+                    f"{path}: dbt leaves this model disabled, so it is not built; "
+                    "Dex compiled it enabled to check its SQL"
+                    for path in disabled
                 )
             compiled = {}
             for path, edit in wanted.items():

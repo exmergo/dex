@@ -166,6 +166,11 @@ class ReferenceIndex:
         #: this list to explain why it cannot rule out a missing definition;
         #: references and rewrites treat skipped YAML as an incomplete index.
         self.unread: list[str] = []
+        #: Files whose SQL the column scan could not parse once its Jinja was
+        #: blanked. Each also stands in ``limits`` for every existing reader.
+        #: It bounds column references only: a ``var()``, ``ref()`` or macro
+        #: call is found by the Jinja scan, which read these files (#1172).
+        self.column_unread: list[str] = []
 
         self._scan(view, package=None)
         if scan_packages:
@@ -879,7 +884,8 @@ class ReferenceIndex:
         try:
             parsed = sqlglot.parse_one(blanked)
         except Exception:
-            self.limits.append(f"{path}: dex could not parse the SQL for columns")
+            self.limits.append(column_parse_limit(path))
+            self.column_unread.append(path)
             return
         if parsed is None:
             return
@@ -1474,6 +1480,12 @@ class _ScalarLines:
 #: put a token nobody typed into a reference report and into a plan's dependency
 #: graph.
 JINJA_PLACEHOLDER = "_dx"
+
+
+def column_parse_limit(path: str) -> str:
+    """The limit a file whose SQL the column scan could not parse stands under."""
+
+    return f"{path}: dex could not parse the SQL for columns"
 
 
 def blank_jinja(content: str) -> str:

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import DbtProjectView, EditOp, node_files, node_name, path_family
 from ..errors import RequestError
-from ..references import KINDS, ReferenceIndex
+from ..references import KINDS, ReferenceIndex, column_parse_limit
 from ..yaml_spans import with_leading_comments
 from .plans import EditKind, PlanEdit
 from .rewrite import (
@@ -376,6 +376,13 @@ def _refuse_incomplete(
         name.rpartition(".")[2] if kind == "column" else name, kind
     )
     limits = list(dict.fromkeys([*index.limits, *query_limits]))
+    if retirement and kind == "var":
+        # A var read is found by the Jinja scan, which read every one of these
+        # files; a column-parse limit bounds only the column reads the
+        # retirement checks itself, from compiled SQL, and reports as partial
+        # where it cannot (#1172). Every other limit still refuses.
+        column = {column_parse_limit(path) for path in index.column_unread}
+        limits = [limit for limit in limits if limit not in column]
     if limits:
         action = "a removal" if verb == "remove" else "a rename"
         raise PropagationRefusedError(

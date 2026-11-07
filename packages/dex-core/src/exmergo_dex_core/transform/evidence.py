@@ -305,6 +305,24 @@ class BuildEvidence(BaseModel):
         return payload
 
 
+def _disabled_models(manifest: Any) -> set[str]:
+    """The models a manifest lists as disabled, by name and version label."""
+
+    names: set[str] = set()
+    if not isinstance(manifest, dict):
+        return names
+    for uid, entries in (manifest.get("disabled") or {}).items():
+        if not str(uid).startswith("model."):
+            continue
+        for node in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                continue
+            names.add(node["name"])
+            if node.get("version") is not None:
+                names.add(f"{node['name']}.v{node['version']}")
+    return names
+
+
 def _file_digest(path: Path) -> str | None:
     if not path.is_file():
         return None
@@ -913,6 +931,16 @@ def build_evidence(
     if edits is not None:
         drift = plan_drift(edits, root)
         required, basis, undetermined = required_nodes(edits, root)
+        # dbt never builds a disabled model, so a plan that edits one (to drop a
+        # flag read from it, say) does not owe a build of it (#1156).
+        disabled = _disabled_models(manifest)
+        idle = [name for name in required if name in disabled and name not in answers]
+        if idle:
+            required = [name for name in required if name not in idle]
+            basis = [
+                *basis,
+                *(f"'{name}' is disabled, so no build runs it" for name in idle),
+            ]
         covered = [name for name in required if name in answers]
         successful = [name for name in covered if name not in unsuccessful_answers]
         coverage = BuildCoverage(

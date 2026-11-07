@@ -9,6 +9,9 @@ from typing import Any
 import pytest
 
 from exmergo_dex_core.dbt_project import load as load_project
+from exmergo_dex_core.transform.compiled_tree import Branch as _Branch
+from exmergo_dex_core.transform.compiled_tree import Catalog as _Catalog
+from exmergo_dex_core.transform.compiled_tree import Model as _Model
 from exmergo_dex_core.transform.native_semantic import (
     edits_from_payload,
     payload_from_file,
@@ -30,7 +33,6 @@ from exmergo_dex_core.transform.retirement import (
     stored_form,
     yaml_reads,
 )
-from exmergo_dex_core.transform.toggle import _Branch, _Catalog, _Model
 
 FLAG = "use_region_enrichment"
 GUARDED = (
@@ -593,10 +595,12 @@ def test_compile_tree_selects_judged_models_and_ancestors(monkeypatch: Any) -> N
         def strip_run_hooks(self) -> None:
             """dummy strip run hooks."""
 
-        def compile(self, selector: str, vars_: Any = None) -> dict[str, Any]:
+        def compile_isolating(
+            self, selector: str, vars_: Any = None
+        ) -> tuple[dict[str, Any], dict[str, str]]:
             """capture selector and return minimal manifest."""
             recorded.append(selector)
-            return {"nodes": {}}
+            return {"nodes": {}}, {}
 
         def __enter__(self) -> DummyShadow:
             """enter context."""
@@ -621,3 +625,93 @@ def test_compile_tree_selects_judged_models_and_ancestors(monkeypatch: Any) -> N
         "duckdb",
     )
     assert recorded == ["+rpt_orders +rpt_summary"]
+
+
+def test_analyze_judges_a_star_over_a_profiled_source_in_every_tree(
+    root: Path, monkeypatch: Any
+) -> None:
+    """Through ``analyze``: each tree resolves the source from the cache.
+
+    A tree that dropped the cache callback would leave the source unchecked
+    and this would fail, which the catalog-level test above cannot see.
+    """
+
+    from exmergo_dex_core.transform import compiled_tree
+    from exmergo_dex_core.transform.retirement import analyze
+
+    def compiled(*_args: Any, **_kwargs: Any) -> Any:
+        branch = _Branch()
+        branch.manifest = {
+            "sources": {
+                "source.shop.raw.orders": {
+                    "relation_name": "dev.raw_orders",
+                    "schema": "raw",
+                    "name": "orders",
+                    "identifier": "orders",
+                }
+            }
+        }
+        branch.models["rpt"] = _Model(
+            "select * from dev.raw_orders", "dev.rpt", "shop", "models/rpt.sql"
+        )
+        return branch
+
+    cache = SimpleNamespace(
+        datasets=[
+            SimpleNamespace(
+                identifier="raw.orders",
+                columns=[
+                    SimpleNamespace(name="order_id"),
+                    SimpleNamespace(name="total"),
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr(compiled_tree, "compile_branch", compiled)
+    monkeypatch.setattr("exmergo_dex_core.storage.readable_cache", lambda _s: cache)
+    engine = SimpleNamespace(
+        connector="duckdb",
+        config=SimpleNamespace(connector="duckdb", dbt_target="dev"),
+        store=None,
+    )
+    contract = parse_contract(
+        {
+            "behavior": "retire",
+            "retained_value": False,
+            "outputs": {"rpt": {"expected": ["order_id", "total"], "removed": []}},
+        }
+    )
+    report = analyze(
+        engine,  # type: ignore[arg-type]
+        SimpleNamespace(edits=[]),
+        root,
+        load_project(root),
+        contract,
+        FLAG,
+    )
+    (record,) = report["models"]
+    assert record["status"] == "satisfied", record
+    assert record["branches"] == {
+        "retained": ["order_id", "total"],
+        "other": ["order_id", "total"],
+        "proposed": ["order_id", "total"],
+    }
+    assert report["column_reads"]["coverage"] == "not_applicable"
+
+
+def test_a_model_disabled_in_every_tree_is_owed_not_missing() -> None:
+    """dbt compiles no SQL for a disabled model; that is not a missing one."""
+
+    from exmergo_dex_core.transform.retirement import _disabled_everywhere
+
+    off = _Branch()
+    off.disabled = {"rpt_fee_history": "models/legacy/rpt_fee_history.sql"}
+    on = _Branch()
+    on.disabled = dict(off.disabled)
+    assert _disabled_everywhere("rpt_fee_history", {"retained": off, "proposed": on})
+    on.disabled = {}
+    on.models["rpt_fee_history"] = _Model("select 1", None, "shop", "")
+    assert not _disabled_everywhere(
+        "rpt_fee_history", {"retained": off, "proposed": on}
+    )
+    assert not _disabled_everywhere("rpt_fee_history", {})

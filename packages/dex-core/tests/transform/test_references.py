@@ -989,3 +989,28 @@ def test_yaml_declared_snapshot_kind_is_independent_of_traversal_order(
         (f"snapshots/{reader_file}", "yaml_snapshot_relation", "snapshot"),
     }
     assert index.references_to("history", "model")[0] == []
+
+
+def test_a_file_the_column_scan_cannot_parse_is_named_apart(tmp_path):
+    """A column-parse limit is also listed structurally (#1172).
+
+    Both branches of a conditional group-by survive blanking, so the scan
+    cannot parse the file; its ``var()`` read is still found.
+    """
+
+    from exmergo_dex_core.dbt_project import load as load_project
+    from exmergo_dex_core.references import ReferenceIndex, column_parse_limit
+
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0"\nprofile: shop\n', encoding="utf-8"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models/rpt.sql").write_text(
+        "select a, b, count(*) as n from t\n"
+        "group by {% if var('wide') %}1, 2{% else %}1{% endif %}\n",
+        encoding="utf-8",
+    )
+    index = ReferenceIndex(load_project(tmp_path), scan_packages=False)
+    assert index.column_unread == ["models/rpt.sql"]
+    assert column_parse_limit("models/rpt.sql") in index.limits
+    assert index.references_to("wide", "var")[0]

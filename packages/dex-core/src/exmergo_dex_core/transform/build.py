@@ -1020,6 +1020,39 @@ class ShadowRun:
             raise DbtRunError(messages[0] if messages else "dbt compile failed")
         return self.manifest()
 
+    def compile_isolating(
+        self,
+        select: str,
+        *,
+        vars_: Mapping[str, Any] | None = None,
+        max_isolated: int = 10,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Compile a selection, setting aside each node whose own compile fails.
+
+        dbt stops a compile at the first node that fails and then writes no
+        compiled SQL for any node, so one broken model would leave a whole
+        project unjudged. Each node dbt names as failing is excluded by its path
+        and the compile is run again, at most ``max_isolated`` times, so a
+        model that does not compile is that model's problem alone. Returns the
+        manifest and ``{original_file_path: message}`` for the nodes set aside.
+        A failure dbt pins on no node (a parse error, no profile) still raises.
+        """
+
+        extra = ["--vars", json.dumps(dict(vars_))] if vars_ else []
+        isolated: dict[str, str] = {}
+        while True:
+            args = ["--select", select, *extra]
+            for path in isolated:
+                args += ["--exclude", f"path:{path}"]
+            completed = self._invoke("compile", *args)
+            if completed.returncode == 0:
+                return self.manifest(), isolated
+            failed = _failed_node(completed)
+            if failed is None or failed[0] in isolated or len(isolated) >= max_isolated:
+                messages = _collect_messages(completed)
+                raise DbtRunError(messages[0] if messages else "dbt compile failed")
+            isolated[failed[0]] = failed[1]
+
     def test(
         self, select: str, *, exclude: Sequence[str] = ()
     ) -> dict[str, Any] | None:
@@ -2576,6 +2609,43 @@ _VALIDATION_HEADER = re.compile(r"^\d+ validation errors? for .+$")
 # --log-format json, baking raw ANSI escapes into info.msg; harmless on a
 # terminal, but unreadable noise once that text crosses into a JSON envelope.
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+#: dbt's header for one node's failure: "Compilation Error in model x (path)".
+_NODE_FAILURE = re.compile(
+    r"Error in (?:model|seed|snapshot|analysis|test|unit_test|sql_operation) "
+    r"\S+ \(([^)\n]+)\)"
+)
+
+
+def _failed_node(completed: subprocess.CompletedProcess) -> tuple[str, str] | None:
+    """The file of the node a failed dbt run names, and why it failed.
+
+    The reason is the first line of dbt's message after its header, redacted
+    and value-masked, so a warehouse error cannot carry a value out.
+    """
+
+    texts: list[str] = []
+    for line in (completed.stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            texts.append(line)
+            continue
+        msg = (event.get("info") or {}).get("msg")
+        if msg:
+            texts.append(str(msg))
+    texts.append(completed.stderr or "")
+    for text in texts:
+        clean = _ANSI_ESCAPE.sub("", text)
+        found = _NODE_FAILURE.search(clean)
+        if found is None:
+            continue
+        rest = [
+            part.strip() for part in clean[found.end() :].splitlines() if part.strip()
+        ]
+        reason = rest[0] if rest else found.group(0)
+        return found.group(1).strip(), redact(mask_values(reason))[:300]
+    return None
 
 
 def _detail_lines(lines: list[str]) -> list[str]:

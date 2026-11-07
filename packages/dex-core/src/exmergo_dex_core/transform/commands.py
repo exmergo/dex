@@ -1518,6 +1518,12 @@ def _retire(
     analysis = retirement_mod.analyze(
         engine, stored, Path(project), view, contract, name
     )
+    if (analysis.get("column_reads") or {}).get("coverage") == "partial":
+        # Carried on the plan so a build for it keeps the unread files among its
+        # unchecked obligations (#1172).
+        stated = {**stated, "column_reads": analysis["column_reads"]}
+        stored.retirement = stated
+        store.save_plan(stored)
     result.retirement = {
         **analysis,
         "contract": stated,
