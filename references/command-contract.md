@@ -757,7 +757,14 @@ would change, computes the diffs, and stores the plan under
 `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
 `packages_yml` is the guarded way to declare dbt package dependencies: a
 reviewable diff like any other edit, then `transform deps` (or the automatic
-deps step in `transform build`) installs them. Installing the packages a project
+deps step in `transform build`) installs them. A plan installs nothing, and dbt
+cannot parse or compile a tree whose declared packages are not installed, so a
+plan that needs dbt's parse or a control-flow compile is refused, naming each
+missing package and `transform deps`. The check reads the post-edit tree
+(#1166): a package the plan's own `packages_yml` edit declares is refused the
+same way, with the route spelled out (the `packages_yml` edit as a plan of its
+own, applied, `transform deps`, then the rest); a `packages_yml`-only plan needs
+no parse and is stored. Installing the packages a project
 declares (at the versions `package-lock.yml` pins, where it matches) is not
 installing or upgrading a tool. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path

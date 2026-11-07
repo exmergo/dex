@@ -1644,3 +1644,323 @@ def test_reserved_column_quoted_or_untested_is_silent(
     dbt_project_dir: Path, schema: str
 ):
     assert _reserved_plan(dbt_project_dir, schema) == []
+
+
+# --- #1166: the package check reads the post-edit tree --------------------------
+
+_DBT_UTILS = 'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n'
+_LOCAL_PKG = "packages:\n  - local: ../shared_pkg\n"
+_SCHEMA_EDIT = {
+    "path": "models/staging/schema.yml",
+    "kind": "schema_yml",
+    "content": (
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n      - name: id\n"
+    ),
+}
+
+
+def _plan(
+    tmp_path: Path, edits: list[dict], capsys, declarations: list[dict] | None = None
+) -> tuple[int, dict]:
+    """Plan ``edits`` (and any ``declarations``) through the CLI."""
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps({"edits": edits, "declarations": declarations or []}),
+        encoding="utf-8",
+    )
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare and use a package",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def _install(project: Path, directory: str, name: str) -> None:
+    """Lay down a package directory the way `dbt deps` would leave it."""
+
+    package = project / "dbt_packages" / directory
+    package.mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        f"name: {name}\nversion: '1.0.0'\nconfig-version: 2\n", encoding="utf-8"
+    )
+
+
+def _parse_passes(monkeypatch) -> list[list]:
+    """Stand in for dbt's parse, recording each call, so a test can say the
+    package gate let the plan through without depending on a real install."""
+
+    import importlib
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls: list[list] = []
+
+    def fake(project_dir, edits, **_kwargs):
+        """Record the call and report a passing parse."""
+
+        calls.append(list(edits))
+        return {"available": True, "reason": None, "success": True, "messages": []}
+
+    monkeypatch.setattr(build_module, "shadow_parse", fake)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("spec", "named"),
+    [(_DBT_UTILS, "dbt-labs/dbt_utils@1.3.0"), (_LOCAL_PKG, "../shared_pkg")],
+    ids=["hub", "local"],
+)
+def test_plan_refuses_a_package_its_own_edit_declares_before_dbt_parses(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch, spec: str, named: str
+):
+    """A package the plan declares is refused in Dex's words before dbt runs (#1166)."""
+
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": spec},
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    message = envelope["errors"][0]
+    assert "this plan declares dbt packages that are not installed" in message
+    assert named in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    assert "packages.yml change on its own" in message
+    # Refused before dbt ran, and planning installed nothing.
+    assert calls == []
+    assert not (dbt_project_dir / "dbt_packages").exists()
+
+
+@pytest.mark.parametrize(
+    ("spec", "directory", "name"),
+    [(_DBT_UTILS, "dbt_utils", "dbt_utils"), (_LOCAL_PKG, "shared_pkg", "shared")],
+    ids=["hub", "local"],
+)
+def test_plan_declaring_an_installed_package_reaches_the_parse(
+    dbt_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    spec: str,
+    directory: str,
+    name: str,
+):
+    """A declared package that is installed passes the gate to dbt's parse."""
+
+    _install(dbt_project_dir, directory, name)
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": spec},
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert len(calls) == 1
+
+
+def test_a_packages_only_plan_is_stored_so_the_two_step_route_works(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The refusal's own advice has to be followable: a plan carrying only the
+    `packages_yml` edit needs no parse, so it is stored even though the package
+    is not installed yet."""
+
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [{"path": "packages.yml", "kind": "packages_yml", "content": _DBT_UTILS}],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert envelope["data"]["paths"] == ["packages.yml"]
+    assert calls == []
+
+
+def test_a_plan_that_stops_declaring_an_uninstalled_package_is_not_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The post-edit tree no longer declares the missing package: not refused."""
+
+    (dbt_project_dir / "packages.yml").write_text(_DBT_UTILS, encoding="utf-8")
+    _install(dbt_project_dir, "shared_pkg", "shared")
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": _LOCAL_PKG},
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert len(calls) == 1
+
+
+def test_a_plan_adding_a_package_names_the_already_missing_ones_apart(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The plan's new package and the project's missing one are named apart."""
+
+    (dbt_project_dir / "packages.yml").write_text(_LOCAL_PKG, encoding="utf-8")
+    _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {
+                "path": "packages.yml",
+                "kind": "packages_yml",
+                "content": _LOCAL_PKG
+                + '  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+            },
+            _SCHEMA_EDIT,
+        ],
+        capsys,
+    )
+    assert rc == 1
+    message = envelope["errors"][0]
+    declared, _, already = message.partition("already declares")
+    assert "dbt-labs/dbt_utils@1.3.0" in declared
+    assert "../shared_pkg" not in declared
+    assert "../shared_pkg" in already
+
+
+def test_a_control_flow_model_with_a_new_package_is_refused_before_compile(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The control-flow compile path gets the same refusal, before dbt compiles."""
+
+    import importlib
+
+    compile_module = importlib.import_module("exmergo_dex_core.transform.compile")
+
+    def must_not_compile(*_args, **_kwargs):
+        """Fail the test if the compile is reached."""
+
+        raise AssertionError("dbt compile ran before the package check")
+
+    monkeypatch.setattr(compile_module, "compile_models", must_not_compile)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": _DBT_UTILS},
+            {
+                "path": "models/staging/stg_flagged.sql",
+                "kind": "model_sql",
+                "content": "{% if true %}select 1 as id{% else %}select 2 as id"
+                "{% endif %}\n",
+            },
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    message = envelope["errors"][0]
+    assert "dbt-labs/dbt_utils@1.3.0" in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+
+
+def test_a_mart_declaration_with_a_new_package_is_refused_before_any_parse(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The derivation of a declared mart runs dbt's parse too; the package check
+    comes before it, so no dbt run is spent on a plan that cannot parse."""
+
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {"path": "packages.yml", "kind": "packages_yml", "content": _DBT_UTILS},
+            {
+                "path": "models/marts/fct_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as order_id, 2.0 as amount\n",
+            },
+        ],
+        capsys,
+        declarations=[
+            {
+                "model": "fct_orders",
+                "description": "One row per order.",
+                "grain": ["order_id"],
+                "columns": {
+                    "order_id": {"role": "key"},
+                    "amount": {"role": "measure", "aggregation": "sum"},
+                },
+            }
+        ],
+    )
+    assert rc == 1 and envelope["status"] == "error", envelope
+    message = envelope["errors"][0]
+    assert "this plan declares dbt packages that are not installed" in message
+    assert "dbt deps" not in message
+    assert calls == []
+
+
+def test_a_sql_only_mart_edit_with_packages_missing_skips_the_derivation_parse(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A SQL-only edit to a declared mart needs no dbt parse of its own, so the
+    plan is stored; the derivation it triggers is left unvalidated in Dex's words
+    instead of spending two parses that dbt would refuse."""
+
+    (dbt_project_dir / "models" / "marts").mkdir(parents=True)
+    (dbt_project_dir / "models" / "marts" / "fct_orders.sql").write_text(
+        "select 1 as order_id, current_date as ordered_at, 2.0 as amount\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "marts" / "fct_orders.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    description: One row per order.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [order_id]\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        config: {meta: {dex: {role: key}}}\n"
+        "      - name: ordered_at\n"
+        "        config: {meta: {dex: {role: time}}}\n"
+        "      - name: amount\n"
+        "        config: {meta: {dex: {role: measure, aggregation: sum}}}\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "packages.yml").write_text(_DBT_UTILS, encoding="utf-8")
+    calls = _parse_passes(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        [
+            {
+                "path": "models/marts/fct_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as order_id, current_date as ordered_at, "
+                "3.0 as amount\n",
+            }
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope["errors"]
+    assert calls == []
+    derived = envelope["data"]["semantic_proposal"]["models"]["fct_orders"]
+    assert derived["status"] == "unvalidated"
+    parse = derived["validation"]["parse"]
+    assert parse["result"] == "not_run"
+    assert "transform deps" in parse["detail"]
+    assert "dbt deps" not in parse["detail"]
+    assert envelope["data"]["paths"] == ["models/marts/fct_orders.sql"]
