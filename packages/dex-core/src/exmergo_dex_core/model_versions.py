@@ -31,6 +31,7 @@ not read versions at all:
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -479,6 +480,60 @@ def effective_entry(
                 break
     out["version"] = version_text(item["v"])
     return out
+
+
+def version_items(entry: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """``(label, item)`` for each item of a model entry's ``versions:`` list."""
+
+    name = entry.get("name")
+    if not isinstance(name, str):
+        return []
+    return [
+        (f"{name}.v{version_text(item['v'])}", item)
+        for item in entry.get("versions") or []
+        if isinstance(item, dict) and "v" in item
+    ]
+
+
+def column_versions(entry: Mapping[str, Any], column: str) -> list[str]:
+    """The versions that take the top-level column entry ``column`` as their own.
+
+    A version admits it through its ``include``/``exclude`` element, and loses it
+    again where it writes its own entry of that name, which replaces the
+    inherited one wholesale.
+    """
+
+    out = []
+    for label, item in version_items(entry):
+        include, exclude, _ = include_exclude(item)
+        if not includes(include, exclude, column):
+            continue
+        if any(own["name"] == column for own in own_columns(item)):
+            continue
+        out.append(label)
+    return out
+
+
+def versions_inheriting_tests(entry: Mapping[str, Any]) -> list[str]:
+    """The versions that take the top-level ``data_tests``/``tests`` as theirs:
+    every version that states none of its own."""
+
+    return [
+        label
+        for label, item in version_items(entry)
+        if item.get("data_tests") is None and item.get("tests") is None
+    ]
+
+
+#: The version selector of a ``ref()`` as written: ``v=2``, ``version='1.5'``.
+REF_VERSION = re.compile(r"\b(?:v|version)\s*=\s*['\"]?([A-Za-z0-9_.]+)")
+
+
+def written_ref_version(written: str) -> str | None:
+    """The version a written ``ref(...)`` call pins, or ``None``."""
+
+    pinned = REF_VERSION.search(written)
+    return pinned.group(1) if pinned else None
 
 
 def entry_variants(entry: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
