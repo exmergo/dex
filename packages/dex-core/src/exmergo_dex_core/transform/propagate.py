@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from io import StringIO
 from typing import TYPE_CHECKING, Any
 
+from .. import model_versions as mv
 from ..dbt_project import DbtProjectView, EditOp, node_files, node_name, path_family
 from ..errors import RequestError
 from ..references import KINDS, ReferenceIndex
@@ -46,7 +47,9 @@ from .rewrite import (
     narrow_quotes,
     rename_column_in_sql,
     splice,
+    stop_inheriting_column,
     unproject_column_in_sql,
+    version_list_removals,
     yaml_blocks,
     yaml_names,
 )
@@ -147,14 +150,21 @@ def propagate(
     verb = "rename" if new is not None else "remove"
     if not scoped:
         _refuse_incomplete(index, kind, old, verb=verb, retirement=retirement)
-    owner, column = _resolve_target(index, kind, old)
+    scope = _resolve_target(index, kind, old)
+    column = scope.column
     # Compared against the *bare* name for a column, since `old` carries the
     # model that scopes it and `new` never does: `stg_orders.order_id` renamed to
     # `order_id` is a no-op that these two strings do not look equal.
     if new is not None and new == (column if column is not None else old):
         raise PropagationRefusedError(f"'{new}' is already its name; nothing to do")
 
-    builder = _Builder(view, project_dir, index, kind, old, new, owner, column)
+    builder = _Builder(view, project_dir, index, kind, old, new, scope)
+    pins = index.version_pin_limits(builder.in_scope)
+    if pins and not scoped:
+        raise PropagationRefusedError(
+            f"dex cannot promise it found every use of '{old}': {'; '.join(pins)}. "
+            "Rewrite each to pin a literal version, then re-run"
+        )
     builder.run(allow_nothing=retirement)
     edits = builder.edits() + list(extra_edits or [])
     if retirement:
@@ -412,9 +422,23 @@ def _refuse_incomplete(
         )
 
 
-def _resolve_target(
-    index: ReferenceIndex, kind: str, name: str
-) -> tuple[str | None, str | None]:
+@dataclass
+class _Target:
+    """What a change is scoped to.
+
+    ``roots`` are the nodes that define the column: the model itself, or the
+    files that build the selected versions of a versioned model, whose base
+    name is no node (#1126). ``base`` names that versioned model.
+    """
+
+    owner: str | None = None
+    column: str | None = None
+    roots: set[str] = field(default_factory=set)
+    base: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def _resolve_target(index: ReferenceIndex, kind: str, name: str) -> _Target:
     """The node a change is scoped to, and the bare column where there is one.
 
     A column has to be addressed as ``model.column``. `transform references`
@@ -422,12 +446,15 @@ def _resolve_target(
     reading that list can see which hits are theirs. A rewrite cannot: renaming a
     bare ``id`` would rewrite every unrelated ``id`` in the project, and the
     result would compile.
+
+    A versioned model is addressed by its base name, which selects every version
+    that has the column, or by a version's label, ``dim_teams.v2.team_label``,
+    which selects that one (#1126).
     """
 
     if kind != "column":
-        return None, None
-    node, _, column = name.partition(".")
-    if not column:
+        return _Target()
+    if "." not in name:
         owners = sorted(
             {
                 reference.owner
@@ -441,12 +468,84 @@ def _resolve_target(
             f"column name anywhere in the project, and dex will not rewrite "
             f"every one of them. Try one of: {listed}"
         )
+    node, column = index.split_column(name)
+    selection = index.version_selection(node)
+    if selection is not None:
+        return _versioned_target(index, name, node, column, *selection)
     if index.node_kind(node) is None:
         raise PropagationRefusedError(
             f"'{node}' is not a model, seed or snapshot in this project, so dex "
             f"cannot scope '{name}' to its lineage"
         )
-    return node, column
+    return _Target(owner=node, column=column, roots={node})
+
+
+def _versioned_target(
+    index: ReferenceIndex,
+    name: str,
+    node: str,
+    column: str,
+    model: mv.VersionedModel,
+    labels: list[str],
+) -> _Target:
+    """The versions of ``model`` a change to ``column`` applies to.
+
+    A version that neither selects the column in its SQL nor declares it in its
+    YAML does not have it, so a change on the base name leaves that version and
+    its consumers alone, and a change naming that version is refused.
+    """
+
+    if not labels:
+        raise PropagationRefusedError(
+            f"'{model.base}' has no version '{node.partition('.')[2]}'; its "
+            f"versions are {', '.join(model.labels)}"
+        )
+    built = [label for label in labels if index.version_nodes([label])]
+    having = [label for label in built if _version_has(index, model, label, column)]
+    if not having:
+        which = (
+            f"'{labels[0]}' does not have"
+            if len(labels) == 1
+            else f"no version of '{model.base}' ({', '.join(labels)}) has"
+        )
+        raise PropagationRefusedError(
+            f"{which} a column '{column}': no version file selects it and no "
+            f"`versions:` entry declares it, so there is nothing to change for "
+            f"'{name}'"
+        )
+    notes = [
+        f"'{label}' has no column '{column}', so it and the models that read it "
+        "were left alone"
+        for label in labels
+        if label not in having
+    ]
+    return _Target(
+        owner=node,
+        column=column,
+        roots=index.version_nodes(having),
+        base=model.base,
+        notes=notes,
+    )
+
+
+def _version_has(
+    index: ReferenceIndex, model: mv.VersionedModel, label: str, column: str
+) -> bool:
+    """Whether version ``label`` has ``column``: its file selects it, or the
+    entry dbt builds it from declares it."""
+
+    nodes = index.version_nodes([label])
+    if any(
+        hit.form == "select_column" and hit.owner in nodes
+        for hit in index.references_to(column, "column")[0]
+    ):
+        return True
+    return any(
+        isinstance(declared, dict) and declared.get("name") == column
+        for variant, entry in mv.entry_variants(model.entry)
+        if variant == label
+        for declared in entry.get("columns") or []
+    )
 
 
 class _Builder:
@@ -465,8 +564,7 @@ class _Builder:
         kind: str,
         old: str,
         new: str | None,
-        owner: str | None,
-        column: str | None,
+        target: _Target,
     ) -> None:
         self.view = view
         self.project_dir = project_dir
@@ -474,16 +572,26 @@ class _Builder:
         self.kind = kind
         self.old = old
         self.new = new
-        self.owner = owner
-        self.column = column
+        self.owner = target.owner
+        self.column = target.column
+        self.roots = target.roots
+        self.base = target.base
         self.sites: dict[str, int] = defaultdict(int)
-        self.notes: list[str] = []
+        self.notes: list[str] = list(target.notes)
         self._spans: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
         self._whole: dict[str, str] = {}
         self._moves: list[tuple[str, str]] = []
         self._deletes: list[str] = []
         self._nodes = node_files(view)
-        self.lineage = index.descendants_of(owner) if owner is not None else set()
+        self.lineage = index.column_lineage(self.roots) if self.roots else set()
+        #: The versions of any versioned model the change reaches: the ones it
+        #: names, and the ones built from a model in its lineage (#1126).
+        self.in_scope = {
+            label
+            for model in index.versions.values()
+            for label in model.labels
+            if index.version_nodes([label]) & self.lineage
+        }
 
     # --- the walk ------------------------------------------------------------
 
@@ -566,7 +674,7 @@ class _Builder:
         try:
             if self.new is not None:
                 result = rename_column_in_sql(content, path, column, self.new)
-            elif node == self.owner:
+            elif node in self.roots:
                 result = unproject_column_in_sql(
                     content, path, column, through_ctes=True
                 )
@@ -590,25 +698,107 @@ class _Builder:
         if self.new is None:
             self._yaml_removal(path, content)
             return
-        for name in yaml_names(content):
+        for name in yaml_names(content, self.index.versions):
             if not self._matches(name.name, name.kind):
                 continue
-            if name.kind == "column" and not self._owned(name.owner):
-                continue
+            if name.kind == "column":
+                scope = self._version_scope(name.versions)
+                if scope is None and not self._owned(name.owner):
+                    continue
+                if scope == "none":
+                    continue
+                if scope == "partial":
+                    self._partial(path, content, name)
+                    continue
             self.sites[name.form] += 1
             span = self._replacement_span(name, content)
             if span is not None:
                 self._spans[path].append(span)
 
     def _yaml_removal(self, path: str, content: str) -> None:
-        for block in yaml_blocks(content):
+        for block in yaml_blocks(content, versions=True):
             if not self._matches(block.name, block.kind):
                 continue
-            if block.kind == "column" and not self._owned(block.owner, defining=True):
-                continue
+            if block.kind == "column":
+                if block.versions is not None:
+                    # Only the entry of the versioned model being changed
+                    # defines the column; any other is a read, refused below.
+                    if self.base is None or block.owner != self.base:
+                        continue
+                    scope = self._version_scope(block.versions)
+                    if scope == "none":
+                        continue
+                    if scope == "partial":
+                        self._partial(path, content, block)
+                        continue
+                    if block.version is None:
+                        for form, span in version_list_removals(
+                            content, self.base, block.name
+                        ):
+                            self.sites[form] += 1
+                            self._spans[path].append(span)
+                elif not self._owned(block.owner, defining=True):
+                    continue
             self.sites[block.form] += 1
             start = with_leading_comments(content, block.span[0])
             self._spans[path].append((start, block.span[1], ""))
+
+    def _version_scope(self, versions: list[str] | None) -> str | None:
+        """How much of a versioned model's YAML entry the change reaches.
+
+        ``None`` where the occurrence belongs to no versioned model; ``"all"``
+        where every version it applies to is in scope, ``"none"`` where none is,
+        and ``"partial"`` where it is shared with a version that is not (#1126).
+        """
+
+        if versions is None:
+            return None
+        reached = set(versions) & self.in_scope
+        if not reached:
+            return "none"
+        return "all" if reached == set(versions) else "partial"
+
+    def _partial(self, path: str, content: str, found: Any) -> None:
+        """An occurrence shared by versions in and out of the change's scope.
+
+        A top-level column entry stays for the versions the change does not
+        reach, and each version it does reach stops inheriting it, declaring its
+        own entry under the new name for a rename. The name in an ``include``
+        or ``exclude`` list goes with that edit. A test the versions share is
+        refused, since dex cannot split one test into two.
+        """
+
+        if found.form in ("yaml_version_include", "yaml_version_exclude"):
+            return
+        reached = sorted(set(found.versions) & self.in_scope)
+        others = sorted(set(found.versions) - self.in_scope)
+        line = content.count("\n", 0, found.span[0]) + 1
+        if found.form != "yaml_column" or found.version is not None:
+            raise PropagationRefusedError(
+                f"{path}:{line} names '{found.name}' for {', '.join(found.versions)}, "
+                f"and this change reaches only {', '.join(reached)}. dex will not "
+                "split one test between versions: give each version its own "
+                "tests, or change the column on every version, and re-run"
+            )
+        for label in reached:
+            try:
+                spans = stop_inheriting_column(
+                    content, found.owner, label, found.name, self.new
+                )
+            except RewriteError as exc:
+                raise PropagationRefusedError(str(exc)) from exc
+            self._spans[path].extend(spans)
+        self.sites[found.form] += 1
+        verb = (
+            f"declares its own '{self.new}', copied from it"
+            if self.new is not None
+            else "no longer has it"
+        )
+        self.notes.append(
+            f"{path}:{line}: the top-level column '{found.name}' is shared with "
+            f"{', '.join(others)}, so it was kept; {', '.join(reached)} now "
+            f"{'excludes' if len(reached) == 1 else 'exclude'} it and {verb}"
+        )
 
     def _seed_file(self, path: str, content: str) -> None:
         """A seed's header row, and never a row below it.
@@ -618,7 +808,7 @@ class _Builder:
         rename may touch.
         """
 
-        if self.kind != "column" or node_name(path) != self.owner:
+        if self.kind != "column" or node_name(path) not in self.roots:
             return
         header = next(csv.reader(StringIO(content)), [])
         if self.column not in header:
@@ -683,7 +873,7 @@ class _Builder:
             return True
         if owner is None:
             return False
-        return owner == self.owner if defining else owner in self.lineage
+        return owner in self.roots if defining else owner in self.lineage
 
     def _replacement_span(
         self, name: Any, content: str | None = None
