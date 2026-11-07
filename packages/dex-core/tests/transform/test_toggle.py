@@ -703,21 +703,29 @@ def test_each_test_still_running_off_is_named_with_its_line(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    ("on_value", "expression"),
+    ("on_value", "off_value", "expression"),
     [
-        (True, "{{ var('flag') }}"),
-        (False, "{{ not var('flag') }}"),
-        ("on", "{{ var('flag') == 'on' }}"),
-        (2, "{{ var('flag') == 2 }}"),
+        (True, False, "{{ var('flag') }}"),
+        (False, True, "{{ not var('flag') }}"),
+        ("on", "off", "{{ var('flag') == 'on' }}"),
+        (2, 1, "{{ var('flag') == 2 }}"),
+        (False, 0, "{{ var('flag') is sameas false }}"),
+        (0, False, "{{ (var('flag') == 0 and var('flag') is not boolean) }}"),
     ],
 )
 def test_the_disable_advice_is_true_at_the_on_value_alone(
-    on_value, expression: str
+    on_value, off_value, expression: str
 ) -> None:
     """A bare var() is only right for a flag that is on when true: a
-    `disable_x` flag, or a string or integer one, needs the comparison."""
+    `disable_x` flag, or a string or integer one, needs the comparison, and
+    values Jinja holds equal across types (0 and false) need their type."""
 
-    assert toggle._enabled_expression("flag", on_value) == expression
+    import jinja2
+
+    assert toggle._enabled_expression("flag", on_value, off_value) == expression
+    template = jinja2.Environment(autoescape=True).from_string(expression)
+    for value, wanted in ((on_value, "True"), (off_value, "False")):
+        assert template.render(var=lambda _name, v=value: v) == wanted, value
 
 
 def test_a_test_with_no_compiled_node_is_a_limit(tmp_path: Path) -> None:
