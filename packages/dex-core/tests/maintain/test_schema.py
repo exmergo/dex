@@ -108,6 +108,33 @@ def test_dropped_source_table_is_flagged_dangling(maintain_repo):
     assert dangling["data"]["declared_in"] == "models/staging/_dex_sources.yml"
 
 
+def test_a_same_named_table_in_another_schema_does_not_satisfy_the_source(
+    maintain_repo,
+):
+    """The declaration names its schema, and that schema is absent while a
+    same-named table lives in another one: bare-name matching would count the
+    other schema's table as the source and miss the dangling declaration, so
+    a recorded schema has to agree for the match to count."""
+
+    sources = maintain_repo.root / "models" / "staging" / "_dex_sources.yml"
+    sources.write_text(
+        "version: 2\n"
+        "sources:\n"
+        "  - name: raw\n"
+        "    schema: raw\n"
+        "    tables:\n"
+        "      - name: orders\n"
+        "        columns:\n"
+        "          - name: order_id\n",
+        encoding="utf-8",
+    )
+    maintain_repo.snapshot()
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    dangling = _by_code(payload)["dangling_source"]
+    assert dangling, "raw.orders is absent from the warehouse and must be dangling"
+    assert dangling[0]["identifier"] == "raw.orders"
+
+
 def test_a_host_supplied_pathless_baseline_omits_declared_in_and_carries_its_note(
     maintain_repo,
 ):
@@ -142,6 +169,25 @@ def test_a_host_supplied_pathless_baseline_omits_declared_in_and_carries_its_not
     assert any(
         "declared in configuration" in warning for warning in payload["warnings"]
     ), payload["warnings"]
+
+
+def test_a_renamed_source_is_not_dangling_while_its_table_exists(maintain_repo):
+    """A source whose declaration gives the table an `identifier` names the
+    physical object the warehouse holds; matching the logical name instead
+    reports a live table as dangling and points at a name nothing can rename
+    (#1158)."""
+
+    maintain_repo.snapshot()
+    store = FilesystemStore(maintain_repo.root)
+    snap = store.load_snapshot()
+    snap.transform_layer = TransformLayer(
+        models=[],
+        sources=[SourceTable(source_name="raw", table="events", identifier="orders")],
+    )
+    store.save_snapshot(snap)
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    assert "dangling_source" not in _by_code(payload)
 
 
 def test_new_table_is_reported_added(maintain_repo):
