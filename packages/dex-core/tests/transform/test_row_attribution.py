@@ -731,6 +731,54 @@ def test_a_union_branch_whose_string_literal_is_recased_is_named():
     ]
 
 
+#: One UNION branch joins two relations that both carry ``active``.
+JOINED_UNION = (
+    "select a.id from orders a join flags b on a.id = b.id where {}\n"
+    "union all select id from orders_b"
+)
+
+
+def test_a_union_branch_reading_the_other_join_side_is_named():
+    """``a.active`` and ``b.active`` are different columns: dropping the
+    qualifier would read the edit as notation."""
+
+    changes, unresolved = classify(
+        JOINED_UNION.format("a.active"), JOINED_UNION.format("b.active"), "duckdb"
+    )
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+@pytest.mark.parametrize(
+    "authored",
+    [
+        JOINED_UNION.format("a.active")
+        .replace("orders a", "orders o")
+        .replace("a.", "o."),
+        "select l.id from orders l join flags r on l.id = r.id where l.active\n"
+        "union all select id from orders_b",
+    ],
+    ids=["renamed_alias", "renamed_both_aliases"],
+)
+def test_a_joined_union_branch_that_only_renames_aliases_reports_nothing(authored):
+    prior = JOINED_UNION.format("a.active")
+    assert classify(prior, authored, "duckdb") == ([], [])
+
+
+def test_a_self_joined_union_branch_reading_the_other_side_is_named():
+    prior = (
+        "select l.id from orders l join orders r on l.parent_id = r.id where {}\n"
+        "union all select id from orders_b"
+    )
+    changes, unresolved = classify(
+        prior.format("l.active"), prior.format("r.active"), "duckdb"
+    )
+    assert changes == []
+    assert [u.scope for u in unresolved] == ["(final select)"]
+
+
 def test_a_set_operation_beside_an_isolable_change_keeps_both():
     prior = (
         "with merged as (select id from orders_a union all select id from orders_b)\n"

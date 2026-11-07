@@ -188,22 +188,61 @@ def match_key(node: exp.Expression | None) -> str:
 
 
 def unqualified_key(node: exp.Expression) -> str:
-    """A comparison form with table qualifiers dropped from every column and
-    identifiers and function names lowercased, so renaming an alias or
-    re-casing an identifier is not a change.
+    """A comparison form in which re-aliasing or re-casing is not a change.
+
+    Identifiers and function names are lowercased. A column's table qualifier
+    is dropped where its select reads one relation, since the column can only
+    come from there. Where a select reads several, the qualifier is replaced by
+    the relation it names, so ``a.active`` edited to ``b.active`` across a join
+    is a change while renaming ``a`` is not; an unqualified column there stays
+    unqualified and so differs from a qualified one.
 
     String literals keep their case: ``status = 'OPEN'`` edited to
     ``status = 'open'`` can select different rows, so it must not compare equal.
     """
 
     bare = node.copy()
-    for column in bare.find_all(exp.Column):
-        column.set("table", None)
+    sources = {
+        id(select): _source_names(select) for select in bare.find_all(exp.Select)
+    }
+    for column in list(bare.find_all(exp.Column)):
+        select = column.find_ancestor(exp.Select)
+        named = sources.get(id(select)) if select is not None else None
+        qualifier = column.table.lower()
+        if named is not None and len(named) > 1 and qualifier:
+            column.set("table", exp.to_identifier(named.get(qualifier, qualifier)))
+        else:
+            column.set("table", None)
         column.set("db", None)
         column.set("catalog", None)
+    for select in bare.find_all(exp.Select):
+        for relation in _relations(select):
+            relation.set("alias", None)
     for identifier in bare.find_all(exp.Identifier):
         identifier.set("this", identifier.this.lower())
     return bare.sql(comments=False, normalize_functions="lower").strip()
+
+
+def _source_names(select: exp.Select) -> dict[str, str]:
+    """Each relation a select reads, keyed by the name its columns qualify it
+    with, mapped to the relation itself and its occurrence (a self-join's two
+    sides stay apart)."""
+
+    seen: dict[str, int] = {}
+    named: dict[str, str] = {}
+    for relation in _relations(select):
+        key = relation_key(relation)
+        seen[key] = seen.get(key, 0) + 1
+        named[relation.alias_or_name.lower()] = f"{key}#{seen[key]}"
+    return named
+
+
+def _relations(select: exp.Select) -> list[exp.Expression]:
+    """The relations a select reads directly: its FROM and each join."""
+
+    from_ = select.args.get("from_") or select.args.get("from")
+    relations = [from_.this] if from_ is not None else []
+    return relations + [join.this for join in select.args.get("joins") or []]
 
 
 def relation_key(node: exp.Expression | None) -> str:
