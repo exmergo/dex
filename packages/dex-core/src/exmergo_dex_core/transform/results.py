@@ -645,6 +645,15 @@ class MutationCoverageResult(Result):
     fraction, a compound interval, the second bound of a frame whose first one
     was moved). Its boundary is untested by this run, and an empty list means
     every offset bound was mutated (#1112).
+
+    ``incremental`` is the model's ``is_incremental()`` branch, measured as the
+    program it is (#1132): its own ``mutants``, ``counts``, ``score``,
+    ``baseline`` and share of the ``cap``, the unit tests that override
+    ``is_incremental`` to true in ``tests``, and a ``reason`` when nothing ran
+    against it. Those tests run only against the branch, and the full build's
+    tests only against the full build, so ``score`` and ``incremental.score``
+    never mix the two. Null for a model with no branch dex read. ``cap`` is the
+    whole run's, since one cap binds both.
     """
 
     model: str = ""
@@ -659,6 +668,7 @@ class MutationCoverageResult(Result):
     equivalence: dict[str, Any] | None = None
     downstream: dict[str, Any] | None = None
     unsupported_sites: list[dict[str, Any]] = Field(default_factory=list)
+    incremental: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         return {
@@ -674,6 +684,7 @@ class MutationCoverageResult(Result):
             "runs": self.runs,
             "equivalence": self.equivalence,
             "downstream": self.downstream,
+            "incremental": self.incremental,
         }
 
 

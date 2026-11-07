@@ -788,6 +788,12 @@ the model's own tests against each, and reports which defects nothing caught.
   the mutant cannot reach) and why, and a `reason` when it was off.
 - `baseline.excluded` names tests already failing against the unmutated model;
   every verdict is relative to the tests that passed.
+- An incremental model's `{% if is_incremental() %}` branch is compiled a second
+  time with the branch taken, and its own comparisons and filters are planted
+  there (#1132). Only unit tests overriding `is_incremental` to true run against
+  them. `data.incremental` holds the branch's `mutants`, `counts`, `score`,
+  `baseline`, `tests` and `cap` share, apart from the full build's; with no such
+  test every branch mutant survives and `suggested_test` names one.
 - Capped at 20 mutants (`--max-mutants` narrows, never widens), sampled across
   defect classes; `cap.elided` reports the cut.
 - Mutants build as ephemeral models in a throwaway copy, so nothing is written

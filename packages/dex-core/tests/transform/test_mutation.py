@@ -1046,3 +1046,149 @@ def test_the_cap_keeps_the_nearest_models_and_counts_the_rest():
     assert closure.elided == 1
     assert closure.cut[0]["name"] == "deep"
     assert "cap of 2" in closure.cut[0]["reason"]
+
+
+# --- the incremental branch (#1132) --------------------------------------------
+
+_INCREMENTAL_MODEL = (
+    "{{ config(materialized='incremental') }}\n"
+    "select id, d from {{ ref('stg_orders') }}\n"
+    "where id > 0\n"
+    "{%- if is_incremental() %}\n"
+    "and d >= (select max(d) from {{ this }})\n"
+    "{%- endif %}\n"
+)
+
+_FULL_COMPILED = 'select id, d from "dev"."main"."stg_orders" where id > 0'
+_BRANCH_COMPILED = (
+    'select id, d from "dev"."main"."stg_orders" '  # noqa: S608
+    f"where id > 0 and d >= (select max(d) from {mutation.THIS_SENTINEL})"
+)
+
+
+def _branch(sql: str = _BRANCH_COMPILED):
+    """The branch program as `prepare` reads it, `{{ this }}` included."""
+
+    this = mutation.ParentRelation(rendered=mutation.THIS_SENTINEL, jinja="{{ this }}")
+    return _prepare(sql, parents=[*_parents(), this])
+
+
+def test_the_branch_is_taken_and_this_is_spelled_so_it_survives_the_compile():
+    """Only the `is_incremental()` call and `{{ this }}` are rewritten."""
+
+    source = mutation.incremental_source(_INCREMENTAL_MODEL)
+
+    assert source is not None
+    assert "is_incremental" not in source
+    assert "{%- if true %}" in source
+    assert f"from {mutation.THIS_SENTINEL})" in source
+    assert "{{ this }}" not in source
+    # everything that is not the branch's test or `this` is left for dbt
+    assert "{{ ref('stg_orders') }}" in source
+    assert "{{ config(materialized='incremental') }}" in source
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select 1 as x from {{ ref('a') }}",
+        "select 1 as x from {{ ref('a') }} {% if var('f') %}where x = 1{% endif %}",
+        # a commented-out branch is not a branch
+        "select 1 as x from {{ ref('a') }} {# {% if is_incremental() %} #}",
+    ],
+)
+def test_a_model_with_no_is_incremental_call_has_no_second_program(sql):
+    """Without an `is_incremental()` call there is nothing to compile twice."""
+
+    assert mutation.incremental_source(sql) is None
+
+
+def test_a_negated_test_and_an_else_branch_are_read_as_dbt_would():
+    """The call is replaced in place, so `not` and `else` keep dbt's meaning."""
+
+    sql = (
+        "select d from {{ ref('a') }} {% if not is_incremental() %}where d > 0"
+        "{% else %}where d > (select max(d) from {{ this }}){% endif %}"
+    )
+
+    source = mutation.incremental_source(sql)
+
+    assert "{% if not true %}" in source
+
+
+def test_only_the_branchs_own_comparisons_and_filters_are_planted_in_it():
+    """A site the two programs share is the full build's, planted once; the
+    branch gets its watermark, as a flipped boundary, a dropped filter and a
+    negated one, and nothing of another defect class."""
+
+    batch = mutation.enumerate_mutants(_prepare(_FULL_COMPILED), incremental=_branch())
+
+    assert batch.incremental is not None
+    full = [m.before for m in batch.mutants]
+    assert all("this" not in before for before in full)
+    planted = batch.incremental.mutants
+    assert sorted(m.operator for m in planted) == sorted(mutation.INCREMENTAL_OPERATORS)
+    for mutant in planted:
+        assert mutant.before == "d >= (SELECT MAX(d) FROM {{ this }})"
+        assert mutant.id.startswith("i")
+        assert mutant.defect.startswith("in the is_incremental() branch, ")
+        assert "is_incremental to true" in mutant.suggested_test
+        # a dropped watermark filter takes its read of `this` with it
+        assert ("{{ this }}" in mutant.body) == (mutant.operator != "predicate_drop")
+    assert batch.considered == len(batch.mutants)
+    assert batch.incremental.considered == len(planted)
+
+
+def test_the_branch_identity_restores_this_for_the_unit_tests_fixture():
+    """The baseline file names `{{ this }}`, which a `this` fixture binds to."""
+
+    batch = mutation.enumerate_mutants(_prepare(_FULL_COMPILED), incremental=_branch())
+
+    identity = batch.incremental.identity
+    assert "{{ this }}" in identity
+    assert mutation.THIS_SENTINEL not in identity
+    assert identity.rstrip().endswith(mutation.EPHEMERAL_HEADER)
+
+
+def test_a_predicate_written_inside_and_outside_the_branch_is_planted_in_each():
+    """Shared sites are subtracted as a multiset, not as a set."""
+
+    branch = _branch(
+        'select id, d from "dev"."main"."stg_orders" where id > 0 and id > 0'
+    )
+
+    batch = mutation.enumerate_mutants(_prepare(_FULL_COMPILED), incremental=branch)
+
+    flipped = [m for m in batch.incremental.mutants if m.operator == "comparison"]
+    assert [m.before for m in flipped] == ["id > 0"]
+
+
+def test_one_cap_binds_both_programs_and_still_reaches_the_watermark():
+    """The cap stays one bound on the run. The branch's classes sit beside the
+    full build's in the round robin, so even a cap of two tests the watermark,
+    and what the cap cut is counted per program and per class."""
+
+    full = mutation.enumerate_mutants(_prepare(_FULL_COMPILED), incremental=_branch())
+    capped = mutation.enumerate_mutants(
+        _prepare(_FULL_COMPILED), cap=2, incremental=_branch()
+    )
+
+    assert [m.id for m in capped.mutants] == ["m01"]
+    assert [m.id for m in capped.incremental.mutants] == ["i01"]
+    assert capped.incremental.mutants[0].operator == "comparison"
+    assert capped.elided_total + capped.incremental.elided_total == (
+        len(full.mutants) + len(full.incremental.mutants) - 2
+    )
+    assert set(capped.incremental.elided) <= set(mutation.INCREMENTAL_OPERATORS)
+
+
+def test_a_model_without_a_branch_is_ordered_and_capped_exactly_as_before():
+    """No branch means the round robin and the cap are unchanged."""
+
+    sql = "select a from x inner join y on x.id = y.id where a > 1 and b > 2"
+
+    batch = mutation.enumerate_mutants(_prepare(sql), cap=3)
+
+    assert batch.incremental is None
+    assert [m.id for m in batch.mutants] == ["m01", "m02", "m03"]
+    assert _operators(batch) == ["comparison", "predicate_drop", "join_type"]

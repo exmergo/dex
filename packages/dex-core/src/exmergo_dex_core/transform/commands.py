@@ -24,9 +24,9 @@ import json
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import yaml
 
@@ -2164,8 +2164,14 @@ def test_mutations(
                     f"(`transform test --scaffold {model}` scaffolds a unit test), "
                     "then measure it" + below.no_tests_hint()
                 )
-            prepared, batch = _plan_mutants(
-                shadow, node, model_path, cap, get_dialect(connector), mutation_mod
+            prepared, batch, incremental_reason = _plan_mutants(
+                shadow,
+                node,
+                model_path,
+                cap,
+                get_dialect(connector),
+                mutation_mod,
+                select=below.select,
             )
             warnings.extend(prepared.notes)
             if batch.unparsed:
@@ -2173,25 +2179,61 @@ def test_mutations(
                     f"{batch.unparsed} mutant(s) did not survive a re-read and "
                     "were dropped rather than run"
                 )
-            if not batch.mutants:
+            if incremental_reason:
+                warnings.append(
+                    f"'{model}' has an is_incremental() branch, but "
+                    f"{incremental_reason}"
+                )
+            branch = batch.incremental
+            if not batch.mutants and not (branch is not None and branch.mutants):
                 raise mutation_mod.MutationError(
                     f"'{model}' has no SQL dex knows how to plant a defect in "
                     "(no comparison, filter, join, CASE, division, window frame "
                     "or aggregate), so there is nothing to measure its tests against"
                     + _unsupported_frames_clause(batch.unsupported)
+                    + (
+                        f". It has an is_incremental() branch, but {incremental_reason}"
+                        if incremental_reason
+                        else ""
+                    )
                 )
 
-            equivalence = _EquivalenceCheck.prepare(
-                shadow,
-                node,
-                model_path,
-                batch,
-                select=below.select,
-                requested=check_equivalence,
-                paradigm=paradigm,
-                connector=connector,
-                mutation_mod=mutation_mod,
+            # The branch is another program, so the unit tests that run it
+            # answer only for its mutants and never for the full build's (#1132).
+            incremental_tests = (
+                _incremental_unit_tests(shadow.manifest(), node)
+                if branch is not None
+                else []
             )
+            full_tests = bool(below.tests) or _runs_full_build(
+                shadow.manifest(), node, incremental_tests
+            )
+            if not batch.mutants:
+                equivalence = _EquivalenceCheck(
+                    reason=(
+                        "the full build has no SQL dex plants a defect in, so "
+                        "nothing is compared with the model on the dev data"
+                    )
+                )
+            elif not full_tests:
+                equivalence = _EquivalenceCheck(
+                    reason=(
+                        "no test runs the full build, so no mutant of it ran and "
+                        "nothing is compared with the model on the dev data"
+                    )
+                )
+            else:
+                equivalence = _EquivalenceCheck.prepare(
+                    shadow,
+                    node,
+                    model_path,
+                    batch,
+                    select=below.select,
+                    requested=check_equivalence,
+                    paradigm=paradigm,
+                    connector=connector,
+                    mutation_mod=mutation_mod,
+                )
 
             estimate = None
             prices: dict[str, float] = {}
@@ -2207,6 +2249,7 @@ def test_mutations(
                     equivalence=equivalence,
                     reads=below.selected_ids,
                     skip=below.excluded_names,
+                    incremental_tests=incremental_tests,
                 )
                 warnings.extend(price_notes)
                 if estimate is not None:
@@ -2235,6 +2278,8 @@ def test_mutations(
                 uptime=getattr(adapter, "warehouse_uptime", None),
                 adapter=adapter,
                 downstream=below,
+                incremental_tests=incremental_tests,
+                full_tests=full_tests,
             )
             runs, spend, run_warnings = result.pop("_meta")
             warnings.extend(run_warnings)
@@ -2254,12 +2299,22 @@ def test_mutations(
 
     warnings.extend(_survivor_warnings(result["counts"], result["equivalence"]))
     warnings.extend(below.warnings(result["counts"]))
+    warnings.extend(_incremental_warnings(result["incremental"]))
     if batch.unsupported:
         warnings.append(_unsupported_frames_warning(batch.unsupported))
-    if batch.elided_total:
+    elided = dict(batch.elided)
+    if branch is not None:
+        for operator, cut in branch.elided.items():
+            elided[operator] = elided.get(operator, 0) + cut
+    if sum(elided.values()):
         warnings.append(
-            f"{batch.elided_total} further mutant(s) were not run: the cap is "
+            f"{sum(elided.values())} further mutant(s) were not run: the cap is "
             f"{batch.cap}, and what it cut is in data.cap.elided, per defect class"
+            + (
+                ", with the incremental branch's share in data.incremental.cap"
+                if branch is not None and branch.elided_total
+                else ""
+            )
         )
 
     return MutationCoverageResult(
@@ -2270,15 +2325,20 @@ def test_mutations(
         counts=result["counts"],
         score=result["score"],
         score_with_downstream=result["score_with_downstream"],
+        # The whole run's cap: it binds the full build and the incremental
+        # branch together, and data.incremental.cap holds the branch's share.
         cap={
             "limit": batch.cap,
-            "generated": len(batch.mutants),
-            "considered": batch.considered,
-            "elided": batch.elided,
+            "generated": len(batch.mutants)
+            + (len(branch.mutants) if branch is not None else 0),
+            "considered": batch.considered
+            + (branch.considered if branch is not None else 0),
+            "elided": elided,
         },
         unsupported_sites=batch.unsupported,
         runs=runs,
         equivalence=result["equivalence"],
+        incremental=result["incremental"],
         downstream=below.summary(),
         spend=spend,
         cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
@@ -2356,6 +2416,33 @@ def _survivor_warnings(counts: dict, equivalence: dict | None) -> list[str]:
     return [
         sentence + ". They are in data.mutants, the ones the data tells apart "
         "first, each with the test that would catch it"
+    ]
+
+
+def _incremental_warnings(block: dict | None) -> list[str]:
+    """The pointer line for the incremental branch's survivors (#1132).
+
+    Its own line because its own score: a reader of ``data.score`` alone would
+    otherwise never learn that the watermark went untested.
+    """
+
+    if not block:
+        return []
+    survivors = block["counts"].get("survived", 0)
+    if not survivors:
+        return []
+    if not block["tests"]:
+        return [
+            f"{survivors} planted defect(s) in the is_incremental() branch survive "
+            "by construction: no unit test overrides is_incremental to true, so "
+            "nothing runs the branch. They are in data.incremental.mutants, each "
+            "with the test that would catch it"
+        ]
+    return [
+        f"{survivors} planted defect(s) in the is_incremental() branch survived "
+        "the unit tests that override is_incremental to true. They are in "
+        "data.incremental.mutants, scored apart from the full build in "
+        "data.incremental.score"
     ]
 
 
@@ -2454,10 +2541,181 @@ def _attached_tests(manifest: dict, node: dict) -> list[str]:
     return attached
 
 
-def _plan_mutants(shadow, node, model_path, cap, dialect, mutation_mod):
-    """The compiled model, references restored, and the defects to plant in it."""
+def _plan_mutants(
+    shadow, node, model_path, cap, dialect, mutation_mod, *, select: str | None = None
+):
+    """The compiled model, references restored, and the defects to plant in it.
 
-    manifest = shadow.manifest()
+    Also the incremental branch's (#1132): returns ``(prepared, batch,
+    reason)``, where ``batch.incremental`` holds the branch's mutants and
+    ``reason`` says why a branch the model has was not read. ``select`` is
+    what the copy was last compiled with, which the branch's compile restores.
+    """
+
+    parents = _parent_relations(shadow.manifest(), node, mutation_mod)
+    prepared = mutation_mod.prepare(
+        node.get("compiled_code") or "", dialect=dialect, parents=parents
+    )
+    incremental, reason = _incremental_program(
+        shadow,
+        node,
+        model_path,
+        parents,
+        dialect,
+        mutation_mod,
+        select=select or node["name"],
+    )
+    if incremental is not None:
+        prepared.notes.extend(
+            note for note in incremental.notes if note not in prepared.notes
+        )
+    batch = mutation_mod.enumerate_mutants(prepared, cap=cap, incremental=incremental)
+    return prepared, batch, reason
+
+
+def _incremental_program(
+    shadow, node, model_path, parents, dialect, mutation_mod, *, select: str
+):
+    """The model compiled with its ``is_incremental()`` branch taken, or why not.
+
+    An ephemeral model is never incremental, so the compile every mutant comes
+    from renders the branch false and the watermark never reaches it (#1132).
+    This writes the model file with each ``is_incremental()`` call as ``true``
+    and ``{{ this }}`` as a sentinel, compiles it, and puts the file back,
+    compiling ``select`` again so everything after reads the copy exactly as it
+    was. Returns ``(None, None)`` for a model with no branch, or one that is
+    not incremental, whose branch never runs; ``(None, reason)`` when dbt or
+    dex could not read the branch.
+    """
+
+    from .build import DbtRunError
+    from .test_scaffold import _model_materialization
+
+    view = shadow.view
+    file = view.files.get(model_path) if view is not None else None
+    if file is None:
+        return None, None
+    content = file.content
+    source = mutation_mod.incremental_source(content)
+    if source is None:
+        return None, None
+    if _model_materialization(view, node["name"], content, model_path) != (
+        "incremental"
+    ):
+        return None, None
+
+    header = "\n" + mutation_mod.EPHEMERAL_HEADER + "\n"
+    compiled = None
+    shadow.write(model_path, source + header)
+    try:
+        manifest = shadow.compile(select)
+        compiled = (manifest.get("nodes", {}).get(node.get("unique_id")) or {}).get(
+            "compiled_code"
+        )
+    except DbtRunError:
+        compiled = None
+    finally:
+        shadow.write(model_path, content + header)
+    shadow.compile(select)
+    if not compiled:
+        return None, (
+            "dbt would not compile it with is_incremental() taken, so its "
+            "comparisons and filters are not measured"
+        )
+    try:
+        prepared = mutation_mod.prepare(
+            compiled,
+            dialect=dialect,
+            parents=[
+                *parents,
+                mutation_mod.ParentRelation(
+                    rendered=mutation_mod.THIS_SENTINEL, jinja="{{ this }}"
+                ),
+            ],
+        )
+    except mutation_mod.MutationError as exc:
+        return None, f"dex could not read it ({exc})"
+    return prepared, None
+
+
+class IncrementalUnitTest(NamedTuple):
+    """One unit test that runs the incremental branch, as dbt knows it.
+
+    ``name`` is the test as a run reports it, ``select`` the name dbt's
+    ``unit_test:`` selector matches. They differ on a versioned model: dbt
+    reports each version's instance as ``<name>_v<version>`` while the
+    selector matches the definition's ``<name>`` and so every version of it,
+    which is why a run's statuses are read for ``name`` alone.
+    """
+
+    unique_id: str
+    name: str
+    select: str
+
+
+def _covers(unit: dict, node: dict) -> bool:
+    """Whether this unit test runs ``node`` rather than another version of it.
+
+    dbt binds each unit test instance to one model through ``depends_on``,
+    one instance per version on a versioned model. The model name is a
+    fallback only for an unversioned model, where it cannot name another one.
+    """
+
+    if node.get("unique_id") in (unit.get("depends_on") or {}).get("nodes", []):
+        return True
+    return node.get("version") is None and unit.get("model") == node.get("name")
+
+
+def _incremental_unit_tests(manifest: dict, node: dict) -> list[IncrementalUnitTest]:
+    """The unit tests on this model that run its ``is_incremental()`` branch.
+
+    dbt runs the branch in a unit test only where the test overrides the
+    ``is_incremental`` macro to true; every other test runs the full build.
+    On a versioned model, only the instances that test this version.
+    """
+
+    found = []
+    for unique_id, unit in (manifest.get("unit_tests") or {}).items():
+        if not _covers(unit, node) or not unit.get("name"):
+            continue
+        value = ((unit.get("overrides") or {}).get("macros") or {}).get(
+            "is_incremental"
+        )
+        if value is not True and str(value).lower() != "true":
+            continue
+        version = unit.get("version")
+        found.append(
+            IncrementalUnitTest(
+                unique_id=unique_id,
+                name=unit["name"] if version is None else f"{unit['name']}_v{version}",
+                select=unit["name"],
+            )
+        )
+    return sorted(found, key=lambda test: test.name)
+
+
+def _runs_full_build(
+    manifest: dict, node: dict, incremental: Sequence[IncrementalUnitTest]
+) -> bool:
+    """Whether any test of the model's own runs its full build.
+
+    Compared by unique id, which is what tells one version's unit test from
+    another's: a unit test that tests another version of the model, or one that
+    runs the incremental branch, does not count.
+    """
+
+    branch = {test.unique_id for test in incremental}
+    units = manifest.get("unit_tests") or {}
+    return any(
+        unique_id not in branch
+        and (unique_id not in units or _covers(units[unique_id], node))
+        for unique_id in _attached_tests(manifest, node)
+    )
+
+
+def _parent_relations(manifest: dict, node: dict, mutation_mod) -> list:
+    """Each input of the model, as compiled SQL names it and as a ref."""
+
     parents = []
     for uid in node.get("depends_on", {}).get("nodes", []):
         parent = manifest.get("nodes", {}).get(uid) or manifest.get("sources", {}).get(
@@ -2480,10 +2738,7 @@ def _plan_mutants(shadow, node, model_path, cap, dialect, mutation_mod):
                 ephemeral=ephemeral,
             )
         )
-    prepared = mutation_mod.prepare(
-        node.get("compiled_code") or "", dialect=dialect, parents=parents
-    )
-    return prepared, mutation_mod.enumerate_mutants(prepared, cap=cap)
+    return parents
 
 
 def _reference_jinja(parent: dict, unique_id: str) -> str:
@@ -2500,6 +2755,11 @@ def _reference_jinja(parent: dict, unique_id: str) -> str:
 #: only the survivors will run one and nobody knows which those are yet.
 _EQUIVALENCE_LINE = "(equivalence checks, if every mutant survives)"
 
+#: The incremental branch's baseline run, keyed the way the run loop asks for
+#: its price, and the per-table line its unit test runs are shown under.
+_INCREMENTAL_BASELINE = "(incremental baseline)"
+_INCREMENTAL_LINE = "(incremental branch unit tests)"
+
 
 def _price_mutations(
     adapter,
@@ -2512,6 +2772,7 @@ def _price_mutations(
     equivalence=None,
     reads: set[str] | None = None,
     skip: frozenset[str] | set[str] = frozenset(),
+    incremental_tests: Sequence[IncrementalUnitTest] = (),
 ):
     """Price the whole batch upfront, per statement, as one number to confirm.
 
@@ -2598,12 +2859,22 @@ def _price_mutations(
     quoted = uptime.quote() if uptime is not None else 0.0
     if quoted > 0:
         per_table[UPTIME_LINE] = quoted
-    with contextlib.suppress(Exception):
-        per_table["(baseline)"] = prices["(baseline)"] = price(batch.identity_compiled)
+    if batch.mutants:
+        with contextlib.suppress(Exception):
+            per_table["(baseline)"] = prices["(baseline)"] = price(
+                batch.identity_compiled
+            )
     for mutant in batch.mutants:
         with contextlib.suppress(Exception):
             cost = price(mutant.compiled)
             per_table[f"{mutant.id} {mutant.operator}"] = prices[mutant.id] = cost
+    branch = getattr(batch, "incremental", None)
+    if branch is not None and branch.mutants and incremental_tests:
+        # The branch runs only unit tests, which read their fixtures and never
+        # the warehouse, so each of its runs is priced at zero, as a unit test
+        # on the full build is. A line of its own says they are in the batch.
+        per_table[_INCREMENTAL_LINE] = prices[_INCREMENTAL_BASELINE] = 0.0
+        prices.update({mutant.id: 0.0 for mutant in branch.mutants})
 
     if equivalence is not None and equivalence.enabled:
         comparison = equivalence.compiled
@@ -2657,6 +2928,8 @@ def _run_mutants(
     uptime=None,
     adapter=None,
     downstream: _DownstreamTests | None = None,
+    incremental_tests: Sequence[IncrementalUnitTest] = (),
+    full_tests: bool = True,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
 
@@ -2667,10 +2940,19 @@ def _run_mutants(
     ``downstream`` widens every run, the baseline included, to the tests on the
     models the mutant is routed through, and tells :func:`classify` which tests
     those are so a catch there is kept apart from one by the model's own tests.
+
+    ``incremental_tests`` are the unit tests that override ``is_incremental``
+    to true. They run the branch rather than the full build, so the full
+    build's runs leave them out and they run only against ``batch.incremental``
+    afterwards (#1132). ``full_tests`` false means no other test runs the full
+    build: its mutants then survive by construction, without a run.
     """
 
     select = downstream.select if downstream is not None else model
-    exclude = downstream.exclude if downstream is not None else []
+    exclude = [
+        *(downstream.exclude if downstream is not None else []),
+        *sorted({f"unit_test:{test.select}" for test in incremental_tests}),
+    ]
     below = set(downstream.tests) if downstream is not None else set()
     warnings: list[str] = []
     meter = _BatchSpend(
@@ -2686,26 +2968,6 @@ def _run_mutants(
         adapter=adapter,
     )
 
-    shadow.write(model_path, batch.identity)
-    baseline_summary = shadow.test(select, exclude=exclude)
-    meter.settle(baseline_summary, "(baseline)")
-    baseline = _test_statuses(baseline_summary)
-    excluded = [
-        {"name": name, "status": status, "reason": _exclusion_reason(status)}
-        for name, status in sorted(baseline.items())
-        if status != "pass"
-    ]
-    if not any(status == "pass" for status in baseline.values()):
-        raise mutation_mod.MutationError(
-            f"no test of '{model}' passes against the unmutated model, so there is "
-            "nothing that could catch a defect. Build its parents first "
-            f"(`transform build --select +{model}`) and fix the failing tests, "
-            "then measure them"
-        )
-
-    if equivalence is not None:
-        equivalence.run_self_check(meter, mutation_mod)
-
     mutants: list[dict] = []
     counts = {
         "killed": 0,
@@ -2714,9 +2976,14 @@ def _run_mutants(
         "rejected": 0,
         "not_run": 0,
     }
+    baseline: dict[str, str] = {}
+    excluded: list[dict[str, str]] = []
     tested = 0
+    exhausted = False
 
     def stop(remaining) -> None:
+        nonlocal exhausted
+        exhausted = True
         for mutant in remaining:
             mutants.append(
                 {**mutant.payload(), "status": "not_run", "equivalence": None}
@@ -2728,37 +2995,98 @@ def _run_mutants(
             "--budget, or narrow the run with --max-mutants"
         )
 
-    for index, mutant in enumerate(batch.mutants):
-        if not meter.affords(mutant.id):
-            stop(batch.mutants[index:])
-            break
-        shadow.write(model_path, mutant.body)
-        summary = shadow.test(select, exclude=exclude)
-        tested += 1
-        meter.settle(summary, mutant.id)
-        verdict = mutation_mod.classify(
-            baseline, _test_statuses(summary), downstream=below
+    if batch.mutants and full_tests:
+        shadow.write(model_path, batch.identity)
+        baseline_summary = shadow.test(select, exclude=exclude)
+        meter.settle(baseline_summary, "(baseline)")
+        baseline = _test_statuses(baseline_summary)
+        excluded = [
+            {"name": name, "status": status, "reason": _exclusion_reason(status)}
+            for name, status in sorted(baseline.items())
+            if status != "pass"
+        ]
+        if not any(status == "pass" for status in baseline.values()):
+            raise mutation_mod.MutationError(
+                f"no test of '{model}' passes against the unmutated model, so there "
+                "is nothing that could catch a defect. Build its parents first "
+                f"(`transform build --select +{model}`) and fix the failing tests, "
+                "then measure them"
+            )
+
+        if equivalence is not None:
+            equivalence.run_self_check(meter, mutation_mod)
+
+        for index, mutant in enumerate(batch.mutants):
+            if not meter.affords(mutant.id):
+                stop(batch.mutants[index:])
+                break
+            shadow.write(model_path, mutant.body)
+            summary = shadow.test(select, exclude=exclude)
+            tested += 1
+            meter.settle(summary, mutant.id)
+            verdict = mutation_mod.classify(
+                baseline, _test_statuses(summary), downstream=below
+            )
+            counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
+            record = {
+                **mutant.payload(),
+                "status": verdict.outcome,
+                "caught_by": verdict.caught_by,
+                "caught_downstream_by": verdict.caught_downstream,
+                "warn_only": verdict.warn_only,
+                "equivalence": None,
+            }
+            mutants.append(record)
+            if verdict.outcome != "survived" or equivalence is None:
+                continue
+            label = equivalence.check(meter, mutant.id, mutation_mod)
+            record["equivalence"] = label.payload()
+            record["suggested_test"] = mutation_mod.suggested_test(
+                mutant.operator, label.status, frame=mutant.frame
+            )
+            if equivalence.out_of_budget:
+                stop(batch.mutants[index + 1 :])
+                break
+    elif batch.mutants:
+        # Every test of the model runs the incremental branch, so nothing runs
+        # the full build: its defects survive by construction, and a run would
+        # spend a dbt invocation each to say so.
+        warnings.append(
+            f"no test of '{model}' runs its full build (each one overrides "
+            "is_incremental to true), so every defect planted in the full build "
+            "survives by construction"
         )
-        counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
-        record = {
-            **mutant.payload(),
-            "status": verdict.outcome,
-            "caught_by": verdict.caught_by,
-            "caught_downstream_by": verdict.caught_downstream,
-            "warn_only": verdict.warn_only,
-            "equivalence": None,
-        }
-        mutants.append(record)
-        if verdict.outcome != "survived" or equivalence is None:
-            continue
-        label = equivalence.check(meter, mutant.id, mutation_mod)
-        record["equivalence"] = label.payload()
-        record["suggested_test"] = mutation_mod.suggested_test(
-            mutant.operator, label.status, frame=mutant.frame
+        for mutant in batch.mutants:
+            label = (
+                equivalence.check(meter, mutant.id, mutation_mod)
+                if equivalence is not None
+                else None
+            )
+            mutants.append(
+                {
+                    **mutant.payload(),
+                    "status": "survived",
+                    "caught_by": [],
+                    "caught_downstream_by": [],
+                    "warn_only": False,
+                    "equivalence": label.payload() if label is not None else None,
+                }
+            )
+            counts["survived"] += 1
+
+    incremental = None
+    if batch.incremental is not None:
+        incremental = _run_incremental(
+            shadow,
+            model_path,
+            batch.incremental,
+            model=model,
+            tests=list(incremental_tests),
+            meter=meter,
+            mutation_mod=mutation_mod,
+            exhausted=exhausted,
+            warnings=warnings,
         )
-        if equivalence.out_of_budget:
-            stop(batch.mutants[index + 1 :])
-            break
 
     mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
     # The model's own score counts a defect only downstream tests caught as a
@@ -2784,7 +3112,157 @@ def _run_mutants(
             else None
         ),
         "equivalence": equivalence.summary() if equivalence is not None else None,
+        "incremental": incremental,
         "_meta": (meter.runs, meter.spend, warnings),
+    }
+
+
+def _run_incremental(
+    shadow,
+    model_path,
+    branch,
+    *,
+    model: str,
+    tests: list[IncrementalUnitTest],
+    meter: _BatchSpend,
+    mutation_mod,
+    exhausted: bool,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """The incremental branch's mutants, against the tests that run the branch.
+
+    Only a unit test that overrides ``is_incremental`` to true executes the
+    branch, so those are the whole selection, and the baseline is the
+    branch-taken model file rather than the full build. With no such test,
+    nothing could catch a defect there, so every one survives without a run and
+    names that test as the one to write (#1132).
+
+    Its survivors are never compared on the dev data: the branch reads
+    ``{{ this }}``, which is the model itself. Each says so in ``equivalence``,
+    as ``not_checked`` with that reason, exactly as any survivor that was not
+    compared does. Nothing is routed downstream, since a downstream test reads
+    the full build.
+    """
+
+    counts = {"killed": 0, "survived": 0, "rejected": 0, "not_run": 0}
+    mutants: list[dict] = []
+    baseline: dict[str, str] = {}
+    reason: str | None = None
+    unchecked = mutation_mod.Equivalence.unchecked(
+        mutation_mod.INCREMENTAL_NOT_COMPARED
+    ).payload()
+
+    def record(mutant, status: str, verdict=None) -> None:
+        """Book one branch mutant's outcome into the counts and the report."""
+
+        counts[status] = counts.get(status, 0) + 1
+        mutants.append(
+            {
+                **mutant.payload(),
+                "status": status,
+                "caught_by": verdict.caught_by if verdict is not None else [],
+                "warn_only": verdict.warn_only if verdict is not None else False,
+                "equivalence": unchecked if status == "survived" else None,
+            }
+        )
+
+    def not_run(remaining, why: str) -> None:
+        """Report the remaining branch mutants not_run, with the reason why."""
+
+        for mutant in remaining:
+            record(mutant, "not_run")
+        warnings.append(why)
+
+    select = " ".join(sorted({f"unit_test:{test.select}" for test in tests}))
+    ids = {test.unique_id for test in tests}
+
+    def statuses(summary) -> dict[str, str]:
+        """This model's branch tests' statuses, read by unique id.
+
+        The selector matches a unit test by name, which is unique only per
+        model, and on a versioned model it matches every version's instance.
+        Only the instances that test this model and version may testify.
+        """
+
+        mine = [
+            node
+            for node in (summary or {}).get("nodes", [])
+            if node.get("unique_id") in ids
+        ]
+        return _test_statuses({"nodes": mine})
+
+    if not branch.mutants:
+        pass
+    elif not tests:
+        reason = (
+            f"no unit test of '{model}' overrides is_incremental to true, so "
+            "nothing runs the branch and every defect planted in it survives"
+        )
+        for mutant in branch.mutants:
+            record(mutant, "survived")
+    elif exhausted or not meter.affords(_INCREMENTAL_BASELINE):
+        reason = "the confirmed budget ran out before the incremental branch ran"
+        not_run(
+            branch.mutants,
+            "the confirmed budget ran out before the incremental branch ran; its "
+            "mutants are reported as not_run",
+        )
+    else:
+        shadow.write(model_path, branch.identity)
+        summary = shadow.test(select)
+        meter.settle(summary, _INCREMENTAL_BASELINE)
+        baseline = statuses(summary)
+        if not any(status == "pass" for status in baseline.values()):
+            reason = (
+                "no unit test that overrides is_incremental to true passes against "
+                "the unmutated branch, so nothing could catch a defect there"
+            )
+            not_run(
+                branch.mutants,
+                f"no unit test of '{model}' that overrides is_incremental to true "
+                "passes against the unmutated branch, so its mutants are reported "
+                "as not_run; fix those tests, then measure them",
+            )
+        else:
+            for index, mutant in enumerate(branch.mutants):
+                if not meter.affords(mutant.id):
+                    not_run(
+                        branch.mutants[index:],
+                        f"the confirmed budget covered {index} of "
+                        f"{len(branch.mutants)} incremental branch mutants; the "
+                        "rest are reported as not_run",
+                    )
+                    break
+                shadow.write(model_path, mutant.body)
+                summary = shadow.test(select)
+                meter.settle(summary, mutant.id)
+                verdict = mutation_mod.classify(baseline, statuses(summary))
+                record(mutant, verdict.outcome, verdict)
+
+    mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
+    decided = counts["killed"] + counts["survived"]
+    return {
+        "tests": [test.name for test in tests],
+        "reason": reason,
+        "baseline": {
+            "tests": [
+                {"name": name, "status": status}
+                for name, status in sorted(baseline.items())
+            ],
+            "excluded": [
+                {"name": name, "status": status, "reason": _exclusion_reason(status)}
+                for name, status in sorted(baseline.items())
+                if status != "pass"
+            ],
+        },
+        "mutants": mutants,
+        "counts": {"generated": len(branch.mutants), **counts},
+        "score": (counts["killed"] / decided) if decided else None,
+        "cap": {
+            "generated": len(branch.mutants),
+            "considered": branch.considered,
+            "elided": dict(branch.elided),
+        },
     }
 
 

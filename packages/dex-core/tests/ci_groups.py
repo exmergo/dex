@@ -33,6 +33,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "mutation-coverage": ("tests/transform/test_mutation_coverage.py",),
     "mutation-equivalence": ("tests/transform/test_mutation_equivalence.py",),
     "mutation-downstream": ("tests/transform/test_mutation_downstream.py",),
+    "mutation-incremental": ("tests/transform/test_mutation_incremental.py",),
     "transform-build": (
         "tests/transform/test_build",
         "tests/transform/test_previous_build",
