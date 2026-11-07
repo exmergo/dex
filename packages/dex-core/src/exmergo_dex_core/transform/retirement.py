@@ -668,7 +668,8 @@ def _compile_tree(
     _read_manifest(branch, manifest, name)
     catalog = _Catalog(branch, view, dialect, cache or (lambda: None))
     for label in branch.models:
-        catalog.resolve(label)
+        if label in models or label.rsplit(".v", 1)[0] in models:
+            catalog.resolve(label)
     out: dict[str, _Compiled] = {}
     for uid, node in (manifest.get("nodes") or {}).items():
         if not uid.startswith("model.") or node.get("name") not in models:
