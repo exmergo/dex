@@ -550,7 +550,9 @@ dex maintain grain [<objects>]    -> cardinality/identity drift: lost key unique
 dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + declaration drift
                                      (declaration_added|removed|changed naming the model, column and
                                      field, population/grain/additivity/unit ranked above a description;
-                                     free; data.declaration_drift says whether it was checked) +
+                                     on Ossie, SLayer and Cube too, from ai_context.dex / meta.dex and
+                                     the primary key as grain, with data.layer: semantic; free;
+                                     data.declaration_drift says whether it was checked) +
                                      categorical dimension cardinality change on any model naming its
                                      table (a scan; gated on billed connectors); a compiled-only Cube
                                      definition is compared by content alone (compiled_only_changed)
@@ -1701,6 +1703,13 @@ whether it ran: a baseline pinned before declarations were fingerprinted, or a
 project format that does not read them, is `false` with a `reason` and a
 warning, never an empty, clean-looking result. `maintain snapshot
 --project-only` baselines the declarations without re-measuring the warehouse.
+A native semantic layer (Ossie, SLayer, Cube) is fingerprinted the same way,
+from the `dex` block of each definition's `ai_context` or `meta` and of its
+members', with its primary key as the grain, so a changed key is a `high` grain
+change. Its findings carry `data.layer: semantic` and the vendor. With no
+transformation project the status is the layer's own; beside one, the layer's
+is under `data.declaration_drift.semantic_layer` and `checked` is true only
+when both were compared.
 
 **`explore semantic` queries the semantic layer; `transform` and the `semantic`
 group author it, and `maintain semantic` detects drift in it.** Three backends
