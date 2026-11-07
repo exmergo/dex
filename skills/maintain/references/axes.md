@@ -258,7 +258,10 @@ Needs no baseline. The classes of finding:
     warehouse table), `filtered_cte` (a filtering scope of any other shape: a
     `GROUP BY`, `DISTINCT`, `LIMIT`, `HAVING`, `QUALIFY`, a join beside the
     filter, a subquery or clock function in it, or a filter on a computed or
-    window column such as `rn = 1`; the reason names the scope and the shape),
+    window column such as `rn = 1`, or a join that can drop rows of the
+    relation the key is read from: an inner, bare, comma or CROSS join, a
+    RIGHT join with the key on its left, or a LEFT join with the key on its
+    joined side; the reason names the scope and the shape),
     `unparseable_sql`, `relation_not_found`,
     `probe_refused` or `scan_offered`.
 
