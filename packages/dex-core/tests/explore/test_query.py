@@ -1214,3 +1214,124 @@ def test_query_batch_warehouse_error_reports_warehouse_refused_the_statement(
     assert results[1]["reason"] == "execution_failure"
     assert "the warehouse refused the statement:" in results[1]["error"]
     assert "dex built" not in results[1]["error"]
+
+
+def test_target_dev_answers_and_names_the_no_op_on_duckdb(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    # #1133: the flag exists (an agent got `unrecognized arguments: --target
+    # dev`). DuckDB's dev target is the file it already reads, so the answer is
+    # the plain one and a note says the flag widened nothing.
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    sql = "SELECT COUNT(*) - COUNT(DISTINCT HOST_ID) AS dupes FROM RAW_LISTINGS"
+    plain = _query(sql, airbnb_duckdb, repo, capsys)["data"]
+    dev = _run(
+        [
+            "explore",
+            "query",
+            sql,
+            "--target",
+            "dev",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+    assert dev["cells"] == plain["cells"]
+    assert any("--target dev widened nothing" in note for note in dev["notes"])
+    assert not any("--target dev" in note for note in plain["notes"])
+
+    batch = _run(
+        [
+            "explore",
+            "query",
+            sql,
+            "SELECT COUNT(*) AS n FROM RAW_LISTINGS",
+            "--target",
+            "dev",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+    assert batch["ok_count"] == 2
+    assert any("--target dev widened nothing" in note for note in batch["notes"])
+
+
+@pytest.mark.parametrize("target", ["prod", "production"])
+def test_target_prod_is_refused_before_anything_runs(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, target: str
+):
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    before = (
+        (repo / ".dex" / QUERIES_FILE).read_text()
+        if (repo / ".dex" / QUERIES_FILE).exists()
+        else ""
+    )
+    payload = _run(
+        [
+            "explore",
+            "query",
+            "SELECT COUNT(*) FROM RAW_LISTINGS",
+            "--target",
+            target,
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+        expect_error=True,
+    )
+    assert "looks like production" in payload["errors"][0]
+    after = (
+        (repo / ".dex" / QUERIES_FILE).read_text()
+        if (repo / ".dex" / QUERIES_FILE).exists()
+        else ""
+    )
+    assert after == before
+
+
+def test_an_uncached_relation_behind_an_unopenable_connection_names_the_connection(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    # #1133: with the warehouse unreachable (a DuckDB file another process holds
+    # locked, in the ADE-bench run), a relation the cache cannot speak for was
+    # refused as "not in the exploration cache; run `explore map`", which fails
+    # the same way. The refusal now carries why the on-demand profile could not
+    # run, and still refuses.
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    unreachable_warehouse(monkeypatch)
+
+    payload = _query(
+        "SELECT COUNT(*) FROM main_marts.fct_orders",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+
+    message = payload["errors"][0]
+    assert "not in the exploration cache" in message
+    assert "could not be opened" in message
+    assert "connector extra is not installed" in message
+    assert _log_entries(repo)[-1]["decision"] == "refused"
+
+
+def test_no_cache_behind_an_unopenable_connection_names_the_connection(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    unreachable_warehouse(monkeypatch)
+
+    payload = _query(
+        "SELECT COUNT(*) FROM RAW_HOSTS", airbnb_duckdb, repo, capsys, expect_error=True
+    )
+    message = payload["errors"][0]
+    assert "no exploration cache yet" in message
+    assert "connector extra is not installed" in message

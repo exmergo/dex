@@ -155,6 +155,8 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
                                      the dev one becomes profileable without widening the committed
                                      allowlist. --scope still only narrows, nothing is written back,
                                      the cost guard prices the scan; prod-looking targets refused.
+                                     Also reads the namespaces dbt derives from the dev one for the
+                                     project's models (a package's +schema, #1155), named in notes.
                                      DuckDB: its dev target is the file already read, so the flag
                                      widens nothing and a note says so
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
@@ -179,8 +181,16 @@ dex explore diagram               -> the cached map as a Mermaid erDiagram, in `
 dex explore query "<SELECT ...>"  -> firewall-approved SELECTs, capped and row-major
   [more...] | --sql-file <path>      (variadic: one call answers several questions; a file takes
   [--across <ds,ds>]                 one statement per line or semicolon-separated statements;
-                                     --across runs each statement once per mirrored dataset,
-                                     named as {ds} in the SQL, under one handshake)
+  [--target dev]                     --across runs each statement once per mirrored dataset,
+                                     named as {ds} in the SQL, under one handshake).
+                                     --target dev (#1133) reads what transform build wrote, for this
+                                     one command, exactly as explore profile --target dev does (the
+                                     dev namespace and the ones dbt derives from it); firewall, PII
+                                     gate, values-free mode and cost handshake unchanged; prod-looking
+                                     targets refused. Without it, a relation in the dev namespace
+                                     outside the source scope is refused naming the namespace and the
+                                     flag. A refusal for an uncached relation behind a connection that
+                                     cannot open (a locked DuckDB file) says why
 dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII non-key columns
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows

@@ -251,3 +251,24 @@ def test_an_ordinary_batch_payload_is_unchanged(mirrored: Path, tmp_path: Path, 
 
     assert "across" not in data
     assert all("target" not in r and "template" not in r for r in data["results"])
+
+
+def test_across_takes_the_dev_target_flag_apart_from_its_datasets(
+    mirrored: Path, tmp_path: Path, capsys
+):
+    # #1133: `--target dev` names the dbt dev target, not an `--across` dataset.
+    # On DuckDB it widens nothing, says so, and leaves the fan-out unchanged.
+    repo = _repo(mirrored, tmp_path, capsys)
+    data = _across(
+        mirrored,
+        repo,
+        capsys,
+        "select count(*) as n from {ds}.orders",
+        "--across",
+        "dev_raw,prod_raw",
+        "--target",
+        "dev",
+    )["data"]
+    assert data["across"] == ["dev_raw", "prod_raw"]
+    assert [r["cells"] for r in data["results"]] == [[[2]], [[3]]]
+    assert any("--target dev widened nothing" in n for n in data["notes"])
