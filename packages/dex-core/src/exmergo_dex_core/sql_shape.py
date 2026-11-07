@@ -187,6 +187,21 @@ def match_key(node: exp.Expression | None) -> str:
     return text(node).lower()
 
 
+def expression_key(node: exp.Expression) -> str:
+    """Match an expression without treating column qualifiers as meaningful.
+
+    A table alias can change while the expression and its effect remain the
+    same. Keep :func:`text` for diagnostics; this key is only for comparison.
+    """
+
+    bare = node.copy()
+    for column in bare.find_all(exp.Column):
+        column.set("table", None)
+        column.set("db", None)
+        column.set("catalog", None)
+    return match_key(bare)
+
+
 def relation_key(node: exp.Expression | None) -> str:
     """A relation's identity with its alias removed.
 
@@ -255,6 +270,98 @@ def joins(select: exp.Select) -> list[Join]:
 def group_by(select: exp.Select) -> list[str]:
     group = select.args.get("group")
     return [] if group is None else [text(e) for e in group.expressions]
+
+
+def group_by_key(select: exp.Select) -> list[str]:
+    """The matching form of a GROUP BY, retaining its expression order.
+
+    A column qualifier is canonicalized to its source relation only when that
+    relation is unambiguous in this SELECT. This lets an alias change compare
+    equal without erasing the distinction between columns from joined sources.
+    """
+
+    group = select.args.get("group")
+    if group is None:
+        return []
+
+    relations = [from_relation(select), *(join.relation for join in joins(select))]
+    sources = [relation for relation in relations if relation is not None]
+    by_qualifier: dict[str, exp.Expression | None] = {}
+    relation_counts: dict[str, int] = {}
+    for relation in sources:
+        identity = relation_key(relation)
+        relation_counts[identity] = relation_counts.get(identity, 0) + 1
+        qualifier = relation.alias_or_name.lower()
+        if qualifier in by_qualifier:
+            by_qualifier[qualifier] = None
+        else:
+            by_qualifier[qualifier] = relation
+
+    return [
+        _group_expression_key(
+            expression, sources, by_qualifier, relation_counts
+        )
+        for expression in group.expressions
+    ]
+
+
+def _group_expression_key(
+    expression: exp.Expression,
+    sources: list[exp.Expression],
+    by_qualifier: dict[str, exp.Expression | None],
+    relation_counts: dict[str, int],
+) -> str:
+    """Normalize only columns whose source relation this SELECT can establish."""
+
+    bare = expression.copy()
+    for column in bare.find_all(exp.Column):
+        # A nested query has its own source namespace. Leave it alone rather
+        # than resolving its columns against this SELECT's FROM and JOINs.
+        parent = column.parent
+        nested_select = False
+        while parent is not None and parent is not bare:
+            if isinstance(parent, exp.Select):
+                nested_select = True
+                break
+            parent = parent.parent
+        if nested_select:
+            continue
+
+        if column.table:
+            relation = by_qualifier.get(column.table.lower())
+        elif len(sources) == 1:
+            relation = sources[0]
+        else:
+            # Without schema metadata an unqualified reference in a join is
+            # ambiguous; retaining its spelling is the safe comparison.
+            relation = None
+
+        if not isinstance(relation, exp.Table):
+            continue
+        if relation_counts[relation_key(relation)] != 1:
+            # A self-join has multiple relation instances even if their table
+            # names match. Do not collapse those distinct column identities.
+            continue
+
+        relation_db = relation.args.get("db")
+        relation_catalog = relation.args.get("catalog")
+        if column.db and (
+            relation_db is None or column.db.lower() != relation_db.name.lower()
+        ):
+            continue
+        if column.catalog and (
+            relation_catalog is None
+            or column.catalog.lower() != relation_catalog.name.lower()
+        ):
+            continue
+
+        column.set("table", relation.this.copy())
+        column.set("db", relation_db.copy() if relation_db is not None else None)
+        column.set(
+            "catalog", relation_catalog.copy() if relation_catalog is not None else None
+        )
+
+    return match_key(bare)
 
 
 #: Constructs that turn one input row into several by design. A query holding
