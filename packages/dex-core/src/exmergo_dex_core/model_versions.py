@@ -526,9 +526,11 @@ def versions_inheriting_tests(entry: Mapping[str, Any]) -> list[str]:
 
 
 #: The version selector of a ``ref()`` as written: ``v=2``, ``version='1.5'``.
-#: A selector that is not a literal still matches, with no value captured.
+#: A selector that is not a literal still matches, with no value captured, and
+#: so does one that only starts with a literal (``v=1 + offset``).
 REF_VERSION = re.compile(
-    r"\b(?:v|version)\s*=\s*(?:'([^'\s]*)'|\"([^\"\s]*)\"|(\d+(?:\.\d+)?)\b)?"
+    r"\b(?:v|version)\s*=\s*"
+    r"(?:(?:'([^'\s]*)'|\"([^\"\s]*)\"|(\d+(?:\.\d+)?))(?=\s*(?:[,)]|$)))?"
 )
 
 #: What :func:`written_ref_version` returns for a selector that is not a
