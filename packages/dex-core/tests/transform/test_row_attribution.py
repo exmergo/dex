@@ -731,6 +731,29 @@ def test_a_union_branch_whose_string_literal_is_recased_is_named():
     ]
 
 
+def test_a_union_branch_whose_quoted_identifier_is_recased_is_named():
+    """A quoted identifier keeps its case: in Postgres ``"Status"`` and
+    ``"status"`` are two columns, so the edit can select different rows."""
+
+    prior = (
+        'select id from orders_a where "Status" = 1\nunion all select id from orders_b'
+    )
+    authored = prior.replace('"Status"', '"status"')
+    changes, unresolved = classify(prior, authored, "postgres")
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+def test_a_union_that_requotes_nothing_and_recases_unquoted_names_reports_nothing():
+    prior = (
+        'select ID from orders_a where "Status" = 1\nunion all select id from orders_b'
+    )
+    authored = prior.replace("select ID", "select id")
+    assert classify(prior, authored, "postgres") == ([], [])
+
+
 #: One UNION branch joins two relations that both carry ``active``.
 JOINED_UNION = (
     "select a.id from orders a join flags b on a.id = b.id where {}\n"

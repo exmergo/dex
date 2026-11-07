@@ -199,8 +199,10 @@ def unqualified_key(node: exp.Expression) -> str:
     while renaming ``a`` is not. An unqualified column in a select that reads
     several relations stays unqualified and so differs from a qualified one.
 
-    String literals keep their case: ``status = 'OPEN'`` edited to
-    ``status = 'open'`` can select different rows, so it must not compare equal.
+    String literals and quoted identifiers keep their case: ``status = 'OPEN'``
+    edited to ``status = 'open'``, or ``"Status"`` edited to ``"status"`` in
+    Postgres, can select different rows, so neither may compare equal. Only
+    unquoted identifiers are folded.
     """
 
     bare = node.copy()
@@ -228,7 +230,8 @@ def unqualified_key(node: exp.Expression) -> str:
         for relation in _relations(select):
             relation.set("alias", None)
     for identifier in bare.find_all(exp.Identifier):
-        identifier.set("this", identifier.this.lower())
+        if not identifier.quoted:
+            identifier.set("this", identifier.this.lower())
     return bare.sql(comments=False, normalize_functions="lower").strip()
 
 
