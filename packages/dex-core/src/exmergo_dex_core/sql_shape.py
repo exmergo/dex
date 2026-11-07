@@ -188,15 +188,22 @@ def match_key(node: exp.Expression | None) -> str:
 
 
 def unqualified_key(node: exp.Expression) -> str:
-    """:func:`match_key` with table qualifiers dropped from every column, so
-    renaming an alias or re-casing an identifier is not a change."""
+    """A comparison form with table qualifiers dropped from every column and
+    identifiers and function names lowercased, so renaming an alias or
+    re-casing an identifier is not a change.
+
+    String literals keep their case: ``status = 'OPEN'`` edited to
+    ``status = 'open'`` can select different rows, so it must not compare equal.
+    """
 
     bare = node.copy()
     for column in bare.find_all(exp.Column):
         column.set("table", None)
         column.set("db", None)
         column.set("catalog", None)
-    return match_key(bare)
+    for identifier in bare.find_all(exp.Identifier):
+        identifier.set("this", identifier.this.lower())
+    return bare.sql(comments=False, normalize_functions="lower").strip()
 
 
 def relation_key(node: exp.Expression | None) -> str:

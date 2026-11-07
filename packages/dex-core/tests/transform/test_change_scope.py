@@ -332,6 +332,22 @@ def test_a_changed_union_is_named_once_beside_row_attribution():
     )
 
 
+def test_a_recased_string_literal_in_a_union_is_unchecked_not_kept():
+    """Only identifier case is folded: ``'OPEN'`` edited to ``'open'`` can
+    select different rows."""
+
+    prior = (
+        "with both as (\n"
+        "  select account_id from {{ ref('a') }} where status = 'OPEN'\n"
+        "  union all\n"
+        "  select account_id from {{ ref('b') }}\n"
+        ")\nselect account_id from both\n"
+    )
+    scope = _scope(prior.replace("'OPEN'", "'open'"), prior=prior)
+    assert scope.population == "unchecked"
+    assert scope.reason and "`both`" in scope.reason
+
+
 def test_the_caps_count_what_they_cut():
     columns = ", ".join(f"cast(c{i} as integer) as c{i}" for i in range(12))
     prior = "select " + columns + " from {{ ref('t') }}"

@@ -715,6 +715,22 @@ def test_a_union_that_only_drops_qualifiers_or_recases_reports_nothing():
     assert classify(prior, authored, "duckdb") == ([], [])
 
 
+def test_a_union_branch_whose_string_literal_is_recased_is_named():
+    """Identifier case is folded, string literals are not: ``'OPEN'`` and
+    ``'open'`` can select different rows."""
+
+    prior = (
+        "select id from orders_a where status = 'OPEN'\n"
+        "union all select id from orders_b"
+    )
+    authored = prior.replace("'OPEN'", "'open'")
+    changes, unresolved = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
 def test_a_set_operation_beside_an_isolable_change_keeps_both():
     prior = (
         "with merged as (select id from orders_a union all select id from orders_b)\n"
