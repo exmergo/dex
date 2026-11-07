@@ -779,6 +779,46 @@ def test_a_self_joined_union_branch_reading_the_other_side_is_named():
     assert [u.scope for u in unresolved] == ["(final select)"]
 
 
+#: A UNION branch whose EXISTS subquery reads one relation and correlates to
+#: the outer select.
+CORRELATED_UNION = (
+    "select a.id from orders a join orders_b b on a.k = b.k\n"
+    "where exists (select 1 from flags f where f.id = {})\n"
+    "union all select id from orders_c"
+)
+
+
+@pytest.mark.parametrize(
+    ("prior", "authored"),
+    [
+        (CORRELATED_UNION.format("a.id"), CORRELATED_UNION.format("b.id")),
+        (CORRELATED_UNION.format("a.id"), CORRELATED_UNION.format("f.id")),
+        (
+            "select a.id from orders a\n"
+            "where exists (select 1 from flags f where f.id = a.id)\n"
+            "union all select id from orders_c",
+            "select a.id from orders a\n"
+            "where exists (select 1 from flags f where f.id = f.id)\n"
+            "union all select id from orders_c",
+        ),
+    ],
+    ids=["outer_join_side", "outer_to_inner", "single_outer_to_inner"],
+)
+def test_a_correlated_reference_moved_in_a_union_branch_is_named(prior, authored):
+    """A qualifier that names an outer relation is resolved there, not dropped
+    because the subquery itself reads one relation."""
+
+    changes, unresolved = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert [u.scope for u in unresolved] == ["(final select)"]
+
+
+def test_a_correlated_union_branch_that_only_renames_the_outer_alias_reports_nothing():
+    prior = CORRELATED_UNION.format("a.id")
+    authored = prior.replace("orders a ", "orders o ").replace("a.", "o.")
+    assert classify(prior, authored, "duckdb") == ([], [])
+
+
 def test_a_set_operation_beside_an_isolable_change_keeps_both():
     prior = (
         "with merged as (select id from orders_a union all select id from orders_b)\n"

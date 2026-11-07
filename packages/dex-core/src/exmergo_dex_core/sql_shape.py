@@ -191,11 +191,13 @@ def unqualified_key(node: exp.Expression) -> str:
     """A comparison form in which re-aliasing or re-casing is not a change.
 
     Identifiers and function names are lowercased. A column's table qualifier
-    is dropped where its select reads one relation, since the column can only
-    come from there. Where a select reads several, the qualifier is replaced by
-    the relation it names, so ``a.active`` edited to ``b.active`` across a join
-    is a change while renaming ``a`` is not; an unqualified column there stays
-    unqualified and so differs from a qualified one.
+    is dropped where its own select reads one relation and defines it, since
+    the column can only come from there. Otherwise the qualifier is replaced by
+    the relation it names, found by walking out through the enclosing selects:
+    ``a.active`` edited to ``b.active`` across a join is a change, and so is a
+    correlated subquery's ``a.id`` edited to ``b.id`` or to its own ``f.id``,
+    while renaming ``a`` is not. An unqualified column in a select that reads
+    several relations stays unqualified and so differs from a qualified one.
 
     String literals keep their case: ``status = 'OPEN'`` edited to
     ``status = 'open'`` can select different rows, so it must not compare equal.
@@ -206,13 +208,20 @@ def unqualified_key(node: exp.Expression) -> str:
         id(select): _source_names(select) for select in bare.find_all(exp.Select)
     }
     for column in list(bare.find_all(exp.Column)):
-        select = column.find_ancestor(exp.Select)
-        named = sources.get(id(select)) if select is not None else None
         qualifier = column.table.lower()
-        if named is not None and len(named) > 1 and qualifier:
-            column.set("table", exp.to_identifier(named.get(qualifier, qualifier)))
-        else:
+        nearest = column.find_ancestor(exp.Select)
+        owner = nearest
+        while owner is not None and qualifier not in sources[id(owner)]:
+            owner = owner.find_ancestor(exp.Select)
+        if not qualifier or (
+            owner in (nearest, None)
+            and (nearest is None or len(sources[id(nearest)]) <= 1)
+        ):
             column.set("table", None)
+        elif owner is None:
+            column.set("table", exp.to_identifier(qualifier))
+        else:
+            column.set("table", exp.to_identifier(sources[id(owner)][qualifier]))
         column.set("db", None)
         column.set("catalog", None)
     for select in bare.find_all(exp.Select):
