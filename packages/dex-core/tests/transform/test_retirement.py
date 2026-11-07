@@ -791,3 +791,48 @@ def test_a_set_aside_file_with_no_manifest_node_is_owed() -> None:
     read_manifest(branch, {"nodes": {}}, "shop", {"models/gone.sql": "no such macro"})
     assert branch.unmatched_failed == ["models/gone.sql"]
     assert _failed_callers(branch, "shop", "macros/region.sql") == ["models/gone.sql"]
+
+
+def test_a_disabled_caller_of_an_unread_macro_is_owed() -> None:
+    """A disabled model's source shows only the macro call, and no tree compiles
+    it (CodeRabbit on #1192)."""
+
+    from exmergo_dex_core.transform.compiled_tree import read_manifest
+    from exmergo_dex_core.transform.retirement import _failed_callers
+
+    manifest = {
+        "nodes": {},
+        "macros": {
+            "macro.shop.outer": {
+                "package_name": "shop",
+                "original_file_path": "macros/outer.sql",
+                "depends_on": {"macros": ["macro.shop.region"]},
+            },
+            "macro.shop.region": {
+                "package_name": "shop",
+                "original_file_path": "macros/region.sql",
+            },
+        },
+        "disabled": {
+            "model.shop.legacy": [
+                {
+                    "name": "legacy",
+                    "package_name": "shop",
+                    "original_file_path": "models/legacy.sql",
+                    "depends_on": {"macros": ["macro.shop.outer"]},
+                }
+            ],
+            "model.vendor.legacy": [
+                {
+                    "name": "legacy",
+                    "package_name": "vendor",
+                    "original_file_path": "models/vendor_legacy.sql",
+                    "depends_on": {"macros": ["macro.shop.outer"]},
+                }
+            ],
+        },
+    }
+    branch = _Branch()
+    read_manifest(branch, manifest, "shop")
+    assert _failed_callers(branch, "shop", "macros/region.sql") == ["models/legacy.sql"]
+    assert _failed_callers(branch, "shop", "macros/other.sql") == []

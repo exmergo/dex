@@ -1070,12 +1070,12 @@ def _column_reads(
 
 
 def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
-    """Files of models that failed to compile and call ``macro_path``'s macro.
+    """Files of models nothing compiled that call ``macro_path``'s macro.
 
-    Read from the manifest's parsed nodes, which keep ``depends_on`` for a node
-    whose compile was set aside. Both lookups are held to this project's
-    package: a package's paths are relative to its own root, so one can share a
-    path with a project file.
+    Those whose compile was set aside, and those dbt leaves disabled, read from
+    the manifest's parsed nodes, which keep ``depends_on`` for both. Both
+    lookups are held to this project's package: a package's paths are relative
+    to its own root, so one can share a path with a project file.
     """
 
     from .compiled_tree import macro_closure
@@ -1083,6 +1083,18 @@ def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
     manifest = branch.manifest
     macros = manifest.get("macros") or {}
     nodes = manifest.get("nodes") or {}
+
+    def calls(node: Any) -> bool:
+        reached = macro_closure(
+            macros, (node.get("depends_on") or {}).get("macros") or ()
+        )
+        return any(
+            (macros.get(uid) or {}).get("package_name") == project
+            and str((macros.get(uid) or {}).get("original_file_path") or "")
+            == macro_path
+            for uid in reached
+        )
+
     # A set-aside file with no node to read dependencies from may call it.
     out = list(branch.unmatched_failed)
     for path in sorted(branch.failed_paths.values()):
@@ -1096,19 +1108,17 @@ def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
             ),
             None,
         )
-        if node is None:
+        if node is None or calls(node):
             out.append(path)
+    # A disabled model compiles in no tree, so only its source was read, and
+    # that sees the call, not the columns the macro writes.
+    for uid, entries in sorted((manifest.get("disabled") or {}).items()):
+        if not uid.startswith(f"model.{project}."):
             continue
-        reached = macro_closure(
-            macros, (node.get("depends_on") or {}).get("macros") or ()
-        )
-        if any(
-            (macros.get(uid) or {}).get("package_name") == project
-            and str((macros.get(uid) or {}).get("original_file_path") or "")
-            == macro_path
-            for uid in reached
-        ):
-            out.append(path)
+        for node in entries if isinstance(entries, list) else [entries]:
+            path = str(node.get("original_file_path") or "")
+            if path and path not in out and calls(node):
+                out.append(path)
     return out
 
 
