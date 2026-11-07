@@ -137,3 +137,52 @@ def test_the_contract_travels_in_the_plan_document(repo, capsys):
     assert plan_digest(swapped) != honest
     without = {k: v for k, v in document.items() if k != "retirement"}
     assert plan_digest(without) != honest
+
+
+def test_a_star_over_an_untouched_model_and_unprofiled_source(repo, capsys):
+    """a star over an untouched model is resolved; an unprofiled source stays
+    unchecked naming explore profile."""
+
+    _write(
+        repo / "shop/models/rpt_wide.sql",
+        "select * from {{ ref('stg_orders') }}\n",
+    )
+    _write(
+        repo / "shop/models/sources.yml",
+        "version: 2\nsources:\n  - name: raw\n    tables:\n      - name: events\n",
+    )
+    _write(
+        repo / "shop/models/rpt_events.sql",
+        "select * from {{ source('raw', 'events') }}\n",
+    )
+    planned = _remove(
+        repo,
+        capsys,
+        {
+            **RETIRE_SQL,
+            "rpt_wide": "select * from {{ ref('stg_orders') }}\n",
+            "rpt_events": "select * from {{ source('raw', 'events') }}\n",
+        },
+        {
+            **RETIRE,
+            "outputs": {
+                **RETIRE["outputs"],
+                "rpt_wide": {
+                    "expected": ["order_id", "region_id", "amount"],
+                    "removed": [],
+                },
+                "rpt_events": {
+                    "expected": ["event_id"],
+                    "removed": [],
+                },
+            },
+        },
+    )
+    records = _records(planned)
+    assert records["rpt_wide"]["status"] == "satisfied"
+    assert not any(
+        c["check"] == "unreadable_select" for c in records["rpt_wide"]["checks"]
+    )
+    assert records["rpt_events"]["status"] == "unchecked"
+    assert records["rpt_events"]["reason_code"] == "unreadable_select"
+    assert "dex explore profile raw.events" in records["rpt_events"]["reason"]
