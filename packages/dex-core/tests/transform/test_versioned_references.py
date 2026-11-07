@@ -283,13 +283,18 @@ class TestReferences:
                 1,
             ),
             (
+                "models/fct_dynamic.sql",
+                "select team_label from {{ ref('dim_teams', v=1 + var('step')) }}\n",
+                1,
+            ),
+            (
                 "models/fct_dynamic.py",
                 "def model(dbt, session):\n"
                 "    return dbt.ref('dim_teams', v=dbt.config.get('which'))\n",
                 2,
             ),
         ],
-        ids=["jinja", "python"],
+        ids=["jinja", "jinja_literal_prefix", "python"],
     )
     def test_a_version_pinned_by_an_expression_is_a_limit(
         self, project, path, text, line
