@@ -72,6 +72,7 @@ DIGESTS = {
     "incremental_watermark": "708724ae33e4abd42360c359667364542bbf75beac5b3bd7a385cac1f8b15d0f",
     "trailing_window": "9bc38c6d85e6e7bcfa81ad11926d7c7207ce20265dc699b9c1f9f4f444c37a74",
     "optional_fees": "4becda5d5ad945ba188d20567e2a874f66c6de1df6c370b3403739839ed5f10d",
+    "gated_fees": "c905e6c4e0677485c46eeb5c5e13d8b37995e65805d0fe33017909043070b92b",
     "sandbox_scope": "c39e1d55a470611137dcbd0b62fdbd617ea8abc183f202b06e51b7d46ea2a07a",
     "visit_coverage": "89f49a8cfb57454f2bccea7e679f82bdecddb20494fb4822077249ee8190c124",
     "package_parent": "ba531ac5af7723884ac87e3d665d2e802efa79b0ed969723b6295a6de723c6bf",
@@ -3277,3 +3278,106 @@ def test_a_shifted_range_that_drops_a_visit_day_fails_the_unchanged_check(tmp_pa
     )
     score = _visits_with(tmp_path, shifted)
     assert "days with visits are unchanged" in _failed(score)
+
+
+# --- the toggle check judges compiled SQL (#1156) ---------------------------
+
+_GATED = "gated_fees/close_fee_leak"
+
+
+@needs_dbt
+def test_the_starting_ledger_leaks_its_fee_total_off(tmp_path):
+    """The negative control: the project as it starts fails only the off build,
+    on the ledger; every gated shape (the macro, the gated group-by count, the
+    disabled report) already holds."""
+
+    task, fixture, workspace = _reference(tmp_path, _GATED)
+    path = "models/finance/ledger_daily.sql"
+    (workspace / path).write_text(
+        (fixture.project / path).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored"
+    assert _failed(score) == [
+        "fees_off: no reporting model exposes a fee column",
+        "fees_off: the ledger has exactly its other columns",
+    ]
+
+
+@needs_dbt
+def test_the_toggle_check_judges_every_gated_shape_in_the_fixture(
+    tmp_path, monkeypatch, capsys
+):
+    """Real CLI on the fixture: the reference fix planned with a toggle contract.
+
+    The merchant report's gated group-by count leaves its source unparseable
+    once the Jinja is blanked, the order fact reads the flag through a macro, and
+    the retired report is disabled. Each is judged, attributed or named on its
+    own, and only the disabled report is left owed.
+    """
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(_GATED)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    path = "models/finance/ledger_daily.sql"
+    payload = workspace / "payload.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": path,
+                        "kind": "model_sql",
+                        "content": (task.directory / "reference" / path).read_text(),
+                    }
+                ],
+                "toggle": {
+                    "variable": "enable_platform_fees",
+                    "on_value": True,
+                    "off_value": False,
+                    "columns": [
+                        "platform_fee",
+                        "net_amount",
+                        "platform_fees",
+                        "high_fee",
+                        "total_fees",
+                        "lifetime_fees",
+                    ],
+                    "exempt_models": ["stg_orders", "stg_ledger_postings"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(
+        [
+            "--repo-root",
+            str(workspace),
+            "transform",
+            "plan",
+            "close the fee leak",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "ok", envelope.get("errors")
+    toggle = envelope["data"]["toggle"]
+    models = {r["model"]: r for r in toggle["models"]}
+    assert not any("could not parse" in limit for limit in toggle["limits"])
+    for name in ("fct_orders", "rpt_merchant_revenue", "ledger_daily"):
+        assert models[name]["status"] == "satisfied", models[name]
+    assert models["rpt_merchant_revenue"]["produces"] == ["high_fee", "platform_fees"]
+    (macro,) = toggle["macro_reads"]
+    assert macro["path"] == "macros/fee_columns.sql"
+    assert macro["models"] == ["fct_orders"]
+    assert toggle["not_compiled"] == [
+        {"model": "rpt_fee_history", "path": "models/legacy/rpt_fee_history.sql"}
+    ]
+    assert toggle["verdict"] == "unchecked"
+    assert len(toggle["limits"]) == 1

@@ -137,13 +137,21 @@ def test_the_digest_moves_when_only_the_scope_changes():
 # --- the full path keeps refusing, and names the route ------------------------
 
 
-def test_the_full_retirement_still_refuses_an_incomplete_scan(root: Path):
+def test_the_full_retirement_runs_when_only_column_parsing_is_short(root: Path):
+    """A column-parse limit cannot hide a var read, so it no longer refuses (#1172)."""
+
     _write(root / "macros/unioned.sql", UNPARSEABLE)
+    propagation = _propagate(root, _edit())
+    assert propagation.edits
+
+
+def test_the_full_retirement_still_refuses_unread_yaml(root: Path):
+    _write(root / "macros/unioned.sql", UNPARSEABLE)
+    _write(root / "models/broken.yml", "models: [\n  - name: x\n")
     with pytest.raises(PropagationRefusedError) as refused:
         _propagate(root, _edit())
     message = str(refused.value)
-    assert "macros/unioned.sql" in message
-    assert "a removal applied to most of a project still compiles" in message
+    assert "models/broken.yml" in message
     assert '"scope": "authored"' in message
 
 

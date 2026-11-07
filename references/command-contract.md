@@ -273,7 +273,12 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      required), the governed columns and exempt_models. data.toggle
                                      compiles every project model at each value and names each one
                                      still outputting a governed column off, or losing one on, from
-                                     compiled SQL alone (skills/transform/references/feature-toggles.md)
+                                     compiled SQL alone, so a select list or group-by count gated
+                                     in Jinja is judged at both values; a model that does not compile
+                                     is set aside on its own record, a flag read in a macro is
+                                     attributed to the models calling it (macro_reads), and a disabled
+                                     model that reads the flag is named under not_compiled (#1156;
+                                     skills/transform/references/feature-toggles.md)
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind, named in
                                      data.resolved_plan and a warnings line, and an empty id is refused
@@ -317,7 +322,12 @@ dex transform remove <kind> <name>   -> the definition removed, and every read v
                                      compiled SQL, transform compare compiles its baseline at that value,
                                      and build --verify --for-plan checks the built columns
                                      (skills/transform/references/feature-retirement.md).
-                                     Where the reference scan cannot finish, `scope: authored`
+                                     A `*` over an untouched model, seed or profiled source is read
+                                     with the toggle check's catalog (#1170). Column-parse limits
+                                     alone run the full contract, with data.retirement.column_reads
+                                     naming any file removed_column_still_read could not read
+                                     (#1172). Where the scan cannot finish otherwise (unread YAML or
+                                     a package, a dynamic var read), `scope: authored`
                                      keeps those checks for the outputs the contract names and
                                      reports discovery unchecked (data.retirement.discovery, and a
                                      reference_discovery record in the build's verification).

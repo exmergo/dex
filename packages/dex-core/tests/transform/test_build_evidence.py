@@ -794,3 +794,34 @@ def test_a_node_message_never_carries_the_value_a_cast_failed_on():
     assert message is not None
     assert "zq_sentinel_7" not in message
     assert "Could not convert string <value withheld> to INT32" in message
+
+
+def test_a_disabled_model_is_read_from_the_manifest_by_name_and_version():
+    """What a build never runs, which ``read_build_evidence`` drops from
+    ``required`` when the plan edited it (#1156)."""
+
+    from exmergo_dex_core.transform.evidence import _disabled_models
+
+    manifest = {
+        "disabled": {
+            "model.shop.legacy": [{"name": "legacy"}],
+            "model.shop.dim_teams.v2": [{"name": "dim_teams", "version": 2}],
+            "seed.shop.old": [{"name": "old"}],
+        }
+    }
+    assert _disabled_models(manifest) == {"legacy", "dim_teams", "dim_teams.v2"}
+    assert _disabled_models(None) == set()
+
+
+def test_one_disabled_version_does_not_excuse_the_enabled_one():
+    """A bare requirement stays owed while any version of it is enabled."""
+
+    from exmergo_dex_core.transform.evidence import _disabled_models
+
+    manifest = {
+        "nodes": {"model.shop.dim_teams.v1": {"name": "dim_teams", "version": 1}},
+        "disabled": {
+            "model.shop.dim_teams.v2": [{"name": "dim_teams", "version": 2}],
+        },
+    }
+    assert _disabled_models(manifest) == {"dim_teams.v2"}

@@ -1,0 +1,5 @@
+{
+  "name": "gated_fees",
+  "seed": 1156,
+  "description": "A marketplace whose platform fee already sits behind `enable_platform_fees`, gated in every shape a toggle check meets in a real project: the order fact through a project macro that reads the flag, the merchant report through a select list and a group-by count gated together, and a retired report left disabled that still reads the flag. One model was missed: the finance ledger still outputs its fee total with the flag off. Before the check judged compiled SQL, the gated group-by made the report's source unparseable and the macro read went unattributed, so the check came back unchecked on exactly the files it exists to judge (#1156)."
+}

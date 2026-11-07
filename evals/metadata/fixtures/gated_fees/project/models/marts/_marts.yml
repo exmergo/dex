@@ -1,0 +1,7 @@
+version: 2
+models:
+  - name: fct_orders
+    description: One row per order.
+  - name: rpt_merchant_revenue
+    description: >-
+      One row per merchant, split by fee band while platform fees are on.

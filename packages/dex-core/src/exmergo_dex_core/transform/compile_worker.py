@@ -271,7 +271,29 @@ def main() -> int:
                 == content.get("metadata", {}).get("project_name")
             ):
                 nodes[path] = node.get("compiled_code")
-    send({"type": "complete", "success": result.success, "nodes": nodes})
+    # A requested model dbt left disabled has no compiled SQL; named so the
+    # caller can compile it enabled rather than read silence as a failure.
+    disabled = []
+    if result.success and manifest.is_file():
+        project_name = content.get("metadata", {}).get("project_name")
+        for entries in (content.get("disabled") or {}).values():
+            for node in entries if isinstance(entries, list) else [entries]:
+                path = str(node.get("original_file_path") or "").replace("\\", "/")
+                if (
+                    path in spec["paths"]
+                    and path not in nodes
+                    and node.get("resource_type") == "model"
+                    and node.get("package_name") == project_name
+                ):
+                    disabled.append(path)
+    send(
+        {
+            "type": "complete",
+            "success": result.success,
+            "nodes": nodes,
+            "disabled": sorted(set(disabled)),
+        }
+    )
     return 0 if result.success else 1
 
 

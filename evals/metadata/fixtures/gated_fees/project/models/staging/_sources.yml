@@ -1,0 +1,8 @@
+version: 2
+sources:
+  - name: raw
+    schema: raw
+    description: Loaded by the order and ledger feeds.
+    tables:
+      - name: orders
+      - name: ledger_postings
