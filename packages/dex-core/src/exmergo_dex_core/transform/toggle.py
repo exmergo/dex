@@ -758,6 +758,22 @@ def _test_columns(node: Mapping[str, Any], uid: str) -> set[str]:
     return names
 
 
+def _argument_columns(node: Mapping[str, Any]) -> set[str]:
+    """The columns a test names in its arguments, beyond the column it sits on.
+
+    The index records these as ``yaml_test_column``; a column test's own
+    ``column_name`` is the column entry it is written under instead.
+    """
+
+    kwargs = (node.get("test_metadata") or {}).get("kwargs") or {}
+    names: set[str] = set()
+    for key in ("combination_of_columns", "compare_columns", "field"):
+        names |= _names(kwargs.get(key))
+    if not node.get("column_name"):
+        names |= _names(kwargs.get("column_name"))
+    return names
+
+
 def _project_tests(
     manifest: Mapping[str, Any], project: str
 ) -> tuple[list[tuple[str, Mapping[str, Any]]], list[tuple[str, Mapping[str, Any]]]]:
@@ -886,8 +902,10 @@ def _tested_when_off(
             for test_id, node in enabled
             if column in _test_columns(node, uid)
         ]
-        held_off = [
-            node for _test_id, node in disabled if column in _test_columns(node, uid)
+        compiled = [
+            node
+            for _test_id, node in (*enabled, *disabled)
+            if column in _test_columns(node, uid)
         ]
         for test_id, node in reading:
             if test_id in seen:
@@ -916,16 +934,25 @@ def _tested_when_off(
                 }
             )
         # A test the index places on this column that dbt compiled into no node,
-        # enabled or not, is one this check could not judge.
-        if reading or held_off:
-            continue
+        # enabled or not, is one this check could not judge. Each site is held
+        # to the nodes of its own file and kind, so one compiled test on the
+        # column does not stand for another written elsewhere.
         for hit in hits:
-            if hit.owner != base or not (
-                hit.form == "yaml_test_column"
-                or (
-                    hit.form == "yaml_column"
-                    and _declares_tests(view, hit.path, base, column)
+            if hit.owner != base or hit.form not in ("yaml_test_column", "yaml_column"):
+                continue
+            in_file = [
+                node
+                for node in compiled
+                if node.get("original_file_path") == hit.path
+                and (
+                    column in _argument_columns(node)
+                    if hit.form == "yaml_test_column"
+                    else str(node.get("column_name") or "").lower() == column
                 )
+            ]
+            if in_file or (
+                hit.form == "yaml_column"
+                and not _declares_tests(view, hit.path, base, column)
             ):
                 continue
             limits.append(
