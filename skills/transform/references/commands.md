@@ -298,7 +298,10 @@ macros, semantic YAML, seed headers, and installed packages. Repo-only and free.
   that inherits it through `include`, and a consumer the version its
   `ref('dim_teams')` or `ref('dim_teams', v=N)` resolves to. Names in an
   `include` or `exclude` list are reported as `yaml_version_include` and
-  `yaml_version_exclude`.
+  `yaml_version_exclude`. A label alone (`dim_teams.v2`) is answered as that
+  version: its file and the `ref()` calls that resolve to it. A `ref()` that
+  pins its version with an expression (`v=var('x')`) is a limit, and `rename`
+  and `remove` refuse while it stands.
 - Capped at 200 occurrences across 50 files; `--full` lifts both.
 - `--usage` also reports how other models use each qualified `model.column`
   (or `source_table.column`): each target gains `usage`, the same `readers`,
