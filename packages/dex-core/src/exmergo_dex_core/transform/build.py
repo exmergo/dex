@@ -1129,17 +1129,64 @@ class ShadowRun:
         return self.shadow
 
 
-def has_package_spec(project_dir: Path | str) -> bool:
+#: The project-root files that decide which packages a project declares and
+#: where dbt installs them. A plan's edit to any of them is read in place of the
+#: file on disk when the package check runs against the post-edit tree (#1166).
+PACKAGE_DECIDING_FILES = ("packages.yml", "dependencies.yml", "dbt_project.yml")
+
+#: Root-relative file name to post-edit text, ``None`` where the edit deletes it.
+PackageOverlay = Mapping[str, str | None]
+
+
+def _root_text(
+    project: Path, name: str, overlay: PackageOverlay | None = None
+) -> str | None:
+    """A project-root file's text, as a plan would leave it where ``overlay``
+    says, and as it stands on disk otherwise. ``None`` means it does not exist."""
+
+    if overlay is not None and name in overlay:
+        return overlay[name]
+    candidate = project / name
+    if not candidate.is_file():
+        return None
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def package_overlay(edits: Iterable[Edit]) -> dict[str, str | None]:
+    """The edits that change which packages are declared, keyed by file name.
+
+    Only a project-root ``packages.yml``, ``dependencies.yml`` or
+    ``dbt_project.yml`` counts: the first two declare the packages and the last
+    can move ``packages-install-path``. A delete maps to ``None``.
+    """
+
+    overlay: dict[str, str | None] = {}
+    for edit in edits:
+        path = Path(edit.path)
+        if path.parent != Path() or path.name not in PACKAGE_DECIDING_FILES:
+            continue
+        overlay[path.name] = (
+            None if edit.op is EditOp.DELETE else (edit.new_content or "")
+        )
+    return overlay
+
+
+def has_package_spec(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> bool:
     """True when the project declares dbt packages (packages.yml, or a
     dependencies.yml with a ``packages:`` key)."""
 
     project = Path(project_dir)
-    if (project / "packages.yml").is_file():
+    if _root_text(project, "packages.yml", overlay) is not None:
         return True
-    dependencies = project / "dependencies.yml"
-    if dependencies.is_file():
+    text = _root_text(project, "dependencies.yml", overlay)
+    if text is not None:
         try:
-            parsed = yaml.safe_load(dependencies.read_text(encoding="utf-8"))
+            parsed = yaml.safe_load(text)
         except yaml.YAMLError:
             return False
         return isinstance(parsed, dict) and bool(parsed.get("packages"))
@@ -1185,15 +1232,17 @@ def _without_userinfo(value: str) -> str:
     return f"{scheme}://{authority}{separator}{tail}"
 
 
-def _package_entries(project: Path) -> list[dict[str, Any]]:
+def _package_entries(
+    project: Path, overlay: PackageOverlay | None = None
+) -> list[dict[str, Any]]:
     """The raw ``packages:`` list, from whichever file declares it."""
 
     for filename in ("packages.yml", "dependencies.yml"):
-        candidate = project / filename
-        if not candidate.is_file():
+        text = _root_text(project, filename, overlay)
+        if text is None:
             continue
         try:
-            parsed = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+            parsed = yaml.safe_load(text)
         except yaml.YAMLError:
             continue
         if isinstance(parsed, dict) and isinstance(parsed.get("packages"), list):
@@ -1201,7 +1250,9 @@ def _package_entries(project: Path) -> list[dict[str, Any]]:
     return []
 
 
-def declared_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+def declared_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> list[DeclaredPackage]:
     """Every package the project declares, in the three forms dbt accepts.
 
     Read rather than resolved: this says what the project asks for, not what a
@@ -1211,7 +1262,7 @@ def declared_packages(project_dir: Path | str) -> list[DeclaredPackage]:
 
     project = Path(project_dir)
     packages: list[DeclaredPackage] = []
-    for entry in _package_entries(project):
+    for entry in _package_entries(project, overlay):
         if isinstance(entry.get("package"), str):
             name = entry["package"]
             packages.append(
@@ -1259,7 +1310,9 @@ def _version_text(value: Any) -> str | None:
     return str(value)
 
 
-def package_install_dir(project_dir: Path | str) -> Path:
+def package_install_dir(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> Path:
     """Where dbt installs declared packages, honoring ``packages-install-path``.
 
     dbt defaults to ``dbt_packages/`` beside the project; a project may move it.
@@ -1269,10 +1322,10 @@ def package_install_dir(project_dir: Path | str) -> Path:
 
     project = Path(project_dir)
     configured: str | None = None
-    config = project / "dbt_project.yml"
-    if config.is_file():
+    text = _root_text(project, "dbt_project.yml", overlay)
+    if text is not None:
         try:
-            parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
+            parsed = yaml.safe_load(text)
         except yaml.YAMLError:
             parsed = None
         if isinstance(parsed, dict):
@@ -1282,7 +1335,9 @@ def package_install_dir(project_dir: Path | str) -> Path:
     return project / (configured or "dbt_packages")
 
 
-def installed_packages(project_dir: Path | str) -> set[str]:
+def installed_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> set[str]:
     """What is actually in the package directory, by directory and by declared name.
 
     Both, because dbt installs a hub package into a directory named after the
@@ -1293,7 +1348,7 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     """
 
     installed: set[str] = set()
-    root = package_install_dir(project_dir)
+    root = package_install_dir(project_dir, overlay=overlay)
     if not root.is_dir():
         return installed
     for child in root.iterdir():
@@ -1312,7 +1367,9 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     return installed
 
 
-def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+def missing_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> list[DeclaredPackage]:
     """Declared packages this project does not have installed.
 
     An empty ``dbt_packages/`` means every declaration is missing, which is the
@@ -1323,10 +1380,10 @@ def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
     """
 
     project = Path(project_dir)
-    declared = declared_packages(project)
+    declared = declared_packages(project, overlay=overlay)
     if not declared:
         return []
-    installed = installed_packages(project)
+    installed = installed_packages(project, overlay=overlay)
     if not installed:
         return declared
     return [
@@ -1336,12 +1393,18 @@ def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
     ]
 
 
-def unverifiable_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+def unverifiable_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> list[DeclaredPackage]:
     """Declared packages whose presence dex cannot check by name."""
 
-    if not installed_packages(project_dir):
+    if not installed_packages(project_dir, overlay=overlay):
         return []
-    return [p for p in declared_packages(project_dir) if p.install_name is None]
+    return [
+        p
+        for p in declared_packages(project_dir, overlay=overlay)
+        if p.install_name is None
+    ]
 
 
 class MissingPackagesError(PrerequisiteError):
@@ -1358,6 +1421,8 @@ class MissingPackagesError(PrerequisiteError):
         self,
         packages: list[DeclaredPackage],
         unverifiable: list[DeclaredPackage] | None = None,
+        *,
+        lead: str = "this build may not install dependencies",
     ):
         self.packages = packages
         self.unverifiable = unverifiable or []
@@ -1374,7 +1439,7 @@ class MissingPackagesError(PrerequisiteError):
                 + " by name, so those may be missing too"
             )
         super().__init__(
-            f"this build may not install dependencies, and {detail}. "
+            f"{lead}, and {detail}. "
             "Run `transform deps` "
             "where the network is available, or bake dbt_packages/ into the "
             "environment before the build. `transform deps` installs the "
@@ -1385,7 +1450,11 @@ class MissingPackagesError(PrerequisiteError):
 
 
 def assert_packages_installed(
-    project_dir: Path | str, *, unverifiable_is_fatal: bool = True
+    project_dir: Path | str,
+    *,
+    unverifiable_is_fatal: bool = True,
+    overlay: PackageOverlay | None = None,
+    lead: str | None = None,
 ) -> None:
     """Check every declaration, even when some packages are already installed.
 
@@ -1396,26 +1465,136 @@ def assert_packages_installed(
     still runs schema checks when dbt cannot parse) passes
     ``unverifiable_is_fatal=False``: a git package's directory name is not
     determined by its URL, so refusing on it would refuse the whole project.
+    ``overlay`` reads the package-deciding files as a plan would leave them
+    (:func:`package_overlay`), so the check is of the post-edit tree.
     """
 
-    missing = missing_packages(project_dir)
-    unverifiable = unverifiable_packages(project_dir)
-    shortfall = has_package_shortfall(project_dir)
+    missing = missing_packages(project_dir, overlay=overlay)
+    unverifiable = unverifiable_packages(project_dir, overlay=overlay)
+    shortfall = has_package_shortfall(project_dir, overlay=overlay)
     if (
         missing
         or (unverifiable_is_fatal and unverifiable)
-        or needs_deps(project_dir)
+        or needs_deps(project_dir, overlay=overlay)
         or shortfall
     ):
         # A count shortfall is a definite absence somewhere, so the packages dex
         # could not check are worth naming even when the caller tolerates an
         # unverifiable installation on its own.
+        extra = {"lead": lead} if lead else {}
         raise MissingPackagesError(
-            missing, unverifiable if (unverifiable_is_fatal or shortfall) else []
+            missing,
+            unverifiable if (unverifiable_is_fatal or shortfall) else [],
+            **extra,
         )
 
 
-def has_package_shortfall(project_dir: Path | str) -> bool:
+class PlanDeclaresMissingPackagesError(MissingPackagesError):
+    """A plan refused because its own edit declares a package not installed (#1166).
+
+    dbt cannot parse or compile the plan's other edits against a declaration
+    whose package is absent, and a plan installs nothing, since installing can
+    reach the network. The way through is two plans: the ``packages.yml``
+    change on its own (which needs no parse), applied, then ``transform deps``,
+    then the rest.
+    """
+
+    def __init__(
+        self,
+        declared_by_plan: list[DeclaredPackage],
+        already_declared: list[DeclaredPackage] | None = None,
+        unverifiable: list[DeclaredPackage] | None = None,
+    ):
+        self.declared_by_plan = declared_by_plan
+        already = already_declared or []
+        unchecked = unverifiable or []
+        # Not super().__init__: the message is this refusal's own, and the
+        # attributes a caller reads are the parent's.
+        self.packages = [*declared_by_plan, *already]
+        self.unverifiable = unchecked
+        message = (
+            "this plan declares dbt packages that are not installed: "
+            + ", ".join(p.describe() for p in declared_by_plan)
+            + ". dbt cannot parse the plan's other edits without them, and a "
+            "plan installs nothing. Plan the packages.yml change on its own and "
+            "apply it, run `transform deps` where the network is available, then "
+            "plan the rest"
+        )
+        if already:
+            message += (
+                "; the project already declares these, also not installed: "
+                + ", ".join(p.describe() for p in already)
+            )
+        if unchecked:
+            message += (
+                "; dex could not check "
+                + ", ".join(p.describe() for p in unchecked)
+                + " by name, so those may be missing too"
+            )
+        PrerequisiteError.__init__(self, message)
+
+
+def _package_key(package: DeclaredPackage) -> tuple[str, str]:
+    """What makes two declarations the same package across the two trees."""
+
+    return package.source, package.name
+
+
+def assert_plan_packages_installed(
+    project_dir: Path | str, edits: Iterable[Edit]
+) -> None:
+    """The plan-time package check, read against the post-edit tree (#1166).
+
+    #1060's check read the declarations on disk, so a plan whose own
+    ``packages_yml`` edit added a package passed it and then failed in dbt's
+    words. Here the plan's edits to the package-deciding files are read in place
+    of the disk copies: a package the plan declares is checked, and one the plan
+    stops declaring no longer refuses it. A package the plan adds and dex cannot
+    check by name (git, tarball) is named whenever the installed count proves
+    something declared is absent.
+    """
+
+    overlay = package_overlay(edits)
+    lead = "a plan installs nothing"
+    try:
+        assert_packages_installed(
+            project_dir, unverifiable_is_fatal=False, overlay=overlay, lead=lead
+        )
+    except MissingPackagesError as exc:
+        if not overlay:
+            raise
+        before = {_package_key(p) for p in declared_packages(project_dir)}
+        added = [
+            p
+            for p in declared_packages(project_dir, overlay=overlay)
+            if _package_key(p) not in before
+        ]
+        added_keys = {_package_key(p) for p in added}
+        named = {_package_key(p) for p in exc.packages}
+        ours = [p for p in added if _package_key(p) in named]
+        # An added package dex cannot check by name, refused only when the count
+        # (or an empty install directory) proves an absence it may account for.
+        ours_unchecked = [
+            p for p in added if p.install_name is None and _package_key(p) not in named
+        ]
+        theirs = [p for p in exc.packages if _package_key(p) not in added_keys]
+        unchecked = [p for p in exc.unverifiable if _package_key(p) not in added_keys]
+        if ours:
+            # The plan's unverifiable additions ride along as "may be missing".
+            raise PlanDeclaresMissingPackagesError(
+                ours, theirs, [*unchecked, *ours_unchecked]
+            ) from None
+        if ours_unchecked and not theirs:
+            # Nothing already declared explains the absence the count proves.
+            raise PlanDeclaresMissingPackagesError(
+                ours_unchecked, [], unchecked
+            ) from None
+        raise
+
+
+def has_package_shortfall(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> bool:
     """True when fewer packages are installed than the project declares.
 
     A git declaration's install directory name is unknown, so it can never be
@@ -1426,26 +1605,28 @@ def has_package_shortfall(project_dir: Path | str) -> bool:
     """
 
     project = Path(project_dir)
-    declared = declared_packages(project)
+    declared = declared_packages(project, overlay=overlay)
     if not declared:
         return False
-    root = package_install_dir(project)
+    root = package_install_dir(project, overlay=overlay)
     if not root.is_dir():
         return False
     installed = sum(1 for child in root.iterdir() if child.is_dir())
     return installed < len(declared)
 
 
-def needs_deps(project_dir: Path | str) -> bool:
+def needs_deps(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> bool:
     """True when declared packages are not installed yet (install path missing
     or empty). Lockfile staleness is not tracked; `transform deps` is the
     explicit refresh. Honours ``packages-install-path`` via
     :func:`package_install_dir`."""
 
     project = Path(project_dir)
-    if not has_package_spec(project):
+    if not has_package_spec(project, overlay=overlay):
         return False
-    install_dir = package_install_dir(project)
+    install_dir = package_install_dir(project, overlay=overlay)
     return not install_dir.is_dir() or not any(install_dir.iterdir())
 
 

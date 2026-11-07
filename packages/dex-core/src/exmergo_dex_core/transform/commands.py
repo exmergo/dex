@@ -368,7 +368,7 @@ def plan(
         # The secret-guard runs first, so an inlined credential is never handed
         # to the dbt subprocess.
         from ..dbt_project import load as load_project
-        from .build import assert_packages_installed, shadow_parse
+        from .build import assert_plan_packages_installed, shadow_parse
         from .validate import assert_profiles_safe
 
         project = engine.project_dir()
@@ -413,6 +413,19 @@ def plan(
         version_report, version_notes = versions_mod.analyze(
             view, edits, dialect=dialect
         )
+        # dbt refuses to parse a project whose declared packages are not
+        # installed, and its message names raw `dbt deps`. Refuse first with the
+        # verb this project has; plan installs nothing because deps can reach
+        # the network. An installed git package whose directory name dex cannot
+        # know is not a reason to refuse the whole plan: the parse either runs or
+        # degrades to a warning. Read against the post-edit tree, so a package
+        # this plan's own `packages_yml` edit declares is checked too (#1166),
+        # and ahead of the derivation, whose own parse would otherwise fail on
+        # it first (twice) before the gate below said so.
+        if (
+            has_delete or parser_owned or version_report is not None
+        ) and _unparseable_reason(view, edits) is None:
+            assert_plan_packages_installed(project, edits)
         # After the guards above, because a derivation is checked by dbt's
         # parse of a copy of the project with these edits in it.
         derived = _derive_semantic(engine, view, edits)
@@ -433,13 +446,7 @@ def plan(
             elif blocker := _unparseable_reason(view, edits):
                 parse_result = {"available": False, "reason": blocker}
             else:
-                # dbt refuses to parse a project whose declared packages are not
-                # installed, and its message names raw `dbt deps`. Refuse first
-                # with the verb this project has; plan installs nothing because
-                # deps can reach the network. An installed git package whose
-                # directory name dex cannot know is not a reason to refuse the
-                # whole plan: the parse either runs or degrades to a warning.
-                assert_packages_installed(project, unverifiable_is_fatal=False)
+                # The package check ran ahead of the derivation (#1166).
                 parse_result = shadow_parse(
                     project,
                     edits,
@@ -6135,6 +6142,12 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
                 pii_overrides=overrides,
                 defer_compilation=True,
             )
+        # dbt compile refuses a project whose declared packages are not
+        # installed, in words naming raw `dbt deps`; the parse gate's check,
+        # read against the post-edit tree, refuses first in Dex's (#1166).
+        from .build import assert_plan_packages_installed
+
+        assert_plan_packages_installed(project, edits)
         compiled_models, compilation = compile_models(engine, edits)
     try:
         stored, diffs, warnings = plans_mod.plan(

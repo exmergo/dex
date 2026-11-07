@@ -791,7 +791,11 @@ def validate_parse(
     them; otherwise the plan's own gate reports it, in its own words.
     """
 
-    from .build import shadow_parse
+    from .build import (
+        MissingPackagesError,
+        assert_plan_packages_installed,
+        shadow_parse,
+    )
 
     def record(result: str, detail: str | None = None) -> None:
         for derivation in derivations:
@@ -805,6 +809,16 @@ def validate_parse(
                 )
             derivation.validation["parse"] = entry
 
+    # dbt parses nothing whose declared packages are not installed, so a parse
+    # here could only fail, twice, in dbt's `Run "dbt deps"` words. Say why in
+    # Dex's, read against the post-edit tree (#1166). The plan's own gate
+    # refuses where its edits need a parse; a plan that needs none (a SQL-only
+    # edit to a declared mart) keeps its edits and leaves this one unvalidated.
+    try:
+        assert_plan_packages_installed(project, base_edits)
+    except MissingPackagesError as exc:
+        record("not_run", str(exc))
+        return None
     combined = shadow_parse(
         project, [*base_edits, *spine, *derived_edits], target=target
     )

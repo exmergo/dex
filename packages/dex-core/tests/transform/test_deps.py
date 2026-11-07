@@ -180,3 +180,159 @@ def test_transform_deps_installs_local_package_for_real(
     assert envelope["data"]["success"] is True
     assert envelope["data"]["packages_dir_exists"] is True
     assert (dbt_project_dir / "dbt_packages").is_dir()
+
+
+# --- #1166: the package readers take the post-edit tree -------------------------
+
+
+def _edit(path: str, content: str | None):
+    """A plan edit at ``path``; ``None`` content makes it a delete."""
+
+    from exmergo_dex_core.dbt_project import Edit, EditOp
+
+    if content is None:
+        return Edit(path=path, op=EditOp.DELETE, new_content=None)
+    return Edit(path=path, op=EditOp.UPSERT, new_content=content)
+
+
+def test_package_overlay_keeps_only_the_root_package_files():
+    """Only root package-deciding files enter the overlay; a delete maps to None."""
+
+    from exmergo_dex_core.transform.build import package_overlay
+
+    overlay = package_overlay(
+        [
+            _edit("packages.yml", "packages: []\n"),
+            _edit("dependencies.yml", None),
+            _edit("models/packages.yml", "packages: []\n"),
+            _edit("models/a.sql", "select 1\n"),
+        ]
+    )
+    assert overlay == {"packages.yml": "packages: []\n", "dependencies.yml": None}
+
+
+def test_the_readers_see_the_overlay_in_place_of_the_disk(tmp_path: Path):
+    """Every package reader answers for the post-edit tree when given an overlay."""
+
+    from exmergo_dex_core.transform.build import (
+        declared_packages,
+        has_package_shortfall,
+        missing_packages,
+        needs_deps,
+        package_install_dir,
+    )
+
+    (tmp_path / "dbt_project.yml").write_text("name: p\n", encoding="utf-8")
+    (tmp_path / "packages.yml").write_text(
+        "packages:\n  - local: ../a\n", encoding="utf-8"
+    )
+    (tmp_path / "dbt_packages" / "a").mkdir(parents=True)
+    overlay = {
+        "packages.yml": "packages:\n  - local: ../a\n  - git: https://x/y.git\n",
+        "dbt_project.yml": "name: p\npackages-install-path: vendor\n",
+    }
+    assert [p.name for p in declared_packages(tmp_path)] == ["../a"]
+    assert [p.name for p in declared_packages(tmp_path, overlay=overlay)] == [
+        "../a",
+        "https://x/y.git",
+    ]
+    assert package_install_dir(tmp_path, overlay=overlay) == tmp_path / "vendor"
+    # Nothing installed under the overlaid path: every declaration is missing.
+    assert needs_deps(tmp_path, overlay=overlay)
+    assert len(missing_packages(tmp_path, overlay=overlay)) == 2
+    # Without the moved install path, the git package is a count shortfall.
+    assert has_package_shortfall(
+        tmp_path, overlay={"packages.yml": overlay["packages.yml"]}
+    )
+    assert not has_package_shortfall(tmp_path)
+    # A deleted spec declares nothing.
+    assert declared_packages(tmp_path, overlay={"packages.yml": None}) == []
+
+
+def test_a_plan_adding_a_git_package_is_refused_on_the_count(tmp_path: Path):
+    """An added git package is named on a count shortfall, credentials stripped."""
+
+    from exmergo_dex_core.transform.build import (
+        PlanDeclaresMissingPackagesError,
+        assert_plan_packages_installed,
+    )
+
+    (tmp_path / "dbt_project.yml").write_text("name: p\n", encoding="utf-8")
+    (tmp_path / "packages.yml").write_text(
+        "packages:\n  - local: ../a\n", encoding="utf-8"
+    )
+    (tmp_path / "dbt_packages" / "a").mkdir(parents=True)
+    assert_plan_packages_installed(tmp_path, [])
+    with pytest.raises(PlanDeclaresMissingPackagesError) as caught:
+        assert_plan_packages_installed(
+            tmp_path,
+            [
+                _edit(
+                    "packages.yml",
+                    "packages:\n  - local: ../a\n"
+                    "  - git: https://token@github.com/o/r.git\n",
+                )
+            ],
+        )
+    message = str(caught.value)
+    assert "https://github.com/o/r.git" in message
+    assert "token" not in message
+    assert "transform deps" in message
+
+
+def test_a_plan_adding_hub_and_git_packages_names_both(tmp_path: Path):
+    """A checkable and an unverifiable addition are both named as the plan's."""
+
+    from exmergo_dex_core.transform.build import (
+        PlanDeclaresMissingPackagesError,
+        assert_plan_packages_installed,
+    )
+
+    (tmp_path / "dbt_project.yml").write_text("name: p\n", encoding="utf-8")
+    with pytest.raises(PlanDeclaresMissingPackagesError) as caught:
+        assert_plan_packages_installed(
+            tmp_path,
+            [
+                _edit(
+                    "packages.yml",
+                    "packages:\n  - package: dbt-labs/dbt_utils\n"
+                    "  - git: https://github.com/o/r.git\n",
+                )
+            ],
+        )
+    assert [p.name for p in caught.value.declared_by_plan] == [
+        "dbt-labs/dbt_utils",
+        "https://github.com/o/r.git",
+    ]
+
+
+def test_an_unverifiable_addition_is_not_blamed_for_an_existing_absence(
+    tmp_path: Path,
+):
+    """An already-declared missing package explains the shortfall, not the addition."""
+
+    from exmergo_dex_core.transform.build import (
+        MissingPackagesError,
+        PlanDeclaresMissingPackagesError,
+        assert_plan_packages_installed,
+    )
+
+    (tmp_path / "dbt_project.yml").write_text("name: p\n", encoding="utf-8")
+    (tmp_path / "packages.yml").write_text(
+        "packages:\n  - local: ../a\n  - local: ../b\n", encoding="utf-8"
+    )
+    (tmp_path / "dbt_packages" / "a").mkdir(parents=True)
+    with pytest.raises(MissingPackagesError) as caught:
+        assert_plan_packages_installed(
+            tmp_path,
+            [
+                _edit(
+                    "packages.yml",
+                    "packages:\n  - local: ../a\n  - local: ../b\n"
+                    "  - git: https://github.com/o/r.git\n",
+                )
+            ],
+        )
+    assert not isinstance(caught.value, PlanDeclaresMissingPackagesError)
+    assert "../b" in str(caught.value)
+    assert "a plan installs nothing" in str(caught.value)
