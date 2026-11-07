@@ -531,6 +531,7 @@ def _dev_relation_test(engine: DexEngine) -> tuple[str, Callable[[str], bool]] |
         wanted = [str(project).lower(), *wanted]
 
     def in_dev(name: str) -> bool:
+        """Whether ``name`` lies in the dev namespace or one derived from it."""
         namespace = name.lower().split(".")[:-1]
         if not namespace:
             return False
@@ -1822,6 +1823,7 @@ def _run_statements(
         return value if reads_dev_target else _without_dev_profiles(engine, value)
 
     def acquire_adapter() -> Adapter:
+        """The call's one adapter, opened on first use."""
         # `--target dev` reads the dev namespace, and those dbt derives from it,
         # for this command only (#1133); every other call reads the source scope.
         if shared.adapter is None:

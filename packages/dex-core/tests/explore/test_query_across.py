@@ -256,6 +256,8 @@ def test_an_ordinary_batch_payload_is_unchanged(mirrored: Path, tmp_path: Path, 
 def test_across_takes_the_dev_target_flag_apart_from_its_datasets(
     mirrored: Path, tmp_path: Path, capsys
 ):
+    """`--target dev` is the dbt target, apart from `--across` datasets."""
+
     # #1133: `--target dev` names the dbt dev target, not an `--across` dataset.
     # On DuckDB it widens nothing, says so, and leaves the fan-out unchanged.
     repo = _repo(mirrored, tmp_path, capsys)

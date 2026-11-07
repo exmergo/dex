@@ -5245,6 +5245,8 @@ def _cache_dev_profile(
 def test_query_without_target_names_the_dev_namespace_and_the_flag(
     monkeypatch, fake_sf_connection
 ):
+    """A dev relation without the flag is refused naming the namespace and flag."""
+
     # #1133: the plain query used to say "not in the exploration cache; run
     # `explore profile`", which a caller who just ran `explore profile --target
     # dev` had already done. It names the namespace and the flag instead, from
@@ -5279,6 +5281,8 @@ def test_query_without_target_names_the_dev_namespace_and_the_flag(
 
 
 def test_query_reads_a_dev_only_build_for_one_command(monkeypatch, fake_sf_connection):
+    """`--target dev` reads the dev namespace for one call only."""
+
     # #1133: `--target dev` reads the dev namespace for this call, under the
     # same cost handshake, and the next call reads the committed scope again.
     # Nothing is written back to config.
@@ -5310,6 +5314,8 @@ def test_query_reads_a_dev_only_build_for_one_command(monkeypatch, fake_sf_conne
 def test_query_refuses_a_prod_target_before_anything_opens(
     monkeypatch, fake_sf_connection
 ):
+    """A prod-looking target is refused before any statement."""
+
     from exmergo_dex_core.explore.commands import query, query_batch
     from exmergo_dex_core.transform.build import ProdTargetRefusedError
 
@@ -5325,6 +5331,8 @@ def test_query_refuses_a_prod_target_before_anything_opens(
 def test_query_on_the_dev_target_keeps_the_pii_gate_and_values_free_mode(
     monkeypatch, fake_sf_connection
 ):
+    """The PII gate and values-free mode hold under `--target dev`."""
+
     # #1133: the dev namespace is read like any other relation; the firewall,
     # the PII gate and values-free mode are unchanged.
     from exmergo_dex_core.explore.commands import query
@@ -5359,6 +5367,8 @@ def test_query_on_the_dev_target_keeps_the_pii_gate_and_values_free_mode(
 def test_query_on_the_dev_target_reads_a_namespace_dbt_derived(
     monkeypatch, fake_sf_connection, tmp_path
 ):
+    """A namespace dbt derived from the dev one is read and named."""
+
     # #1133 with #1155: a package's `+schema` builds into DBT_DEV_<name>. Its
     # model is the build's own output, so `--target dev` reads that namespace
     # too, for the project's manifest relations, and says so.

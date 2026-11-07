@@ -1219,6 +1219,8 @@ def test_query_batch_warehouse_error_reports_warehouse_refused_the_statement(
 def test_target_dev_answers_and_names_the_no_op_on_duckdb(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
+    """On DuckDB the flag answers as before and notes it widened nothing."""
+
     # #1133: the flag exists (an agent got `unrecognized arguments: --target
     # dev`). DuckDB's dev target is the file it already reads, so the answer is
     # the plain one and a note says the flag widened nothing.
@@ -1266,6 +1268,8 @@ def test_target_dev_answers_and_names_the_no_op_on_duckdb(
 def test_target_prod_is_refused_before_anything_runs(
     airbnb_duckdb: Path, tmp_path: Path, capsys, target: str
 ):
+    """`--target prod` is refused and nothing is ledgered."""
+
     repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
     before = (
         (repo / ".dex" / QUERIES_FILE).read_text()
@@ -1299,6 +1303,8 @@ def test_target_prod_is_refused_before_anything_runs(
 def test_an_uncached_relation_behind_an_unopenable_connection_names_the_connection(
     airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """An uncached relation behind a dead connection names the connection error."""
+
     # #1133: with the warehouse unreachable (a DuckDB file another process holds
     # locked, in the ADE-bench run), a relation the cache cannot speak for was
     # refused as "not in the exploration cache; run `explore map`", which fails
@@ -1325,6 +1331,8 @@ def test_an_uncached_relation_behind_an_unopenable_connection_names_the_connecti
 def test_no_cache_behind_an_unopenable_connection_names_the_connection(
     airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """A missing cache behind a dead connection names the connection error."""
+
     repo = tmp_path / "repo"
     repo.mkdir()
     unreachable_warehouse(monkeypatch)
