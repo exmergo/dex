@@ -26,7 +26,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import yaml
 
@@ -2205,8 +2205,8 @@ def test_mutations(
                 if branch is not None
                 else []
             )
-            full_tests = bool(below.tests) or bool(
-                below.direct - set(incremental_tests)
+            full_tests = bool(below.tests) or _runs_full_build(
+                shadow.manifest(), node, incremental_tests
             )
             if not batch.mutants:
                 equivalence = _EquivalenceCheck(
@@ -2638,26 +2638,79 @@ def _incremental_program(
     return prepared, None
 
 
-def _incremental_unit_tests(manifest: dict, node: dict) -> list[str]:
+class IncrementalUnitTest(NamedTuple):
+    """One unit test that runs the incremental branch, as dbt knows it.
+
+    ``name`` is the test as a run reports it, ``select`` the name dbt's
+    ``unit_test:`` selector matches. They differ on a versioned model: dbt
+    reports each version's instance as ``<name>_v<version>`` while the
+    selector matches the definition's ``<name>`` and so every version of it,
+    which is why a run's statuses are read for ``name`` alone.
+    """
+
+    unique_id: str
+    name: str
+    select: str
+
+
+def _covers(unit: dict, node: dict) -> bool:
+    """Whether this unit test runs ``node`` rather than another version of it.
+
+    dbt binds each unit test instance to one model through ``depends_on``,
+    one instance per version on a versioned model. The model name is a
+    fallback only for an unversioned model, where it cannot name another one.
+    """
+
+    if node.get("unique_id") in (unit.get("depends_on") or {}).get("nodes", []):
+        return True
+    return node.get("version") is None and unit.get("model") == node.get("name")
+
+
+def _incremental_unit_tests(manifest: dict, node: dict) -> list[IncrementalUnitTest]:
     """The unit tests on this model that run its ``is_incremental()`` branch.
 
     dbt runs the branch in a unit test only where the test overrides the
     ``is_incremental`` macro to true; every other test runs the full build.
+    On a versioned model, only the instances that test this version.
     """
 
-    unique_id = node.get("unique_id")
-    names = []
-    for unit in (manifest.get("unit_tests") or {}).values():
-        if unique_id not in (unit.get("depends_on") or {}).get(
-            "nodes", []
-        ) and unit.get("model") != node.get("name"):
+    found = []
+    for unique_id, unit in (manifest.get("unit_tests") or {}).items():
+        if not _covers(unit, node) or not unit.get("name"):
             continue
         value = ((unit.get("overrides") or {}).get("macros") or {}).get(
             "is_incremental"
         )
-        if value is True or str(value).lower() == "true":
-            names.append(unit.get("name"))
-    return sorted(name for name in names if name)
+        if value is not True and str(value).lower() != "true":
+            continue
+        version = unit.get("version")
+        found.append(
+            IncrementalUnitTest(
+                unique_id=unique_id,
+                name=unit["name"] if version is None else f"{unit['name']}_v{version}",
+                select=unit["name"],
+            )
+        )
+    return sorted(found, key=lambda test: test.name)
+
+
+def _runs_full_build(
+    manifest: dict, node: dict, incremental: Sequence[IncrementalUnitTest]
+) -> bool:
+    """Whether any test of the model's own runs its full build.
+
+    Compared by unique id, which is what tells one version's unit test from
+    another's: a unit test that tests another version of the model, or one that
+    runs the incremental branch, does not count.
+    """
+
+    branch = {test.unique_id for test in incremental}
+    units = manifest.get("unit_tests") or {}
+    return any(
+        unique_id not in branch
+        and (unique_id not in units or _covers(units[unique_id], node))
+        for unique_id in _attached_tests(manifest, node)
+    )
 
 
 def _parent_relations(manifest: dict, node: dict, mutation_mod) -> list:
@@ -2719,7 +2772,7 @@ def _price_mutations(
     equivalence=None,
     reads: set[str] | None = None,
     skip: frozenset[str] | set[str] = frozenset(),
-    incremental_tests: Sequence[str] = (),
+    incremental_tests: Sequence[IncrementalUnitTest] = (),
 ):
     """Price the whole batch upfront, per statement, as one number to confirm.
 
@@ -2875,7 +2928,7 @@ def _run_mutants(
     uptime=None,
     adapter=None,
     downstream: _DownstreamTests | None = None,
-    incremental_tests: Sequence[str] = (),
+    incremental_tests: Sequence[IncrementalUnitTest] = (),
     full_tests: bool = True,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
@@ -2898,7 +2951,7 @@ def _run_mutants(
     select = downstream.select if downstream is not None else model
     exclude = [
         *(downstream.exclude if downstream is not None else []),
-        *(f"unit_test:{name}" for name in incremental_tests),
+        *sorted({f"unit_test:{test.select}" for test in incremental_tests}),
     ]
     below = set(downstream.tests) if downstream is not None else set()
     warnings: list[str] = []
@@ -3070,7 +3123,7 @@ def _run_incremental(
     branch,
     *,
     model: str,
-    tests: list[str],
+    tests: list[IncrementalUnitTest],
     meter: _BatchSpend,
     mutation_mod,
     exhausted: bool,
@@ -3100,6 +3153,8 @@ def _run_incremental(
     ).payload()
 
     def record(mutant, status: str, verdict=None) -> None:
+        """Book one branch mutant's outcome into the counts and the report."""
+
         counts[status] = counts.get(status, 0) + 1
         mutants.append(
             {
@@ -3112,11 +3167,20 @@ def _run_incremental(
         )
 
     def not_run(remaining, why: str) -> None:
+        """Report the remaining branch mutants not_run, with the reason why."""
+
         for mutant in remaining:
             record(mutant, "not_run")
         warnings.append(why)
 
-    select = " ".join(f"unit_test:{name}" for name in tests)
+    select = " ".join(sorted({f"unit_test:{test.select}" for test in tests}))
+    names = {test.name for test in tests}
+
+    def statuses(summary) -> dict[str, str]:
+        # The selector matches every version of a versioned model's unit test,
+        # so only this version's instances may testify.
+        return {k: v for k, v in _test_statuses(summary).items() if k in names}
+
     if not branch.mutants:
         pass
     elif not tests:
@@ -3137,7 +3201,7 @@ def _run_incremental(
         shadow.write(model_path, branch.identity)
         summary = shadow.test(select)
         meter.settle(summary, _INCREMENTAL_BASELINE)
-        baseline = _test_statuses(summary)
+        baseline = statuses(summary)
         if not any(status == "pass" for status in baseline.values()):
             reason = (
                 "no unit test that overrides is_incremental to true passes against "
@@ -3162,13 +3226,13 @@ def _run_incremental(
                 shadow.write(model_path, mutant.body)
                 summary = shadow.test(select)
                 meter.settle(summary, mutant.id)
-                verdict = mutation_mod.classify(baseline, _test_statuses(summary))
+                verdict = mutation_mod.classify(baseline, statuses(summary))
                 record(mutant, verdict.outcome, verdict)
 
     mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
     decided = counts["killed"] + counts["survived"]
     return {
-        "tests": list(tests),
+        "tests": [test.name for test in tests],
         "reason": reason,
         "baseline": {
             "tests": [

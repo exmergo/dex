@@ -385,6 +385,8 @@ class IncrementalBatch:
 
     @property
     def elided_total(self) -> int:
+        """How many of the branch's mutants the cap cut, across classes."""
+
         return sum(self.elided.values())
 
 
@@ -417,6 +419,8 @@ class MutantBatch:
 
     @property
     def elided_total(self) -> int:
+        """How many of the full build's mutants the cap cut, across classes."""
+
         return sum(self.elided.values())
 
 
@@ -1139,6 +1143,8 @@ def _branch_only_sites(
     """
 
     def key(source: PreparedModel, node: exp.Expression) -> tuple[str, str]:
+        """A site's scope and readable text, comparable across the two compiles."""
+
         return (
             _scope_label(node, source.tree),
             source.readable(_text(source.dialect, node)),

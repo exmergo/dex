@@ -1067,11 +1067,15 @@ _BRANCH_COMPILED = (
 
 
 def _branch(sql: str = _BRANCH_COMPILED):
+    """The branch program as `prepare` reads it, `{{ this }}` included."""
+
     this = mutation.ParentRelation(rendered=mutation.THIS_SENTINEL, jinja="{{ this }}")
     return _prepare(sql, parents=[*_parents(), this])
 
 
 def test_the_branch_is_taken_and_this_is_spelled_so_it_survives_the_compile():
+    """Only the `is_incremental()` call and `{{ this }}` are rewritten."""
+
     source = mutation.incremental_source(_INCREMENTAL_MODEL)
 
     assert source is not None
@@ -1094,10 +1098,14 @@ def test_the_branch_is_taken_and_this_is_spelled_so_it_survives_the_compile():
     ],
 )
 def test_a_model_with_no_is_incremental_call_has_no_second_program(sql):
+    """Without an `is_incremental()` call there is nothing to compile twice."""
+
     assert mutation.incremental_source(sql) is None
 
 
 def test_a_negated_test_and_an_else_branch_are_read_as_dbt_would():
+    """The call is replaced in place, so `not` and `else` keep dbt's meaning."""
+
     sql = (
         "select d from {{ ref('a') }} {% if not is_incremental() %}where d > 0"
         "{% else %}where d > (select max(d) from {{ this }}){% endif %}"
@@ -1132,6 +1140,8 @@ def test_only_the_branchs_own_comparisons_and_filters_are_planted_in_it():
 
 
 def test_the_branch_identity_restores_this_for_the_unit_tests_fixture():
+    """The baseline file names `{{ this }}`, which a `this` fixture binds to."""
+
     batch = mutation.enumerate_mutants(_prepare(_FULL_COMPILED), incremental=_branch())
 
     identity = batch.incremental.identity
@@ -1141,6 +1151,8 @@ def test_the_branch_identity_restores_this_for_the_unit_tests_fixture():
 
 
 def test_a_predicate_written_inside_and_outside_the_branch_is_planted_in_each():
+    """Shared sites are subtracted as a multiset, not as a set."""
+
     branch = _branch(
         'select id, d from "dev"."main"."stg_orders" where id > 0 and id > 0'
     )
@@ -1171,6 +1183,8 @@ def test_one_cap_binds_both_programs_and_still_reaches_the_watermark():
 
 
 def test_a_model_without_a_branch_is_ordered_and_capped_exactly_as_before():
+    """No branch means the round robin and the cap are unchanged."""
+
     sql = "select a from x inner join y on x.id = y.id where a > 1 and b > 2"
 
     batch = mutation.enumerate_mutants(_prepare(sql), cap=3)

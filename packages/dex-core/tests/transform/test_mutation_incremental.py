@@ -123,6 +123,8 @@ def incremental_project(tmp_path: Path, duckdb_file: Path) -> Path:
 def _measure(project: Path, model_sql: str, schema: str):
     # Built before the unit tests are declared: dbt types a `this` fixture from
     # the model's relation, and a build runs unit tests before the model.
+    """Build the model, declare `schema`, and measure it with real dbt."""
+
     (project / "models" / "inc.sql").write_text(model_sql, encoding="utf-8")
     (project / "models" / "schema.yml").write_text(_NOT_NULL, encoding="utf-8")
     engine = _engine(project)
