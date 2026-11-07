@@ -255,3 +255,20 @@ def test_a_rename_still_refuses_on_a_column_parse_limit(repo, capsys):
     refused = _run(repo, capsys, "transform", "rename", "var", FLAG, "use_regions")
     assert refused["status"] == "error"
     assert "could not parse the SQL for columns" in " ".join(refused["errors"])
+
+
+def test_an_unparsed_model_outside_the_lineage_leaves_coverage_complete(repo, capsys):
+    """The proposal compiles the declared models and their descendants only, so
+    an unrelated model has no compiled SQL; it cannot read a removed column, and
+    is not counted as unchecked (CodeRabbit on #1192)."""
+
+    _write(
+        repo / "shop/models/rpt_unrelated.sql",
+        "select order_id, count(*) as n\nfrom {{ ref('stg_orders') }}\n"
+        "group by {% if target.name == 'dev' %}1{% else %}1, 1{% endif %}\n",
+    )
+    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
+    assert planned["status"] == "ok", planned["errors"]
+    reads = planned["data"]["retirement"]["column_reads"]
+    assert reads["coverage"] == "complete", reads
+    assert "models/rpt_unrelated.sql" not in reads["read_from_compiled"]

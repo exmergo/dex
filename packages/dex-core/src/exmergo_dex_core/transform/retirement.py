@@ -1014,6 +1014,10 @@ def _column_reads(
         if any(path.startswith(base) for base in macro_bases):
             continue
         found = by_path.get(path)
+        if found is not None and not found[1].sql:
+            # The proposal compiles the declared models and their descendants,
+            # so an enabled model it left uncompiled reads none of them.
+            continue
         names = identifiers(found[1].sql, dialect) if found is not None else None
         if found is None or names is None:
             unchecked.append(path)

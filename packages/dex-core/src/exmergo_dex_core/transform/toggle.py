@@ -38,7 +38,14 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from ..dbt_project import DbtProjectView, jinja_calls
 from ..references import column_parse_limit
 from ..semantic_declarations import Assumption, _Strict
-from .compiled_tree import Branch, Catalog, compile_branch, identifiers, macro_callers
+from .compiled_tree import (
+    Branch,
+    Catalog,
+    compile_branch,
+    identifiers,
+    macro_callers,
+    macro_closure,
+)
 from .plans import PlanEdit
 
 if TYPE_CHECKING:
@@ -426,7 +433,7 @@ def analyze(
     callers = _callers(branches, project_name)
     macro_reads = _attributed(reads, callers, view)
     dynamic_reads = _attributed(dynamic, callers, view, keep_models=True)
-    not_compiled = _not_compiled(branches, reads, callers)
+    not_compiled = _not_compiled(branches, reads, view)
     for entry in not_compiled:
         record = _record(entry["model"])
         _uncheck(
@@ -527,18 +534,20 @@ def _is_macro(path: str, view: DbtProjectView) -> bool:
 
 
 def _not_compiled(
-    branches: Mapping[str, Branch], reads: list[str], callers: Mapping[str, list[str]]
+    branches: Mapping[str, Branch], reads: list[str], view: DbtProjectView
 ) -> list[dict[str, Any]]:
     """Disabled models that read the flag, which no branch compiled (#1156).
 
     Read the flag means the model's own file has a ``var()`` read of it, or its
-    disabled node calls a project macro that does. A model enabled at either
-    value is judged instead, with its disabled side reported on its record.
+    disabled node calls a project macro that does, directly or through another
+    macro. A macro read counts whether or not any enabled model calls it. A
+    model enabled at either value is judged instead, with its disabled side
+    reported on its record.
     """
 
     on, off = branches["on"], branches["off"]
     read_paths = {site.rpartition(":")[0] for site in reads}
-    macro_paths = {path for path in read_paths if path in callers}
+    macro_paths = {path for path in read_paths if _is_macro(path, view)}
     disabled = {
         label: path
         for label, path in {**off.disabled, **on.disabled}.items()
@@ -560,7 +569,9 @@ def _not_compiled(
     for label, path in sorted(disabled.items()):
         called = {
             str((manifest_macros.get(uid) or {}).get("original_file_path") or "")
-            for uid in macros_of.get(label.split(".v")[0], set())
+            for uid in macro_closure(
+                manifest_macros, macros_of.get(label.split(".v")[0], set())
+            )
         }
         if path in read_paths or called & macro_paths:
             out.append({"model": label, "path": path})

@@ -204,6 +204,21 @@ def read_manifest(
     branch.manifest = manifest
 
 
+def macro_closure(macros: Mapping[str, Any], uids: Any) -> set[str]:
+    """``uids`` and every macro they call, directly or through another macro."""
+
+    seen: set[str] = set()
+    pending = [str(uid) for uid in uids]
+    while pending:
+        uid = pending.pop()
+        if uid in seen:
+            continue
+        seen.add(uid)
+        depends = ((macros.get(uid) or {}).get("depends_on") or {}).get("macros")
+        pending.extend(str(child) for child in depends or ())
+    return seen
+
+
 def macro_callers(branch: Branch, project: str) -> dict[str, list[str]]:
     """``{macro file: [model, ...]}`` for this project's macros, transitively.
 
@@ -214,23 +229,10 @@ def macro_callers(branch: Branch, project: str) -> dict[str, list[str]]:
 
     macros = branch.manifest.get("macros") or {}
     prefix = f"macro.{project}."
-    reach: dict[str, set[str]] = {}
-
-    def closure(uid: str, seen: frozenset[str] = frozenset()) -> set[str]:
-        if uid in reach:
-            return reach[uid]
-        found = {uid}
-        if uid not in seen:
-            depends = ((macros.get(uid) or {}).get("depends_on") or {}).get("macros")
-            for child in depends or ():
-                found |= closure(str(child), seen | {uid})
-        reach[uid] = found
-        return found
-
     out: dict[str, set[str]] = {}
     for label, model in branch.models.items():
         for uid in model.macros:
-            for reached in closure(str(uid)):
+            for reached in macro_closure(macros, [str(uid)]):
                 if not reached.startswith(prefix):
                     continue
                 path = str((macros.get(reached) or {}).get("original_file_path") or "")

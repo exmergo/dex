@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from types import SimpleNamespace
 
 from exmergo_dex_core.transform.build import _failed_node
 from exmergo_dex_core.transform.compiled_tree import (
@@ -118,10 +119,44 @@ def test_only_a_disabled_model_that_reads_the_flag_is_not_compiled() -> None:
 
     branch = _branch()
     branches = {"on": branch, "off": branch, "before": branch}
-    callers = macro_callers(branch, "shop")
-    assert _not_compiled(branches, ["macros/inner.sql:3"], callers) == [
+    view = SimpleNamespace(macro_paths=["macros"])
+    assert _not_compiled(branches, ["macros/inner.sql:3"], view) == [
         {"model": "legacy", "path": "models/legacy.sql"}
     ]
-    assert _not_compiled(branches, ["models/quiet.sql:2"], callers) == [
+    assert _not_compiled(branches, ["models/quiet.sql:2"], view) == [
         {"model": "quiet", "path": "models/quiet.sql"}
+    ]
+
+
+def test_a_disabled_model_reached_only_through_its_own_macros_is_not_compiled():
+    """No enabled model calls ``legacy_fees()``, and the read is one macro deeper
+    (CodeRabbit on #1192): the disabled model is still owed."""
+
+    manifest = {
+        "metadata": {"project_name": "shop"},
+        "nodes": {},
+        "macros": {
+            "macro.shop.legacy_fees": {
+                "original_file_path": "macros/legacy_fees.sql",
+                "depends_on": {"macros": ["macro.shop.fee_flag"]},
+            },
+            "macro.shop.fee_flag": {"original_file_path": "macros/fee_flag.sql"},
+        },
+        "disabled": {
+            "model.shop.legacy": [
+                {
+                    "name": "legacy",
+                    "original_file_path": "models/legacy.sql",
+                    "depends_on": {"macros": ["macro.shop.legacy_fees"]},
+                }
+            ]
+        },
+    }
+    branch = Branch()
+    read_manifest(branch, manifest, "shop")
+    branches = {"on": branch, "off": branch, "before": branch}
+    view = SimpleNamespace(macro_paths=["macros"])
+    assert macro_callers(branch, "shop") == {}
+    assert _not_compiled(branches, ["macros/fee_flag.sql:1"], view) == [
+        {"model": "legacy", "path": "models/legacy.sql"}
     ]

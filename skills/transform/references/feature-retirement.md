@@ -94,7 +94,9 @@ the reason names the `dex explore profile` that supplies them) or
 
 - `coverage: not_applicable` means the contract removes no column.
 - `coverage: complete` means every file was read: from source text, or, for each file under `read_from_compiled`, from the SQL dbt compiled for it.
-- `coverage: partial` means the files under `unchecked` were read neither way (a disabled model, one that does not compile, or a test or analysis whose source does not parse). The verdict is then `unchecked`, a warning names the files, and the build carries a `check: removed_column_reads` record (`reason_code: column_reads_partial`) to `data.completion.obligations`. Read each named file yourself. A flag that is not boolean has no other branch to compile, so
+- `coverage: partial` means the files under `unchecked` were read neither way (a disabled model, one that does not compile, or a test or analysis whose source does not parse). The verdict is then `unchecked`, a warning names the files, and the build carries a `check: removed_column_reads` record (`reason_code: column_reads_partial`) to `data.completion.obligations`. Read each named file yourself.
+
+A flag that is not boolean has no other branch to compile, so
 `other_branch: non_boolean_flag`.
 
 `orphaned_models` names models nothing reads any more, which you decide about:
