@@ -72,6 +72,10 @@ class Branch:
         self.disabled: dict[str, str] = {}
         self.failed: dict[str, str] = {}
         self.failed_paths: dict[str, str] = {}
+        #: Set-aside files no project node of the manifest names. dbt keeps an
+        #: excluded node in the manifest, so this stays empty in practice; a
+        #: path here is owed, never dropped.
+        self.unmatched_failed: list[str] = []
         self.failure: str | None = None
         self.manifest: Mapping[str, Any] = {}
 
@@ -195,6 +199,9 @@ def read_manifest(
             macros=tuple(depends.get("macros") or ()),
             parents=tuple(depends.get("nodes") or ()),
         )
+    branch.unmatched_failed = sorted(
+        path for path in isolated if path not in branch.failed_paths.values()
+    )
     for uid, entries in (manifest.get("disabled") or {}).items():
         if uid.startswith(f"model.{project}."):
             for node in entries if isinstance(entries, list) else [entries]:

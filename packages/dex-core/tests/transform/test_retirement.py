@@ -778,3 +778,16 @@ def test_a_macro_caller_that_did_not_compile_is_owed() -> None:
     ]
     assert _failed_callers(branch, "shop", "macros/vendor_region.sql") == []
     assert _failed_callers(branch, "shop", "macros/unrelated.sql") == []
+
+
+def test_a_set_aside_file_with_no_manifest_node_is_owed() -> None:
+    """dbt keeps an excluded node in the manifest; were one missing, its file
+    is still unchecked rather than dropped (CodeRabbit on #1192)."""
+
+    from exmergo_dex_core.transform.compiled_tree import read_manifest
+    from exmergo_dex_core.transform.retirement import _failed_callers
+
+    branch = _Branch()
+    read_manifest(branch, {"nodes": {}}, "shop", {"models/gone.sql": "no such macro"})
+    assert branch.unmatched_failed == ["models/gone.sql"]
+    assert _failed_callers(branch, "shop", "macros/region.sql") == ["models/gone.sql"]

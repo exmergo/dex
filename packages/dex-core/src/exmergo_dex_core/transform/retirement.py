@@ -1083,7 +1083,8 @@ def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
     manifest = branch.manifest
     macros = manifest.get("macros") or {}
     nodes = manifest.get("nodes") or {}
-    out = []
+    # A set-aside file with no node to read dependencies from may call it.
+    out = list(branch.unmatched_failed)
     for path in sorted(branch.failed_paths.values()):
         node = next(
             (
