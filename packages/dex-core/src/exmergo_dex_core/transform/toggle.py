@@ -848,7 +848,7 @@ def governed_readers(
             hits_of[(label, column)] = [hit for hit in hits if not hit.package]
 
     if off.failure is None:
-        advice = _enabled_expression(variable, on_value)
+        advice = _enabled_expression(variable, on_value, off_value)
         _tested_when_off(view, off, hits_of, sites, limits, name, advice, off_value)
     elif any(
         hit.form in ("yaml_column", "yaml_test_column")
@@ -935,19 +935,24 @@ def _tested_when_off(
             )
 
 
-def _enabled_expression(variable: str, on_value: Any) -> str:
-    """A test ``enabled`` config that is true at ``on_value`` alone.
+def _enabled_expression(variable: str, on_value: Any, off_value: Any) -> str:
+    """A test ``enabled`` config that is true at ``on_value`` and false at
+    ``off_value``.
 
     A bare ``var()`` only works for a boolean flag that is on when true: a
     ``disable_x`` flag turns the feature on with ``false``, and a string or
-    integer flag renders a value dbt does not read as a boolean.
+    integer flag renders a value dbt does not read as a boolean. A contract may
+    pair values Jinja holds equal across types (``0`` and ``false``), so the
+    test then also checks the type, never truthiness alone.
     """
 
     read = f"var('{variable}')"
-    if on_value is True:
-        expression = read
-    elif on_value is False:
-        expression = f"not {read}"
+    if isinstance(on_value, bool) and isinstance(off_value, bool):
+        expression = read if on_value else f"not {read}"
+    elif isinstance(on_value, bool):
+        expression = f"{read} is sameas {'true' if on_value else 'false'}"
+    elif isinstance(off_value, bool) and on_value == off_value:
+        expression = f"({read} == {on_value!r} and {read} is not boolean)"
     else:
         expression = f"{read} == {on_value!r}"
     return "{{ " + expression + " }}"
