@@ -987,7 +987,7 @@ def _column_reads(
     """
 
     from ..adapters import get_dialect
-    from .compiled_tree import identifiers
+    from .compiled_tree import identifiers, macro_callers, project_name
 
     removed = {
         (model, column.lower())
@@ -1010,20 +1010,15 @@ def _column_reads(
     dialect = get_dialect(connector) if connector else None
     unchecked: list[str] = []
     compiled_from: list[str] = []
-    for path in unread:
-        if any(path.startswith(base) for base in macro_bases):
-            continue
-        found = by_path.get(path)
-        if found is not None and not found[1].sql:
-            # The proposal compiles the declared models and their descendants,
-            # so an enabled model it left uncompiled reads none of them.
-            continue
-        names = identifiers(found[1].sql, dialect) if found is not None else None
-        if found is None or names is None:
-            unchecked.append(path)
-            continue
-        compiled_from.append(path)
-        label, model = found
+
+    def read(label: str, model: Any) -> bool:
+        """Hold one compiled model's SQL to the removed columns; False if unread."""
+
+        names = identifiers(model.sql, dialect)
+        if names is None:
+            return False
+        if model.path not in compiled_from:
+            compiled_from.append(model.path)
         parents = {
             uid.split(".")[2]
             for uid in model.parents
@@ -1035,8 +1030,33 @@ def _column_reads(
             if column not in names:
                 continue
             where = surviving.setdefault(declared, {}).setdefault(column, [])
-            if not any(site.startswith(f"{path}:") or site == path for site in where):
-                where.append(path)
+            if not any(
+                site.startswith(f"{model.path}:") or site == model.path
+                for site in where
+            ):
+                where.append(model.path)
+        return True
+
+    callers = macro_callers(branch, project_name(view)) if branch is not None else {}
+    for path in unread:
+        if any(path.startswith(base) for base in macro_bases):
+            # A macro's columns land in the models that call it, whose own
+            # source scan sees only the call: read each caller's compiled SQL.
+            if branch is None:
+                unchecked.append(path)
+                continue
+            for label in callers.get(path, []):
+                model = models[label]
+                if model.sql and not read(label, model) and model.path not in unchecked:
+                    unchecked.append(model.path)
+            continue
+        found = by_path.get(path)
+        if found is not None and not found[1].sql:
+            # The proposal compiles the declared models and their descendants,
+            # so an enabled model it left uncompiled reads none of them.
+            continue
+        if found is None or not read(*found):
+            unchecked.append(path)
     report["coverage"] = "partial" if unchecked else "complete"
     report["unchecked"] = unchecked[:MAX_LIMITS]
     report["unchecked_elided"] = max(0, len(unchecked) - MAX_LIMITS)

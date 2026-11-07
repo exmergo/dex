@@ -272,3 +272,31 @@ def test_an_unparsed_model_outside_the_lineage_leaves_coverage_complete(repo, ca
     reads = planned["data"]["retirement"]["column_reads"]
     assert reads["coverage"] == "complete", reads
     assert "models/rpt_unrelated.sql" not in reads["read_from_compiled"]
+
+
+def test_a_removed_column_a_macro_emits_into_a_parsed_model_is_caught(repo, capsys):
+    """The macro does not parse once its Jinja is blanked, and the model calling
+    it parses but sees only the call: the read is found in the caller's compiled
+    SQL (CodeRabbit on #1192)."""
+
+    _write(
+        repo / "shop/macros/region_column.sql",
+        "{% macro region_column() %}"
+        "{% if target.name == 'dev' %}(region_label){% else %}(region_label{% endif %}"
+        "{% endmacro %}\n",
+    )
+    _write(
+        repo / "shop/models/rpt_via_macro.sql",
+        "select order_id, {{ region_column() }} as region\n"
+        "from {{ ref('rpt_orders') }}\n",
+    )
+    planned = _remove(repo, capsys, RETIRE_SQL, RETIRE)
+    assert planned["status"] == "ok", planned["errors"]
+    retirement = planned["data"]["retirement"]
+    assert retirement["column_reads"]["coverage"] == "complete"
+    assert (
+        "models/rpt_via_macro.sql" in retirement["column_reads"]["read_from_compiled"]
+    )
+    checks = _records(planned)["rpt_orders"]["checks"]
+    (still,) = [c for c in checks if c["check"] == "removed_column_still_read"]
+    assert "models/rpt_via_macro.sql" in still["detail"]

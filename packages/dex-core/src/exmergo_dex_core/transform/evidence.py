@@ -311,13 +311,21 @@ def _disabled_models(manifest: Any) -> set[str]:
     names: set[str] = set()
     if not isinstance(manifest, dict):
         return names
+    # A bare name is exempt only when no enabled model answers to it: one
+    # disabled version does not excuse a build of the version still enabled.
+    enabled = {
+        str(node.get("name"))
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if str(uid).startswith("model.") and isinstance(node, dict)
+    }
     for uid, entries in (manifest.get("disabled") or {}).items():
         if not str(uid).startswith("model."):
             continue
         for node in entries if isinstance(entries, list) else [entries]:
             if not isinstance(node, dict) or not isinstance(node.get("name"), str):
                 continue
-            names.add(node["name"])
+            if node["name"] not in enabled:
+                names.add(node["name"])
             if node.get("version") is not None:
                 names.add(f"{node['name']}.v{node['version']}")
     return names

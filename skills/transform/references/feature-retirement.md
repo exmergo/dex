@@ -93,8 +93,8 @@ the reason names the `dex explore profile` that supplies them) or
 `column_reads` says how far `removed_column_still_read` reached:
 
 - `coverage: not_applicable` means the contract removes no column.
-- `coverage: complete` means every file was read: from source text, or, for each file under `read_from_compiled`, from the SQL dbt compiled for it.
-- `coverage: partial` means the files under `unchecked` were read neither way (a disabled model, one that does not compile, or a test or analysis whose source does not parse). The verdict is then `unchecked`, a warning names the files, and the build carries a `check: removed_column_reads` record (`reason_code: column_reads_partial`) to `data.completion.obligations`. Read each named file yourself.
+- `coverage: complete` means every file was read: from source text, or, for each file under `read_from_compiled`, from the SQL dbt compiled for it. A macro whose source does not parse is read through the compiled SQL of each model that calls it.
+- `coverage: partial` means the files under `unchecked` were read neither way (a disabled model, one that does not compile, or a test or analysis whose source does not parse). The verdict is then `unchecked`, a warning names the files, and the build carries a `check: removed_column_reads` record (`reason_code: column_reads_partial`) to `data.completion.obligations`. Read each named file yourself. `unchecked` names the first 10 files and `unchecked_elided` counts the rest. When it is not zero, find the others among the files the reference scan could not parse (`dex transform references <model.column>` names them under `limits`) and read those too.
 
 A flag that is not boolean has no other branch to compile, so
 `other_branch: non_boolean_flag`.
