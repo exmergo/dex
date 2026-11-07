@@ -1811,9 +1811,9 @@ def test_a_versioned_model_runs_its_full_build_only_with_a_full_build_test(
 
 
 def test_only_the_mutated_versions_instance_testifies_for_the_branch(project):
-    """The selector also runs the other version's instance, which reads its own
-    file and would pass against every mutant; it is left out of the baseline
-    and the verdicts."""
+    """The selector also runs the other version's instance, and any same-named
+    unit test on another model, which read their own files and pass against
+    every mutant; they are left out of the baseline and the verdicts."""
 
     from exmergo_dex_core.transform.commands import IncrementalUnitTest
 
@@ -1826,10 +1826,22 @@ def test_only_the_mutated_versions_instance_testifies_for_the_branch(project):
             summary = super().test(select, exclude)
             if select.startswith("unit_test:"):
                 summary["nodes"] = [
-                    {**summary["nodes"][0], "name": "check_v1"},
+                    {
+                        **summary["nodes"][0],
+                        "unique_id": "unit_test.p.fct.check_v1",
+                        "name": "check_v1",
+                    },
                     {
                         "unique_id": "unit_test.p.fct.check_v2",
                         "name": "check_v2",
+                        "status": "pass",
+                        "execution_time": 1.0,
+                    },
+                    # a same-named test on another model, which the selector
+                    # also matches and whose status must not overwrite v1's
+                    {
+                        "unique_id": "unit_test.p.other.check_v1",
+                        "name": "check_v1",
                         "status": "pass",
                         "execution_time": 1.0,
                     },

@@ -3174,12 +3174,22 @@ def _run_incremental(
         warnings.append(why)
 
     select = " ".join(sorted({f"unit_test:{test.select}" for test in tests}))
-    names = {test.name for test in tests}
+    ids = {test.unique_id for test in tests}
 
     def statuses(summary) -> dict[str, str]:
-        # The selector matches every version of a versioned model's unit test,
-        # so only this version's instances may testify.
-        return {k: v for k, v in _test_statuses(summary).items() if k in names}
+        """This model's branch tests' statuses, read by unique id.
+
+        The selector matches a unit test by name, which is unique only per
+        model, and on a versioned model it matches every version's instance.
+        Only the instances that test this model and version may testify.
+        """
+
+        mine = [
+            node
+            for node in (summary or {}).get("nodes", [])
+            if node.get("unique_id") in ids
+        ]
+        return _test_statuses({"nodes": mine})
 
     if not branch.mutants:
         pass
