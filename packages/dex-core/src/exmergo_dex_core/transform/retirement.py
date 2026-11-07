@@ -1051,7 +1051,7 @@ def _column_reads(
                     unchecked.append(model.path)
             # A caller that did not compile has no SQL to read, whatever its
             # own source shows: owed, never clean.
-            for failed in _failed_callers(branch, path):
+            for failed in _failed_callers(branch, project_name(view), path):
                 if failed not in unchecked:
                     unchecked.append(failed)
             continue
@@ -1069,11 +1069,13 @@ def _column_reads(
     return report
 
 
-def _failed_callers(branch: Any, macro_path: str) -> list[str]:
+def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
     """Files of models that failed to compile and call ``macro_path``'s macro.
 
     Read from the manifest's parsed nodes, which keep ``depends_on`` for a node
-    whose compile was set aside.
+    whose compile was set aside. Both lookups are held to this project's
+    package: a package's paths are relative to its own root, so one can share a
+    path with a project file.
     """
 
     from .compiled_tree import macro_closure
@@ -1088,6 +1090,7 @@ def _failed_callers(branch: Any, macro_path: str) -> list[str]:
                 n
                 for uid, n in nodes.items()
                 if uid.startswith("model.")
+                and n.get("package_name") == project
                 and str(n.get("original_file_path") or "") == path
             ),
             None,
@@ -1099,7 +1102,9 @@ def _failed_callers(branch: Any, macro_path: str) -> list[str]:
             macros, (node.get("depends_on") or {}).get("macros") or ()
         )
         if any(
-            str((macros.get(uid) or {}).get("original_file_path") or "") == macro_path
+            (macros.get(uid) or {}).get("package_name") == project
+            and str((macros.get(uid) or {}).get("original_file_path") or "")
+            == macro_path
             for uid in reached
         ):
             out.append(path)

@@ -741,11 +741,30 @@ def test_a_macro_caller_that_did_not_compile_is_owed() -> None:
         },
         "macros": {
             "macro.shop.outer": {
+                "package_name": "shop",
                 "original_file_path": "macros/outer.sql",
                 "depends_on": {"macros": ["macro.shop.region"]},
             },
-            "macro.shop.region": {"original_file_path": "macros/region.sql"},
+            "macro.shop.region": {
+                "package_name": "shop",
+                "original_file_path": "macros/region.sql",
+            },
+            "macro.vendor.region": {
+                "package_name": "vendor",
+                "original_file_path": "macros/vendor_region.sql",
+            },
         },
+    }
+    # A package model on the same relative path as the failed project model,
+    # listed first so a lookup by path alone would read its dependencies.
+    manifest["nodes"] = {
+        "model.vendor.rpt_broken": {
+            "name": "rpt_broken",
+            "package_name": "vendor",
+            "original_file_path": "models/rpt_broken.sql",
+            "depends_on": {"macros": ["macro.vendor.region"]},
+        },
+        **manifest["nodes"],
     }
     branch = _Branch()
     read_manifest(
@@ -754,5 +773,8 @@ def test_a_macro_caller_that_did_not_compile_is_owed() -> None:
         "shop",
         {"models/rpt_broken.sql": "no such macro", "models/rpt_other.sql": "x"},
     )
-    assert _failed_callers(branch, "macros/region.sql") == ["models/rpt_broken.sql"]
-    assert _failed_callers(branch, "macros/unrelated.sql") == []
+    assert _failed_callers(branch, "shop", "macros/region.sql") == [
+        "models/rpt_broken.sql"
+    ]
+    assert _failed_callers(branch, "shop", "macros/vendor_region.sql") == []
+    assert _failed_callers(branch, "shop", "macros/unrelated.sql") == []
