@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -577,3 +578,46 @@ def test_retirement_unprofiled_source_stays_unchecked_naming_explore_profile(
     assert record["status"] == "unchecked"
     assert record["reason_code"] == "unreadable_select"
     assert "dex explore profile raw.orders" in record["reason"]
+
+
+def test_compile_tree_selects_judged_models_and_ancestors(monkeypatch: Any) -> None:
+    """shadow compilation restricts selector to judged models and ancestors."""
+
+    from exmergo_dex_core.transform.retirement import _compile_tree
+
+    recorded: list[str] = []
+
+    class DummyShadow:
+        """dummy shadow capturing the compilation selector."""
+
+        def strip_run_hooks(self) -> None:
+            """dummy strip run hooks."""
+
+        def compile(self, selector: str, vars_: Any = None) -> dict[str, Any]:
+            """capture selector and return minimal manifest."""
+            recorded.append(selector)
+            return {"nodes": {}}
+
+        def __enter__(self) -> DummyShadow:
+            """enter context."""
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            """exit context."""
+
+    monkeypatch.setattr(
+        "exmergo_dex_core.transform.refactor_compare._shadow",
+        lambda *args, **kwargs: DummyShadow(),
+    )
+    engine = SimpleNamespace(config=SimpleNamespace(dbt_target="dev"))
+    view = SimpleNamespace(project_name="shop", files={})
+    stored = SimpleNamespace(edits=[])
+    _compile_tree(
+        engine,  # type: ignore[arg-type]
+        stored,
+        Path(),
+        view,  # type: ignore[arg-type]
+        ["rpt_orders", "rpt_summary"],
+        "duckdb",
+    )
+    assert recorded == ["+rpt_orders +rpt_summary"]
