@@ -1,0 +1,4 @@
+version: 2
+models:
+  - name: ledger_daily
+    description: One row per posting day and ledger account.

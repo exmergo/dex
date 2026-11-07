@@ -1,0 +1,19 @@
+name: marketplace
+version: "1.0.0"
+profile: marketplace
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+vars:
+  enable_platform_fees: true
+
+models:
+  marketplace:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+    finance:
+      +materialized: table
+    legacy:
+      +materialized: table
