@@ -750,6 +750,37 @@ def test_a_test_with_no_compiled_node_is_a_limit(tmp_path: Path) -> None:
     assert len(limits) == 2, limits
 
 
+def test_an_unmatched_test_beside_a_compiled_one_is_still_a_limit(
+    tmp_path: Path,
+) -> None:
+    """A compiled test on the column does not stand for another site naming it:
+    the model-level test with no node is still a limit, the column's own
+    tests, which compiled, are not."""
+
+    view, index = _readers_project(tmp_path)
+    fct = "model.shop.fct"
+    off = _off_branch(
+        {
+            "test.shop.not_null_fct_fee_amount": _test_node(
+                "not_null", fct, {"column_name": "fee_amount"}, column="fee_amount"
+            )
+        }
+    )
+    sites, limits = toggle.governed_readers(
+        index,
+        view,
+        off,
+        {"fct": ["fee_amount"]},
+        name="shop",
+        variable="enable_fees",
+        on_value=True,
+        off_value=False,
+    )
+    assert [site["test"] for site in sites["fct"]] == ["not_null"]
+    assert len(limits) == 1, limits
+    assert f"models/_tests.yml:{_line_of('combination_of_columns: [')} " in limits[0]
+
+
 def test_tests_are_not_judged_when_the_off_branch_fails(tmp_path: Path) -> None:
     """With no off manifest, the tests over a governed column are a limit."""
 
