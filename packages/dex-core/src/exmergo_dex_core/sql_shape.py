@@ -298,9 +298,7 @@ def group_by_key(select: exp.Select) -> list[str]:
             by_qualifier[qualifier] = relation
 
     return [
-        _group_expression_key(
-            expression, sources, by_qualifier, relation_counts
-        )
+        _group_expression_key(expression, sources, by_qualifier, relation_counts)
         for expression in group.expressions
     ]
 

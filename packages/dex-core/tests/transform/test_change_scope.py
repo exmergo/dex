@@ -198,9 +198,7 @@ def test_bare_group_by_column_in_join_is_not_assumed_unambiguous():
         ),
     ],
 )
-def test_group_by_keeps_catalog_and_database_qualifiers(
-    before: str, after: str
-):
+def test_group_by_keeps_catalog_and_database_qualifiers(before: str, after: str):
     prior = f"select s.visit_date from visits as s group by {before}"
     authored = f"select s.visit_date from visits as s group by {after}"
 
