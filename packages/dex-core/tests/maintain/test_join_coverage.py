@@ -1022,3 +1022,243 @@ def test_every_declared_check_over_a_failing_view_names_the_failure_only(
         }
     )
     assert _MASKED in said
+
+
+# --- an INNER join used as a filter (#1162) ------------------------------------
+
+_WITH_HANDLE = (
+    "select m.member_id, h.handle "
+    f"from {W}.members m inner join {W}.handles h on m.member_id = h.member_id"
+)
+
+
+def _members_and_handles(repo) -> None:
+    """The issue's session: 33 members, 13 of whom have no handle."""
+
+    repo.sql(
+        "CREATE TABLE members (member_id INTEGER, name VARCHAR)",
+        "INSERT INTO members SELECT i, 'm' || i FROM range(1, 34) t(i)",
+        "CREATE TABLE handles (member_id INTEGER, handle VARCHAR)",
+        "INSERT INTO handles SELECT i, 'h' || i FROM range(1, 21) t(i)",
+    )
+
+
+def _handles_mart(repo, *, dex=None, columns=None, sql: str = _WITH_HANDLE) -> dict:
+    _members_and_handles(repo)
+    _build(repo, "mrt_members_with_handle", sql)
+    _write_artifacts(
+        repo.project_dir,
+        nodes={
+            "model.maintain_test.handles": _source_model("handles"),
+            "model.maintain_test.mrt_members_with_handle": _node(
+                "mrt_members_with_handle", sql, columns=columns, dex=dex
+            ),
+        },
+        results=[],
+    )
+    return _verify(repo, "mrt_members_with_handle")
+
+
+_HANDLE_ASSUMPTION = {
+    "decision": "Which members count",
+    "chosen": "only members with a handle; the inner join drops the rest",
+    "evidence": "request",
+    "column": "member_id",
+}
+
+
+def test_an_inner_join_the_declaration_names_as_its_filter_is_satisfied(
+    maintain_repo, _assume_the_project_compiles
+):
+    """An assumption whose `column` names the driving key says the join is the
+    model's filter: the record is satisfied with its counts kept, names the
+    assumption, and no join finding is raised."""
+
+    data = _handles_mart(maintain_repo, dex={"assumptions": [_HANDLE_ASSUMPTION]})
+    codes = _codes(data, "mrt_members_with_handle")
+    assert not [c for c in codes if c.startswith("join_")], codes
+    (record,) = _records(data, "mrt_members_with_handle")
+    assert record["status"] == "satisfied"
+    assert "finding" not in record
+    assert record["measured"]["eligible_rows"] == 33
+    assert record["measured"]["unmatched_rows"] == 13
+    assert record["coverage"]["rows"] == 0.6061
+    assert record["threshold_source"] == "default"
+    assert record["unmatched_accounted_for"] == {
+        "by": "assumption",
+        "column": "member_id",
+        "decision": "Which members count",
+        "chosen": "only members with a handle; the inner join drops the rest",
+        "evidence": "request",
+        "withheld_finding": "join_orphans",
+    }
+
+
+def test_a_population_filter_on_the_driving_key_accounts_for_the_join(
+    maintain_repo, _assume_the_project_compiles
+):
+    data = _handles_mart(
+        maintain_repo,
+        dex={
+            "population": {
+                "rule": "Members with a handle.",
+                "filters": [{"column": "MEMBER_ID"}],
+            }
+        },
+    )
+    assert "join_orphans" not in _codes(data, "mrt_members_with_handle")
+    (record,) = _records(data, "mrt_members_with_handle")
+    assert record["status"] == "satisfied"
+    assert record["measured"]["unmatched_rows"] == 13
+    assert record["unmatched_accounted_for"] == {
+        "by": "population_filter",
+        "column": "member_id",
+        "withheld_finding": "join_orphans",
+    }
+
+
+def test_an_inner_join_the_declaration_says_nothing_about_stays_contradicted(
+    maintain_repo, _assume_the_project_compiles
+):
+    """No declaration, or an assumption on another column, leaves the default
+    reading: the join is `join_orphans` and the record is contradicted."""
+
+    for dex in (
+        None,
+        {"assumptions": [{**_HANDLE_ASSUMPTION, "column": "handle"}]},
+        {"population": {"filters": [{"column": "handle", "excludes": ["x"]}]}},
+    ):
+        data = _handles_mart(maintain_repo, dex=dex)
+        orphans = _codes(data, "mrt_members_with_handle")["join_orphans"]
+        assert orphans["data"]["unmatched_rows"] == 13
+        (record,) = _records(data, "mrt_members_with_handle")
+        assert record["status"] == "contradicted"
+        assert record["finding"] == "join_orphans"
+        assert "unmatched_accounted_for" not in record
+        maintain_repo.sql("DROP TABLE members", "DROP TABLE handles")
+
+
+def test_a_left_join_ignores_an_assumption_on_its_key(
+    maintain_repo, _assume_the_project_compiles
+):
+    """LEFT-join handling is unchanged: unmatched rows are the optional
+    relationship it writes, and an assumption naming the key does not turn a
+    zero-overlap finding into a satisfied record."""
+
+    sql = (
+        "select m.member_id, h.handle "
+        f"from {W}.members m left join {W}.handles h on m.member_id = h.member_id"
+    )
+    _members_and_handles(maintain_repo)
+    maintain_repo.sql("DELETE FROM handles WHERE member_id > 2")
+    _build(maintain_repo, "mrt_members", sql)
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.mrt_members": _node(
+                "mrt_members", sql, dex={"assumptions": [_HANDLE_ASSUMPTION]}
+            )
+        },
+        results=[],
+    )
+    data = _verify(maintain_repo, "mrt_members")
+    overlap = _codes(data, "mrt_members")["join_zero_overlap"]
+    assert overlap["severity"] == "medium"
+    (record,) = _records(data, "mrt_members")
+    assert record["status"] == "contradicted"
+    assert "unmatched_accounted_for" not in record
+
+
+def test_a_required_inner_join_is_judged_against_the_contract_regardless(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A driving key declared a `foreign_key` referencing the joined model
+    requires every key to match (`threshold_source: contract`), and an
+    assumption on the same column does not loosen that."""
+
+    data = _handles_mart(
+        maintain_repo,
+        dex={"assumptions": [_HANDLE_ASSUMPTION]},
+        columns={
+            "member_id": {"role": "foreign_key", "references": "handles.member_id"}
+        },
+    )
+    orphans = _codes(data, "mrt_members_with_handle")["join_orphans"]
+    assert orphans["severity"] == "high"
+    assert orphans["data"]["threshold_source"] == "contract"
+    (record,) = _records(data, "mrt_members_with_handle")
+    assert record["status"] == "contradicted"
+    assert "unmatched_accounted_for" not in record
+
+
+def test_an_inner_join_matching_nothing_is_still_no_match(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A filter that keeps no row is not what the declaration describes: the
+    keys share no value, so `join_no_match` stands."""
+
+    _members_and_handles(maintain_repo)
+    maintain_repo.sql("UPDATE handles SET member_id = member_id + 100")
+    sql = _WITH_HANDLE
+    _build(maintain_repo, "mrt_members_with_handle", sql)
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.mrt_members_with_handle": _node(
+                "mrt_members_with_handle",
+                sql,
+                dex={"assumptions": [_HANDLE_ASSUMPTION]},
+            )
+        },
+        results=[],
+    )
+    data = _verify(maintain_repo, "mrt_members_with_handle")
+    assert "join_no_match" in _codes(data, "mrt_members_with_handle")
+    (record,) = _records(data, "mrt_members_with_handle")
+    assert record["status"] == "contradicted"
+    assert "unmatched_accounted_for" not in record
+
+
+def test_the_build_completion_reads_the_accounted_join_as_asserted(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The issue's acceptance, end to end into `data.completion`: with the
+    assumption the mart is asserted and absent from `failed_checks`; without
+    it, `failed_checks` names the check kind, the finding and the join."""
+
+    from exmergo_dex_core.transform.completion import summarize_completion
+    from exmergo_dex_core.transform.evidence import (
+        BuildEvidence,
+        BuildNode,
+        BuildSelection,
+    )
+
+    mart = "mrt_members_with_handle"
+    evidence = BuildEvidence(
+        outcome="validated",
+        nodes=[BuildNode(unique_id=f"model.t.{mart}", name=mart, status="success")],
+        selection=BuildSelection(matched=[mart]),
+    )
+
+    def completion(data: dict):
+        verification = {
+            "ran": True,
+            "findings": data["findings"],
+            "join_coverage": data["join_coverage"],
+        }
+        return summarize_completion(evidence, verification).assurance
+
+    declared = completion(
+        _handles_mart(maintain_repo, dex={"assumptions": [_HANDLE_ASSUMPTION]})
+    )
+    assert declared.asserted.names == [mart]
+    assert declared.failed_checks.count == 0
+    assert declared.failed_checks.checks == []
+
+    maintain_repo.sql("DROP TABLE members", "DROP TABLE handles")
+    undeclared = completion(_handles_mart(maintain_repo))
+    assert undeclared.failed_checks.names == [mart]
+    (check,) = undeclared.failed_checks.checks
+    assert check.kind == "join_coverage"
+    assert check.finding == "join_orphans"
+    assert check.join == (f"inner join {W}.handles AS h on m.member_id = h.member_id")

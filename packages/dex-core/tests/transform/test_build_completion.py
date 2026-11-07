@@ -403,6 +403,132 @@ def test_a_failed_check_is_not_build_only_and_a_unit_test_is_not_a_row_check():
     assert completion.assurance.build_only.names == ["unit_only"]
 
 
+def test_failed_checks_say_which_kind_of_check_failed():
+    """A join measured against a default threshold is not a failed test: each
+    failure names its kind, and a join's names its finding and the join
+    (#1162)."""
+
+    join = 'inner join "dev"."main"."handles" AS h on m.member_id = h.member_id'
+    nodes = [
+        BuildNode(unique_id=_uid("mart"), name="mart", status="success"),
+        BuildNode(unique_id=_uid("tested"), name="tested", status="success"),
+        BuildNode(
+            unique_id="test.dex_test.not_null_tested_id.1",
+            name="not_null_tested_id",
+            resource_type="test",
+            status="warn",
+        ),
+    ]
+    verification = {
+        "ran": True,
+        "findings": [],
+        "join_coverage": [
+            {
+                "model": "mart",
+                "join": join,
+                "status": "contradicted",
+                "finding": "join_orphans",
+            },
+            {"model": "tested", "join": "left join x", "status": "satisfied"},
+        ],
+    }
+    completion = summarize_completion(
+        _evidence(nodes, required=["mart", "tested"]),
+        verification,
+        graph={"test.dex_test.not_null_tested_id.1": [_uid("tested")]},
+    )
+    failed = completion.assurance.failed_checks
+    assert failed.names == ["mart", "tested"]
+    assert completion.data()["assurance"]["failed_checks"]["checks"] == [
+        {
+            "model": "mart",
+            "kind": "join_coverage",
+            "finding": "join_orphans",
+            "join": join,
+        },
+        {"model": "tested", "kind": "data_test", "name": "not_null_tested_id"},
+    ]
+
+
+def test_failed_checks_beyond_the_cap_are_counted():
+    nodes = [BuildNode(unique_id=_uid("mart"), name="mart", status="success")]
+    verification = {
+        "ran": True,
+        "findings": [],
+        "join_coverage": [
+            {
+                "model": "mart",
+                "join": f"inner join t{i} " + "on a.k = b.k and " * 20,
+                "status": "contradicted",
+                "finding": "join_orphans",
+            }
+            for i in range(8)
+        ],
+    }
+    completion = summarize_completion(_evidence(nodes, required=["mart"]), verification)
+    checks = completion.assurance.failed_checks.checks
+    assert len(checks) == 5
+    assert completion.elided["assurance.failed_checks.checks"] == 3
+    assert all(len(c.join or "") <= 163 for c in checks)
+    assert completion.size() <= COMPLETION_BUDGET_BYTES
+
+
+def _three_failed_models() -> tuple[list[BuildNode], dict]:
+    """``busy`` fails eight join checks; ``quiet`` and ``last`` fail one each."""
+
+    names = ["busy", "quiet", "last"]
+    nodes = [BuildNode(unique_id=_uid(n), name=n, status="success") for n in names]
+    records = [
+        {
+            "model": "busy",
+            "join": f"inner join t{i} on a.k = b.k",
+            "status": "contradicted",
+            "finding": "join_orphans",
+        }
+        for i in range(8)
+    ] + [
+        {
+            "model": name,
+            "join": "inner join u on a.k = u.k",
+            "status": "contradicted",
+            "finding": "join_orphans",
+        }
+        for name in ("quiet", "last")
+    ]
+    return nodes, {"ran": True, "findings": [], "join_coverage": records}
+
+
+def test_capped_failed_checks_give_every_listed_model_its_kind_first():
+    nodes, verification = _three_failed_models()
+    completion = summarize_completion(
+        _evidence(nodes, required=["busy", "quiet", "last"]), verification
+    )
+    failed = completion.assurance.failed_checks
+    assert failed.names == ["busy", "quiet", "last"]
+    assert [c.model for c in failed.checks] == [
+        "busy",
+        "quiet",
+        "last",
+        "busy",
+        "busy",
+    ]
+    assert completion.elided["assurance.failed_checks.checks"] == 5
+
+
+@pytest.mark.parametrize(("budget", "kept"), [(2000, 3), (1400, 1)])
+def test_a_tight_budget_keeps_failed_checks_aligned_with_their_names(budget, kept):
+    nodes, verification = _three_failed_models()
+    completion = summarize_completion(
+        _evidence(nodes, required=["busy", "quiet", "last"]),
+        verification,
+        budget=budget,
+    )
+    failed = completion.assurance.failed_checks
+    assert completion.size() <= budget
+    assert len(failed.checks) == kept
+    assert [c.model for c in failed.checks] == failed.names[:kept]
+
+
 def test_a_unit_test_alone_does_not_count_as_its_model_being_built():
     nodes = [
         BuildNode(
