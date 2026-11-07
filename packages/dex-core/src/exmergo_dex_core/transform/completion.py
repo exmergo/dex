@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from itertools import zip_longest
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -751,7 +752,7 @@ def summarize_completion(
             asserted=_names(n for n in built_names if n in asserted),
             failed_checks=FailedChecks(
                 **_names(failed_names).model_dump(),
-                checks=[c for n in failed_names for c in failures.get(n, [])],
+                checks=_one_per_model_first(failed_names, failures),
             ),
             build_only=_names(
                 n for n in built_names if n not in asserted and n not in failed_checks
@@ -841,6 +842,21 @@ def _scope_obligations(
                 )
             )
     return out
+
+
+def _one_per_model_first(
+    names: list[str], failures: Mapping[str, list[FailedCheck]]
+) -> list[FailedCheck]:
+    """Each model's failed checks, taken breadth first in ``names`` order.
+
+    The list is capped, and every cut keeps a prefix. Taking each model's first
+    check before anyone's second means a prefix that covers the first ``n``
+    names gives each of them a kind, instead of one model with many failures
+    filling the list.
+    """
+
+    rounds = zip_longest(*(failures.get(n, []) for n in names))
+    return [check for round_ in rounds for check in round_ if check is not None]
 
 
 def _bounded_change(change: ChangeRef) -> ChangeRef:

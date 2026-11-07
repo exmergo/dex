@@ -473,6 +473,62 @@ def test_failed_checks_beyond_the_cap_are_counted():
     assert completion.size() <= COMPLETION_BUDGET_BYTES
 
 
+def _three_failed_models() -> tuple[list[BuildNode], dict]:
+    """``busy`` fails eight join checks; ``quiet`` and ``last`` fail one each."""
+
+    names = ["busy", "quiet", "last"]
+    nodes = [BuildNode(unique_id=_uid(n), name=n, status="success") for n in names]
+    records = [
+        {
+            "model": "busy",
+            "join": f"inner join t{i} on a.k = b.k",
+            "status": "contradicted",
+            "finding": "join_orphans",
+        }
+        for i in range(8)
+    ] + [
+        {
+            "model": name,
+            "join": "inner join u on a.k = u.k",
+            "status": "contradicted",
+            "finding": "join_orphans",
+        }
+        for name in ("quiet", "last")
+    ]
+    return nodes, {"ran": True, "findings": [], "join_coverage": records}
+
+
+def test_capped_failed_checks_give_every_listed_model_its_kind_first():
+    nodes, verification = _three_failed_models()
+    completion = summarize_completion(
+        _evidence(nodes, required=["busy", "quiet", "last"]), verification
+    )
+    failed = completion.assurance.failed_checks
+    assert failed.names == ["busy", "quiet", "last"]
+    assert [c.model for c in failed.checks] == [
+        "busy",
+        "quiet",
+        "last",
+        "busy",
+        "busy",
+    ]
+    assert completion.elided["assurance.failed_checks.checks"] == 5
+
+
+@pytest.mark.parametrize(("budget", "kept"), [(2000, 3), (1400, 1)])
+def test_a_tight_budget_keeps_failed_checks_aligned_with_their_names(budget, kept):
+    nodes, verification = _three_failed_models()
+    completion = summarize_completion(
+        _evidence(nodes, required=["busy", "quiet", "last"]),
+        verification,
+        budget=budget,
+    )
+    failed = completion.assurance.failed_checks
+    assert completion.size() <= budget
+    assert len(failed.checks) == kept
+    assert [c.model for c in failed.checks] == failed.names[:kept]
+
+
 def test_a_unit_test_alone_does_not_count_as_its_model_being_built():
     nodes = [
         BuildNode(
