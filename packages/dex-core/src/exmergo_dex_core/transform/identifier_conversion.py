@@ -46,6 +46,7 @@ from ..dbt_project import (
     EditOp,
     authored_source_qualifications,
     declared_source_relations,
+    unresolvable_source_relations,
 )
 from ..storage import readable_cache
 from .plans import EditKind
@@ -1212,6 +1213,7 @@ def diagnose(
         else naming_resolver
     )
     source_relations = declared_source_relations(view)
+    unresolved_sources = unresolvable_source_relations(view)
     total = 0
     for edit in edits:
         if edit.kind is not EditKind.MODEL_SQL or edit.op is not EditOp.UPSERT:
@@ -1266,7 +1268,11 @@ def diagnose(
             try:
                 authored_tree = sqlglot.parse_one(
                     render_model_sql(
-                        edit.new_content, resolver, view.vars, source_relations
+                        edit.new_content,
+                        resolver,
+                        view.vars,
+                        source_relations,
+                        unresolved_sources,
                     ),
                     dialect=dialect,
                 )
@@ -1275,7 +1281,11 @@ def diagnose(
                     try:
                         prior_tree = sqlglot.parse_one(
                             render_model_sql(
-                                prior_sql, resolver, view.vars, source_relations
+                                prior_sql,
+                                resolver,
+                                view.vars,
+                                source_relations,
+                                unresolved_sources,
                             ),
                             dialect=dialect,
                         )

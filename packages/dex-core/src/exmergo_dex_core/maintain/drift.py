@@ -379,16 +379,20 @@ def schema_drift(
             matches = match_identifier(looked_for, current_identifiers)
             if source.schema_name and matches:
                 # A declaration that names its schema must match one that
-                # carries it: a same-named table in another schema is a
-                # different relation, and bare-name matching it would suppress
-                # a dangling_source for a source whose own schema is absent.
-                # Sources without a recorded schema keep bare-name matching.
+                # carries it as the table's own schema -- the component
+                # immediately before the table name, not any component of the
+                # identifier, so a catalog or database that happens to share
+                # the name cannot accept an unrelated warehouse table. A
+                # same-named table in another schema is a different relation,
+                # and bare-name matching it would suppress a dangling_source
+                # for a source whose own schema is absent. Sources without a
+                # recorded schema keep bare-name matching.
                 schema_l = source.schema_name.lower()
                 matches = [
                     candidate
                     for candidate in matches
-                    if schema_l
-                    in {part.lower() for part in candidate.split(".")}
+                    if len(parts := candidate.split(".")) >= 2
+                    and parts[-2].lower() == schema_l
                 ]
             if not matches:
                 findings.append(
