@@ -253,8 +253,12 @@ See the cost-controls reference for the shared budget mechanism.
 
   The checks are `governed_column_present_when_off`,
   `governed_column_read_when_off`, `governed_column_lost_when_on`,
-  `ungoverned_column_lost`, `ungoverned_columns_differ` and
-  `branch_compile_failed`, each also a warning. A plan whose tree never reads the
+  `ungoverned_column_lost`, `ungoverned_columns_differ`,
+  `branch_compile_failed`, `governed_column_tested_when_off` (a test on a
+  producer's governed column that still runs with the flag off) and
+  `governed_column_in_semantic_layer` (a dimension, measure or entity over one,
+  with the metrics on it), each also a warning. The last two carry the `path`
+  and `line` they name; a semantic `expr` the index cannot resolve is a limit. A plan whose tree never reads the
   variable is refused. Recipe: [feature-toggles.md](feature-toggles.md).
 
 ## `transform apply [plan-id]` and `transform plans`
