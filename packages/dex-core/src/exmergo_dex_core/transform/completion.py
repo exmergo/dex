@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from itertools import zip_longest
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -52,6 +53,8 @@ from .evidence import (
 __all__ = [
     "COMPLETION_BUDGET_BYTES",
     "BuildCompletion",
+    "FailedCheck",
+    "FailedChecks",
     "NameList",
     "node_answers",
     "summarize_completion",
@@ -117,6 +120,29 @@ class NameList(BaseModel):
     elided: int = 0
 
 
+class FailedCheck(BaseModel):
+    """One check that failed on a built model, and which kind it was (#1162).
+
+    ``kind`` is ``data_test`` for a dbt data test, named in ``name``, or the
+    verification record list that judged it ``contradicted``
+    (``join_coverage``, ``parent_population``, ...), with the ``finding`` it
+    raised and, for a join, the ``join`` as the model writes it. A join
+    measured against a default threshold is then not read as a failed test.
+    """
+
+    model: str
+    kind: str
+    name: str | None = None
+    finding: str | None = None
+    join: str | None = None
+
+
+class FailedChecks(NameList):
+    """The models a check failed on, and each failed check, kind first."""
+
+    checks: list[FailedCheck] = Field(default_factory=list)
+
+
 class ChangeRef(BaseModel):
     """The change this build was asked to validate, if one was named."""
 
@@ -168,8 +194,9 @@ class Assurance(BaseModel):
 
     basis: Literal["required", "built_models"] = "built_models"
     asserted: NameList = Field(default_factory=NameList)
-    #: Built, and a data test or a verification record on it failed.
-    failed_checks: NameList = Field(default_factory=NameList)
+    #: Built, and a data test or a verification record on it failed; each
+    #: failure is under ``checks`` with its kind (#1162).
+    failed_checks: FailedChecks = Field(default_factory=FailedChecks)
     build_only: NameList = Field(default_factory=NameList)
 
 
@@ -543,9 +570,10 @@ def _checked(
     evidence: BuildEvidence,
     graph: Mapping[str, list[str]],
     verification: Mapping[str, Any] | None,
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[str], dict[str, list[FailedCheck]]]:
     """Models whose built rows something in this run checked: those every
-    check passed on, and those a check failed on.
+    check passed on, those a check failed on, and each model's failed checks
+    with their kind.
 
     Data tests and verification records read the built relation. A unit test
     reads fixtures, so it vouches for the SQL and not for the rows, and is not
@@ -555,29 +583,49 @@ def _checked(
     label_of = {n.unique_id: n.name for n in evidence.nodes}
     passed: set[str] = set()
     failed: set[str] = set()
+    failures: dict[str, list[FailedCheck]] = {}
     for node in evidence.nodes:
         if not node.unique_id.startswith("test."):
             continue
         status = node.status.lower()
-        if status in _PASSING_TEST:
-            target = passed
-        elif status in FAILED_STATUSES or status == "warn":
-            target = failed
-        else:
+        failing = status in FAILED_STATUSES or status == "warn"
+        if not failing and status not in _PASSING_TEST:
             continue
         for parent in graph.get(node.unique_id, []):
-            if parent.startswith("model."):
-                target.add(label_of.get(parent) or parent.split(".")[2])
+            if not parent.startswith("model."):
+                continue
+            model = label_of.get(parent) or parent.split(".")[2]
+            if not failing:
+                passed.add(model)
+                continue
+            failed.add(model)
+            failures.setdefault(model, []).append(
+                FailedCheck(model=model, kind="data_test", name=node.name)
+            )
     if verification and verification.get("ran"):
         for kind in _RECORD_KINDS:
             for record in verification.get(kind) or []:
                 if not record.get("model"):
                     continue
+                model = str(record["model"])
                 if record.get("status") == "satisfied":
-                    passed.add(str(record["model"]))
+                    passed.add(model)
                 elif record.get("status") == "contradicted":
-                    failed.add(str(record["model"]))
-    return passed - failed, failed
+                    failed.add(model)
+                    join = record.get("join")
+                    failures.setdefault(model, []).append(
+                        FailedCheck(
+                            model=model,
+                            kind=kind,
+                            finding=record.get("finding"),
+                            join=_bounded(join) if isinstance(join, str) else None,
+                        )
+                    )
+    return passed - failed, failed, failures
+
+
+def _bounded(text: str, limit: int = _MESSAGE) -> str:
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _verification(
@@ -685,7 +733,8 @@ def summarize_completion(
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
     blockers = _blockers(evidence, causes, prerequisites or ())
-    asserted, failed_checks = _checked(evidence, graph, verification)
+    asserted, failed_checks, failures = _checked(evidence, graph, verification)
+    failed_names = list(dict.fromkeys(n for n in built_names if n in failed_checks))
     statuses = Counter(n.status.lower() for n in evidence.nodes)
     completion = BuildCompletion(
         outcome=evidence.outcome.value,
@@ -701,7 +750,10 @@ def summarize_completion(
         assurance=Assurance(
             basis="required" if deliverables.coverage == "known" else "built_models",
             asserted=_names(n for n in built_names if n in asserted),
-            failed_checks=_names(n for n in built_names if n in failed_checks),
+            failed_checks=FailedChecks(
+                **_names(failed_names).model_dump(),
+                checks=_one_per_model_first(failed_names, failures),
+            ),
             build_only=_names(
                 n for n in built_names if n not in asserted and n not in failed_checks
             ),
@@ -792,6 +844,21 @@ def _scope_obligations(
     return out
 
 
+def _one_per_model_first(
+    names: list[str], failures: Mapping[str, list[FailedCheck]]
+) -> list[FailedCheck]:
+    """Each model's failed checks, taken breadth first in ``names`` order.
+
+    The list is capped, and every cut keeps a prefix. Taking each model's first
+    check before anyone's second means a prefix that covers the first ``n``
+    names gives each of them a kind, instead of one model with many failures
+    filling the list.
+    """
+
+    rounds = zip_longest(*(failures.get(n, []) for n in names))
+    return [check for round_ in rounds for check in round_ if check is not None]
+
+
 def _bounded_change(change: ChangeRef) -> ChangeRef:
     selector = change.selector
     if selector is not None and len(selector) > _SELECTOR:
@@ -834,6 +901,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     )
     if completion.refactor_comparison is not None:
         cap_list(completion, "refactor_comparison", _NAMES, "refactor_comparison")
+    cap_list(
+        completion.assurance.failed_checks,
+        "checks",
+        _NAMES,
+        "assurance.failed_checks.checks",
+    )
     completion.elided = dict(elided)
     if completion.size() <= budget:
         return
@@ -865,6 +938,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             "obligations.change_scope",
         )
         cap_list(completion.verification, "top", keep, "verification.top")
+        cap_list(
+            completion.assurance.failed_checks,
+            "checks",
+            keep,
+            "assurance.failed_checks.checks",
+        )
         # The first blocked deliverable is the last thing to go: it is the
         # answer to "is the change done", which is what the block is for.
         cap_list(

@@ -187,6 +187,73 @@ def match_key(node: exp.Expression | None) -> str:
     return text(node).lower()
 
 
+def unqualified_key(node: exp.Expression) -> str:
+    """A comparison form in which re-aliasing or re-casing is not a change.
+
+    Identifiers and function names are lowercased. A column's table qualifier
+    is dropped where its own select reads one relation and defines it, since
+    the column can only come from there. Otherwise the qualifier is replaced by
+    the relation it names, found by walking out through the enclosing selects:
+    ``a.active`` edited to ``b.active`` across a join is a change, and so is a
+    correlated subquery's ``a.id`` edited to ``b.id`` or to its own ``f.id``,
+    while renaming ``a`` is not. An unqualified column in a select that reads
+    several relations stays unqualified and so differs from a qualified one.
+
+    String literals keep their case: ``status = 'OPEN'`` edited to
+    ``status = 'open'`` can select different rows, so it must not compare equal.
+    """
+
+    bare = node.copy()
+    sources = {
+        id(select): _source_names(select) for select in bare.find_all(exp.Select)
+    }
+    for column in list(bare.find_all(exp.Column)):
+        qualifier = column.table.lower()
+        nearest = column.find_ancestor(exp.Select)
+        owner = nearest
+        while owner is not None and qualifier not in sources[id(owner)]:
+            owner = owner.find_ancestor(exp.Select)
+        if not qualifier or (
+            owner in (nearest, None)
+            and (nearest is None or len(sources[id(nearest)]) <= 1)
+        ):
+            column.set("table", None)
+        elif owner is None:
+            column.set("table", exp.to_identifier(qualifier))
+        else:
+            column.set("table", exp.to_identifier(sources[id(owner)][qualifier]))
+        column.set("db", None)
+        column.set("catalog", None)
+    for select in bare.find_all(exp.Select):
+        for relation in _relations(select):
+            relation.set("alias", None)
+    for identifier in bare.find_all(exp.Identifier):
+        identifier.set("this", identifier.this.lower())
+    return bare.sql(comments=False, normalize_functions="lower").strip()
+
+
+def _source_names(select: exp.Select) -> dict[str, str]:
+    """Each relation a select reads, keyed by the name its columns qualify it
+    with, mapped to the relation itself and its occurrence (a self-join's two
+    sides stay apart)."""
+
+    seen: dict[str, int] = {}
+    named: dict[str, str] = {}
+    for relation in _relations(select):
+        key = relation_key(relation)
+        seen[key] = seen.get(key, 0) + 1
+        named[relation.alias_or_name.lower()] = f"{key}#{seen[key]}"
+    return named
+
+
+def _relations(select: exp.Select) -> list[exp.Expression]:
+    """The relations a select reads directly: its FROM and each join."""
+
+    from_ = select.args.get("from_") or select.args.get("from")
+    relations = [from_.this] if from_ is not None else []
+    return relations + [join.this for join in select.args.get("joins") or []]
+
+
 def relation_key(node: exp.Expression | None) -> str:
     """A relation's identity with its alias removed.
 
