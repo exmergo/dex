@@ -1463,12 +1463,11 @@ def test_a_declared_schema_that_conflicts_refuses_instead_of_bare_matching(
 
     model = _attribution(_plan(tmp_path, warehouse, payload, capsys))
     assert model["changes"], model["changes"]
-    assert not any(
-        change["attributed"] is True for change in model["changes"]
-    ), model["changes"]
+    assert not any(change["attributed"] is True for change in model["changes"]), model[
+        "changes"
+    ]
     assert any(
-        "feed.raw_events" in (change.get("reason") or "")
-        for change in model["changes"]
+        "feed.raw_events" in (change.get("reason") or "") for change in model["changes"]
     ), model["changes"]
 
 

@@ -251,9 +251,7 @@ def cache_resolver(
                         kept.append(candidate)
                         continue
                     tail = parts[-len(declared_parts) - 1 : -1]
-                    if [
-                        p.lower() for p in tail
-                    ] == [p.lower() for p in declared_parts]:
+                    if [p.lower() for p in tail] == [p.lower() for p in declared_parts]:
                         kept.append(candidate)
                     else:
                         conflicts.append(candidate)

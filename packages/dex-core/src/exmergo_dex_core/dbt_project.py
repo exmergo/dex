@@ -463,9 +463,7 @@ def unresolvable_source_relations(view: DbtProjectView) -> set[tuple[str, str]]:
     return {
         (name, table)
         for name, table, schema, database, identifier in _source_declarations(view)
-        if _is_templated(schema)
-        or _is_templated(database)
-        or _is_templated(identifier)
+        if _is_templated(schema) or _is_templated(database) or _is_templated(identifier)
     }
 
 
