@@ -2716,12 +2716,13 @@ def test_a_join_inside_a_joined_cte_is_also_visited():
         ),
         sql_shape,
     )
-    assert skipped == []
     pairs = {(c.from_relation, c.to_relation) for c in candidates}
-    assert pairs == {
-        ("wh.main.orders", "wh.main.customers"),
-        ("wh.main.customers", "wh.main.regions"),
-    }
+    assert pairs == {("wh.main.customers", "wh.main.regions")}
+    # The outer join reads `customers` through that inner join, which can drop
+    # customers, so it is not probed against the whole table (#1159).
+    (skip,) = skipped
+    assert skip.code == "filtered_cte"
+    assert "CTE `cust_regions`" in skip.reason
 
 
 def test_a_using_join_is_an_equality_candidate():
@@ -2762,13 +2763,15 @@ def test_a_chained_using_join_with_two_relations_in_scope_is_skipped():
 
 def test_a_cte_column_projected_from_a_joined_relation_resolves_correctly():
     # `c.region_id` inside the CTE comes from `customers`, joined there, not
-    # from the CTE's own FROM relation (`orders`, which has no region_id).
+    # from the CTE's own FROM relation (`orders`, which has no region_id). A
+    # RIGHT join keeps every customer, so the column resolves through; an
+    # inner join could drop some and would be `filtered_cte` (#1159).
     candidates, skipped = verify_mod._model_joins(
         _parsed(
             "with x as ("
             "  select o.order_id, c.region_id from "
             '  "wh"."main"."orders" o '
-            '  inner join "wh"."main"."customers" c on o.customer_id = c.id'
+            '  right join "wh"."main"."customers" c on o.customer_id = c.id'
             ") "
             'select * from x inner join "wh"."main"."regions" r '
             "on x.region_id = r.id"

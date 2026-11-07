@@ -2018,9 +2018,16 @@ class _FilterWalk:
     quoted, the form the coverage probe is authored in before it is transpiled
     to the connector's dialect. ``scopes`` names each filtering scope as the
     model writes it, for the record. ``code``/``reason`` is the first failure.
+
+    ``keep_rows`` is set by the join contract, which measures the rows a model
+    joins: a scope whose own join can drop rows of the relation a column reads
+    is then refused like any other reducer (#1159). Lineage leaves it unset,
+    since a join that drops rows does not change which physical column an
+    output is.
     """
 
     dialect: str | None = None
+    keep_rows: bool = False
     filters: list[tuple[str, str]] = field(default_factory=list)
     scopes: list[str] = field(default_factory=list)
     code: str | None = None
@@ -2066,6 +2073,38 @@ class _FilterWalk:
         if name not in self.scopes:
             self.scopes.append(name)
         return True
+
+    def narrows(self, select, source, sql_shape) -> bool:
+        """Whether one of ``select``'s own joins can drop rows of ``source``,
+        the relation in it a column is read from; record why if so (#1159).
+
+        Joins associate left to right, so ``source`` keeps every row only when
+        the join that brings it in (if any) keeps its right side, a RIGHT or
+        FULL join, and every join after that keeps its left side, a LEFT or
+        FULL join. An inner join, a bare JOIN, a comma join and a CROSS JOIN
+        can all drop rows (a CROSS JOIN with an empty side, or an UNNEST of an
+        empty array, keeps none), so probing the whole relation underneath
+        would count keys the model never joins. Semi and anti joins never
+        reach here: :func:`~..sql_shape.reducing_clauses` already names them.
+        """
+
+        if not self.keep_rows:
+            return False
+        joins = sql_shape.joins(select)
+        start = next((i for i, j in enumerate(joins) if j.relation is source), None)
+        for i, join in enumerate(joins):
+            if start is not None and i < start:
+                continue
+            side = join.side.split(" ")[0]
+            kept = ("right", "full") if i == start else ("left", "full")
+            if side not in kept:
+                self._refuse(
+                    _scope_label(select),
+                    f"its {join.label}, which can drop rows of "
+                    f"`{source.alias_or_name}`",
+                )
+                return True
+        return False
 
     def _refuse(self, name: str, why: str) -> bool:
         self.fail(
@@ -2199,7 +2238,9 @@ def _resolve_within_scope(
 
     Refuses -- rather than resolving through -- any scope that reduces rows
     (:func:`~..sql_shape.reducing_clauses`: a WHERE, a HAVING, a GROUP BY, a
-    scalar aggregate, a DISTINCT, a LIMIT). ``select * from customers where
+    scalar aggregate, a DISTINCT, a LIMIT, a semi or anti join; for the join
+    contract, also a join that can drop rows of the relation the column is
+    read from, :meth:`_FilterWalk.narrows`, #1159). ``select * from customers where
     active = true``
     projects the same column names the physical ``customers`` table has,
     but not the same rows: probing a join against the whole table when the
@@ -2239,7 +2280,7 @@ def _resolve_within_scope(
             source = _qualified_source(inner, scope_relations)
             return (
                 None
-                if source is None
+                if source is None or (walk and walk.narrows(select, source, sql_shape))
                 else _resolve_join_column(
                     source, inner.name, cte_scopes, sql_shape, seen, walk
                 )
@@ -2251,7 +2292,7 @@ def _resolve_within_scope(
             source = _qualified_source(proj, scope_relations)
             return (
                 None
-                if source is None
+                if source is None or (walk and walk.narrows(select, source, sql_shape))
                 else _resolve_join_column(
                     source, proj.name, cte_scopes, sql_shape, seen, walk
                 )
@@ -2590,7 +2631,8 @@ def _model_joins(
                 # Each side resolves with its own walk, which carries a
                 # supported filter down to the physical relation (#1085) and
                 # records why an unsupported one stays unchecked.
-                left_walk, right_walk = _FilterWalk(dialect), _FilterWalk(dialect)
+                left_walk = _FilterWalk(dialect, keep_rows=True)
+                right_walk = _FilterWalk(dialect, keep_rows=True)
                 left_resolved = _resolve_join_column(
                     left_relation, left.name, cte_scopes, sql_shape, walk=left_walk
                 )
