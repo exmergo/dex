@@ -564,3 +564,177 @@ def test_a_verification_failure_still_owes_the_plan_gaps(tmp_path: Path) -> None
     _toggle_contract(tmp_path, stored, {}, set(), broken_adapter, result)
     assert [r["reason_code"] for r in result.toggle] == ["analysis_failed"]
     assert result.toggle[0]["model"] == "var:enable_fees"
+
+
+# --- tests and semantic definitions over a governed column (#1169) -------------
+
+READERS_YML = """version: 2
+models:
+  - name: fct
+    columns:
+      - name: id
+        data_tests: [unique]
+      - name: fee_amount
+        data_tests:
+          - unique
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [id, fee_amount]
+  - name: rpt
+    columns:
+      - name: order_id
+        data_tests:
+          - relationships:
+              to: ref('fct')
+              field: fee_amount
+"""
+
+
+def _readers_project(tmp_path: Path):
+    """A project whose fct produces the governed fee column, with tests on it."""
+
+    from exmergo_dex_core.dbt_project import load
+    from exmergo_dex_core.references import ReferenceIndex
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0"\nprofile: shop\nmodel-paths: [models]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "models/fct.sql").write_text(
+        "select 1 as id, 2 as fee_amount\n", encoding="utf-8"
+    )
+    (tmp_path / "models/rpt.sql").write_text("select 1 as order_id\n", encoding="utf-8")
+    (tmp_path / "models/_tests.yml").write_text(READERS_YML, encoding="utf-8")
+    view = load(tmp_path)
+    return view, ReferenceIndex(view, scan_packages=False)
+
+
+def _test_node(name: str, attached: str, kwargs: dict, *, column=None, deps=()):
+    """A compiled generic test node as dbt's manifest holds it."""
+
+    return {
+        "original_file_path": "models/_tests.yml",
+        "attached_node": attached,
+        "column_name": column,
+        "test_metadata": {"name": name, "kwargs": kwargs},
+        "depends_on": {"nodes": [attached, *deps]},
+    }
+
+
+def _off_branch(enabled: dict, disabled: dict | None = None):
+    """An off branch whose manifest holds these test nodes."""
+
+    branch = toggle._Branch()
+    branch.manifest = {
+        "nodes": enabled,
+        "disabled": {uid: [node] for uid, node in (disabled or {}).items()},
+    }
+    return branch
+
+
+def _line_of(needle: str, after: int = 0) -> int:
+    """The 1-based line of the first ``needle`` in READERS_YML after line ``after``."""
+
+    lines = READERS_YML.splitlines()
+    return next(n for n in range(after, len(lines)) if needle in lines[n]) + 1
+
+
+def test_each_test_still_running_off_is_named_with_its_line(tmp_path: Path) -> None:
+    """A column test, a model-level test and a relationships test pointing at the
+    producer all read the governed column; a disabled one and a test on another
+    column do not count."""
+
+    view, index = _readers_project(tmp_path)
+    fct = "model.shop.fct"
+    off = _off_branch(
+        {
+            "test.shop.unique_fct_id": _test_node(
+                "unique", fct, {"column_name": "id"}, column="id"
+            ),
+            "test.shop.not_null_fct_fee_amount": _test_node(
+                "not_null", fct, {"column_name": "fee_amount"}, column="fee_amount"
+            ),
+            "test.shop.combo": _test_node(
+                "unique_combination_of_columns",
+                fct,
+                {"combination_of_columns": ["id", "fee_amount"]},
+            ),
+            "test.shop.rel": _test_node(
+                "relationships",
+                "model.shop.rpt",
+                {"column_name": "order_id", "to": "ref('fct')", "field": "fee_amount"},
+                column="order_id",
+                deps=(fct,),
+            ),
+        },
+        disabled={
+            "test.shop.unique_fct_fee_amount": _test_node(
+                "unique", fct, {"column_name": "fee_amount"}, column="fee_amount"
+            )
+        },
+    )
+    sites, limits = toggle.governed_readers(
+        index,
+        view,
+        off,
+        {"fct": ["fee_amount"]},
+        name="shop",
+        variable="enable_fees",
+        off_value=False,
+    )
+    assert limits == []
+    found = {
+        site["test"]: site["line"]
+        for site in sites["fct"]
+        if site["check"] == "governed_column_tested_when_off"
+    }
+    fee = _line_of("- name: fee_amount")
+    assert found == {
+        "not_null": _line_of("- not_null", fee),
+        "unique_combination_of_columns": _line_of("combination_of_columns: ["),
+        "relationships": _line_of("field: fee_amount"),
+    }
+    assert all(site["path"] == "models/_tests.yml" for site in sites["fct"])
+    assert "models/_tests.yml:" in sites["fct"][0]["detail"]
+
+
+def test_a_test_with_no_compiled_node_is_a_limit(tmp_path: Path) -> None:
+    """A test the index finds over the column that dbt compiled into no node is
+    unknown, so it is listed in the limits, not dropped."""
+
+    view, index = _readers_project(tmp_path)
+    sites, limits = toggle.governed_readers(
+        index,
+        view,
+        _off_branch({}),
+        {"fct": ["fee_amount"]},
+        name="shop",
+        variable="enable_fees",
+        off_value=False,
+    )
+    assert sites == {}
+    assert any(
+        f"models/_tests.yml:{_line_of('combination_of_columns: [')}" in limit
+        for limit in limits
+    ), limits
+
+
+def test_tests_are_not_judged_when_the_off_branch_fails(tmp_path: Path) -> None:
+    """With no off manifest, the tests over a governed column are a limit."""
+
+    view, index = _readers_project(tmp_path)
+    off = toggle._Branch()
+    off.failure = "boom"
+    sites, limits = toggle.governed_readers(
+        index,
+        view,
+        off,
+        {"fct": ["fee_amount"]},
+        name="shop",
+        variable="enable_fees",
+        off_value=False,
+    )
+    assert sites == {}
+    assert any("not compile with the flag off" in limit for limit in limits)
