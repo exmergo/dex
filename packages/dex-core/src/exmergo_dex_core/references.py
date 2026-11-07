@@ -1587,10 +1587,16 @@ class ReferenceIndex:
         target = _relation_from(entry.get("model"))
         versions = None
         if target is not None and "." not in target and package is None:
-            label = mv.ref_target(
-                target, mv.written_ref_version(str(entry.get("model"))), self.versions
-            )
+            version = mv.written_ref_version(str(entry.get("model")))
+            label = mv.ref_target(target, version, self.versions)
             versions = [label] if label else None
+            model = mv.lookup(self.versions, target)
+            if version == mv.UNREAD_VERSION and model is not None:
+                # A semantic model is no node, so its `ref()` is no edge; an
+                # unread pin is still one, and every version question names it.
+                self._unread_pins[model.base].append(
+                    f"{path}:{lines.peek(str(entry.get('model')))}"
+                )
         if target is not None:
             self._record(
                 Reference(

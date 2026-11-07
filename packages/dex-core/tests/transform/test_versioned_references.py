@@ -299,8 +299,24 @@ class TestReferences:
                 "    return dbt.ref('dim_teams', v=dbt.config.get('which'))\n",
                 2,
             ),
+            (
+                "models/semantic.yml",
+                "semantic_models:\n"
+                "  - name: teams\n"
+                "    model: ref('dim_teams', v=var('wanted'))\n"
+                "    dimensions:\n"
+                "      - name: team_label\n"
+                "        type: categorical\n",
+                3,
+            ),
         ],
-        ids=["jinja", "jinja_literal_prefix", "jinja_both_selectors", "python"],
+        ids=[
+            "jinja",
+            "jinja_literal_prefix",
+            "jinja_both_selectors",
+            "python",
+            "semantic_model",
+        ],
     )
     def test_a_version_pinned_by_an_expression_is_a_limit(
         self, project, path, text, line
