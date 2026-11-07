@@ -1049,6 +1049,11 @@ def _column_reads(
                 model = models[label]
                 if model.sql and not read(label, model) and model.path not in unchecked:
                     unchecked.append(model.path)
+            # A caller that did not compile has no SQL to read, whatever its
+            # own source shows: owed, never clean.
+            for failed in _failed_callers(branch, path):
+                if failed not in unchecked:
+                    unchecked.append(failed)
             continue
         found = by_path.get(path)
         if found is not None and not found[1].sql:
@@ -1062,6 +1067,43 @@ def _column_reads(
     report["unchecked_elided"] = max(0, len(unchecked) - MAX_LIMITS)
     report["read_from_compiled"] = compiled_from[:MAX_LIMITS]
     return report
+
+
+def _failed_callers(branch: Any, macro_path: str) -> list[str]:
+    """Files of models that failed to compile and call ``macro_path``'s macro.
+
+    Read from the manifest's parsed nodes, which keep ``depends_on`` for a node
+    whose compile was set aside.
+    """
+
+    from .compiled_tree import macro_closure
+
+    manifest = branch.manifest
+    macros = manifest.get("macros") or {}
+    nodes = manifest.get("nodes") or {}
+    out = []
+    for path in sorted(branch.failed_paths.values()):
+        node = next(
+            (
+                n
+                for uid, n in nodes.items()
+                if uid.startswith("model.")
+                and str(n.get("original_file_path") or "") == path
+            ),
+            None,
+        )
+        if node is None:
+            out.append(path)
+            continue
+        reached = macro_closure(
+            macros, (node.get("depends_on") or {}).get("macros") or ()
+        )
+        if any(
+            str((macros.get(uid) or {}).get("original_file_path") or "") == macro_path
+            for uid in reached
+        ):
+            out.append(path)
+    return out
 
 
 def metric_records(index: Any, contract: RetirementContract) -> list[dict[str, Any]]:

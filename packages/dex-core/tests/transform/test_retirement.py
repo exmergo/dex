@@ -715,3 +715,44 @@ def test_a_model_disabled_in_every_tree_is_owed_not_missing() -> None:
         "rpt_fee_history", {"retained": off, "proposed": on}
     )
     assert not _disabled_everywhere("rpt_fee_history", {})
+
+
+def test_a_macro_caller_that_did_not_compile_is_owed() -> None:
+    """``macro_callers`` sees compiled models only; one set aside is still a
+    caller, read from its parsed node (CodeRabbit on #1192)."""
+
+    from exmergo_dex_core.transform.compiled_tree import read_manifest
+    from exmergo_dex_core.transform.retirement import _failed_callers
+
+    manifest = {
+        "nodes": {
+            "model.shop.rpt_broken": {
+                "name": "rpt_broken",
+                "package_name": "shop",
+                "original_file_path": "models/rpt_broken.sql",
+                "depends_on": {"macros": ["macro.shop.outer"]},
+            },
+            "model.shop.rpt_other": {
+                "name": "rpt_other",
+                "package_name": "shop",
+                "original_file_path": "models/rpt_other.sql",
+                "depends_on": {"macros": []},
+            },
+        },
+        "macros": {
+            "macro.shop.outer": {
+                "original_file_path": "macros/outer.sql",
+                "depends_on": {"macros": ["macro.shop.region"]},
+            },
+            "macro.shop.region": {"original_file_path": "macros/region.sql"},
+        },
+    }
+    branch = _Branch()
+    read_manifest(
+        branch,
+        manifest,
+        "shop",
+        {"models/rpt_broken.sql": "no such macro", "models/rpt_other.sql": "x"},
+    )
+    assert _failed_callers(branch, "macros/region.sql") == ["models/rpt_broken.sql"]
+    assert _failed_callers(branch, "macros/unrelated.sql") == []
