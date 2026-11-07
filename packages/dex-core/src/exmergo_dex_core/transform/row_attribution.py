@@ -27,7 +27,7 @@ import ast
 import datetime
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +38,13 @@ from sqlglot import expressions as exp
 from .. import sql_shape
 from ..adapters import get_dialect, is_free_connector
 from ..cache import DexCache, match_identifier
-from ..dbt_project import EditOp, declared_source_relations, jinja_regions
+from ..dbt_project import (
+    EditOp,
+    authored_source_qualifications,
+    declared_source_relations,
+    jinja_regions,
+    unresolvable_source_relations,
+)
 from ..dbt_project import load as load_project
 from ..errors import DexError
 from ..guards.query_firewall import QueryRefusedError, inspect_query
@@ -187,7 +193,11 @@ def naming_resolver(name: str) -> str:
     return name
 
 
-def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
+def cache_resolver(
+    cache: DexCache | None,
+    dialect: str,
+    authored_qualifications: Mapping[str, str] | None = None,
+) -> Resolver:
     """Resolve through the same :func:`~..cache.match_identifier` the query
     firewall and ``explore profile`` use, so nothing here reimplements dbt's own
     resolution and a name dex cannot place fails the way it fails everywhere
@@ -196,7 +206,10 @@ def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
     A dotted name is the physical relation the project declared its source to
     resolve to: the whole thing is tried first, then its bare object name,
     because that bare identifier is what the warehouse holds and what
-    ``explore profile`` can be pointed at."""
+    ``explore profile`` can be pointed at. When the bare tail matches, an
+    authored qualification (:func:`~..dbt_project.authored_source_qualifications`)
+    must agree with the candidate's, so a same-named table in a schema the
+    declaration never points at is refused rather than counted."""
 
     known = [d.identifier for d in cache.datasets] if cache is not None else []
 
@@ -217,6 +230,41 @@ def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
             matches = match_identifier(target, known)
             if matches:
                 break
+        if targets[-1] != name and matches:
+            # The dotted name failed and the bare tail matched. An authored
+            # qualification overrides the bare tail: a same-named table in a
+            # schema the declaration never points at is a different relation,
+            # and attributing its rows to this source would count a table the
+            # project never builds against. dbt's *default* qualification
+            # (schema = source name) is a guess rather than something a human
+            # wrote, so it does not participate -- refusing on it would break
+            # the projects the bare-identifier resolution exists for.
+            # Identifiers without enough qualification to disagree are kept.
+            authored = (authored_qualifications or {}).get(name)
+            if authored:
+                declared_parts = authored.split(".")
+                kept: list[str] = []
+                conflicts: list[str] = []
+                for candidate in matches:
+                    parts = candidate.split(".")
+                    if len(parts) < len(declared_parts) + 1:
+                        kept.append(candidate)
+                        continue
+                    tail = parts[-len(declared_parts) - 1 : -1]
+                    if [
+                        p.lower() for p in tail
+                    ] == [p.lower() for p in declared_parts]:
+                        kept.append(candidate)
+                    else:
+                        conflicts.append(candidate)
+                matches = kept
+                if not matches:
+                    raise UnattributableError(
+                        f"'{name}' is declared as a relation, but the cache "
+                        f"only holds {', '.join(sorted(conflicts))} and none "
+                        "of them match the declared schema, so the rows it "
+                        "contributes cannot be counted"
+                    )
         if not matches:
             looked_for = targets[-1]
             raise UnattributableError(
@@ -243,6 +291,7 @@ def render_model_sql(
     resolve: Resolver,
     vars: Mapping[str, Any] | None = None,
     source_relations: Mapping[tuple[str, str], str] | None = None,
+    unresolved_sources: Collection[tuple[str, str]] | None = None,
 ) -> str:
     """A dbt model reduced to plain SQL over relations ``resolve`` can name.
 
@@ -311,10 +360,17 @@ def render_model_sql(
         # share it. Without that, the bare table name is the relation
         # `explore profile` can be pointed at, so it is what resolve gets.
         if call.callee == "source" and len(call.args) >= 2:
-            declared = (source_relations or {}).get(
-                (str(call.args[0]), str(call.args[-1]))
-            )
-            rendered.append(resolve(declared if declared is not None else call.args[-1]))
+            pair = (str(call.args[0]), str(call.args[-1]))
+            if unresolved_sources and pair in unresolved_sources:
+                raise UnattributableError(
+                    f"the declaration for source '{pair[0]}.{pair[1]}' builds "
+                    "its schema or identifier with jinja dex cannot render, so "
+                    "the relation it points at is unknown and the rows it "
+                    "contributes cannot be counted"
+                )
+            declared = (source_relations or {}).get(pair)
+            target = declared if declared is not None else call.args[-1]
+            rendered.append(resolve(target))
         else:
             rendered.append(resolve(call.args[-1]))
     rendered.append(text[cursor:])
@@ -1013,11 +1069,16 @@ def attribute(
     # reading the same SQL. The cache is loaded only when counting, so the
     # named-only path stays free of both the store read and the connection.
     resolver = (
-        cache_resolver(readable_cache(engine.store), dialect)
+        cache_resolver(
+            readable_cache(engine.store),
+            dialect,
+            authored_source_qualifications(view),
+        )
         if counting
         else naming_resolver
     )
     source_relations = declared_source_relations(view)
+    unresolved_sources = unresolvable_source_relations(view)
 
     warnings: list[str] = []
     models: list[_Model] = []
@@ -1033,6 +1094,7 @@ def attribute(
             dialect,
             view.vars,
             source_relations,
+            unresolved_sources,
         )
         if model is not None:
             models.append(model)
@@ -1098,6 +1160,7 @@ def _prepare(
     dialect: str,
     vars: Mapping[str, Any] | None = None,
     source_relations: Mapping[tuple[str, str], str] | None = None,
+    unresolved_sources: Collection[tuple[str, str]] | None = None,
 ) -> _Model | None:
     """Render both versions, classify their difference, and keep the trees.
 
@@ -1116,8 +1179,12 @@ def _prepare(
     record = ModelAttribution(path=path)
     degraded: str | None = None
     try:
-        prior = render_model_sql(prior_sql, resolve, vars, source_relations)
-        authored = render_model_sql(authored_sql, resolve, vars, source_relations)
+        prior = render_model_sql(
+            prior_sql, resolve, vars, source_relations, unresolved_sources
+        )
+        authored = render_model_sql(
+            authored_sql, resolve, vars, source_relations, unresolved_sources
+        )
     except UnattributableError as exc:
         degraded = str(exc)
         try:

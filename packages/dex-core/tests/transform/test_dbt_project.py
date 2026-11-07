@@ -14,8 +14,10 @@ from maintain.conftest import SEMANTIC_YAML
 from exmergo_dex_core import dbt_project
 from exmergo_dex_core.dbt_project import (
     DbtProjectError,
+    DbtProjectView,
     Edit,
     EditOp,
+    SourceFile,
     content_hash,
     definitions,
     find_project,
@@ -24,9 +26,87 @@ from exmergo_dex_core.dbt_project import (
     load,
     model_file,
     resolve_target,
+    unresolvable_source_relations,
     write_edits,
 )
 from exmergo_dex_core.errors import RequestError
+
+
+def _sources_view(tmp_path: Path, yml: str) -> DbtProjectView:
+    return DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            "models/sources.yml": SourceFile(
+                path="models/sources.yml", content=yml, sha256="x"
+            )
+        },
+    )
+
+
+def test_a_scalar_sources_value_declares_nothing(tmp_path):
+    """``sources: 5`` is a broken declaration; walking it must not crash row
+    attribution with a TypeError, and a truthy scalar no longer iterates."""
+
+    view = _sources_view(Path(tmp_path), "version: 2\nsources: 5\n")
+    assert dbt_project.declared_source_relations(view) == {}
+    assert unresolvable_source_relations(view) == set()
+
+
+def test_a_scalar_tables_value_declares_nothing(tmp_path):
+    view = _sources_view(
+        Path(tmp_path),
+        "version: 2\nsources:\n  - name: feed\n    tables: 7\n",
+    )
+    assert dbt_project.declared_source_relations(view) == {}
+    assert unresolvable_source_relations(view) == set()
+
+
+def test_a_templated_schema_is_reported_unresolvable_and_omitted(tmp_path):
+    """``schema`` built with jinja: the relation cannot be known, so the pair
+    is reported for refusal instead of sitting in the map as template text
+    that a bare-name fallback would happily match."""
+
+    view = _sources_view(
+        Path(tmp_path),
+        "version: 2\nsources:\n"
+        "  - name: feed\n    schema: \"{{ var('env') }}_feed\"\n"
+        "    tables:\n      - name: events\n        identifier: raw_events\n",
+    )
+    assert dbt_project.declared_source_relations(view) == {}
+    assert unresolvable_source_relations(view) == {("feed", "events")}
+
+
+def test_a_plain_declaration_still_resolves(tmp_path):
+    view = _sources_view(
+        Path(tmp_path),
+        "version: 2\nsources:\n  - name: feed\n    schema: feed\n"
+        "    tables:\n      - name: events\n        identifier: raw_events\n",
+    )
+    assert dbt_project.declared_source_relations(view) == {
+        ("feed", "events"): "feed.raw_events"
+    }
+    assert unresolvable_source_relations(view) == set()
+
+
+def test_authored_qualifications_separate_authored_schema_from_dbt_s_default(tmp_path):
+    """Only a schema the declaration writes may override a cache match: dbt's
+    own default (schema = source name) is a guess, so it maps to '' and the
+    bare-identifier resolution stays available for projects that never
+    declare a schema."""
+
+    view = _sources_view(
+        Path(tmp_path),
+        "version: 2\nsources:\n"
+        "  - name: feed\n    schema: feed\n"
+        "    tables:\n      - name: events\n        identifier: raw_events\n"
+        "  - name: other\n    tables:\n      - name: things\n",
+    )
+    assert dbt_project.authored_source_qualifications(view) == {
+        "feed.raw_events": "feed",
+        "other.things": "",
+    }
 
 
 def test_load_parses_project_and_files(dbt_project_dir: Path):

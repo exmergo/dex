@@ -376,7 +376,21 @@ def schema_drift(
             looked_for = source.identifier or source.table
             if scoped_tables is not None and looked_for.lower() not in scoped_tables:
                 continue
-            if not match_identifier(looked_for, current_identifiers):
+            matches = match_identifier(looked_for, current_identifiers)
+            if source.schema_name and matches:
+                # A declaration that names its schema must match one that
+                # carries it: a same-named table in another schema is a
+                # different relation, and bare-name matching it would suppress
+                # a dangling_source for a source whose own schema is absent.
+                # Sources without a recorded schema keep bare-name matching.
+                schema_l = source.schema_name.lower()
+                matches = [
+                    candidate
+                    for candidate in matches
+                    if schema_l
+                    in {part.lower() for part in candidate.split(".")}
+                ]
+            if not matches:
                 findings.append(
                     DriftFinding(
                         axis="schema",

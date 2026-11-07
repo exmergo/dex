@@ -42,7 +42,11 @@ from sqlglot import expressions as exp
 from .. import sql_shape
 from ..adapters import get_dialect
 from ..cache import DexCache, match_identifier
-from ..dbt_project import EditOp, declared_source_relations
+from ..dbt_project import (
+    EditOp,
+    authored_source_qualifications,
+    declared_source_relations,
+)
 from ..storage import readable_cache
 from .plans import EditKind
 from .row_attribution import (
@@ -1203,7 +1207,9 @@ def diagnose(
     cache = readable_cache(engine.store) if counting else None
     detection_cache = cache if cache is not None else readable_cache(engine.store)
     resolver = (
-        cache_resolver(cache, dialect) if counting else naming_resolver
+        cache_resolver(cache, dialect, authored_source_qualifications(view))
+        if counting
+        else naming_resolver
     )
     source_relations = declared_source_relations(view)
     total = 0

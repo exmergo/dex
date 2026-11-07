@@ -1256,6 +1256,54 @@ def test_a_source_without_a_declared_relation_keeps_the_name_lookup():
     assert "raw_orders" in rendered
 
 
+def test_a_templated_source_declaration_refuses_instead_of_bare_matching():
+    """A declaration whose relation dex cannot resolve (jinja in the schema)
+    reaches render_model_sql only as an unresolved pair, and refusing keeps
+    the bare-name fallback from attributing rows to whichever cached table
+    happens to share the logical name."""
+
+    cache = DexCache(datasets=[Dataset(identifier="analytics.main.raw_events")])
+    resolve = cache_resolver(cache, "duckdb")
+    with pytest.raises(UnattributableError) as excinfo:
+        render_model_sql(
+            "select * from {{ source('feed', 'events') }}",
+            resolve,
+            unresolved_sources={("feed", "events")},
+        )
+    assert "jinja" in str(excinfo.value)
+
+
+def test_a_bare_fallback_refuses_a_conflicting_schema():
+    """Declared ``feed.raw_events`` with only ``analytics.main.raw_events``
+    cached: the bare tail matches by name, but its schema disagrees with the
+    declaration, so the rows are refused rather than misattributed."""
+
+    cache = DexCache(datasets=[Dataset(identifier="analytics.main.raw_events")])
+    resolve = cache_resolver(cache, "duckdb", {"feed.raw_events": "feed"})
+    with pytest.raises(UnattributableError) as excinfo:
+        render_model_sql(
+            "select * from {{ source('feed', 'events') }}",
+            resolve,
+            source_relations={("feed", "events"): "feed.raw_events"},
+        )
+    assert "feed.raw_events" in str(excinfo.value)
+    assert "analytics.main.raw_events" in str(excinfo.value)
+
+
+def test_a_bare_fallback_keeps_an_unqualified_identifier():
+    """A cache identifier with no schema to disagree with is still reachable
+    through the bare tail."""
+
+    cache = DexCache(datasets=[Dataset(identifier="raw_events")])
+    resolve = cache_resolver(cache, "duckdb", {"feed.raw_events": "feed"})
+    rendered = render_model_sql(
+        "select * from {{ source('feed', 'events') }}",
+        resolve,
+        source_relations={("feed", "events"): "feed.raw_events"},
+    )
+    assert "raw_events" in rendered
+
+
 def test_a_source_renamed_by_identifier_still_gets_its_rows_counted(tmp_path, capsys):
     """The acceptance case from #1158, end to end on DuckDB: the cache holds
     the table's identifier, so attribution must count the source rather than
@@ -1336,3 +1384,180 @@ def test_a_source_renamed_by_identifier_still_gets_its_rows_counted(tmp_path, ca
         "changes"
     ]
     assert model["baseline_rows"] is not None
+
+
+def test_a_declared_schema_that_conflicts_refuses_instead_of_bare_matching(
+    tmp_path, capsys
+):
+    """The declared relation is ``feed.raw_events`` and the cache only holds a
+    same-named table in another schema: the bare-name fallback must not count
+    that table's rows for this source — refusing names the conflict instead."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "shop.duckdb"
+    conn = duckdb.connect(str(warehouse))
+    conn.execute("CREATE SCHEMA decoy")
+    conn.execute(
+        "CREATE TABLE decoy.raw_events (id INTEGER, kind VARCHAR, amount DOUBLE)"
+    )
+    conn.execute(
+        "INSERT INTO decoy.raw_events SELECT i, 'z', 9.0 FROM range(1, 100) t(i)"
+    )
+    conn.close()
+
+    project = tmp_path / "analytics"
+    (project / "models" / "marts").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (project / "profiles.yml").write_text(
+        "shop:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "marts" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: feed\n    schema: feed\n"
+        "    tables:\n      - name: events\n        identifier: raw_events\n",
+        encoding="utf-8",
+    )
+    model_path = "models/marts/fct_events.sql"
+    prior = (
+        "{{ config(materialized='table') }}\n"
+        "select id, amount from {{ source('feed', 'events') }}\n"
+        "where kind != 'a'\n"
+    )
+    (project / model_path).write_text(prior, encoding="utf-8")
+
+    rc = main(
+        [
+            "explore",
+            "map",
+            "--full",
+            "--connector",
+            "duckdb",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(tmp_path),
+        ]
+    )
+    capsys.readouterr()
+    assert rc == 0, "the fixture's exploration cache must build"
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": model_path,
+                        "kind": "model_sql",
+                        "content": prior.replace("kind != 'a'", "kind = 'a'"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = _attribution(_plan(tmp_path, warehouse, payload, capsys))
+    assert model["changes"], model["changes"]
+    assert not any(
+        change["attributed"] is True for change in model["changes"]
+    ), model["changes"]
+    assert any(
+        "feed.raw_events" in (change.get("reason") or "")
+        for change in model["changes"]
+    ), model["changes"]
+
+
+def test_a_source_resolves_to_its_declared_schema_not_a_same_named_table_elsewhere(
+    tmp_path, capsys
+):
+    """The declared relation wins over the bare name even when a same-named
+    table exists in an undeclared schema: the counted rows are the declared
+    schema's, never the decoy's."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "shop.duckdb"
+    conn = duckdb.connect(str(warehouse))
+    conn.execute("CREATE SCHEMA feed")
+    conn.execute("CREATE SCHEMA decoy")
+    conn.execute(
+        "CREATE TABLE feed.raw_events (id INTEGER, kind VARCHAR, amount DOUBLE)"
+    )
+    conn.execute(
+        "INSERT INTO feed.raw_events VALUES (1, 'a', 1.0), (2, 'b', 2.0), (3, 'a', 3.0)"
+    )
+    conn.execute(
+        "CREATE TABLE decoy.raw_events (id INTEGER, kind VARCHAR, amount DOUBLE)"
+    )
+    conn.execute(
+        "INSERT INTO decoy.raw_events SELECT i, 'z', 9.0 FROM range(1, 100) t(i)"
+    )
+    conn.close()
+
+    project = tmp_path / "analytics"
+    (project / "models" / "marts").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (project / "profiles.yml").write_text(
+        "shop:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "marts" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: feed\n    schema: feed\n"
+        "    tables:\n      - name: events\n        identifier: raw_events\n",
+        encoding="utf-8",
+    )
+    model_path = "models/marts/fct_events.sql"
+    prior = (
+        "{{ config(materialized='table') }}\n"
+        "select id, amount from {{ source('feed', 'events') }}\n"
+        "where kind != 'a'\n"
+    )
+    (project / model_path).write_text(prior, encoding="utf-8")
+
+    rc = main(
+        [
+            "explore",
+            "map",
+            "--full",
+            "--connector",
+            "duckdb",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(tmp_path),
+        ]
+    )
+    capsys.readouterr()
+    assert rc == 0, "the fixture's exploration cache must build"
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": model_path,
+                        "kind": "model_sql",
+                        "content": prior.replace("kind != 'a'", "kind = 'a'"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = _attribution(_plan(tmp_path, warehouse, payload, capsys))
+    assert any(change["attributed"] is True for change in model["changes"]), model[
+        "changes"
+    ]
+    # prior keeps kind != 'a': 1 row of the declared schema's 3. The decoy
+    # table holds 99 rows, so this count can only come from feed.raw_events.
+    assert model["baseline_rows"] == 1, model["changes"]
