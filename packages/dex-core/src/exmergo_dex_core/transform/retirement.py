@@ -648,7 +648,12 @@ def _compile_tree(
 
     target = engine.config.dbt_target or "dev"
     name = view.project_name or _project_name(view) or ""
-    selector = f"package:{name},resource_type:model" if name else "resource_type:model"
+    if models:
+        selector = " ".join(f"+{m}" for m in models)
+    elif name:
+        selector = f"package:{name},resource_type:model"
+    else:
+        selector = "resource_type:model"
     dialect = get_dialect(connector) if connector else None
     with _shadow(engine, project, target, connector or "") as shadow:
         shadow.strip_run_hooks()
