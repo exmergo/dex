@@ -131,6 +131,16 @@ See the cost-controls reference for the shared budget mechanism.
     join `matched_entities` against the other side's distinct keys that pass
     its own `WHERE` and `ON` conjuncts (`partner_filters`, #1073).
     `denominator` states the population in words.
+  - `own_filters` (#1171): on a join, the converted side's own filters applied
+    to the rows counted: its `WHERE` conjuncts and, where the join drops its
+    rows (an inner join, or the side a `LEFT` or `RIGHT` join does not keep),
+    its `ON` conjuncts. On the kept side of an outer join an `ON` conjunct
+    removes none of its rows and is not applied. A conjunct converting the key
+    itself is the conversion's effect and stays counted.
+    `scope_filters_not_applied` names, as `{filter, reason}`, each `WHERE` or
+    `ON` conjunct that narrows neither side's rows in the counts because it
+    reads both sides, another relation, or a column whose relation is not
+    stated.
   - `later_filters_applied` (#1073): a row-by-row `WHERE` conjunct in a later
     CTE, on the one chain of scopes that read the conversion's scope as their
     `FROM`, carried back onto the rows counted, as `scope: predicate`. A
