@@ -36,10 +36,12 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from ..maintain.snapshot import (
+    DeclarationFingerprint,
     MetricDef,
     RelationshipDef,
     SemanticLayerSnapshot,
     SemanticModelDef,
+    native_declaration_fingerprint,
 )
 from . import catalog as catalog_mod
 
@@ -59,7 +61,9 @@ def semantic_layer(
     """Fingerprint the semantic layer from the validated models."""
 
     if not loaded.models:
-        return SemanticLayerSnapshot(**_provenance(), notes=loaded.notes())
+        return SemanticLayerSnapshot(
+            **_provenance(), declarations={}, notes=loaded.notes()
+        )
 
     by_name = {entry.model.name: entry.model for entry in loaded.models}
     relations: dict[str, str] = {}
@@ -71,9 +75,15 @@ def semantic_layer(
     semantic_models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
     relationships: list[RelationshipDef] = []
+    declarations: dict[str, DeclarationFingerprint] = {}
     notes: list[str] = list(loaded.notes())
     for entry in loaded.models:
         model = entry.model
+        declared = native_declaration_fingerprint(
+            *catalog_mod.declaration_inputs(model, connector), path=entry.file
+        )
+        if declared is not None:
+            declarations[model.name] = declared
         # A model declaring no column, measure, or join says nothing semantic
         # about its relation yet: the relation itself is a schema-axis fact, and
         # recording it here would make a bare table reference indistinguishable
@@ -98,6 +108,7 @@ def semantic_layer(
         relationships_and_keys_captured=True,
         relationship_cardinality_captured=True,
         **_provenance(),
+        declarations=declarations,
         notes=notes,
     )
 

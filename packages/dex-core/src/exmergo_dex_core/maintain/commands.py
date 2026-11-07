@@ -628,6 +628,11 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
             LayerFingerprint(
                 semantic_model_count=len(semantic_layer.semantic_models),
                 metric_count=len(semantic_layer.metrics),
+                declared_model_count=(
+                    len(semantic_layer.declarations)
+                    if semantic_layer.declarations is not None
+                    else None
+                ),
             )
             if semantic_layer is not None
             else None
@@ -2427,41 +2432,98 @@ def _declaration_drift(
     to tell the two apart without parsing a warning. The warning is left out
     where there is no transformation project on either side, since there is
     nothing there that could have been declared.
+
+    A native semantic layer's declarations (#995) are judged beside the
+    project's. With no transformation project on either side, the status is the
+    layer's own, with its ``vendor``. With both, the status is the project's,
+    the layer's rides under ``semantic_layer``, and ``checked`` is true only when
+    both were compared, so neither half reads clean on the other's account.
     """
+
+    findings = _semantic_scope(
+        drift_mod.declaration_drift(current_transform, snap, current_semantic),
+        scope_names,
+    )
+    status, warnings = _transform_declaration_status(current_transform, snap)
+    native = _native_declaration_status(current_semantic, snap)
+    if native is None:
+        return findings, status, warnings
+    if snap.transform_layer is None and current_transform is None:
+        status, warnings = native, []
+    else:
+        status["semantic_layer"] = native
+        if not native["checked"] and status["checked"]:
+            status["checked"] = False
+            status["reason"] = native["reason"]
+    if not native["checked"]:
+        warnings.append(
+            "declaration drift was not checked for the semantic layer: "
+            f"{native['reason']}"
+            if "semantic_layer" in status
+            else f"declaration drift was not checked: {native['reason']}"
+        )
+    return findings, status, warnings
+
+
+def _transform_declaration_status(
+    current_transform: TransformLayer | None, snap: snapshot_mod.Snapshot
+) -> tuple[dict[str, object], list[str]]:
+    """Whether the transformation project's declarations were compared."""
 
     checked, reason = drift_mod.declaration_drift_status(current_transform, snap)
     baseline = snap.transform_layer
     status: dict[str, object] = {"checked": checked}
     if checked:
         if baseline is None or current_transform is None:
-            return [], status, []
+            return status, []
         status["baseline_declared_models"] = len(baseline.declarations or {})
         status["declared_models"] = len(current_transform.declarations or {})
-        findings = _semantic_scope(
-            drift_mod.declaration_drift(current_transform, snap, current_semantic),
-            scope_names,
-        )
         rekeyed = drift_mod.rekeyed_versioned_declarations(current_transform, snap)
         if not rekeyed:
-            return findings, status, []
+            return status, []
         status["unchecked_models"] = rekeyed
         status["unchecked_reason"] = "baseline_predates_versions"
-        return (
-            findings,
-            status,
-            [
-                "declaration drift was not checked for "
-                + ", ".join(rekeyed)
-                + ": the baseline keyed each versioned model's declaration by its "
-                "bare name, and declarations are now read per version "
-                "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
-                "baseline them per version"
-            ],
-        )
+        return status, [
+            "declaration drift was not checked for "
+            + ", ".join(rekeyed)
+            + ": the baseline keyed each versioned model's declaration by its "
+            "bare name, and declarations are now read per version "
+            "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
+            "baseline them per version"
+        ]
     status["reason"] = reason
     if baseline is None and current_transform is None:
-        return [], status, []
-    return [], status, [f"declaration drift was not checked: {reason}"]
+        return status, []
+    return status, [f"declaration drift was not checked: {reason}"]
+
+
+def _native_declaration_status(
+    current_semantic: SemanticLayer | None, snap: snapshot_mod.Snapshot
+) -> dict[str, object] | None:
+    """Whether a native semantic layer's declarations were compared, or
+    ``None`` where no native layer holds any on either side."""
+
+    native = drift_mod.native_declaration_drift_status(current_semantic, snap)
+    if native is None:
+        return None
+    checked, reason = native
+    baseline = snap.semantic_layer
+    vendor = (current_semantic.vendor if current_semantic is not None else None) or (
+        baseline.vendor if baseline is not None else None
+    )
+    status: dict[str, object] = {"checked": checked}
+    if vendor:
+        status["vendor"] = vendor
+    if not checked:
+        status["reason"] = reason
+        return status
+    status["baseline_declared_models"] = len(
+        (baseline.declarations if baseline is not None else None) or {}
+    )
+    status["declared_models"] = len(
+        (current_semantic.declarations if current_semantic is not None else None) or {}
+    )
+    return status
 
 
 def _semantic_names(scope_names: list[str]) -> set[str]:
