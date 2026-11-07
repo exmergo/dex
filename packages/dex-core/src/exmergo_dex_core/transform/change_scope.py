@@ -265,7 +265,8 @@ def _changed_set_operations(
         if not (
             isinstance(before[name], exp.Select) and isinstance(after[name], exp.Select)
         )
-        and _normal(before[name]) != _normal(after[name])
+        and sql_shape.expression_key(before[name])
+        != sql_shape.expression_key(after[name])
     )
 
 
@@ -390,18 +391,6 @@ def _outputs(
     return ("unchecked" if reason else "kept"), reason
 
 
-def _normal(node: exp.Expression) -> str:
-    """The comparison form: table qualifiers dropped, case folded, so renaming an
-    alias or re-casing an identifier is not a change."""
-
-    bare = node.copy()
-    for column in bare.find_all(exp.Column):
-        column.set("table", None)
-        column.set("db", None)
-        column.set("catalog", None)
-    return sql_shape.match_key(bare)
-
-
 def _cast_target(node: exp.Expression) -> str | None:
     """The type an expression is cast to at its outermost level, if it is cast."""
 
@@ -422,7 +411,7 @@ def _aggregates(node: exp.Expression) -> Counter[str]:
         distinct = isinstance(arg, exp.Distinct)
         inner = (arg.expressions[0] if arg.expressions else None) if distinct else arg
         star = inner is None or isinstance(inner, exp.Star)
-        shape = "*" if star else _normal(inner)
+        shape = "*" if star else sql_shape.expression_key(inner)
         found[f"{agg.key}({'distinct ' if distinct else ''}{shape})"] += 1
     return found
 
@@ -444,7 +433,7 @@ def _expression_changes(
     """How one column's expression changed: a cast, an aggregate, a NULL
     treatment, or, failing all three, the expression itself."""
 
-    if _normal(prior) == _normal(authored):
+    if sql_shape.expression_key(prior) == sql_shape.expression_key(authored):
         return []
     shown = (sql_shape.text(prior), sql_shape.text(authored))
     where = "" if scope == sql_shape.MAIN_SCOPE else f" in `{scope}`"

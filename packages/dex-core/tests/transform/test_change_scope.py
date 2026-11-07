@@ -97,6 +97,119 @@ def test_reformatting_and_renaming_an_alias_are_silent():
     assert (scope.population, scope.outputs) == ("kept", "kept")
 
 
+@pytest.mark.parametrize(
+    ("before", "after", "population"),
+    [
+        ("visit_date", "s.visit_date", "kept"),
+        ("t.visit_date", "s.visit_date", "kept"),
+        ("visit_date", "month", "changed"),
+        ("visit_date", "visit_date, site_id", "changed"),
+        ("visit_date, site_id", "visit_date", "changed"),
+        ("visit_date, site_id", "s.visit_date, s.site_id", "kept"),
+    ],
+)
+def test_group_by_qualifier_changes_do_not_change_population(
+    before: str, after: str, population: str
+):
+    prior = f"select visit_date, count(*) as visits from visits t group by {before}"
+    authored = f"select s.visit_date, count(*) as visits from visits s group by {after}"
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == population
+    assert scope.outputs == "kept"
+    assert ("group_by_changed" in {change.kind for change in scope.changes}) is (
+        population == "changed"
+    )
+
+
+def test_group_by_alias_rename_keeps_relation_identity():
+    prior = "select s.visit_date from visits as s group by s.visit_date"
+    authored = "select t.visit_date from visits as t group by t.visit_date"
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "kept"
+    assert "group_by_changed" not in {change.kind for change in scope.changes}
+
+
+def test_group_by_different_joined_relations_remains_a_change():
+    prior = (
+        "select a.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by a.id"
+    )
+    authored = (
+        "select b.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by b.id"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+    (change,) = [
+        change for change in scope.changes if change.kind == "group_by_changed"
+    ]
+    assert "a.id" in change.detail and "b.id" in change.detail
+
+
+def test_group_by_self_join_aliases_are_not_assumed_equivalent():
+    prior = (
+        "select a.id from customers as a "
+        "join customers as b on a.parent_id = b.id group by a.id"
+    )
+    authored = (
+        "select b.id from customers as a "
+        "join customers as b on a.parent_id = b.id group by b.id"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+def test_bare_group_by_column_in_join_is_not_assumed_unambiguous():
+    prior = (
+        "select a.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by id"
+    )
+    authored = (
+        "select a.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by a.id"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (
+            "catalog_a.schema_a.visits.visit_date",
+            "catalog_b.schema_a.visits.visit_date",
+        ),
+        (
+            "catalog_a.schema_a.visits.visit_date",
+            "catalog_a.schema_b.visits.visit_date",
+        ),
+    ],
+)
+def test_group_by_keeps_catalog_and_database_qualifiers(
+    before: str, after: str
+):
+    prior = f"select s.visit_date from visits as s group by {before}"
+    authored = f"select s.visit_date from visits as s group by {after}"
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
 # --- population ------------------------------------------------------------------
 
 
