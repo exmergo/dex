@@ -76,7 +76,8 @@ See the cost-controls reference for the shared budget mechanism.
   report nothing. On DuckDB the deltas are measured automatically; on a billed
   connector the changes are named for free and measuring needs `--attribute-rows`
   plus `--confirm --budget`. `attributed: false` carries the reason (macro SQL, a
-  jinja conditional, a renamed CTE, an unprofiled parent). Advisory: nothing here
+  jinja conditional, a renamed CTE, a changed `UNION`, `INTERSECT` or `EXCEPT`
+  whose branches are not compared, an unprofiled parent). Advisory: nothing here
   refuses a plan.
 - `data.change_scope` (#1115): on each model that already exists, what the edit
   changes beside its request, read statically from both versions with no query.
