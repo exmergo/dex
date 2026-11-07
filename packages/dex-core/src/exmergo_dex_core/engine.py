@@ -1182,19 +1182,27 @@ class DexEngine:
         *,
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryResult:
         """One SELECT through the query firewall.
 
         In values-free mode only an aggregate-only statement runs (see
         :mod:`.guards.values_free_shape`); any other shape is refused with a
         :class:`~.values_free.ValuesFreeError` naming the rule, and no cell.
+        ``target='dev'`` also reads the dev namespace for this call (#1133).
         """
 
         from .explore import commands as explore
 
         mode = self.resolve_result_mode(result_mode)
         return call_withholding(
-            mode, explore.query, self, sql, auto_profile=auto_profile, result_mode=mode
+            mode,
+            explore.query,
+            self,
+            sql,
+            auto_profile=auto_profile,
+            result_mode=mode,
+            target=target,
         )
 
     def query_batch(
@@ -1202,6 +1210,7 @@ class DexEngine:
         *sql: str,
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryBatchResult:
         """Several statements in one call, each with its own verdict.
 
@@ -1221,6 +1230,7 @@ class DexEngine:
             list(sql),
             auto_profile=auto_profile,
             result_mode=mode,
+            target=target,
         )
 
     def query_across(
@@ -1229,11 +1239,14 @@ class DexEngine:
         targets: list[str],
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryBatchResult:
         """Each statement once per target dataset, in one call (#545).
 
         Each statement names its dataset as ``{ds}``; every result carries the
         ``target`` it ran against. See :func:`.explore.commands.query_across`.
+        ``target='dev'`` is the dbt dev target, not an ``--across`` dataset: it
+        also reads the dev namespace for this call (#1133).
         """
 
         from .explore import commands as explore
@@ -1247,6 +1260,7 @@ class DexEngine:
             targets,
             auto_profile=auto_profile,
             result_mode=mode,
+            target=target,
         )
 
     def cluster(

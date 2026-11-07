@@ -639,6 +639,8 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "no_auto_profile": _TRANSLATED,
             # Comma-separated and repeatable on the CLI, a list on the engine.
             "across": "targets",
+            # The dbt dev target (#1133), not an `--across` dataset.
+            "target": "target",
         },
     },
     ("explore", "cluster"): {

@@ -755,6 +755,17 @@ def _build_parser() -> argparse.ArgumentParser:
                             "run each statement once per dataset, substituted for {ds}"
                         ),
                     )
+                    # A model `transform build` just wrote lives in the dev
+                    # namespace, outside the source scope (#1133); this reads it
+                    # for one command, as `explore profile --target dev` does.
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "also read this dbt dev target's namespace; "
+                            "prod-looking targets are refused"
+                        ),
+                    )
                 if group == "explore" and name == "cluster":
                     sp.add_argument("object", help="table or view to cluster")
                 # An off switch only. Profiling an object the connection has but
