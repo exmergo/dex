@@ -526,14 +526,26 @@ def versions_inheriting_tests(entry: Mapping[str, Any]) -> list[str]:
 
 
 #: The version selector of a ``ref()`` as written: ``v=2``, ``version='1.5'``.
-REF_VERSION = re.compile(r"\b(?:v|version)\s*=\s*['\"]?([A-Za-z0-9_.]+)")
+#: A selector that is not a literal still matches, with no value captured.
+REF_VERSION = re.compile(
+    r"\b(?:v|version)\s*=\s*(?:'([^'\s]*)'|\"([^\"\s]*)\"|(\d+(?:\.\d+)?)\b)?"
+)
+
+#: What :func:`written_ref_version` returns for a selector that is not a
+#: literal, such as ``v=var('x')``: the call pins a version, and which one is
+#: not known until it compiles.
+UNREAD_VERSION = "<unread>"
 
 
 def written_ref_version(written: str) -> str | None:
-    """The version a written ``ref(...)`` call pins, or ``None``."""
+    """The version a written ``ref(...)`` call pins, ``None`` where it pins
+    none, or :data:`UNREAD_VERSION` where the pin is not a literal."""
 
     pinned = REF_VERSION.search(written)
-    return pinned.group(1) if pinned else None
+    if pinned is None:
+        return None
+    literal = next((group for group in pinned.groups() if group), None)
+    return literal if literal is not None else UNREAD_VERSION
 
 
 def entry_variants(entry: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:

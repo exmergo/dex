@@ -191,6 +191,9 @@ class ReferenceIndex:
         self._version_files: dict[str, str] = {}
         #: Node -> the version labels its `ref()` calls resolve to.
         self._version_refs: dict[str, set[str]] = defaultdict(set)
+        #: Versioned base name -> each `path:line` whose `ref()` pins a version
+        #: with an expression dex cannot read (`v=var('x')`).
+        self._unread_pins: dict[str, list[str]] = defaultdict(list)
 
         self._scan(view, package=None)
         if scan_packages:
@@ -212,6 +215,8 @@ class ReferenceIndex:
         kinds = [kind for kind in KINDS if self._by_name.get((kind, name))]
         if kinds or not self._is_qualified(name):
             return kinds
+        if self._version_label_hits(name) is not None:
+            return ["model"]
         # A dotted name is a source (`raw.orders`) as often as it is a qualified
         # column (`stg_orders.order_id`). The name as written wins; the column
         # reading is the fallback, so `raw.orders` is never answered as a column
@@ -231,9 +236,13 @@ class ReferenceIndex:
         """
 
         if kind != "column":
-            return list(self._by_name.get((kind, name), [])), self._python_query_limits(
-                kind
-            )
+            hits = list(self._by_name.get((kind, name), []))
+            limits = self._python_query_limits(kind)
+            label = self._version_label_hits(name) if kind == "model" else None
+            if label is not None:
+                hits, extra = label
+                limits = [*limits, *extra]
+            return hits, limits
 
         query_limits = (
             [
@@ -268,11 +277,53 @@ class ReferenceIndex:
             ]
         else:
             roots = {model}
-        return self._attribute(hits, roots), query_limits
+        attributed, reached = self._attribute(hits, roots)
+        return attributed, [*query_limits, *self.version_pin_limits(reached)]
 
-    def _attribute(self, hits: list[Reference], roots: set[str]) -> list[Reference]:
+    def _version_label_hits(
+        self, name: str
+    ) -> tuple[list[Reference], list[str]] | None:
+        """Where a version label (``dim_teams.v2``) is used as a model: the file
+        that builds it and the ``ref()`` calls that resolve to it. ``None`` where
+        ``name`` labels no version this project declares."""
+
+        base, v = mv.split_label(name)
+        model = mv.lookup(self.versions, base) if v is not None else None
+        found = model.version(v) if model is not None and v is not None else None
+        if model is None or found is None:
+            return None
+        hits = [
+            reference
+            for reference in self._by_name.get(("model", model.base), [])
+            if reference.versions == [found.label]
+        ]
+        for node in self.version_nodes([found.label]):
+            hits.extend(
+                reference
+                for reference in self._by_name.get(("model", node), [])
+                if reference.form == "definition"
+            )
+        return hits, self.version_pin_limits({found.label})
+
+    def version_pin_limits(self, labels: set[str]) -> list[str]:
+        """A limit for each ``ref()`` that pins a version of a model these
+        versions belong to with an expression dex cannot read: it may read any
+        of them, so no answer about one version is complete."""
+
+        bases = sorted({mv.split_label(label)[0] for label in labels})
+        return [
+            f"{where}: a `ref()` to '{base}' pins its version with an expression "
+            "dex cannot read, so dex cannot tell which version it reads"
+            for base in bases
+            for where in self._unread_pins.get(base, [])
+        ]
+
+    def _attribute(
+        self, hits: list[Reference], roots: set[str]
+    ) -> tuple[list[Reference], set[str]]:
         """Each column hit marked in or out of the lineage of ``roots``, and with
-        the versions it reaches the column through.
+        the versions it reaches the column through; and the versions in that
+        lineage.
 
         A hit in a YAML entry of a versioned model is placed by the versions the
         entry applies to, since the file it sits in builds none of them. Any
@@ -303,7 +354,7 @@ class ReferenceIndex:
             if attributed:
                 update["versions"] = attributed
             out.append(hit.model_copy(update=update))
-        return out
+        return out, set(reached)
 
     def split_column(self, name: str) -> tuple[str, str]:
         """``model.column`` as ``(model, column)``, reading ``dim_teams.v2.x`` as
@@ -816,7 +867,9 @@ class ReferenceIndex:
                     resolution=RESOLVED if target else INDETERMINATE,
                     package=package,
                     qualifier=args[0] if target and len(args) > 1 else None,
-                    versions=self._ref_versions(path, target, version, package=package),
+                    versions=self._ref_versions(
+                        path, line, target, version, package=package
+                    ),
                 )
             )
             if target:
@@ -923,7 +976,11 @@ class ReferenceIndex:
                     package=package,
                     qualifier=call.args[0] if target and len(call.args) > 1 else None,
                     versions=self._ref_versions(
-                        path, target, _written_version(text, call), package=package
+                        path,
+                        call.line,
+                        target,
+                        _written_version(text, call),
+                        package=package,
                     ),
                 )
             )
@@ -982,15 +1039,26 @@ class ReferenceIndex:
     def _ref_versions(
         self,
         path: str,
+        line: int,
         target: str | None,
         version: str | None,
         *,
         package: str | None,
     ) -> list[str] | None:
         """The version a ``ref()`` to a versioned model resolves to, recorded as
-        an edge from the node ``path`` builds to that version (#1126)."""
+        an edge from the node ``path`` builds to that version (#1126).
+
+        A version pinned by an expression is no edge to any version, and it is
+        not the latest either: it is recorded so every question about that
+        model's versions names it as a limit.
+        """
 
         if package is not None or not target:
+            return None
+        if version == mv.UNREAD_VERSION:
+            model = mv.lookup(self.versions, target)
+            if model is not None:
+                self._unread_pins[model.base].append(f"{path}:{line}")
             return None
         label = mv.ref_target(target, version, self.versions)
         if label is None:
@@ -1865,9 +1933,11 @@ def _python_relation_calls(
             version = next(
                 (
                     mv.version_text(keyword.value.value)
-                    for keyword in node.keywords
                     if isinstance(keyword.value, ast.Constant)
                     and isinstance(keyword.value.value, (str, int, float))
+                    and not isinstance(keyword.value.value, bool)
+                    else mv.UNREAD_VERSION
+                    for keyword in node.keywords
                 ),
                 None,
             )

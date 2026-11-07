@@ -159,6 +159,12 @@ def propagate(
         raise PropagationRefusedError(f"'{new}' is already its name; nothing to do")
 
     builder = _Builder(view, project_dir, index, kind, old, new, scope)
+    pins = index.version_pin_limits(builder.in_scope)
+    if pins and not scoped:
+        raise PropagationRefusedError(
+            f"dex cannot promise it found every use of '{old}': {'; '.join(pins)}. "
+            "Rewrite each to pin a literal version, then re-run"
+        )
     builder.run(allow_nothing=retirement)
     edits = builder.edits() + list(extra_edits or [])
     if retirement:

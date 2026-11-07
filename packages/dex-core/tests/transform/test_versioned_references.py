@@ -255,6 +255,59 @@ class TestReferences:
             "models/fct_v3.sql": ["dim_teams.v3"],
         }
 
+    def test_a_label_is_answered_as_that_version_of_the_model(self, project):
+        """`dim_teams.v1` with no `--kind` names a model: the file that builds
+        it and the `ref()` calls that resolve to it, not a column called `v1`."""
+
+        report = find_references(load(project), ["dim_teams.v1"])
+        (target,) = report.targets
+        found = {
+            (entry["path"], occurrence["form"])
+            for entry in target["files"]
+            for occurrence in entry["occurrences"]
+        }
+
+        assert target["kind"] == "model"
+        assert target["versions"] == ["dim_teams.v1"]
+        assert found == {
+            ("models/dim_teams_v1.sql", "definition"),
+            ("models/fct_pinned.sql", "ref_call"),
+        }
+
+    @pytest.mark.parametrize(
+        ("path", "text", "line"),
+        [
+            (
+                "models/fct_dynamic.sql",
+                "select team_label from {{ ref('dim_teams', v=var('which')) }}\n",
+                1,
+            ),
+            (
+                "models/fct_dynamic.py",
+                "def model(dbt, session):\n"
+                "    return dbt.ref('dim_teams', v=dbt.config.get('which'))\n",
+                2,
+            ),
+        ],
+        ids=["jinja", "python"],
+    )
+    def test_a_version_pinned_by_an_expression_is_a_limit(
+        self, project, path, text, line
+    ):
+        """Which version such a `ref()` reads is unknown until it compiles, so
+        it is neither the latest version nor dropped."""
+
+        _write(project / path, text)
+
+        report = find_references(load(project), ["dim_teams.v1.team_label"])
+
+        assert report.completeness == "incomplete"
+        assert any(limit.startswith(f"{path}:{line}:") for limit in report.limits)
+        with pytest.raises(PropagationRefusedError) as exc:
+            _rename(project, "dim_teams.v1.team_label", "team_name")
+        assert f"{path}:{line}" in str(exc.value)
+        assert "pin a literal version" in str(exc.value)
+
     def test_the_command_reports_the_versions(self, project, capsys):
         rc = main(
             [

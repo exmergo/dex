@@ -1420,6 +1420,8 @@ def version_list_removals(
 
 
 def _model_entry(root: Any, base: str) -> Any:
+    """The ``models:`` entry named ``base`` in a composed document, or ``None``."""
+
     for key, node in _mapping(root):
         if key != "models":
             continue
