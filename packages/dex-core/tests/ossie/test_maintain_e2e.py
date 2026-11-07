@@ -344,6 +344,8 @@ def _declare(
 
 
 def _declared(payload: dict) -> list[dict]:
+    """The declaration findings of a drift payload, in ranked order."""
+
     return [
         f for f in payload["data"]["findings"] if f["code"].startswith("declaration_")
     ]
@@ -352,6 +354,10 @@ def _declared(payload: dict) -> list[dict]:
 def test_a_changed_population_is_high_severity_declaration_drift(
     ossie_repo: Path, capsys
 ):
+    """A population edited in ``ai_context.dex`` is a high ``declaration_changed``
+    naming the field, on `semantic` and `check` alike.
+    """
+
     _declare(ossie_repo)
     _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
     _declare(ossie_repo, excludes=(0, 99))
@@ -399,6 +405,8 @@ def test_a_changed_primary_key_is_a_grain_change(ossie_repo: Path, capsys):
 
 
 def test_the_baseline_holds_no_declared_value(ossie_repo: Path, capsys):
+    """The snapshot holds each dataset's declaration as hashes, never its values."""
+
     _declare(ossie_repo, excludes=(424242,))
     payload = _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
 
@@ -413,6 +421,10 @@ def test_the_baseline_holds_no_declared_value(ossie_repo: Path, capsys):
 def test_a_baseline_from_before_native_declarations_is_unchecked(
     ossie_repo: Path, capsys
 ):
+    """A baseline with no native declarations is unchecked, never clean, until a
+    project-only snapshot baselines them.
+    """
+
     _declare(ossie_repo)
     _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
     path = ossie_repo / ".dex" / "snapshot.json"

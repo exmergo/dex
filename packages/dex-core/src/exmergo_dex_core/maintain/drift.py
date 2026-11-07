@@ -700,6 +700,8 @@ def _compare_declarations(
         detail: str,
         data: dict,
     ) -> None:
+        """Record one finding on ``model`` (or one of its columns), tagged."""
+
         findings.append(
             DriftFinding(
                 axis="semantic",
@@ -717,6 +719,8 @@ def _compare_declarations(
         )
 
     def subject(model: str, column: str | None) -> str:
+        """How a detail names the model, or one column of it."""
+
         if column is None:
             return f"{noun} '{model}'"
         return f"column '{column}' of {noun} '{model}'"

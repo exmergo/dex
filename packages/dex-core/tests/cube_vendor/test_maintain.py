@@ -1250,6 +1250,8 @@ def _declared_orders(
 
 
 def _declarations(payload: dict) -> list[dict]:
+    """The declaration findings of a drift payload, in ranked order."""
+
     return [
         f for f in payload["data"]["findings"] if f["code"].startswith("declaration_")
     ]
@@ -1259,6 +1261,10 @@ def _declarations(payload: dict) -> list[dict]:
 def test_a_changed_population_in_meta_dex_is_high_severity_drift(
     tmp_path: Path, capsys, dbt: bool
 ):
+    """A population edited in a cube's ``meta.dex`` is a high ``declaration_changed``,
+    with or without a dbt project beside the layer.
+    """
+
     root = _layout(tmp_path, dbt=dbt)
     _write(root, ORDERS_FILE, {"cubes": [_declared_orders()]}, header=HEADER)
     _cli(root, capsys, "maintain", "snapshot")
@@ -1292,6 +1298,8 @@ def test_a_restated_meta_dex_block_is_not_drift(repo: Path, capsys):
 
 
 def test_a_changed_primary_key_is_a_grain_change(tmp_path: Path, capsys):
+    """A cube's primary key is its grain (#976): changing it is a high grain change."""
+
     root = _layout(tmp_path, dbt=False)
     _cli(root, capsys, "maintain", "snapshot")
     orders = _orders()
@@ -1308,6 +1316,10 @@ def test_a_changed_primary_key_is_a_grain_change(tmp_path: Path, capsys):
 def test_a_pre_declaration_baseline_is_unchecked_until_project_only(
     tmp_path: Path, capsys
 ):
+    """A baseline with no native declarations is unchecked, never clean, until a
+    project-only snapshot baselines them.
+    """
+
     root = _layout(tmp_path, dbt=False)
     _write(root, ORDERS_FILE, {"cubes": [_declared_orders()]})
     _cli(root, capsys, "maintain", "snapshot")

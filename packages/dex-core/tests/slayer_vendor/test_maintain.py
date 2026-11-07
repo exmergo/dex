@@ -612,6 +612,8 @@ def _declared_orders(
 
 
 def _declarations(payload: dict) -> list[dict]:
+    """The declaration findings of a drift payload, in ranked order."""
+
     return [
         f for f in payload["data"]["findings"] if f["code"].startswith("declaration_")
     ]
@@ -663,6 +665,10 @@ def test_a_changed_unit_names_the_column(repo: Path, capsys):
 
 
 def test_a_pre_declaration_baseline_is_unchecked_until_project_only(repo: Path, capsys):
+    """A baseline with no native declarations is unchecked, never clean, until a
+    project-only snapshot baselines them.
+    """
+
     _write_model(repo, ORDERS, _declared_orders())
     _cli(repo, capsys, "maintain", "snapshot")
     path = repo / ".dex" / "snapshot.json"

@@ -543,6 +543,10 @@ def _native(
     amount=None,
     **dex,
 ) -> DeclarationFingerprint | None:
+    """An orders definition's fingerprint, with its population, key and the unit of
+    ``amount`` overridable.
+    """
+
     members = [
         ("order_id", "order_id", {"dex": {"role": "key"}}),
         ("amount", "amount", {"dex": amount or {"unit": "currency:USD"}}),
@@ -577,6 +581,8 @@ def _native_snap(declarations, vendor="cube", transform=None) -> Snapshot:
 
 
 def test_a_native_declaration_is_fingerprinted_per_field_with_its_key_as_grain():
+    """Every ``dex`` key is a field, the key is the grain, and no value is held."""
+
     fingerprint = _native(grain=["x"], grain_note="kept")
 
     assert fingerprint.path == "orders.yml"
@@ -646,6 +652,8 @@ def test_a_changed_native_population_is_high_and_names_the_layer():
 
 
 def test_a_changed_native_key_or_unit_is_high():
+    """A changed key is a grain change, a changed unit names its column; both high."""
+
     snap = _native_snap({"orders": _native()})
     current = _native_layer(
         {"orders": _native(key=("order_id", "line"), amount={"unit": "count"})}
