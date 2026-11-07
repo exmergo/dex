@@ -947,6 +947,29 @@ mutant, or the routed models would not compile as ephemeral, in which case every
 file is put back and only the model's own tests run. A model with no tests of its
 own is measurable when downstream tests read it.
 
+**The incremental branch.** An incremental model is two programs, and a mutant
+builds ephemeral, so `is_incremental()` renders false and the
+`{% if is_incremental() %}` branch is not in the SQL the full build's mutants come
+from (#1132). The model is compiled a second time with the branch taken and
+`{{ this }}` kept as `{{ this }}`, and its comparisons and filters that the full
+build does not also have are planted there: a flipped boundary, a dropped filter
+and a negated one. A site both programs share is the full build's. Only the unit
+tests that override `is_incremental` to true run the branch, so those, and nothing
+else, run against its mutants, and the full build's runs leave them out.
+`data.incremental` holds the branch: `tests` (those unit tests), `baseline`,
+`mutants` (ids `i01`...), `counts`, `score`, `cap` (its share) and a `reason`
+when nothing ran against it. With no such test, every branch mutant is
+`survived` without a run, `reason` says why, and `suggested_test` names a unit test
+with the override and a `this` fixture. A branch survivor's `equivalence` is
+`not_checked`, since the branch reads `{{ this }}`. `data.score` and
+`data.counts` stay the full build's, so neither score mixes the two programs;
+`data.cap` is the whole run's, and one cap binds both, with the branch's classes
+beside the full build's in the round robin. A model whose only mutable SQL is the
+branch is measured rather than refused. A model whose only tests override
+`is_incremental` runs no full-build mutant: each survives by construction, with
+a warning. `data.incremental` is null for a model with no branch, and a model that
+is not materialized `incremental` has none, since dbt never runs it.
+
 `seed_csv` is the first kind that puts **values**, not logic, into a reviewable
 diff, and a diff goes into git and stays there. So a seed's header is checked
 both against the PII detector `explore` profiles warehouse columns with and
