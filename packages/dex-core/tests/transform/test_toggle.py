@@ -682,6 +682,7 @@ def test_each_test_still_running_off_is_named_with_its_line(tmp_path: Path) -> N
         {"fct": ["fee_amount"]},
         name="shop",
         variable="enable_fees",
+        on_value=True,
         off_value=False,
     )
     assert limits == []
@@ -698,6 +699,25 @@ def test_each_test_still_running_off_is_named_with_its_line(tmp_path: Path) -> N
     }
     assert all(site["path"] == "models/_tests.yml" for site in sites["fct"])
     assert "models/_tests.yml:" in sites["fct"][0]["detail"]
+    assert "`enabled: \"{{ var('enable_fees') }}\"`" in sites["fct"][0]["detail"]
+
+
+@pytest.mark.parametrize(
+    ("on_value", "expression"),
+    [
+        (True, "{{ var('flag') }}"),
+        (False, "{{ not var('flag') }}"),
+        ("on", "{{ var('flag') == 'on' }}"),
+        (2, "{{ var('flag') == 2 }}"),
+    ],
+)
+def test_the_disable_advice_is_true_at_the_on_value_alone(
+    on_value, expression: str
+) -> None:
+    """A bare var() is only right for a flag that is on when true: a
+    `disable_x` flag, or a string or integer one, needs the comparison."""
+
+    assert toggle._enabled_expression("flag", on_value) == expression
 
 
 def test_a_test_with_no_compiled_node_is_a_limit(tmp_path: Path) -> None:
@@ -712,13 +732,14 @@ def test_a_test_with_no_compiled_node_is_a_limit(tmp_path: Path) -> None:
         {"fct": ["fee_amount"]},
         name="shop",
         variable="enable_fees",
+        on_value=True,
         off_value=False,
     )
     assert sites == {}
-    assert any(
-        f"models/_tests.yml:{_line_of('combination_of_columns: [')}" in limit
-        for limit in limits
-    ), limits
+    # The model-level test naming the column, and the column's own tests.
+    for line in (_line_of("combination_of_columns: ["), _line_of("- name: fee_amount")):
+        assert any(f"models/_tests.yml:{line} " in limit for limit in limits), limits
+    assert len(limits) == 2, limits
 
 
 def test_tests_are_not_judged_when_the_off_branch_fails(tmp_path: Path) -> None:
@@ -734,6 +755,7 @@ def test_tests_are_not_judged_when_the_off_branch_fails(tmp_path: Path) -> None:
         {"fct": ["fee_amount"]},
         name="shop",
         variable="enable_fees",
+        on_value=True,
         off_value=False,
     )
     assert sites == {}
