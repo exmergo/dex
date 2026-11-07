@@ -31,6 +31,7 @@ import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ..dbt_project import DbtProjectView, jinja_calls
+from ..errors import PrerequisiteError
 from ..semantic_declarations import Assumption, _Strict
 from .plans import EditKind, EditOp, PlanEdit
 
@@ -664,8 +665,12 @@ class _Compiled:
         self.failed = failed
 
 
-class _CompileUnavailableError(Exception):
-    """Nothing in one tree compiled: dbt absent, no profile, or a parse error."""
+class CompileUnavailableError(PrerequisiteError):
+    """Nothing in one tree compiled: dbt absent, no profile, or a parse error.
+
+    Never reaches a caller: :func:`analyze` turns it into ``compile_unavailable``
+    records.
+    """
 
 
 def _compile_tree(
@@ -711,7 +716,7 @@ def _compile_tree(
         select=selector,
     )
     if branch.failure is not None:
-        raise _CompileUnavailableError(branch.failure)
+        raise CompileUnavailableError(branch.failure)
     if trees is not None:
         side = "proposed" if proposed else "retained"
         if not proposed and "retained" in trees:
