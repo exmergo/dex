@@ -341,6 +341,10 @@ class _MatchedColumn:
     right_name: str
     type_name: str
     right_type_name: str = ""
+    groupable: bool = True
+    right_groupable: bool = True
+    comparison_type: str | None = None
+    right_comparison_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -612,8 +616,20 @@ def _compare(
     left_names = [column.left_name for column in aligned.matched]
     right_names = [column.right_name for column in aligned.matched]
     dialect = adapter.dialect
-    left_proj = _project(left, left_names, left_names, dialect)
-    right_proj = _project(right, right_names, left_names, dialect)
+    left_proj = _project(
+        left,
+        left_names,
+        left_names,
+        [column.comparison_type for column in aligned.matched],
+        dialect,
+    )
+    right_proj = _project(
+        right,
+        right_names,
+        left_names,
+        [column.right_comparison_type for column in aligned.matched],
+        dialect,
+    )
     statements = [_multiset_sql(left_proj, right_proj, left_names, dialect)]
     if keys is not None:
         statements.append(_keyed_sql(left_proj, right_proj, left_names, keys, dialect))
@@ -904,7 +920,16 @@ def _align(
                 )
             accepted_changes.append(change)
         matched.append(
-            _MatchedColumn(column.name, right.name, column.data_type, right.data_type)
+            _MatchedColumn(
+                column.name,
+                right.name,
+                column.data_type,
+                right.data_type,
+                column.groupable,
+                right.groupable,
+                column.comparison_type,
+                right.comparison_type,
+            )
         )
     only_right = tuple(
         SchemaColumn(column.name, column.data_type)
@@ -956,6 +981,10 @@ def _unsupported_column(columns: Sequence[_MatchedColumn], dialect: str) -> str 
             # here can say it groups.
             if base in refused or base.isdigit():
                 return f"{column.left_name} ({type_name})"
+        if not column.groupable:
+            return f"{column.left_name} ({column.type_name})"
+        if not column.right_groupable:
+            return f"{column.left_name} ({column.right_type_name})"
     return None
 
 
@@ -967,6 +996,7 @@ def _project(
     sql: str,
     source_names: Sequence[str],
     output_names: Sequence[str],
+    comparison_types: Sequence[str | None],
     dialect: str,
 ) -> str:
     """Select ``source_names`` under ``output_names``, in that order.
@@ -975,13 +1005,23 @@ def _project(
     multiset comparison, so a rename or a reordering is not a changed row.
     """
 
-    pairs = zip(source_names, output_names, strict=True)
+    pairs = zip(source_names, output_names, comparison_types, strict=True)
     select_list = ", ".join(
-        f"{_quote(source, dialect)} as {_quote(output, dialect)}"
-        for source, output in pairs
+        f"{_comparison_expression(source, comparison_type, dialect)} "
+        f"as {_quote(output, dialect)}"
+        for source, output, comparison_type in pairs
     )
     # Names are quoted identifiers. sql already passed the SELECT shape check.
     return f"select {select_list} from ({sql}) as dex_proj"  # noqa: S608
+
+
+def _comparison_expression(name: str, comparison_type: str | None, dialect: str) -> str:
+    """Render a column using its adapter-required comparison representation."""
+
+    column = _quote(name, dialect)
+    if comparison_type == "text" and dialect == "postgres":
+        return f'({column}::text COLLATE "C")'
+    return column
 
 
 def _rows_cte(left_proj: str, right_proj: str, column_list: str) -> str:
