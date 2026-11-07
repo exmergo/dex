@@ -468,6 +468,7 @@ def analyze(
         },
         name=project_name,
         variable=variable,
+        on_value=contract.on_value,
         off_value=contract.off_value,
     )
     limits.extend(reader_limits)
@@ -814,6 +815,7 @@ def governed_readers(
     *,
     name: str,
     variable: str,
+    on_value: Any,
     off_value: Any,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     """The tests and semantic definitions over a producer's governed column.
@@ -846,7 +848,8 @@ def governed_readers(
             hits_of[(label, column)] = [hit for hit in hits if not hit.package]
 
     if off.failure is None:
-        _tested_when_off(view, off, hits_of, sites, limits, name, variable, off_value)
+        advice = _enabled_expression(variable, on_value)
+        _tested_when_off(view, off, hits_of, sites, limits, name, advice, off_value)
     elif any(
         hit.form in ("yaml_column", "yaml_test_column")
         for hits in hits_of.values()
@@ -867,7 +870,7 @@ def _tested_when_off(
     sites: dict[str, list[dict[str, Any]]],
     limits: list[str],
     project: str,
-    variable: str,
+    advice: str,
     off_value: Any,
 ) -> None:
     """Each test still enabled with the flag off over a producer's governed column."""
@@ -903,8 +906,8 @@ def _tested_when_off(
                         f"the {test} test at {where} reads '{label}.{column}' and "
                         f"still runs with the flag off ({off_value!r}), where the "
                         "column is gone, so the off build fails it. Disable it at "
-                        f"the off value (`enabled: \"{{{{ var('{variable}') }}}}\"` "
-                        "in its config) or remove it"
+                        f'the off value (`enabled: "{advice}"` in its config) or '
+                        "remove it"
                     ),
                     "path": path,
                     "line": line,
@@ -917,12 +920,59 @@ def _tested_when_off(
         if reading or held_off:
             continue
         for hit in hits:
-            if hit.form == "yaml_test_column" and hit.owner == base:
-                limits.append(
-                    f"{hit.path}:{hit.line} names '{label}.{column}' in a test "
-                    "that matched no compiled test node, so whether it runs with "
-                    "the flag off is unknown"
+            if hit.owner != base or not (
+                hit.form == "yaml_test_column"
+                or (
+                    hit.form == "yaml_column"
+                    and _declares_tests(view, hit.path, base, column)
                 )
+            ):
+                continue
+            limits.append(
+                f"{hit.path}:{hit.line} names '{label}.{column}' in a test "
+                "that matched no compiled test node, so whether it runs with "
+                "the flag off is unknown"
+            )
+
+
+def _enabled_expression(variable: str, on_value: Any) -> str:
+    """A test ``enabled`` config that is true at ``on_value`` alone.
+
+    A bare ``var()`` only works for a boolean flag that is on when true: a
+    ``disable_x`` flag turns the feature on with ``false``, and a string or
+    integer flag renders a value dbt does not read as a boolean.
+    """
+
+    read = f"var('{variable}')"
+    if on_value is True:
+        expression = read
+    elif on_value is False:
+        expression = f"not {read}"
+    else:
+        expression = f"{read} == {on_value!r}"
+    return "{{ " + expression + " }}"
+
+
+def _declares_tests(view: DbtProjectView, path: str, model: str, column: str) -> bool:
+    """Whether the YAML at ``path`` declares a test under ``model.column``."""
+
+    from ..dbt_project import yaml_documents
+    from ..references import _tests_of
+
+    for parsed, where in yaml_documents(view):
+        if where != path:
+            continue
+        for entry in parsed.get("models") or []:
+            if not isinstance(entry, dict) or entry.get("name") != model:
+                continue
+            for item in entry.get("columns") or []:
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("name") or "").lower() == column
+                    and _tests_of(item)
+                ):
+                    return True
+    return False
 
 
 def _locate_test(
