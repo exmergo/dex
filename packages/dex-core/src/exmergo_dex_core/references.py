@@ -362,10 +362,17 @@ class ReferenceIndex:
         """
 
         first, _, rest = name.partition(".")
+        model = mv.lookup(self.versions, first)
+        if model is not None:
+            # Longest first, so `dim_teams.v1.5.x` is version 1.5's column.
+            for label in sorted(model.labels, key=len, reverse=True):
+                written = f"{first}.{label.partition('.')[2]}."
+                if name.startswith(written):
+                    return written[:-1], name[len(written) :]
         label, dot, column = rest.partition(".")
         if (
             dot
-            and mv.lookup(self.versions, first) is not None
+            and model is not None
             and mv.split_label(f"{first}.{label}")[1] is not None
         ):
             return f"{first}.{label}", column
@@ -1930,12 +1937,15 @@ def _python_relation_calls(
                 else None
                 for arg in node.args
             )
+            # Both `v` and `version` on one call is left unread: dbt lets
+            # `version` win, and dex does not reproduce that.
             version = next(
                 (
                     mv.version_text(keyword.value.value)
                     if isinstance(keyword.value, ast.Constant)
                     and isinstance(keyword.value.value, (str, int, float))
                     and not isinstance(keyword.value.value, bool)
+                    and len(node.keywords) == 1
                     else mv.UNREAD_VERSION
                     for keyword in node.keywords
                 ),

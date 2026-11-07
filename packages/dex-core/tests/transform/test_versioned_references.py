@@ -288,13 +288,19 @@ class TestReferences:
                 1,
             ),
             (
+                "models/fct_dynamic.sql",
+                "select team_label\n"
+                "from {{ ref('dim_teams', v=1, version=var('wanted')) }}\n",
+                2,
+            ),
+            (
                 "models/fct_dynamic.py",
                 "def model(dbt, session):\n"
                 "    return dbt.ref('dim_teams', v=dbt.config.get('which'))\n",
                 2,
             ),
         ],
-        ids=["jinja", "jinja_literal_prefix", "python"],
+        ids=["jinja", "jinja_literal_prefix", "jinja_both_selectors", "python"],
     )
     def test_a_version_pinned_by_an_expression_is_a_limit(
         self, project, path, text, line
@@ -312,6 +318,37 @@ class TestReferences:
             _rename(project, "dim_teams.v1.team_label", "team_name")
         assert f"{path}:{line}" in str(exc.value)
         assert "pin a literal version" in str(exc.value)
+
+    def test_a_numeric_pin_is_read_as_jinja_reads_it(self, project):
+        """`v=1.50` is the number 1.5, which is how YAML reads `v: 1.5`."""
+
+        _write(
+            project / "models/schema.yml",
+            SCHEMA.replace("      - v: 1\n", "      - v: 1.5\n"),
+        )
+        _write(project / "models/dim_teams_v1.5.sql", "select 1 as team_label\n")
+        _write(
+            project / "models/fct_pinned.sql",
+            "select\n    team_label\nfrom {{ ref('dim_teams', v=1.50) }}\n",
+        )
+
+        report = find_references(load(project), ["dim_teams"], kind="model")
+        pinned = [
+            occurrence.get("versions")
+            for entry in report.targets[0]["files"]
+            if entry["path"] == "models/fct_pinned.sql"
+            for occurrence in entry["occurrences"]
+        ]
+        found = _occurrences(project, "dim_teams.v1.5.team_label")
+
+        assert pinned == [["dim_teams.v1.5"]]
+        assert (
+            "models/fct_pinned.sql",
+            2,
+            "select_column",
+            "lineage_resolved",
+            ["dim_teams.v1.5"],
+        ) in found
 
     def test_the_command_reports_the_versions(self, project, capsys):
         rc = main(

@@ -541,13 +541,23 @@ UNREAD_VERSION = "<unread>"
 
 def written_ref_version(written: str) -> str | None:
     """The version a written ``ref(...)`` call pins, ``None`` where it pins
-    none, or :data:`UNREAD_VERSION` where the pin is not a literal."""
+    none, or :data:`UNREAD_VERSION` where the pin is not a literal.
 
-    pinned = REF_VERSION.search(written)
-    if pinned is None:
+    A number is read as Jinja reads it, so ``v=1.50`` pins the version YAML
+    declares as ``v: 1.5``. A call that writes both ``v`` and ``version`` is
+    unread: dbt lets ``version`` win, and dex does not reproduce that.
+    """
+
+    found = list(REF_VERSION.finditer(written))
+    if not found:
         return None
-    literal = next((group for group in pinned.groups() if group), None)
-    return literal if literal is not None else UNREAD_VERSION
+    if len(found) > 1:
+        return UNREAD_VERSION
+    single, double, number = found[0].groups()
+    if number is not None:
+        return version_text(float(number) if "." in number else int(number))
+    literal = single if single is not None else double
+    return literal if literal else UNREAD_VERSION
 
 
 def entry_variants(entry: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
