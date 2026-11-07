@@ -392,8 +392,10 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      failure: at most 4096 bytes summarizing the change, its required
                                      deliverables (built, failed, skipped, missing, stale; coverage
                                      unknown with no plan) and what blocked each, the failing nodes,
-                                     which deliverables anything checked, what verification ran and
-                                     suppressed, the declared obligations by status, and where the
+                                     which deliverables anything checked (assurance.failed_checks
+                                     lists each failed check's kind: a data_test by name, or a
+                                     contradicted record by kind, finding and join), what verification
+                                     ran and suppressed, the declared obligations by status, and where the
                                      full evidence is, so a truncated read still has the answer.
                                      With --verify and a plan carrying a toggle (#1113),
                                      data.verification.toggle judges the built relations' columns from
@@ -593,7 +595,11 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      over its filtered rows with effective_input on the record (#1085),
                                      any other filtering CTE unchecked as filtered_cte; join_no_match for a nonempty population matching
                                      nothing, join_orphans and join_zero_overlap against the contract or
-                                     the stated defaults, join_field_all_null and join_field_newly_null
+                                     the stated defaults (an INNER join whose unmatched rows an
+                                     assumptions entry or population.filters entry on the driving key
+                                     column accounts for is satisfied, its counts kept, with
+                                     unmatched_accounted_for naming the entry; #1162),
+                                     join_field_all_null and join_field_newly_null
                                      for a column the join supplies that came back all NULL. A project that fails
                                      to compile is reported first and suppresses every other check;
                                      data.suppressed names each finding class that did not run and why,

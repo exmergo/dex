@@ -2765,13 +2765,18 @@ class ModelJoinContext:
     computed column has no entry. ``columns`` is each output column's declared
     ``config.meta.dex`` (lowered keys). ``parents`` maps every project node
     name (lowered) to its relation, so a ``references`` can be lined up with
-    the relation a join reads.
+    the relation a join reads. ``assumptions`` is the model's declared
+    ``assumptions`` entries and ``population_filters`` the columns its
+    ``population.filters`` entries name (lowered), which say an INNER join's
+    unmatched rows are the population the model means to drop (#1162).
     """
 
     relation: str | None = None
     lineage: dict[str, tuple[str, str]] = field(default_factory=dict)
     columns: dict[str, dict] = field(default_factory=dict)
     parents: dict[str, str] = field(default_factory=dict)
+    assumptions: list[dict] = field(default_factory=list)
+    population_filters: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2870,6 +2875,9 @@ def plan_join_contract(
                 column_name = column.get("name") or key
                 if isinstance(dex, dict) and isinstance(column_name, str):
                     declared[column_name.lower()] = dex
+            assumptions, population_filters = _model_population_intent(
+                entry_meta(node).get("dex")
+            )
             plan.context[name] = ModelJoinContext(
                 relation=strip_relation_quoting(relation)
                 if isinstance(relation, str) and relation
@@ -2877,8 +2885,37 @@ def plan_join_contract(
                 lineage=_output_lineage(tree, sql_shape),
                 columns=declared,
                 parents=parents,
+                assumptions=assumptions,
+                population_filters=population_filters,
             )
     return plan
+
+
+def _model_population_intent(dex) -> tuple[list[dict], tuple[str, ...]]:
+    """The model-level ``assumptions`` entries that name a column, and the
+    columns its ``population.filters`` entries name (lowered), from its
+    ``config.meta.dex`` (#1162)."""
+
+    if not isinstance(dex, dict):
+        return [], ()
+    stated = dex.get("assumptions")
+    assumptions = [
+        entry
+        for entry in (stated if isinstance(stated, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("column"), str)
+        and entry["column"].strip()
+    ]
+    population = dex.get("population")
+    entries = population.get("filters") if isinstance(population, dict) else None
+    filters = tuple(
+        entry["column"].strip().lower()
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("column"), str)
+        and entry["column"].strip()
+    )
+    return assumptions, filters
 
 
 def join_contract_plan(
@@ -2996,6 +3033,10 @@ class JoinPolicy:
     declared_optional: bool
     #: NULL driving keys count as unmatched rather than ineligible.
     null_keys_unmatched_by: str | None
+    #: On an INNER join the declaration does not require, what in it says the
+    #: unmatched driving rows are meant to be dropped: an ``assumptions`` entry
+    #: or a ``population.filters`` entry naming the driving key column (#1162).
+    unmatched_accounted_for: dict | None = None
 
 
 def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinPolicy:
@@ -3007,6 +3048,11 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
     whose ``references`` names the joined relation (every key must exist in the
     parent). NULL driving keys count against coverage only when the column
     carrying them is declared ``null_rule: never``.
+
+    An INNER join that is not required drops its unmatched driving rows, which
+    is a filter when the model means it: an ``assumptions`` entry whose
+    ``column`` names the driving key column, or a ``population.filters`` entry
+    on it, says so, and is returned as what accounts for those rows (#1162).
     """
 
     if ctx is None:
@@ -3050,13 +3096,40 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
         _null_allowed(ctx.columns.get(c)) for c in derived
     )
     counted = next((c for c in driving if _never_null(ctx.columns.get(c))), None)
+    inner = candidate.side.split(" ")[0] == "inner" if candidate.side else False
     return JoinPolicy(
         derived,
         driving,
         required_by,
         declared_optional,
         f"{counted} is declared null_rule: never" if counted else None,
+        _unmatched_accounted_for(from_columns | set(driving), ctx)
+        if inner and required_by is None
+        else None,
     )
+
+
+def _unmatched_accounted_for(keys: set[str], ctx: ModelJoinContext) -> dict | None:
+    """The declaration entry that names one of ``keys`` (the driving key's
+    physical columns and the output columns carrying it, lowered): the first
+    such ``assumptions`` entry, else the first ``population.filters`` entry,
+    or None (#1162)."""
+
+    for assumption in ctx.assumptions:
+        column = assumption.get("column")
+        if isinstance(column, str) and column.strip().lower() in keys:
+            return {
+                "by": "assumption",
+                **{
+                    k: assumption[k]
+                    for k in ("column", "decision", "chosen", "evidence")
+                    if assumption.get(k) is not None
+                },
+            }
+    for column in ctx.population_filters:
+        if column in keys:
+            return {"by": "population_filter", "column": column}
+    return None
 
 
 def _resolve_join_relationships(
@@ -3490,7 +3563,11 @@ def join_coverage(
       (``threshold_source: default``, stated in ``data``), and on a LEFT join
       unmatched rows are the optional relationship a LEFT join writes: recorded
       as evidence, with ``join_orphans`` withheld and ``join_zero_overlap``
-      ranked medium.
+      ranked medium. On an INNER join whose unmatched rows the declaration
+      accounts for (an ``assumptions`` entry or a ``population.filters`` entry
+      naming the driving key column), the join is the model's filter: the
+      record is ``satisfied``, keeps its counts and names that entry under
+      ``unmatched_accounted_for`` (#1162).
     - ``join_field_all_null`` (high): a column the join supplies, declared
       ``null_rule: never``, is NULL on every row of the built relation.
       ``join_field_newly_null`` (medium): one with no declared rule that is
@@ -3744,6 +3821,7 @@ def _judge_coverage(
         else ""
     )
 
+    accounted = policy.unmatched_accounted_for if unmatched_rows else None
     if matched_rows == 0:
         code = "join_no_match"
         severity = "low" if policy.declared_optional and not required else "high"
@@ -3793,6 +3871,16 @@ def _judge_coverage(
         record["status"] = "satisfied"
         if left and unmatched_rows:
             record["optional_unmatched"] = True
+        if accounted is not None:
+            record["unmatched_accounted_for"] = dict(accounted)
+        return None
+
+    if accounted is not None and code != "join_no_match":
+        # An INNER join used as a filter, and the declaration says so: the
+        # rows it drops are the population the model means (#1162). The counts
+        # stay on the record, with the finding the default would have raised.
+        record["status"] = "satisfied"
+        record["unmatched_accounted_for"] = {**accounted, "withheld_finding": code}
         return None
 
     record["status"] = "contradicted"
