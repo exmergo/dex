@@ -1075,8 +1075,8 @@ def attribute(
         if counting
         else naming_resolver
     )
-    source_relations = declared_source_relations(view)
-    unresolved_sources = unresolvable_source_relations(view)
+    source_relations = declared_source_relations(view) if counting else None
+    unresolved_sources = unresolvable_source_relations(view) if counting else None
 
     warnings: list[str] = []
     models: list[_Model] = []
