@@ -523,6 +523,7 @@ def test_semantic_refuses_uninstalled_declared_packages_with_the_dex_verb(
     parsed_calls = []
 
     def fake(project_dir, edits, **_kwargs):
+        """Record the parse call and return a passing result."""
         parsed_calls.append(list(edits))
         return {"available": True, "reason": None, "success": True, "messages": []}
 
@@ -568,6 +569,7 @@ def test_semantic_update_refuses_uninstalled_declared_packages_with_the_dex_verb
     parsed_calls = []
 
     def fake(project_dir, edits, **_kwargs):
+        """Record the parse call and return a passing result."""
         parsed_calls.append(list(edits))
         return {"available": True, "reason": None, "success": True, "messages": []}
 

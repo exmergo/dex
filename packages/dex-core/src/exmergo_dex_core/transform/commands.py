@@ -6697,6 +6697,8 @@ def _semantic_plan(
     no_parse: bool = False,
     declarations: list[Any] | None = None,
 ) -> PlanResult:
+    """Validate, parse-gate, and construct a semantic plan across authoring modes."""
+
     from ..dbt_project import load as load_project
 
     project = engine.project_dir()
