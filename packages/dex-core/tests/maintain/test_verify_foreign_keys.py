@@ -437,12 +437,43 @@ def test_a_refused_probe_is_unchecked(keys_repo, monkeypatch: pytest.MonkeyPatch
     assert {r["reason_code"] for r in records.values()} == {"probe_refused"}
 
 
-def test_a_dbt_project_reports_no_foreign_key_records(maintain_repo):
+def test_a_dbt_project_reports_no_foreign_key_records(
+    maintain_repo, monkeypatch: pytest.MonkeyPatch
+):
     """dbt judges a declared foreign key itself, as a `relationships` test that
-    build status reads, so the axis does not run and is not listed."""
+    build status reads, so the axis does not run and is not listed, though the
+    project declares one."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    # The fixture never runs dbt; its own parse is not what is under test, and
+    # a project that does not compile returns before any of this is reached.
+    monkeypatch.setattr(
+        verify_mod,
+        "shadow_parse",
+        lambda *a, **k: {
+            "available": True,
+            "reason": None,
+            "success": True,
+            "messages": [],
+        },
+    )
+    maintain_repo.edit(
+        "models/staging/stg_orders.yml",
+        "version: 2\n\nmodels:\n  - name: stg_orders\n    columns:\n"
+        "      - name: order_id\n        tests: [unique, not_null]\n"
+        "      - name: customer_id\n        tests:\n          - not_null\n"
+        "          - relationships:\n"
+        "              to: source('main', 'customers')\n              field: id\n",
+    )
 
     rc, payload = maintain_repo.dex("maintain", "verify")
 
     assert rc == 0, payload
+    assert [
+        f["code"]
+        for f in payload["data"]["findings"]
+        if f["code"] == "project_does_not_compile"
+    ] == []
     assert "foreign_key_coverage" not in payload["data"]
     assert "foreign_key_contract" not in payload["data"]["suppressed"]
