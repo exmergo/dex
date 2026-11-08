@@ -36,6 +36,7 @@ from typing import Any, Literal
 import sqlglot
 from sqlglot import exp
 
+from ..errors import RequestError
 from ..sql_shape import simple_row_predicate
 
 #: Keys named per unexpected class (added, removed, changed).
@@ -49,8 +50,13 @@ RESERVED_COLUMNS = frozenset(
 )
 
 
-class ExpectationError(ValueError):
-    """An expectation that cannot be judged as stated: ``invalid_expectation``."""
+class ExpectationError(RequestError):
+    """An expectation that cannot be judged as stated (#1157).
+
+    Malformed JSON or an unknown field is raised to the caller as a request
+    error; one that does not fit the compared columns becomes ``not_checked``
+    with ``invalid_expectation``.
+    """
 
 
 @dataclass(frozen=True)

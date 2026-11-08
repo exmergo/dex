@@ -86,6 +86,7 @@ _EXPORTS = {
     "DexError": "errors",
     "DialectDependencyError": "guards.dialect",
     "Document": "storage",
+    "ExpectationError": "transform.expected_change",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
     "IncompatibleArtifactsError": "transform.artifact_runtime",
@@ -225,6 +226,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         PlanDeclaresMissingPackagesError,
     )
     from .transform.evidence import BuildEvidenceError
+    from .transform.expected_change import ExpectationError
     from .transform.model_versions import ModelVersionError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
@@ -279,6 +281,7 @@ __all__ = [
     "DexError",
     "DialectDependencyError",
     "Document",
+    "ExpectationError",
     "ExploreStore",
     "FilesystemStore",
     "IncompatibleArtifactsError",
