@@ -870,8 +870,8 @@ def _scope_obligations(
 
 #: A unit test's status in run results that means it ran and passed.
 _PASSED = frozenset({"pass", "success"})
-#: Statuses that mean it ran and did not pass.
-_FAILED = frozenset({"fail", "error"})
+#: Statuses that mean it ran and did not pass: the build evidence's own set.
+_FAILED = FAILED_STATUSES
 
 
 def _required(evidence: BuildEvidence) -> set[str] | None:

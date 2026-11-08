@@ -109,11 +109,12 @@ def test_a_failing_incremental_test_contradicts_the_replay():
     ]
 
 
-def test_a_failing_test_beside_a_passing_one_contradicts_the_replay():
+@pytest.mark.parametrize("failed", ["fail", "error", "runtime error", "failed"])
+def test_a_failing_test_beside_a_passing_one_contradicts_the_replay(failed):
     other = f"unit_test.dex_test.{FCT}.test_{FCT}_incremental_late"
     nodes = [
         *_nodes("pass"),
-        BuildNode(unique_id=other, name=f"test_{FCT}_incremental_late", status="fail"),
+        BuildNode(unique_id=other, name=f"test_{FCT}_incremental_late", status=failed),
     ]
     _, obligations = _obligations(
         nodes, incremental_replay=_replay(tests=[TEST_UID, other])
