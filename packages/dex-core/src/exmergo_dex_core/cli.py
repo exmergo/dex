@@ -1376,6 +1376,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="COLUMN",
                         help="baseline column whose type may change in its family",
                     )
+                    expect = sp.add_mutually_exclusive_group()
+                    expect.add_argument(
+                        "--expect",
+                        default=None,
+                        metavar="JSON",
+                        help="JSON: the rows the plan may add, remove and change",
+                    )
+                    expect.add_argument(
+                        "--expect-file",
+                        default=None,
+                        metavar="PATH",
+                        help='read --expect\'s JSON from a file ("-" reads stdin)',
+                    )
                     sp.add_argument(
                         "--target",
                         default=None,

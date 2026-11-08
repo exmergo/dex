@@ -540,6 +540,12 @@ class RefactorComparisonResult(Result):
     a claim about a build, or about any input that was not compared. Every field
     here is a count, a name or a type: no row comes back.
 
+    With a stated expectation (#1157) ``status`` is ``as_expected`` or
+    ``unexpected`` instead (``matches_expected_change``, ``unexpected_change``),
+    and ``expectation`` says how. Its ``unexpected_keys`` is the one place key
+    values appear: key columns only, at most five per class, through the query
+    firewall, so a PII-flagged key is withheld (``samples_withheld``).
+
     ``keyed`` is present only when a key was given or declared, and unique on both
     sides. ``key_source`` says which, because a key the request named and one a
     declaration stated are different evidence.
@@ -574,6 +580,13 @@ class RefactorComparisonResult(Result):
     # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
     # so `cold` does not mean every input was built cold. None with no build.
     inputs_built_by: dict[str, Any] | None = None
+    # How the difference matches a stated expected change (#1157): the clauses,
+    # the counts split into matching and unexpected, the failed clauses, and up
+    # to five unexpected keys per class, firewall-cleared. Absent with no
+    # expectation.
+    expectation: dict[str, Any] | None = None
+    # A digest of the stated expectation, recorded with the verdict.
+    expectation_digest: str | None = None
 
     def data(self) -> dict[str, Any]:
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
@@ -604,6 +617,7 @@ class RefactorComparisonResult(Result):
             "key_source": self.key_source,
             "keyed": self.keyed,
             "keyed_reason": self.keyed_reason,
+            **({"expectation": self.expectation} if self.expectation else {}),
             "profiled_on_demand": self.profiled_on_demand,
         }
 

@@ -220,9 +220,6 @@ def test_no_recorded_comparisons_leaves_no_comparison_key():
 _SQL = "select * from {{ source('feed', 'scans') }}\n"
 
 
-_LATER = datetime.now(UTC) + timedelta(minutes=1)
-
-
 def _manifest(with_test: bool) -> dict:
     manifest = {
         "metadata": {

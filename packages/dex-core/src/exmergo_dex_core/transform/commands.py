@@ -1052,7 +1052,16 @@ def _offer_refactor_comparison(
         "models": ordered,
         "command": (
             f"transform compare {result.plan_id} --model {shlex.quote(ordered[0])} "
-            "[--map old=new] [--key column]"
+            "[--map old=new] [--key column] [--expect-file <expected-change.json>]"
+        ),
+        # A change meant to alter results is compared too, against what it
+        # is meant to change, rather than skipped (#1157).
+        "intended_change": (
+            "if the plan is meant to change rows, compare with --expect, stating "
+            "which rows may be added and removed, which columns may change, and "
+            "that the key holds: "
+            '{"added": "none"|"any"|{"where": "<predicate>"}, "removed": ..., '
+            '"changed_columns": [...], "key": "unchanged"}'
         ),
     }
     if mixed:
@@ -3998,10 +4007,26 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 key_columns=getattr(args, "key", None),
                 target=getattr(args, "target", None),
                 accepted_type_changes=getattr(args, "accept_type", None),
+                expectation=_expectation_arg(args),
             )
         )
     except ValueError as exc:
         return env.error_for(exc, **_resolution_error(exc))
+
+
+def _expectation_arg(args: argparse.Namespace) -> str | None:
+    """``--expect``'s JSON, inline or read from ``--expect-file`` (``-`` is stdin)."""
+
+    inline = getattr(args, "expect", None)
+    path = getattr(args, "expect_file", None)
+    if path is None:
+        return inline
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"--expect-file could not be read: {exc}") from exc
 
 
 def _column_map(pairs: list[str] | None) -> dict[str, str] | None:
