@@ -626,7 +626,7 @@ def _test_node(name: str, attached: str, kwargs: dict, *, column=None, deps=()):
 def _off_branch(enabled: dict, disabled: dict | None = None):
     """An off branch whose manifest holds these test nodes."""
 
-    branch = toggle._Branch()
+    branch = compiled_tree.Branch()
     branch.manifest = {
         "nodes": enabled,
         "disabled": {uid: [node] for uid, node in (disabled or {}).items()},
@@ -785,7 +785,7 @@ def test_tests_are_not_judged_when_the_off_branch_fails(tmp_path: Path) -> None:
     """With no off manifest, the tests over a governed column are a limit."""
 
     view, index = _readers_project(tmp_path)
-    off = toggle._Branch()
+    off = compiled_tree.Branch()
     off.failure = "boom"
     sites, limits = toggle.governed_readers(
         index,
