@@ -1,0 +1,5 @@
+{
+  "name": "intended_repairs",
+  "description": "Three repairs meant to change rows (a backfill, an exclusion, late arrivals), each with an over-broad variant a comparison against the stated change has to flag.",
+  "seed": 1157
+}

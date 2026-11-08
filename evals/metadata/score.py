@@ -863,6 +863,7 @@ def scope_grades(
 #: Each reads ``Session.dex_calls``, in the order the agent made them.
 PROCEDURE_STEPS = (
     "compare_before_apply",
+    "compare_expected_before_apply",
     "build_after_apply",
     "cold_deps_after_apply",
     "rebuilt_before_compare",
@@ -886,6 +887,25 @@ def _is_mutation(call: dict[str, Any]) -> bool:
     """Whether a recorded Dex call is a ``transform test --mutate`` run."""
 
     return call["label"] == "transform test" and "mutate" in (call.get("flags") or [])
+
+
+def _compared_as_expected(
+    calls: list[dict[str, Any]], compare: int, applies: list[int]
+) -> bool:
+    """Whether the comparison at ``compare`` held the last apply to a stated
+    change (#1157) and found it as stated.
+
+    A change meant to alter rows is compared with ``--expect``; an ``unexpected``
+    verdict is a defect the agent should have fixed and compared again, so only
+    ``as_expected`` (or a verdict the agent's own pipe hid) counts.
+    """
+
+    flags = calls[compare].get("flags") or []
+    if "expect" not in flags and "expect-file" not in flags:
+        return False
+    if calls[compare].get("verdict") not in ("as_expected", None):
+        return False
+    return _compared_the_apply(calls, compare, applies)
 
 
 def _compared_the_apply(
@@ -1009,6 +1029,10 @@ def procedure_steps(
     if "compare_before_apply" in required:
         results["compare_before_apply"] = bool(applies) and any(
             _compared_the_apply(calls, i, applies) for i in compares
+        )
+    if "compare_expected_before_apply" in required:
+        results["compare_expected_before_apply"] = bool(applies) and any(
+            _compared_as_expected(calls, i, applies) for i in compares
         )
     if "build_after_apply" in required:
         results["build_after_apply"] = bool(applies) and any(

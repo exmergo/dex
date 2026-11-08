@@ -21,6 +21,7 @@ What is held:
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -76,6 +77,7 @@ DIGESTS = {
     "sandbox_scope": "c39e1d55a470611137dcbd0b62fdbd617ea8abc183f202b06e51b7d46ea2a07a",
     "visit_coverage": "89f49a8cfb57454f2bccea7e679f82bdecddb20494fb4822077249ee8190c124",
     "package_parent": "ba531ac5af7723884ac87e3d665d2e802efa79b0ed969723b6295a6de723c6bf",
+    "intended_repairs": "f85cf9bda1ccac17b11c024cbee3e351047b425a5f60dfc178f3fce4e3133b8a",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -3381,3 +3383,125 @@ def test_the_toggle_check_judges_every_gated_shape_in_the_fixture(
     ]
     assert toggle["verdict"] == "unchecked"
     assert len(toggle["limits"]) == 1
+
+
+# --- intended repairs (#1157): a change meant to move rows, held to its statement --
+
+_INTENDED = ("backfill_days", "exclude_archived", "late_arrivals")
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        # Compared with no expectation: a change meant to move rows reads
+        # `different`, which says nothing about which rows moved.
+        ([("compare", "p1", "different", []), ("apply", "p1")], False),
+        ([("compare", "p1", "as_expected", ["expect"]), ("apply", "p1")], True),
+        ([("compare", "p1", "as_expected", ["expect-file"]), ("apply", "p1")], True),
+        # An unexpected change applied as it was.
+        ([("compare", "p1", "unexpected", ["expect"]), ("apply", "p1")], False),
+        # Fixed, planned again, compared again, then applied.
+        (
+            [
+                ("compare", "p1", "unexpected", ["expect"]),
+                ("compare", "p2", "as_expected", ["expect"]),
+                ("apply", "p2"),
+            ],
+            True,
+        ),
+        ([("compare", "p1", "not_checked", ["expect"]), ("apply", "p1")], False),
+        # Compared only after the apply: the baseline is gone.
+        ([("apply", "p1"), ("compare", "p1", "as_expected", ["expect"])], False),
+        # A verdict the agent's pipe hid.
+        ([("compare", "p1", None, ["expect"]), ("apply", "p1")], True),
+    ],
+)
+def test_an_intended_change_is_compared_against_its_statement(calls, passed):
+    from evals.metadata.score import procedure_steps
+
+    def call(verb, plan=None, verdict=None, flags=()):
+        return {
+            "label": f"transform {verb}",
+            "plan": plan,
+            "verdict": verdict,
+            "flags": list(flags),
+        }
+
+    graded = procedure_steps(
+        {"compare_expected_before_apply": True}, [call(*spec) for spec in calls]
+    )
+    assert graded["passed"] is passed
+
+
+def test_the_expected_change_verdicts_are_read_from_an_envelope():
+    from evals.metadata.live import _compare_verdict
+
+    for verdict in ("as_expected", "unexpected"):
+        text = json.dumps({"status": "ok", "data": {"status": verdict}})
+        assert _compare_verdict({"content": text}) == verdict
+
+
+def test_each_intended_repair_states_a_change_its_truth_can_check():
+    for name in _INTENDED:
+        task = _task(f"intended_repairs/{name}")
+        stated = task.truth["expected_change"]
+        assert stated["model"] in task.models
+        assert task.truth["procedure"]["compare_expected_before_apply"] is True
+        assert (task.directory / "overbroad").is_dir()
+
+
+@needs_dbt
+@pytest.mark.parametrize("name", _INTENDED)
+def test_compare_expect_passes_the_repair_and_flags_its_over_broad_variant(
+    name, tmp_path, monkeypatch, capsys
+):
+    """Each repair is ``as_expected`` against the change its truth states, and
+    its over-broad variant, which passes its own build, is ``unexpected``."""
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(f"intended_repairs/{name}")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    stated = task.truth["expected_change"]
+    expect = workspace / "expected_change.json"
+    expect.write_text(json.dumps(stated["expect"]), encoding="utf-8")
+
+    def dex(*args, expected="ok"):
+        main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        return envelope
+
+    dex("transform", "build", "--target", "dev", "--confirm")
+    verdicts = {}
+    for variant in ("reference", "overbroad"):
+        root = task.directory / variant
+        edits = [
+            {
+                "path": str(path.relative_to(root)),
+                "kind": "model_sql" if path.suffix == ".sql" else "schema_yml",
+                "content": path.read_text(encoding="utf-8"),
+            }
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        ]
+        payload = workspace / f"{variant}.json"
+        payload.write_text(json.dumps({"edits": edits}), encoding="utf-8")
+        planned = dex("transform", "plan", name, "--edits-file", str(payload))
+        compared = dex(
+            "transform",
+            "compare",
+            planned["data"]["plan_id"],
+            "--model",
+            stated["model"],
+            "--key",
+            stated["key"],
+            "--expect-file",
+            str(expect),
+        )
+        verdicts[variant] = compared["data"]
+    assert verdicts["reference"]["status"] == "as_expected", verdicts["reference"]
+    assert verdicts["overbroad"]["status"] == "unexpected", verdicts["overbroad"]
+    assert verdicts["overbroad"]["expectation"]["findings"]
