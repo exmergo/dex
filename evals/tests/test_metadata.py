@@ -3633,3 +3633,34 @@ def test_a_mixed_sentence_still_names_the_defect():
         "list_price, not adjusted_price from int_line_prices."
     )
     assert diagnosis_rubric(truth, final, [], [])["checks"]["qualified"]
+
+
+def test_a_clean_build_statement_does_not_swallow_a_defect_claim():
+    truth = _task(_UNUSED).truth["diagnosis"]
+    final = (
+        "The build has no errors but avg_adjusted_price is wrong: it averages "
+        "list_price, not adjusted_price from int_line_prices."
+    )
+    assert diagnosis_rubric(truth, final, [], [])["checks"]["qualified"]
+
+
+def test_a_no_defect_verdict_that_calls_the_model_wrong_fails():
+    """Naming the filter that explains the symptom is not enough when the same
+    message calls the model wrong."""
+
+    truth = _task("trial_events/legitimate_exclusion").truth["diagnosis"]
+    models = ["subscription_activity"]
+    contradicted = (
+        "subscription_activity is wrong: subscription 1013 is filtered out "
+        "because is_internal is true."
+    )
+    graded = diagnosis_rubric(truth, contradicted, [], models)
+    assert graded["checks"]["qualified"] is False
+    consistent = (
+        "Subscription 1013 is missing because is_internal is true, and "
+        "subscription_activity declares internal subscriptions excluded."
+    )
+    assert diagnosis_rubric(truth, consistent, [], models)["passed"]
+    # A fault word about something else is no contradiction (a live phrasing).
+    elsewhere = consistent + " If you expected it, the id you were given is wrong."
+    assert diagnosis_rubric(truth, elsewhere, [], models)["passed"]

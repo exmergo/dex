@@ -1201,9 +1201,23 @@ _DEFECT = re.compile(
 # A defect word under a negation ("no row is missing", "found no defect") is a
 # clean verdict, not a defect named.
 _NEGATED_DEFECT = re.compile(
-    r"\b(?:no|not|nothing|none|never)\b(?:\s+\w+){0,3}?\s+"
+    r"\b(?:no|not|nothing|none|never)\b"
+    r"(?:\s+(?!(?:but|however|yet|although|though|while|and|whereas)\b)\w+){0,3}?\s+"
     r"(?:(?:is|are|was|were|looks?|seems?)\s+)?(?:defects?|bugs?|wrong|missing)\b"
 )
+
+
+# The model itself called at fault, as distinct from the symptom restated
+# ("1013 is missing"): what a no-defect verdict cannot also say.
+_FAULT = re.compile(
+    r"\b(?:bugs?|defects?|wrong(?:ly)?|incorrect(?:ly)?|mislabel(?:l?ed)?|swapped)\b"
+)
+
+
+def _clean(sentence: str) -> str:
+    """``sentence`` with its clean verdicts and negated defect words removed."""
+
+    return _CLEAN.sub(" ", _NEGATED_DEFECT.sub(" ", sentence))
 
 
 def diagnosis_rubric(
@@ -1256,12 +1270,23 @@ def diagnosis_rubric(
     if verdict == "defect":
         # A clean phrase is dropped first: "nothing is wrong" names no defect.
         checks["qualified"] = any(
-            _DEFECT.search(_CLEAN.sub(" ", _NEGATED_DEFECT.sub(" ", sentence)))
-            for sentence in sentences
+            _DEFECT.search(_clean(sentence)) for sentence in sentences
         )
     elif verdict == "no_defect":
         explains = truth.get("explains") or []
-        checks["qualified"] = any(mentions(t) for t in explains) if explains else True
+        # A message that also calls the model wrong contradicts its own verdict.
+        # Only an unhedged sentence about the model counts: "a wrong id would
+        # explain this" is about the report, not the model.
+        subjects = [str(model).lower() for model in models] + ["the model"]
+        faulted = any(
+            _FAULT.search(_clean(sentence))
+            and any(subject in sentence for subject in subjects)
+            and not _HEDGE.search(sentence)
+            for sentence in sentences
+        )
+        checks["qualified"] = not faulted and (
+            any(mentions(t) for t in explains) if explains else True
+        )
     elif verdict == "unresolved":
         checks["qualified"] = any(
             _UNRESOLVED.search(sentence) for sentence in sentences
