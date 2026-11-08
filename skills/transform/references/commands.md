@@ -790,7 +790,13 @@ and the verdict becomes `as_expected` (`matches_expected_change`) or `unexpected
   `(expected change keys)` and `(expected change key sample)`; the sample runs
   only when a class failed.
 - The verdict is recorded on the plan with a digest of the expectation, and a
-  `--for-plan` build reads it into `obligations.comparison` as `satisfied`.
+  `--for-plan` build reads it into `obligations.comparison`: `as_expected` is
+  `satisfied` and `unexpected` is `contradicted` (`unexpected_change`).
+- With no key compared, the report says `key: "unchanged"` was not judged (a
+  note, and `grain.holds: null`); pass `--key` to have it checked. A key column
+  whose name reads like a credential's (`token_count`) withholds the sample
+  (`samples_withheld: key_name_withheld`), since the envelope refuses such a
+  name.
 
 ## `transform test --scaffold <model>`
 

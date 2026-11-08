@@ -109,6 +109,18 @@ def test_a_failing_incremental_test_contradicts_the_replay():
     ]
 
 
+def test_a_failing_test_beside_a_passing_one_contradicts_the_replay():
+    other = f"unit_test.dex_test.{FCT}.test_{FCT}_incremental_late"
+    nodes = [
+        *_nodes("pass"),
+        BuildNode(unique_id=other, name=f"test_{FCT}_incremental_late", status="fail"),
+    ]
+    _, obligations = _obligations(
+        nodes, incremental_replay=_replay(tests=[TEST_UID, other])
+    )
+    assert obligations["incremental_replay"][0]["status"] == "contradicted"
+
+
 def test_a_plan_touching_no_incremental_model_carries_no_replay_key():
     _, obligations = _obligations(_nodes(), incremental_replay=None)
     assert "incremental_replay" not in obligations

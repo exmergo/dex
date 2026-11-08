@@ -886,9 +886,10 @@ def _replay_obligations(
     """Whether this build ran each edited incremental model's next run (#1130).
 
     The only evidence that the ``is_incremental()`` branch works is a unit test
-    that overrides it to true. A passing one is ``satisfied`` and a failing one
-    ``contradicted``. With none in the build the obligation is ``unchecked``,
-    and the reason says whether a full refresh is what stood in for it.
+    that overrides it to true. A failing one is ``contradicted``, even beside a
+    passing one, and otherwise a passing one is ``satisfied``. With none in the
+    build the obligation is ``unchecked``, and the reason says whether a full
+    refresh is what stood in for it.
     """
 
     if not recorded:
@@ -901,11 +902,9 @@ def _replay_obligations(
         if required and not answers & required:
             continue
         ran = [statuses[uid] for uid in facts.get("tests") or () if uid in statuses]
-        if any(status in _PASSED for status in ran):
-            out.append(
-                Obligation(model=model, kind="incremental_replay", status="satisfied")
-            )
-        elif any(status in _FAILED for status in ran):
+        # A failing test wins over a passing one: the branch is wrong for the
+        # case that test pins, whatever another test shows.
+        if any(status in _FAILED for status in ran):
             out.append(
                 Obligation(
                     model=model,
@@ -913,6 +912,10 @@ def _replay_obligations(
                     status="contradicted",
                     finding="incremental_test_failed",
                 )
+            )
+        elif any(status in _PASSED for status in ran):
+            out.append(
+                Obligation(model=model, kind="incremental_replay", status="satisfied")
             )
         else:
             out.append(

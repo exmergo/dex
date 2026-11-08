@@ -688,6 +688,14 @@ def judge_rows(
         findings.append("unexpected_added")
     if removed.unexpected:
         findings.append("unexpected_removed")
+    if resolved.expectation.key == "unchanged":
+        # The verdict covers the clauses it could count; it does not vouch for
+        # a key nothing measured.
+        notes = [
+            *notes,
+            'key: "unchanged" was not judged, since no key unique on the baseline '
+            "was compared; pass --key to have it checked",
+        ]
     return ExpectationReport(
         expectation=resolved.expectation,
         unit="rows",

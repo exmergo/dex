@@ -57,6 +57,8 @@ def warehouse(tmp_path: Path):
     connection.execute("insert into workspaces values (1, false), (2, true)")
     connection.execute("create table members (id integer, workspace_id integer)")
     connection.execute("insert into members values (1, 1), (2, 2), (3, 1)")
+    connection.execute("create table usage (token_count integer, calls integer)")
+    connection.execute("insert into usage values (1, 5), (2, 6)")
     connection.execute("create table people (email varchar, score integer)")
     connection.execute(
         "insert into people values (?, 1), ('ada@example.com', 2)", [_EMAIL]
@@ -68,6 +70,7 @@ def warehouse(tmp_path: Path):
             _dataset("daily", ("day", "DATE"), ("visits", "INTEGER")),
             _dataset("workspaces", ("id", "INTEGER"), ("archived", "BOOLEAN")),
             _dataset("members", ("id", "INTEGER"), ("workspace_id", "INTEGER")),
+            _dataset("usage", ("token_count", "INTEGER"), ("calls", "INTEGER")),
             _dataset("people", ("email", "VARCHAR"), ("score", "INTEGER"), pii="email"),
         ]
     )
@@ -309,3 +312,39 @@ def test_ref_resolves_to_the_relation_the_comparison_reads():
     assert lookup_relations(resolved, "duckdb") == ['"dev"."main"."stg_workspaces"']
     with pytest.raises(ExpectationError, match="is not one of"):
         resolve_refs(stated, ["main.other"], "duckdb")
+
+
+def test_a_key_named_like_a_credential_withholds_the_sample(warehouse):
+    """The envelope refuses a key that reads as a credential's name, so a sample
+    keyed by `token_count` would fail the whole command: it is withheld."""
+
+    report = _compare(
+        warehouse,
+        "select token_count, calls from usage",
+        "select token_count, calls from usage where calls > 5",
+        {},
+        ["token_count"],
+    ).expectation
+    assert report.findings == ("unexpected_removed",)
+    assert report.removed.total == 1
+    assert report.unexpected_keys is None
+    assert report.samples_withheld == "key_name_withheld"
+
+
+def test_rows_say_the_key_clause_was_not_judged(warehouse):
+    report = _compare(
+        warehouse,
+        ALL_MEMBERS,
+        f"{ALL_MEMBERS} where id < 3",
+        {"removed": "any"},
+    ).expectation.data()
+    assert report["verdict"] == "as_expected"
+    assert report["grain"]["holds"] is None
+    assert any("was not judged" in note for note in report["notes"])
+    stated_any = _compare(
+        warehouse,
+        ALL_MEMBERS,
+        f"{ALL_MEMBERS} where id < 3",
+        {"removed": "any", "key": "any"},
+    ).expectation.data()
+    assert "notes" not in stated_any

@@ -31,6 +31,7 @@ from .. import command_args
 from ..adapters.base import Adapter, ColumnMeta, QueryResult
 from ..cache import DexCache
 from ..config import QueryLimits
+from ..envelope import secret_like
 from ..errors import DexError
 from ..guards.cost_guard import CostGuardError
 from ..guards.query_firewall import QueryRefusedError, assert_query_shape, inspect_query
@@ -870,6 +871,10 @@ def _run_expectation(
         )
     if not set(report.findings) - {"grain_not_held"}:
         return report
+    if any(secret_like(key) for key in keys):
+        # A sample is keyed by column name, and the envelope refuses a key that
+        # reads as a credential's name (`token_count`). Withheld, counts kept.
+        return xc.with_samples(report, withheld="key_name_withheld")
     if sample_refusal is not None or len(approved) < 3:
         return xc.with_samples(report, withheld=sample_refusal or "firewall_refused")
     limit = xc.SAMPLE_PER_CLASS * 3
