@@ -107,7 +107,7 @@ outputs a governed column with the flag on.
 | `ungoverned_columns_differ` | The two values output different non-governed columns | Same as above |
 | `branch_compile_failed` | The model does not compile at one value (for example, a dangling ref). Recorded on that model alone; the rest of the project is still judged | Fix that branch |
 | `governed_column_tested_when_off` | A test on a producer's governed column (a column test, a model-level test naming it, a `relationships` test pointing at it) still runs with the flag off, so the off build fails it. The check names its `path`, `line`, `column` and `test` | Disable it at the off value, with an `enabled` config true at `on_value` alone: `"{{ var('enable_fees') }}"` for an on value of `true`, `"{{ not var('disable_fees') }}"` for `false`, `"{{ var('fee_mode') == 'on' }}"` for a string. The warning names the one for this contract. Or remove it |
-| `governed_column_in_semantic_layer` | A dimension, measure or entity is defined over a producer's governed column, so it stops resolving with the flag off. The check names its `path`, `line`, `kind`, `definition`, `semantic_model` and the `metrics` drawing on it | Change it and its metrics in the same payload, or disable the semantic model at the off value |
+| `governed_column_in_semantic_layer` | A dimension, measure or entity is defined over a producer's governed column, so it stops resolving with the flag off. The check names its `path`, `line`, `kind`, `definition`, `semantic_model` and, for a measure, the `metrics` drawing on it. A metric that filters on a dimension or entity is not listed, so read the metrics' filters too | Change it and its metrics in the same payload, or disable the semantic model at the off value together with every metric on any of its measures, directly or through other metrics: dbt refuses to parse an enabled metric over a disabled semantic model, so the off value fails with `branch_compile_failed` |
 
 `verdict: satisfied` needs every record satisfied **and** `completeness: complete`.
 `unchecked` is not clean. A record carries a `reason_code`:
@@ -183,6 +183,9 @@ through a reviewed plan that carries the same `toggle`, then build again with
 - A disabled model: named under `not_compiled` until it is enabled.
 - A semantic definition whose `expr` is computed (`fee_amount * 2`): it is
   listed under `limits` with its file and line, not judged. Read it, and change
-  it in the same payload if it reads a governed column.
+  it in the same payload if it reads a governed column. The limit stays even when
+  it reads none, so the verdict stays `unchecked`: keep that incomplete verdict
+  and say why, or move the expression into a model column and point `expr` at
+  that column, which the compiled SQL then judges.
 - Tests and semantic definitions in installed packages, and singular tests
   under `tests/`.

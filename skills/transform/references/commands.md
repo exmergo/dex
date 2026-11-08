@@ -256,9 +256,11 @@ See the cost-controls reference for the shared budget mechanism.
   `ungoverned_column_lost`, `ungoverned_columns_differ`,
   `branch_compile_failed`, `governed_column_tested_when_off` (a test on a
   producer's governed column that still runs with the flag off) and
-  `governed_column_in_semantic_layer` (a dimension, measure or entity over one,
-  with the metrics on it), each also a warning. The last two carry the `path`
-  and `line` they name; a semantic `expr` the index cannot resolve is a limit. A plan whose tree never reads the
+  `governed_column_in_semantic_layer` (a dimension, measure or entity over one;
+  `metrics` names the metrics on a measure, directly or through other metrics,
+  and is empty for a dimension or entity, even one a metric filters on), each
+  also a warning. The last two carry the `path` and `line` they name; a semantic
+  `expr` the index cannot resolve is a limit. A plan whose tree never reads the
   variable is refused. Recipe: [feature-toggles.md](feature-toggles.md).
 
 ## `transform apply [plan-id]` and `transform plans`
