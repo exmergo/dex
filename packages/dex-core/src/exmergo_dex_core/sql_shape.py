@@ -233,7 +233,25 @@ def unqualified_key(node: exp.Expression) -> str:
     for identifier in bare.find_all(exp.Identifier):
         if not identifier.quoted:
             identifier.set("this", identifier.this.lower())
-    generator = _KeyGenerator(comments=False, normalize_functions="lower")
+    generator = Generator(comments=False, normalize_functions="lower")
+    # A quoted function name keeps its case: in Postgres ``"IsActive"(id)`` and
+    # ``"isactive"(id)`` can call two different functions, but
+    # ``normalize_functions`` folds every anonymous name. So each such call is
+    # rendered without folding and swapped for that text, innermost first. Not
+    # a Generator subclass: sqlglot's compiled build (sqlglotc) refuses one.
+    for call in reversed(list(bare.find_all(exp.Anonymous))):
+        name = call.this
+        if not (isinstance(name, exp.Identifier) and name.quoted):
+            continue
+        rendered = exp.var(
+            generator.func(
+                generator.sql(call, "this"), *call.expressions, normalize=False
+            )
+        )
+        if call is bare:
+            bare = rendered
+        else:
+            call.replace(rendered)
     return generator.generate(bare).strip()
 
 
@@ -244,20 +262,6 @@ def _name_key(name: exp.Expression | str | None) -> str:
     if isinstance(name, exp.Identifier):
         return name.this if name.quoted else name.this.lower()
     return name.lower() if isinstance(name, str) else ""
-
-
-class _KeyGenerator(Generator):
-    """The default generator, except that a quoted function name keeps its
-    case: in Postgres ``"IsActive"(id)`` and ``"isactive"(id)`` can call two
-    different functions."""
-
-    def anonymous_sql(self, expression: exp.Anonymous) -> str:
-        name = expression.this
-        if isinstance(name, exp.Identifier) and name.quoted:
-            return self.func(
-                self.sql(expression, "this"), *expression.expressions, normalize=False
-            )
-        return super().anonymous_sql(expression)
 
 
 def _source_names(select: exp.Select) -> dict[str, str]:
