@@ -497,8 +497,8 @@ def test_a_time_spine_alone_is_a_note(tmp_path: Path):
 
 
 def test_a_model_driven_off_the_time_spine_is_a_note_on_a_build(tmp_path: Path):
-    """#988: a build's sweep skips the spine-driven comparison with a note and
-    no count, and still compares the model beside it."""
+    """#988: a build's sweep skips the spine-driven comparison with a note, no
+    row count and no row-population finding."""
 
     _artifacts(
         tmp_path,
@@ -534,6 +534,8 @@ def test_a_model_driven_off_the_time_spine_is_a_note_on_a_build(tmp_path: Path):
     )
     assert note in result.notes
     assert note not in result.warnings
+    assert result.suppressed.get("row_population") == note
+    assert not [q for q in adapter.queries if "count(" in q.lower()], adapter.queries
     assert not [f for f in result.findings if f.code in {"row_fanout", "row_loss"}]
 
 

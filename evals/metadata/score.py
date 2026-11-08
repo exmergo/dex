@@ -1198,6 +1198,14 @@ _DEFECT = re.compile(
 )
 
 
+# A defect word under a negation ("no row is missing", "found no defect") is a
+# clean verdict, not a defect named.
+_NEGATED_DEFECT = re.compile(
+    r"\b(?:no|not|nothing|none|never)\b(?:\s+\w+){0,3}?\s+"
+    r"(?:(?:is|are|was|were|looks?|seems?)\s+)?(?:defects?|bugs?|wrong|missing)\b"
+)
+
+
 def diagnosis_rubric(
     truth: dict[str, Any] | None,
     final: str | None,
@@ -1246,7 +1254,11 @@ def diagnosis_rubric(
     if groups:
         checks["evidenced"] = all(any(mentions(t) for t in group) for group in groups)
     if verdict == "defect":
-        checks["qualified"] = any(_DEFECT.search(sentence) for sentence in sentences)
+        # A clean phrase is dropped first: "nothing is wrong" names no defect.
+        checks["qualified"] = any(
+            _DEFECT.search(_CLEAN.sub(" ", _NEGATED_DEFECT.sub(" ", sentence)))
+            for sentence in sentences
+        )
     elif verdict == "no_defect":
         explains = truth.get("explains") or []
         checks["qualified"] = any(mentions(t) for t in explains) if explains else True

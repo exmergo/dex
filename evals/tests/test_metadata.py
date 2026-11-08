@@ -3605,3 +3605,31 @@ def test_live_phrasings_of_a_right_diagnosis_pass(key, final):
     task = _task(key)
     graded = diagnosis_rubric(task.truth["diagnosis"], final, [], task.models)
     assert graded["passed"], graded
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "trial_event_count reads stg_events, whose event_tier maps trl. "
+        "I found no defect.",
+        "trial_event_count reads stg_events and trl is mapped. Nothing is wrong "
+        "with the model.",
+        "trial_event_count reads stg_events and trl. No row is missing.",
+    ],
+)
+def test_a_negated_defect_word_does_not_qualify_a_defect(final):
+    """A clean verdict that names the field and the evidence is not a defect
+    named, whatever defect words it negates."""
+
+    truth = _task(_TRIAL).truth["diagnosis"]
+    graded = diagnosis_rubric(truth, final, ["stg_events"], [])
+    assert graded["checks"]["qualified"] is False, graded
+
+
+def test_a_mixed_sentence_still_names_the_defect():
+    truth = _task(_UNUSED).truth["diagnosis"]
+    final = (
+        "The intermediate is correct, but avg_adjusted_price is wrong: it averages "
+        "list_price, not adjusted_price from int_line_prices."
+    )
+    assert diagnosis_rubric(truth, final, [], [])["checks"]["qualified"]
