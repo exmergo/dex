@@ -81,6 +81,10 @@ _MIN_BILLED_BYTES = 10 * 1024 * 1024
 # margin, so the retry below asks for precisely what BigQuery says it needs,
 # whatever the underlying rounding rule turns out to be.
 _BYTES_BILLED_REQUIRED_RE = re.compile(r"(\d+) or higher required")
+_API_ERROR_PREFIX_RE = re.compile(
+    r"^(?:\d{3}\s+)*(?:[A-Z]+\s+https?://\S+:\s*)?",
+    re.IGNORECASE,
+)
 
 # Field types whose values are nested or non-scalar: no approx-distinct, no
 # min/max, and non-null counting via COUNTIF (COUNT DISTINCT is invalid on
@@ -1381,22 +1385,24 @@ class BigQueryAdapter:
         max_rows: int,
         timeout_seconds: float,
     ) -> QueryResult:
-        """Execute one firewall-approved SELECT, bounded in rows, wall time,
+        """execute one firewall-approved select, bounded in rows, wall time,
         and billed bytes (client preflight plus server-side cap)."""
 
         try:
             _job, iterator = self._execute(
                 sql, timeout_seconds=timeout_seconds, max_results=max_rows + 1
             )
-        except self._api_exceptions.BadRequest as exc:
-            # BigQuery refused the statement before running it: at the dry run
+        except (self._api_exceptions.BadRequest, self._api_exceptions.NotFound) as exc:
+            # bigquery refused the statement before running it: at the dry run
             # inside `_execute`, or at admission. `_run` already types the
             # refusal it meets at execution; this is the same verdict a step
             # earlier, typed the same way, so a host reads `execution_failure`
-            # and BigQuery's own words rather than `internal` (issue #480).
-            # Both are the plan door: nothing ran, so the statement itself has
+            # and bigquery's own words rather than `internal` (issues #480, #1209).
+            # both are the plan door: nothing ran, so the statement itself has
             # to change, and the stage says so without the text (issue #524).
-            raise warehouse_refusal(str(exc), stage=StatementStage.PLAN) from exc
+            raise warehouse_refusal(
+                _api_error_message(exc), stage=StatementStage.PLAN
+            ) from exc
         rows = list(iterator)
         schema = list(iterator.schema)
         return QueryResult(
@@ -1431,13 +1437,13 @@ class BigQueryAdapter:
         max_results: int | None = None,
         _retried: bool = False,
     ) -> tuple[Any, Any]:
-        """The single billed door past the gate: run with the server-side byte
+        """the single billed door past the gate: run with the server-side byte
         cap, wait for completion (bounded when a timeout is given), account the
         actual billed bytes, and return (job, row iterator).
 
         ``dry_run_estimate`` is what :meth:`_execute` already charged for this
         exact statement; a bytes-billed refusal below widens the charge by the
-        gap between that estimate and what BigQuery says it actually needed,
+        gap between that estimate and what bigquery says it actually needed,
         rather than charging the full requirement a second time on top of it.
         """
 
@@ -1486,16 +1492,21 @@ class BigQueryAdapter:
                     "(server-side maximum_bytes_billed); raise --budget or "
                     "narrow the query"
                 ) from exc
-            # Every other BadRequest is BigQuery refusing the statement itself
-            # (an invalid query, a type it will not coerce). Typed, so the
-            # envelope carries `execution_failure` and BigQuery's own words
-            # rather than the `internal` an untyped API exception falls
-            # through to. Anything else in the family is a transport or server
-            # fault rather than a verdict on the statement, and is left to
-            # propagate exactly as it did before. The job was created, so this
-            # is the run door: it may have billed, and it can fail on the data.
-            if isinstance(exc, self._api_exceptions.BadRequest):
-                raise warehouse_refusal(str(exc), stage=StatementStage.RUN) from exc
+            # every other badrequest (or notfound) is bigquery refusing the
+            # statement itself (an invalid query, a type it will not coerce, or
+            # a referenced relation that does not exist). typed, so the envelope
+            # carries `execution_failure` and bigquery's own words rather than
+            # the `internal` an untyped api exception falls through to. anything
+            # else in the family is a transport or server fault rather than a
+            # verdict on the statement, and is left to propagate exactly as it
+            # did before. the job was created, so this is the run door: it may
+            # have billed, and it can fail on the data (issue #1209).
+            if isinstance(
+                exc, (self._api_exceptions.BadRequest, self._api_exceptions.NotFound)
+            ):
+                raise warehouse_refusal(
+                    _api_error_message(exc), stage=StatementStage.RUN
+                ) from exc
             raise
         except TimeoutError as exc:
             # concurrent.futures.TimeoutError is the builtin on Python 3.11+.
@@ -1519,28 +1530,31 @@ class BigQueryAdapter:
         return float(getattr(job, "total_bytes_processed", 0) or 0)
 
     def _typed_dry_run(self, sql: str) -> float:
-        """The dry run for a host's own statement.
+        """dry run for a host's own statement.
 
-        A statement BigQuery will not plan fails here first, on the free call,
-        and the real client raises ``BadRequest`` from ``query()`` itself. Typed
-        the way ``_run`` types the refusal it meets at execution, so the
-        envelope carries ``execution_failure`` and BigQuery's own words rather
-        than the ``internal`` an untyped API exception falls through to, which
-        a host reads as a crash and retries (issue #480).
+        a statement bigquery will not plan fails here first, on the free call,
+        and the real client raises ``badrequest`` (or ``notfound`` on an
+        unbuilt dev relation) from ``query()`` itself. typed the way ``_run``
+        types the refusal it meets at execution, so the envelope carries
+        ``execution_failure`` and bigquery's own words rather than the
+        ``internal`` an untyped api exception falls through to, which a host
+        reads as a crash and retries (issues #480, #1209).
 
         ``_dry_run`` stays untyped on purpose: the profile's own aggregate
         statements cross it through ``_execute`` and the scan estimate, and
-        those callers degrade to metadata on a ``BadRequest`` rather than
+        those callers degrade to metadata on a ``badrequest`` rather than
         failing the profile.
 
-        A refusal here is the plan door by definition, since a dry run runs
-        nothing, so it carries :attr:`StatementStage.PLAN` (issue #524).
+        a refusal here is the plan door by definition, since a dry run runs
+        nothing, so it carries :attr:`statementstage.plan` (issue #524).
         """
 
         try:
             return self._dry_run(sql)
-        except self._api_exceptions.BadRequest as exc:
-            raise warehouse_refusal(str(exc), stage=StatementStage.PLAN) from exc
+        except (self._api_exceptions.BadRequest, self._api_exceptions.NotFound) as exc:
+            raise warehouse_refusal(
+                _api_error_message(exc), stage=StatementStage.PLAN
+            ) from exc
 
     def _request(self, operation: Callable[[], Any]) -> Any:
         try:
@@ -1602,3 +1616,18 @@ def _bad_request_reason(exc: Exception) -> str | None:
         if isinstance(reason, str) and reason.isidentifier():
             return reason
     return None
+
+
+def _api_error_message(exc: Exception) -> str:
+    """clean error message from a google api call.
+
+    extracts the structured error message from ``exc.errors`` when present,
+    or strips the http status code and request url prefix from the first
+    line of ``str(exc)`` (issue #1209).
+    """
+
+    for error in getattr(exc, "errors", None) or []:
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+    first = next((ln.strip() for ln in str(exc).splitlines() if ln.strip()), "")
+    return _API_ERROR_PREFIX_RE.sub("", first)
