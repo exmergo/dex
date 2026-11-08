@@ -1111,3 +1111,18 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         completion.elided = dict(elided)
         if completion.size() <= budget:
             return
+
+    # The last resort: the per-model obligation lists keep one entry each above,
+    # and with long model names those can still overflow. Each goes whole, its
+    # count kept under `elided`, since a block over budget is cut by the reader
+    # where nothing counts it.
+    for listed in (
+        "identifier_conversions",
+        "change_scope",
+        "incremental_replay",
+        "comparison",
+    ):
+        cap_list(completion.obligations, listed, 0, f"obligations.{listed}")
+        completion.elided = dict(elided)
+        if completion.size() <= budget:
+            return

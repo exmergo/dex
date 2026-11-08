@@ -165,6 +165,26 @@ def test_many_replay_obligations_fit_the_bound_and_count_the_cut():
     )
 
 
+def test_long_named_obligations_on_every_list_still_fit_the_bound():
+    name = "fct_" + "a_model_with_a_name_far_longer_than_any_real_one_" * 40
+    nodes = [BuildNode(unique_id=_uid(name), name=name, status="success")]
+    completion = summarize_completion(
+        _evidence(nodes, required=[name]),
+        None,
+        change_scope={name: [{"status": "undeclared", "column": name, "kind": "x"}]},
+        incremental_replay={name: {"tests": [], "full_refreshed": True}},
+        comparisons=[ComparisonState(model=name, status="not_compared")],
+    )
+    assert completion.size() <= COMPLETION_BUDGET_BYTES
+    assert (
+        sum(
+            completion.elided.get(f"obligations.{k}", 0)
+            for k in ("change_scope", "incremental_replay", "comparison")
+        )
+        >= 1
+    )
+
+
 # --- comparison (#1157) -------------------------------------------------------
 
 
