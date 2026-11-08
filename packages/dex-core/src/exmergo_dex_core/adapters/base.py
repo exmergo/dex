@@ -48,6 +48,7 @@ class ObjectMeta:
     row_count: int | None
     byte_size: int | None
     column_count: int
+    database: str | None = None
 
 
 @dataclass(frozen=True)
