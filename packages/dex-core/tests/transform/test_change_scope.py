@@ -88,13 +88,202 @@ def test_reformatting_and_renaming_an_alias_are_silent():
     authored = (
         "WITH v AS (SELECT s.visit_date, COUNT(*) AS visits,\n"
         "  AVG(s.duration) AS avg_duration FROM {{ ref('stg_visits') }} AS s\n"
-        "  GROUP BY visit_date)\n"
+        "  GROUP BY s.visit_date)\n"
         "SELECT visit_date, visits, avg_duration, CAST(site_id AS INTEGER) AS site_id "
         "FROM v"
     )
     scope = _scope(authored)
     assert scope.changes == []
     assert (scope.population, scope.outputs) == ("kept", "kept")
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "population"),
+    [
+        ("visit_date", "s.visit_date", "kept"),
+        ("t.visit_date", "s.visit_date", "kept"),
+        ("visit_date", "month", "changed"),
+        ("visit_date", "visit_date, site_id", "changed"),
+        ("visit_date, site_id", "visit_date", "changed"),
+        ("visit_date, site_id", "s.visit_date, s.site_id", "kept"),
+    ],
+)
+def test_group_by_qualifier_changes_do_not_change_population(
+    before: str, after: str, population: str
+):
+    prior = f"select visit_date, count(*) as visits from visits t group by {before}"
+    authored = f"select s.visit_date, count(*) as visits from visits s group by {after}"
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == population
+    assert scope.outputs == "kept"
+    assert ("group_by_changed" in {change.kind for change in scope.changes}) is (
+        population == "changed"
+    )
+
+
+def test_group_by_alias_rename_keeps_relation_identity():
+    prior = "select s.visit_date from visits as s group by s.visit_date"
+    authored = "select t.visit_date from visits as t group by t.visit_date"
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "kept"
+    assert "group_by_changed" not in {change.kind for change in scope.changes}
+
+
+def test_projection_alias_is_not_rewritten_as_same_named_source_column():
+    """BigQuery's projected alias can represent a different grouping value."""
+
+    prior = "select upper(last_name) as last_name from singers group by last_name"
+    authored = (
+        "select upper(last_name) as last_name from singers group by singers.last_name"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "bigquery", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+def test_bigquery_group_by_alias_for_same_source_column_resolves_before_matching():
+    """A direct projection alias still resolves to its underlying source column."""
+
+    prior = "select singers.last_name as last_name from singers group by last_name"
+    authored = (
+        "select singers.last_name as last_name from singers group by singers.last_name"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "bigquery", [])
+
+    assert scope.population == "kept"
+    assert "group_by_changed" not in {change.kind for change in scope.changes}
+
+
+def test_source_replacement_is_reported_without_duplicate_group_change():
+    """A relation swap has its own finding while stable grouping stays unchanged."""
+
+    prior = "select o.status from orders o group by o.status"
+    authored = "select o.status from orders_v2 o group by o.status"
+
+    scope = _scope(authored, prior=prior)
+
+    assert scope.population == "changed"
+    kinds = {change.kind for change in scope.changes}
+    assert "source_changed" in kinds
+    assert "group_by_changed" not in kinds
+
+
+def test_qualifier_insensitive_grouping_with_multiple_join_sources():
+    """Renaming both aliases preserves each source position in a multi-join."""
+
+    prior = (
+        "select a.id from customers a cross join orders b group by a.id, b.customer_id"
+    )
+    authored = (
+        "select x.id from customers x cross join orders y group by x.id, y.customer_id"
+    )
+
+    scope = _scope(authored, prior=prior)
+
+    assert scope.population == "kept"
+    assert "group_by_changed" not in {change.kind for change in scope.changes}
+
+
+def test_group_by_different_joined_relations_remains_a_change():
+    """Columns from different joined source positions are not interchangeable."""
+
+    prior = (
+        "select a.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by a.id"
+    )
+    authored = (
+        "select b.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by b.id"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+    (change,) = [
+        change for change in scope.changes if change.kind == "group_by_changed"
+    ]
+    assert "a.id" in change.detail and "b.id" in change.detail
+
+
+def test_group_by_self_join_aliases_are_not_assumed_equivalent():
+    """A self-join's two aliases continue to identify separate source instances."""
+
+    prior = (
+        "select a.id from customers as a "
+        "join customers as b on a.parent_id = b.id group by a.id"
+    )
+    authored = (
+        "select b.id from customers as a "
+        "join customers as b on a.parent_id = b.id group by b.id"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+def test_bare_group_by_column_in_join_is_not_assumed_unambiguous():
+    """Without schema metadata, a bare joined column cannot be resolved safely."""
+
+    prior = (
+        "select a.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by id"
+    )
+    authored = (
+        "select a.id from customers as a "
+        "join orders as b on a.id = b.customer_id group by a.id"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+def test_derived_source_aliases_remain_conservative():
+    """Derived relations are left unresolved instead of guessing their identity."""
+
+    prior = "select x.id from (select id from customers) as x group by x.id"
+    authored = "select y.id from (select id from customers) as y group by y.id"
+
+    scope = _scope(authored, prior=prior)
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (
+            "catalog_a.schema_a.visits.visit_date",
+            "catalog_b.schema_a.visits.visit_date",
+        ),
+        (
+            "catalog_a.schema_a.visits.visit_date",
+            "catalog_a.schema_b.visits.visit_date",
+        ),
+    ],
+)
+def test_group_by_keeps_catalog_and_database_qualifiers(before: str, after: str):
+    """Changing a catalog or database qualifier remains a semantic difference."""
+
+    prior = f"select s.visit_date from visits as s group by {before}"
+    authored = f"select s.visit_date from visits as s group by {after}"
+
+    scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
 
 
 # --- population ------------------------------------------------------------------

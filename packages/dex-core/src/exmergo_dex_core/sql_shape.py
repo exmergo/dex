@@ -288,19 +288,27 @@ class Join:
 
     @property
     def key(self) -> str:
+        """The relation identity with its alias removed."""
+
         return relation_key(self.relation)
 
     @property
     def name(self) -> str:
+        """The SQL text of this join's relation."""
+
         return text(self.relation)
 
     @property
     def label(self) -> str:
+        """A readable summary of the joined relation and its ON condition."""
+
         on = f" on {text(self.on)}" if self.on is not None else ""
         return f"{self.side} join {self.name}{on}"
 
 
 def joins(select: exp.Select) -> list[Join]:
+    """Return the SELECT's joins with their type, relation, and condition."""
+
     out = []
     for node in select.args.get("joins") or []:
         side = " ".join(
@@ -320,8 +328,134 @@ def joins(select: exp.Select) -> list[Join]:
 
 
 def group_by(select: exp.Select) -> list[str]:
+    """Return the SELECT's GROUP BY expressions as readable SQL text."""
+
     group = select.args.get("group")
     return [] if group is None else [text(e) for e in group.expressions]
+
+
+def group_by_key(select: exp.Select, dialect: str = "") -> list[str]:
+    """The matching form of a GROUP BY, retaining its expression order.
+
+    A column qualifier is canonicalized to its source relation only when that
+    relation is unambiguous in this SELECT. This lets an alias change compare
+    equal without erasing the distinction between columns from joined sources.
+    """
+
+    group = select.args.get("group")
+    if group is None:
+        return []
+
+    sources = _relations(select)
+    by_qualifier: dict[str, tuple[int, exp.Expression] | None] = {}
+    for position, relation in enumerate(sources):
+        qualifier = relation.alias_or_name.lower()
+        if qualifier in by_qualifier:
+            by_qualifier[qualifier] = None
+        else:
+            by_qualifier[qualifier] = (position, relation)
+
+    # BigQuery resolves an unqualified GROUP BY name to a projection alias
+    # before looking for a source column. Expand that alias first so
+    # ``UPPER(last_name) AS last_name ... GROUP BY last_name`` does not compare
+    # equal to ``GROUP BY singers.last_name``. Other dialects retain their own
+    # name-resolution behavior; do not impose BigQuery's rule on them.
+    aliases = (
+        {
+            projection.alias.lower(): projection.this
+            for projection in select.expressions
+            if isinstance(projection, exp.Alias)
+        }
+        if dialect.lower() == "bigquery"
+        else {}
+    )
+
+    return [
+        _group_expression_key(expression, sources, by_qualifier, aliases)
+        for expression in group.expressions
+    ]
+
+
+def _group_expression_key(
+    expression: exp.Expression,
+    sources: list[exp.Expression],
+    by_qualifier: dict[str, tuple[int, exp.Expression] | None],
+    aliases: dict[str, exp.Expression],
+) -> str:
+    """Normalize only columns whose source relation this SELECT can establish."""
+
+    bare = expression.copy()
+    if aliases:
+        if (
+            isinstance(bare, exp.Column)
+            and not bare.table
+            and bare.name.lower() in aliases
+            and not _is_nested_select_column(bare, bare)
+        ):
+            bare = aliases[bare.name.lower()].copy()
+        for column in list(bare.find_all(exp.Column)):
+            if (
+                not _is_nested_select_column(column, bare)
+                and not column.table
+                and column.name.lower() in aliases
+            ):
+                column.replace(aliases[column.name.lower()].copy())
+
+    for column in bare.find_all(exp.Column):
+        # A nested query has its own source namespace. Leave it alone rather
+        # than resolving its columns against this SELECT's FROM and JOINs.
+        if _is_nested_select_column(column, bare):
+            continue
+
+        if column.table:
+            source = by_qualifier.get(column.table.lower())
+        elif len(sources) == 1:
+            source = (0, sources[0])
+        else:
+            # Without schema metadata an unqualified reference in a join is
+            # ambiguous; retaining its spelling is the safe comparison.
+            source = None
+
+        if source is None:
+            continue
+        position, relation = source
+
+        if not isinstance(relation, exp.Table):
+            continue
+
+        relation_db = relation.args.get("db")
+        relation_catalog = relation.args.get("catalog")
+        if column.db and (
+            relation_db is None or column.db.lower() != relation_db.name.lower()
+        ):
+            continue
+        if column.catalog and (
+            relation_catalog is None
+            or column.catalog.lower() != relation_catalog.name.lower()
+        ):
+            continue
+
+        # Position distinguishes joined relations and self-join instances while
+        # allowing a replacement relation at the same source position to be
+        # reported once by relation-change detection.
+        column.set("table", exp.to_identifier(f"__source_{position}"))
+        column.set("db", relation_db.copy() if relation_db is not None else None)
+        column.set(
+            "catalog", relation_catalog.copy() if relation_catalog is not None else None
+        )
+
+    return match_key(bare)
+
+
+def _is_nested_select_column(column: exp.Column, expression: exp.Expression) -> bool:
+    """Whether a column belongs to a SELECT nested inside the expression."""
+
+    parent = column.parent
+    while parent is not None and parent is not expression:
+        if isinstance(parent, exp.Select):
+            return True
+        parent = parent.parent
+    return False
 
 
 #: Constructs that turn one input row into several by design. A query holding

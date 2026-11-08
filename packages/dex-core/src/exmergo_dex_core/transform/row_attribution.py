@@ -658,8 +658,10 @@ def _rejoin_on(select: exp.Select, key: str, on: exp.Expression | None) -> None:
 
 
 def _grain_changes(
-    scope: str, prior: exp.Select, authored: exp.Select
+    scope: str, prior: exp.Select, authored: exp.Select, dialect: str
 ) -> list[_Change]:
+    """Report DISTINCT or GROUP BY edits that can change a scope's row grain."""
+
     changes: list[_Change] = []
     was_distinct = prior.args.get("distinct") is not None
     is_distinct = authored.args.get("distinct") is not None
@@ -679,7 +681,9 @@ def _grain_changes(
         )
 
     before, after = sql_shape.group_by(prior), sql_shape.group_by(authored)
-    if before != after:
+    if sql_shape.group_by_key(prior, dialect) != sql_shape.group_by_key(
+        authored, dialect
+    ):
         group = authored.args.get("group")
         changes.append(
             _Change(
@@ -857,7 +861,7 @@ def classify(
         for clause in ("where", "having", "qualify"):
             changes.extend(_clause_changes(name, before, after, clause, dialect))
         changes.extend(_join_changes(name, before, after, prior_ctes, authored_ctes))
-        changes.extend(_grain_changes(name, before, after))
+        changes.extend(_grain_changes(name, before, after, dialect))
 
     # A stable order so a re-plan of the same edit reports the same sequence:
     # the final select last, since that is where a reader ends up looking.
