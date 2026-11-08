@@ -6789,8 +6789,9 @@ def _semantic_plan(
     elif spine_warning:
         parse_warning = "dbt parse skipped until the project has a time spine"
     else:
-        from .build import shadow_parse
+        from .build import assert_plan_packages_installed, shadow_parse
 
+        assert_plan_packages_installed(project, edits)
         parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
         if not parse_result["available"]:
             parse_warning = parse_result["reason"]
