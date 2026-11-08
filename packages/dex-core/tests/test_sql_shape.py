@@ -221,6 +221,40 @@ def test_group_by_reports_its_expressions_as_written():
     assert sql_shape.group_by(tree) == ["a"]
 
 
+def test_bigquery_group_by_alias_expands_only_in_the_outer_query_scope():
+    """An outer alias must not replace a same-named nested-query column."""
+
+    tree = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers "
+        "group by (select last_name from archive)",
+        read="bigquery",
+    )
+
+    (key,) = sql_shape.group_by_key(tree, "bigquery")
+
+    assert "upper" not in key.lower()
+    assert "last_name" in key.lower()
+
+
+def test_bigquery_group_by_outer_projection_alias_keeps_its_expression():
+    """The projection alias expands before source-column canonicalization."""
+
+    alias = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers group by last_name",
+        read="bigquery",
+    )
+    source_column = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers group by singers.last_name",
+        read="bigquery",
+    )
+
+    (alias_key,) = sql_shape.group_by_key(alias, "bigquery")
+    (source_key,) = sql_shape.group_by_key(source_column, "bigquery")
+
+    assert "upper" in alias_key.lower()
+    assert alias_key != source_key
+
+
 def test_scopes_includes_set_operation_ctes():
     sql = (
         "with named as (select 1 as a), "

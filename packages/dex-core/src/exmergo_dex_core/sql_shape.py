@@ -390,23 +390,21 @@ def _group_expression_key(
             isinstance(bare, exp.Column)
             and not bare.table
             and bare.name.lower() in aliases
+            and not _is_nested_select_column(bare, bare)
         ):
             bare = aliases[bare.name.lower()].copy()
         for column in list(bare.find_all(exp.Column)):
-            if not column.table and column.name.lower() in aliases:
+            if (
+                not _is_nested_select_column(column, bare)
+                and not column.table
+                and column.name.lower() in aliases
+            ):
                 column.replace(aliases[column.name.lower()].copy())
 
     for column in bare.find_all(exp.Column):
         # A nested query has its own source namespace. Leave it alone rather
         # than resolving its columns against this SELECT's FROM and JOINs.
-        parent = column.parent
-        nested_select = False
-        while parent is not None and parent is not bare:
-            if isinstance(parent, exp.Select):
-                nested_select = True
-                break
-            parent = parent.parent
-        if nested_select:
+        if _is_nested_select_column(column, bare):
             continue
 
         if column.table:
@@ -447,6 +445,17 @@ def _group_expression_key(
         )
 
     return match_key(bare)
+
+
+def _is_nested_select_column(column: exp.Column, expression: exp.Expression) -> bool:
+    """Whether a column belongs to a SELECT nested inside the expression."""
+
+    parent = column.parent
+    while parent is not None and parent is not expression:
+        if isinstance(parent, exp.Select):
+            return True
+        parent = parent.parent
+    return False
 
 
 #: Constructs that turn one input row into several by design. A query holding
