@@ -4202,7 +4202,7 @@ def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
     unproven = [
         f"{s['model']} ({s.get('reason_code') or s.get('status')})"
         for s in states or []
-        if s.get("status") in {"different", "not_checked"}
+        if s.get("status") in {"different", "not_checked", "unexpected"}
     ]
     notes: list[str] = []
     if uncompared:
@@ -4214,8 +4214,8 @@ def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
         )
     if unproven:
         notes.append(
-            "the last comparison did not establish equivalence for: "
-            + ", ".join(unproven)
+            "the last comparison did not establish the results were kept or "
+            "changed only as expected for: " + ", ".join(unproven)
         )
     return notes
 
@@ -6506,12 +6506,63 @@ def _attach_completion(
             prose_population=_prose_population(result, inputs),
             identifier_conversions=inputs.get("identifier_conversions"),
             change_scope=inputs.get("change_scope"),
+            incremental_replay=_incremental_replay_inputs(result, inputs),
         )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _incremental_replay_inputs(
+    result: BuildResult, inputs: dict[str, Any]
+) -> dict[str, dict[str, Any]] | None:
+    """Each incremental model the plan edited, with the unit tests that run its
+    ``is_incremental()`` branch and whether this build full-refreshed it (#1130).
+
+    Read from the plan's model edits and this build's manifest, matched on the
+    file a model is defined in, so a model the plan only reads carries nothing.
+    Keyed on dbt's label for the node; ``answers`` holds every name a required
+    deliverable may use for it.
+    """
+
+    from ..dbt_project import manifest_node_label
+
+    edits = inputs.get("edits")
+    manifest = inputs.get("manifest")
+    if not edits or not isinstance(manifest, dict):
+        return None
+    edited = {
+        Path(edit.path).as_posix()
+        for edit in edits
+        if getattr(edit, "kind", None) is EditKind.MODEL_SQL
+        and getattr(edit, "op", None) is not EditOp.DELETE
+    }
+    if not edited:
+        return None
+    refresh = result.summary.get("full_refresh") or {}
+    refreshed = set(refresh.get("models") or []) if refresh.get("requested") else set()
+    found: dict[str, dict[str, Any]] = {}
+    for unique_id, node in (manifest.get("nodes") or {}).items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        if (node.get("config") or {}).get("materialized") != "incremental":
+            continue
+        path = str(node.get("original_file_path") or "")
+        if not path or not any(
+            path == candidate or candidate.endswith("/" + path) for candidate in edited
+        ):
+            continue
+        label = manifest_node_label(unique_id, node)
+        found[label] = {
+            "tests": [
+                test.unique_id for test in _incremental_unit_tests(manifest, node)
+            ],
+            "full_refreshed": label in refreshed,
+            "answers": sorted({label, str(node.get("name") or ""), Path(path).stem}),
+        }
+    return found or None
 
 
 def _completion_inputs(
