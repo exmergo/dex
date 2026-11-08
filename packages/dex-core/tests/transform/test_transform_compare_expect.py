@@ -231,6 +231,9 @@ def test_the_exclusion_names_the_membership_it_should_not_have_dropped(project):
     )
     assert result.expectation["removed"] == {"total": 3, "matching": 2, "unexpected": 1}
     assert result.expectation["unexpected_keys"] == {"removed": [{"membership_id": 14}]}
+    # The statement is echoed as written, so its digest is the same on any
+    # target, whichever relation the ref() resolved to.
+    assert "ref('stg_workspaces')" in result.expectation["stated"]["removed"]["where"]
 
 
 def test_the_recorded_verdict_settles_the_builds_comparison_obligation(project):

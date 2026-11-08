@@ -532,7 +532,8 @@ def _compare(
             expectation = resolve_refs(expectation, names, dialect)
         except ExpectationError as exc:
             return not_checked("invalid_expectation", str(exc))
-        identity["expectation"] = expectation
+        # `identity` keeps the expectation as stated, so its digest and the
+        # echoed statement do not depend on which relation a ref() named here.
         # A lookup reads a relation the model may not: it is checked and
         # profiled like the inputs, but it is not part of the compared scope.
         names = list(dict.fromkeys([*names, *lookup_relations(expectation, dialect)]))
@@ -1170,7 +1171,13 @@ def _result(
         **_identity_fields(identity),
         status=status,
         reason_code=reason_code,
-        expectation=report.data() if report is not None else None,
+        expectation=(
+            {**report.data(), "stated": stated.data()}
+            if report is not None and stated is not None
+            else report.data()
+            if report is not None
+            else None
+        ),
         expectation_digest=stated.digest() if stated is not None else None,
         detail=verdict.detail,
         compared_at=verdict.compared_at,
