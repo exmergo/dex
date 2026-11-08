@@ -411,6 +411,121 @@ def test_wrapping_a_declared_grain_column_still_contradicts_when_another_key_rem
     assert found["authored"].startswith("[user_id]")
 
 
+# --- grain with a functionally dependent GROUP BY column (#1204) ----------------
+
+CONVERSATIONS_STG = (
+    "select conversation_id, state, amount from {{ source('raw', 'conversations') }}\n"
+)
+CONVERSATIONS_PRIOR = (
+    "select conversation_id, sum(amount) as revenue\n"
+    "from {{ ref('stg_conversations') }}\ngroup by conversation_id\n"
+)
+CONVERSATIONS_AFTER = (
+    "select conversation_id, state, sum(amount) as revenue\n"
+    "from {{ ref('stg_conversations') }}\ngroup by conversation_id, state\n"
+)
+
+
+def _conversations_cache(*, unique: str) -> DexCache:
+    """Profile of stg_conversations proving one column unique."""
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="warehouse.main.stg_conversations",
+                columns=[
+                    ColumnProfile(
+                        name="conversation_id",
+                        data_type="varchar",
+                        null_fraction=0.0,
+                        is_unique=unique == "conversation_id",
+                        distinct_count_exact=True,
+                    ),
+                    ColumnProfile(
+                        name="state",
+                        data_type="varchar",
+                        null_fraction=0.0,
+                        is_unique=unique == "state",
+                        distinct_count_exact=True,
+                    ),
+                    ColumnProfile(
+                        name="amount",
+                        data_type="integer",
+                        null_fraction=0.0,
+                        is_unique=False,
+                        distinct_count_exact=True,
+                    ),
+                ],
+            )
+        ]
+    )
+
+
+def test_a_group_by_on_a_dependent_attribute_does_not_contradict_the_grain():
+    """Grouping by the key plus an attribute of the key changes no row.
+
+    The cache proves conversation_id is a unique key of stg_conversations,
+    so state has one value per conversation_id and the grain still holds.
+    """
+    assert _found(
+        CONVERSATIONS_PRIOR,
+        CONVERSATIONS_AFTER,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": CONVERSATIONS_STG},
+        cache=_conversations_cache(unique="conversation_id"),
+    ) == ([], [])
+
+
+def test_a_group_by_on_a_non_dependent_column_still_contradicts_the_grain():
+    """The profile proves state unique instead, so state is not shown
+    dependent on the declared grain and the widened GROUP BY still warns."""
+    [found], [warning] = _found(
+        CONVERSATIONS_PRIOR,
+        CONVERSATIONS_AFTER,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": CONVERSATIONS_STG},
+        cache=_conversations_cache(unique="state"),
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "sql",
+    )
+    assert warning.startswith(
+        "'fct' declares grain [conversation_id], and its SQL now reads at grain "
+        "[conversation_id, state]"
+    )
+
+
+def test_a_group_by_on_an_unprofiled_attribute_is_unchecked_and_names_the_profile():
+    """With no profile to judge dependence, the grain is not confirmed
+    rather than called stale, and the warning names the profile that
+    would settle it."""
+    [found], [warning] = _found(
+        CONVERSATIONS_PRIOR,
+        CONVERSATIONS_AFTER,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": CONVERSATIONS_STG},
+    )
+    assert found == {
+        "check": "grain",
+        "status": "unchecked",
+        "rule": "grain [conversation_id]",
+        "prior": "[conversation_id]",
+        "reason": (
+            "the grain could not be confirmed: no profile of "
+            "'stg_conversations' shows whether state has one value per "
+            "conversation_id"
+        ),
+    }
+    assert warning.startswith(
+        "'fct': could not check this edit against its declared grain "
+        "[conversation_id]: the grain could not be confirmed: no profile of "
+        "'stg_conversations' shows whether state has one value per "
+        "conversation_id"
+    )
+
+
 # --- additivity -------------------------------------------------------------------
 
 
