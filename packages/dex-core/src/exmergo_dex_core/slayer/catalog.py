@@ -466,9 +466,7 @@ def definitions(
         declaration, declaration_notes = read_native_declaration(
             model.name,
             relation,
-            primary,
-            model.meta,
-            [(c.name, physical_column(c, connector), c.meta) for c in model.columns],
+            *declaration_inputs(model, connector),
             source=DECLARATION_SOURCE,
         )
         unread.extend(declaration_notes)
@@ -506,6 +504,23 @@ def definitions(
         model_declarations=declarations,
         declaration_notes=unread,
         notes=found,
+    )
+
+
+def declaration_inputs(
+    model: Any, connector: str | None
+) -> tuple[list[str] | None, Any, list[tuple[str, str | None, Any]]]:
+    """What a model's declaration is read from: its primary key as physical
+    columns, its ``meta``, and each column as ``(name, physical column, meta)``.
+
+    One reading for the declarations channel and the drift fingerprint (#995),
+    so the two cannot disagree about what the model declares.
+    """
+
+    return (
+        _primary_key_columns(model, connector),
+        model.meta,
+        [(c.name, physical_column(c, connector), c.meta) for c in model.columns],
     )
 
 

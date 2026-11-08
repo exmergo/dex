@@ -28,10 +28,12 @@ import json
 from typing import Any
 
 from ..maintain.snapshot import (
+    DeclarationFingerprint,
     MetricDef,
     RelationshipDef,
     SemanticLayerSnapshot,
     SemanticModelDef,
+    native_declaration_fingerprint,
 )
 from ..project_definitions import DeclaredRelationship
 from . import catalog as catalog_mod
@@ -57,12 +59,16 @@ def semantic_layer(
 
     if not loaded.documents:
         return SemanticLayerSnapshot(
-            vendor="ossie", format_version=SCHEMA_SHA256, notes=loaded.notes()
+            vendor="ossie",
+            format_version=SCHEMA_SHA256,
+            declarations={},
+            notes=loaded.notes(),
         )
 
     semantic_models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
     relationships: list[RelationshipDef] = []
+    declarations: dict[str, DeclarationFingerprint] = {}
     notes: list[str] = list(loaded.notes())
 
     for document in loaded.documents:
@@ -91,6 +97,14 @@ def semantic_layer(
                 notes.extend(sm_notes)
             if sm_def.relation:
                 relations[qualified] = sm_def.relation
+            grain, metadata, members = catalog_mod.declaration_inputs(
+                dataset, connector
+            )
+            declared = native_declaration_fingerprint(
+                grain, metadata, members, path=document.file
+            )
+            if declared is not None:
+                declarations[qualified] = declared
 
         for rel in model.get("relationships") or []:
             pairs, note = catalog_mod._resolved_pairs(rel, datasets, connector)
@@ -117,6 +131,7 @@ def semantic_layer(
         relationships_and_keys_captured=True,
         vendor="ossie",
         format_version=SCHEMA_SHA256,
+        declarations=declarations,
         notes=notes,
     )
 

@@ -637,6 +637,22 @@ def _declaration(
     """The dataset's declaration: its ``primary_key`` is the grain (#976), and the
     rest is read from ``ai_context.dex`` on the dataset and its fields (#977)."""
 
+    grain, metadata, members = declaration_inputs(dataset, connector)
+    return read_native_declaration(
+        qualified, relation, grain, metadata, members, source=DECLARATION_SOURCE
+    )
+
+
+def declaration_inputs(
+    dataset: dict[str, Any], connector: str | None
+) -> tuple[list[str] | None, Any, list[tuple[str, str | None, Any]]]:
+    """What a dataset's declaration is read from: its primary key as physical
+    columns, its ``ai_context``, and each field as ``(name, column, ai_context)``.
+
+    One reading for the declarations channel and the drift fingerprint (#995),
+    so the two cannot disagree about what the dataset declares.
+    """
+
     key = field_columns(dataset, dataset.get("primary_key") or [], connector)
     grain = [str(c) for _, c in key] if key and not _opaque(key) else None
     members = [
@@ -648,14 +664,7 @@ def _declaration(
         for f in dataset.get("fields") or []
         if isinstance(f, dict) and isinstance(f.get("name"), str)
     ]
-    return read_native_declaration(
-        qualified,
-        relation,
-        grain,
-        dataset.get("ai_context"),
-        members,
-        source=DECLARATION_SOURCE,
-    )
+    return grain, dataset.get("ai_context"), members
 
 
 def _keys(
