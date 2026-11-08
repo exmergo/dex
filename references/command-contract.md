@@ -622,7 +622,14 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      column accounts for is satisfied, its counts kept, with
                                      unmatched_accounted_for naming the entry; #1162),
                                      join_field_all_null and join_field_newly_null
-                                     for a column the join supplies that came back all NULL. A project that fails
+                                     for a column the join supplies that came back all NULL. A project
+                                     format with no dbt artifacts has each declared foreign key measured
+                                     against its parent, placed through model_relations, one
+                                     data.foreign_key_coverage record per key (model, column, to_model,
+                                     to_column; satisfied, contradicted, not_applicable, or unchecked
+                                     with a reason_code), foreign_key_orphans for any non-NULL value the
+                                     parent lacks (#1197); dbt judges these through its own
+                                     relationships tests. A project that fails
                                      to compile is reported first and suppresses every other check;
                                      data.suppressed names each finding class that did not run and why,
                                      declared-fact classes (unit, additivity, population,

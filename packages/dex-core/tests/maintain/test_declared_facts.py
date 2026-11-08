@@ -867,7 +867,7 @@ def test_the_combined_handshake_prices_all_three_axes_in_one_ask(monkeypatch):
             calls.append((estimate, kwargs)) or "offer"
         ),
     )
-    row_ask, join_ask, facts_ask = _combined_scan_handshake(
+    row_ask, join_ask, facts_ask, _fk_ask = _combined_scan_handshake(
         object(), lambda: (5.0, 2), lambda: (7.0, 3)
     )
     assert row_ask(10.0, 1) == "offer"
@@ -898,7 +898,7 @@ def test_facts_alone_are_priced_once_when_nothing_else_asks(monkeypatch):
         ),
     )
     lazy = []
-    _row, _join, facts_ask = _combined_scan_handshake(
+    _row, _join, facts_ask, _fk = _combined_scan_handshake(
         object(), lambda: (5.0, 2), lambda: lazy.append(1) or (7.0, 3)
     )
     assert facts_ask(7.0, 3) == "offer"

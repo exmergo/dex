@@ -3295,7 +3295,7 @@ def test_the_combined_handshake_prices_both_axes_in_one_ask(monkeypatch):
         join_cost_calls.append(1)
         return 5.0, 2
 
-    row_ask, join_ask, _facts_ask = _combined_scan_handshake(
+    row_ask, join_ask, _facts_ask, _fk_ask = _combined_scan_handshake(
         adapter=object(), join_cost=join_cost
     )
 
@@ -3343,7 +3343,7 @@ def test_join_ask_alone_does_not_double_count_its_own_estimate(monkeypatch):
         join_cost_calls.append(1)
         return 5.0, 2
 
-    _row_ask, join_ask, _facts_ask = _combined_scan_handshake(
+    _row_ask, join_ask, _facts_ask, _fk_ask = _combined_scan_handshake(
         adapter=object(), join_cost=join_cost
     )
     offer = join_ask(5.0, 2)  # row_ask never called: row had nothing to count
@@ -3374,7 +3374,7 @@ def test_the_combined_handshake_names_only_the_axis_that_needs_one(monkeypatch):
         ),
     )
 
-    row_ask, _join_ask, _facts_ask = _combined_scan_handshake(
+    row_ask, _join_ask, _facts_ask, _fk_ask = _combined_scan_handshake(
         adapter=object(), join_cost=lambda: (5.0, 2)
     )
     offer = row_ask(0.0, 0)  # row population: nothing to count
@@ -3396,7 +3396,7 @@ def test_the_combined_handshake_returns_none_when_neither_axis_has_work(monkeypa
         lambda *a, **k: pytest.fail("should not be asked with nothing to price"),
     )
 
-    row_ask, join_ask, _facts_ask = _combined_scan_handshake(
+    row_ask, join_ask, _facts_ask, _fk_ask = _combined_scan_handshake(
         adapter=object(), join_cost=lambda: (0.0, 0)
     )
     assert row_ask(0.0, 0) is None

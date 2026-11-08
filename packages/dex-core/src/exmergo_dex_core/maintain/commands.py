@@ -54,6 +54,7 @@ from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, FilesystemStore, MaintainStore, Store, readable_cache
 from . import declared_facts as facts_mod
 from . import drift as drift_mod
+from . import foreign_keys as fk_mod
 from . import snapshot as snapshot_mod
 from . import verify as verify_mod
 from .results import (
@@ -826,11 +827,12 @@ def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(grain_drift(engine, getattr(args, "objects", None)))
 
 
-def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
-    """Three handshakes, ``(row_ask, join_ask, facts_ask)``, sharing one cached
-    decision for the paid scans `maintain verify` can run: row population's
-    row counts, join contract's overlap probe (#228), and the declared-fact
-    checks (#496).
+def _combined_scan_handshake(adapter, join_cost, facts_cost=None, fk_cost=None):
+    """Four handshakes, ``(row_ask, join_ask, facts_ask, fk_ask)``, sharing one
+    cached decision for the paid scans `maintain verify` can run: row
+    population's row counts, join contract's overlap probe (#228), the
+    declared-fact checks (#496), and a project format's declared foreign keys
+    (#1197).
 
     ``VerifyResult.pending_offer`` holds exactly one offer. Without this,
     whichever axis asked last would silently discard the others' price the
@@ -846,23 +848,29 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
     axis again double-counted it (#228's own review).
 
     `verify()` calls the axes in this order: row population, join contract,
-    declared facts. Whichever asks first prices every axis after it lazily
-    (``join_cost``, ``facts_cost``: zero-argument callables) and caches the
-    combined decision, which every later ask reads rather than asking again.
-    An axis before it never asked at all, which only happens when it had
-    nothing to scan -- a real, legitimate zero contribution, not a number this
-    needs to compute a second time.
+    declared facts, foreign keys. Whichever asks first prices every axis after
+    it lazily (``join_cost``, ``facts_cost``, ``fk_cost``: zero-argument
+    callables) and caches the combined decision, which every later ask reads
+    rather than asking again. An axis before it never asked at all, which only
+    happens when it had nothing to scan -- a real, legitimate zero
+    contribution, not a number this needs to compute a second time.
     """
 
-    order = ("row_population", "join_contract", "declared_facts")
+    order = ("row_population", "join_contract", "declared_facts", fk_mod.CLASS)
     keys = {
         "row_population": "(row counts)",
         "join_contract": "(join overlap probes)",
         "declared_facts": "(declared facts)",
+        fk_mod.CLASS: "(foreign key probes)",
     }
+
+    def nothing() -> tuple[float, int]:
+        return 0.0, 0
+
     lazy = {
         "join_contract": join_cost,
-        "declared_facts": facts_cost if facts_cost is not None else (lambda: (0.0, 0)),
+        "declared_facts": facts_cost if facts_cost is not None else nothing,
+        fk_mod.CLASS: fk_cost if fk_cost is not None else nothing,
     }
     cache: dict[str, object] = {}
 
@@ -888,6 +896,32 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
                 "row loss, fanout, a broken or sparse join, and a contradicted "
                 "declaration"
             )
+        final = "the build-status, no-relation, column-contract and grain findings"
+        fk_count = numbers.get(fk_mod.CLASS, (0.0, 0))[1]
+        if fk_count:
+            # Only a project format with no dbt artifacts measures its foreign
+            # keys, so only the axes that ran are named (#1197).
+            final = "the free findings"
+            parts = [
+                f"{count} {label}"
+                for count, label in (
+                    (row_count, "row count(s)"),
+                    (join_count, "join coverage statement(s)"),
+                    (facts_count, "declared-fact check(s)"),
+                    (fk_count, "foreign key coverage statement(s)"),
+                )
+                if count
+            ]
+            bought = (
+                f"{', '.join(parts[:-1])} and {parts[-1]}"
+                if len(parts) > 1
+                else parts[0]
+            )
+            judged = (
+                f"{judged}, and a declared foreign key with values its parent lacks"
+                if len(parts) > 1
+                else "a declared foreign key with values its parent lacks"
+            )
         offer = command_args.confirmation_request(
             "maintain verify",
             adapter,
@@ -895,8 +929,7 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
             per_table=per_table,
             axes=wanted,
             notes=[
-                "the build-status, no-relation, column-contract and grain "
-                f"findings in this envelope are final; the estimate buys {bought}, "
+                f"{final} in this envelope are final; the estimate buys {bought}, "
                 f"which is what {judged} are judged from"
             ],
         )
@@ -914,7 +947,12 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
 
         return ask
 
-    return asker("row_population"), asker("join_contract"), asker("declared_facts")
+    return (
+        asker("row_population"),
+        asker("join_contract"),
+        asker("declared_facts"),
+        asker(fk_mod.CLASS),
+    )
 
 
 def _dev_relations(model_relations: Mapping[str, str], project_dir: Any) -> list[str]:
@@ -956,7 +994,10 @@ def verify(
     whose keys find almost nothing on the other side, or fewer but still
     materially many. Declared facts (#496) hold each declaration's unit,
     additivity and population to the built relation
-    (:mod:`~.declared_facts`).
+    (:mod:`~.declared_facts`). A project format with no dbt artifacts also has
+    each declared foreign key measured against its parent (#1197,
+    :mod:`~.foreign_keys`), since it has no `relationships` test result for
+    build status to read.
 
     Free wherever the answer is free, which is most of it: the manifest read
     touches no connection, the relation check, the column contract, and grain
@@ -1022,6 +1063,9 @@ def verify(
     warnings = list(definitions.notes)
     project_dir: Path | None = None
     artifact_reason: str | None = None
+    # dbt judges a declared foreign key itself, as a `relationships` test that
+    # build-status reads; any other format has no such result to read (#1197).
+    judges_foreign_keys = project.name != "dbt"
     if project.name == "dbt":
         try:
             project_dir = Path(engine.project_dir())
@@ -1043,8 +1087,13 @@ def verify(
             *facts_mod.CLASSES,
         ):
             suppressed[finding_class] = artifact_reason
+        seam_checks = (
+            "no-relation, grain and declared-foreign-key"
+            if judges_foreign_keys
+            else "no-relation and grain"
+        )
         warnings.append(
-            "maintain verify ran no-relation and grain through the project "
+            f"maintain verify ran {seam_checks} through the project "
             f"format seam; dbt target-dependent checks were suppressed: "
             f"{artifact_reason}"
         )
@@ -1098,10 +1147,14 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    foreign_key_coverage: list[dict] | None = None
+    fk_offer: ConfirmationRequest | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
         suppressed["grain"] = reason
+        if judges_foreign_keys:
+            suppressed[fk_mod.CLASS] = reason
         if project_dir is not None:
             suppressed["row_population"] = reason
             suppressed["column_contract"] = reason
@@ -1146,6 +1199,8 @@ def verify(
         except DexError as exc:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
             suppressed["grain"] = f"warehouse unreachable: {exc}"
+            if judges_foreign_keys:
+                suppressed[fk_mod.CLASS] = f"warehouse unreachable: {exc}"
             if project_dir is not None:
                 suppressed["row_population"] = f"warehouse unreachable: {exc}"
                 suppressed["column_contract"] = f"warehouse unreachable: {exc}"
@@ -1239,6 +1294,37 @@ def verify(
             if grain_reason is not None:
                 suppressed["grain"] = grain_reason
 
+            if judges_foreign_keys:
+                fk_plan = fk_mod.plan(
+                    definitions,
+                    adapter,
+                    [o.identifier for o in live],
+                    scope=wanted,
+                )
+                if not fk_plan.declared:
+                    suppressed[fk_mod.CLASS] = (
+                        "the project format declares no foreign key"
+                        + (" in scope" if wanted else "")
+                    )
+                else:
+                    # The only paid axis such a format runs, asked through the
+                    # same combined handshake as the rest so one offer names it.
+                    fk_ask = _combined_scan_handshake(
+                        adapter,
+                        lambda: (0.0, 0),
+                        fk_cost=lambda: fk_mod.cost(adapter, fk_plan),
+                    )[3]
+                    keys = fk_mod.coverage(
+                        adapter,
+                        fk_plan,
+                        timeout_seconds=engine.config.query.timeout_seconds,
+                        handshake=fk_ask,
+                    )
+                    findings.extend(keys.findings)
+                    warnings.extend(keys.notes)
+                    foreign_key_coverage = keys.records
+                    fk_offer = keys.offer
+
             if project_dir is not None:
                 column_findings, column_warnings, column_reason = _column_contract(
                     project_dir, adapter, model_relations, live, scope=wanted
@@ -1255,7 +1341,7 @@ def verify(
                     check_grain=True,
                     tested_grain=True,
                 )
-                row_ask, join_ask, facts_ask = _combined_scan_handshake(
+                row_ask, join_ask, facts_ask, _fk_ask = _combined_scan_handshake(
                     adapter,
                     lambda: verify_mod.join_contract_cost(
                         project_dir,
@@ -1325,6 +1411,7 @@ def verify(
                 # Every axis asks through the same shared cache, so a non-None
                 # offer from any names them all; take whichever answered.
                 offer = offer or join_offer or facts.offer
+            offer = offer or fk_offer
 
     if wanted:
         findings = [f for f in findings if (f.identifier or "").lower() in wanted]
@@ -1342,6 +1429,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        foreign_key_coverage=foreign_key_coverage,
     )
     if cost is not None:
         result.cost = cost

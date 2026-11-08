@@ -177,6 +177,10 @@ class VerifyResult(Result):
     parent_population: list[dict] | None = None
     #: One record per declared ``history`` temporal contract (#1027).
     temporal_contracts: list[dict] | None = None
+    #: One record per declared foreign key a project format with no dbt
+    #: artifacts supplies (#1197): satisfied, contradicted, not applicable or
+    #: unchecked. ``None`` when the axis did not run (always, on dbt).
+    foreign_key_coverage: list[dict] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -186,6 +190,8 @@ class VerifyResult(Result):
         }
         if self.join_coverage is not None:
             payload["join_coverage"] = self.join_coverage
+        if self.foreign_key_coverage is not None:
+            payload["foreign_key_coverage"] = self.foreign_key_coverage
         if self.parent_population:
             payload["parent_population"] = self.parent_population
         if self.temporal_contracts:
