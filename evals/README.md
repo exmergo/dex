@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Nineteen fixture projects, written for this suite and derived from no benchmark task,
+Twenty-three fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -163,6 +163,8 @@ with tasks phrased the way users ask:
 | `sandbox_scope` | `broad`: remove sandbox tenants from every mart, the directory included | all three marts exclude them, each with an assumption at `request`; a directory left whole fails Scope |
 | `sandbox_scope` | `ambiguous`: "our account metrics should not count sandbox tenants" | the usage and summary metrics exclude them; whether the directory does is the agent's call. Either passes Scope when the declared population matches the rows, and an exclusion must be recorded as a `default` (or `precedent`), not as the request. An undocumented directory filter passes every data check and fails Scope |
 | `visit_coverage` | `fill_missing_days`: a daily table skips days with no visits; give every day a row | the missing days added while keeping what the model meant: an empty day counts zero visits (not the one `count(*)` over a left join gives, not NULL), its average stays NULL (not a coalesced zero), days with visits are unchanged, and the columns and types match the visible `data_type` contract (#1115) |
+| `trial_events` | five reports about one subscription each (#1048): `trial_subtotal` (fix), and `legitimate_exclusion`, `missing_entity`, `optional_attribute` and `insufficient_evidence` (diagnose) | finding the entity is a branch, not the verdict. In the fix task every subscription and event survives, but the staging mapping drops the `trl` code the tier-code seed maps to `trial`, so the trial subtotal is wrong: the repair restores the mapping (or maps it downstream), keeps totals, paid counts and rows, and leaves the unplaced `pro-trial` code out of trials. The diagnose tasks are a declared exclusion, a subscription absent from the feed, an active subscription's NULL cancellation date, and a code nothing in the project places, where the answer is unresolved and the project is left as it is |
+| `adjusted_price` | four questions about one average (#1116): `unused_adjustment` and `alias_swap` (fix), `correct_implementation` and `uncertain_contract` (diagnose) | the expression the mart returns under `avg_adjusted_price`, not the intermediate that computes the discounted price. The fixes route the delivered column to the intermediate's value (or undo swapped aliases); the diagnose tasks are a correct model, which must be confirmed from its delivered expression, and a refund policy nothing in the project settles, which is reported unresolved |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -225,6 +227,21 @@ serve the prerequisite tasks:
   performed, and contain no sentence claiming the source or the data now changed
   without a negation. A deterministic, bounded heuristic over sentences, not a
   judge of prose: a paraphrase it does not recognise reads as a miss.
+- **Diagnosis** (pass or fail, live runs only, on tasks that grade one): whether
+  the final message localizes and qualifies its diagnosis (#1048, #1116), graded
+  apart from the build and the row checks, since a green build and an untouched
+  project are both consistent with a diagnosis that never looked at the value
+  asked about. It reports four checks on their own: `localized` (the delivered
+  column is named), `evidenced` (each group of derivation terms has one, such
+  as the source code a mapping drops or the intermediate a column should read),
+  `qualified` (a `defect` is named as one, a `no_defect` names what explains
+  the symptom, and an `unresolved` question says what stayed open with no
+  unqualified clean verdict) and, for `no_defect` and `unresolved`, `unchanged`
+  (no listed model was edited). Terms match whole identifiers, so
+  `adjusted_price` is not found inside `avg_adjusted_price`. A task of kind
+  `diagnose` asks about a model that may be right: it is scored even when
+  nothing changed, and its completeness and correctness are `-` rather than a
+  vacuous pass. Sentence heuristics, like Report, not a judge of prose.
 - **Attribution** (0 to 1, only on tasks that grade it, `-` otherwise): whether
   every assumption about the decision the task turns on carries the tier that
   actually settled it (#1026). It is graded apart from correctness and checks, so

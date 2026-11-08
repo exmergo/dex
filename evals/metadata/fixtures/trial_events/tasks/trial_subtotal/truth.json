@@ -1,0 +1,96 @@
+{
+  "models": {
+    "stg_events": {
+      "grain": [
+        "event_id"
+      ],
+      "columns": {
+        "event_id": {
+          "role": "key"
+        },
+        "subscription_id": {
+          "role": "foreign_key"
+        },
+        "event_tier": {
+          "role": "dimension"
+        },
+        "occurred_on": {
+          "role": "time"
+        }
+      }
+    },
+    "subscription_activity": {
+      "grain": [
+        "subscription_id"
+      ],
+      "population": {
+        "column": "is_internal",
+        "domain": [
+          true,
+          false
+        ],
+        "excluded": [
+          true
+        ]
+      },
+      "columns": {
+        "event_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "trial_event_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "paid_event_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every trial subtotal counts the trial and trl codes, and nothing else",
+      "expect": 0,
+      "sql": "select count(*) from main.subscription_activity a left join (select subscription_id, count(*) filter (where lower(trim(tier_code)) in ('trial', 'trl')) as trials from raw.billing_events group by subscription_id) r using (subscription_id) where a.trial_event_count is distinct from coalesce(r.trials, 0)"
+    },
+    {
+      "name": "every event total and paid subtotal is unchanged",
+      "expect": 0,
+      "sql": "select count(*) from main.subscription_activity a left join (select subscription_id, count(*) as events, count(*) filter (where lower(trim(tier_code)) = 'paid') as paid from raw.billing_events group by subscription_id) r using (subscription_id) where a.event_count is distinct from coalesce(r.events, 0) or a.paid_event_count is distinct from coalesce(r.paid, 0)"
+    },
+    {
+      "name": "every customer subscription keeps exactly one row and internal ones stay out",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.subscriptions where not is_internal) - (select count(distinct subscription_id) from main.subscription_activity) + (select count(*) - count(distinct subscription_id) from main.subscription_activity) + (select count(*) from main.subscription_activity a join raw.subscriptions s using (subscription_id) where s.is_internal)"
+    },
+    {
+      "name": "the unplaced pro-trial code is not counted as a trial",
+      "expect": 0,
+      "sql": "select count(*) from main.stg_events e join raw.billing_events r using (event_id) where lower(trim(r.tier_code)) = 'pro-trial' and e.event_tier = 'trial'"
+    }
+  ],
+  "diagnosis": {
+    "verdict": "defect",
+    "fields": [
+      "trial_event_count"
+    ],
+    "evidence": [
+      [
+        "trl"
+      ],
+      [
+        "stg_events",
+        "event_tier",
+        "tier_code"
+      ]
+    ]
+  }
+}

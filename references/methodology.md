@@ -235,6 +235,13 @@ which knows a model's parents but not which of them drives it, and it is followe
 through the chain of CTEs a dbt model compiles to, since the FROM of a compiled
 model's final select names an internal CTE almost every time.
 
+A parent can drive a model without being its population. A comparison mart that
+takes Monday anchors from the time spine and range-joins a daily fact holds one
+row per anchor, window and day, and the spine's row count is not a number it is
+expected to preserve. So a model driven off the project's time spine, or off a
+model generated in SQL, is not compared, and a note says so (#988). A model that
+only joins a spine still is, because then the spine is not what sets its count.
+
 **What the SQL says about itself decides whether the numbers mean anything.** A
 model carrying a filter, an aggregate, a de-duplication, or a set operation was
 written to hold fewer rows than its parent, and no amount of arithmetic

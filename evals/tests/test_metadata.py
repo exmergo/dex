@@ -76,6 +76,8 @@ DIGESTS = {
     "sandbox_scope": "c39e1d55a470611137dcbd0b62fdbd617ea8abc183f202b06e51b7d46ea2a07a",
     "visit_coverage": "89f49a8cfb57454f2bccea7e679f82bdecddb20494fb4822077249ee8190c124",
     "package_parent": "ba531ac5af7723884ac87e3d665d2e802efa79b0ed969723b6295a6de723c6bf",
+    "trial_events": "74e1c40cadf83d6cdfb83caef52b94855393764cf05c340d2806bd69cb662d6a",
+    "adjusted_price": "a5f757536249ad0a1a9d3834b8e2005838de6588726b3e1ce9be2cebe15282d3",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -103,7 +105,7 @@ def _edit_yaml(path: Path, edit) -> None:
 def test_the_suite_covers_the_issues_five_cases_with_build_and_fix_tasks():
     assert {fx.name for fx in FIXTURES} == set(DIGESTS)
     assert len(TASKS) >= 7
-    assert {t.kind for t in TASKS} == {"build", "fix", "test"}
+    assert {t.kind for t in TASKS} == {"build", "fix", "test", "diagnose"}
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=lambda fx: fx.name)
@@ -137,9 +139,16 @@ def test_every_reference_answer_scores_perfect(task, tmp_path):
     workspace = materialize(task, fixture, tmp_path / "ws", reference=True)
     score = score_workspace(task, fixture, workspace, reference=True)
     assert score.status == "scored", score.gate
-    assert (score.completeness, score.correctness, score.checks_passed) == (1, 1, 1), (
-        score.to_dict()
-    )
+    if task.kind == "diagnose":
+        # A diagnosis authors no declaration: no vacuous pass is averaged in.
+        assert (score.completeness, score.correctness) == (None, None)
+        assert score.checks_passed == 1, score.checks
+    else:
+        assert (
+            score.completeness,
+            score.correctness,
+            score.checks_passed,
+        ) == (1, 1, 1), score.to_dict()
     if task.truth.get("privacy"):
         assert score.privacy["passed"], score.privacy
         assert score.privacy["transcript_checked"] is False
@@ -148,6 +157,7 @@ def test_every_reference_answer_scores_perfect(task, tmp_path):
     )
     # A reference run has no final message to grade.
     assert score.report is None
+    assert score.diagnosis is None
     if task.truth.get("planted_defects"):
         assert score.defects_caught == 1, score.planted_defects
 
@@ -3381,3 +3391,217 @@ def test_the_toggle_check_judges_every_gated_shape_in_the_fixture(
     ]
     assert toggle["verdict"] == "unchecked"
     assert len(toggle["limits"]) == 1
+
+
+# --- diagnosis (#1048, #1116) -------------------------------------------------
+
+from evals.metadata.score import diagnosis_rubric  # noqa: E402
+
+_TRIAL = "trial_events/trial_subtotal"
+_UNUSED = "adjusted_price/unused_adjustment"
+
+_DEFECT_FOUND = (
+    "Subscription 1007 is present and its event_count is right, so no row is "
+    "missing. Its trial_event_count is wrong: stg_events maps the tier_code "
+    "`trl` to nothing, so those events never reach the trial predicate. "
+    "The event_tier_codes seed maps trl to trial; I restored that mapping."
+)
+_ROW_ONLY = (
+    "Subscription 1007 is present in subscription_activity and every event is "
+    "counted, so nothing is missing. Nothing is wrong with the model."
+)
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("key", "setup_file"),
+    [
+        (_TRIAL, "models/staging/stg_events.sql"),
+        (_UNUSED, "models/marts/product_pricing.sql"),
+        ("adjusted_price/alias_swap", "models/marts/product_pricing.sql"),
+    ],
+)
+def test_a_fix_tasks_broken_start_fails_its_checks(tmp_path, key, setup_file):
+    """The defect is real on the data: the starting SQL builds green and fails
+    the row checks, so a passing check is a repair and not the fixture."""
+
+    task, fixture, workspace = _reference(tmp_path, key)
+    shutil.copyfile(task.directory / "setup" / setup_file, workspace / setup_file)
+    # The setup is the starting state: one trailing newline makes it differ
+    # from it, so the task is scored rather than `no_models`.
+    (workspace / setup_file).write_text(
+        (workspace / setup_file).read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored", score.gate
+    assert score.checks_passed < 1, score.checks
+
+
+def test_a_row_count_alone_does_not_pass_a_diagnosis():
+    """#1048's stopping error: finding the entity and its total is not the
+    answer, and it fails localization and evidence as well as the verdict."""
+
+    truth = _task(_TRIAL).truth["diagnosis"]
+    graded = diagnosis_rubric(truth, _ROW_ONLY, ["stg_events"], [])
+    assert graded["passed"] is False
+    assert graded["checks"]["localized"] is False
+    assert graded["checks"]["evidenced"] is False
+    assert diagnosis_rubric(truth, _DEFECT_FOUND, ["stg_events"], [])["passed"]
+
+
+def test_a_correct_intermediate_does_not_localize_the_delivered_column():
+    """#1116's stopping error: judging the intermediate formula, and never the
+    column the mart returns, misses the delivered expression."""
+
+    truth = _task(_UNUSED).truth["diagnosis"]
+    intermediate_only = (
+        "int_line_prices computes adjusted_price as the list price times one "
+        "minus discount_rate, which is correct."
+    )
+    graded = diagnosis_rubric(truth, intermediate_only, [], [])
+    assert graded["checks"]["localized"] is False and not graded["passed"]
+    delivered = (
+        "avg_adjusted_price averages list_price instead of adjusted_price, so the "
+        "discount from int_line_prices is never applied to the delivered column."
+    )
+    assert diagnosis_rubric(truth, delivered, [], [])["passed"]
+
+
+def test_an_identifier_is_matched_whole():
+    """`adjusted_price` is not evidence when only `avg_adjusted_price` is said."""
+
+    truth = {"verdict": "defect", "evidence": [["adjusted_price"]]}
+    assert not diagnosis_rubric(truth, "avg_adjusted_price is wrong.", [], [])[
+        "checks"
+    ]["evidenced"]
+
+
+@pytest.mark.parametrize(
+    ("final", "passed"),
+    [
+        (
+            "avg_adjusted_price for product 12 averages every line, refunded "
+            "ones included. Whether refunds belong is not documented anywhere, "
+            "so this stays unresolved; I left the model unchanged.",
+            True,
+        ),
+        (
+            "avg_adjusted_price for product 12 includes refunded lines. "
+            "The model is correct.",
+            False,
+        ),
+        (
+            "avg_adjusted_price for product 12 looks right. Nothing is wrong.",
+            False,
+        ),
+    ],
+)
+def test_an_open_question_is_reported_as_unresolved(final, passed):
+    truth = _task("adjusted_price/uncertain_contract").truth["diagnosis"]
+    assert diagnosis_rubric(truth, final, [], ["product_pricing"])["passed"] is passed
+
+
+def test_a_model_that_needed_no_repair_must_stay_unchanged():
+    truth = _task("trial_events/legitimate_exclusion").truth["diagnosis"]
+    final = (
+        "Subscription 1013 is internal (is_internal is true), and "
+        "subscription_activity declares that internal subscriptions are excluded."
+    )
+    models = ["subscription_activity"]
+    assert diagnosis_rubric(truth, final, [], models)["passed"]
+    edited = diagnosis_rubric(truth, final, ["subscription_activity"], models)
+    assert edited["checks"]["unchanged"] is False and not edited["passed"]
+
+
+def test_no_message_grades_no_diagnosis():
+    assert diagnosis_rubric({"verdict": "defect"}, None, [], []) is None
+    assert diagnosis_rubric(None, "anything", [], []) is None
+
+
+@needs_dbt
+def test_a_diagnosis_scores_on_an_unchanged_workspace(tmp_path):
+    """A diagnose task with nothing changed is scored, not `no_models`, and its
+    diagnosis is graded apart from the build."""
+
+    task = _task("trial_events/missing_entity")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    final = (
+        "Subscription 1099 does not exist in raw.subscriptions, so "
+        "subscription_activity cannot hold it; the model is not at fault."
+    )
+    score = score_workspace(task, fixture, workspace, final=final)
+    assert score.status == "scored", score.gate
+    assert score.completeness is None and score.diagnosis["passed"], score.diagnosis
+    vague = score_workspace(task, fixture, workspace, final="Nothing is wrong.")
+    assert vague.status == "scored" and not vague.diagnosis["passed"]
+
+
+def test_the_summary_leaves_a_diagnosis_out_of_the_declaration_averages(capsys):
+    """A diagnose row's `None` axes are neither a pass nor a crash, and its
+    diagnosis is averaged on its own."""
+
+    from evals.metadata.cli import _aggregate, _print_table
+
+    base = {
+        "status": "scored",
+        "checks_passed": 1.0,
+        "attribution": None,
+        "workspace_checks": None,
+    }
+    rows = [
+        {"score": {**base, "task": "a/fix", "completeness": 0.5, "correctness": 1.0}},
+        {
+            "score": {
+                **base,
+                "task": "a/diagnose",
+                "completeness": None,
+                "correctness": None,
+                "diagnosis": {"passed": False, "checks": {}},
+            }
+        },
+    ]
+    aggregate = _aggregate(rows)
+    assert (aggregate["completeness"], aggregate["correctness"]) == (0.5, 1.0)
+    assert aggregate["diagnosis"] == 0
+    _print_table({"results": rows, "aggregate": aggregate})
+    out = capsys.readouterr().out
+    assert "a/diagnose" in out and "FAIL" in out and "diagnosis 0.00" in out
+
+
+@pytest.mark.parametrize(
+    ("key", "final"),
+    [
+        (
+            "adjusted_price/uncertain_contract",
+            "I made no change. The avg_adjusted_price calculation for product 12 is "
+            "correct as the model is written. Whether it should count refunded lines "
+            "is a business question, and the project doesn't answer it.",
+        ),
+        (
+            "adjusted_price/uncertain_contract",
+            "I found no defect in avg_adjusted_price, but one question about "
+            "refunded lines for product 12 is still open: that is a business "
+            "decision. Unless the team wants refunds excluded, the figure is "
+            "correct as the model defines it.",
+        ),
+        (
+            _UNUSED,
+            "avg_adjusted_price was computed wrongly: it was avg(list_price). "
+            "int_line_prices.adjusted_price already applies discount_rate, but "
+            "nothing used it.",
+        ),
+        (
+            "trial_events/missing_entity",
+            "Subscription 1099 isn't in the source data: raw.subscriptions holds "
+            "ids 1001 to 1060, so the model isn't dropping it.",
+        ),
+    ],
+)
+def test_live_phrasings_of_a_right_diagnosis_pass(key, final):
+    """Phrasings from the first live run (#1048, #1116) that a narrower rubric
+    read as misses, although each diagnosis was right."""
+
+    task = _task(key)
+    graded = diagnosis_rubric(task.truth["diagnosis"], final, [], task.models)
+    assert graded["passed"], graded

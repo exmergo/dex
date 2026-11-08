@@ -1,0 +1,5 @@
+{
+  "kind": "diagnose",
+  "models": ["subscription_activity"],
+  "prompt": "Subscription 1099 is missing from `subscription_activity`. Find out why, and fix the model if something is wrong."
+}

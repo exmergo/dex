@@ -209,7 +209,12 @@ Needs no baseline. The classes of finding:
   `transform build --full-refresh --verify`, only one the build did not rebuild,
   or a microbatch model). A model that
   generates its rows in SQL, such as `range(...)` or a `VALUES` clause, has no
-  parent relation. That is named in `notes`. A real parent relation that is
+  parent relation. That is named in `notes`. A model whose driving parent is
+  the project's time spine (a `time_spine:` config, or the
+  `metricflow_time_spine` name) or a model generated in SQL
+  (`dbt_utils.date_spine` included) is not compared either, since the spine
+  supplies anchors rather than a population, and `notes` names it (#988). A
+  model that only joins a spine keeps its check. A real parent relation that is
   absent from the warehouse is still a warning.
 - **Column contract**: `column_missing`, `column_undeclared` and
   `column_type_mismatch`, the built relation's columns against `schema.yml`.

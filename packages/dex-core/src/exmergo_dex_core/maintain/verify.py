@@ -1176,6 +1176,11 @@ def grain_findings(
 # --- row population: a model against the relation it is built from -------------
 
 _GENERATED_SQL = "generated in SQL; no parent relation to compare against"
+#: Why a driving parent is not a population (#988), as the note words it.
+_TIME_SPINE = "the project's time spine"
+_GENERATED_PARENT = "generated in SQL"
+#: The time spine's required name before dbt 1.9 added the `time_spine:` config.
+_LEGACY_TIME_SPINE = "metricflow_time_spine"
 
 
 @dataclass(frozen=True)
@@ -1315,6 +1320,61 @@ def _join_label(join, resolved, name_of) -> str:
     return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
 
 
+def _generates_rows(relation) -> bool:
+    """An ``UNNEST`` of generator calls or literal arrays: BigQuery's
+    ``unnest(generate_date_array(...))``, the time spine's usual shape there,
+    generates its rows in SQL just as DuckDB's ``range(...)`` does (#988)."""
+
+    from sqlglot import expressions as exp
+
+    if not isinstance(relation, exp.Unnest) or not relation.expressions:
+        return False
+    generators = tuple(
+        kind
+        for kind in (
+            getattr(exp, name, None)
+            for name in (
+                "GenerateDateArray",
+                "GenerateTimestampArray",
+                "GenerateSeries",
+                "ExplodingGenerateSeries",
+            )
+        )
+        if kind is not None
+    )
+    return all(
+        isinstance(argument, generators)
+        or (
+            isinstance(argument, exp.Array)
+            and all(isinstance(item, exp.Literal) for item in argument.expressions)
+        )
+        for argument in relation.expressions
+    )
+
+
+_DRIVEN_BY_SET_OPERATION = "it is driven by a set operation, so it has no single parent"
+
+
+def _set_operation_reason(node, sql_shape, reason: str) -> str:
+    """Why a set operation has no parent: ``reason``, unless every branch
+    selects from nothing or from VALUES, which generates its rows in SQL
+    (``select 0 union all select 1``, the seed of ``dbt_utils.date_spine``)."""
+
+    from sqlglot import expressions as exp
+
+    def generates(branch) -> bool:
+        if sql_shape.SET_OPERATIONS and isinstance(branch, sql_shape.SET_OPERATIONS):
+            return generates(branch.left) and generates(branch.right)
+        if isinstance(branch, exp.Subquery):
+            return generates(branch.this)
+        if not isinstance(branch, exp.Select) or sql_shape.joins(branch):
+            return False
+        relation = sql_shape.from_relation(branch)
+        return relation is None or isinstance(relation, exp.Values)
+
+    return _GENERATED_SQL if generates(node) else reason
+
+
 def _driving_parent(tree, sql_shape):
     """Walk from the outermost select down to the physical relation it drives off.
 
@@ -1342,7 +1402,9 @@ def _driving_parent(tree, sql_shape):
             [],
             [],
             False,
-            "it is a set operation, so it has no single parent",
+            _set_operation_reason(
+                tree, sql_shape, "it is a set operation, so it has no single parent"
+            ),
             {},
         )
     if not isinstance(tree, exp.Select):
@@ -1366,7 +1428,7 @@ def _driving_parent(tree, sql_shape):
                 reducers,
                 found_joins,
                 multiplies,
-                "it is driven by a set operation, so it has no single parent",
+                _set_operation_reason(current, sql_shape, _DRIVEN_BY_SET_OPERATION),
                 cte_scopes,
             )
         if not isinstance(current, exp.Select):
@@ -1398,7 +1460,7 @@ def _driving_parent(tree, sql_shape):
                     reducers,
                     found_joins,
                     multiplies,
-                    "it is driven by a set operation, so it has no single parent",
+                    _set_operation_reason(inner, sql_shape, _DRIVEN_BY_SET_OPERATION),
                     cte_scopes,
                 )
             if not isinstance(inner, exp.Select):
@@ -1419,7 +1481,7 @@ def _driving_parent(tree, sql_shape):
             )
             current = inner
             continue
-        if isinstance(relation, exp.Values):
+        if isinstance(relation, exp.Values) or _generates_rows(relation):
             return (
                 None,
                 reducers,
@@ -1457,6 +1519,17 @@ def _driving_parent(tree, sql_shape):
                 )
             visited.add(name)
             current = cte_scopes[name]
+            # A CTE can carry a WITH of its own (dbt_utils.date_spine compiles
+            # to one): its names are in scope from here down, and a nested name
+            # is never a physical table.
+            if isinstance(current, exp.Select):
+                cte_scopes.update(
+                    {
+                        nested: scope
+                        for nested, scope in sql_shape.scopes(current).items()
+                        if nested != sql_shape.MAIN_SCOPE
+                    }
+                )
             continue
         return relation, reducers, found_joins, multiplies, None, cte_scopes
 
@@ -1493,6 +1566,12 @@ def row_population_plan(
     a caller with no build behind it leaves it empty. A microbatch model stays
     skipped even so: it rebuilds only from its own ``begin``, so what it holds is
     still not its whole parent, and nothing in its SQL would say so.
+
+    A model whose driving parent supplies anchors rather than a population
+    (#988) is not compared either, and an informational note says why: the
+    project's time spine (a `time_spine:` config, or the `metricflow_time_spine`
+    name dbt required before it), or a model generated in SQL. A model that only
+    joins one is unaffected.
     """
 
     import sqlglot
@@ -1532,6 +1611,25 @@ def row_population_plan(
         matched = match_identifier(relation, known)
         resolved = matched[0] if len(matched) == 1 else relation
         return resolved, relations.get(resolved, resolved)
+
+    # Relations that supply rows without being a population (#988): the
+    # project's time spine, by its dbt `time_spine:` config or the name dbt
+    # before 1.9 required, and, filled in below, any model generated in SQL.
+    # A model driven off one is not compared to its row count, because the
+    # spine's dates are anchors, not rows the model is expected to preserve.
+    non_population: dict[str, str] = {}
+    model_by_relation: dict[str, dict] = {}
+    for node in nodes.values():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        if not (isinstance(relation, str) and relation):
+            continue
+        model_by_relation[strip_relation_quoting(relation)] = node
+        if node.get("time_spine") or str(node.get("name", "")).lower() == (
+            _LEGACY_TIME_SPINE
+        ):
+            non_population[strip_relation_quoting(relation)] = _TIME_SPINE
 
     checks: list[RowPopulationCheck] = []
     notes: list[str] = []
@@ -1595,9 +1693,14 @@ def row_population_plan(
         table, reducers, found_joins, multiplies, reason, cte_scopes = _driving_parent(
             tree, sql_shape
         )
+        # Read here, so the generated-parent pass below need not read it again.
+        model_by_relation.pop(strip_relation_quoting(relation), None)
         if table is None:
             if reason == _GENERATED_SQL:
                 generated.append(name)
+                non_population.setdefault(
+                    strip_relation_quoting(relation), _GENERATED_PARENT
+                )
             else:
                 unfollowable.append(f"{name} ({reason})")
             continue
@@ -1648,6 +1751,43 @@ def row_population_plan(
         )
         notes.append(generated_note)
         informational.append(generated_note)
+    # Settled only now, since a generated parent is known once every model has
+    # been read. A parent outside a scoped run was never read above, so it is
+    # read here, once. A spine reached only through a join is not the driving
+    # parent, so a model that joins one keeps its check.
+    for check in checks:
+        parent_node = model_by_relation.get(check.parent_relation)
+        if check.parent_relation in non_population or parent_node is None:
+            continue
+        parent_code = parent_node.get("compiled_code")
+        if not (isinstance(parent_code, str) and parent_code.strip()):
+            continue
+        try:
+            parent_tree = sqlglot.parse_one(parent_code, read=dialect)
+        except Exception:
+            parent_tree = None
+        if parent_tree is not None and (
+            _driving_parent(parent_tree, sql_shape)[4] == _GENERATED_SQL
+        ):
+            non_population[check.parent_relation] = _GENERATED_PARENT
+        else:
+            model_by_relation.pop(check.parent_relation, None)
+    anchored = sorted(
+        (check for check in checks if check.parent_relation in non_population),
+        key=lambda check: check.model,
+    )
+    if anchored:
+        checks = [
+            check for check in checks if check.parent_relation not in non_population
+        ]
+        anchored_note = "row population was not compared for " + ", ".join(
+            f"{check.model} (its driving parent '{check.parent}' is "
+            f"{non_population[check.parent_relation]}, which supplies anchors "
+            "rather than a population the model is expected to preserve)"
+            for check in anchored
+        )
+        notes.append(anchored_note)
+        informational.append(anchored_note)
     if unfollowable:
         notes.append(
             "no single driving parent could be identified for "

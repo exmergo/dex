@@ -139,6 +139,30 @@ and continue without asking for approval. "Include every account" and "only
 accounts with events" are each `request`, and a population the project already
 declares is `contract`.
 
+**Diagnose the value the request names.** A report that data is missing or a
+number is wrong is answered from the output the person reads. Finding the entity
+is one branch, not the verdict: when the row is there, the defect can be an
+attribute, a category membership or a derived measure. Bound what to check with
+the symptom, the model's definitions and its declared contract, rather than every
+column. For each field, follow the expression the model returns under that column
+name through the final select, its aliases and aggregations, to the filters,
+category mappings and joins it reads (the model SQL, and
+`dex transform references <model.column> --usage`). A correct intermediate
+formula proves nothing until the delivered column is shown to use it. Check the
+rows in question with an aggregate (`dex explore query`), and set the categories a
+predicate keeps beside the column's actual values (`dex explore profile`): a
+spelling outside the predicate is evidence to investigate. Only a mapping,
+contract or precedent that covers that value settles that it belongs; a
+resemblance of names is a `default` at most, and never outranks a mapping that
+leaves the value out or a contract that keeps unlisted values as sent, so such a
+value stays where it is and is reported as open. Report the
+field checked, its derivation, and the evidence of the defect or of what explains
+the symptom. Where the evidence does not settle it, say the question is
+unresolved and name what was not verified, rather than "nothing is wrong" or a
+question asked before investigating. A green build, or a model that selects the
+expected answer as a constant, is not that evidence. A defect found is repaired
+through transform.
+
 **Settle the scope before the repair.** Before changing a model that already
 exists, name what the request asks for: the outputs (each column and its visible
 type), the grain and the population. Name what it leaves alone: the other models'
