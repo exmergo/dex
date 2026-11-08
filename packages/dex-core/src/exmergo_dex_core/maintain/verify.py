@@ -979,12 +979,18 @@ def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = Non
     if name not in cte_scopes or name in seen:
         return node if name not in cte_scopes else None
     seen.add(name)
+    cte = cte_scopes[name]
+    if sql_shape.SET_OPERATIONS and isinstance(cte, sql_shape.SET_OPERATIONS):
+        return node
     return _through_ctes(
-        sql_shape.from_relation(cte_scopes[name]), cte_scopes, sql_shape, seen
+        sql_shape.from_relation(cte) if isinstance(cte, exp.Select) else None,
+        cte_scopes,
+        sql_shape,
+        seen,
     )
 
 
-def _join_label(join, resolved, name_of) -> str:
+def _join_label(join, resolved, name_of, sql_shape=None) -> str:
     """One join named the way a reader would name it: how it joins, and what to.
 
     The project's own name for the joined relation where there is one, since
@@ -993,8 +999,20 @@ def _join_label(join, resolved, name_of) -> str:
     the join keys, which is the part that identifies a wrong grain.
     """
 
+    from sqlglot import expressions as exp
+
     if resolved is None:
-        return f"{join.side} join to a subquery"
+        target = (
+            "a set operation"
+            if (
+                isinstance(join.relation, exp.Subquery)
+                and sql_shape is not None
+                and sql_shape.SET_OPERATIONS
+                and isinstance(join.relation.this, sql_shape.SET_OPERATIONS)
+            )
+            else "a subquery"
+        )
+        return f"{join.side} join to {target}"
     return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
 
 
@@ -1031,11 +1049,12 @@ def _driving_parent(tree, sql_shape):
     if not isinstance(tree, exp.Select):
         return None, [], [], False, "its compiled SQL is not a SELECT", {}
 
-    cte_scopes = {
-        name: scope
-        for name, scope in sql_shape.scopes(tree).items()
-        if name != sql_shape.MAIN_SCOPE
-    }
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    cte_scopes = (
+        {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        if with_clause is not None
+        else {}
+    )
     reducers: list[str] = []
     found_joins: list = []
     multiplies = sql_shape.multiplies_rows(tree)
@@ -1043,6 +1062,15 @@ def _driving_parent(tree, sql_shape):
     current = tree
     visited: set[str] = set()
     while True:
+        if sql_shape.SET_OPERATIONS and isinstance(current, sql_shape.SET_OPERATIONS):
+            return (
+                None,
+                reducers,
+                found_joins,
+                multiplies,
+                "it is driven by a set operation, so it has no single parent",
+                cte_scopes,
+            )
         reducers.extend(sql_shape.reducing_clauses(current))
         found_joins.extend(sql_shape.joins(current))
         relation = sql_shape.from_relation(current)
@@ -1075,13 +1103,14 @@ def _driving_parent(tree, sql_shape):
                     "its driving relation is not a table or a subquery dex can follow",
                     cte_scopes,
                 )
-            cte_scopes.update(
-                {
-                    name: scope
-                    for name, scope in sql_shape.scopes(inner).items()
-                    if name != sql_shape.MAIN_SCOPE
-                }
-            )
+            with_inner = inner.args.get("with_") or inner.args.get("with")
+            if with_inner is not None:
+                cte_scopes.update(
+                    {
+                        cte.alias_or_name.lower(): cte.this
+                        for cte in with_inner.expressions
+                    }
+                )
             current = inner
             continue
         if isinstance(relation, exp.Values):
@@ -1257,6 +1286,7 @@ def row_population_plan(
                         join,
                         _through_ctes(join.relation, cte_scopes, sql_shape),
                         name_of,
+                        sql_shape,
                     )
                     for join in found_joins
                 ),

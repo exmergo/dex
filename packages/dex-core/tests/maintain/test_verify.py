@@ -1406,6 +1406,43 @@ def test_a_union_is_not_mistaken_for_fanout(tmp_path: Path):
     assert "set operation" in notes[0]
 
 
+def test_cross_join_to_set_operation_cte_names_cte_in_detail(tmp_path: Path):
+    """#1211: a cross join to a CTE holding a set operation names the CTE,
+    rather than calling it 'a subquery'. An anonymous set-operation subquery
+    says 'a set operation'."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "windowed_orders",
+                "with windows as ("
+                '  select "w1" as window_id union all select "w2" as window_id'
+                ") "
+                'select * from "wh"."main"."stg_orders" cross join windows',
+            ),
+            "m.2": _model(
+                "anon_windowed_orders",
+                'select * from "wh"."main"."stg_orders" '
+                'cross join (select "w1" as window_id '
+                'union all select "w2" as window_id)',
+            ),
+        },
+    )
+    windowed = next(c for c in checks if c.model == "windowed_orders")
+    assert windowed.joins == ("cross join to 'windows'",)
+    findings, _ = _judge([windowed], {"stg_orders": 200, "windowed_orders": 400})
+    assert len(findings) == 1
+    assert findings[0].code == "row_fanout"
+    assert (
+        "the cross join to 'windows' (dex could not read the join key)"
+        in findings[0].detail
+    )
+
+    anon = next(c for c in checks if c.model == "anon_windowed_orders")
+    assert anon.joins == ("cross join to a set operation",)
+
+
 def test_an_unnest_is_not_mistaken_for_fanout(tmp_path: Path):
     """A construct that turns one row into several is doing its job."""
 
