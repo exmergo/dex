@@ -999,6 +999,7 @@ def render(
         return _render_version(content, declaration, base, version, notes)
     text = _with_entry(content, model)
     entry = lambda root: _model_entry(root, model)  # noqa: E731
+    text = _restyle_flow_entry(text, entry)
 
     if declaration.description is not None:
         text = _set_key(text, entry, "description", declaration.description)
@@ -1038,7 +1039,7 @@ def _render_version(
     """
 
     item = lambda root: _version_item(root, base, version)  # noqa: E731
-    text = content
+    text = _restyle_flow_entry(content, item)
     if item(_compose(text)) is None:
         raise RewriteError(f"it has no version {version} under '{base}'")
     label = f"{base}.v{version}"
@@ -1327,6 +1328,118 @@ def _compose(text: str) -> Any:
         ) from exc
 
 
+def _carries_anchor(root: Any, node: Any) -> bool:
+    """True when the subtree defines or uses a YAML anchor or alias.
+
+    PyYAML resolves an alias to the anchored node object itself, so a node
+    that appears more than once in the document is an aliased one: a restyle
+    re-renders the subtree from its parsed value, which would rename the
+    anchor and break a reference written elsewhere (#1203). Such a mapping
+    keeps refusing, with the reason named.
+    """
+
+    counts: dict[int, int] = {}
+
+    def count(current: Any, seen: set[int]) -> None:
+        # every VISIT counts, even one the seen-set skips: an aliased node is
+        # precisely one that is reached twice, and a revisit must not be
+        # mistaken for a cycle before it is counted
+        counts[id(current)] = counts.get(id(current), 0) + 1
+        if id(current) in seen:
+            return
+        seen.add(id(current))
+        if isinstance(current, yaml.MappingNode):
+            for k, v in current.value:
+                count(k, seen)
+                count(v, seen)
+        elif isinstance(current, yaml.SequenceNode):
+            for item in current.value:
+                count(item, seen)
+
+    count(root, set())
+
+    def carries(current: Any, seen: set[int]) -> bool:
+        if id(current) in seen:
+            return False
+        seen.add(id(current))
+        if getattr(current, "anchor", None) or counts.get(id(current), 0) > 1:
+            return True
+        if isinstance(current, yaml.MappingNode):
+            return any(carries(k, seen) or carries(v, seen) for k, v in current.value)
+        if isinstance(current, yaml.SequenceNode):
+            return any(carries(item, seen) for item in current.value)
+        return False
+
+    return carries(node, set())
+
+
+def _restyle_flow_entry(text: str, locate) -> str:
+    """``text`` with the located entry restyled from flow style to block style.
+
+    A declaration is written INTO the entry, so a flow-style entry blocks it
+    whole: the entry is converted to block style in the same edit instead,
+    keeping its keys and values, and every byte outside its span (other
+    entries, comments) exactly as the author wrote it (#1203). An entry
+    nested in a flow-style list is left untouched: a block entry cannot sit
+    inside one, and the downstream refusal names that.
+    """
+
+    root = _compose(text)
+    node = locate(root)
+    if (
+        node is None
+        or not isinstance(node, yaml.MappingNode)
+        or not node.flow_style
+        or not node.value
+    ):
+        return text
+    if _carries_anchor(root, node):
+        raise RewriteError(
+            "the entry is a flow-style mapping that defines or uses a YAML "
+            "anchor; rewrite it in block style"
+        )
+    start, end = _span(node)
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    if prefix.strip() != "-":
+        return text
+    body = _dump(yaml.safe_load(yaml.serialize(node))).strip("\n")
+    lines = body.split("\n")
+    indent = " " * len(prefix)
+    rendered = lines[0] + "".join(f"\n{indent}{ln}" for ln in lines[1:])
+    return splice(text, [(start, end, rendered)])
+
+
+def _restyle_flow_value(text: str, root: Any, parent: Any, key: str) -> str:
+    """``text`` with ``parent``'s flow-style ``key`` value restyled to block.
+
+    A block mapping cannot sit inside a flow one, so the value's own keys and
+    values are re-rendered one level under the parent's; every byte outside
+    the pair is untouched. An empty flow mapping holds nothing to keep: its
+    pair is dropped, and the caller writes the key fresh (#1203).
+    """
+
+    found = _child(parent, key)
+    if found is None:
+        return text
+    k, v = found
+    if not isinstance(v, yaml.MappingNode) or not v.flow_style:
+        return text
+    if _carries_anchor(root, v):
+        raise RewriteError(
+            f"'{key}' is a flow-style mapping that defines or uses a YAML "
+            "anchor; rewrite it in block style"
+        )
+    if not v.value:
+        start, end = _pair_span(text, _span(k), v)
+        return splice(text, [(start, end, "")])
+    body = _dump(yaml.safe_load(yaml.serialize(v))).strip("\n")
+    indent = " " * (parent.value[0][0].start_mark.column + 2)
+    start, end = _span(v)
+    rendered = "\n" + "\n".join(f"{indent}{ln}" for ln in body.split("\n"))
+    return splice(text, [(start, end, rendered)])
+
+
 def _child(mapping: Any, key: str) -> tuple[Any, Any] | None:
     if not isinstance(mapping, yaml.MappingNode):
         return None
@@ -1382,6 +1495,7 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
     key under ``config.meta`` is untouched.
     """
 
+    text = _restyle_flow_entry(text, locate)
     root = _compose(text)
     node = locate(root)
     plain = yaml.safe_load(yaml.serialize(node)) if node is not None else None
@@ -1391,6 +1505,15 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         merged = _merge_population(existing, merged)
 
     config = _child(node, "config")
+    if config is not None and isinstance(config[1], yaml.MappingNode) and config[1].flow_style:
+        # `config: {...}` written in flow style: the mapping is restyled to
+        # block style in the same edit, so the steps below write into a
+        # block mapping instead of refusing (#1203). An empty `{}` holds
+        # nothing to keep: the pair is dropped and written fresh below.
+        text = _restyle_flow_value(text, root, node, "config")
+        root = _compose(text)
+        node = locate(root)
+        config = _child(node, "config")
     if config is None:
         return _set_key(text, locate, "config", {"meta": {DEX_META_KEY: merged}})
 
@@ -1399,6 +1522,13 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         return found[1] if found else None
 
     meta = _child(config[1], "meta")
+    if meta is not None and isinstance(meta[1], yaml.MappingNode) and meta[1].flow_style:
+        # `config.meta` in flow style: same restyle, one level down.
+        text = _restyle_flow_value(text, root, config[1], "meta")
+        root = _compose(text)
+        node = locate(root)
+        config = _child(node, "config")
+        meta = _child(config[1], "meta") if config is not None else None
     if meta is None:
         return _set_key(text, config_node, "meta", {DEX_META_KEY: merged})
 
