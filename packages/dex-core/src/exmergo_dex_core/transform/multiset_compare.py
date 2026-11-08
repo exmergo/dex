@@ -565,6 +565,8 @@ def _compare(
     accepted: tuple[str, ...] = (),
     expectation: xc.Expectation | None = None,
 ):
+    """The comparison behind :func:`compare_refactors`."""
+
     _assert_shapes(left, right, adapter)
     if not callable(getattr(adapter, "describe_query", None)):
         raise _NotCheckedError(
@@ -783,10 +785,14 @@ class _ExpectationPlan:
 
     @property
     def keyed(self) -> bool:
+        """Whether the plan carries the key statements and the key sample."""
+
         return len(self.statements) == 3
 
 
 def _reserved_by_expectation(name: str) -> bool:
+    """Whether an output name collides with a column the expectation adds."""
+
     lowered = name.lower()
     return lowered in xc.RESERVED_COLUMNS or bool(
         re.fullmatch(r"dex_(?:[cn]|in)\d+", lowered)
@@ -802,6 +808,8 @@ def _expectation_plan(
     dialect: str,
     schema: SchemaDiff,
 ) -> _ExpectationPlan:
+    """The expectation bound to the compared columns, and its statements."""
+
     left_names = [column.left_name for column in aligned.matched]
     right_names = [column.right_name for column in aligned.matched]
     try:
@@ -834,7 +842,11 @@ def _run_expectation(
     *,
     sample_refusal: str | None,
 ) -> xc.ExpectationReport:
+    """Run and judge the expectation, sampling keys only when a class failed."""
+
     def run(sql: str, rows: int) -> QueryResult:
+        """Run one statement, reporting a failure by its exception class alone."""
+
         try:
             return adapter.run_query(
                 sql, max_rows=rows, timeout_seconds=limits.timeout_seconds
@@ -1152,6 +1164,8 @@ def _unsupported_column(columns: Sequence[_MatchedColumn], dialect: str) -> str 
 
 
 def _quote(name: str, dialect: str) -> str:
+    """A quoted identifier in the dialect."""
+
     return exp.to_identifier(name, quoted=True).sql(dialect=dialect)
 
 
@@ -1206,6 +1220,8 @@ def _rows_cte(left_proj: str, right_proj: str, column_list: str) -> str:
 def _count(expression: str, alias: str) -> str:
     # Cast because several warehouses widen a sum to a decimal, and json_safe
     # would carry a decimal as a float, which is not an exact count.
+    """An aggregate cast to an exact, non-NULL count."""
+
     return f"cast(coalesce({expression}, 0) as bigint) as {alias}"
 
 

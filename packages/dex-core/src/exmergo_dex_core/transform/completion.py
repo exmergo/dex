@@ -875,6 +875,8 @@ _FAILED = FAILED_STATUSES
 
 
 def _required(evidence: BuildEvidence) -> set[str] | None:
+    """The models the change requires, or None where coverage is unknown."""
+
     coverage = evidence.coverage
     return set(coverage.required) if coverage is not None else None
 

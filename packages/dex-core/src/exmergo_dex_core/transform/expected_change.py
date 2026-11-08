@@ -69,6 +69,8 @@ class Expectation:
     key: Literal["unchanged", "any"] = "unchanged"
 
     def data(self) -> dict[str, Any]:
+        """The expectation as JSON, every clause spelled out."""
+
         return {
             "added": _clause_data(self.added),
             "removed": _clause_data(self.removed),
@@ -77,11 +79,15 @@ class Expectation:
         }
 
     def digest(self) -> str:
+        """A short, stable fingerprint of the stated expectation."""
+
         text = json.dumps(self.data(), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def _clause_data(clause: Clause) -> str | dict[str, str]:
+    """One clause as JSON: the keyword, or ``{"where": ...}``."""
+
     return clause if clause in ("none", "any") else {"where": clause}
 
 
@@ -124,6 +130,8 @@ def parse_expectation(raw: Any) -> Expectation:
 
 
 def _clause(value: Any, name: str) -> Clause:
+    """Read one ``added``/``removed`` clause, refusing anything else by name."""
+
     if value in ("none", "any"):
         return value
     if isinstance(value, dict) and set(value) == {"where"}:
@@ -139,6 +147,8 @@ _REF = re.compile(r"""\bref\(\s*(['"])([^'"]+)\1\s*\)""")
 
 
 def _wheres(expectation: Expectation) -> list[tuple[str, str]]:
+    """The clauses that carry a predicate, with their names."""
+
     return [
         (name, clause)
         for name, clause in (
@@ -163,6 +173,8 @@ def resolve_refs(
     from dataclasses import replace
 
     def table_name(relation: str) -> str:
+        """The last name part of a relation, as the dialect parses it."""
+
         try:
             table = exp.to_table(relation, dialect=dialect)
         except Exception:
@@ -170,6 +182,8 @@ def resolve_refs(
         return table.name
 
     def swap(match: re.Match[str], where: str) -> str:
+        """The relation one ``ref()`` names, refused unless exactly one matches."""
+
         model = match.group(2)
         found = [r for r in relations if table_name(r).lower() == model.lower()]
         if len(found) != 1:
@@ -255,6 +269,8 @@ def resolve(
     key_set = {k.lower() for k in keys or ()}
 
     def column(name: str, where: str) -> str:
+        """A caller's column name as the projected output spells it."""
+
         found = by_name.get(name.lower())
         if found is None:
             raise ExpectationError(
@@ -353,6 +369,8 @@ def _lookup(
 def _predicate(
     clause: Clause, name: str, column, dialect: str, lookups: list[Lookup]
 ) -> str:
+    """One clause as SQL over the projected columns, or a refusal."""
+
     if clause == "none":
         return "1 = 0"
     if clause == "any":
@@ -376,6 +394,8 @@ def _predicate(
         raise ExpectationError(f"{name}.where: {problem}")
 
     def bind(node: exp.Expression) -> exp.Expression:
+        """A column reference rewritten to the projection's quoted name."""
+
         if isinstance(node, exp.Column) and re.fullmatch(r"dex_in\d+", node.name):
             return node
         if isinstance(node, exp.Column):
@@ -430,10 +450,14 @@ def with_lookups(rows_cte: str, resolved: Resolved, dialect: str) -> str:
 
 
 def _quote(name: str, dialect: str) -> str:
+    """A quoted identifier in the dialect."""
+
     return exp.to_identifier(name, quoted=True).sql(dialect=dialect)
 
 
 def _count(expression: str, alias: str) -> str:
+    """An aggregate cast to an exact, non-NULL count."""
+
     return f"cast(coalesce({expression}, 0) as bigint) as {alias}"
 
 
@@ -461,6 +485,8 @@ def rows_sql(rows_cte: str, resolved: Resolved, dialect: str) -> str:
 
 
 def _keys_cte(rows_cte: str, resolved: Resolved, dialect: str) -> tuple[str, list[str]]:
+    """The per-key CTE over the compared rows, and the non-key columns it flags."""
+
     keys = resolved.keys or ()
     key_list = ", ".join(_quote(k, dialect) for k in keys)
     others = [c for c in resolved.columns if c not in keys]
@@ -497,6 +523,8 @@ def _keys_cte(rows_cte: str, resolved: Resolved, dialect: str) -> tuple[str, lis
 
 
 def _disallowed(resolved: Resolved, others: Sequence[str]) -> str:
+    """The condition that a changed key moved a column not allowed to change."""
+
     allowed = set(resolved.changed)
     terms = [f"dex_c{i} = 1" for i, name in enumerate(others) if name not in allowed]
     return " or ".join(terms) if terms else "1 = 0"
@@ -600,9 +628,13 @@ class ClauseCounts:
 
     @property
     def unexpected(self) -> int:
+        """The rows or keys the clause does not allow."""
+
         return self.total - self.matching
 
     def data(self) -> dict[str, int]:
+        """The counts as JSON."""
+
         return {
             "total": self.total,
             "matching": self.matching,
@@ -612,6 +644,8 @@ class ClauseCounts:
 
 @dataclass(frozen=True)
 class ColumnChange:
+    """One non-key column: the kept keys it changed on, and whether it may."""
+
     column: str
     keys_changed: int
     allowed: bool
@@ -640,9 +674,13 @@ class ExpectationReport:
 
     @property
     def verdict(self) -> Literal["as_expected", "unexpected"]:
+        """``as_expected`` when no clause failed, else ``unexpected``."""
+
         return "unexpected" if self.findings else "as_expected"
 
     def data(self) -> dict[str, Any]:
+        """The report as JSON, ``unexpected_keys`` only when a sample ran."""
+
         out: dict[str, Any] = {
             "stated": self.expectation.data(),
             "verdict": self.verdict,
@@ -754,6 +792,8 @@ def judge_keys(resolved: Resolved, counts: Sequence[int]) -> ExpectationReport |
 def read_samples(
     cells: Sequence[Sequence[Any]], keys: Sequence[str]
 ) -> dict[str, list[dict[str, Any]]]:
+    """The sample statement's rows, grouped by class and keyed by column."""
+
     out: dict[str, list[dict[str, Any]]] = {}
     for row in cells:
         cls, *values = row
@@ -769,6 +809,8 @@ def with_samples(
     samples: dict[str, list[dict[str, Any]]] | None = None,
     withheld: str | None = None,
 ) -> ExpectationReport:
+    """The report with its key sample, or with the reason it was withheld."""
+
     from dataclasses import replace
 
     return replace(report, unexpected_keys=samples, samples_withheld=withheld)
