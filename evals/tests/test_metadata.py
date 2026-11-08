@@ -3417,6 +3417,8 @@ _INTENDED = ("backfill_days", "exclude_archived", "late_arrivals")
     ],
 )
 def test_an_intended_change_is_compared_against_its_statement(calls, passed):
+    """The step needs an ``--expect`` comparison of the applied plan that read ``as_expected``."""
+
     from evals.metadata.score import procedure_steps
 
     def call(verb, plan=None, verdict=None, flags=()):
@@ -3434,6 +3436,8 @@ def test_an_intended_change_is_compared_against_its_statement(calls, passed):
 
 
 def test_the_expected_change_verdicts_are_read_from_an_envelope():
+    """The two new verdicts are read from a comparison's envelope."""
+
     from evals.metadata.live import _compare_verdict
 
     for verdict in ("as_expected", "unexpected"):
@@ -3442,6 +3446,8 @@ def test_the_expected_change_verdicts_are_read_from_an_envelope():
 
 
 def test_each_intended_repair_states_a_change_its_truth_can_check():
+    """Each task states its change, grades the step, and ships an over-broad variant."""
+
     for name in _INTENDED:
         task = _task(f"intended_repairs/{name}")
         stated = task.truth["expected_change"]

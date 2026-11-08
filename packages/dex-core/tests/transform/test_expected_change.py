@@ -29,6 +29,8 @@ _EMAIL = "hidden-key@example.com"
 
 
 def _dataset(name: str, *columns: tuple[str, str], pii: str | None = None) -> Dataset:
+    """A cached profile of ``main.<name>``, with ``pii`` flagged as an email."""
+
     return Dataset(
         identifier=f"main.{name}",
         columns=[
@@ -46,6 +48,8 @@ def _dataset(name: str, *columns: tuple[str, str], pii: str | None = None) -> Da
 
 @pytest.fixture
 def warehouse(tmp_path: Path):
+    """A DuckDB warehouse with the four tables and their cached profiles."""
+
     path = tmp_path / "expect.duckdb"
     connection = duckdb.connect(str(path))
     connection.execute("create table daily (day date, visits integer)")
@@ -290,6 +294,8 @@ def test_a_pii_key_is_withheld_from_the_sample_and_the_counts_stay(warehouse):
     ],
 )
 def test_a_malformed_expectation_is_refused(raw, message):
+    """Malformed JSON or a wrong field is refused, naming the field."""
+
     with pytest.raises(ExpectationError, match=message):
         parse_expectation(raw)
 
@@ -304,6 +310,8 @@ def test_the_issue_spelling_and_defaults_parse():
 
 
 def test_ref_resolves_to_the_relation_the_comparison_reads():
+    """``ref('<model>')`` resolves to the relation either side reads, or is refused."""
+
     stated = parse_expectation(
         {"removed": {"where": "w in (select id from ref('stg_workspaces') where a)"}}
     )
@@ -332,6 +340,8 @@ def test_a_key_named_like_a_credential_withholds_the_sample(warehouse):
 
 
 def test_rows_say_the_key_clause_was_not_judged(warehouse):
+    """With no key, the default ``key: unchanged`` is noted as not judged."""
+
     report = _compare(
         warehouse,
         ALL_MEMBERS,

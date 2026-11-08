@@ -589,6 +589,8 @@ class RefactorComparisonResult(Result):
     expectation_digest: str | None = None
 
     def data(self) -> dict[str, Any]:
+        """The comparison as ``data``: identity, verdict, counts and any expectation."""
+
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
         if self.proposed_vars:
             branch["proposed_vars"] = self.proposed_vars

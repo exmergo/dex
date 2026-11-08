@@ -3995,6 +3995,8 @@ def _merge_spend(running: dict | None, latest: dict | None) -> dict | None:
 
 
 def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """``transform compare``: one model before and after a plan."""
+
     from .refactor_compare import compare
 
     try:

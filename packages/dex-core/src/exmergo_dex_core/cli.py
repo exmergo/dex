@@ -576,6 +576,8 @@ ranks what matters, profiles it, and infers how the tables join.
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """The argparse tree for every group and subcommand."""
+
     parser = argparse.ArgumentParser(
         prog="dex",
         description=(

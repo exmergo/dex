@@ -1155,6 +1155,8 @@ def _result(
     warnings: list[str],
     profiled: list[str],
 ) -> RefactorComparisonResult:
+    """The envelope result for a finished comparison, judged by any stated change."""
+
     status, reason_code = verdict.status, verdict.reason_code
     report = verdict.expectation
     if report is not None:
@@ -1199,6 +1201,8 @@ def _not_checked_result(
     *,
     pending: Any = None,
 ) -> RefactorComparisonResult:
+    """The envelope result for a comparison that could not be judged."""
+
     return RefactorComparisonResult(
         **_identity_fields(identity),
         status="not_checked",

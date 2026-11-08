@@ -111,6 +111,8 @@ def _engine(project: Path) -> DexEngine:
 
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
+    """A built dbt-duckdb project with the three marts and their inputs."""
+
     pytest.importorskip("dbt.adapters.duckdb")
     root = tmp_path / "analytics"
     models = root / "models"

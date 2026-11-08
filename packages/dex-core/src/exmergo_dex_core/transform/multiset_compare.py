@@ -277,6 +277,8 @@ class RefactorCompareResult:
     expectation: xc.ExpectationReport | None = None
 
     def __post_init__(self) -> None:
+        """Refuse a status, reason and payload that do not belong together."""
+
         schema_ok = self.schema is not None and self.schema.compatible
         rows_ok = self.multiset is not None and self.multiset.equivalent
         keys_ok = self.keyed is not None and (

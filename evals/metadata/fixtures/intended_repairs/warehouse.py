@@ -20,6 +20,8 @@ from evals.metadata.fixtures import Table
 
 
 def tables(seed: int) -> list[Table]:
+    """Calendar, tickets, workspaces, memberships and shipments for ``seed``."""
+
     rng = random.Random(seed)
     start = date(2026, 4, 1)
     days = [start + timedelta(days=i) for i in range(28)]

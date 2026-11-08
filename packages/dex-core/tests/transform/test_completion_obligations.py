@@ -41,6 +41,8 @@ def _replay(**facts):
 
 
 def _nodes(test_status: str | None = None) -> list[BuildNode]:
+    """The model node, and an incremental unit test with ``test_status`` if given."""
+
     nodes = [BuildNode(unique_id=_uid(FCT), name=FCT, status="success")]
     if test_status is not None:
         nodes.append(
@@ -137,6 +139,8 @@ def test_an_incremental_model_the_change_does_not_require_is_left_out():
 
 
 def test_a_required_name_matches_any_of_the_models_answers():
+    """A required name matches the model's label, name or file stem."""
+
     nodes = [BuildNode(unique_id=_uid(FCT), name=FCT, status="success")]
     completion = summarize_completion(
         _evidence(nodes, required=["fct_scans_v2"]),
@@ -151,6 +155,8 @@ def test_a_required_name_matches_any_of_the_models_answers():
 
 
 def test_many_replay_obligations_fit_the_bound_and_count_the_cut():
+    """Four hundred unchecked entries are cut to the bound, and the cut is counted."""
+
     names = [f"fct_incremental_model_with_a_long_name_{i:03d}" for i in range(400)]
     nodes = [BuildNode(unique_id=_uid(n), name=n, status="success") for n in names]
     completion = summarize_completion(
@@ -166,6 +172,8 @@ def test_many_replay_obligations_fit_the_bound_and_count_the_cut():
 
 
 def test_long_named_obligations_on_every_list_still_fit_the_bound():
+    """A long name on every per-model list still fits the 4096-byte bound."""
+
     name = "fct_" + "a_model_with_a_name_far_longer_than_any_real_one_" * 40
     nodes = [BuildNode(unique_id=_uid(name), name=name, status="success")]
     completion = summarize_completion(
@@ -201,6 +209,8 @@ def test_long_named_obligations_on_every_list_still_fit_the_bound():
 def test_a_recorded_verdict_is_the_comparison_obligation(
     verdict, status, finding, reason
 ):
+    """Each recorded verdict maps to its obligation status and finding."""
+
     _, obligations = _obligations(
         _nodes(), comparisons=[ComparisonState(model=FCT, status=verdict)]
     )
@@ -226,6 +236,8 @@ def test_a_not_checked_verdict_keeps_its_reason():
 
 
 def test_an_uncompared_rewrite_beside_a_compared_one_says_so():
+    """A rewrite left uncompared beside a compared one reads ``compared_elsewhere``."""
+
     nodes = [
         BuildNode(unique_id=_uid(n), name=n, status="success")
         for n in ("int_scans", FCT)
@@ -254,6 +266,8 @@ _SQL = "select * from {{ source('feed', 'scans') }}\n"
 
 
 def _manifest(with_test: bool) -> dict:
+    """A manifest with the incremental model, and its incremental unit test if asked."""
+
     manifest = {
         "metadata": {
             "generated_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
@@ -281,6 +295,8 @@ def _manifest(with_test: bool) -> dict:
 
 
 def _write(directory: Path, with_test: bool, test_status: str = "pass") -> None:
+    """Write the manifest and run results a fake dbt run would leave."""
+
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "manifest.json").write_text(
         json.dumps(_manifest(with_test)), encoding="utf-8"
@@ -334,7 +350,11 @@ def incremental_plan(dbt_project_dir: Path, tmp_path: Path) -> tuple[Path, str]:
 def _build(
     tmp_path, capsys, monkeypatch, project, *extra, with_test=False, status="pass"
 ):
+    """Build the stored plan through the CLI with a fake dbt, returning completion."""
+
     def write(argv):
+        """Leave the artifacts where the build and its pricing compile read them."""
+
         if "--target-path" in argv:
             _write(Path(argv[argv.index("--target-path") + 1]), with_test, status)
         _write(dex_target(project), with_test, status)
