@@ -39,6 +39,7 @@ from sqlglot import expressions as exp
 from .. import sql_shape
 from .row_attribution import (
     UnattributableError,
+    changed_set_operations,
     classify,
     naming_resolver,
     render_model_sql,
@@ -186,11 +187,17 @@ def scope_for(
         )
 
     changes: list[ScopeChange] = []
-    population, population_reason = _population(prior, authored, dialect, changes)
-    unread_sets = _changed_set_operations(prior_tree, authored_tree)
+    unread_sets = changed_set_operations(
+        sql_shape.scopes(prior_tree), sql_shape.scopes(authored_tree)
+    )
+    population, population_reason = _population(
+        prior, authored, dialect, changes, unread_sets
+    )
     if unread_sets:
         # Row attribution compares SELECT bodies only, so an edit inside a UNION
-        # (a branch's WHERE) reached nothing and must not read as `kept`.
+        # (a branch's WHERE) is unattributable there and must not read as
+        # `kept` here. This one note names those scopes together, which is why
+        # `_population` leaves row attribution's entries for them out.
         note = (
             f"the set operation in {', '.join(f'`{n}`' for n in unread_sets)} "
             "changed and its branches were not compared"
@@ -227,12 +234,22 @@ def scope_for(
 
 
 def _population(
-    prior: str, authored: str, dialect: str, out: list[ScopeChange]
+    prior: str,
+    authored: str,
+    dialect: str,
+    out: list[ScopeChange],
+    unread_sets: Iterable[str] = (),
 ) -> tuple[str, str | None]:
     """Append each row-moving change row attribution classifies, and return the
-    population state with the reason it could not be read, if any."""
+    population state with the reason it could not be read, if any.
+
+    Row attribution's entries for ``unread_sets`` are skipped: the caller
+    reports those scopes itself.
+    """
 
     isolable, unresolved = classify(prior, authored, dialect)
+    skip = set(unread_sets)
+    unresolved = [u for u in unresolved if u.scope not in skip]
     out.extend(
         ScopeChange(
             axis="population",
@@ -250,24 +267,6 @@ def _population(
     if unresolved:
         return "unchecked", "; ".join(sorted({u.detail for u in unresolved}))
     return "kept", None
-
-
-def _changed_set_operations(
-    prior: exp.Expression, authored: exp.Expression
-) -> list[str]:
-    """Scopes both versions share where either side is a set operation and the
-    two differ: changes there are invisible to the SELECT-by-SELECT reading."""
-
-    before, after = sql_shape.scopes(prior), sql_shape.scopes(authored)
-    return sorted(
-        name
-        for name in before.keys() & after.keys()
-        if not (
-            isinstance(before[name], exp.Select) and isinstance(after[name], exp.Select)
-        )
-        and sql_shape.expression_key(before[name])
-        != sql_shape.expression_key(after[name])
-    )
 
 
 def _columns_of(prior: str | None, authored: str | None, dialect: str) -> list[str]:
@@ -411,7 +410,7 @@ def _aggregates(node: exp.Expression) -> Counter[str]:
         distinct = isinstance(arg, exp.Distinct)
         inner = (arg.expressions[0] if arg.expressions else None) if distinct else arg
         star = inner is None or isinstance(inner, exp.Star)
-        shape = "*" if star else sql_shape.expression_key(inner)
+        shape = "*" if star else sql_shape.unqualified_key(inner)
         found[f"{agg.key}({'distinct ' if distinct else ''}{shape})"] += 1
     return found
 
@@ -433,7 +432,7 @@ def _expression_changes(
     """How one column's expression changed: a cast, an aggregate, a NULL
     treatment, or, failing all three, the expression itself."""
 
-    if sql_shape.expression_key(prior) == sql_shape.expression_key(authored):
+    if sql_shape.unqualified_key(prior) == sql_shape.unqualified_key(authored):
         return []
     shown = (sql_shape.text(prior), sql_shape.text(authored))
     where = "" if scope == sql_shape.MAIN_SCOPE else f" in `{scope}`"

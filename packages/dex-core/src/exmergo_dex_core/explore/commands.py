@@ -496,6 +496,62 @@ class _ObjectGap:
         )
 
 
+def _dev_relation_test(engine: DexEngine) -> tuple[str, Callable[[str], bool]] | None:
+    """The dev namespace this command's source scope does not reach, and a test
+    for whether a relation name lies in it or in a namespace dbt derives from it.
+
+    ``None`` where the scope reaches the dev namespace (an empty allowlist reads
+    everything, so it is a source like any other there), where no dev namespace
+    is configured, and on DuckDB, which reads its whole file. A derived namespace
+    (``<dev schema>_<name>``, where a package or a folder sets ``+schema``,
+    #1155) counts only where the scope does not reach it either.
+
+    Names are compared aligned at the end, case-insensitively, so a name written
+    with fewer parts than the dev namespace (``dbt_dev.orders``) matches it, and
+    one written with more must agree on every part the dev namespace spells. A
+    bare BigQuery dev dataset lives in the configured project, as the adapter
+    reads it; a dataset of that name in another project is not it. This only
+    ever decides what is held back or how a refusal is worded: it widens no read.
+    """
+
+    from ..adapters.base import scope_within
+    from ..connect import dev_namespace_outside_allowlist, source_scope
+
+    connector = engine.connector or engine.config.connector
+    if not connector:
+        return None
+    target = getattr(engine.config, connector, None)
+    dev = dev_namespace_outside_allowlist(connector, target, engine.scopes)
+    if dev is None:
+        return None
+    committed = source_scope(connector, target, engine.scopes)
+    project = engine.project or getattr(target, "project", None)
+    wanted = dev.lower().split(".")
+    if connector == "bigquery" and len(wanted) == 1 and project:
+        wanted = [str(project).lower(), *wanted]
+
+    def in_dev(name: str) -> bool:
+        """Whether ``name`` lies in the dev namespace or one derived from it."""
+        namespace = name.lower().split(".")[:-1]
+        if not namespace:
+            return False
+        span = min(len(namespace), len(wanted))
+        ours, theirs = namespace[-span:], wanted[-span:]
+        if ours[:-1] != theirs[:-1]:
+            return False
+        if ours[-1] == theirs[-1]:
+            return True
+        if not ours[-1].startswith(theirs[-1] + "_"):
+            return False
+        # A derived namespace the scope reaches is a source like any other.
+        spelled = ".".join(namespace)
+        return not (
+            scope_within(spelled, committed) or scope_within(namespace[-1], committed)
+        )
+
+    return dev, in_dev
+
+
 def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
     """The cache as a command reading only the source allowlist may adjudicate on.
 
@@ -505,35 +561,106 @@ def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
     a relation the source scope does not reach, and the adapter would run it
     without ever having agreed to read that namespace. Only the dev namespace
     outside the scope this command reads (the allowlist, or the ``--scope``
-    narrowing it) is held back; one that scope reaches is a source like any
-    other. A copy, so the entries stay in the cache for drafting.
+    narrowing it), and the namespaces dbt derives from it, are held back; one
+    that scope reaches is a source like any other. A copy, so the entries stay
+    in the cache for drafting.
     """
 
-    from ..connect import dev_namespace_outside_allowlist
-
-    connector = engine.connector or engine.config.connector
-    if not connector:
+    reach = _dev_relation_test(engine)
+    if reach is None:
         return cache
-    target = getattr(engine.config, connector, None)
-    dev = dev_namespace_outside_allowlist(connector, target, engine.scopes)
-    if dev is None:
-        return cache
-    dev = dev.lower()
-    # A bare BigQuery dev dataset lives in the configured project, as the
-    # adapter reads it; a dataset of that name in another project is not it.
-    project = engine.project or getattr(target, "project", None)
-    exact = connector == "bigquery" and ("." in dev or bool(project))
-    if exact and "." not in dev:
-        dev = f"{project}.{dev}".lower()
-
-    def in_dev(identifier: str) -> bool:
-        namespace = identifier.rsplit(".", 1)[0].lower()
-        return namespace == dev or (not exact and namespace.endswith(f".{dev}"))
-
+    _dev, in_dev = reach
     kept = [d for d in cache.datasets if not in_dev(d.identifier)]
     if len(kept) == len(cache.datasets):
         return cache
     return cache.model_copy(update={"datasets": kept})
+
+
+def _dev_namespace_refusal(engine: DexEngine, names: list[str]) -> str | None:
+    """The refusal for a statement naming a dev-built relation without
+    ``--target dev`` (#1133), or ``None`` when it names none.
+
+    Without it the firewall answers that the relation is not in the exploration
+    cache and names `explore profile`, which a caller who just ran
+    `explore profile --target dev` has already done: the advice loops. The dev
+    namespace is outside the source scope on purpose, so the answer is the one
+    flag that reads it for one command.
+    """
+
+    reach = _dev_relation_test(engine)
+    if reach is None:
+        return None
+    dev, in_dev = reach
+    named = [name for name in names if in_dev(name)]
+    if not named:
+        return None
+    leaf = dev.lower().rsplit(".", 1)[-1]
+    derived = sorted(
+        {
+            name.rsplit(".", 1)[0]
+            for name in named
+            if name.lower().split(".")[-2] != leaf
+        }
+    )
+    where = f"the dev namespace '{dev}'"
+    if derived:
+        where += f" or a namespace dbt derives from it ({', '.join(derived)})"
+    return (
+        f"'{', '.join(named)}' is in {where}, where `transform build` writes. It "
+        "is outside the source scope, so `explore query` reads it only for one "
+        "command: rerun with `--target dev`"
+    )
+
+
+def _dev_build_relations(engine: DexEngine) -> list[str]:
+    """The relations the project's manifest says it builds, or none when there is
+    no dbt project or manifest to read."""
+
+    from ..transform.verify import _manifest_relations
+
+    try:
+        project_dir = Path(engine.project_dir())
+    except DexError:
+        return []
+    try:
+        return _manifest_relations(project_dir)
+    except (OSError, ValueError):
+        return []
+
+
+def _dev_target_adapter(engine: DexEngine, command: str) -> tuple[Adapter, list[str]]:
+    """The adapter for one command that reads the dev target, with the notes
+    saying what it read (#893, #1133).
+
+    The dev namespace, and the namespaces dbt derives from it for the project's
+    own models (#1155: a package's ``+schema`` builds into
+    ``<dev schema>_<name>``), read for this command only; the next call to
+    ``engine._adapter`` clears both. Nothing is written back to config, and the
+    cost gate is the command's own.
+    """
+
+    from .. import connect
+
+    adapter = engine._adapter(command, reads_dev_target=True)
+    if getattr(engine, "_dev_target_read", None) is None:
+        return adapter, [
+            "--target dev widened nothing: "
+            + (
+                "DuckDB's dev target is the file this connection already reads"
+                if adapter.name == "duckdb"
+                else f"no dev namespace is configured under `{adapter.name}:` in "
+                ".dex/config.yml"
+            )
+        ]
+    derived = connect.widen_dev_reads(
+        adapter, engine.config, _dev_build_relations(engine)
+    )
+    if not derived:
+        return adapter, []
+    return adapter, [
+        "also read the namespace(s) dbt derived from the dev namespace for this "
+        f"project's models: {', '.join(derived)}"
+    ]
 
 
 def _object_gap(
@@ -725,7 +852,9 @@ def profile(
     so a model whose only build is the dev one can be profiled for drafting
     without adding the namespace dbt writes into to the source allowlist.
     ``--scope`` still only narrows, nothing is written back to config, and the
-    cost guard applies as on any profile. Prod-looking targets are refused.
+    cost guard applies as on any profile. Prod-looking targets are refused. The
+    namespaces dbt derives from the dev one for the project's models (a
+    package's ``+schema``, #1155) are read too, and named in ``notes``.
     """
 
     reads_dev_target = False
@@ -740,11 +869,11 @@ def profile(
     config = engine.config
     defs = _project_definitions(engine, use_project)
     blob_paths = blob_override_paths(config.blob_overrides)
-    adapter = (
-        engine._adapter("explore profile", reads_dev_target=True)
-        if reads_dev_target
-        else engine._adapter("explore profile")
-    )
+    dev_notes: list[str] = []
+    if reads_dev_target:
+        adapter, dev_notes = _dev_target_adapter(engine, "explore profile")
+    else:
+        adapter = engine._adapter("explore profile")
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
@@ -805,16 +934,7 @@ def profile(
 
     notes = [persist_note]
     notes.extend(_override_notes(datasets))
-    if reads_dev_target and getattr(engine, "_dev_target_read", None) is None:
-        notes.append(
-            "--target dev widened nothing: "
-            + (
-                "DuckDB's dev target is the file this connection already reads"
-                if connector == "duckdb"
-                else f"no dev namespace is configured under `{connector}:` in "
-                ".dex/config.yml"
-            )
-        )
+    notes.extend(dev_notes)
     if fresh_reused:
         window = config.profile_freshness_hours
         notes.append(
@@ -1474,6 +1594,7 @@ class _Batch:
     adapter: Adapter | None = None
     profiled: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 def query(
@@ -1482,6 +1603,7 @@ def query(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> QueryResult:
     """Run one caller-authored SELECT through the query firewall.
 
@@ -1490,11 +1612,24 @@ def query(
     produces cannot drift from the one it produced before batching existed. A
     refusal is raised here rather than reported, because with one statement there
     is no surviving neighbor for a status field to protect.
+
+    ``target`` is dev-target only (#1133), as on `explore profile`: ``'dev'``
+    reads the dev namespace, and the namespaces dbt derives from it for the
+    project's models, for this one command, so a model `transform build` just
+    wrote can be checked with an aggregate. The firewall, the PII gate,
+    values-free mode and the cost handshake are unchanged, ``--scope`` still only
+    narrows, nothing is written back to config, and prod-looking targets are
+    refused before anything opens.
     """
 
+    reads_dev_target = _reads_dev_target(engine, target)
     mode = engine.resolve_result_mode(result_mode)
     batch, shared = _run_statements(
-        engine, [(sql, None)], auto_profile=auto_profile, result_mode=mode
+        engine,
+        [(sql, None)],
+        auto_profile=auto_profile,
+        result_mode=mode,
+        reads_dev_target=reads_dev_target,
     )
     statement = batch[0]
     if statement.error is not None:
@@ -1502,6 +1637,7 @@ def query(
 
     record = statement.result
     record.result_mode = mode
+    record.notes.extend(shared.notes)
     command_args.stamp_spend(record, shared.adapter)
     if shared.profiled and command_args.cost_gate(shared.adapter) is not None:
         record.notes.append(
@@ -1517,6 +1653,7 @@ def query_batch(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> QueryBatchResult:
     """Run several caller-authored SELECTs through the query firewall, in order.
 
@@ -1537,10 +1674,15 @@ def query_batch(
     raise: nothing ran, so there is nothing to protect.
     """
 
+    reads_dev_target = _reads_dev_target(engine, target)
     mode = engine.resolve_result_mode(result_mode)
     prepared = [s if isinstance(s, tuple) else (s, None) for s in statements]
     batch, shared = _run_statements(
-        engine, prepared, auto_profile=auto_profile, result_mode=mode
+        engine,
+        prepared,
+        auto_profile=auto_profile,
+        result_mode=mode,
+        reads_dev_target=reads_dev_target,
     )
     result = QueryBatchResult(
         results=[
@@ -1583,6 +1725,7 @@ def query_batch(
         ],
         profiled_on_demand=shared.profiled,
         warnings=shared.warnings,
+        notes=list(shared.notes),
         result_mode=mode,
     )
     if shared.adapter is not None:
@@ -1593,6 +1736,28 @@ def query_batch(
                 f"object(s) and running {len(batch)} statement(s)"
             )
     return result
+
+
+def _reads_dev_target(engine: DexEngine, target: str | None) -> bool:
+    """Whether this call reads the dev target, refusing any target but the dev
+    one before anything opens (#1133), as `explore profile --target` does."""
+
+    if target is None:
+        return False
+    from ..transform.build import assert_dev_target
+
+    assert_dev_target(target, engine.config.dbt_target)
+    return True
+
+
+def _uncached(names: list[str], cache: DexCache | None) -> bool:
+    """Whether the cache cannot speak for one of ``names``: no single profiled
+    entry matches it."""
+
+    if cache is None:
+        return bool(names)
+    profiled = [d.identifier for d in cache.datasets if d.columns]
+    return any(len(match_identifier(name, profiled)) != 1 for name in names)
 
 
 def _run_statements(
@@ -1648,9 +1813,26 @@ def _run_statements(
     batch = [_Statement(i, sql, line) for i, (sql, line) in enumerate(statements)]
     size = len(batch)
     shared = _Batch(adapter=adapter)
+    # Why the connection could not open, when it could not: a refusal for a
+    # relation the cache cannot speak for then says so, rather than naming an
+    # `explore map` that would fail the same way (#1133).
+    unreachable: DexError | None = None
+    reads: dict[int, list[str]] = {}
 
     def visible_cache(value: DexCache) -> DexCache:
         return value if reads_dev_target else _without_dev_profiles(engine, value)
+
+    def acquire_adapter() -> Adapter:
+        """The call's one adapter, opened on first use."""
+        # `--target dev` reads the dev namespace, and those dbt derives from it,
+        # for this command only (#1133); every other call reads the source scope.
+        if shared.adapter is None:
+            if reads_dev_target:
+                shared.adapter, notes = _dev_target_adapter(engine, "explore query")
+                shared.notes.extend(notes)
+            else:
+                shared.adapter = engine._adapter("explore query")
+        return shared.adapter
 
     def ledger(statement: _Statement, entry: dict) -> None:
         if values_free and "reason" in entry:
@@ -1675,11 +1857,33 @@ def _run_statements(
                     {"sql": statement.sql, "decision": "refused", "reason": ""},
                 )
 
+    if not reads_dev_target:
+        # A relation `transform build` wrote into the dev namespace is outside
+        # the source scope, so the firewall would call it uncached and name an
+        # `explore profile` the caller may already have run (#1133). Said here,
+        # from the names alone, before anything opens: the fix is the flag.
+        for statement in batch:
+            if not statement.live:
+                continue
+            try:
+                assert_query_shape(statement.sql, dialect=dialect)
+                names = referenced_relations(statement.sql, dialect=dialect)
+            except QueryRefusedError:
+                continue  # refused below, by the check that owns the shape
+            message = _dev_namespace_refusal(engine, names)
+            if message is None:
+                continue
+            exc = QueryRefusedError(message)
+            statement.stop(exc, "refused")
+            ledger(
+                statement,
+                {"sql": statement.sql, "decision": "refused", "reason": str(exc)},
+            )
+
     if auto:
         # Read-only first, before anything reaches the warehouse. Resolving a
         # relation introspects the live connection, and no agent-authored
         # statement earns that until it is proven to be a single SELECT.
-        reads: dict[int, list[str]] = {}
         for statement in batch:
             if not statement.live:
                 continue
@@ -1703,8 +1907,9 @@ def _run_statements(
         named = list(dict.fromkeys(name for names in reads.values() for name in names))
         if named:
             try:
-                shared.adapter = shared.adapter or engine._adapter("explore query")
-            except DexError:
+                acquire_adapter()
+            except DexError as exc:
+                unreachable = exc
                 # No connection settles nothing, exactly as an unreadable column
                 # signature settles nothing inside `_object_gap`. That tolerance
                 # already exists one level down; it was missing here, at the
@@ -1767,6 +1972,12 @@ def _run_statements(
                 )
 
     if cache is None and any(statement.live for statement in batch):
+        if unreachable is not None:
+            raise CacheRequiredError(
+                "no exploration cache yet, and the connection could not be opened "
+                f"to profile what the statement reads on demand ({unreachable}); "
+                "fix the connection first, since `explore map` needs it too"
+            )
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` first so the query "
             "firewall knows the schema and the PII flags"
@@ -1809,11 +2020,21 @@ def _run_statements(
                 # stored and re-raised by the caller rather than raised here.
                 wrapped.__cause__ = exc
                 exc = wrapped
+            elif unreachable is not None and _uncached(
+                reads.get(statement.index, []), cache
+            ):
+                wrapped = QueryRefusedError(
+                    f"{exc}. The connection could not be opened to profile it on "
+                    f"demand ({unreachable}); fix the connection first, since "
+                    "`explore map` and `explore profile` need it too"
+                )
+                wrapped.__cause__ = exc
+                exc = wrapped
             statement.stop(exc, "refused")
 
     live = [statement for statement in batch if statement.live]
     if live:
-        shared.adapter = shared.adapter or engine._adapter("explore query")
+        acquire_adapter()
         # Priced once, above, when a profile was needed: `preflight_command` sets
         # the reservation rather than adding to it, so a second handshake here
         # would release the profile's booking. Every statement still passes the
@@ -2217,6 +2438,7 @@ def query_across(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> QueryBatchResult:
     """Run each template once per target, as one call under one handshake (#545).
 
@@ -2238,16 +2460,16 @@ def query_across(
     if not targets:
         raise RequestError("--across needs at least one target dataset")
     seen: set[str] = set()
-    for target in targets:
-        if not _ACROSS_TARGET.fullmatch(target):
+    for dataset in targets:
+        if not _ACROSS_TARGET.fullmatch(dataset):
             raise RequestError(
-                f"--across target '{target}' is not a dataset name; use letters, "
+                f"--across target '{dataset}' is not a dataset name; use letters, "
                 "digits, underscores and hyphens, dot-separated for a qualified "
                 "project.dataset"
             )
-        if target.lower() in seen:
-            raise RequestError(f"--across names '{target}' more than once")
-        seen.add(target.lower())
+        if dataset.lower() in seen:
+            raise RequestError(f"--across names '{dataset}' more than once")
+        seen.add(dataset.lower())
     for number, (sql, line) in enumerate(prepared, start=1):
         if ACROSS_PLACEHOLDER not in sql:
             where = f"line {line}" if line is not None else f"statement {number}"
@@ -2272,16 +2494,22 @@ def query_across(
     expanded: list[tuple[str, int | None]] = []
     labels: list[tuple[int, str]] = []
     for template_index, (sql, line) in enumerate(prepared):
-        for target in targets:
-            expanded.append((sql.replace(ACROSS_PLACEHOLDER, target), line))
-            labels.append((template_index, target))
+        for dataset in targets:
+            expanded.append((sql.replace(ACROSS_PLACEHOLDER, dataset), line))
+            labels.append((template_index, dataset))
 
     result = query_batch(
-        engine, expanded, auto_profile=auto_profile, result_mode=result_mode
+        engine,
+        expanded,
+        auto_profile=auto_profile,
+        result_mode=result_mode,
+        target=target,
     )
-    for statement, (template_index, target) in zip(result.results, labels, strict=True):
+    for statement, (template_index, dataset) in zip(
+        result.results, labels, strict=True
+    ):
         statement.template = template_index
-        statement.target = target
+        statement.target = dataset
     result.across = list(targets)
     return result
 
@@ -2301,19 +2529,33 @@ def _across_targets(args: argparse.Namespace) -> list[str] | None:
 def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     statements = _statements_from(args, engine)
     targets = _across_targets(args)
+    # `--target dev` (#1133), as on `explore profile`; not `--across`, whose
+    # targets are datasets substituted into the SQL.
+    dev = getattr(args, "target", None)
     if targets is not None:
         return _batch_envelope(
-            query_across(engine, statements, targets, auto_profile=_auto_profile(args))
+            query_across(
+                engine,
+                statements,
+                targets,
+                auto_profile=_auto_profile(args),
+                target=dev,
+            )
         )
     if len(statements) == 1:
         try:
             return to_envelope(
-                query(engine, statements[0][0], auto_profile=_auto_profile(args))
+                query(
+                    engine,
+                    statements[0][0],
+                    auto_profile=_auto_profile(args),
+                    target=dev,
+                )
             )
         except (QueryRefusedError, ValuesFreeError) as exc:
             return env.error_for(exc, f"query refused: {exc}")
     return _batch_envelope(
-        query_batch(engine, statements, auto_profile=_auto_profile(args))
+        query_batch(engine, statements, auto_profile=_auto_profile(args), target=dev)
     )
 
 

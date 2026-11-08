@@ -492,3 +492,154 @@ def test_several_filters_are_parenthesized_where_findings_name_them():
         verify_mod._side_label("t", ("a OR b", "c"))
         == "t (rows where (a OR b) AND (c))"
     )
+
+
+# --- a scope that narrows rows with a join (#1159) ------------------------------
+
+
+def _through(cte: str) -> str:
+    return f"with k as ({cte}) select o.id from {W}.o o left join k on o.k_id = k.id"
+
+
+@pytest.mark.parametrize(
+    ("cte", "said"),
+    [
+        (f"select t.id from {W}.t t inner join {W}.keep q on t.id = q.id", "inner"),
+        (f"select t.id from {W}.t t join {W}.keep q on t.id = q.id", "inner"),
+        (f"select t.id from {W}.t t join {W}.keep q using (id)", "inner"),
+        (f"select t.id from {W}.t t, {W}.keep q", "inner"),
+        (f"select t.id from {W}.t t cross join {W}.keep q", "cross"),
+        (f"select t.id from {W}.t t right join {W}.keep q on t.id = q.id", "right"),
+        # The column is read from the joined side, which a LEFT join narrows
+        # to the rows its FROM matches.
+        (f"select q.id from {W}.t t left join {W}.keep q on t.id = q.id", "left"),
+        # A LEFT join keeps `t`, but a later inner join can still drop it.
+        (
+            f"select t.id from {W}.t t left join {W}.a a on t.id = a.id "
+            f"join {W}.keep q on t.id = q.id",
+            "inner",
+        ),
+    ],
+)
+def test_a_scope_whose_join_can_drop_the_key_rows_is_filtered_cte(cte, said):
+    candidates, skipped = _joins(_through(cte))
+    assert not [c for c in candidates if c.from_relation == "warehouse.main.o"]
+    (skip,) = [s for s in skipped if "o.k_id" in s.join]
+    assert skip.code == "filtered_cte"
+    assert "CTE `k`" in skip.reason
+    assert f"{said} join" in skip.reason
+
+
+def test_an_inner_join_two_hops_down_is_named_where_it_is():
+    candidates, (skip,) = _joins(
+        f"with k as (select t.id from {W}.t t join {W}.keep q on t.id = q.id), "
+        "k2 as (select id from k) "
+        f"select o.id from {W}.o o left join k2 on o.k_id = k2.id"
+    )
+    assert not [c for c in candidates if c.from_relation == "warehouse.main.o"]
+    assert skip.code == "filtered_cte"
+    assert "CTE `k`" in skip.reason
+    assert "inner join" in skip.reason
+
+
+def test_an_inner_join_in_a_subquery_is_filtered_cte_too():
+    candidates, (skip,) = _joins(
+        f"select o.id from {W}.o o left join (select t.id from {W}.t t "
+        f"join {W}.keep q on t.id = q.id) k on o.k_id = k.id"
+    )
+    assert not [c for c in candidates if c.from_relation == "warehouse.main.o"]
+    assert skip.code == "filtered_cte"
+    assert "a subquery" in skip.reason
+
+
+@pytest.mark.parametrize(
+    "cte",
+    [
+        f"select t.id from {W}.t t left join {W}.u u on t.id = u.id",
+        f"select t.id from {W}.t t left outer join {W}.u u on t.id = u.id",
+        f"select t.id from {W}.t t full join {W}.u u on t.id = u.id",
+        f"select t.id from {W}.u u right join {W}.t t on t.id = u.id",
+        f"select t.id from {W}.t t left join {W}.u u on t.id = u.id "
+        f"left join {W}.v v on u.id = v.id",
+    ],
+)
+def test_a_scope_whose_joins_keep_every_key_row_still_resolves_through(cte):
+    candidates, skipped = _joins(_through(cte))
+    assert not [s for s in skipped if "o.k_id" in s.join]
+    (candidate,) = [c for c in candidates if c.from_relation == "warehouse.main.o"]
+    assert candidate.to_relation == "warehouse.main.t"
+    assert candidate.to_columns == ("id",)
+    assert candidate.to_filters == ()
+
+
+def test_an_output_read_through_an_inner_join_keeps_its_lineage():
+    # Lineage asks which physical column an output is, which a join that
+    # drops rows does not change.
+    tree = sqlglot.parse_one(
+        f"with k as (select t.id, t.name from {W}.t t join {W}.keep q "
+        "on t.id = q.id) select * from k",
+        read="duckdb",
+    )
+    lineage = verify_mod._output_lineage(tree, sql_shape)
+    assert lineage["name"] == ("warehouse.main.t", "name")
+
+
+def _keep(repo, targets: list[str], keep: list[str], purchases: list[tuple]) -> None:
+    def rows(values):
+        return ", ".join(f"({v!r})" for v in values)
+
+    repo.sql(
+        "CREATE TABLE target (id VARCHAR)",
+        "CREATE TABLE keep (id VARCHAR)",
+        "CREATE TABLE purchases (purchase_id INTEGER, target_id VARCHAR)",
+        f"INSERT INTO target VALUES {rows(targets)}",
+        f"INSERT INTO keep VALUES {rows(keep)}",
+        "INSERT INTO purchases VALUES "
+        + ", ".join(f"({o}, {t!r})" for o, t in purchases),
+    )
+
+
+def test_a_key_the_inner_join_drops_is_not_a_match(maintain_repo):
+    """Every order key exists in `target`, but the CTE keeps only the targets
+    `keep` names. Probed against the whole of `target` the join is covered;
+    over the rows the model joins one key matches nothing."""
+
+    _keep(
+        maintain_repo,
+        targets=["t_a", "t_b"],
+        keep=["t_a"],
+        purchases=[(1, "t_a"), (2, "t_b")],
+    )
+    sql = (
+        f"with k as (select t.id from {W}.target t inner join {W}.keep q "
+        "on t.id = q.id) "
+        f"select o.purchase_id, k.id as target_id from {W}.purchases o "
+        "left join k on o.target_id = k.id"
+    )
+    _model(maintain_repo, sql)
+    data = _verify(maintain_repo, "rpt_events")
+    (record,) = [r for r in _records(data, "rpt_events") if "o.target_id" in r["join"]]
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "filtered_cte"
+    assert "CTE `k`" in record["reason"]
+    assert "inner join" in record["reason"]
+
+
+def test_a_left_join_that_keeps_every_row_is_still_measured(maintain_repo):
+    _keep(
+        maintain_repo,
+        targets=["t_a", "t_b"],
+        keep=["t_a"],
+        purchases=[(1, "t_a"), (2, "t_b")],
+    )
+    sql = (
+        f"with k as (select t.id from {W}.target t left join {W}.keep q "
+        "on t.id = q.id) "
+        f"select o.purchase_id, k.id as target_id from {W}.purchases o "
+        "left join k on o.target_id = k.id"
+    )
+    _model(maintain_repo, sql)
+    data = _verify(maintain_repo, "rpt_events")
+    (record,) = [r for r in _records(data, "rpt_events") if "o.target_id" in r["join"]]
+    assert record["status"] == "satisfied"
+    assert record["measured"]["matched_rows"] == 2

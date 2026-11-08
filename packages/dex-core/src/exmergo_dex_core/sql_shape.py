@@ -187,19 +187,71 @@ def match_key(node: exp.Expression | None) -> str:
     return text(node).lower()
 
 
-def expression_key(node: exp.Expression) -> str:
-    """Match an expression without treating column qualifiers as meaningful.
+def unqualified_key(node: exp.Expression) -> str:
+    """A comparison form in which re-aliasing or re-casing is not a change.
 
-    A table alias can change while the expression and its effect remain the
-    same. Keep :func:`text` for diagnostics; this key is only for comparison.
+    Identifiers and function names are lowercased. A column's table qualifier
+    is dropped where its own select reads one relation and defines it, since
+    the column can only come from there. Otherwise the qualifier is replaced by
+    the relation it names, found by walking out through the enclosing selects:
+    ``a.active`` edited to ``b.active`` across a join is a change, and so is a
+    correlated subquery's ``a.id`` edited to ``b.id`` or to its own ``f.id``,
+    while renaming ``a`` is not. An unqualified column in a select that reads
+    several relations stays unqualified and so differs from a qualified one.
+
+    String literals keep their case: ``status = 'OPEN'`` edited to
+    ``status = 'open'`` can select different rows, so it must not compare equal.
     """
 
     bare = node.copy()
-    for column in bare.find_all(exp.Column):
-        column.set("table", None)
+    sources = {
+        id(select): _source_names(select) for select in bare.find_all(exp.Select)
+    }
+    for column in list(bare.find_all(exp.Column)):
+        qualifier = column.table.lower()
+        nearest = column.find_ancestor(exp.Select)
+        owner = nearest
+        while owner is not None and qualifier not in sources[id(owner)]:
+            owner = owner.find_ancestor(exp.Select)
+        if not qualifier or (
+            owner in (nearest, None)
+            and (nearest is None or len(sources[id(nearest)]) <= 1)
+        ):
+            column.set("table", None)
+        elif owner is None:
+            column.set("table", exp.to_identifier(qualifier))
+        else:
+            column.set("table", exp.to_identifier(sources[id(owner)][qualifier]))
         column.set("db", None)
         column.set("catalog", None)
-    return match_key(bare)
+    for select in bare.find_all(exp.Select):
+        for relation in _relations(select):
+            relation.set("alias", None)
+    for identifier in bare.find_all(exp.Identifier):
+        identifier.set("this", identifier.this.lower())
+    return bare.sql(comments=False, normalize_functions="lower").strip()
+
+
+def _source_names(select: exp.Select) -> dict[str, str]:
+    """Each relation a select reads, keyed by the name its columns qualify it
+    with, mapped to the relation itself and its occurrence (a self-join's two
+    sides stay apart)."""
+
+    seen: dict[str, int] = {}
+    named: dict[str, str] = {}
+    for relation in _relations(select):
+        key = relation_key(relation)
+        seen[key] = seen.get(key, 0) + 1
+        named[relation.alias_or_name.lower()] = f"{key}#{seen[key]}"
+    return named
+
+
+def _relations(select: exp.Select) -> list[exp.Expression]:
+    """The relations a select reads directly: its FROM and each join."""
+
+    from_ = select.args.get("from_") or select.args.get("from")
+    relations = [from_.this] if from_ is not None else []
+    return relations + [join.this for join in select.args.get("joins") or []]
 
 
 def relation_key(node: exp.Expression | None) -> str:
@@ -236,19 +288,27 @@ class Join:
 
     @property
     def key(self) -> str:
+        """The relation identity with its alias removed."""
+
         return relation_key(self.relation)
 
     @property
     def name(self) -> str:
+        """The SQL text of this join's relation."""
+
         return text(self.relation)
 
     @property
     def label(self) -> str:
+        """A readable summary of the joined relation and its ON condition."""
+
         on = f" on {text(self.on)}" if self.on is not None else ""
         return f"{self.side} join {self.name}{on}"
 
 
 def joins(select: exp.Select) -> list[Join]:
+    """Return the SELECT's joins with their type, relation, and condition."""
+
     out = []
     for node in select.args.get("joins") or []:
         side = " ".join(
@@ -268,11 +328,13 @@ def joins(select: exp.Select) -> list[Join]:
 
 
 def group_by(select: exp.Select) -> list[str]:
+    """Return the SELECT's GROUP BY expressions as readable SQL text."""
+
     group = select.args.get("group")
     return [] if group is None else [text(e) for e in group.expressions]
 
 
-def group_by_key(select: exp.Select) -> list[str]:
+def group_by_key(select: exp.Select, dialect: str = "") -> list[str]:
     """The matching form of a GROUP BY, retaining its expression order.
 
     A column qualifier is canonicalized to its source relation only when that
@@ -284,21 +346,32 @@ def group_by_key(select: exp.Select) -> list[str]:
     if group is None:
         return []
 
-    relations = [from_relation(select), *(join.relation for join in joins(select))]
-    sources = [relation for relation in relations if relation is not None]
-    by_qualifier: dict[str, exp.Expression | None] = {}
-    relation_counts: dict[str, int] = {}
-    for relation in sources:
-        identity = relation_key(relation)
-        relation_counts[identity] = relation_counts.get(identity, 0) + 1
+    sources = _relations(select)
+    by_qualifier: dict[str, tuple[int, exp.Expression] | None] = {}
+    for position, relation in enumerate(sources):
         qualifier = relation.alias_or_name.lower()
         if qualifier in by_qualifier:
             by_qualifier[qualifier] = None
         else:
-            by_qualifier[qualifier] = relation
+            by_qualifier[qualifier] = (position, relation)
+
+    # BigQuery resolves an unqualified GROUP BY name to a projection alias
+    # before looking for a source column. Expand that alias first so
+    # ``UPPER(last_name) AS last_name ... GROUP BY last_name`` does not compare
+    # equal to ``GROUP BY singers.last_name``. Other dialects retain their own
+    # name-resolution behavior; do not impose BigQuery's rule on them.
+    aliases = (
+        {
+            projection.alias.lower(): projection.this
+            for projection in select.expressions
+            if isinstance(projection, exp.Alias)
+        }
+        if dialect.lower() == "bigquery"
+        else {}
+    )
 
     return [
-        _group_expression_key(expression, sources, by_qualifier, relation_counts)
+        _group_expression_key(expression, sources, by_qualifier, aliases)
         for expression in group.expressions
     ]
 
@@ -306,12 +379,23 @@ def group_by_key(select: exp.Select) -> list[str]:
 def _group_expression_key(
     expression: exp.Expression,
     sources: list[exp.Expression],
-    by_qualifier: dict[str, exp.Expression | None],
-    relation_counts: dict[str, int],
+    by_qualifier: dict[str, tuple[int, exp.Expression] | None],
+    aliases: dict[str, exp.Expression],
 ) -> str:
     """Normalize only columns whose source relation this SELECT can establish."""
 
     bare = expression.copy()
+    if aliases:
+        if (
+            isinstance(bare, exp.Column)
+            and not bare.table
+            and bare.name.lower() in aliases
+        ):
+            bare = aliases[bare.name.lower()].copy()
+        for column in list(bare.find_all(exp.Column)):
+            if not column.table and column.name.lower() in aliases:
+                column.replace(aliases[column.name.lower()].copy())
+
     for column in bare.find_all(exp.Column):
         # A nested query has its own source namespace. Leave it alone rather
         # than resolving its columns against this SELECT's FROM and JOINs.
@@ -326,19 +410,19 @@ def _group_expression_key(
             continue
 
         if column.table:
-            relation = by_qualifier.get(column.table.lower())
+            source = by_qualifier.get(column.table.lower())
         elif len(sources) == 1:
-            relation = sources[0]
+            source = (0, sources[0])
         else:
             # Without schema metadata an unqualified reference in a join is
             # ambiguous; retaining its spelling is the safe comparison.
-            relation = None
+            source = None
+
+        if source is None:
+            continue
+        position, relation = source
 
         if not isinstance(relation, exp.Table):
-            continue
-        if relation_counts[relation_key(relation)] != 1:
-            # A self-join has multiple relation instances even if their table
-            # names match. Do not collapse those distinct column identities.
             continue
 
         relation_db = relation.args.get("db")
@@ -353,7 +437,10 @@ def _group_expression_key(
         ):
             continue
 
-        column.set("table", relation.this.copy())
+        # Position distinguishes joined relations and self-join instances while
+        # allowing a replacement relation at the same source position to be
+        # reported once by relation-change detection.
+        column.set("table", exp.to_identifier(f"__source_{position}"))
         column.set("db", relation_db.copy() if relation_db is not None else None)
         column.set(
             "catalog", relation_catalog.copy() if relation_catalog is not None else None

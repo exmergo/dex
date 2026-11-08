@@ -2018,9 +2018,16 @@ class _FilterWalk:
     quoted, the form the coverage probe is authored in before it is transpiled
     to the connector's dialect. ``scopes`` names each filtering scope as the
     model writes it, for the record. ``code``/``reason`` is the first failure.
+
+    ``keep_rows`` is set by the join contract, which measures the rows a model
+    joins: a scope whose own join can drop rows of the relation a column reads
+    is then refused like any other reducer (#1159). Lineage leaves it unset,
+    since a join that drops rows does not change which physical column an
+    output is.
     """
 
     dialect: str | None = None
+    keep_rows: bool = False
     filters: list[tuple[str, str]] = field(default_factory=list)
     scopes: list[str] = field(default_factory=list)
     code: str | None = None
@@ -2066,6 +2073,38 @@ class _FilterWalk:
         if name not in self.scopes:
             self.scopes.append(name)
         return True
+
+    def narrows(self, select, source, sql_shape) -> bool:
+        """Whether one of ``select``'s own joins can drop rows of ``source``,
+        the relation in it a column is read from; record why if so (#1159).
+
+        Joins associate left to right, so ``source`` keeps every row only when
+        the join that brings it in (if any) keeps its right side, a RIGHT or
+        FULL join, and every join after that keeps its left side, a LEFT or
+        FULL join. An inner join, a bare JOIN, a comma join and a CROSS JOIN
+        can all drop rows (a CROSS JOIN with an empty side, or an UNNEST of an
+        empty array, keeps none), so probing the whole relation underneath
+        would count keys the model never joins. Semi and anti joins never
+        reach here: :func:`~..sql_shape.reducing_clauses` already names them.
+        """
+
+        if not self.keep_rows:
+            return False
+        joins = sql_shape.joins(select)
+        start = next((i for i, j in enumerate(joins) if j.relation is source), None)
+        for i, join in enumerate(joins):
+            if start is not None and i < start:
+                continue
+            side = join.side.split(" ")[0]
+            kept = ("right", "full") if i == start else ("left", "full")
+            if side not in kept:
+                self._refuse(
+                    _scope_label(select),
+                    f"its {join.label}, which can drop rows of "
+                    f"`{source.alias_or_name}`",
+                )
+                return True
+        return False
 
     def _refuse(self, name: str, why: str) -> bool:
         self.fail(
@@ -2199,7 +2238,9 @@ def _resolve_within_scope(
 
     Refuses -- rather than resolving through -- any scope that reduces rows
     (:func:`~..sql_shape.reducing_clauses`: a WHERE, a HAVING, a GROUP BY, a
-    scalar aggregate, a DISTINCT, a LIMIT). ``select * from customers where
+    scalar aggregate, a DISTINCT, a LIMIT, a semi or anti join; for the join
+    contract, also a join that can drop rows of the relation the column is
+    read from, :meth:`_FilterWalk.narrows`, #1159). ``select * from customers where
     active = true``
     projects the same column names the physical ``customers`` table has,
     but not the same rows: probing a join against the whole table when the
@@ -2239,7 +2280,7 @@ def _resolve_within_scope(
             source = _qualified_source(inner, scope_relations)
             return (
                 None
-                if source is None
+                if source is None or (walk and walk.narrows(select, source, sql_shape))
                 else _resolve_join_column(
                     source, inner.name, cte_scopes, sql_shape, seen, walk
                 )
@@ -2251,7 +2292,7 @@ def _resolve_within_scope(
             source = _qualified_source(proj, scope_relations)
             return (
                 None
-                if source is None
+                if source is None or (walk and walk.narrows(select, source, sql_shape))
                 else _resolve_join_column(
                     source, proj.name, cte_scopes, sql_shape, seen, walk
                 )
@@ -2590,7 +2631,8 @@ def _model_joins(
                 # Each side resolves with its own walk, which carries a
                 # supported filter down to the physical relation (#1085) and
                 # records why an unsupported one stays unchecked.
-                left_walk, right_walk = _FilterWalk(dialect), _FilterWalk(dialect)
+                left_walk = _FilterWalk(dialect, keep_rows=True)
+                right_walk = _FilterWalk(dialect, keep_rows=True)
                 left_resolved = _resolve_join_column(
                     left_relation, left.name, cte_scopes, sql_shape, walk=left_walk
                 )
@@ -2765,13 +2807,18 @@ class ModelJoinContext:
     computed column has no entry. ``columns`` is each output column's declared
     ``config.meta.dex`` (lowered keys). ``parents`` maps every project node
     name (lowered) to its relation, so a ``references`` can be lined up with
-    the relation a join reads.
+    the relation a join reads. ``assumptions`` is the model's declared
+    ``assumptions`` entries and ``population_filters`` the columns its
+    ``population.filters`` entries name (lowered), which say an INNER join's
+    unmatched rows are the population the model means to drop (#1162).
     """
 
     relation: str | None = None
     lineage: dict[str, tuple[str, str]] = field(default_factory=dict)
     columns: dict[str, dict] = field(default_factory=dict)
     parents: dict[str, str] = field(default_factory=dict)
+    assumptions: list[dict] = field(default_factory=list)
+    population_filters: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2870,6 +2917,9 @@ def plan_join_contract(
                 column_name = column.get("name") or key
                 if isinstance(dex, dict) and isinstance(column_name, str):
                     declared[column_name.lower()] = dex
+            assumptions, population_filters = _model_population_intent(
+                entry_meta(node).get("dex")
+            )
             plan.context[name] = ModelJoinContext(
                 relation=strip_relation_quoting(relation)
                 if isinstance(relation, str) and relation
@@ -2877,8 +2927,37 @@ def plan_join_contract(
                 lineage=_output_lineage(tree, sql_shape),
                 columns=declared,
                 parents=parents,
+                assumptions=assumptions,
+                population_filters=population_filters,
             )
     return plan
+
+
+def _model_population_intent(dex) -> tuple[list[dict], tuple[str, ...]]:
+    """The model-level ``assumptions`` entries that name a column, and the
+    columns its ``population.filters`` entries name (lowered), from its
+    ``config.meta.dex`` (#1162)."""
+
+    if not isinstance(dex, dict):
+        return [], ()
+    stated = dex.get("assumptions")
+    assumptions = [
+        entry
+        for entry in (stated if isinstance(stated, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("column"), str)
+        and entry["column"].strip()
+    ]
+    population = dex.get("population")
+    entries = population.get("filters") if isinstance(population, dict) else None
+    filters = tuple(
+        entry["column"].strip().lower()
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("column"), str)
+        and entry["column"].strip()
+    )
+    return assumptions, filters
 
 
 def join_contract_plan(
@@ -2996,6 +3075,10 @@ class JoinPolicy:
     declared_optional: bool
     #: NULL driving keys count as unmatched rather than ineligible.
     null_keys_unmatched_by: str | None
+    #: On an INNER join the declaration does not require, what in it says the
+    #: unmatched driving rows are meant to be dropped: an ``assumptions`` entry
+    #: or a ``population.filters`` entry naming the driving key column (#1162).
+    unmatched_accounted_for: dict | None = None
 
 
 def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinPolicy:
@@ -3007,6 +3090,11 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
     whose ``references`` names the joined relation (every key must exist in the
     parent). NULL driving keys count against coverage only when the column
     carrying them is declared ``null_rule: never``.
+
+    An INNER join that is not required drops its unmatched driving rows, which
+    is a filter when the model means it: an ``assumptions`` entry whose
+    ``column`` names the driving key column, or a ``population.filters`` entry
+    on it, says so, and is returned as what accounts for those rows (#1162).
     """
 
     if ctx is None:
@@ -3050,13 +3138,40 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
         _null_allowed(ctx.columns.get(c)) for c in derived
     )
     counted = next((c for c in driving if _never_null(ctx.columns.get(c))), None)
+    inner = candidate.side.split(" ")[0] == "inner" if candidate.side else False
     return JoinPolicy(
         derived,
         driving,
         required_by,
         declared_optional,
         f"{counted} is declared null_rule: never" if counted else None,
+        _unmatched_accounted_for(from_columns | set(driving), ctx)
+        if inner and required_by is None
+        else None,
     )
+
+
+def _unmatched_accounted_for(keys: set[str], ctx: ModelJoinContext) -> dict | None:
+    """The declaration entry that names one of ``keys`` (the driving key's
+    physical columns and the output columns carrying it, lowered): the first
+    such ``assumptions`` entry, else the first ``population.filters`` entry,
+    or None (#1162)."""
+
+    for assumption in ctx.assumptions:
+        column = assumption.get("column")
+        if isinstance(column, str) and column.strip().lower() in keys:
+            return {
+                "by": "assumption",
+                **{
+                    k: assumption[k]
+                    for k in ("column", "decision", "chosen", "evidence")
+                    if assumption.get(k) is not None
+                },
+            }
+    for column in ctx.population_filters:
+        if column in keys:
+            return {"by": "population_filter", "column": column}
+    return None
 
 
 def _resolve_join_relationships(
@@ -3490,7 +3605,11 @@ def join_coverage(
       (``threshold_source: default``, stated in ``data``), and on a LEFT join
       unmatched rows are the optional relationship a LEFT join writes: recorded
       as evidence, with ``join_orphans`` withheld and ``join_zero_overlap``
-      ranked medium.
+      ranked medium. On an INNER join whose unmatched rows the declaration
+      accounts for (an ``assumptions`` entry or a ``population.filters`` entry
+      naming the driving key column), the join is the model's filter: the
+      record is ``satisfied``, keeps its counts and names that entry under
+      ``unmatched_accounted_for`` (#1162).
     - ``join_field_all_null`` (high): a column the join supplies, declared
       ``null_rule: never``, is NULL on every row of the built relation.
       ``join_field_newly_null`` (medium): one with no declared rule that is
@@ -3744,6 +3863,7 @@ def _judge_coverage(
         else ""
     )
 
+    accounted = policy.unmatched_accounted_for if unmatched_rows else None
     if matched_rows == 0:
         code = "join_no_match"
         severity = "low" if policy.declared_optional and not required else "high"
@@ -3793,6 +3913,16 @@ def _judge_coverage(
         record["status"] = "satisfied"
         if left and unmatched_rows:
             record["optional_unmatched"] = True
+        if accounted is not None:
+            record["unmatched_accounted_for"] = dict(accounted)
+        return None
+
+    if accounted is not None and code != "join_no_match":
+        # An INNER join used as a filter, and the declaration says so: the
+        # rows it drops are the population the model means (#1162). The counts
+        # stay on the record, with the finding the default would have raised.
+        record["status"] = "satisfied"
+        record["unmatched_accounted_for"] = {**accounted, "withheld_finding": code}
         return None
 
     record["status"] = "contradicted"

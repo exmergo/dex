@@ -1546,3 +1546,319 @@ def test_downstream_tests_are_priced_with_the_mutant_spliced_beneath_the_mart():
     assert every["(baseline)"] > kept["(baseline)"]
     dropped = next(m for m in batch.mutants if m.operator == "predicate_drop")
     assert kept[f"{dropped.id} predicate_drop"] < kept["(baseline)"]
+
+
+# --- the incremental branch (#1132) --------------------------------------------
+
+
+def _incremental_batch():
+    """A batch with one full-build filter and a watermark in the branch."""
+
+    this = mutation.ParentRelation(rendered=mutation.THIS_SENTINEL, jinja="{{ this }}")
+    full = mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    branch = mutation.prepare(
+        "select a from t where a > 1 and a >= (select max(a) from "  # noqa: S608
+        f"{mutation.THIS_SENTINEL})",
+        dialect="duckdb",
+        parents=[this],
+    )
+    return mutation.enumerate_mutants(full, incremental=branch)
+
+
+class _ProgramCopy:
+    """A copy whose tests answer by which program the model file holds.
+
+    The full build's not_null passes on everything. The incremental unit test
+    passes on the branch's identity only, so it fails on every branch mutant,
+    and a baseline that sent it the full build would leave it nothing to
+    testify with."""
+
+    def __init__(self, batch):
+        self.branch_identity = batch.incremental.identity
+        self.body = ""
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def write(self, _path, text):
+        self.body = text
+
+    def test(self, select, exclude=()):
+        self.calls.append((select, list(exclude)))
+        if select.startswith("unit_test:"):
+            status = "pass" if self.body == self.branch_identity else "fail"
+            return {
+                "nodes": [
+                    {
+                        "unique_id": "unit_test.p.fct.fct_incremental",
+                        "name": "fct_incremental",
+                        "status": status,
+                        "execution_time": 1.0,
+                    }
+                ]
+            }
+        assert self.body != self.branch_identity
+        return {
+            "nodes": [
+                {
+                    "unique_id": "test.p.not_null.abc",
+                    "name": "not_null",
+                    "status": "pass",
+                    "execution_time": 1.0,
+                }
+            ]
+        }
+
+
+def _incremental_test():
+    """The one unit test that runs the branch in these cases."""
+
+    from exmergo_dex_core.transform.commands import IncrementalUnitTest
+
+    return IncrementalUnitTest(
+        unique_id="unit_test.p.fct.fct_incremental",
+        name="fct_incremental",
+        select="fct_incremental",
+    )
+
+
+_INCREMENTAL_TEST = _incremental_test()
+
+
+def _run(shadow, batch, project, **kwargs):
+    """Run `_run_mutants` free and locally, overriding only what a case needs."""
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.commands import _run_mutants
+
+    defaults = {
+        "model": "fct",
+        "paradigm": Paradigm.FREE_LOCAL,
+        "connector": "duckdb",
+        "store": FilesystemStore(project.parent),
+        "ceiling": None,
+        "estimate": None,
+        "mutation_mod": mutation,
+        "incremental_tests": [_INCREMENTAL_TEST],
+    }
+    result = _run_mutants(shadow, "models/fct.sql", batch, **{**defaults, **kwargs})
+    return result, result.pop("_meta")
+
+
+def test_each_program_runs_against_its_own_tests_and_is_scored_apart(project):
+    """Full runs exclude the branch's test; branch runs select only it."""
+
+    batch = _incremental_batch()
+    shadow = _ProgramCopy(batch)
+
+    result, (runs, _spend, _warnings) = _run(shadow, batch, project)
+
+    full_runs = [call for call in shadow.calls if call[0] == "fct"]
+    branch_runs = [call for call in shadow.calls if call[0] != "fct"]
+    assert len(full_runs) == len(batch.mutants) + 1
+    assert all("unit_test:fct_incremental" in exclude for _, exclude in full_runs)
+    assert {select for select, _ in branch_runs} == {"unit_test:fct_incremental"}
+    assert len(branch_runs) == len(batch.incremental.mutants) + 1
+    assert runs == len(shadow.calls)
+    assert result["counts"]["survived"] == len(batch.mutants)
+    assert result["score"] == 0.0
+    branch = result["incremental"]
+    assert branch["counts"]["killed"] == len(batch.incremental.mutants)
+    assert branch["score"] == 1.0
+    assert branch["cap"]["generated"] == len(batch.incremental.mutants)
+
+
+def test_a_model_tested_only_through_its_branch_runs_no_full_build_mutant(project):
+    """When every test overrides is_incremental, nothing runs the full build:
+    its mutants survive by construction, not compared, without a run."""
+
+    from exmergo_dex_core.transform.commands import _EquivalenceCheck
+
+    batch = _incremental_batch()
+    shadow = _ProgramCopy(batch)
+
+    result, (_runs, _spend, warnings) = _run(
+        shadow,
+        batch,
+        project,
+        full_tests=False,
+        equivalence=_EquivalenceCheck(reason="no test runs the full build"),
+    )
+
+    assert all(select != "fct" for select, _ in shadow.calls)
+    assert result["baseline"] == {"tests": [], "excluded": []}
+    assert {m["status"] for m in result["mutants"]} == {"survived"}
+    assert {m["equivalence"]["status"] for m in result["mutants"]} == {"not_checked"}
+    assert result["incremental"]["score"] == 1.0
+    assert any("runs its full build" in w for w in warnings)
+
+
+def test_a_budget_spent_on_the_full_build_leaves_the_branch_not_run(project):
+    """The full build runs first, so a spent budget reaches the branch as not_run."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    batch = _incremental_batch()
+    shadow = _ProgramCopy(batch)
+    prices = {"(baseline)": 10.0, **{m.id: 10.0 for m in batch.mutants}}
+    prices.update({m.id: 0.0 for m in batch.incremental.mutants})
+
+    result, (_runs, _spend, warnings) = _run(
+        shadow,
+        batch,
+        project,
+        paradigm=Paradigm.COMPUTE_TIME,
+        connector="snowflake",
+        ceiling=5.0,
+        prices=prices,
+    )
+
+    assert all(select == "fct" for select, _ in shadow.calls)
+    branch = result["incremental"]
+    assert branch["counts"]["not_run"] == len(batch.incremental.mutants)
+    assert branch["score"] is None
+    assert "budget" in branch["reason"]
+    assert any("before the incremental branch ran" in w for w in warnings)
+
+
+def test_the_branch_runs_unit_tests_only_and_prices_at_zero():
+    """Unit tests read fixtures, so the branch's runs are priced at zero."""
+
+    from exmergo_dex_core.transform.commands import _price_mutations
+
+    batch = _incremental_batch()
+    _estimate, per_table, prices, _notes = _price_mutations(
+        _TextPricedAdapter(),
+        _PricingCopy(None),
+        "models/fct.sql",
+        batch,
+        {"name": "fct"},
+        mutation,
+        incremental_tests=[_INCREMENTAL_TEST],
+    )
+
+    assert per_table["(incremental branch unit tests)"] == 0.0
+    assert prices["(incremental baseline)"] == 0.0
+    assert all(prices[m.id] == 0.0 for m in batch.incremental.mutants)
+    assert all(prices[m.id] > 0.0 for m in batch.mutants)
+
+
+def _versioned_manifest(*, full_unit_test: bool):
+    """A model at two versions, each with the incremental unit test dbt
+    instantiates once per version, and optionally a full-build one on v1."""
+
+    units = {}
+    for version in (1, 2):
+        units[f"unit_test.p.fct.check_v{version}"] = {
+            "name": "check",
+            "model": "fct",
+            "version": version,
+            "depends_on": {"nodes": [f"model.p.fct.v{version}"]},
+            "overrides": {"macros": {"is_incremental": True}},
+        }
+    if full_unit_test:
+        units["unit_test.p.fct.bands_v1"] = {
+            "name": "bands",
+            "model": "fct",
+            "version": 1,
+            "depends_on": {"nodes": ["model.p.fct.v1"]},
+            "overrides": {"macros": {"is_incremental": False}},
+        }
+    nodes = {
+        f"model.p.fct.v{v}": {
+            "name": "fct",
+            "unique_id": f"model.p.fct.v{v}",
+            "version": v,
+            "resource_type": "model",
+        }
+        for v in (1, 2)
+    }
+    return {"nodes": nodes, "unit_tests": units}
+
+
+def test_a_versioned_models_branch_tests_are_this_versions_instances():
+    """dbt runs one instance of a unit test per version, named <name>_v<N>, and
+    its selector matches the definition's name. Only the mutated version's
+    instance is the branch's test, reported under the name a run gives it."""
+
+    from exmergo_dex_core.transform.commands import _incremental_unit_tests
+
+    manifest = _versioned_manifest(full_unit_test=False)
+
+    tests = _incremental_unit_tests(manifest, manifest["nodes"]["model.p.fct.v1"])
+
+    assert [(t.unique_id, t.name, t.select) for t in tests] == [
+        ("unit_test.p.fct.check_v1", "check_v1", "check")
+    ]
+
+
+@pytest.mark.parametrize("full_unit_test", [False, True])
+def test_a_versioned_model_runs_its_full_build_only_with_a_full_build_test(
+    full_unit_test,
+):
+    """Compared by unique id: v2's incremental test and v1's own incremental
+    test never count as a test of v1's full build."""
+
+    from exmergo_dex_core.transform.commands import (
+        _incremental_unit_tests,
+        _runs_full_build,
+    )
+
+    manifest = _versioned_manifest(full_unit_test=full_unit_test)
+    node = manifest["nodes"]["model.p.fct.v1"]
+
+    runs = _runs_full_build(manifest, node, _incremental_unit_tests(manifest, node))
+
+    assert runs is full_unit_test
+
+
+def test_only_the_mutated_versions_instance_testifies_for_the_branch(project):
+    """The selector also runs the other version's instance, and any same-named
+    unit test on another model, which read their own files and pass against
+    every mutant; they are left out of the baseline and the verdicts."""
+
+    from exmergo_dex_core.transform.commands import IncrementalUnitTest
+
+    batch = _incremental_batch()
+
+    class _BothVersions(_ProgramCopy):
+        """Reports the other version's instance beside this version's."""
+
+        def test(self, select, exclude=()):
+            summary = super().test(select, exclude)
+            if select.startswith("unit_test:"):
+                summary["nodes"] = [
+                    {
+                        **summary["nodes"][0],
+                        "unique_id": "unit_test.p.fct.check_v1",
+                        "name": "check_v1",
+                    },
+                    {
+                        "unique_id": "unit_test.p.fct.check_v2",
+                        "name": "check_v2",
+                        "status": "pass",
+                        "execution_time": 1.0,
+                    },
+                    # a same-named test on another model, which the selector
+                    # also matches and whose status must not overwrite v1's
+                    {
+                        "unique_id": "unit_test.p.other.check_v1",
+                        "name": "check_v1",
+                        "status": "pass",
+                        "execution_time": 1.0,
+                    },
+                ]
+            return summary
+
+    shadow = _BothVersions(batch)
+    test = IncrementalUnitTest("unit_test.p.fct.check_v1", "check_v1", "check")
+
+    result, _meta = _run(shadow, batch, project, incremental_tests=[test])
+
+    branch = result["incremental"]
+    assert {select for select, _ in shadow.calls if select != "fct"} == {
+        "unit_test:check"
+    }
+    assert branch["tests"] == ["check_v1"]
+    assert [t["name"] for t in branch["baseline"]["tests"]] == ["check_v1"]
+    assert branch["counts"]["killed"] == len(batch.incremental.mutants)
+    for mutant in branch["mutants"]:
+        assert mutant["caught_by"] == ["check_v1"]

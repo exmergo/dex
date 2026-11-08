@@ -88,7 +88,7 @@ def test_reformatting_and_renaming_an_alias_are_silent():
     authored = (
         "WITH v AS (SELECT s.visit_date, COUNT(*) AS visits,\n"
         "  AVG(s.duration) AS avg_duration FROM {{ ref('stg_visits') }} AS s\n"
-        "  GROUP BY visit_date)\n"
+        "  GROUP BY s.visit_date)\n"
         "SELECT visit_date, visits, avg_duration, CAST(site_id AS INTEGER) AS site_id "
         "FROM v"
     )
@@ -133,7 +133,67 @@ def test_group_by_alias_rename_keeps_relation_identity():
     assert "group_by_changed" not in {change.kind for change in scope.changes}
 
 
+def test_projection_alias_is_not_rewritten_as_same_named_source_column():
+    """BigQuery's projected alias can represent a different grouping value."""
+
+    prior = "select upper(last_name) as last_name from singers group by last_name"
+    authored = (
+        "select upper(last_name) as last_name from singers group by singers.last_name"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "bigquery", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+def test_bigquery_group_by_alias_for_same_source_column_resolves_before_matching():
+    """A direct projection alias still resolves to its underlying source column."""
+
+    prior = "select singers.last_name as last_name from singers group by last_name"
+    authored = (
+        "select singers.last_name as last_name from singers group by singers.last_name"
+    )
+
+    scope = cs.scope_for(PATH, prior, authored, "bigquery", [])
+
+    assert scope.population == "kept"
+    assert "group_by_changed" not in {change.kind for change in scope.changes}
+
+
+def test_source_replacement_is_reported_without_duplicate_group_change():
+    """A relation swap has its own finding while stable grouping stays unchanged."""
+
+    prior = "select o.status from orders o group by o.status"
+    authored = "select o.status from orders_v2 o group by o.status"
+
+    scope = _scope(authored, prior=prior)
+
+    assert scope.population == "changed"
+    kinds = {change.kind for change in scope.changes}
+    assert "source_changed" in kinds
+    assert "group_by_changed" not in kinds
+
+
+def test_qualifier_insensitive_grouping_with_multiple_join_sources():
+    """Renaming both aliases preserves each source position in a multi-join."""
+
+    prior = (
+        "select a.id from customers a cross join orders b group by a.id, b.customer_id"
+    )
+    authored = (
+        "select x.id from customers x cross join orders y group by x.id, y.customer_id"
+    )
+
+    scope = _scope(authored, prior=prior)
+
+    assert scope.population == "kept"
+    assert "group_by_changed" not in {change.kind for change in scope.changes}
+
+
 def test_group_by_different_joined_relations_remains_a_change():
+    """Columns from different joined source positions are not interchangeable."""
+
     prior = (
         "select a.id from customers as a "
         "join orders as b on a.id = b.customer_id group by a.id"
@@ -154,6 +214,8 @@ def test_group_by_different_joined_relations_remains_a_change():
 
 
 def test_group_by_self_join_aliases_are_not_assumed_equivalent():
+    """A self-join's two aliases continue to identify separate source instances."""
+
     prior = (
         "select a.id from customers as a "
         "join customers as b on a.parent_id = b.id group by a.id"
@@ -170,6 +232,8 @@ def test_group_by_self_join_aliases_are_not_assumed_equivalent():
 
 
 def test_bare_group_by_column_in_join_is_not_assumed_unambiguous():
+    """Without schema metadata, a bare joined column cannot be resolved safely."""
+
     prior = (
         "select a.id from customers as a "
         "join orders as b on a.id = b.customer_id group by id"
@@ -180,6 +244,18 @@ def test_bare_group_by_column_in_join_is_not_assumed_unambiguous():
     )
 
     scope = cs.scope_for(PATH, prior, authored, "duckdb", [])
+
+    assert scope.population == "changed"
+    assert "group_by_changed" in {change.kind for change in scope.changes}
+
+
+def test_derived_source_aliases_remain_conservative():
+    """Derived relations are left unresolved instead of guessing their identity."""
+
+    prior = "select x.id from (select id from customers) as x group by x.id"
+    authored = "select y.id from (select id from customers) as y group by y.id"
+
+    scope = _scope(authored, prior=prior)
 
     assert scope.population == "changed"
     assert "group_by_changed" in {change.kind for change in scope.changes}
@@ -199,6 +275,8 @@ def test_bare_group_by_column_in_join_is_not_assumed_unambiguous():
     ],
 )
 def test_group_by_keeps_catalog_and_database_qualifiers(before: str, after: str):
+    """Changing a catalog or database qualifier remains a semantic difference."""
+
     prior = f"select s.visit_date from visits as s group by {before}"
     authored = f"select s.visit_date from visits as s group by {after}"
 
@@ -422,6 +500,41 @@ def test_an_edit_inside_a_union_is_unchecked_not_kept():
     assert cs.stored_form(
         {"models": [scope.model_dump(mode="json", exclude_none=True)]}
     ) == {"site_daily": [{"kind": "unread", "status": "unchecked"}]}
+
+
+def test_a_changed_union_is_named_once_beside_row_attribution():
+    """Row attribution now names a changed set operation too (#1163); the
+    reason still says it once."""
+
+    prior = (
+        "with both as (\n"
+        "  select account_id from {{ ref('a') }}\n"
+        "  union all\n"
+        "  select account_id from {{ ref('b') }}\n"
+        ")\nselect account_id from both\n"
+    )
+    authored = prior.replace("{{ ref('b') }}", "{{ ref('b') }} where active")
+    scope = _scope(authored, prior=prior)
+    assert scope.population == "unchecked"
+    assert scope.reason == (
+        "the set operation in `both` changed and its branches were not compared"
+    )
+
+
+def test_a_recased_string_literal_in_a_union_is_unchecked_not_kept():
+    """Only identifier case is folded: ``'OPEN'`` edited to ``'open'`` can
+    select different rows."""
+
+    prior = (
+        "with both as (\n"
+        "  select account_id from {{ ref('a') }} where status = 'OPEN'\n"
+        "  union all\n"
+        "  select account_id from {{ ref('b') }}\n"
+        ")\nselect account_id from both\n"
+    )
+    scope = _scope(prior.replace("'OPEN'", "'open'"), prior=prior)
+    assert scope.population == "unchecked"
+    assert scope.reason and "`both`" in scope.reason
 
 
 def test_the_caps_count_what_they_cut():

@@ -155,6 +155,8 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
                                      the dev one becomes profileable without widening the committed
                                      allowlist. --scope still only narrows, nothing is written back,
                                      the cost guard prices the scan; prod-looking targets refused.
+                                     Also reads the namespaces dbt derives from the dev one for the
+                                     project's models (a package's +schema, #1155), named in notes.
                                      DuckDB: its dev target is the file already read, so the flag
                                      widens nothing and a note says so
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
@@ -179,8 +181,16 @@ dex explore diagram               -> the cached map as a Mermaid erDiagram, in `
 dex explore query "<SELECT ...>"  -> firewall-approved SELECTs, capped and row-major
   [more...] | --sql-file <path>      (variadic: one call answers several questions; a file takes
   [--across <ds,ds>]                 one statement per line or semicolon-separated statements;
-                                     --across runs each statement once per mirrored dataset,
-                                     named as {ds} in the SQL, under one handshake)
+  [--target dev]                     --across runs each statement once per mirrored dataset,
+                                     named as {ds} in the SQL, under one handshake).
+                                     --target dev (#1133) reads what transform build wrote, for this
+                                     one command, exactly as explore profile --target dev does (the
+                                     dev namespace and the ones dbt derives from it); firewall, PII
+                                     gate, values-free mode and cost handshake unchanged; prod-looking
+                                     targets refused. Without it, a relation in the dev namespace
+                                     outside the source scope is refused naming the namespace and the
+                                     flag. A refusal for an uncached relation behind a connection that
+                                     cannot open (a locked DuckDB file) says why
 dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII non-key columns
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows
@@ -392,8 +402,10 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      failure: at most 4096 bytes summarizing the change, its required
                                      deliverables (built, failed, skipped, missing, stale; coverage
                                      unknown with no plan) and what blocked each, the failing nodes,
-                                     which deliverables anything checked, what verification ran and
-                                     suppressed, the declared obligations by status, and where the
+                                     which deliverables anything checked (assurance.failed_checks
+                                     lists each failed check's kind: a data_test by name, or a
+                                     contradicted record by kind, finding and join), what verification
+                                     ran and suppressed, the declared obligations by status, and where the
                                      full evidence is, so a truncated read still has the answer.
                                      With --verify and a plan carrying a toggle (#1113),
                                      data.verification.toggle judges the built relations' columns from
@@ -593,7 +605,11 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      over its filtered rows with effective_input on the record (#1085),
                                      any other filtering CTE unchecked as filtered_cte; join_no_match for a nonempty population matching
                                      nothing, join_orphans and join_zero_overlap against the contract or
-                                     the stated defaults, join_field_all_null and join_field_newly_null
+                                     the stated defaults (an INNER join whose unmatched rows an
+                                     assumptions entry or population.filters entry on the driving key
+                                     column accounts for is satisfied, its counts kept, with
+                                     unmatched_accounted_for naming the entry; #1162),
+                                     join_field_all_null and join_field_newly_null
                                      for a column the join supplies that came back all NULL. A project that fails
                                      to compile is reported first and suppresses every other check;
                                      data.suppressed names each finding class that did not run and why,
@@ -757,7 +773,14 @@ would change, computes the diffs, and stores the plan under
 `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
 `packages_yml` is the guarded way to declare dbt package dependencies: a
 reviewable diff like any other edit, then `transform deps` (or the automatic
-deps step in `transform build`) installs them. Installing the packages a project
+deps step in `transform build`) installs them. A plan installs nothing, and dbt
+cannot parse or compile a tree whose declared packages are not installed, so a
+plan that needs dbt's parse or a control-flow compile is refused, naming each
+missing package and `transform deps`. The check reads the post-edit tree
+(#1166): a package the plan's own `packages_yml` edit declares is refused the
+same way, with the route spelled out (the `packages_yml` edit as a plan of its
+own, applied, `transform deps`, then the rest); a `packages_yml`-only plan needs
+no parse and is stored. Installing the packages a project
 declares (at the versions `package-lock.yml` pins, where it matches) is not
 installing or upgrading a tool. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path
@@ -934,6 +957,29 @@ mutant, or the routed models would not compile as ephemeral, in which case every
 file is put back and only the model's own tests run. A model with no tests of its
 own is measurable when downstream tests read it.
 
+**The incremental branch.** An incremental model is two programs, and a mutant
+builds ephemeral, so `is_incremental()` renders false and the
+`{% if is_incremental() %}` branch is not in the SQL the full build's mutants come
+from (#1132). The model is compiled a second time with the branch taken and
+`{{ this }}` kept as `{{ this }}`, and its comparisons and filters that the full
+build does not also have are planted there: a flipped boundary, a dropped filter
+and a negated one. A site both programs share is the full build's. Only the unit
+tests that override `is_incremental` to true run the branch, so those, and nothing
+else, run against its mutants, and the full build's runs leave them out.
+`data.incremental` holds the branch: `tests` (those unit tests), `baseline`,
+`mutants` (ids `i01`...), `counts`, `score`, `cap` (its share) and a `reason`
+when nothing ran against it. With no such test, every branch mutant is
+`survived` without a run, `reason` says why, and `suggested_test` names a unit test
+with the override and a `this` fixture. A branch survivor's `equivalence` is
+`not_checked`, since the branch reads `{{ this }}`. `data.score` and
+`data.counts` stay the full build's, so neither score mixes the two programs;
+`data.cap` is the whole run's, and one cap binds both, with the branch's classes
+beside the full build's in the round robin. A model whose only mutable SQL is the
+branch is measured rather than refused. A model whose only tests override
+`is_incremental` runs no full-build mutant: each survives by construction, with
+a warning. `data.incremental` is null for a model with no branch, and a model that
+is not materialized `incremental` has none, since dbt never runs it.
+
 `seed_csv` is the first kind that puts **values**, not logic, into a reviewable
 diff, and a diff goes into git and stays there. So a seed's header is checked
 both against the PII detector `explore` profiles warehouse columns with and
@@ -1043,9 +1089,10 @@ default, or a filter or operator after it is refused. A key naming a location
   resolved in place; a change dex cannot isolate or measure reports
   `attributed: false` and names why: macro-generated SQL, a jinja statement
   block, an unresolved or non-scalar `var()`, a renamed or added CTE that cannot
-  be paired with a prior scope, a relation absent from the cache, or a
-  counterfactual that is not valid on its own because it depends on something
-  else in the same edit.
+  be paired with a prior scope, a changed set operation (a `UNION`, `INTERSECT`
+  or `EXCEPT`, or a scope that becomes or stops being one), whose branches are
+  not compared, a relation absent from the cache, or a counterfactual that is
+  not valid on its own because it depends on something else in the same edit.
   Authoring a model that does not exist yet produces no findings and opens
   nothing.
 - `transform plan` raises two **advisory warnings about the shape of what was

@@ -731,12 +731,21 @@ def dev_namespace_outside_allowlist(
     dev = dev_target_scope(connector, target)
     if dev is None or connector not in _SCOPE_FIELDS:
         return None
-    committed = [str(entry) for entry in getattr(target, _SCOPE_FIELDS[connector])]
-    if scopes:
-        committed = [str(entry) for entry in scopes]
+    committed = source_scope(connector, target, scopes)
     if not committed or scope_within(dev, committed):
         return None
     return dev
+
+
+def source_scope(connector: str, target, scopes: list[str] | None = None) -> list[str]:
+    """The source allowlist one command reads: ``--scope`` where it narrowed the
+    committed entries, else the committed entries. Empty reads everything."""
+
+    if scopes:
+        return [str(entry) for entry in scopes]
+    if target is None or connector not in _SCOPE_FIELDS:
+        return []
+    return [str(entry) for entry in getattr(target, _SCOPE_FIELDS[connector])]
 
 
 def dev_target_scope(connector: str, target) -> str | None:
