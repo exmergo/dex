@@ -387,7 +387,15 @@ def derive(
         )
         return derivation
 
-    body: dict[str, Any] = {"name": model}
+    semantic_model_name = model
+    if "__" in model:
+        semantic_model_name = re.sub(r"_+", "_", model).strip("_")
+        notes.append(
+            f"semantic model named '{semantic_model_name}' instead of '{model}': "
+            "MetricFlow does not allow '__' in a semantic model name"
+        )
+
+    body: dict[str, Any] = {"name": semantic_model_name}
     description = with_population(
         declared.get("description"), declared.get("population")
     )
@@ -523,8 +531,10 @@ def _described(
 def _entity_name(column: str, model: str) -> str:
     stem = re.sub(r"_?id$", "", column, flags=re.IGNORECASE)
     if stem:
-        return stem.lower()
-    return _LAYER_PREFIX.sub("", model).lower() or model.lower()
+        candidate = stem.lower()
+    else:
+        candidate = _LAYER_PREFIX.sub("", model).lower() or model.lower()
+    return re.sub(r"_+", "_", candidate).strip("_")
 
 
 def _foreign_entity(
