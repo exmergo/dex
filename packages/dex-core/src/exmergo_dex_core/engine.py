@@ -37,7 +37,7 @@ its filesystem at all can supply the connection instead; see ``connection=`` and
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -1625,7 +1625,7 @@ class DexEngine:
         self,
         *,
         target: str | None = None,
-        select: str | None = None,
+        select: str | Sequence[str] | None = None,
         verify: bool = False,
         for_plan: str | None = None,
         for_plan_document: Any = None,

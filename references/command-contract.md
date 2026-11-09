@@ -384,7 +384,7 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
              [--for-plan <id>]       --verify sweeps the nodes this build ran for correctness and
              [--for-plan-file <f>]   reports the findings in the same envelope, under
              [--no-install-deps]     data.verification; findings never change the status
-             [--select <s>]          --full-refresh passes dbt's flag, for after an incremental
+             [--select <s ...>]      --full-refresh passes dbt's flag, for after an incremental
              [--full-refresh]        model's logic changed: priced as the full rebuild, the
                                      rebuilt nodes named under data.full_refresh, recorded in
                                      data.evidence.invocation.full_refresh. Every dbt invocation
@@ -1239,7 +1239,7 @@ default, or a filter or operator after it is refused. A key naming a location
   is, and what its edits actually contain. Both are repo-only and free. See
   `references/host-integration.md` for the whole seam, including the
   conformance vectors shipped for a consumer to assert its own reader against.
-- `transform build` accepts `--target`, `--select`, `--full-refresh` and `--verify`. The target must be `dev`
+- `transform build` accepts `--target`, `--select` (one or more selector expressions or space-separated model names, matching dbt's syntax), `--full-refresh` and `--verify`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
   the refusal. On a billed connector the cost gate is priced upfront: dex runs a

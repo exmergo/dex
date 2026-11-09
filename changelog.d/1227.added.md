@@ -1,0 +1,1 @@
+**`dex transform build --select` accepts several values.** Passing multiple space-separated selectors or model names is joined as dbt reads them, matching dbt CLI syntax while preserving quoted lists.
