@@ -1137,6 +1137,7 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     # count kept under `elided`, since a block over budget is cut by the reader
     # where nothing counts it.
     for listed in (
+        "needs_decision",
         "identifier_conversions",
         "change_scope",
         "incremental_replay",

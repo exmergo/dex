@@ -516,7 +516,7 @@ a record under `data.verification.population_delta`:
 |---|---|
 | `orphan_keys` | the model's distinct keys the drafted parent does not have |
 | `missing_parents` | the parent's keys (after any declared `population.filters` the parent can evaluate) with no row in the model |
-| `empty_rows`, `empty_columns`, `empty_share` | rows whose child columns (the aggregates, else the columns from a join's outer side) are all NULL or zero: parents kept with no children |
+| `empty_rows`, `empty_columns`, `empty_share` | rows whose child columns (the aggregates, else the columns from a join's outer side) are all NULL or zero: a signal of parents kept with no children to investigate, not proof, since children whose amounts sum to zero read the same |
 
 `status` is `satisfied` (no orphans, no missing parent, `empty_share` at most
 0.05), `needs_decision`, `settled`, `not_applicable` (both sides empty) or

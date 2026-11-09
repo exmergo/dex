@@ -475,3 +475,18 @@ def test_a_drafted_parent_that_was_not_measured_is_unchecked():
         "population_delta",
         "no_parent_drafted",
     )
+
+
+def test_needs_decision_goes_whole_before_the_block_overflows():
+    long_name = "m" * 3000
+    completion = summarize_completion(
+        _evidence(_nodes(), required=[FCT]),
+        {
+            "ran": True,
+            "findings": [],
+            "suppressed": {},
+            "population_delta": [{"model": long_name, "status": "needs_decision"}],
+        },
+    )
+    assert completion.size() <= COMPLETION_BUDGET_BYTES
+    assert completion.elided.get("obligations.needs_decision") == 1

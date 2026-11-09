@@ -1153,6 +1153,17 @@ def draft_parents(
             and (own is None or node.get("package_name") == own)
             and (uid in scope or manifest_node_label(uid, node).lower() in scope)
         ]
+        if focus is not None:
+            # A plan names files; a version's file stem (`dim_teams_v2`) is
+            # the manifest's label (`dim_teams.v2`), so match by the file.
+            focus = set(focus) | {
+                manifest_node_label(uid, node).lower()
+                for uid, node in nodes.items()
+                if isinstance(node, dict)
+                and node.get("resource_type") == "model"
+                and Path(str(node.get("original_file_path") or "")).stem.lower()
+                in focus
+            }
         return draft_for_build(
             project_dir,
             labels,

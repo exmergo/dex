@@ -334,3 +334,46 @@ def test_redriving_a_model_an_earlier_plan_wrote_is_flagged(project, capsys):
         if e["model"] == "conversation_summary"
     )
     assert entry["against"] == "earlier_plan"
+
+
+def test_a_plan_on_a_versions_file_drafts_that_version(tmp_path, monkeypatch):
+    """A plan names `dim_teams_v2.sql`; the manifest labels it `dim_teams.v2`."""
+
+    from exmergo_dex_core.transform import population_inference
+    from exmergo_dex_core.transform import verify as verify_mod
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.proj.dim_teams.v2": {
+                        "name": "dim_teams",
+                        "version": 2,
+                        "resource_type": "model",
+                        "package_name": "proj",
+                        "original_file_path": "models/dim_teams_v2.sql",
+                        "relation_name": '"dev"."main"."dim_teams_v2"',
+                    }
+                }
+            }
+        )
+    )
+    seen = {}
+
+    def capture(project_dir, labels, *, cache, dialect, focus):
+        seen["labels"], seen["focus"] = list(labels), focus
+        return population_inference.BuildDrafts()
+
+    monkeypatch.setattr(population_inference, "draft_for_build", capture)
+    monkeypatch.setattr(verify_mod, "_root_package", lambda _p: "proj")
+
+    class _Engine:
+        connector = "duckdb"
+
+    verify_mod.draft_parents(
+        _Engine(), tmp_path, {"model.proj.dim_teams.v2"}, {"dim_teams_v2"}
+    )
+    assert seen["labels"] == ["dim_teams.v2"]
+    assert "dim_teams.v2" in seen["focus"]
