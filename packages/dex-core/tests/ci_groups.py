@@ -67,6 +67,8 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "transform-refactor": (
         "tests/transform/test_refactor",
         "tests/transform/test_transform_compare.py",
+        "tests/transform/test_transform_compare_expect.py",
+        "tests/transform/test_expected_change.py",
         "tests/transform/test_multiset_compare.py",
     ),
     "transform-contracts": (

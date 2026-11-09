@@ -1470,8 +1470,13 @@ class DexEngine:
         key_columns: list[str] | None = None,
         target: str | None = None,
         accepted_type_changes: list[str] | None = None,
+        expectation: dict[str, Any] | str | None = None,
     ) -> RefactorComparisonResult:
-        """One model before and after a stored plan, on the same dev inputs."""
+        """One model before and after a stored plan, on the same dev inputs.
+
+        ``expectation`` states an intended change (#1157), and the verdict is
+        then ``as_expected`` or ``unexpected``.
+        """
 
         from .transform.refactor_compare import compare
 
@@ -1483,6 +1488,7 @@ class DexEngine:
             key_columns=key_columns,
             target=target,
             accepted_type_changes=accepted_type_changes,
+            expectation=expectation,
         )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:

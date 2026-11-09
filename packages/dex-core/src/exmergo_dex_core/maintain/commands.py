@@ -628,6 +628,11 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
             LayerFingerprint(
                 semantic_model_count=len(semantic_layer.semantic_models),
                 metric_count=len(semantic_layer.metrics),
+                declared_model_count=(
+                    len(semantic_layer.declarations)
+                    if semantic_layer.declarations is not None
+                    else None
+                ),
             )
             if semantic_layer is not None
             else None
@@ -1093,6 +1098,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    grain_coverage: list[dict] | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
@@ -1220,6 +1226,7 @@ def verify(
                 else ([], [])
             )
             proven_grains: dict[str, dict] = {}
+            grain_coverage = []
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1228,6 +1235,7 @@ def verify(
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
+                records=grain_coverage,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1307,6 +1315,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
                 findings = verify_mod.damp_fanout(
@@ -1326,6 +1335,10 @@ def verify(
 
     if wanted and join_coverage is not None:
         join_coverage = [r for r in join_coverage if r["model"].lower() in wanted]
+    if grain_coverage is not None:
+        grain_coverage = _complete_grain_coverage(
+            definitions, grain_coverage, scope=wanted
+        )
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
@@ -1337,6 +1350,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        grain_coverage=grain_coverage,
     )
     if cost is not None:
         result.cost = cost
@@ -1394,6 +1408,7 @@ def _grain_contract(
     scope=None,
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1432,8 +1447,44 @@ def _grain_contract(
         [o.identifier for o in live],
         scoped_models,
         proven=proven,
+        records=records,
     )
     return findings, notes, None
+
+
+def _complete_grain_coverage(
+    definitions, records: list[dict], *, scope: set[str] | None = None
+) -> list[dict]:
+    """``grain_coverage`` as the result carries it (#1223): the records the
+    grain axis and the declared-fact statement wrote, a ``not_planned`` record
+    for each declared key the priority rule left out, and an ``unchecked``
+    record (``not_measured``) for any planned key neither path reached, so no
+    declared key is ever absent. Sorted by model, then source rank."""
+
+    declared = verify_mod.declared_grain_candidates(definitions, scope=scope)
+    planned = verify_mod.grain_plan(definitions, scope=scope)
+    seen = {
+        (r["model"], r["source"], tuple(c.lower() for c in r["columns"]))
+        for r in records
+    }
+    complete = list(records)
+    for model, candidates in planned.items():
+        for candidate in candidates:
+            marker = (
+                model,
+                candidate.source,
+                tuple(c.lower() for c in candidate.columns),
+            )
+            if marker not in seen:
+                complete.append(
+                    verify_mod.grain_record(
+                        model, candidate, "unchecked", "not_measured"
+                    )
+                )
+    complete.extend(verify_mod.not_planned_grain_records(declared, planned))
+    if scope:
+        complete = [r for r in complete if r["model"].lower() in scope]
+    return verify_mod.sort_grain_records(complete)
 
 
 def _join_contract(
@@ -2427,41 +2478,98 @@ def _declaration_drift(
     to tell the two apart without parsing a warning. The warning is left out
     where there is no transformation project on either side, since there is
     nothing there that could have been declared.
+
+    A native semantic layer's declarations (#995) are judged beside the
+    project's. With no transformation project on either side, the status is the
+    layer's own, with its ``vendor``. With both, the status is the project's,
+    the layer's rides under ``semantic_layer``, and ``checked`` is true only when
+    both were compared, so neither half reads clean on the other's account.
     """
+
+    findings = _semantic_scope(
+        drift_mod.declaration_drift(current_transform, snap, current_semantic),
+        scope_names,
+    )
+    status, warnings = _transform_declaration_status(current_transform, snap)
+    native = _native_declaration_status(current_semantic, snap)
+    if native is None:
+        return findings, status, warnings
+    if snap.transform_layer is None and current_transform is None:
+        status, warnings = native, []
+    else:
+        status["semantic_layer"] = native
+        if not native["checked"] and status["checked"]:
+            status["checked"] = False
+            status["reason"] = native["reason"]
+    if not native["checked"]:
+        warnings.append(
+            "declaration drift was not checked for the semantic layer: "
+            f"{native['reason']}"
+            if "semantic_layer" in status
+            else f"declaration drift was not checked: {native['reason']}"
+        )
+    return findings, status, warnings
+
+
+def _transform_declaration_status(
+    current_transform: TransformLayer | None, snap: snapshot_mod.Snapshot
+) -> tuple[dict[str, object], list[str]]:
+    """Whether the transformation project's declarations were compared."""
 
     checked, reason = drift_mod.declaration_drift_status(current_transform, snap)
     baseline = snap.transform_layer
     status: dict[str, object] = {"checked": checked}
     if checked:
         if baseline is None or current_transform is None:
-            return [], status, []
+            return status, []
         status["baseline_declared_models"] = len(baseline.declarations or {})
         status["declared_models"] = len(current_transform.declarations or {})
-        findings = _semantic_scope(
-            drift_mod.declaration_drift(current_transform, snap, current_semantic),
-            scope_names,
-        )
         rekeyed = drift_mod.rekeyed_versioned_declarations(current_transform, snap)
         if not rekeyed:
-            return findings, status, []
+            return status, []
         status["unchecked_models"] = rekeyed
         status["unchecked_reason"] = "baseline_predates_versions"
-        return (
-            findings,
-            status,
-            [
-                "declaration drift was not checked for "
-                + ", ".join(rekeyed)
-                + ": the baseline keyed each versioned model's declaration by its "
-                "bare name, and declarations are now read per version "
-                "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
-                "baseline them per version"
-            ],
-        )
+        return status, [
+            "declaration drift was not checked for "
+            + ", ".join(rekeyed)
+            + ": the baseline keyed each versioned model's declaration by its "
+            "bare name, and declarations are now read per version "
+            "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
+            "baseline them per version"
+        ]
     status["reason"] = reason
     if baseline is None and current_transform is None:
-        return [], status, []
-    return [], status, [f"declaration drift was not checked: {reason}"]
+        return status, []
+    return status, [f"declaration drift was not checked: {reason}"]
+
+
+def _native_declaration_status(
+    current_semantic: SemanticLayer | None, snap: snapshot_mod.Snapshot
+) -> dict[str, object] | None:
+    """Whether a native semantic layer's declarations were compared, or
+    ``None`` where no native layer holds any on either side."""
+
+    native = drift_mod.native_declaration_drift_status(current_semantic, snap)
+    if native is None:
+        return None
+    checked, reason = native
+    baseline = snap.semantic_layer
+    vendor = (current_semantic.vendor if current_semantic is not None else None) or (
+        baseline.vendor if baseline is not None else None
+    )
+    status: dict[str, object] = {"checked": checked}
+    if vendor:
+        status["vendor"] = vendor
+    if not checked:
+        status["reason"] = reason
+        return status
+    status["baseline_declared_models"] = len(
+        (baseline.declarations if baseline is not None else None) or {}
+    )
+    status["declared_models"] = len(
+        (current_semantic.declarations if current_semantic is not None else None) or {}
+    )
+    return status
 
 
 def _semantic_names(scope_names: list[str]) -> set[str]:

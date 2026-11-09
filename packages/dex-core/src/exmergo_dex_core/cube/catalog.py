@@ -729,12 +729,7 @@ def definitions(
         declaration, declaration_notes = read_native_declaration(
             cube.name,
             relations.get(cube.name),
-            columns,
-            cube.raw.get("meta"),
-            [
-                (m.name, resolved.columns.get((cube.name, m.name)), m.raw.get("meta"))
-                for m in [*cube.dimensions, *cube.measures]
-            ],
+            *declaration_inputs(cube, resolved),
             source=DECLARATION_SOURCE,
         )
         unread.extend(declaration_notes)
@@ -779,6 +774,27 @@ def definitions(
         model_declarations=declarations,
         declaration_notes=unread,
         notes=found,
+    )
+
+
+def declaration_inputs(
+    cube: Cube, resolved: Resolution
+) -> tuple[list[str] | None, Any, list[tuple[str, str | None, Any]]]:
+    """What a cube's declaration is read from: its primary key as physical
+    columns, its ``meta``, and each dimension and measure as ``(name, physical
+    column, meta)``.
+
+    One reading for the declarations channel and the drift fingerprint (#995),
+    so the two cannot disagree about what the cube declares.
+    """
+
+    return (
+        declared_key_columns(cube, resolved) or None,
+        cube.raw.get("meta"),
+        [
+            (m.name, resolved.columns.get((cube.name, m.name)), m.raw.get("meta"))
+            for m in [*cube.dimensions, *cube.measures]
+        ],
     )
 
 

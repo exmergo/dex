@@ -789,6 +789,9 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "key": "key_columns",
             "accept_type": "accepted_type_changes",
             "target": "target",
+            # Both read into one JSON text: the file form is read by the shim.
+            "expect": "expectation",
+            "expect_file": _TRANSLATED,
         },
     },
     ("semantic", "define"): {

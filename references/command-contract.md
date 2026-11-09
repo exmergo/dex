@@ -423,7 +423,17 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      off (toggle_column_present_when_off, an empty table included),
                                      every producer when on (toggle_column_missing_when_on); the other
                                      value is unchecked (branch_not_built). Each record reaches
-                                     data.completion.obligations
+                                     data.completion.obligations.
+                                     obligations.incremental_replay names each required incremental
+                                     model the plan edited: satisfied when a unit test overriding
+                                     is_incremental to true passed in this build, contradicted
+                                     (incremental_test_failed) when it failed, else unchecked
+                                     (full_refresh_only, no_incremental_test) (#1130).
+                                     obligations.comparison (--for-plan only) holds each required
+                                     rewrite to its recorded compare verdict: equivalent or
+                                     as_expected satisfied, different or unexpected contradicted,
+                                     none unchecked (not_compared, compared_elsewhere) (#1157).
+                                     Obligations are listed and never change outcome
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
 dex transform export [plan-id]    -> one stored plan as a portable document a second process can check
                                      and apply: every edit's operation, kind, preimage hash, content
@@ -486,7 +496,20 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      unapplied. A recorded verdict carries inputs_built_by (invocation_id,
                                      generated_at, cold): the latest build among the model's upstream
                                      models, one run, recorded with it; null where no build
-                                     attempted them (#1114)
+                                     attempted them (#1114).
+                                     --expect <json> | --expect-file <f> states an intended change
+                                     (#1157): added and removed ("none", "any" or {"where": <row
+                                     predicate over output columns, which may test a column with
+                                     IN (SELECT c FROM <relation or ref()> WHERE ...)>}),
+                                     changed_columns and key ("unchanged"). data.status is then
+                                     as_expected or unexpected; data.expectation splits added,
+                                     removed and changed keys (rows with no key) into matching and
+                                     unexpected, names findings (unexpected_added,
+                                     unexpected_removed, unexpected_changed_column, grain_not_held,
+                                     schema_changed) and up to five unexpected_keys per class,
+                                     key columns only through the firewall (a PII key is
+                                     withheld); an expectation that does not fit is not_checked
+                                     invalid_expectation and is not recorded
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
                                      ref()/source() input with only the columns <m> reads, typed from
                                      the exploration cache; expect: is an empty stub that fails until
@@ -560,7 +583,9 @@ dex maintain grain [<objects>]    -> cardinality/identity drift: lost key unique
 dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + declaration drift
                                      (declaration_added|removed|changed naming the model, column and
                                      field, population/grain/additivity/unit ranked above a description;
-                                     free; data.declaration_drift says whether it was checked) +
+                                     on Ossie, SLayer and Cube too, from ai_context.dex / meta.dex and
+                                     the primary key as grain, with data.layer: semantic; free;
+                                     data.declaration_drift says whether it was checked) +
                                      categorical dimension cardinality change on any model naming its
                                      table (a scan; gated on billed connectors); a compiled-only Cube
                                      definition is compared by content alone (compiled_only_changed)
@@ -597,7 +622,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      aggregate and returned as an offer beside findings already final.
                                      Grain: the grain a declaration states first, then a unique test,
                                      a unique_combination_of_columns test, a primary entity, or a
-                                     naming guess, one source per model. Declared facts, checked with
+                                     naming guess, one source per model; one data.grain_coverage
+                                     record per declared key (proven, broken, not_applicable for an
+                                     empty relation, unchecked with a reason, not_planned for a key
+                                     a higher-ranked source displaced; #1223). Declared facts, checked with
                                      aggregate-only statements: unit_out_of_range (a fraction outside
                                      0..1, a percent wholly inside it, with the observed min and max),
                                      additivity_contradicted (an additive column the cumulative
@@ -1714,6 +1742,13 @@ whether it ran: a baseline pinned before declarations were fingerprinted, or a
 project format that does not read them, is `false` with a `reason` and a
 warning, never an empty, clean-looking result. `maintain snapshot
 --project-only` baselines the declarations without re-measuring the warehouse.
+A native semantic layer (Ossie, SLayer, Cube) is fingerprinted the same way,
+from the `dex` block of each definition's `ai_context` or `meta` and of its
+members', with its primary key as the grain, so a changed key is a `high` grain
+change. Its findings carry `data.layer: semantic` and the vendor. With no
+transformation project the status is the layer's own; beside one, the layer's
+is under `data.declaration_drift.semantic_layer` and `checked` is true only
+when both were compared.
 
 **`explore semantic` queries the semantic layer; `transform` and the `semantic`
 group author it, and `maintain semantic` detects drift in it.** Three backends

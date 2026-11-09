@@ -25,6 +25,7 @@ pass deemed safe to record.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -385,6 +386,14 @@ class SemanticLayerSnapshot(BaseModel):
     #: which must not read as every one of them being new (#912).
     opaque_definitions: list[OpaqueDef] = Field(default_factory=list)
     opaque_captured: bool = False
+    #: Each native definition's declaration, keyed by the definition's name, the
+    #: way :attr:`TransformLayer.declarations` keys a dbt model's (#995): the
+    #: ``dex`` block of its own metadata (Ossie's ``ai_context``, SLayer's and
+    #: Cube's ``meta``) and of each member's, plus its primary key as the
+    #: ``grain``. ``None`` is *not captured*: a baseline pinned before this field
+    #: existed, a layer that could not be read, and the dbt layer, whose
+    #: declarations live on the transformation layer.
+    declarations: dict[str, DeclarationFingerprint] | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -565,6 +574,73 @@ def declaration_fingerprints(
     return out
 
 
+def native_declaration_fingerprint(
+    grain: list[str] | None,
+    metadata: Any,
+    members: Iterable[tuple[str, str | None, Any]],
+    *,
+    path: str | None = None,
+) -> DeclarationFingerprint | None:
+    """A native definition's declaration as one hash per field (#995).
+
+    Takes what ``semantic_declarations.read_native_declaration`` reads, so the
+    fingerprint covers the declaration ``explore --use-project`` reads back:
+    ``grain`` is the definition's primary key as physical columns (#976),
+    ``metadata`` the definition's own metadata (``ai_context`` or ``meta``), and
+    ``members`` ``(member, physical column or None, member metadata)``.
+
+    Every key under the ``dex`` block is a field, as on a dbt model, except
+    ``grain``: a native definition's primary key states that, and the reader
+    ignores a ``grain`` in the metadata, so a change to the key is the grain
+    changing. The definition's ``description`` is not a field here: on a native
+    layer it carries the generated population sentence, and an edit to it is
+    already ``definition_changed``. A member's fields are keyed by the physical
+    column it reads, the way the reader keys them, and a member that reads none
+    is left out, as the reader leaves it out. Two members on one column (a
+    dimension and a measure over ``amount``) share its fields; where they state
+    one field differently, the field's hash covers every value stated, in no
+    particular order.
+
+    Hashes only, over the same canonical form a dbt declaration is hashed in,
+    so reformatting a block or reordering its keys is not a change. ``None``
+    when the definition declares nothing.
+    """
+
+    fields = {
+        key: value for key, value in _dex_fields(metadata).items() if key != "grain"
+    }
+    if grain:
+        fields["grain"] = list(grain)
+    stated: dict[str, dict[str, list[Any]]] = {}
+    for _member, column, member_metadata in members:
+        member_fields = _dex_fields(member_metadata)
+        if column is None or not member_fields:
+            continue
+        for key, value in member_fields.items():
+            values = stated.setdefault(column, {}).setdefault(key, [])
+            canonical = _canonical(key, value)
+            if canonical not in values:
+                values.append(canonical)
+    columns = {
+        column: {
+            key: _field_hash(
+                values[0]
+                if len(values) == 1
+                else sorted(
+                    values,
+                    key=lambda item: json.dumps(item, sort_keys=True, default=str),
+                )
+            )
+            for key, values in by_key.items()
+        }
+        for column, by_key in stated.items()
+    }
+    hashed = {key: _field_hash(_canonical(key, value)) for key, value in fields.items()}
+    if not (hashed or columns):
+        return None
+    return DeclarationFingerprint(path=path, fields=hashed, columns=columns)
+
+
 def semantic_layer_snapshot(view: DbtProjectView) -> SemanticLayerSnapshot:
     """Fingerprint the semantic layer from the project's YAML files."""
 
@@ -604,17 +680,25 @@ def _declared_fields(entry: dict[str, Any]) -> dict[str, str]:
     description = entry.get("description")
     if isinstance(description, str) and description.strip():
         stated["description"] = description
-    dex = entry_meta(entry).get(DEX_META_KEY)
-    if isinstance(dex, dict):
-        for key, value in dex.items():
-            if value not in (None, "", [], {}):
-                stated[str(key)] = value
+    stated.update(_dex_fields(entry_meta(entry)))
     return {
-        field: content_hash(
-            json.dumps(_canonical(field, value), sort_keys=True, default=str)
-        )
-        for field, value in stated.items()
+        field: _field_hash(_canonical(field, value)) for field, value in stated.items()
     }
+
+
+def _dex_fields(metadata: Any) -> dict[str, Any]:
+    """Every field a ``dex`` metadata block states, an empty one left out."""
+
+    dex = metadata.get(DEX_META_KEY) if isinstance(metadata, dict) else None
+    if not isinstance(dex, dict):
+        return {}
+    return {
+        str(key): value for key, value in dex.items() if value not in (None, "", [], {})
+    }
+
+
+def _field_hash(canonical: Any) -> str:
+    return content_hash(json.dumps(canonical, sort_keys=True, default=str))
 
 
 #: Lists whose order says nothing. A grain is a set of columns, and a population

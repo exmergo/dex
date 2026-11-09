@@ -7,9 +7,11 @@ import json
 
 import yaml
 
+from exmergo_dex_core.maintain.commands import _declaration_drift
 from exmergo_dex_core.maintain.drift import (
     declaration_drift,
     declaration_drift_status,
+    native_declaration_drift_status,
     rank_findings,
 )
 from exmergo_dex_core.maintain.snapshot import (
@@ -21,6 +23,7 @@ from exmergo_dex_core.maintain.snapshot import (
     Snapshot,
     TransformLayer,
     declaration_fingerprints,
+    native_declaration_fingerprint,
 )
 
 YML_PATH = "models/staging/stg_orders.yml"
@@ -524,3 +527,227 @@ def test_moving_an_assumption_to_another_column_is_assumptions_drift():
     [finding] = _drift(before, after)
     assert finding.code == "declaration_changed"
     assert finding.data["field"] == "assumptions"
+
+
+# --- a native semantic layer (#995) ---------------------------------------------
+
+NATIVE_POPULATION = {
+    "rule": "Every order except test orders.",
+    "filters": [{"column": "status", "excludes": ["returned", "test"]}],
+}
+
+
+def _native(
+    population=NATIVE_POPULATION,
+    key=("order_id",),
+    amount=None,
+    **dex,
+) -> DeclarationFingerprint | None:
+    """An orders definition's fingerprint, with its population, key and the unit of
+    ``amount`` overridable.
+    """
+
+    members = [
+        ("order_id", "order_id", {"dex": {"role": "key"}}),
+        ("amount", "amount", {"dex": amount or {"unit": "currency:USD"}}),
+        # A computed member reads no column, so its metadata is not a column's.
+        ("amount_cents", None, {"dex": {"unit": "cents"}}),
+    ]
+    block = {"population": population, **dex} if population else dict(dex)
+    return native_declaration_fingerprint(
+        list(key) if key else None,
+        {"instructions": "free text", "dex": block},
+        members,
+        path="orders.yml",
+    )
+
+
+def _native_layer(declarations, vendor="cube") -> SemanticLayer:
+    return SemanticLayer(
+        semantic_models=[
+            SemanticModelDef(name="orders", content_sha256="x", relation="d.m.orders")
+        ],
+        vendor=vendor,
+        declarations=declarations,
+    )
+
+
+def _native_snap(declarations, vendor="cube", transform=None) -> Snapshot:
+    return Snapshot(
+        created_at="2026-11-07T00:00:00+00:00",
+        transform_layer=transform,
+        semantic_layer=_native_layer(declarations, vendor),
+    )
+
+
+def test_a_native_declaration_is_fingerprinted_per_field_with_its_key_as_grain():
+    """Every ``dex`` key is a field, the key is the grain, and no value is held."""
+
+    fingerprint = _native(grain=["x"], grain_note="kept")
+
+    assert fingerprint.path == "orders.yml"
+    # The primary key states the grain, never a `grain` written in the metadata.
+    assert set(fingerprint.fields) == {"population", "grain", "grain_note"}
+    assert fingerprint.fields["grain"] == _native(key=("order_id",)).fields["grain"]
+    # A member with no physical column is left out, as the reader leaves it out.
+    assert set(fingerprint.columns) == {"order_id", "amount"}
+    raw = fingerprint.model_dump_json()
+    for value in ("returned", "test orders", "currency:USD", "free text"):
+        assert value not in raw
+
+
+def test_restating_a_native_declaration_is_not_a_change():
+    restated = {
+        "filters": [{"excludes": ["test", "returned"], "column": "status"}],
+        "rule": "Every   order except\ntest orders.",
+    }
+    assert _native(restated) == _native()
+    # A composite key is a set of columns, as a dbt grain is.
+    assert (
+        _native(key=("order_id", "line")).fields
+        == _native(key=("line", "order_id")).fields
+    )
+
+
+def test_a_definition_with_nothing_declared_has_no_fingerprint():
+    assert native_declaration_fingerprint(None, {"meta": 1}, [("a", "a", None)]) is None
+    assert native_declaration_fingerprint(["id"], None, []).fields.keys() == {"grain"}
+
+
+def test_two_members_on_one_column_share_its_fields():
+    def fingerprint(*members):
+        return native_declaration_fingerprint(None, None, list(members))
+
+    dimension = ("amount", "amount", {"dex": {"role": "dimension"}})
+    measure = ("revenue", "amount", {"dex": {"unit": "currency:USD"}})
+    same = ("total", "amount", {"dex": {"unit": "currency:USD"}})
+    other = ("total", "amount", {"dex": {"unit": "currency:EUR"}})
+
+    both = fingerprint(dimension, measure)
+    assert set(both.columns["amount"]) == {"role", "unit"}
+    # The same value stated twice is the value; two values are both covered,
+    # in whichever order the members are written.
+    assert fingerprint(dimension, measure, same) == both
+    assert fingerprint(measure, other) == fingerprint(other, measure)
+    assert fingerprint(measure, other) != fingerprint(measure)
+
+
+def test_a_changed_native_population_is_high_and_names_the_layer():
+    snap = _native_snap({"orders": _native()})
+    changed = {
+        **NATIVE_POPULATION,
+        "filters": [{"column": "status", "excludes": ["x"]}],
+    }
+
+    [finding] = declaration_drift(
+        None, snap, _native_layer({"orders": _native(changed)})
+    )
+
+    assert finding.code == "declaration_changed"
+    assert (finding.identifier, finding.severity) == ("orders", "high")
+    assert finding.data["field"] == "population"
+    assert finding.data["layer"] == "semantic"
+    assert finding.data["vendor"] == "cube"
+    assert "definition 'orders'" in finding.detail
+
+
+def test_a_changed_native_key_or_unit_is_high():
+    """A changed key is a grain change, a changed unit names its column; both high."""
+
+    snap = _native_snap({"orders": _native()})
+    current = _native_layer(
+        {"orders": _native(key=("order_id", "line"), amount={"unit": "count"})}
+    )
+
+    findings = declaration_drift(None, snap, current)
+
+    assert {(f.column, f.data["field"], f.severity) for f in findings} == {
+        (None, "grain", "high"),
+        ("amount", "unit", "high"),
+    }
+
+
+def test_a_native_declaration_dropped_or_added_is_reported():
+    snap = _native_snap({"orders": _native()})
+
+    [removed] = declaration_drift(None, snap, _native_layer({}))
+    assert removed.code == "declaration_removed"
+    assert removed.data["model_present"] is True
+
+    [added] = declaration_drift(
+        None, _native_snap({}), _native_layer({"orders": _native()})
+    )
+    assert (added.code, added.severity) == ("declaration_added", "low")
+
+
+def test_native_declarations_are_not_comparable_across_a_gap():
+    current = _native_layer({"orders": _native()})
+
+    assert native_declaration_drift_status(None, Snapshot(created_at="t")) is None
+    # The dbt layer keeps its declarations on the transformation layer.
+    assert (
+        native_declaration_drift_status(_native_layer(None, "dbt"), _snap({})) is None
+    )
+
+    checked, reason = native_declaration_drift_status(current, _native_snap(None))
+    assert checked is False
+    assert "before the semantic layer's declarations" in reason
+    assert declaration_drift(None, _native_snap(None), current) == []
+
+    checked, reason = native_declaration_drift_status(
+        current, _native_snap({"orders": _native()}, vendor="slayer")
+    )
+    assert checked is False
+    assert "read as slayer" in reason
+    assert (
+        declaration_drift(None, _native_snap({"orders": _native()}, "slayer"), current)
+        == []
+    )
+
+    checked, reason = native_declaration_drift_status(
+        _native_layer(None), _native_snap({"orders": _native()})
+    )
+    assert (checked, reason) == (
+        False,
+        "the current semantic layer's declarations could not be read",
+    )
+
+
+def test_a_native_layer_alone_reports_its_own_status():
+    snap = _native_snap({"orders": _native()})
+    current = _native_layer({"orders": _native()})
+
+    findings, status, warnings = _declaration_drift(None, current, snap, [])
+    assert (findings, warnings) == ([], [])
+    assert status == {
+        "checked": True,
+        "vendor": "cube",
+        "baseline_declared_models": 1,
+        "declared_models": 1,
+    }
+
+    _, status, warnings = _declaration_drift(None, current, _native_snap(None), [])
+    assert status["checked"] is False
+    assert status["vendor"] == "cube"
+    assert warnings == [f"declaration drift was not checked: {status['reason']}"]
+
+
+def test_beside_a_project_both_halves_must_be_compared_to_read_checked():
+    project = _layer(_fingerprints(DECLARED_YML))
+    current = _native_layer({"orders": _native()})
+    snap = _native_snap({"orders": _native()}, transform=project)
+
+    _, status, warnings = _declaration_drift(project, current, snap, [])
+    assert warnings == []
+    assert status["checked"] is True
+    assert status["baseline_declared_models"] == 1
+    assert status["semantic_layer"]["checked"] is True
+
+    old = _native_snap(None, transform=project)
+    _, status, warnings = _declaration_drift(project, current, old, [])
+    assert status["checked"] is False
+    assert status["reason"] == status["semantic_layer"]["reason"]
+    assert warnings == [
+        "declaration drift was not checked for the semantic layer: "
+        + status["semantic_layer"]["reason"]
+    ]

@@ -699,8 +699,9 @@ def grain_plan(
     Priority is per model, not per candidate: a model whose declaration
     states a grain is checked on that grain alone (#496); otherwise every
     column independently declared ``unique`` is checked (a model can have more
-    than one, each its own claim); a declared composite is checked only when
-    the model has no single-column unique test; the primary entity is checked
+    than one, each its own claim); every declared composite is checked only
+    when the model has no single-column unique test (#1223: a second composite
+    on the same model was once dropped); the primary entity is checked
     only when the model has none of those. A model can therefore only ever
     produce candidates from one source, never a mix, so one duplicate is never
     reported twice under two sources.
@@ -711,34 +712,156 @@ def grain_plan(
     """
 
     by_model: dict[str, list[GrainCandidate]] = {}
-    for model, columns in definitions.declared_grains.items():
-        if scope is not None and model.lower() not in scope:
-            continue
-        by_model[model] = [GrainCandidate(columns=list(columns), source="declaration")]
-    declared = set(by_model)
-    for key in definitions.declared_keys:
-        if not key.unique or key.model in declared:
-            continue
-        if scope is not None and key.model.lower() not in scope:
-            continue
-        by_model.setdefault(key.model, []).append(
-            GrainCandidate(columns=[key.column], source="unique_test")
-        )
-    for combo in definitions.declared_composite_keys:
-        if combo.model in by_model:
-            continue
-        if scope is not None and combo.model.lower() not in scope:
-            continue
-        by_model.setdefault(combo.model, []).append(
-            GrainCandidate(columns=list(combo.columns), source="unique_test_composite")
-        )
-    for model, column in definitions.primary_entities.items():
-        if model in by_model:
-            continue
-        if scope is not None and model.lower() not in scope:
-            continue
-        by_model[model] = [GrainCandidate(columns=[column], source="primary_entity")]
+    for model, candidates in declared_grain_candidates(
+        definitions, scope=scope
+    ).items():
+        for source in _GRAIN_SOURCE_ORDER:
+            chosen = [c for c in candidates if c.source == source]
+            if chosen:
+                by_model[model] = chosen
+                break
     return by_model
+
+
+#: The order :func:`grain_plan` ranks the declared sources in, first wins.
+_GRAIN_SOURCE_ORDER = (
+    "declaration",
+    "unique_test",
+    "unique_test_composite",
+    "primary_entity",
+)
+
+
+def declared_grain_candidates(
+    definitions, *, scope: set[str] | None = None
+) -> dict[str, list[GrainCandidate]]:
+    """Every grain each selected model declares, from every source, before
+    :func:`grain_plan`'s priority rule picks the ones it checks (#1223).
+
+    The difference between the two is what ``grain_coverage`` reports as
+    ``not_planned``: a key the project states that this command leaves to a
+    higher-ranked one. Each candidate appears once per model and source; the
+    order within a model is the ranking, then declaration order.
+    """
+
+    def wanted(model: str) -> bool:
+        return scope is None or model.lower() in scope
+
+    by_model: dict[str, list[GrainCandidate]] = {}
+    for model, columns in definitions.declared_grains.items():
+        if wanted(model):
+            by_model.setdefault(model, []).append(
+                GrainCandidate(columns=list(columns), source="declaration")
+            )
+    for key in definitions.declared_keys:
+        if key.unique and wanted(key.model):
+            by_model.setdefault(key.model, []).append(
+                GrainCandidate(columns=[key.column], source="unique_test")
+            )
+    for combo in definitions.declared_composite_keys:
+        if wanted(combo.model):
+            by_model.setdefault(combo.model, []).append(
+                GrainCandidate(
+                    columns=list(combo.columns), source="unique_test_composite"
+                )
+            )
+    for model, column in definitions.primary_entities.items():
+        if wanted(model):
+            by_model.setdefault(model, []).append(
+                GrainCandidate(columns=[column], source="primary_entity")
+            )
+    for model, candidates in by_model.items():
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        unique: list[GrainCandidate] = []
+        for c in sorted(candidates, key=lambda c: _GRAIN_SOURCE_ORDER.index(c.source)):
+            marker = (c.source, tuple(column.lower() for column in c.columns))
+            if marker not in seen:
+                seen.add(marker)
+                unique.append(c)
+        by_model[model] = unique
+    return by_model
+
+
+def grain_record(
+    model: str,
+    candidate: GrainCandidate,
+    status: str,
+    reason: str | None = None,
+    *,
+    rows: int | None = None,
+    distinct: int | None = None,
+) -> dict:
+    """One ``grain_coverage`` record (#1223): a declared key and its verdict.
+
+    ``status`` is ``proven`` (the exact distinct count reached the row count),
+    ``broken`` (it did not, and a ``grain_broken`` finding says by how much),
+    ``not_applicable`` (the relation has no rows, so uniqueness says nothing),
+    ``unchecked`` (planned, not measured; ``reason`` says why) or
+    ``not_planned`` (left to a higher-ranked key, ``reason`` ``priority``).
+    ``measured`` carries the two counts wherever both were read, and never a
+    value: the warehouse's own words stay in ``notes``.
+    """
+
+    return {
+        "model": model,
+        "columns": list(candidate.columns),
+        "source": candidate.source,
+        "status": status,
+        "reason": reason,
+        "measured": (
+            {"rows": rows, "distinct": distinct}
+            if rows is not None and distinct is not None
+            else None
+        ),
+    }
+
+
+def measured_grain_record(
+    model: str, candidate: GrainCandidate, rows: int, distinct: int
+) -> dict:
+    if rows == 0:
+        return grain_record(
+            model,
+            candidate,
+            "not_applicable",
+            "empty_relation",
+            rows=rows,
+            distinct=distinct,
+        )
+    status = "proven" if distinct >= rows else "broken"
+    return grain_record(model, candidate, status, rows=rows, distinct=distinct)
+
+
+def not_planned_grain_records(
+    declared: dict[str, list[GrainCandidate]],
+    planned: dict[str, list[GrainCandidate]],
+) -> list[dict]:
+    """A ``not_planned`` record for each declared key the priority rule left
+    out, unless a planned key on the same model names the same columns: that
+    key is judged, under the source that ranked first (#1223)."""
+
+    records: list[dict] = []
+    for model, candidates in declared.items():
+        chosen = planned.get(model, [])
+        judged = {frozenset(column.lower() for column in c.columns) for c in chosen}
+        for candidate in candidates:
+            if candidate in chosen:
+                continue
+            if frozenset(column.lower() for column in candidate.columns) in judged:
+                continue
+            records.append(grain_record(model, candidate, "not_planned", "priority"))
+    return records
+
+
+def sort_grain_records(records: list[dict]) -> list[dict]:
+    return sorted(
+        records,
+        key=lambda r: (
+            r["model"],
+            _GRAIN_SOURCE_ORDER.index(r["source"]),
+            [column.lower() for column in r["columns"]],
+        ),
+    )
 
 
 _GRAIN_SOURCE_PHRASE = {
@@ -800,10 +923,12 @@ def _declared_grain_findings(
     candidates: list[GrainCandidate],
     min_rows: int,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
 ) -> tuple[list[DriftFinding], str | None, list[str]]:
     """Check every declared candidate for one model. Returns ``(findings,
     unchecked_reason, unresolved)``, and records in ``proven`` the first
-    candidate the scans showed unique (see :func:`damp_fanout`).
+    candidate the scans showed unique (see :func:`damp_fanout`). ``records``,
+    when given, gains one ``grain_coverage`` record per candidate (#1223).
     ``unchecked_reason`` is None when every candidate was measured, ``"scan"``
     when a candidate could not be measured at all (a metered adapter declining
     an unaffordable scan, per
@@ -895,6 +1020,26 @@ def _declared_grain_findings(
     row_count = adapter.table_metadata(identifier)[0].row_count
     if row_count is None:
         row_count = meta.row_count
+
+    def counted(names: list[str] | None) -> int | None:
+        if names is None:
+            return None
+        if len(names) == 1:
+            return single_counts.get(names[0])
+        return combo_counts.get(tuple(names))
+
+    if records is not None:
+        for c, spelled in resolved:
+            distinct = counted(spelled)
+            if spelled is None:
+                records.append(grain_record(model, c, "unchecked", "missing_columns"))
+            elif distinct is None:
+                records.append(grain_record(model, c, "unchecked", "scan"))
+            elif row_count is None:
+                records.append(grain_record(model, c, "unchecked", "no_count"))
+            else:
+                records.append(measured_grain_record(model, c, row_count, distinct))
+
     if row_count is None:
         if single_counts or combo_counts:
             return [], "no_count", unresolved
@@ -1057,6 +1202,7 @@ def grain_findings(
     *,
     min_rows: int = 100,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """A built relation's grain against what the project declares (or, absent
     any declaration, a free naming guess), for every selected model (#229).
@@ -1064,6 +1210,15 @@ def grain_findings(
     ``proven`` collects, per model, the declared grain the scans showed unique
     (#841). Only a declaration counts: the naming guess is never recorded,
     because a guess proven unique says nothing about what the model intends.
+
+    ``records``, when given, gains one ``grain_coverage`` record per declared
+    candidate in ``declared`` (#1223), measured or not, so a key that held is
+    stated rather than left to an absent finding. Each reason a candidate went
+    unmeasured has a code there that the notes below spell out in prose:
+    ``no_relation`` (nothing in the warehouse matched, or the model has no
+    relation), ``ambiguous`` (more than one matched), ``refused``,
+    ``missing_columns``, ``scan`` and ``no_count``. The naming guess has no
+    record, since it is not a declared key.
 
     A declared source (unique test, composite, or primary entity) is checked
     directly with an exact scan: the declaration itself is the justification
@@ -1090,15 +1245,24 @@ def grain_findings(
     unresolved: dict[str, list[str]] = {}
     refused: dict[str, str] = {}
 
-    for model in sorted(all_models):
+    def unmeasured(model: str, reason: str) -> None:
+        if records is not None:
+            for candidate in declared.get(model) or []:
+                records.append(grain_record(model, candidate, "unchecked", reason))
+
+    for model in sorted(all_models | set(declared)):
         relation = model_relations.get(model)
         if relation is None:
             # missing_relation_findings already reports this model; nothing
             # about its grain belongs in a second, unrelated finding class.
+            unmeasured(model, "no_relation")
+            continue
+        if model not in all_models:
             continue
         matches = match_identifier(relation, live_identifiers)
         if len(matches) != 1:
             ambiguous.append(model)
+            unmeasured(model, "ambiguous" if matches else "no_relation")
             continue
         identifier = matches[0]
 
@@ -1109,9 +1273,24 @@ def grain_findings(
         try:
             candidates = declared.get(model)
             if candidates:
-                model_findings, unchecked_reason, missing = _declared_grain_findings(
-                    adapter, model, identifier, candidates, min_rows, proven
-                )
+                model_records: list[dict] | None = [] if records is not None else None
+                try:
+                    model_findings, unchecked_reason, missing = (
+                        _declared_grain_findings(
+                            adapter,
+                            model,
+                            identifier,
+                            candidates,
+                            min_rows,
+                            proven,
+                            model_records,
+                        )
+                    )
+                except WarehouseQueryError:
+                    unmeasured(model, "refused")
+                    raise
+                if records is not None and model_records is not None:
+                    records.extend(model_records)
                 findings.extend(model_findings)
                 if unchecked_reason == "scan":
                     unchecked.append(model)
@@ -1306,18 +1485,43 @@ def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = Non
     )
 
 
-def _join_label(join, resolved, name_of) -> str:
+def _join_label(
+    join,
+    resolved,
+    name_of,
+    cte_scopes: dict | None = None,
+    sql_shape=None,
+) -> str:
     """One join named the way a reader would name it: how it joins, and what to.
 
     The project's own name for the joined relation where there is one, since
     that is what the reader will go and open; the physical relation otherwise.
+    When a joined CTE holds a set operation, it has no underlying physical table,
+    so the join is named after the CTE itself. A join to an anonymous set operation
+    names it as a set operation rather than a generic subquery.
     The ON condition is deliberately not here, because it travels separately as
     the join keys, which is the part that identifies a wrong grain.
     """
 
-    if resolved is None:
-        return f"{join.side} join to a subquery"
-    return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
+    if resolved is not None:
+        return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
+
+    if cte_scopes and _cte_name(join.relation, cte_scopes) is not None:
+        return f"{join.side} join to '{join.relation.name}'"
+
+    inner = (
+        join.relation.this.unnest()
+        if hasattr(join.relation, "this") and hasattr(join.relation.this, "unnest")
+        else getattr(join.relation, "this", None)
+    )
+    if (
+        sql_shape is not None
+        and sql_shape.SET_OPERATIONS
+        and isinstance(inner, sql_shape.SET_OPERATIONS)
+    ):
+        return f"{join.side} join to a set operation"
+
+    return f"{join.side} join to a subquery"
 
 
 def _generates_rows(relation) -> bool:
@@ -1717,6 +1921,8 @@ def row_population_plan(
                         join,
                         _through_ctes(join.relation, cte_scopes, sql_shape),
                         name_of,
+                        cte_scopes=cte_scopes,
+                        sql_shape=sql_shape,
                     )
                     for join in found_joins
                 ),

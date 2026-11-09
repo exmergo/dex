@@ -985,6 +985,132 @@ def test_a_partner_only_on_conjunct_narrows_the_match_too(products_project, caps
     assert found["partner_filters"] == ["l.price > 5"]
 
 
+_ON_OWN = (
+    _HEAD + "select p.product_id, l.price\n"
+    "from {first}\n"
+    "{join} {second} on try_cast(p.product_id as integer) = l.product_id "
+    "and p.supplier <> 'retired'\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("join", "converted_first", "applied"),
+    [
+        pytest.param("join", True, True, id="inner-join-converted-side-in-from"),
+        pytest.param("inner join", False, True, id="inner-join-converted-side-joined"),
+        pytest.param("left join", True, False, id="left-join-converted-side-kept"),
+        pytest.param("left join", False, True, id="left-join-converted-side-joined"),
+        pytest.param("right join", False, False, id="right-join-converted-side-kept"),
+    ],
+)
+def test_an_own_side_on_conjunct_applies_only_where_the_join_drops_those_rows(
+    products_project, capsys, join, converted_first, applied
+):
+    """`p.supplier <> 'retired'` in the ON (#1171). Where the join drops the
+    rows of `p` it fails (an inner join, or the side an outer join does not
+    keep), the retired hashed id never reaches the model: 8 rows, 7
+    identifiers, 3 failing. Where the join keeps every row of `p` (the kept
+    side of a LEFT or RIGHT join), the conjunct removes nothing from `p`: all
+    9 rows, 8 identifiers, 4 failing, and it is not applied."""
+
+    repo, warehouse = products_project
+    own, other = f"{_SRC} p", f"{_PRICES} l"
+    first, second = (own, other) if converted_first else (other, own)
+    sql = (
+        _ON_OWN.replace("{first}", first)
+        .replace("{join}", join)
+        .replace("{second}", second)
+    )
+    found = _at(_plan(repo, warehouse, sql, capsys), "join")
+    measured = found["measured"]
+    if applied:
+        assert (measured["input_rows"], measured["input_entities"]) == (8, 7)
+        assert measured["failed_entities"] == 3
+        assert found["own_filters"] == ["p.supplier <> 'retired'"]
+        assert "1 filter(s) on raw_products alone" in found["denominator"]
+    else:
+        assert (measured["input_rows"], measured["input_entities"]) == (9, 8)
+        assert measured["failed_entities"] == 4
+        assert found["own_filters"] == []
+        assert "0 filter(s) on raw_products alone" in found["denominator"]
+    assert measured["matched_entities"] == 4
+    assert found["scope_filters_not_applied"] == []
+
+
+def test_a_cross_side_where_conjunct_is_named_not_applied(products_project, capsys):
+    """`p.supplier = 'acme' or l.price > 50` reads both sides, so it narrows
+    neither side's rows in the counts; it is named rather than left out
+    silently (#1171). The own-side supplier filter is still applied."""
+
+    repo, warehouse = products_project
+    sql = (
+        _HEAD + "select p.product_id, l.price\n"
+        f"from {_SRC} p\n"
+        f"inner join {_PRICES} l on try_cast(p.product_id as integer) = l.product_id\n"
+        "where p.supplier <> 'retired' and (p.supplier = 'acme' or l.price > 50)\n"
+    )
+    found = _at(_plan(repo, warehouse, sql, capsys), "join")
+    assert found["own_filters"] == ["p.supplier <> 'retired'"]
+    assert found["partner_filters"] == []
+    (skipped,) = found["scope_filters_not_applied"]
+    assert skipped["filter"] == "(p.supplier = 'acme' OR l.price > 50)"
+    assert "WHERE" in skipped["reason"] and "both sides" in skipped["reason"]
+    assert found["measured"]["input_rows"] == 8
+    assert "see scope_filters_not_applied" in found["denominator"]
+
+
+def _join_probe(sql: str) -> ic._Built:
+    (built,) = [
+        ic.conversion_probe(authored, i, "duckdb")
+        for authored in [_tree(sql)]
+        for i, f in enumerate(ic.find_conversions(authored))
+        if f.site == "join" and f.partner is not None and not f.unsupported
+    ]
+    assert built.sql is not None, built
+    return built
+
+
+def test_a_cross_side_on_conjunct_is_named_not_applied():
+    built = _join_probe(
+        "select p.k from raw p left join keep l "
+        "on try_cast(p.k as int) = l.id and l.v > length(p.s) and l.ok and p.live"
+    )
+    assert built.own_filters == []
+    assert built.partner_filters == ["l.ok"]
+    (skipped,) = built.scope_not_applied
+    assert skipped["filter"] == "l.v > LENGTH(p.s)"
+    assert "ON" in skipped["reason"]
+
+
+def test_an_unqualified_conjunct_beside_a_join_is_named_not_applied():
+    built = _join_probe(
+        "select p.k from raw p join keep l on try_cast(p.k as int) = l.id "
+        "where s = 'x' and p.live and 1 = 1"
+    )
+    assert built.own_filters == ["p.live"]
+    assert [s["filter"] for s in built.scope_not_applied] == ["s = 'x'"]
+
+
+@pytest.mark.parametrize("join", ["anti join", "semi join"])
+def test_an_own_side_on_conjunct_of_a_filtering_join_is_not_applied(join):
+    # An anti join keeps the rows its ON rejects, so applying `p.live` there
+    # would count the wrong rows; a semi join is left alone with it.
+    built = _join_probe(
+        f"select p.k from raw p {join} keep l on try_cast(p.k as int) = l.id and p.live"
+    )
+    assert built.own_filters == []
+    assert built.scope_not_applied == []
+
+
+def test_an_own_side_on_conjunct_converting_the_key_is_the_conversions_effect():
+    built = _join_probe(
+        "select p.k from raw p join keep l on try_cast(p.k as int) = l.id "
+        "and p.live and try_cast(p.k as int) > 0"
+    )
+    assert built.own_filters == ["p.live"]
+    assert built.scope_not_applied == []
+
+
 _LATER = (
     _HEAD + "with base as (\n"
     "  select p.product_id, p.supplier, try_cast(p.product_id as integer) as pid\n"

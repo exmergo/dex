@@ -1,0 +1,56 @@
+{
+  "models": {
+    "daily_tickets": {
+      "grain": [
+        "ticket_date"
+      ],
+      "columns": {
+        "ticket_date": {
+          "role": [
+            "key",
+            "time"
+          ]
+        },
+        "tickets": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every day from the first to the last ticket has one row",
+      "expect": 0,
+      "sql": "select (select date_diff('day', min(opened_on), max(opened_on)) + 1 from raw.tickets) - (select count(distinct ticket_date) from main.daily_tickets) + (select count(*) - count(distinct ticket_date) from main.daily_tickets)"
+    },
+    {
+      "name": "a quiet day counts zero tickets",
+      "expect": 0,
+      "sql": "select count(*) from main.daily_tickets d where not exists (select 1 from raw.tickets t where t.opened_on = d.ticket_date) and (d.tickets is null or d.tickets <> 0)"
+    },
+    {
+      "name": "days with tickets are unchanged",
+      "expect": 0,
+      "sql": "select count(*) from (select opened_on, count(*) as n from raw.tickets group by opened_on) r left join main.daily_tickets d on d.ticket_date = r.opened_on where d.tickets is distinct from r.n"
+    }
+  ],
+  "procedure": {
+    "compare_expected_before_apply": true,
+    "build_after_apply": true
+  },
+  "expected_change": {
+    "model": "daily_tickets",
+    "key": "ticket_date",
+    "expect": {
+      "added": {
+        "where": "tickets = 0"
+      },
+      "removed": "none",
+      "changed_columns": [],
+      "key": "unchanged"
+    }
+  }
+}

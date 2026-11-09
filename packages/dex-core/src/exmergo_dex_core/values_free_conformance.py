@@ -47,6 +47,7 @@ This module imports pytest, so nothing in the package imports it. Install the
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -663,10 +664,20 @@ def build_sentinel_warehouse(path: str | Path) -> Path:
     return generate_fixture_warehouse(path, sentinel_tables())
 
 
-def find_sentinels(text: str) -> list[str]:
-    """The sentinels ``text`` contains, case-insensitively."""
+#: The fractional seconds of a time of day (``13:37:42.731950``). A payload carries
+#: the cache's own timestamps, whose microseconds can spell any five-digit numeric
+#: sentinel (#1225); the fixture's timestamps have none, so masking them hides no
+#: value the fixture seeded, and the date sentinel stays where it was.
+_FRACTIONAL_SECONDS = re.compile(r"(?<=\d\d:\d\d:\d\d)\.\d+")
 
-    lowered = text.lower()
+
+def find_sentinels(text: str) -> list[str]:
+    """The sentinels ``text`` contains, case-insensitively.
+
+    Fractional seconds are masked first, so a timestamp the run itself wrote is
+    never read as a seeded value."""
+
+    lowered = _FRACTIONAL_SECONDS.sub(".", text.lower())
     return [s for s in SENTINELS if s in lowered]
 
 

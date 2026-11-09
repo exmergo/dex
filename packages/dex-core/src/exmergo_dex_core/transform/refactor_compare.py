@@ -40,6 +40,12 @@ from ..guards.sql_guard import referenced_relations
 from ..storage import readable_cache
 from .build import DbtRunError, ShadowRun, assert_dev_target
 from .evidence import BUILT_STATUS
+from .expected_change import (
+    Expectation,
+    ExpectationError,
+    lookup_relations,
+    resolve_refs,
+)
 from .multiset_compare import (
     ReasonCode,
     RefactorCompareResult,
@@ -136,8 +142,13 @@ def compare(
     key_columns: Sequence[str] | None = None,
     target: str | None = None,
     accepted_type_changes: Sequence[str] | None = None,
+    expectation: Any = None,
 ) -> RefactorComparisonResult:
     """Compare one model before and after a stored, unapplied plan.
+
+    ``expectation`` states the change the plan is meant to make (#1157), as a
+    JSON object or its text; see :mod:`.expected_change`. A malformed one is
+    refused before anything compiles.
 
     DuckDB allows one writer or many readers, and dbt opens the file to write. So
     a handle dex holds is released before dbt compiles and again afterwards,
@@ -151,6 +162,11 @@ def compare(
     # refusal raised after the pick (#1103). An explicitly empty id is refused
     # before anything else.
     _, plan_id, resolved = _resolve_plan_id(engine, plan_id, "comparing a plan")
+    stated = None
+    if expectation is not None:
+        from .expected_change import parse_expectation
+
+        stated = parse_expectation(expectation)
     local = (engine.connector or engine.config.connector) == "duckdb"
     if local:
         engine.close()
@@ -164,6 +180,7 @@ def compare(
                 key_columns=key_columns,
                 target=target,
                 accepted_type_changes=accepted_type_changes,
+                expectation=stated,
             )
         finally:
             if local:
@@ -184,7 +201,9 @@ def compare(
 #: Verdicts that say nothing about the plan, so recording them would overwrite a
 #: verdict that does: a comparison still waiting on its price, and one refused
 #: because the plan is already applied.
-_UNRECORDED = frozenset({"awaiting_confirmation", "plan_applied"})
+_UNRECORDED = frozenset(
+    {"awaiting_confirmation", "plan_applied", "invalid_expectation"}
+)
 
 
 def _record_verdict(engine: DexEngine, result: RefactorComparisonResult) -> None:
@@ -214,6 +233,11 @@ def _record_verdict(engine: DexEngine, result: RefactorComparisonResult) -> None
                 "baseline_compiled": result.baseline_compiled,
                 "proposed_compiled": result.proposed_compiled,
                 "inputs_built_by": result.inputs_built_by,
+                **(
+                    {"expectation": result.expectation_digest}
+                    if result.expectation_digest
+                    else {}
+                ),
             },
         }
         store.save_plan(stored)
@@ -230,6 +254,7 @@ def _compare(
     key_columns: Sequence[str] | None,
     target: str | None,
     accepted_type_changes: Sequence[str] | None,
+    expectation: Expectation | None = None,
 ) -> RefactorComparisonResult:
     """The comparison itself.
 
@@ -501,6 +526,17 @@ def _compare(
         )
     )
     identity["input_scope"] = sorted(names)
+    if expectation is not None:
+        identity["expectation"] = expectation
+        try:
+            expectation = resolve_refs(expectation, names, dialect)
+        except ExpectationError as exc:
+            return not_checked("invalid_expectation", str(exc))
+        # `identity` keeps the expectation as stated, so its digest and the
+        # echoed statement do not depend on which relation a ref() named here.
+        # A lookup reads a relation the model may not: it is checked and
+        # profiled like the inputs, but it is not part of the compared scope.
+        names = list(dict.fromkeys([*names, *lookup_relations(expectation, dialect)]))
 
     from ..explore import commands as explore
 
@@ -527,7 +563,13 @@ def _compare(
     if gap.to_profile:
         try:
             estimate = _profile_handshake(
-                adapter, gap.to_profile, baseline.sql, proposed.sql, keys, config
+                adapter,
+                gap.to_profile,
+                baseline.sql,
+                proposed.sql,
+                keys,
+                config,
+                expected=expectation is not None,
             )
         except _NotCheckedError as exc:
             return not_checked(exc.reason_code, exc.detail)
@@ -567,6 +609,7 @@ def _compare(
         key_columns=keys,
         prepriced=prepriced,
         accepted_type_changes=accepted_type_changes,
+        expectation=expectation,
     )
     result = _result(identity, verdict, warnings, profiled)
     return command_args.stamp_spend(result, adapter)
@@ -1075,7 +1118,9 @@ def _clip(text: str, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "..."
 
 
-def _profile_handshake(adapter, to_profile, left, right, keys, config):
+def _profile_handshake(
+    adapter, to_profile, left, right, keys, config, *, expected=False
+):
     """One ask for profiling the inputs and running the comparison."""
 
     from ..explore import commands as explore
@@ -1088,7 +1133,9 @@ def _profile_handshake(adapter, to_profile, left, right, keys, config):
     )
     # Raises _NotCheckedError with the exception's class name alone, so a warehouse
     # refusal here reads as it does when every input already has a profile.
-    comparison = _raw_estimate(left, right, adapter, keyed=bool(keys))
+    comparison = _raw_estimate(
+        left, right, adapter, keyed=bool(keys), expected=expected
+    )
     return command_args.confirmation_request(
         COMMAND,
         adapter,
@@ -1108,10 +1155,32 @@ def _result(
     warnings: list[str],
     profiled: list[str],
 ) -> RefactorComparisonResult:
+    """The envelope result for a finished comparison, judged by any stated change."""
+
+    status, reason_code = verdict.status, verdict.reason_code
+    report = verdict.expectation
+    if report is not None:
+        # The question asked was "did only the stated change happen", so that
+        # is the verdict; the plain comparison's counts stay beside it.
+        status = report.verdict
+        reason_code = (
+            "matches_expected_change"
+            if report.verdict == "as_expected"
+            else "unexpected_change"
+        )
+    stated = identity.get("expectation")
     return RefactorComparisonResult(
         **_identity_fields(identity),
-        status=verdict.status,
-        reason_code=verdict.reason_code,
+        status=status,
+        reason_code=reason_code,
+        expectation=(
+            {**report.data(), "stated": stated.data()}
+            if report is not None and stated is not None
+            else report.data()
+            if report is not None
+            else None
+        ),
+        expectation_digest=stated.digest() if stated is not None else None,
         detail=verdict.detail,
         compared_at=verdict.compared_at,
         schema_diff=_jsonable(verdict.schema),
@@ -1132,11 +1201,16 @@ def _not_checked_result(
     *,
     pending: Any = None,
 ) -> RefactorComparisonResult:
+    """The envelope result for a comparison that could not be judged."""
+
     return RefactorComparisonResult(
         **_identity_fields(identity),
         status="not_checked",
         reason_code=code,
         detail=detail,
+        expectation_digest=(
+            identity["expectation"].digest() if identity.get("expectation") else None
+        ),
         compared_at=datetime.now(UTC).isoformat(),
         pending_confirmation=pending,
         warnings=warnings,

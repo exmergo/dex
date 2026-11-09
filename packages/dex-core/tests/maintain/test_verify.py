@@ -2806,6 +2806,56 @@ def test_a_join_is_named_by_the_model_it_reads_not_the_cte_alias(tmp_path: Path)
     assert fanned.join_keys == ("orders.order_id = lines.order_id",)
 
 
+def test_a_cross_join_to_a_set_operation_cte_names_the_cte(tmp_path: Path):
+    """#1211: a join to a CTE whose body is a set operation has no physical table
+    behind it, but it is a CTE with a name: report the CTE's own name rather than
+    calling it a subquery."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model("stg_orders", 'select * from "wh"."main"."orders"'),
+            "m.2": _model(
+                "fct_windows",
+                'with orders as (select * from "wh"."main"."stg_orders"), '
+                "windows as (select 1 as w union all select 2 as w) "
+                "select orders.id, windows.w from orders cross join windows",
+            ),
+        },
+    )
+    fanned = next(c for c in checks if c.model == "fct_windows")
+    assert fanned.joins == ("cross join to 'windows'",)
+    findings, _ = _judge(checks, {"stg_orders": 100, "fct_windows": 200})
+    assert [f.code for f in findings] == ["row_fanout"]
+    assert "the cross join to 'windows'" in findings[0].detail
+    assert "cross join to a subquery" not in findings[0].detail
+
+
+def test_a_cross_join_to_an_anonymous_set_operation_says_a_set_operation(
+    tmp_path: Path,
+):
+    """When a set operation is written inline as a subquery with no CTE name,
+    it is labelled as a set operation rather than an ordinary subquery."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model("stg_orders", 'select * from "wh"."main"."orders"'),
+            "m.2": _model(
+                "fct_windows",
+                'with stg as (select * from "wh"."main"."stg_orders") '
+                "select stg.id, w.n from stg "
+                "cross join (select 1 as n union all select 2 as n) as w",
+            ),
+        },
+    )
+    fanned = next(c for c in checks if c.model == "fct_windows")
+    assert fanned.joins == ("cross join to a set operation",)
+    findings, _ = _judge(checks, {"stg_orders": 100, "fct_windows": 200})
+    assert [f.code for f in findings] == ["row_fanout"]
+    assert "the cross join to a set operation" in findings[0].detail
+
+
 def test_a_project_that_was_never_compiled_says_so(
     maintain_repo, _assume_the_project_compiles
 ):

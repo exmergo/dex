@@ -1052,7 +1052,16 @@ def _offer_refactor_comparison(
         "models": ordered,
         "command": (
             f"transform compare {result.plan_id} --model {shlex.quote(ordered[0])} "
-            "[--map old=new] [--key column]"
+            "[--map old=new] [--key column] [--expect-file <expected-change.json>]"
+        ),
+        # A change meant to alter results is compared too, against what it
+        # is meant to change, rather than skipped (#1157).
+        "intended_change": (
+            "if the plan is meant to change rows, compare with --expect, stating "
+            "which rows may be added and removed, which columns may change, and "
+            "that the key holds: "
+            '{"added": "none"|"any"|{"where": "<predicate>"}, "removed": ..., '
+            '"changed_columns": [...], "key": "unchanged"}'
         ),
     }
     if mixed:
@@ -3986,6 +3995,8 @@ def _merge_spend(running: dict | None, latest: dict | None) -> dict | None:
 
 
 def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """``transform compare``: one model before and after a plan."""
+
     from .refactor_compare import compare
 
     try:
@@ -3998,10 +4009,26 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 key_columns=getattr(args, "key", None),
                 target=getattr(args, "target", None),
                 accepted_type_changes=getattr(args, "accept_type", None),
+                expectation=_expectation_arg(args),
             )
         )
     except ValueError as exc:
         return env.error_for(exc, **_resolution_error(exc))
+
+
+def _expectation_arg(args: argparse.Namespace) -> str | None:
+    """``--expect``'s JSON, inline or read from ``--expect-file`` (``-`` is stdin)."""
+
+    inline = getattr(args, "expect", None)
+    path = getattr(args, "expect_file", None)
+    if path is None:
+        return inline
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"--expect-file could not be read: {exc}") from exc
 
 
 def _column_map(pairs: list[str] | None) -> dict[str, str] | None:
@@ -4202,7 +4229,7 @@ def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
     unproven = [
         f"{s['model']} ({s.get('reason_code') or s.get('status')})"
         for s in states or []
-        if s.get("status") in {"different", "not_checked"}
+        if s.get("status") in {"different", "not_checked", "unexpected"}
     ]
     notes: list[str] = []
     if uncompared:
@@ -4214,8 +4241,8 @@ def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
         )
     if unproven:
         notes.append(
-            "the last comparison did not establish equivalence for: "
-            + ", ".join(unproven)
+            "the last comparison did not establish the results were kept or "
+            "changed only as expected for: " + ", ".join(unproven)
         )
     return notes
 
@@ -6506,12 +6533,63 @@ def _attach_completion(
             prose_population=_prose_population(result, inputs),
             identifier_conversions=inputs.get("identifier_conversions"),
             change_scope=inputs.get("change_scope"),
+            incremental_replay=_incremental_replay_inputs(result, inputs),
         )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _incremental_replay_inputs(
+    result: BuildResult, inputs: dict[str, Any]
+) -> dict[str, dict[str, Any]] | None:
+    """Each incremental model the plan edited, with the unit tests that run its
+    ``is_incremental()`` branch and whether this build full-refreshed it (#1130).
+
+    Read from the plan's model edits and this build's manifest, matched on the
+    file a model is defined in, so a model the plan only reads carries nothing.
+    Keyed on dbt's label for the node; ``answers`` holds every name a required
+    deliverable may use for it.
+    """
+
+    from ..dbt_project import manifest_node_label
+
+    edits = inputs.get("edits")
+    manifest = inputs.get("manifest")
+    if not edits or not isinstance(manifest, dict):
+        return None
+    edited = {
+        Path(edit.path).as_posix()
+        for edit in edits
+        if getattr(edit, "kind", None) is EditKind.MODEL_SQL
+        and getattr(edit, "op", None) is not EditOp.DELETE
+    }
+    if not edited:
+        return None
+    refresh = result.summary.get("full_refresh") or {}
+    refreshed = set(refresh.get("models") or []) if refresh.get("requested") else set()
+    found: dict[str, dict[str, Any]] = {}
+    for unique_id, node in (manifest.get("nodes") or {}).items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        if (node.get("config") or {}).get("materialized") != "incremental":
+            continue
+        path = str(node.get("original_file_path") or "")
+        if not path or not any(
+            path == candidate or candidate.endswith("/" + path) for candidate in edited
+        ):
+            continue
+        label = manifest_node_label(unique_id, node)
+        found[label] = {
+            "tests": [
+                test.unique_id for test in _incremental_unit_tests(manifest, node)
+            ],
+            "full_refreshed": label in refreshed,
+            "answers": sorted({label, str(node.get("name") or ""), Path(path).stem}),
+        }
+    return found or None
 
 
 def _completion_inputs(
@@ -6697,6 +6775,8 @@ def _semantic_plan(
     no_parse: bool = False,
     declarations: list[Any] | None = None,
 ) -> PlanResult:
+    """Validate, parse-gate, and construct a semantic plan across authoring modes."""
+
     from ..dbt_project import load as load_project
 
     project = engine.project_dir()
@@ -6789,8 +6869,9 @@ def _semantic_plan(
     elif spine_warning:
         parse_warning = "dbt parse skipped until the project has a time spine"
     else:
-        from .build import shadow_parse
+        from .build import assert_plan_packages_installed, shadow_parse
 
+        assert_plan_packages_installed(project, edits)
         parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
         if not parse_result["available"]:
             parse_warning = parse_result["reason"]

@@ -175,6 +175,21 @@ change is accepted. `maintain reconcile` answers these findings with advisories
 only: a declaration is a human's decision, so Dex never rewrites one to match the
 baseline.
 
+A native semantic layer (Ossie, SLayer, Cube) is compared the same way, from
+each definition's own declaration: every key of the `dex` block in its
+`ai_context` (Ossie) or `meta` (SLayer, Cube) and in each member's, a member's
+fields keyed by the column it reads, and its primary key as the `grain`, so a
+changed primary key is a `high` grain change and a `grain` written in the `dex`
+block is not read. The finding names the definition (`commerce.orders`, a SLayer
+model, a cube) and carries `data.layer: semantic` and `data.vendor`. With no
+transformation project, `data.declaration_drift` is the layer's own status, with
+its `vendor`; beside a dbt project the layer's status rides under
+`data.declaration_drift.semantic_layer`, and `checked` is true only when both
+were compared. A baseline pinned before native declarations were fingerprinted,
+a layer whose declarations could not be read, and a change of vendor are
+`checked: false` with a `reason`, never clean; `maintain snapshot
+--project-only` baselines them.
+
 The baseline records which vendor read the layer, and for SLayer the release and
 model format version. A change in any of them is reported first
 (`semantic_vendor_changed`, `semantic_format_changed`), and definitions are not
@@ -224,6 +239,20 @@ Needs no baseline. The classes of finding:
   `unique_combination_of_columns` test, a semantic model's primary entity,
   then a naming guess. `data.source` says which one. A declared grain is
   counted in the declared-fact statement below, so it is priced with it.
+  `data.grain_coverage` (#1223) holds one record per declared key, whichever
+  source declared it (`model`, `columns`, `source`, `status`, `reason`,
+  `measured`), so a key that held is stated rather than read out of an absent
+  finding. `status` is `proven` (the exact distinct count reached the row
+  count), `broken` (beside its `grain_broken` finding), `not_applicable`
+  (`empty_relation`), `unchecked` or `not_planned` (`priority`: a key from a
+  lower-ranked source the model's checked keys displaced; one on the same
+  columns as a checked key is judged by it and gets no record of its own).
+  `unchecked` names its `reason`: `no_relation`, `ambiguous`,
+  `metadata_unreadable`, `missing_columns`, `scan` (the connector could not
+  run the count), `scan_offered`, `no_count`, `refused` or `not_measured`. The
+  naming guess has no record, and the field is absent when the grain class is
+  suppressed. Only `proven` is a pass. `measured` carries the row and distinct
+  counts where both were read; the warehouse's own words stay in `notes`.
 - **Join contract** (#228, #857): every equality join's coverage, measured
   with one aggregate probe per driving relation and recorded under
   `data.join_coverage`, one record per join:

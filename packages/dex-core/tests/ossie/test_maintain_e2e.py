@@ -302,3 +302,152 @@ def test_renaming_a_relationship_field_is_drift_on_the_relationship(
     assert {"kind": "relationship", "name": "orders_to_customers"} in [
         {k: d.get(k) for k in ("kind", "name")} for d in changed
     ], payload["data"]["findings"]
+
+
+# --- declaration drift on the native layer (#995) -----------------------------
+
+
+def _declare(
+    repo: Path,
+    excludes: tuple[int, ...] = (0,),
+    *,
+    primary_key: tuple[str, ...] = ("order_id",),
+    restated: bool = False,
+) -> None:
+    """Declare the orders dataset's population and a field's role in
+    ``ai_context.dex``. ``restated`` writes the same declaration with its keys,
+    its filter values and the YAML style reordered."""
+
+    path = repo / "commerce.ossie.yaml"
+    doc = yaml.safe_load(path.read_text())
+    orders = doc["datasets"][0]
+    population: dict = {
+        "rule": "Every order placed by a real customer.",
+        "filters": [{"column": "customer_id", "excludes": list(excludes)}],
+    }
+    if restated:
+        population = {
+            "filters": [
+                {"excludes": sorted(excludes, reverse=True), "column": "customer_id"}
+            ],
+            "rule": "Every   order placed by a real customer.",
+        }
+    orders["ai_context"] = {"dex": {"population": population}}
+    orders["fields"][1]["ai_context"] = {
+        "dex": {"role": "foreign_key", "references": "customers.customer_id"}
+    }
+    orders["primary_key"] = list(primary_key)
+    path.write_text(
+        yaml.safe_dump(doc, sort_keys=restated, default_flow_style=restated),
+        encoding="utf-8",
+    )
+
+
+def _declared(payload: dict) -> list[dict]:
+    """The declaration findings of a drift payload, in ranked order."""
+
+    return [
+        f for f in payload["data"]["findings"] if f["code"].startswith("declaration_")
+    ]
+
+
+def test_a_changed_population_is_high_severity_declaration_drift(
+    ossie_repo: Path, capsys
+):
+    """A population edited in ``ai_context.dex`` is a high ``declaration_changed``
+    naming the field, on `semantic` and `check` alike.
+    """
+
+    _declare(ossie_repo)
+    _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
+    _declare(ossie_repo, excludes=(0, 99))
+
+    payload = _cli(ossie_repo, "maintain", "semantic", capsys=capsys)
+
+    assert payload["_exit"] == 0, payload
+    [finding] = _declared(payload)
+    assert finding["code"] == "declaration_changed"
+    assert finding["severity"] == "high"
+    assert finding["identifier"] == "commerce.orders"
+    assert finding["data"]["field"] == "population"
+    assert finding["data"]["change"] == "changed"
+    assert finding["data"]["path"] == "commerce.ossie.yaml"
+    status = payload["data"]["declaration_drift"]
+    assert status["checked"] is True
+    assert status["vendor"] == "ossie"
+    assert status["baseline_declared_models"] == status["declared_models"] == 2
+    # `maintain check` sweeps the same focus.
+    payload = _cli(ossie_repo, "maintain", "check", capsys=capsys)
+    assert [f["data"]["field"] for f in _declared(payload)] == ["population"]
+
+
+def test_a_restated_declaration_is_not_drift(ossie_repo: Path, capsys):
+    _declare(ossie_repo)
+    _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
+    _declare(ossie_repo, restated=True)
+
+    payload = _cli(ossie_repo, "maintain", "semantic", capsys=capsys)
+
+    assert payload["_exit"] == 0, payload
+    assert _declared(payload) == []
+    assert payload["data"]["declaration_drift"]["checked"] is True
+
+
+def test_a_changed_primary_key_is_a_grain_change(ossie_repo: Path, capsys):
+    _declare(ossie_repo)
+    _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
+    _declare(ossie_repo, primary_key=("order_id", "customer_id"))
+
+    payload = _cli(ossie_repo, "maintain", "semantic", capsys=capsys)
+
+    [finding] = _declared(payload)
+    assert (finding["data"]["field"], finding["severity"]) == ("grain", "high")
+
+
+def test_the_baseline_holds_no_declared_value(ossie_repo: Path, capsys):
+    """The snapshot holds each dataset's declaration as hashes, never its values."""
+
+    _declare(ossie_repo, excludes=(424242,))
+    payload = _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
+
+    assert payload["data"]["semantic_layer"]["declared_model_count"] == 2
+    text = (ossie_repo / ".dex" / "snapshot.json").read_text()
+    stored = json.loads(text)["semantic_layer"]["declarations"]
+    assert set(stored) == {"commerce.orders", "commerce.customers"}
+    for value in ("424242", "real customer", "customers.customer_id"):
+        assert value not in text
+
+
+def test_a_baseline_from_before_native_declarations_is_unchecked(
+    ossie_repo: Path, capsys
+):
+    """A baseline with no native declarations is unchecked, never clean, until a
+    project-only snapshot baselines them.
+    """
+
+    _declare(ossie_repo)
+    _cli(ossie_repo, "maintain", "snapshot", capsys=capsys)
+    path = ossie_repo / ".dex" / "snapshot.json"
+    stored = json.loads(path.read_text())
+    del stored["semantic_layer"]["declarations"]
+    path.write_text(json.dumps(stored))
+    _declare(ossie_repo, excludes=(0, 99))
+
+    for command in ("semantic", "check"):
+        payload = _cli(ossie_repo, "maintain", command, capsys=capsys)
+        assert payload["_exit"] == 0, payload
+        status = payload["data"]["declaration_drift"]
+        assert status["checked"] is False
+        assert "before the semantic layer's declarations" in status["reason"]
+        assert _declared(payload) == []
+        assert any(
+            w.startswith("declaration drift was not checked")
+            for w in payload["warnings"]
+        )
+
+    # `--project-only` baselines them without re-measuring the warehouse.
+    payload = _cli(ossie_repo, "maintain", "snapshot", "--project-only", capsys=capsys)
+    assert payload["_exit"] == 0, payload
+    payload = _cli(ossie_repo, "maintain", "semantic", capsys=capsys)
+    assert payload["data"]["declaration_drift"]["checked"] is True
+    assert _declared(payload) == []

@@ -1,0 +1,53 @@
+{
+  "models": {
+    "shipments_loaded": {
+      "grain": [
+        "shipment_id"
+      ],
+      "columns": {
+        "shipment_id": {
+          "role": "key"
+        },
+        "shipped_on": {
+          "role": "time"
+        },
+        "region": {
+          "role": "dimension"
+        },
+        "days_to_load": {
+          "role": "measure",
+          "additivity": "non_additive",
+          "unit": "days"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every shipment is present once",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.shipments) - (select count(distinct shipment_id) from main.shipments_loaded) + (select count(*) - count(distinct shipment_id) from main.shipments_loaded)"
+    },
+    {
+      "name": "ship dates and load times are the source's",
+      "expect": 0,
+      "sql": "select count(*) from raw.shipments s join main.shipments_loaded l using (shipment_id) where l.shipped_on is distinct from s.shipped_on or l.days_to_load is distinct from date_diff('day', s.shipped_on, cast(s.loaded_at as date))"
+    }
+  ],
+  "procedure": {
+    "compare_expected_before_apply": true,
+    "build_after_apply": true
+  },
+  "expected_change": {
+    "model": "shipments_loaded",
+    "key": "shipment_id",
+    "expect": {
+      "added": {
+        "where": "days_to_load > 1"
+      },
+      "removed": "none",
+      "changed_columns": [],
+      "key": "unchanged"
+    }
+  }
+}

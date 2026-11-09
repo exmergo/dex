@@ -71,7 +71,16 @@ the project edits, migrations and dev builds described below.
    refactor's plan: its comparison would have nothing built to read
    (`mixed_with_repair`). Equivalence is about
    the results the request keeps, not an intermediate's layout. A change meant
-   to alter results needs no comparison.
+   to alter results (a backfill, an exclusion, late arrivals) is compared too,
+   against what it is meant to change:
+   `dex transform compare <plan-id> --key <grain> --expect '<json>'`, stating
+   which rows may be `added` and `removed` (`"none"`, `"any"`, or
+   `{"where": "<predicate over output columns>"}`, which may test a column
+   with `IN (SELECT <column> FROM ref('<model>') WHERE ...)`), the
+   `changed_columns` a kept key may change, and that the key holds.
+   `as_expected` is the verdict to relay; `unexpected` is a defect, as
+   `different` is: its `findings` and `unexpected_keys` name the rows the
+   change reached beyond its statement.
 4. **Apply.** `dex transform apply <plan-id>` writes the plan as a reviewable
    diff. A `needs_confirmation` here means a file changed since planning:
    plan again against it. A commit carrying files Dex wrote ends with the
@@ -90,7 +99,12 @@ the project edits, migrations and dev builds described below.
    `join_coverage`, `parent_population` and `temporal_contracts` is `satisfied`,
    `contradicted` (a finding to fix), `not_applicable` (nothing to judge, such as
    an empty input, which is not full coverage) or `unchecked` (its `reason_code`
-   says why, and it is not clean).
+   says why, and it is not clean). The same holds for
+   `data.completion.obligations`: a `comparison` entry that is not `satisfied`
+   (a rewrite applied uncompared, or compared without an `as_expected` or
+   `equivalent` verdict) and an `incremental_replay` entry that is not
+   `satisfied` (no passing unit test ran the `is_incremental()` branch) are
+   unfinished work, not a passing build.
    Output keys the parent lacks are never the population: drive the model from
    the parent instead. Check the rows the request is about with an aggregate
    over the built model, `dex explore query --target dev "<SELECT ...>"`, which
@@ -226,7 +240,8 @@ the checkable form where the model carries the column, and read
   safe. Prove the incremental branch with a unit test that overrides
   `is_incremental` (`dex transform test --scaffold <model>` writes one), build
   again without `--full-refresh`, and state the late-arrival horizon the repair
-  supports. Never insert probe rows into a loader's source.
+  supports. `obligations.incremental_replay` reads `full_refresh_only` or
+  `no_incremental_test` until that test passes in the build. Never insert probe rows into a loader's source.
   Recipe: `skills/transform/references/incremental-repairs.md`.
 - Change only what the request asks; keep the output columns, their types and
   the population the request and the existing model define, and own every other

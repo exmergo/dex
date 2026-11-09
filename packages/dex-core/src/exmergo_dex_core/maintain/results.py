@@ -36,8 +36,9 @@ class LayerFingerprint(BaseModel):
     source_count: int | None = None
     semantic_model_count: int | None = None
     metric_count: int | None = None
-    #: Models whose declaration was fingerprinted (#497). ``None`` when the
-    #: format does not read declarations, so the next run reports the
+    #: Models whose declaration was fingerprinted (#497), or on a native
+    #: semantic layer the definitions whose declaration was (#995). ``None``
+    #: when the format does not read declarations, so the next run reports the
     #: declaration axis as unchecked; ``0`` when it does and none are declared.
     declared_model_count: int | None = None
 
@@ -53,6 +54,7 @@ class LayerFingerprint(BaseModel):
         return {
             "semantic_model_count": self.semantic_model_count,
             "metric_count": self.metric_count,
+            "declared_model_count": self.declared_model_count,
         }
 
 
@@ -175,6 +177,11 @@ class VerifyResult(Result):
     parent_population: list[dict] | None = None
     #: One record per declared ``history`` temporal contract (#1027).
     temporal_contracts: list[dict] | None = None
+    #: One record per declared grain key (#1223): ``proven``, ``broken``,
+    #: ``not_applicable``, ``unchecked`` or ``not_planned``, each with a
+    #: ``reason`` code where it was not judged. ``None`` when the grain class
+    #: did not run at all, which ``suppressed["grain"]`` then says.
+    grain_coverage: list[dict] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -182,6 +189,8 @@ class VerifyResult(Result):
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.grain_coverage is not None:
+            payload["grain_coverage"] = self.grain_coverage
         if self.join_coverage is not None:
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:

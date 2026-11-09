@@ -824,6 +824,53 @@ def test_a_cold_dev_target_degrades_to_a_note_rather_than_failing(tmp_path: Path
     assert "priced again after the build" in notes[0]
 
 
+def test_bigquery_cold_target_pricing_warning_is_single_line_without_url(
+    tmp_path: Path,
+):
+    """bigquery cold target pricing warning is one line naming the relation.
+
+    when bigquery upfront preflight hits notfound for an unbuilt relation,
+    the warning is reported in one line naming the relation without leaking
+    the request url or job id (issue #1209).
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.adapters.base import warehouse_refusal
+    from exmergo_dex_core.adapters.bigquery import _api_error_message
+    from exmergo_dex_core.errors import StatementStage
+    from exmergo_dex_core.transform.verify import price_verification
+
+    _priceable_manifest(tmp_path, materialized="view")
+    raw_404 = (
+        "404 POST https://bigquery.googleapis.com/bigquery/v2/projects/test-proj/"
+        "jobs?prettyPrint=false: Not found: Table test-proj:dbt_dev.fct_orders "
+        "was not found in location US\n\nLocation: None\nJob ID: fake-job-1234"
+    )
+
+    class _BigQueryEstimator:
+        """fake estimator translating bigquery notfound via warehouse_refusal."""
+
+        dialect = "bigquery"
+
+        def query_estimate(self, sql: str) -> float:
+            """dry-run estimator that raises translated notfound."""
+            exc = api_exceptions.NotFound(raw_404)
+            raise warehouse_refusal(_api_error_message(exc), stage=StatementStage.PLAN)
+
+    price, notes = price_verification(
+        _BigQueryEstimator(), tmp_path, scope={"model.p.fct_orders"}
+    )
+    assert price == 0.0
+    assert len(notes) == 1
+    (warning,) = notes
+    assert "https://" not in warning
+    assert "Job ID" not in warning
+    assert "\n" not in warning
+    assert "test-proj:dbt_dev.fct_orders" in warning
+    assert "could not price this build's verification upfront" in warning
+
+
 def test_a_connector_with_no_dry_run_prices_nothing_and_says_nothing(tmp_path: Path):
     """Postgres has no estimator at all. Absent is not a degrade: there was
     never an upfront number to lose, and the phase check still gates it."""
