@@ -1098,6 +1098,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    grain_coverage: list[dict] | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
@@ -1225,6 +1226,7 @@ def verify(
                 else ([], [])
             )
             proven_grains: dict[str, dict] = {}
+            grain_coverage = []
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1233,6 +1235,7 @@ def verify(
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
+                records=grain_coverage,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1312,6 +1315,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
                 findings = verify_mod.damp_fanout(
@@ -1331,6 +1335,10 @@ def verify(
 
     if wanted and join_coverage is not None:
         join_coverage = [r for r in join_coverage if r["model"].lower() in wanted]
+    if grain_coverage is not None:
+        grain_coverage = _complete_grain_coverage(
+            definitions, grain_coverage, scope=wanted
+        )
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
@@ -1342,6 +1350,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        grain_coverage=grain_coverage,
     )
     if cost is not None:
         result.cost = cost
@@ -1399,6 +1408,7 @@ def _grain_contract(
     scope=None,
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1437,8 +1447,44 @@ def _grain_contract(
         [o.identifier for o in live],
         scoped_models,
         proven=proven,
+        records=records,
     )
     return findings, notes, None
+
+
+def _complete_grain_coverage(
+    definitions, records: list[dict], *, scope: set[str] | None = None
+) -> list[dict]:
+    """``grain_coverage`` as the result carries it (#1223): the records the
+    grain axis and the declared-fact statement wrote, a ``not_planned`` record
+    for each declared key the priority rule left out, and an ``unchecked``
+    record (``not_measured``) for any planned key neither path reached, so no
+    declared key is ever absent. Sorted by model, then source rank."""
+
+    declared = verify_mod.declared_grain_candidates(definitions, scope=scope)
+    planned = verify_mod.grain_plan(definitions, scope=scope)
+    seen = {
+        (r["model"], r["source"], tuple(c.lower() for c in r["columns"]))
+        for r in records
+    }
+    complete = list(records)
+    for model, candidates in planned.items():
+        for candidate in candidates:
+            marker = (
+                model,
+                candidate.source,
+                tuple(c.lower() for c in candidate.columns),
+            )
+            if marker not in seen:
+                complete.append(
+                    verify_mod.grain_record(
+                        model, candidate, "unchecked", "not_measured"
+                    )
+                )
+    complete.extend(verify_mod.not_planned_grain_records(declared, planned))
+    if scope:
+        complete = [r for r in complete if r["model"].lower() in scope]
+    return verify_mod.sort_grain_records(complete)
 
 
 def _join_contract(
