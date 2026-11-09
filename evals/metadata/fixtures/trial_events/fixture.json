@@ -1,0 +1,5 @@
+{
+  "name": "trial_events",
+  "description": "Subscriptions and their billing events, where every subscription and every event survives but a derived subtotal can still be wrong: a missing-data report is a diagnosis, not a row count.",
+  "seed": 10480
+}

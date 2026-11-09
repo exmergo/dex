@@ -496,6 +496,49 @@ def test_a_time_spine_alone_is_a_note(tmp_path: Path):
     assert result.suppressed["row_population"] == generated
 
 
+def test_a_model_driven_off_the_time_spine_is_a_note_on_a_build(tmp_path: Path):
+    """#988: a build's sweep skips the spine-driven comparison with a note, no
+    row count and no row-population finding."""
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."metricflow_time_spine"',
+                "compiled_code": 'select date_day from "warehouse"."raw"."dates"',
+            },
+            "model.shop.fct_weekly": {
+                "name": "fct_weekly",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_weekly"',
+                "compiled_code": (
+                    "select s.date_day, o.id from "
+                    '"warehouse"."dbt_dev"."metricflow_time_spine" s '
+                    'cross join "warehouse"."raw"."orders" o'
+                ),
+            },
+        },
+        results=[{"unique_id": "model.shop.fct_weekly", "status": "success"}],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_weekly")],
+        counts={"warehouse.dbt_dev.fct_weekly": 10},
+    )
+    result = _sweep(tmp_path, _summary([_node("model.shop.fct_weekly")]), adapter)
+    note = (
+        "row population was not compared for fct_weekly (its driving parent "
+        "'metricflow_time_spine' is the project's time spine, which supplies "
+        "anchors rather than a population the model is expected to preserve)"
+    )
+    assert note in result.notes
+    assert note not in result.warnings
+    assert result.suppressed.get("row_population") == note
+    assert not [q for q in adapter.queries if "count(" in q.lower()], adapter.queries
+    assert not [f for f in result.findings if f.code in {"row_fanout", "row_loss"}]
+
+
 def test_a_model_whose_final_cte_is_a_union_is_suppressed_with_reason(tmp_path: Path):
     sql = (
         "with named as (select 1 as id), "

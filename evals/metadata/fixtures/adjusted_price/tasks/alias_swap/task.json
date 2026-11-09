@@ -1,0 +1,5 @@
+{
+  "kind": "fix",
+  "models": ["product_pricing"],
+  "prompt": "In `product_pricing`, the discounted average sometimes comes out above the list average, which should not happen. Check whether `avg_adjusted_price` is computed correctly, fix it if it is not, and build it on dev."
+}

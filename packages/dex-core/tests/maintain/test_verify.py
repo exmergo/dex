@@ -1793,7 +1793,7 @@ def test_a_model_that_fans_out_is_reported_with_its_join_key(tmp_path: Path):
 
 _ANCHORED = (
     "with anchors as (select date_day as anchor_date "
-    'from "wh"."main"."metricflow_time_spine"), '
+    'from "wh"."main"."anchor_dates"), '
     'daily as (select * from "wh"."main"."fct_daily") '
     "select anchors.anchor_date, daily.page from anchors inner join daily "
     "on daily.data_date >= anchors.anchor_date - 14 "
@@ -1808,7 +1808,7 @@ def test_a_join_with_no_readable_key_caps_its_fanout_at_medium(tmp_path: Path):
     checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
     findings, _ = _judge(
         checks,
-        {"metricflow_time_spine": 2557, "fct_daily": 900, "fct_comparison": 19096},
+        {"anchor_dates": 2557, "fct_daily": 900, "fct_comparison": 19096},
     )
     assert [f.code for f in findings] == ["row_fanout"]
     finding = findings[0]
@@ -1823,7 +1823,7 @@ def test_a_fanout_inside_the_medium_band_with_no_key_says_no_cap(tmp_path: Path)
     checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
     findings, _ = _judge(
         checks,
-        {"metricflow_time_spine": 100, "fct_daily": 900, "fct_comparison": 150},
+        {"anchor_dates": 100, "fct_daily": 900, "fct_comparison": 150},
     )
     assert findings[0].severity == "medium"
     assert findings[0].data["join_key_read"] is False
@@ -1857,6 +1857,213 @@ def test_each_join_is_shown_beside_its_own_keys(tmp_path: Path):
     # One join's key is readable, so the size of the expansion still ranks it.
     assert findings[0].severity == "high"
     assert "join_key_read" not in findings[0].data
+
+
+# --- #988: a date spine supplies anchors, not a population ----------------------
+
+_SPINE_ANCHORED = _ANCHORED.replace("anchor_dates", "{spine}")
+
+
+def _spine_node(name: str, **extra) -> dict:
+    return _model(name, 'select * from "wh"."main"."raw_dates"', **extra)
+
+
+def _spine_plan(tmp_path: Path, nodes: dict):
+    """Like :func:`_plan`, with the informational notes kept."""
+
+    target = tmp_path / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps({"nodes": nodes, "sources": {}}), encoding="utf-8"
+    )
+    return verify_mod.row_population_plan(tmp_path, "duckdb")
+
+
+def test_a_model_driven_off_the_legacy_time_spine_is_not_compared(tmp_path: Path):
+    """#988: the spine's row count is not a population the model preserves,
+    so the comparison is skipped and a note, not a warning, says why."""
+
+    checks, notes, informational = _spine_plan(
+        tmp_path,
+        {
+            "m.spine": _spine_node("metricflow_time_spine"),
+            "m.1": _model(
+                "fct_comparison", _SPINE_ANCHORED.format(spine="metricflow_time_spine")
+            ),
+        },
+    )
+    assert [check.model for check in checks] == ["metricflow_time_spine"]
+    note = (
+        "row population was not compared for fct_comparison (its driving parent "
+        "'metricflow_time_spine' is the project's time spine, which supplies "
+        "anchors rather than a population the model is expected to preserve)"
+    )
+    assert note in notes and note in informational
+
+
+def test_a_time_spine_config_marks_a_spine_under_any_name(tmp_path: Path):
+    """dbt 1.9's ``time_spine:`` config lands on the manifest node."""
+
+    checks, notes, _ = _spine_plan(
+        tmp_path,
+        {
+            "m.spine": _spine_node(
+                "all_days", time_spine={"standard_granularity_column": "date_day"}
+            ),
+            "m.1": _model("fct_comparison", _SPINE_ANCHORED.format(spine="all_days")),
+        },
+    )
+    assert "fct_comparison" not in [check.model for check in checks]
+    assert any("'all_days' is the project's time spine" in note for note in notes)
+
+
+def test_a_parent_generated_in_sql_is_not_a_population(tmp_path: Path):
+    checks, notes, informational = _spine_plan(
+        tmp_path,
+        {
+            "m.days": _model(
+                "days",
+                "select cast(range as date) as date_day from "
+                "range(date '2020-01-01', date '2021-01-01', interval 1 day)",
+            ),
+            "m.1": _model("fct_comparison", _SPINE_ANCHORED.format(spine="days")),
+        },
+    )
+    assert checks == []
+    note = next(note for note in notes if "fct_comparison" in note)
+    assert "its driving parent 'days' is generated in SQL" in note
+    assert note in informational
+
+
+def test_a_generated_parent_outside_the_scope_is_still_recognized(tmp_path: Path):
+    """A build that verifies one model has not read its parent: the parent is
+    read for this, once, and the note stays inside the scope."""
+
+    target = tmp_path / "target"
+    target.mkdir(parents=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "m.days": _model(
+                        "days",
+                        "select cast(range as date) as date_day from "
+                        "range(date '2020-01-01', date '2021-01-01', interval 1 day)",
+                    ),
+                    "m.1": _model(
+                        "fct_comparison", _SPINE_ANCHORED.format(spine="days")
+                    ),
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks, notes, _ = verify_mod.row_population_plan(tmp_path, "duckdb", scope={"m.1"})
+    assert checks == []
+    assert len(notes) == 1 and "'days' is generated in SQL" in notes[0]
+
+
+_DATE_SPINE = (
+    "with rawdata as (with p as (select 0 as generated_number union all "
+    "select 1), unioned as (select p0.generated_number * power(2, 0) + "
+    "p1.generated_number * power(2, 1) + 1 as generated_number "
+    "from p as p0 cross join p as p1) "
+    "select * from unioned where generated_number <= 3 order by generated_number), "
+    "all_periods as (select cast('2020-01-01' as date) + "
+    "(row_number() over (order by 1) - 1) as date_day from rawdata), "
+    "filtered as (select * from all_periods "
+    "where date_day <= cast('2030-01-01' as date)) "
+    "select * from filtered"
+)
+
+
+def test_dbt_utils_date_spine_is_generated_in_sql(tmp_path: Path):
+    """``dbt_utils.date_spine`` compiles to a CTE with a WITH of its own over a
+    union of FROM-less selects. The nested name ``unioned`` was read as a
+    physical parent; it is generated in SQL, and so is a model driven off it."""
+
+    checks, notes, _ = _spine_plan(
+        tmp_path,
+        {
+            "m.days": _model("all_days", _DATE_SPINE),
+            "m.1": _model("fct_comparison", _SPINE_ANCHORED.format(spine="all_days")),
+        },
+    )
+    assert checks == []
+    text = " ".join(notes)
+    assert "all_days (generated in SQL; no parent relation" in text
+    assert "its driving parent 'all_days' is generated in SQL" in text
+    assert "unioned" not in text
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select day as date_day from "
+        "unnest(generate_date_array('2024-01-01', '2024-04-30')) as day",
+        "select x from unnest([1, 2, 3]) as x",
+    ],
+)
+def test_bigquery_unnest_of_a_generator_is_generated_in_sql(sql):
+    """BigQuery's spine is ``unnest(generate_date_array(...))``: it generates
+    its rows in SQL, like DuckDB's ``range(...)``, rather than reading as a
+    relation dex cannot follow."""
+
+    import sqlglot
+
+    from exmergo_dex_core import sql_shape
+
+    tree = sqlglot.parse_one(sql, read="bigquery")
+    assert verify_mod._driving_parent(tree, sql_shape)[4] == verify_mod._GENERATED_SQL
+
+
+def test_an_unnest_of_a_column_is_not_generated_sql():
+    import sqlglot
+
+    from exmergo_dex_core import sql_shape
+
+    tree = sqlglot.parse_one(
+        'select item from "wh"."main"."orders" o, unnest(o.items) as item',
+        read="duckdb",
+    )
+    assert verify_mod._driving_parent(tree, sql_shape)[4] != verify_mod._GENERATED_SQL
+
+
+def test_a_union_reading_a_table_is_still_a_set_operation(tmp_path: Path):
+    checks, notes = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "mixed", 'select 1 as a union all select a from "wh"."main"."t"'
+            )
+        },
+    )
+    assert checks == []
+    assert "mixed (it is a set operation, so it has no single parent)" in notes[0]
+
+
+def test_a_model_that_only_joins_the_spine_keeps_its_check(tmp_path: Path):
+    """The spine is skipped only as the driving parent: a fact joined to it is
+    still compared, and its fan-out is reported as before."""
+
+    checks, notes, _ = _spine_plan(
+        tmp_path,
+        {
+            "m.spine": _spine_node("metricflow_time_spine"),
+            "m.1": _model(
+                "fct",
+                'select o.id from "wh"."main"."stg_orders" o inner join '
+                '"wh"."main"."metricflow_time_spine" s on o.ordered_at = s.date_day '
+                'left join "wh"."main"."stg_items" i on o.id = i.order_id',
+            ),
+        },
+    )
+    fct = next(check for check in checks if check.model == "fct")
+    assert fct.parent == "wh.main.stg_orders" or fct.parent.endswith("stg_orders")
+    assert not any("fct (" in note for note in notes)
+    findings, _ = _judge([fct], {"stg_orders": 100, "stg_items": 300, "fct": 400})
+    assert [f.code for f in findings] == ["row_fanout"]
 
 
 def _fanout(severity: str = "high", code: str = "row_fanout", model: str = "fct"):
@@ -2344,12 +2551,19 @@ def test_verify_reports_row_loss_end_to_end(
     assert "row_population" not in payload["data"]["suppressed"]
 
 
-def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
-    """#841's shape on a real warehouse: Monday anchors off a date spine,
-    range-joined to a daily fact, one row per anchor x day x page."""
+def _anchored_comparison(
+    maintain_repo,
+    *,
+    duplicate: bool = False,
+    anchors: str = "anchor_dates",
+    spine_config: dict | None = None,
+) -> None:
+    """#841's shape on a real warehouse: Monday anchors off a date table,
+    range-joined to a daily fact, one row per anchor x day x page. ``anchors``
+    names the date table; the project's time spine is not compared (#988)."""
 
     maintain_repo.sql(
-        "CREATE TABLE metricflow_time_spine AS SELECT "
+        f"CREATE TABLE {anchors} AS SELECT "  # noqa: S608 - a fixed test name
         "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 100) t(i)"
     )
     maintain_repo.sql(
@@ -2357,8 +2571,8 @@ def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
         "data_date, p AS page FROM range(0, 100) t(i), (VALUES ('a'), ('b')) v(p)"
     )
     sql = (
-        "with anchors as (select date_day as anchor_date from "
-        '"warehouse"."main"."metricflow_time_spine" where dayofweek(date_day) = 1), '
+        "with anchors as (select date_day as anchor_date from "  # noqa: S608
+        f'"warehouse"."main"."{anchors}" where dayofweek(date_day) = 1), '
         'daily as (select * from "warehouse"."main"."fct_daily") '
         "select anchors.anchor_date || '|' || daily.data_date || '|' || daily.page "
         "as comparison_key, anchors.anchor_date, daily.data_date, daily.page "
@@ -2368,9 +2582,26 @@ def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
     )
     built = f"{sql} union all ({sql} limit 5)" if duplicate else sql
     maintain_repo.sql(f"CREATE TABLE fct_comparison AS {built}")
+    spine = (
+        {
+            f"model.maintain_test.{anchors}": {
+                "name": anchors,
+                "resource_type": "model",
+                "relation_name": f'"warehouse"."main"."{anchors}"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day from "
+                    "range(date '2024-01-01', date '2024-04-10', interval 1 day)"
+                ),
+                **spine_config,
+            }
+        }
+        if spine_config is not None
+        else {}
+    )
     _write_artifacts(
         maintain_repo.project_dir,
         nodes={
+            **spine,
             "model.maintain_test.fct_comparison": {
                 "name": "fct_comparison",
                 "resource_type": "model",
@@ -2422,14 +2653,43 @@ def test_verify_ranks_an_intended_expansion_low_end_to_end(
     # One finding states one cap: the grain's replaces the unread key's.
     assert comparison["detail"].count("severity capped") == 1
     assert "severity capped at low" in comparison["detail"]
-    assert (
-        comparison["data"]["driving_parent"] == "warehouse.main.metricflow_time_spine"
-    )
+    assert comparison["data"]["driving_parent"] == "warehouse.main.anchor_dates"
     assert fanouts["fct_order_lines"]["severity"] == "high"
     assert not [
         f
         for f in payload["data"]["findings"]
         if f["code"] == "grain_broken" and f["identifier"] == "fct_comparison"
+    ]
+
+
+def test_verify_does_not_compare_a_model_to_its_time_spine_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#988 end to end: the same comparison off the project's time spine
+    reports no row-population finding, names the spine in a note, and still
+    reports the ordinary fan-out in the same sweep."""
+
+    _anchored_comparison(
+        maintain_repo,
+        anchors="all_days",
+        spine_config={"time_spine": {"standard_granularity_column": "date_day"}},
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    population = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] in {"row_fanout", "row_loss"}
+    ]
+    assert [f["identifier"] for f in population] == ["fct_order_lines"]
+    note = next(note for note in payload["data"]["notes"] if "fct_comparison (" in note)
+    assert "'all_days' is the project's time spine" in note
+    # Row population speaks in the note only; the range join's own coverage
+    # warning is the join contract's, and is unchanged.
+    assert not [
+        warning
+        for warning in payload["warnings"]
+        if "fct_comparison" in warning and "row population" in warning
     ]
 
 

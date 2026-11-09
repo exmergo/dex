@@ -1,0 +1,9 @@
+version: 2
+models:
+  - name: int_line_prices
+    description: One row per order line, with its price after the line's discount.
+    columns:
+      - name: line_id
+        data_tests: [unique, not_null]
+      - name: adjusted_price
+        description: The list price after the line's discount.

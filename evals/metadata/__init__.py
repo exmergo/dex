@@ -17,6 +17,9 @@ returns the wrong numbers, fix it"), then scores what it left behind:
   (grain, population filters, additivity, unit, aggregation, the evidence tier
   the convention calls for), compared field by field, plus SQL checks on the
   built data.
+- **diagnosis**: on a task that asks whether a model is wrong (#1048, #1116),
+  whether the final message names the delivered column, the evidence of its
+  derivation, and a verdict the evidence allows, apart from the build.
 
 Everything here is deterministic. Every field is decided by a comparison, so no
 LLM judge is used; description prose is carried into the report for a human to

@@ -1,0 +1,27 @@
+{
+  "diagnosis": {
+    "verdict": "no_defect",
+    "fields": [
+      "cancelled_on"
+    ],
+    "evidence": [
+      [
+        "1021"
+      ],
+      [
+        "null",
+        "empty",
+        "no cancellation",
+        "not cancelled",
+        "never cancelled"
+      ]
+    ],
+    "explains": [
+      "active",
+      "not cancelled",
+      "never cancelled",
+      "hasn't been cancelled",
+      "has not been cancelled"
+    ]
+  }
+}

@@ -23,6 +23,10 @@ Truth (``truth.json``), per task::
      "workspace_checks": [{"name": "...", "sql": "...", "expect": 0,
                            "live_only": true}],
      "report": {"names": ["task_data", "due_at"], "not_done": true},
+     "diagnosis": {"verdict": "defect" | "no_defect" | "unresolved",
+                   "fields": ["trial_event_count"],          # every one named
+                   "evidence": [["trl"], ["stg_events", "event_tier"]],
+                   "explains": ["is_internal", "internal"]},  # no_defect only
      "incomplete_allowed": {"blocked_by": ["tasks_task"]},
      "procedure": {"build_after_apply": true, "cold_deps_after_apply": true,
                    "compare_before_apply": true, "rebuilt_before_compare": true,
@@ -52,6 +56,11 @@ read-only against the warehouse the agent left in its workspace, which is the
 only place a change the agent made to data, or failed to make, can be seen; a
 ``live_only`` one is skipped on a reference run, which never builds there.
 ``report`` grades the agent's final message (see :func:`report_rubric`).
+``diagnosis`` grades the diagnosis in it, apart from the build (#1048, #1116;
+see :func:`diagnosis_rubric`). A task of kind ``diagnose`` asks about a model
+that may be right: it is scored even when nothing was changed, its model axes
+are ``None`` rather than a vacuous pass, and changing a model it lists fails
+its diagnosis unless the verdict is ``defect``.
 ``replays`` grade an incremental model's next run, which a single cold build
 never executes (#1111): each starts from its own fresh copy of the workspace and
 grading warehouse, runs its ``setup`` statements, builds the project cold, then
@@ -1177,6 +1186,145 @@ def report_rubric(
     return {"passed": all(checks.values()), "checks": checks}
 
 
+# A clean verdict: "nothing is wrong", "the model is correct", "no issue".
+_CLEAN = re.compile(
+    r"\bnothing (?:is |was |looks )?(?:wrong|missing|broken)\b|"
+    r"\bno (?:issue|problem|defect|bug|error)s?\b|"
+    r"\b(?:is|are|looks?|seems?) (?:correct|fine|right|accurate)\b|"
+    r"\bworking as (?:intended|expected|designed)\b|"
+    r"\b(?:correctly|properly) (?:computed|calculated|implemented|applied)\b"
+)
+# An investigation that stays open, stated as such.
+_UNRESOLVED = re.compile(
+    r"\b(?:unresolved|unverified|undetermined|unsettled|ambiguous|unclear|"
+    r"undefined|undocumented|open question|not (?:verified|settled|specified|"
+    r"documented|defined|stated|determined|confirmed)|"
+    r"(?:could|can)(?:not|n['\u2019]t| not) (?:verify|confirm|determine|tell|"
+    r"settle|establish|decide)|no (?:contract|mapping|rule|documentation|"
+    r"evidence) (?:says|settles|states|decides|defines|specifies|covers)|"
+    r"(?:does not|doesn['\u2019]t|do not|don['\u2019]t) (?:answer|say|settle|define|"
+    r"specify|decide|state)|"
+    r"nothing in [^.]{0,60}?(?:says|settles|defines|answers|states)|"
+    r"business (?:question|decision)|(?:should|to) confirm|judg(?:e)?ment call)\b"
+)
+# A clean verdict that qualifies itself in the same sentence ("correct, but
+# whether refunds count is not stated") is a qualified one.
+_HEDGE = re.compile(
+    r"\b(?:but|however|although|except|whether|if|unless|assuming|"
+    r"as (?:the model is |it is )?written|as (?:the model|it) (?:defines|is defined))\b"
+)
+# A defect named: something the delivered value gets wrong.
+_DEFECT = re.compile(
+    r"\b(?:bug|defect|wrong|incorrect(?:ly)?|missing|miss(?:es|ed)|drop(?:s|ped)?|"
+    r"not (?:counted|included|mapped|normali[sz]ed|used|applied)|ignor(?:es|ed)|"
+    r"instead of|unadjusted|swapped|mislabel(?:l?ed)?|wrongly|unused|nothing used|"
+    r"never (?:used|applied|reached|counted|mapped))\b"
+)
+
+
+# A defect word under a negation ("no row is missing", "found no defect") is a
+# clean verdict, not a defect named.
+_NEGATED_DEFECT = re.compile(
+    r"\b(?:no|not|nothing|none|never)\b"
+    r"(?:\s+(?!(?:but|however|yet|although|though|while|and|whereas)\b)\w+){0,3}?\s+"
+    r"(?:(?:is|are|was|were|looks?|seems?)\s+)?(?:defects?|bugs?|wrong|missing)\b"
+)
+
+
+# The model itself called at fault, as distinct from the symptom restated
+# ("1013 is missing"): what a no-defect verdict cannot also say.
+_FAULT = re.compile(
+    r"\b(?:bugs?|defects?|wrong(?:ly)?|incorrect(?:ly)?|mislabel(?:l?ed)?|swapped)\b"
+)
+
+
+def _clean(sentence: str) -> str:
+    """``sentence`` with its clean verdicts and negated defect words removed."""
+
+    return _CLEAN.sub(" ", _NEGATED_DEFECT.sub(" ", sentence))
+
+
+def diagnosis_rubric(
+    truth: dict[str, Any] | None,
+    final: str | None,
+    touched: list[str],
+    models: list[str],
+) -> dict[str, Any] | None:
+    """Whether the final message localizes and qualifies a diagnosis (#1048, #1116).
+
+    Graded apart from the build and the row checks, because a green build and an
+    untouched project are both consistent with a diagnosis that never looked at
+    the value asked about. Deterministic sentence heuristics, like
+    :func:`report_rubric`, not a judge of prose. ``truth`` is the task's
+    ``diagnosis`` block; every check is reported on its own:
+
+    - ``localized``: every name in ``fields`` appears (the delivered column);
+      every term is matched as a whole identifier, so ``adjusted_price`` is
+      not found inside ``avg_adjusted_price``;
+    - ``evidenced``: each group in ``evidence`` has one of its terms (the
+      derivation: the source column, the category, the intermediate);
+    - ``qualified``: the verdict is stated as the evidence allows. ``defect``
+      names something wrong. ``no_defect`` names what explains the symptom
+      (one of ``explains``). ``unresolved`` says what stayed open, and no
+      sentence gives a clean verdict without qualifying it;
+    - ``unchanged`` (``no_defect`` and ``unresolved``): no model the task
+      lists was changed, since a model that is right, or whose intent is not
+      settled, is not repaired.
+
+    ``None`` when the task grades no diagnosis or there is no message to read.
+    """
+
+    if not truth or final is None:
+        return None
+    text = final.lower()
+    sentences = _sentences(final)
+    verdict = truth.get("verdict")
+
+    def mentions(term: Any) -> bool:
+        # A whole identifier: `adjusted_price` is not found in `avg_adjusted_price`.
+        return bool(re.search(rf"(?<!\w){re.escape(str(term).lower())}(?!\w)", text))
+
+    checks: dict[str, bool] = {}
+    fields = truth.get("fields") or []
+    if fields:
+        checks["localized"] = all(mentions(name) for name in fields)
+    groups = truth.get("evidence") or []
+    if groups:
+        checks["evidenced"] = all(any(mentions(t) for t in group) for group in groups)
+    if verdict == "defect":
+        # A clean phrase is dropped first: "nothing is wrong" names no defect.
+        checks["qualified"] = any(
+            _DEFECT.search(_clean(sentence)) for sentence in sentences
+        )
+    elif verdict == "no_defect":
+        explains = truth.get("explains") or []
+        # A message that also calls the model wrong contradicts its own verdict.
+        # Only an unhedged sentence about the model counts: "a wrong id would
+        # explain this" is about the report, not the model.
+        subjects = [str(model).lower() for model in models] + ["the model"]
+        faulted = any(
+            _FAULT.search(_clean(sentence))
+            and any(subject in sentence for subject in subjects)
+            and not _HEDGE.search(sentence)
+            for sentence in sentences
+        )
+        checks["qualified"] = not faulted and (
+            any(mentions(t) for t in explains) if explains else True
+        )
+    elif verdict == "unresolved":
+        checks["qualified"] = any(
+            _UNRESOLVED.search(sentence) for sentence in sentences
+        ) and not any(
+            _CLEAN.search(sentence)
+            and not _UNRESOLVED.search(sentence)
+            and not _HEDGE.search(sentence)
+            for sentence in sentences
+        )
+    if verdict in {"no_defect", "unresolved"}:
+        checks["unchanged"] = not set(models) & set(touched)
+    return {"passed": all(checks.values()), "verdict": verdict, "checks": checks}
+
+
 # --- the task score ----------------------------------------------------------
 
 
@@ -1193,8 +1341,9 @@ class TaskScore:
     touched: list[str]
     models: dict[str, Any]
     checks: list[dict[str, Any]]
-    completeness: float
-    correctness: float
+    #: ``None`` on a ``diagnose`` task, which authors no declaration to grade.
+    completeness: float | None
+    correctness: float | None
     checks_passed: float
     #: Share of the task's models whose attribution passed; ``None`` when the
     #: task grades no attribution, so it is never averaged in as a pass.
@@ -1210,6 +1359,10 @@ class TaskScore:
     workspace_checks: list[dict[str, Any]] | None = None
     #: Whether the final message reports what was not done (``report_rubric``).
     report: dict[str, Any] | None = None
+    #: Whether the final message localizes and qualifies its diagnosis
+    #: (``diagnosis_rubric``, #1048, #1116); ``None`` when the task grades
+    #: none or there is no message.
+    diagnosis: dict[str, Any] | None = None
     #: ``{"passed", "tests"}``: whether the task's incremental model has a unit
     #: test overriding ``is_incremental`` (``truth.incremental_test``, #1111);
     #: ``None`` when the task grades none.
@@ -1310,6 +1463,9 @@ def score_workspace(
     if wanted:
         score.workspace_checks = run_checks(workspace, wanted)
     score.report = report_rubric(task.truth.get("report"), final)
+    score.diagnosis = diagnosis_rubric(
+        task.truth.get("diagnosis"), final, score.touched, task.models
+    )
     if score.status == "blocked_reported" and not (score.report or {}).get("passed"):
         # Left blocked and not reported as such, or no message to read: the
         # request was neither done nor accurately reported.
@@ -1339,7 +1495,8 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         tmp_path = Path(tmp)
         baseline = starting_project(task, fixture, tmp_path / "baseline")
         touched = touched_models(baseline, workspace)
-        if not set(task.models) & set(touched):
+        diagnose = task.kind == "diagnose"
+        if not diagnose and not set(task.models) & set(touched):
             # An authoring task that changed nothing earns nothing: no vacuous
             # perfect score for a declaration nobody wrote.
             return TaskScore(task.key, "no_models", {}, touched, {}, [], 0.0, 0.0, 0.0)
@@ -1355,7 +1512,8 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         complete_scores: list[float] = []
         correct_fields: list[bool] = []
         attributed: list[bool] = []
-        for model in task.models:
+        # A diagnosis authors no declaration: there is nothing of its own to grade.
+        for model in [] if diagnose else task.models:
             found = entries.get(model)
             decl = declared(found[0][1] if found else None)
             columns = relation_columns(tmp_path / "built", model)
@@ -1394,10 +1552,12 @@ def _score_workspace(task: Task, fixture: Fixture, workspace: Path) -> TaskScore
         touched=touched,
         models=models,
         checks=checks,
-        completeness=sum(complete_scores) / len(complete_scores),
+        completeness=(sum(complete_scores) / len(complete_scores))
+        if complete_scores
+        else None,
         correctness=(sum(correct_fields) / len(correct_fields))
         if correct_fields
-        else 1.0,
+        else (None if diagnose else 1.0),
         checks_passed=(
             sum(c["passed"] for c in checks) / len(checks) if checks else 1.0
         ),

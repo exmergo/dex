@@ -612,7 +612,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      incremental model is skipped (under transform build --full-refresh
                                      --verify, one it rebuilt is compared, except a microbatch model, which
                                      rebuilds only from its begin). A model generated in SQL with no parent
-                                     relation is named in notes. A real parent relation missing from the
+                                     relation is named in notes, and so is one driven off the project's
+                                     time spine (a time_spine: config or the metricflow_time_spine name)
+                                     or off a model generated in SQL, which supplies anchors rather than a
+                                     population and is not compared (#988). A real parent relation missing from the
                                      warehouse is still a warning. Free on metadata alone, and every
                                      count made exact where counting bills nothing; a relation the
                                      warehouse keeps no count for (any view) is priced as one batched
