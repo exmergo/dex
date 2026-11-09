@@ -17,7 +17,7 @@ import yaml
 
 from .. import command_args
 from ..adapters import get_dialect
-from ..dbt_project import profiles_dir
+from ..dbt_project import DbtProjectError, profiles_dir
 from ..envelope import EstimateQuality
 from ..guards.cost_guard import ConfirmationRequiredError
 from .build import _child_environ, _collect_messages, assert_dev_target, shadow_project
@@ -322,7 +322,16 @@ def compile_models(
     assert_dev_target(target, engine.config.dbt_target)
     connector = engine.connector or engine.config.connector
     dialect = get_dialect(connector)
-    profiles = profiles_dir(project).resolve()
+    try:
+        profiles = profiles_dir(project).resolve()
+    except DbtProjectError as exc:
+        if any(
+            has_control_flow(edit.new_content)
+            for edit in wanted.values()
+            if edit.new_content
+        ):
+            raise EditValidationError(str(exc)) from exc
+        return {}, broker
     try:
         with shadow_project(project, edits) as shadow:
             effective = engine.config.model_copy(update={"connector": connector})
@@ -338,9 +347,16 @@ def compile_models(
                 # the disposable project. Normalize only the copied profile.
                 profile_file = shadow / "profiles.yml"
                 if not profile_file.is_file():
-                    raise EditValidationError(
-                        "control-flow compilation requires the post-edit profiles.yml"
-                    )
+                    if any(
+                        has_control_flow(edit.new_content)
+                        for edit in wanted.values()
+                        if edit.new_content
+                    ):
+                        raise EditValidationError(
+                            "control-flow compilation requires the post-edit"
+                            " profiles.yml"
+                        )
+                    return {}, broker
                 raw = yaml.safe_load(profile_file.read_text(encoding="utf-8"))
                 if not isinstance(raw, dict):
                     raise EditValidationError("profiles.yml must be a YAML mapping")

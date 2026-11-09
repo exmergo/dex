@@ -1174,6 +1174,7 @@ class _ProjectCatalog:
         self.cache = cache
         self.dialect = dialect
         self.compiled_models = compiled_models
+        self.project_name = getattr(view, "project_name", None)
         from ..model_versions import cached_version_map, label_for_file
 
         vmap = cached_version_map(self.files, self.model_paths)
@@ -1199,7 +1200,15 @@ class _ProjectCatalog:
         from .select_list import RelationColumns, resolve_select_list
 
         inner: str | None = None
-        if relation.kind == "ref" and len(relation.parts) == 1:
+        is_own_ref = relation.kind == "ref" and (
+            len(relation.parts) == 1
+            or (
+                len(relation.parts) == 2
+                and self.project_name is not None
+                and relation.parts[0].lower() == self.project_name.lower()
+            )
+        )
+        if is_own_ref:
             model = relation.label.lower()
             if model in stack:
                 return RelationColumns(reason=f"a ref() cycle through {relation.name}")
