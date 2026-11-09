@@ -141,13 +141,39 @@ _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _PLACEHOLDER = "__dex_jinja__"
 
 
-def needs_compilation(content: str) -> bool:
+_CONTROL_FLOW_STMT = re.compile(r"\{%\s*-?\s*(?:for|if)\b")
+_COLUMN_LISTING = re.compile(
+    r"\b(?:"
+    r"adapter\."
+    r"|(?:[A-Za-z0-9_]+\.)?star\s*\("
+    r"|(?:[A-Za-z0-9_]+\.)?get_filtered_columns_in_relation\s*\("
+    r"|(?:[A-Za-z0-9_]+\.)?get_columns_in_relation\s*\("
+    r"|(?:[A-Za-z0-9_]+\.)?fill_staging_columns\s*\("
+    r")"
+)
+
+
+def has_control_flow(content: str) -> bool:
     """Control flow cannot be reduced to SQL by deleting its delimiters."""
 
     return any(
-        re.match(r"\{%\s*-?\s*(?:for|if)\b", block)
+        _CONTROL_FLOW_STMT.match(block)
         for block in _JINJA_STMT.findall(_JINJA_COMMENT.sub("", content))
     )
+
+
+def lists_columns(content: str) -> bool:
+    """Column-introspection macros expand to column lists at compile time."""
+
+    cleaned = _JINJA_COMMENT.sub("", content)
+    blocks = _JINJA_STMT.findall(cleaned) + _JINJA_EXPR.findall(cleaned)
+    return any(_COLUMN_LISTING.search(block) for block in blocks)
+
+
+def needs_compilation(content: str) -> bool:
+    """Control flow or compile-time column listing requires dbt compilation."""
+
+    return has_control_flow(content) or lists_columns(content)
 
 
 @dataclass(frozen=True)
@@ -870,7 +896,7 @@ def validate_edit(
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:
-        if needs_compilation(edit.new_content):
+        if has_control_flow(edit.new_content):
             if compiled is not None:
                 compiled.check(edit)
                 warnings.extend(
@@ -881,6 +907,11 @@ def validate_edit(
                     f"{edit.path}: Jinja control flow requires dbt compilation; "
                     "use transform plan with an installed dbt adapter and a dev profile"
                 )
+        elif compiled is not None:
+            compiled.check(edit)
+            warnings.extend(
+                _external_read_warnings(edit.path, compiled.sql, "compiled model")
+            )
         else:
             warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
     else:

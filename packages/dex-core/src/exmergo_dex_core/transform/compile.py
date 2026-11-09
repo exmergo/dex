@@ -22,7 +22,12 @@ from ..envelope import EstimateQuality
 from ..guards.cost_guard import ConfirmationRequiredError
 from .build import _child_environ, _collect_messages, assert_dev_target, shadow_project
 from .plans import EditKind, PlanEdit
-from .validate import CompiledModel, EditValidationError, needs_compilation
+from .validate import (
+    CompiledModel,
+    EditValidationError,
+    has_control_flow,
+    needs_compilation,
+)
 
 TIMEOUT_SECONDS = 120
 
@@ -302,10 +307,16 @@ def compile_models(
     except ModuleNotFoundError:
         available = False
     if not available:
-        raise EditValidationError(
-            "control-flow models require dbt; install the connector extra "
-            "(for example exmergo-dex-core[duckdb])"
-        )
+        if any(
+            has_control_flow(edit.new_content)
+            for edit in wanted.values()
+            if edit.new_content
+        ):
+            raise EditValidationError(
+                "control-flow models require dbt; install the connector extra "
+                "(for example exmergo-dex-core[duckdb])"
+            )
+        return {}, broker
     project = Path(engine.project_dir()).resolve()
     target = engine.config.dbt_target or "dev"
     assert_dev_target(target, engine.config.dbt_target)
