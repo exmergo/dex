@@ -498,7 +498,8 @@ def package_documented_overrides_for_project(
     import re
     from types import SimpleNamespace
 
-    from ..transform.package_overrides import documented_overrides
+    from ..transform.build import packages_dir
+    from ..transform.package_overrides import _installed, documented_overrides
 
     wanted = {m for m in models if m}
     if not wanted:
@@ -521,6 +522,9 @@ def package_documented_overrides_for_project(
 
     overrides: dict[str, Any] = documented_overrides(project_dir, wanted, project_yml)
     nodes = _manifest_nodes(project_dir) or {}
+    package_dirs: dict[str, Path] = {}
+    for package, directory, _ in _installed(project_dir):
+        package_dirs.setdefault(package, directory)
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
             continue
@@ -534,10 +538,18 @@ def package_documented_overrides_for_project(
         if isinstance(patch, str) and isinstance(pkg, str) and "://" in patch:
             patch_pkg, _, rel = patch.partition("://")
             if patch_pkg and patch_pkg != pkg:
+                entry = (
+                    package_dirs.get(patch_pkg, packages_dir(project_dir) / patch_pkg)
+                    / rel
+                )
+                try:
+                    shown = entry.relative_to(project_dir).as_posix()
+                except ValueError:
+                    shown = entry.as_posix()
                 overrides[name] = SimpleNamespace(
                     model=name,
                     package=patch_pkg,
-                    package_entry=f"dbt_packages/{patch_pkg}/{rel}",
+                    package_entry=shown,
                 )
     return overrides
 
