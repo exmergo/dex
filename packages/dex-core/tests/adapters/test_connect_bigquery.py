@@ -1361,6 +1361,141 @@ def test_profile_never_counts_a_skipped_column_exactly(fake_bq_client):
         assert f"COUNT(DISTINCT `{name}`)" not in statements
 
 
+def test_exact_distinct_counts_skips_nested_types(fake_bq_client):
+    """exact_distinct_counts excludes nested and complex columns (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+            bigquery.SchemaField("attrs", "JSON"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 95}]
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.exact_distinct_counts(
+        table.identifier, ["id", "user_geom", "attrs"]
+    )
+    assert counts == {"id": 95}
+    statements = " ".join(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
+    assert "COUNT(DISTINCT `id`)" in statements
+    assert "COUNT(DISTINCT `user_geom`)" not in statements
+    assert "COUNT(DISTINCT `attrs`)" not in statements
+
+
+def test_exact_distinct_counts_returns_empty_when_all_nested(fake_bq_client):
+    """exact_distinct_counts returns empty without querying when all columns
+    are nested (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+            bigquery.SchemaField("attrs", "JSON"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.exact_distinct_counts(table.identifier, ["user_geom", "attrs"])
+    assert counts == {}
+    assert not fake_bq_client.query_calls
+
+
+def test_distinct_combination_counts_skips_nested_types(fake_bq_client):
+    """distinct_combination_counts skips combinations containing nested
+    columns (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("email", "STRING"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 90}]
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.distinct_combination_counts(
+        table.identifier, [["id", "user_geom"], ["id", "email"]]
+    )
+    assert counts == {("id", "email"): 90}
+    statements = " ".join(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
+    assert "`user_geom`" not in statements
+
+
+def test_value_domain_counts_skips_nested_types(fake_bq_client):
+    """value_domain_counts skips nested columns (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.value_domain_counts(table.identifier, ["user_geom"], limit=10)
+    assert counts == {}
+    assert not fake_bq_client.query_calls
+
+
+def test_table_probe_skips_nested_types(fake_bq_client):
+    """table_probe skips nested columns from distinct and combinations (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"n_total": 100, "kd_0": 95}]
+    adapter = make_adapter(fake_bq_client)
+    probe = adapter.table_probe(
+        table.identifier,
+        distinct=["id", "user_geom"],
+        combinations=[["id", "user_geom"]],
+        null_columns=[],
+    )
+    assert probe is not None
+    assert probe.distinct == {"id": 95}
+    assert probe.combinations == {}
+
+
 def test_profile_of_a_refused_batch_stays_metadata_only(fake_bq_client, monkeypatch):
     """A refused batch leaves every column with no count, none of them a column
     the catalog knows nothing about, so the exact pass has nothing to send."""

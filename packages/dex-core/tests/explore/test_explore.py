@@ -779,6 +779,141 @@ def test_map_reports_a_profiled_object_that_joins_to_nothing(tmp_path: Path, cap
     )
 
 
+def test_map_one_object_profile_failure_turns_into_note_and_reports_rest(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """When one object's profile raises WarehouseQueryError, explore map
+    returns ok, names that object and the reason in notes, and reports the
+    rest (#925)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "failing.duckdb"
+    con = duckdb.connect(str(warehouse))
+    con.execute("create table broken (id integer, geom varchar)")
+    con.execute("insert into broken values (1, 'point(0 0)')")
+    con.execute("create table healthy (id integer, name varchar)")
+    con.execute("insert into healthy values (1, 'alpha')")
+    con.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    original_aggs = DuckDBAdapter.column_aggregates
+
+    def failing_aggs(self, identifier, columns, **kwargs):
+        if "broken" in identifier:
+            raise WarehouseQueryError(
+                "aggregate functions with distinct cannot be used with "
+                "arguments of type geography"
+            )
+        return original_aggs(self, identifier, columns, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "column_aggregates", failing_aggs)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        ["explore", "map", "--path", str(warehouse), "--repo-root", str(repo)], capsys
+    )
+    assert payload["status"] == "ok"
+    notes = payload["data"]["notes"]
+    assert any(
+        "broken" in n and "not profiled" in n and "type geography" in n for n in notes
+    )
+    reported = {o["identifier"].rsplit(".", 1)[-1] for o in payload["data"]["objects"]}
+    assert "healthy" in reported
+    assert "broken" not in reported
+    healthy_obj = next(
+        o for o in payload["data"]["objects"] if o["identifier"].endswith("healthy")
+    )
+    assert healthy_obj["columns"]
+
+    payload_detail = _run(
+        [
+            "explore",
+            "map",
+            "--detail",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    detail_reported = {
+        o["identifier"].rsplit(".", 1)[-1] for o in payload_detail["data"]["objects"]
+    }
+    assert "broken" in detail_reported
+    broken_obj = next(
+        o
+        for o in payload_detail["data"]["objects"]
+        if o["identifier"].endswith("broken")
+    )
+    assert not broken_obj["columns"]
+    assert any(
+        "not profiled" in q and "type geography" in q
+        for q in broken_obj["data_quality"]
+    )
+
+
+def test_relationships_one_object_profile_failure_turns_into_note_and_reports_rest(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """When one object's profile raises WarehouseQueryError, explore
+    relationships returns ok, names that object and the reason in notes, and
+    infers relationships among the rest (#925)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "failing_rel.duckdb"
+    con = duckdb.connect(str(warehouse))
+    con.execute("create table broken (id integer, geom varchar)")
+    con.execute("insert into broken values (1, 'point(0 0)')")
+    con.execute("create table parent (id integer)")
+    con.execute("insert into parent values (1), (2)")
+    con.execute("create table child (id integer, parent_id integer)")
+    con.execute("insert into child values (10, 1), (20, 2)")
+    con.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    original_aggs = DuckDBAdapter.column_aggregates
+
+    def failing_aggs(self, identifier, columns, **kwargs):
+        if "broken" in identifier:
+            raise WarehouseQueryError(
+                "aggregate functions with distinct cannot be used with "
+                "arguments of type geography"
+            )
+        return original_aggs(self, identifier, columns, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "column_aggregates", failing_aggs)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert payload["status"] == "ok"
+    notes = payload["data"]["notes"]
+    assert any(
+        "broken" in n and "not profiled" in n and "type geography" in n for n in notes
+    )
+    rels = payload["data"]["relationships"]
+    assert len(rels) >= 1
+    rel = rels[0]
+    assert rel["from_dataset"].endswith("child")
+    assert rel["to_dataset"].endswith("parent")
+
+
 def test_map_data_quality_notes_omit_flag_encodings(tmp_path: Path):
     import duckdb
 

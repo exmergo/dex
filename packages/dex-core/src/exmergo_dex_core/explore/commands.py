@@ -1172,6 +1172,7 @@ def relationships(
             "window); pass --refresh to re-profile them"
         )
     profiled: list[Dataset] = []
+    profile_errors: list[tuple[str, WarehouseQueryError]] = []
     # Nothing stale means nothing to price or confirm: skip the handshake and
     # the scan entirely, and reuse the cached profiles wholesale.
     if stale:
@@ -1191,12 +1192,18 @@ def relationships(
             )
 
         profile_reporter = _reporter(len(stale), "profiled", "objects")
+
+        def _record_profile_error(ident: str, err: WarehouseQueryError) -> None:
+            """record profiling failure for an object so it can be noted."""
+            profile_errors.append((ident, err))
+
         try:
             profiled = profile_mod.profile(
                 adapter,
                 stale,
                 progress=profile_reporter,
                 on_complete=checkpoint,
+                on_error=_record_profile_error,
                 pii_overrides=pii_override_paths(config.pii_overrides),
                 include_blobs=blob_paths,
             )
@@ -1415,6 +1422,9 @@ def relationships(
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
     notes.extend(defs.notes)
+    for ident, err in profile_errors:
+        reason = err.detail or str(err)
+        notes.append(f"{ident} not profiled: {reason}")
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared joins; kept as declared"
@@ -2748,6 +2758,7 @@ def map(
             "window); pass --refresh to re-profile them"
         )
     profiled: list[Dataset] = []
+    profile_errors: list[tuple[str, WarehouseQueryError]] = []
     # Nothing stale means nothing to price or confirm: skip the handshake and
     # the scan entirely, and reuse the cached profiles wholesale.
     if stale:
@@ -2766,12 +2777,18 @@ def map(
             )
 
         profile_reporter = _reporter(len(stale), "profiled", "objects")
+
+        def _record_profile_error(ident: str, err: WarehouseQueryError) -> None:
+            """record profiling failure for an object so it can be noted."""
+            profile_errors.append((ident, err))
+
         try:
             profiled = profile_mod.profile(
                 adapter,
                 stale,
                 progress=profile_reporter,
                 on_complete=checkpoint,
+                on_error=_record_profile_error,
                 pii_overrides=pii_override_paths(config.pii_overrides),
                 include_blobs=blob_paths,
             )
@@ -2986,6 +3003,10 @@ def map(
         reusable,
         observed_namespaces=observed_namespaces,
     )
+    failed_reasons = {ident: (err.detail or str(err)) for ident, err in profile_errors}
+    for ds in datasets:
+        if ds.identifier in failed_reasons:
+            ds.data_quality.append(f"not profiled: {failed_reasons[ds.identifier]}")
 
     # A verified join at a catastrophic orphan rate is a finding, not just a
     # demoted confidence (issue #207): mirrored onto the child dataset's
@@ -3054,6 +3075,9 @@ def map(
         _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
+    for ident, err in profile_errors:
+        reason = err.detail or str(err)
+        notes.append(f"{ident} not profiled: {reason}")
     if semantic_exposed:
         notes.append(
             f"{semantic_exposed} object(s) are exposed through the project's "

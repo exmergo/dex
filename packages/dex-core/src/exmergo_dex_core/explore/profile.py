@@ -880,6 +880,7 @@ def profile(
     *,
     progress: ProgressReporter | None = None,
     on_complete: Callable[[Dataset], None] | None = None,
+    on_error: Callable[[str, WarehouseQueryError], None] | None = None,
     pii_overrides: PIIOverrideMatcher | None = None,
     include_blobs: set[str] | None = None,
 ) -> list[Dataset]:
@@ -892,6 +893,11 @@ def profile(
     profiled, so callers can checkpoint budget-paid work before a later object's
     cost gate can abort the run. It fires *after* the object is appended and only
     for fully-profiled objects, never a half-scanned one.
+
+    ``on_error``, when supplied, is invoked with each ``(identifier, error)``
+    pair when profiling an object raises :class:`~..errors.WarehouseQueryError`,
+    allowing callers to record per-object notes and continue profiling rather
+    than failing the run.
 
     ``pii_overrides`` holds lowered ``identifier.column`` paths a human has
     reviewed as not PII (from `.dex/config.yml`). An overridden column's flag is
@@ -913,73 +919,78 @@ def profile(
     blob_paths = include_blobs or set()
     datasets: list[Dataset] = []
     for identifier in identifiers:
-        meta, columns = adapter.table_metadata(identifier)
-
-        # Decide min/max safety BEFORE querying, from name + type, so the adapter
-        # never even computes a suppressed extreme.
-        classified = {c.name: classify_pii(c.name, c.data_type) for c in columns}
-        prelim_pii = {name: flag for name, (flag, _g) in classified.items()}
-        overridden: dict[str, PIICategory] = {}
-        for c in columns:
-            flag = prelim_pii[c.name]
-            if flag is not None and f"{identifier}.{c.name}".lower() in override_paths:
-                overridden[c.name] = flag.category
-                prelim_pii[c.name] = None
-        safe = {
-            c.name for c in columns if is_min_max_safe(c.data_type, prelim_pii[c.name])
-        }
-        # Shape evidence is bought only for generic-name flags that still stand:
-        # exact person tokens need no corroboration, and a human-cleared column
-        # deserves no scan spend.
-        shape = {
-            name
-            for name, (flag, generic) in classified.items()
-            if generic and prelim_pii[name] is not None
-        }
-        # Declared-type-vs-content checks (#204) run only for non-PII
-        # string/integer columns: PII at any confidence is excluded, full
-        # stop, the same rule is_min_max_safe and value-domain eligibility
-        # already use.
-        type_stats = {
-            c.name
-            for c in columns
-            if prelim_pii[c.name] is None
-            and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
-        }
-        # Heterogeneous-key-shape checks (#205) are string-only, unlike
-        # type_stats above: a UUID/hex check is meaningless on a column SQL
-        # already stores as a number.
-        key_shape_stats = {
-            c.name
-            for c in columns
-            if prelim_pii[c.name] is None and _is_string_type(c.data_type)
-        }
-        # Temporal-continuity checks (#206): non-PII date/timestamp columns
-        # only, same eligibility rule as above.
-        temporal_stats = {
-            c.name
-            for c in columns
-            if prelim_pii[c.name] is None and is_temporal_type(c.data_type)
-        }
-
-        # Blob-type columns can only ever yield a null fraction and a distinct
-        # estimate, yet a columnar engine bills for the whole column once it is
-        # referenced at all, so they are dropped from the scan before it is
-        # built (unless a human opted a specific one back in via config).
-        blob_excluded = [
-            c.name
-            for c in columns
-            if is_blob_type(c.data_type)
-            and f"{identifier}.{c.name}".lower() not in blob_paths
-        ]
-        scan_columns = [c for c in columns if c.name not in blob_excluded]
-
-        # The adapter knows what the server said and this loop knows which
-        # object it said it about, so a server-side refusal picks up the
-        # identifier on its way past: an envelope reading "the warehouse
-        # refused a statement dex built" is only actionable when it names the
-        # object, and a map run has a dozen of them in flight.
         try:
+            meta, columns = adapter.table_metadata(identifier)
+
+            # Decide min/max safety BEFORE querying, from name + type, so the adapter
+            # never even computes a suppressed extreme.
+            classified = {c.name: classify_pii(c.name, c.data_type) for c in columns}
+            prelim_pii = {name: flag for name, (flag, _g) in classified.items()}
+            overridden: dict[str, PIICategory] = {}
+            for c in columns:
+                flag = prelim_pii[c.name]
+                if (
+                    flag is not None
+                    and f"{identifier}.{c.name}".lower() in override_paths
+                ):
+                    overridden[c.name] = flag.category
+                    prelim_pii[c.name] = None
+            safe = {
+                c.name
+                for c in columns
+                if is_min_max_safe(c.data_type, prelim_pii[c.name])
+            }
+            # Shape evidence is bought only for generic-name flags that still stand:
+            # exact person tokens need no corroboration, and a human-cleared column
+            # deserves no scan spend.
+            shape = {
+                name
+                for name, (flag, generic) in classified.items()
+                if generic and prelim_pii[name] is not None
+            }
+            # Declared-type-vs-content checks (#204) run only for non-PII
+            # string/integer columns: PII at any confidence is excluded, full
+            # stop, the same rule is_min_max_safe and value-domain eligibility
+            # already use.
+            type_stats = {
+                c.name
+                for c in columns
+                if prelim_pii[c.name] is None
+                and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
+            }
+            # Heterogeneous-key-shape checks (#205) are string-only, unlike
+            # type_stats above: a UUID/hex check is meaningless on a column SQL
+            # already stores as a number.
+            key_shape_stats = {
+                c.name
+                for c in columns
+                if prelim_pii[c.name] is None and _is_string_type(c.data_type)
+            }
+            # Temporal-continuity checks (#206): non-PII date/timestamp columns
+            # only, same eligibility rule as above.
+            temporal_stats = {
+                c.name
+                for c in columns
+                if prelim_pii[c.name] is None and is_temporal_type(c.data_type)
+            }
+
+            # Blob-type columns can only ever yield a null fraction and a distinct
+            # estimate, yet a columnar engine bills for the whole column once it is
+            # referenced at all, so they are dropped from the scan before it is
+            # built (unless a human opted a specific one back in via config).
+            blob_excluded = [
+                c.name
+                for c in columns
+                if is_blob_type(c.data_type)
+                and f"{identifier}.{c.name}".lower() not in blob_paths
+            ]
+            scan_columns = [c for c in columns if c.name not in blob_excluded]
+
+            # The adapter knows what the server said and this loop knows which
+            # object it said it about, so a server-side refusal picks up the
+            # identifier on its way past: an envelope reading "the warehouse
+            # refused a statement dex built" is only actionable when it names the
+            # object, and a map run has a dozen of them in flight.
             aggregates = {
                 a.name: a
                 for a in adapter.column_aggregates(
@@ -1018,7 +1029,13 @@ def profile(
                 composite_keys,
             )
         except WarehouseQueryError as exc:
-            raise exc.naming(identifier) from exc
+            named = exc.naming(identifier)
+            if on_error is not None:
+                on_error(identifier, named)
+                if progress is not None:
+                    progress.advance()
+                continue
+            raise named from exc
         composite_members = {c for pair in composite_keys for c in pair}
 
         profiles: list[ColumnProfile] = []
