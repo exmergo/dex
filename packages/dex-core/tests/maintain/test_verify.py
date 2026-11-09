@@ -438,10 +438,43 @@ def test_package_documented_overrides_for_project_reads_packages(tmp_path):
     assert "pkg_task" in overrides
     assert "other" not in overrides
     assert overrides["pkg_task"].package == "tiny_pkg"
-    assert (
-        overrides["pkg_task"].package_entry
-        == "dbt_packages/tiny_pkg/models/pkg_task.yml"
+
+
+def test_package_documented_overrides_for_project_ignores_other_packages(
+    tmp_path,
+):
+    """#1205: manifest nodes belonging to another package are not project overrides."""
+    import json
+
+    from exmergo_dex_core.maintain.verify import (
+        package_documented_overrides_for_project,
     )
+
+    (tmp_path / "dbt_project.yml").write_text("name: my_proj\nversion: '1.0'\n")
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.other_pkg.task": {
+                "name": "task",
+                "resource_type": "model",
+                "package_name": "other_pkg",
+                "patch_path": "tiny_pkg://models/task.yml",
+            },
+            "model.my_proj.task": {
+                "name": "task",
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "patch_path": "tiny_pkg://models/task.yml",
+            },
+        }
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+
+    overrides = package_documented_overrides_for_project(tmp_path, ["task"])
+    assert "task" in overrides
+    assert overrides["task"].package == "tiny_pkg"
+    assert overrides["task"].package_entry == "dbt_packages/tiny_pkg/models/task.yml"
 
 
 def test_a_declared_type_that_disagrees_is_a_medium_severity_mismatch():

@@ -495,6 +495,7 @@ def package_documented_overrides_for_project(
 ) -> dict[str, Any]:
     """the models in ``models`` that are project overrides of a package model."""
 
+    import re
     from types import SimpleNamespace
 
     from ..transform.package_overrides import documented_overrides
@@ -508,6 +509,16 @@ def package_documented_overrides_for_project(
     except OSError:
         project_yml = None
 
+    root_project: str | None = None
+    if project_yml:
+        match = re.search(
+            r"^\s*name:\s*['\"]?([a-zA-Z0-9_\-]+)['\"]?",
+            project_yml,
+            re.MULTILINE,
+        )
+        if match:
+            root_project = match.group(1)
+
     overrides: dict[str, Any] = documented_overrides(project_dir, wanted, project_yml)
     nodes = _manifest_nodes(project_dir) or {}
     for uid, node in nodes.items():
@@ -518,6 +529,8 @@ def package_documented_overrides_for_project(
             continue
         patch = node.get("patch_path")
         pkg = node.get("package_name")
+        if root_project and pkg != root_project:
+            continue
         if isinstance(patch, str) and isinstance(pkg, str) and "://" in patch:
             patch_pkg, _, rel = patch.partition("://")
             if patch_pkg and patch_pkg != pkg:
