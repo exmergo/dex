@@ -43,11 +43,21 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import jinja_regions
+from ..explore.relationships import candidate_keys
 from .declarations import model_sql_path
-from .drafting import Usage, _Reading, _untoken, dataset_for, read_declared
+from .drafting import (
+    Usage,
+    _column,
+    _dataset_for_model,
+    _Reading,
+    _untoken,
+    dataset_for,
+    proven_keys,
+    read_declared,
+)
 
 if TYPE_CHECKING:
-    from ..cache import DexCache
+    from ..cache import Dataset, DexCache
     from ..references import ReferenceIndex
 
 _FILTER_CLAUSES = ("where", "having", "qualify")
@@ -93,6 +103,8 @@ class Contradiction:
     parent: str | None = None
     #: The plan creates this model, so "the plan changed both" means it wrote both.
     created: bool = False
+    #: An upstream profile that would confirm or settle dependence.
+    profile: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -108,6 +120,7 @@ class Contradiction:
             "prior",
             "authored",
             "reason",
+            "profile",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -168,7 +181,13 @@ def check(
     found: list[Contradiction] = []
     found.extend(_population(model, before, after))
     found.extend(_parent(model, before, after, model_paths, index))
-    grain = _grain(model, before, after)
+    grain = _grain(
+        model,
+        before,
+        after,
+        cache=cache,
+        model_paths=model_paths,
+    )
     found.extend(grain)
     dropped = {c.column for c in grain if c.column}
     found.extend(_columns(model, before, after, skip=dropped))
@@ -229,6 +248,19 @@ def _judge(
             prior=before.said,
             authored=after.said,
             reason=after.reason,
+            **extra,
+        )
+    if after.state == "unconfirmed":
+        return Contradiction(
+            model,
+            check,
+            "contradicted",
+            rule,
+            stale="unconfirmed",
+            prior=before.said,
+            authored=after.said,
+            profile=after.reason,
+            preexisting=before.state in ("unconfirmed", "contradicted"),
             **extra,
         )
     if not rule_changed:
@@ -688,19 +720,128 @@ def _polarity(expression: str) -> bool | None:
 # --- grain ------------------------------------------------------------------------
 
 
-def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
+def _is_unique_key_in_dataset(dataset: Dataset, key_columns: list[str]) -> bool:
+    """whether key_columns forms a unique key of the profiled dataset."""
+    key_set = {c.lower() for c in key_columns}
+    for key in proven_keys(dataset):
+        if {c.lower() for c in key} == key_set:
+            return True
+    for key in candidate_keys(dataset):
+        if {c.lower() for c in key} == key_set:
+            return True
+    for key in dataset.composite_keys:
+        if {c.lower() for c in key} == key_set:
+            return True
+    if len(key_columns) == 1:
+        col = _column(dataset, key_columns[0])
+        if col is not None and col.is_unique and col.null_fraction in (0.0, None):
+            return True
+    return False
+
+
+def _check_grain_dependence(
+    reading: _Reading,
+    grain: list[str],
+    *,
+    model: str | None = None,
+    cache: DexCache | None = None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
+) -> tuple[str, str | None]:
+    """check whether extra group by columns depend on the declared grain."""
+    if not reading.grain:
+        return ("contradicted", None)
+    reading_grain_set = {c.lower() for c in reading.grain}
+    grain_set = {c.lower() for c in grain}
+    if not grain_set.issubset(reading_grain_set):
+        return ("contradicted", None)
+    extra = [c for c in reading.grain if c.lower() not in grain_set]
+    if not extra:
+        return ("holds", None)
+
+    files_map = files or {}
+    paths = model_paths or []
+    if model and cache is not None:
+        model_ds = _dataset_for_model(cache, model, files_map, paths)
+        if (
+            model_ds is not None
+            and model_ds.columns
+            and _is_unique_key_in_dataset(model_ds, grain)
+        ):
+            return ("holds", None)
+
+    grain_origins = [reading.origins.get(g.lower()) for g in grain]
+    extra_origins = [reading.origins.get(e.lower()) for e in extra]
+
+    relations: list[str] = []
+    for orig in (*grain_origins, *extra_origins):
+        if orig is not None and orig.relation not in relations:
+            relations.append(orig.relation)
+    if not relations:
+        fallback = (
+            reading.driving[0]
+            if reading.driving
+            else (reading.relations[0] if reading.relations else None)
+        )
+        if fallback:
+            relations.append(fallback)
+
+    if not cache or not relations:
+        target = relations[0] if relations else model
+        return ("unconfirmed", target)
+
+    for rel in relations:
+        rel_ds = _dataset_for_model(cache, rel, files_map, paths)
+        if rel_ds is None or not rel_ds.columns:
+            return ("unconfirmed", rel)
+
+    if all(orig is not None for orig in (*grain_origins, *extra_origins)):
+        grain_rel = grain_origins[0].relation
+        if all(orig.relation == grain_rel for orig in (*grain_origins, *extra_origins)):
+            rel_ds = _dataset_for_model(cache, grain_rel, files_map, paths)
+            if rel_ds is not None:
+                upstream_grain = [orig.column.lower() for orig in grain_origins]
+                if _is_unique_key_in_dataset(rel_ds, upstream_grain):
+                    return ("holds", None)
+
+    return ("contradicted", None)
+
+
+def _grain(
+    model: str,
+    before: _Side,
+    after: _Side,
+    *,
+    cache: DexCache | None = None,
+    model_paths: list[str] | None = None,
+) -> list[Contradiction]:
+    """the declared grain matched against what the sql reading proves."""
     declared = after.declared.get("grain")
     if not isinstance(declared, list) or not declared:
         return []
     grain = [str(g).lower() for g in declared]
     prior = before.declared.get("grain")
     prior_grain = [str(g).lower() for g in prior] if isinstance(prior, list) else None
-    after_verdict = _grain_verdict(after.reading, grain)
+    after_verdict = _grain_verdict(
+        after.reading,
+        grain,
+        model=model,
+        cache=cache,
+        files=after.files,
+        model_paths=model_paths,
+    )
     found = _judge(
         model,
         "grain",
         f"grain [{', '.join(declared)}]",
-        _grain_verdict(before.reading, prior_grain or grain),
+        _grain_verdict(
+            before.reading,
+            prior_grain or grain,
+            model=model,
+            cache=cache,
+            files=before.files,
+            model_paths=model_paths,
+        ),
         after_verdict,
         rule_changed=prior_grain is None or set(prior_grain) != set(grain),
     )
@@ -714,7 +855,16 @@ def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
     return [found]
 
 
-def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
+def _grain_verdict(
+    reading: _Reading,
+    grain: list[str],
+    *,
+    model: str | None = None,
+    cache: DexCache | None = None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
+) -> _Verdict:
+    """whether the reading matches the declared grain, or what it does instead."""
     produced = reading.produced
     dropped = [g for g in grain if produced is not None and g not in produced]
     # The declared grain is matched against every proven key, not only the one
@@ -740,9 +890,40 @@ def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
         said = f"[{', '.join(reading.grain)}]"
         if any(set(key) == set(grain) for key in proven):
             return _Verdict("holds", said=said, signature=signature)
+        if set(grain) < {c.lower() for c in reading.grain}:
+            dep_state, target = _check_grain_dependence(
+                reading,
+                grain,
+                model=model,
+                cache=cache,
+                files=files,
+                model_paths=model_paths,
+            )
+            if dep_state == "holds":
+                if reading.proven_grains is not None:
+                    if grain not in reading.proven_grains:
+                        reading.proven_grains.append(grain)
+                else:
+                    reading.proven_grains = [reading.grain, grain]
+                return _Verdict("holds", said=said, signature=signature)
+            if dep_state == "unconfirmed":
+                said_with_evidence = (
+                    f"{said} ({reading.grain_evidence})"
+                    if reading.grain_evidence
+                    else said
+                )
+                return _Verdict(
+                    "unconfirmed",
+                    said=said_with_evidence,
+                    reason=target,
+                    signature=signature,
+                )
+        said_with_evidence = (
+            f"{said} ({reading.grain_evidence})" if reading.grain_evidence else said
+        )
         return _Verdict(
             "contradicted",
-            said=f"{said} ({reading.grain_evidence})",
+            said=said_with_evidence,
             signature=signature,
         )
     reason = reading.grain_withheld or (
@@ -1111,6 +1292,14 @@ def _sentence(model: str, item: dict[str, Any]) -> str:
         fix = (
             "edit the SQL in this same plan to implement the declaration, or "
             "correct the declaration if it is the side that is wrong"
+        )
+    elif stale == "unconfirmed":
+        side = "could not confirm the declared grain holds"
+        profile = item.get("profile")
+        fix = (
+            f"`explore profile {profile}` would settle it"
+            if profile
+            else "an `explore profile` of the upstream relation would settle it"
         )
     elif item.get("created"):
         side = "this plan writes both the SQL and the declaration and they disagree"

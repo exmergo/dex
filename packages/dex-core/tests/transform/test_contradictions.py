@@ -411,6 +411,153 @@ def test_wrapping_a_declared_grain_column_still_contradicts_when_another_key_rem
     assert found["authored"].startswith("[user_id]")
 
 
+CONVERSATIONS_SQL = (
+    "select conversation_id, state, count(*) as cnt\n"
+    "from {{ ref('stg_conversations') }}\n"
+    "group by conversation_id, state\n"
+)
+STG_CONVERSATIONS = (
+    "select conversation_id, state, message_id "
+    "from {{ source('raw', 'conversations') }}\n"
+)
+CONVERSATIONS_KEYED = Dataset(
+    identifier="warehouse.main.stg_conversations",
+    columns=[
+        ColumnProfile(
+            name="conversation_id",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+        ),
+        ColumnProfile(
+            name="state",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=False,
+            distinct_count_exact=True,
+        ),
+        ColumnProfile(
+            name="message_id",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=False,
+            distinct_count_exact=True,
+        ),
+    ],
+)
+CONVERSATIONS_NOT_KEYED = Dataset(
+    identifier="warehouse.main.stg_conversations",
+    columns=[
+        ColumnProfile(
+            name="conversation_id",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=False,
+            distinct_count_exact=True,
+        ),
+        ColumnProfile(
+            name="state",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=False,
+            distinct_count_exact=True,
+        ),
+        ColumnProfile(
+            name="message_id",
+            data_type="varchar",
+            null_fraction=0.0,
+            is_unique=False,
+            distinct_count_exact=True,
+        ),
+    ],
+)
+
+
+def test_group_by_attributes_of_declared_grain_is_silent_when_cache_proves_key():
+    """a group by on the declared grain and attributes is silent when proven."""
+    prior_sql = (
+        "select conversation_id, count(*) as cnt\n"
+        "from {{ ref('stg_conversations') }}\n"
+        "group by conversation_id\n"
+    )
+    assert _found(
+        prior_sql,
+        CONVERSATIONS_SQL,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": STG_CONVERSATIONS},
+        cache=DexCache(datasets=[CONVERSATIONS_KEYED]),
+    ) == ([], [])
+
+
+def test_group_by_dropping_grain_column_still_warns():
+    """a group by that drops a declared grain column still warns as stale sql."""
+    dropped_sql = (
+        "select conversation_id, count(*) as cnt\n"
+        "from {{ ref('stg_conversations') }}\n"
+        "group by conversation_id\n"
+    )
+    [found], [warning] = _found(
+        CONVERSATIONS_SQL,
+        dropped_sql,
+        prior_yml=_yml(grain=["conversation_id", "state"]),
+        others={"models/stg_conversations.sql": STG_CONVERSATIONS},
+        cache=DexCache(datasets=[CONVERSATIONS_KEYED]),
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "sql",
+    )
+    assert "the SQL looks stale" in warning
+
+
+def test_group_by_adding_non_dependent_column_still_warns():
+    """a group by with an extra column that does not depend on the grain warns."""
+    non_dep_sql = (
+        "select conversation_id, message_id, count(*) as cnt\n"
+        "from {{ ref('stg_conversations') }}\n"
+        "group by conversation_id, message_id\n"
+    )
+    [found], [warning] = _found(
+        CONVERSATIONS_SQL,
+        non_dep_sql,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": STG_CONVERSATIONS},
+        cache=DexCache(datasets=[CONVERSATIONS_NOT_KEYED]),
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "sql",
+    )
+    assert "the SQL looks stale" in warning
+
+
+def test_group_by_extra_column_with_no_profile_warns_unconfirmed_and_names_profile():
+    """with no profile to judge dependence, the warning names the profile."""
+    prior_sql = (
+        "select conversation_id, count(*) as cnt\n"
+        "from {{ ref('stg_conversations') }}\n"
+        "group by conversation_id\n"
+    )
+    [found], [warning] = _found(
+        prior_sql,
+        CONVERSATIONS_SQL,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": STG_CONVERSATIONS},
+        cache=None,
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "unconfirmed",
+    )
+    assert found["profile"] == "stg_conversations"
+    assert "could not confirm the declared grain holds" in warning
+    assert "`explore profile stg_conversations` would settle it" in warning
+
+
 # --- additivity -------------------------------------------------------------------
 
 
