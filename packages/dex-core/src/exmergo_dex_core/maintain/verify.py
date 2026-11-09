@@ -1480,18 +1480,43 @@ def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = Non
     )
 
 
-def _join_label(join, resolved, name_of) -> str:
+def _join_label(
+    join,
+    resolved,
+    name_of,
+    cte_scopes: dict | None = None,
+    sql_shape=None,
+) -> str:
     """One join named the way a reader would name it: how it joins, and what to.
 
     The project's own name for the joined relation where there is one, since
     that is what the reader will go and open; the physical relation otherwise.
+    When a joined CTE holds a set operation, it has no underlying physical table,
+    so the join is named after the CTE itself. A join to an anonymous set operation
+    names it as a set operation rather than a generic subquery.
     The ON condition is deliberately not here, because it travels separately as
     the join keys, which is the part that identifies a wrong grain.
     """
 
-    if resolved is None:
-        return f"{join.side} join to a subquery"
-    return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
+    if resolved is not None:
+        return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
+
+    if cte_scopes and _cte_name(join.relation, cte_scopes) is not None:
+        return f"{join.side} join to '{join.relation.name}'"
+
+    inner = (
+        join.relation.this.unnest()
+        if hasattr(join.relation, "this") and hasattr(join.relation.this, "unnest")
+        else getattr(join.relation, "this", None)
+    )
+    if (
+        sql_shape is not None
+        and sql_shape.SET_OPERATIONS
+        and isinstance(inner, sql_shape.SET_OPERATIONS)
+    ):
+        return f"{join.side} join to a set operation"
+
+    return f"{join.side} join to a subquery"
 
 
 def _driving_parent(tree, sql_shape):
@@ -1793,6 +1818,8 @@ def row_population_plan(
                         join,
                         _through_ctes(join.relation, cte_scopes, sql_shape),
                         name_of,
+                        cte_scopes=cte_scopes,
+                        sql_shape=sql_shape,
                     )
                     for join in found_joins
                 ),
