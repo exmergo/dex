@@ -330,6 +330,15 @@ def test_package_target_reads_schema_from_package_or_project(tmp_path):
     assert overridden.schema == "custom_inbox"
 
 
+def test_sql_schema_does_not_match_other_config_keys_ending_in_schema():
+    """#1199: _sql_schema requires a word boundary before schema."""
+
+    from exmergo_dex_core.transform.package_targets import _sql_schema
+
+    assert _sql_schema("{{ config(some_schema='ignored', schema='real') }}") == "real"
+    assert _sql_schema("{{ config(some_schema='ignored') }}") is None
+
+
 def test_a_source_is_still_refused_and_says_so(tmp_path):
     """A source table is not a parent."""
     root = _project(tmp_path / "p")

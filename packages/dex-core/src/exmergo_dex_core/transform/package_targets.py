@@ -43,7 +43,7 @@ from .package_overrides import (
 )
 
 _SQL_CONFIG_SCHEMA = re.compile(
-    r"""config\s*\([^)]*schema\s*=\s*['"]([^'"]+)['"]""",
+    r"""config\s*\([^)]*\bschema\s*=\s*['"]([^'"]+)['"]""",
     re.IGNORECASE,
 )
 

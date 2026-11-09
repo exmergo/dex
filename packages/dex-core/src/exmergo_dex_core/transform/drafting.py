@@ -1450,6 +1450,19 @@ def _is_plan_created_or_edited(
     return prior.get(prior_path) != files.get(current_path)
 
 
+_MACRO_GENERATE_SCHEMA_NAME = re.compile(r"\{%-?\s*macro\s+generate_schema_name\b")
+
+
+def _has_custom_generate_schema_name(files: Mapping[str, str]) -> bool:
+    """whether the project overrides dbt's default ``generate_schema_name``."""
+
+    return any(
+        bool(_MACRO_GENERATE_SCHEMA_NAME.search(content))
+        for path, content in files.items()
+        if path.endswith(".sql")
+    )
+
+
 # --- assembling the draft -------------------------------------------------------------
 
 
@@ -1555,20 +1568,41 @@ def _drafted(
                 (packaged is not None and packaged(relation) is not None)
                 or (package_target is not None and package_target(relation) is not None)
             ):
+                # an installed package model or seed. under dbt's default
+                # generate_schema_name, a custom schema is appended to the dev
+                # target's schema (<target.schema>_<custom>). when the project
+                # overrides generate_schema_name, the effective dev namespace
+                # cannot be safely determined, so withhold the command.
                 target = (
                     package_target(relation) if package_target is not None else None
                 )
                 custom = getattr(target, "schema", None) if target is not None else None
                 if custom:
-                    parts = dev_namespace.split(".")
-                    derived = ".".join([*parts[:-1], f"{parts[-1]}_{custom}"])
+                    if _has_custom_generate_schema_name(files):
+                        entry["reason"] = cache_note or (
+                            "the cache has not profiled it, and the project overrides "
+                            "generate_schema_name so its dev namespace cannot be "
+                            "determined"
+                        )
+                    else:
+                        parts = dev_namespace.split(".")
+                        derived = ".".join([*parts[:-1], f"{parts[-1]}_{custom}"])
+                        entry["reason"] = cache_note or (
+                            "the cache has not profiled it, and its dev build in "
+                            f"{derived} is outside the source allowlist"
+                        )
+                        entry["command"] = (
+                            f"explore profile {derived}.{relation} --target dev"
+                        )
                 else:
                     derived = dev_namespace
-                entry["reason"] = cache_note or (
-                    "the cache has not profiled it, and its dev build in "
-                    f"{derived} is outside the source allowlist"
-                )
-                entry["command"] = f"explore profile {derived}.{relation} --target dev"
+                    entry["reason"] = cache_note or (
+                        "the cache has not profiled it, and its dev build in "
+                        f"{derived} is outside the source allowlist"
+                    )
+                    entry["command"] = (
+                        f"explore profile {derived}.{relation} --target dev"
+                    )
             else:
                 entry["reason"] = cache_note or "the cache has not profiled it"
                 entry["command"] = f"explore profile {relation}"
