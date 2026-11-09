@@ -308,6 +308,18 @@ macros, semantic YAML, seed headers, and installed packages. Repo-only and free.
 - A bare column name is matched project-wide (`scope: name_matched`); a qualified
   `model.column` is resolved through the `ref()` graph, and same-named columns
   outside that lineage are marked `same_name_elsewhere`.
+- A versioned model is named by its base name, which selects every version
+  (`dim_teams.team_label`), or by a version's label, which selects one
+  (`dim_teams.v2.team_label`). The target lists the selected `versions`, and
+  each occurrence names the versions it belongs to: a version's file and its
+  own `versions:` entry that version, a top-level column entry every version
+  that inherits it through `include`, and a consumer the version its
+  `ref('dim_teams')` or `ref('dim_teams', v=N)` resolves to. Names in an
+  `include` or `exclude` list are reported as `yaml_version_include` and
+  `yaml_version_exclude`. A label alone (`dim_teams.v2`) is answered as that
+  version: its file and the `ref()` calls that resolve to it. A `ref()` that
+  pins its version with an expression (`v=var('x')`) is a limit, and `rename`
+  and `remove` refuse while it stands.
 - Capped at 200 occurrences across 50 files; `--full` lifts both.
 - `--usage` also reports how other models use each qualified `model.column`
   (or `source_table.column`): each target gains `usage`, the same `readers`,
@@ -325,6 +337,13 @@ a seed header) and stores them as one plan. Kinds: `column`, `var`, `model`,
 
 - A bare column name is refused, and the refusal lists the models defining a
   column of that name. A report may be imprecise; a rewrite may not.
+- On a versioned model, `dim_teams.<column>` renames every version that has the
+  column (its file selects it or its YAML declares it) and that version's
+  consumers; `dim_teams.v2.<column>` renames v2 and its consumers only. A
+  top-level column entry other versions still inherit is kept for them: the
+  renamed version excludes it and declares its own entry under the new name,
+  and `notes` says so. A model-level test shared with a version the rename does
+  not reach is refused. `transform remove column` takes the same names.
 - It refuses on a reference it could not resolve statically, a name an installed
   package also defines, a column handed to a macro as a literal string, and a
   SELECT list it cannot read.
