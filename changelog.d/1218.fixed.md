@@ -1,0 +1,2 @@
+**`semantic define`, `update`, and `plan` now refuse declared but uninstalled packages before running dbt parse.**
+When dbt packages were declared but not installed, the semantic commands ran shadow dbt parse directly and failed with dbt's raw `Run "dbt deps"` message. dex now runs the same post-edit package check used by `transform plan`, refusing upfront with `reason: prerequisite` and naming `transform deps` without invoking dbt parse.
