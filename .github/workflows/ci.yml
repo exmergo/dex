@@ -129,53 +129,6 @@ jobs:
       - name: Safety-critical assertions
         run: uv run pytest -q tests/test_safety_spine.py
 
-  # `explore diagram` emits Mermaid and dex never renders it, so nothing in
-  # pyproject.toml pins the syntax dialect it has to stay compatible with: the
-  # contract is with a parser living in whatever tool a reader opens the diagram
-  # in. This runs the renderer's own output through the real mermaid package,
-  # which is the only way to hold that contract from here, and it is why there is
-  # no Python mermaid dependency (every candidate is either a string builder that
-  # replaces nothing, or a renderer that would POST the schema to a third-party
-  # host). Advisory like upstream-deps-canaries.yml and for the same reason: it
-  # tracks a moving upstream, so a Mermaid release breaking our dialect should be loud
-  # without blocking a merge that changed nothing. It stays per pull request,
-  # unlike that weekly canary, because the corpus it parses is our own renderer's
-  # output, which a pull request can change.
-  mermaid-syntax:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          enable-cache: true
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "22"
-      # Installed outside the repo, and the checker is copied in beside it,
-      # because Node resolves `node_modules` by walking up from the script's own
-      # location. That keeps a 160MB dependency tree out of the working copy of a
-      # Python repo, where nobody expects one and nothing ignores it. Pinned
-      # major, floating within it, mirroring how sqlglot is bounded: a patch
-      # should not be able to fail this, and moving the major should be a
-      # deliberate act taken on this job's evidence.
-      - name: Install the Mermaid parser outside the repo
-        run: |
-          mkdir -p "$RUNNER_TEMP/mermaid-canary"
-          cd "$RUNNER_TEMP/mermaid-canary"
-          npm install --silent mermaid@^11 jsdom@^26
-          cp "$GITHUB_WORKSPACE/scripts/check_mermaid_syntax.mjs" .
-      # Generated from the renderer rather than committed, so the corpus cannot
-      # drift from what dex actually emits. The dump self-checks that it still
-      # covers every cardinality glyph the policy can produce.
-      - name: Render the fixture corpus
-        run: uv run --project packages/dex-core python scripts/dump_mermaid_fixtures.py "$RUNNER_TEMP/mermaid-fixtures"
-      - name: Parse every fixture with the real Mermaid parser
-        run: |
-          cd "$RUNNER_TEMP/mermaid-canary"
-          node -e "console.log('testing mermaid', require('mermaid/package.json').version)"
-          node check_mermaid_syntax.mjs "$RUNNER_TEMP/mermaid-fixtures"
-
   # The eval groups, read from evals/tests/eval_groups.py rather than listed
   # here, so a group added there cannot be missing from the matrix below.
   eval-groups:
@@ -263,19 +216,70 @@ jobs:
           echo "eval groups finished with: ${{ needs.eval.result }}"
           exit 1
 
-  # On brand for Exmergo (easter egg): all shipped prose is em-dash free. That
-  # includes the documentation site's own pages and its config, where the site
-  # name and description live; the rest of the repo's JSON is fixtures and eval
-  # data, so only docs/ JSON is scanned. The pages the site build generates (the
-  # CLI reference, the changelog) are checked by the build itself.
-  em-dashes:
+  # The checks on shipped prose and emitted syntax, in one job: the em-dash check
+  # (blocking) and the Mermaid syntax canary (advisory). Kept apart from
+  # `safety`, which stays a job of its own so a safety regression is
+  # unmistakable in the checks list.
+  docs-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
+      # On brand for Exmergo (easter egg): all shipped prose is em-dash free. That
+      # includes the documentation site's own pages and its config, where the site
+      # name and description live; the rest of the repo's JSON is fixtures and eval
+      # data, so only docs/ JSON is scanned. The pages the site build generates (the
+      # CLI reference, the changelog) are checked by the build itself.
       - name: Repo prose must be em-dash clean
         run: |
           git ls-files '*.md' '*.mdc' '*.mdx' '*.txt' 'docs/*.json' \
             | xargs python scripts/check_no_em_dashes.py
+      # `explore diagram` emits Mermaid and dex never renders it, so nothing in
+      # pyproject.toml pins the syntax dialect it has to stay compatible with: the
+      # contract is with a parser living in whatever tool a reader opens the
+      # diagram in. These steps run the renderer's own output through the real
+      # mermaid package, which is the only way to hold that contract from here,
+      # and it is why there is no Python mermaid dependency (every candidate is
+      # either a string builder that replaces nothing, or a renderer that would
+      # POST the schema to a third-party host). Advisory (continue-on-error on
+      # each step) like upstream-deps-canaries.yml and for the same reason: it
+      # tracks a moving upstream, so a Mermaid release breaking our dialect should
+      # be loud without blocking a merge that changed nothing. It stays per pull
+      # request, unlike that weekly canary, because the corpus it parses is our
+      # own renderer's output, which a pull request can change.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        continue-on-error: true
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        continue-on-error: true
+        with:
+          node-version: "22"
+      # Installed outside the repo, and the checker is copied in beside it,
+      # because Node resolves `node_modules` by walking up from the script's own
+      # location. That keeps a 160MB dependency tree out of the working copy of a
+      # Python repo, where nobody expects one and nothing ignores it. Pinned
+      # major, floating within it, mirroring how sqlglot is bounded: a patch
+      # should not be able to fail this, and moving the major should be a
+      # deliberate act taken on this job's evidence.
+      - name: Install the Mermaid parser outside the repo
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/mermaid-canary"
+          cd "$RUNNER_TEMP/mermaid-canary"
+          npm install --silent mermaid@^11 jsdom@^26
+          cp "$GITHUB_WORKSPACE/scripts/check_mermaid_syntax.mjs" .
+      # Generated from the renderer rather than committed, so the corpus cannot
+      # drift from what dex actually emits. The dump self-checks that it still
+      # covers every cardinality glyph the policy can produce.
+      - name: Render the Mermaid fixture corpus
+        continue-on-error: true
+        run: uv run --project packages/dex-core python scripts/dump_mermaid_fixtures.py "$RUNNER_TEMP/mermaid-fixtures"
+      - name: Parse every fixture with the real Mermaid parser
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP/mermaid-canary"
+          node -e "console.log('testing mermaid', require('mermaid/package.json').version)"
+          node check_mermaid_syntax.mjs "$RUNNER_TEMP/mermaid-fixtures"
