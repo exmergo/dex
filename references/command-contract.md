@@ -596,7 +596,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      aggregate and returned as an offer beside findings already final.
                                      Grain: the grain a declaration states first, then a unique test,
                                      a unique_combination_of_columns test, a primary entity, or a
-                                     naming guess, one source per model. Declared facts, checked with
+                                     naming guess, one source per model; one data.grain_coverage
+                                     record per declared key (proven, broken, not_applicable for an
+                                     empty relation, unchecked with a reason, not_planned for a key
+                                     a higher-ranked source displaced; #1223). Declared facts, checked with
                                      aggregate-only statements: unit_out_of_range (a fraction outside
                                      0..1, a percent wholly inside it, with the observed min and max),
                                      additivity_contradicted (an additive column the cumulative

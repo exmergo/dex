@@ -369,6 +369,9 @@ class Prepared:
     temporal_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
     #: Each parent check no statement could be written for, with code and why.
     parent_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: A ``grain_coverage`` record for each declared grain no statement could
+    #: be written for (#1223); the measured ones are added when they run.
+    grain_records: list[dict] = field(default_factory=list)
     #: The selector expression that scoped the build, when one did.
     selection: str | None = None
 
@@ -419,6 +422,7 @@ def prepare(
     prepared.temporal_models = [m for m in models if m.history is not None]
 
     for model in models:
+        grain_here = check_grain and (tested_grain or grain_untested(model))
         if live_identifiers is None:
             identifier = model.relation
             live = None
@@ -432,6 +436,15 @@ def prepare(
                     f"{model.relation}",
                     check_grain,
                 )
+                if grain_here:
+                    prepared.grain_records.append(
+                        _grain_record(
+                            model.model,
+                            model.grain,
+                            "unchecked",
+                            "ambiguous" if matches else "no_relation",
+                        )
+                    )
                 continue
             identifier = matches[0]
             try:
@@ -446,6 +459,15 @@ def prepare(
                     f"({_refusal(exc)})",
                     check_grain,
                 )
+                if grain_here:
+                    prepared.grain_records.append(
+                        _grain_record(
+                            model.model,
+                            model.grain,
+                            "unchecked",
+                            "metadata_unreadable",
+                        )
+                    )
                 continue
             live = {c.name.lower(): (c.name, c.data_type) for c in columns}
             if not live:
@@ -456,7 +478,7 @@ def prepare(
             live,
             adapter.dialect,
             prepared,
-            check_grain and (tested_grain or grain_untested(model)),
+            grain_here,
         )
         if model.parent is not None:
             _parent_probe(adapter, probe, live, live_identifiers, prepared)
@@ -475,6 +497,25 @@ def _drop(
             prepared.dropped[finding_class].append(reason)
     if check_grain and model.grain:
         prepared.notes.append(f"the declared grain was not checked for {reason}")
+
+
+def _grain_record(
+    model: str,
+    grain: Iterable[str],
+    status: str,
+    reason: str | None = None,
+    *,
+    rows: int | None = None,
+    distinct: int | None = None,
+) -> dict:
+    """A ``grain_coverage`` record for a declared grain (#1223)."""
+
+    from .verify import GrainCandidate, grain_record, measured_grain_record
+
+    candidate = GrainCandidate(columns=list(grain), source="declaration")
+    if rows is not None and distinct is not None:
+        return measured_grain_record(model, candidate, rows, distinct)
+    return grain_record(model, candidate, status, reason)
 
 
 def grain_untested(model: DeclaredModel) -> bool:
@@ -562,6 +603,9 @@ def _probe(
             )
             probe.grain = list(model.grain)
         else:
+            prepared.grain_records.append(
+                _grain_record(model.model, model.grain, "unchecked", "missing_columns")
+            )
             prepared.notes.append(
                 f"the declared grain on {model.model} names a column the relation "
                 "does not have, so it was not checked: "
@@ -968,6 +1012,9 @@ class DeclaredFactsResult:
     parent_coverage: list[dict] = field(default_factory=list)
     #: One record per declared temporal contract, measured or not (#1027).
     temporal_contracts: list[dict] = field(default_factory=list)
+    #: One record per declared grain this statement was to count, measured or
+    #: not (#1223), in the shape :func:`~.verify.grain_record` writes.
+    grain_coverage: list[dict] = field(default_factory=list)
 
 
 def nothing_declared(finding_class: str, where: str) -> str:
@@ -1003,7 +1050,9 @@ def findings(
     from ..explore import cumulative as cumulative_mod
     from ..guards.cost_guard import CostGuardError
 
-    result = DeclaredFactsResult(notes=list(prepared.notes))
+    result = DeclaredFactsResult(
+        notes=list(prepared.notes), grain_coverage=list(prepared.grain_records)
+    )
     for finding_class in CLASSES:
         if not prepared.declared.get(finding_class):
             result.suppressed[finding_class] = nothing_declared(finding_class, where)
@@ -1022,6 +1071,11 @@ def findings(
                 if prepared.declared.get(finding_class):
                     result.suppressed[finding_class] = reason
             pending = sorted(p.model.model for p in prepared.probes if p.grain)
+            result.grain_coverage.extend(
+                _grain_record(p.model.model, p.grain, "unchecked", "scan_offered")
+                for p in prepared.probes
+                if p.grain
+            )
             if pending:
                 result.notes.append(
                     "the declared grain was not measured for "
@@ -1050,6 +1104,10 @@ def findings(
                     f"the declared facts on {model} could not be measured: the "
                     f"warehouse refused the statement ({detail})"
                 )
+                if probe.grain:
+                    result.grain_coverage.append(
+                        _grain_record(model, probe.grain, "unchecked", "refused")
+                    )
                 for finding_class in ("unit", "population"):
                     if probe.model.declares(finding_class):
                         prepared.dropped[finding_class].append(reason)
@@ -1381,6 +1439,15 @@ def _judge_aggregate(
 
     model = probe.model.model
     rows = int(row.get("dex_rows") or 0)
+    if probe.grain:
+        distinct = row.get("dex_grain")
+        result.grain_coverage.append(
+            _grain_record(model, probe.grain, "unchecked", "scan")
+            if distinct is None
+            else _grain_record(
+                model, probe.grain, "measured", rows=rows, distinct=int(distinct)
+            )
+        )
     if rows == 0:
         reason = f"{model}: the built relation has no rows"
         result.notes.append(
