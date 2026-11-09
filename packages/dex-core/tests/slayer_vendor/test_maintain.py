@@ -452,6 +452,55 @@ def test_reconcile_never_removes_a_whole_model(repo: Path, capsys):
     assert "semantic_plan_id" in payload["data"]
 
 
+def test_reconcile_native_only_repository_whose_findings_the_layer_does_not_handle(
+    tmp_path: Path, capsys
+):
+    """#994: A native-only repository whose findings the layer doesn't handle
+    returns status: ok with advisory proposals and no stored plan."""
+    _sql(
+        tmp_path,
+        "CREATE TABLE customers (id INTEGER, region VARCHAR)",
+        "INSERT INTO customers VALUES (1, 'north'), (2, 'south'), (3, 'east')",
+        "CREATE TABLE orders (order_id INTEGER, customer_id INTEGER, "
+        "amount DOUBLE, status VARCHAR, ordered_at TIMESTAMP)",
+        "INSERT INTO orders VALUES "
+        "(1, 1, 10.0, 'paid', '2026-01-01'), (2, 2, 20.0, 'paid', '2026-01-02'), "
+        "(3, 3, 5.0, 'open', '2026-01-03'), (4, 1, 7.5, 'paid', '2026-01-04')",
+    )
+    _write_model(tmp_path, ORDERS, _orders(), comment="# orders, kept by hand\n")
+    _write_model(tmp_path, CUSTOMERS, _customers())
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: duckdb\n"
+        f"duckdb:\n  path: {tmp_path / 'demo.duckdb'}\n"
+        "semantic:\n"
+        "  vendor: slayer\n"
+        "  slayer:\n"
+        f"    base_dir: {BASE}\n"
+        "    models:\n"
+        f"      - {ORDERS}\n"
+        f"      - {CUSTOMERS}\n",
+        encoding="utf-8",
+    )
+    _cli(tmp_path, capsys, "maintain", "snapshot")
+    _sql(tmp_path, "INSERT INTO orders VALUES (4, 2, 1.0, 'paid', '2026-01-05')")
+    _cli(tmp_path, capsys, "maintain", "grain")
+
+    payload = _cli(tmp_path, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload
+    assert payload["status"] == "ok"
+    proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_grain_not_unique"
+    ]
+    assert len(proposals) == 1
+    assert proposals[0]["kind"] == "advisory"
+    assert payload["data"].get("plan_id") is None
+    assert any("no transformation project to edit" in w for w in payload["warnings"])
+
+
 # --- nothing SLayer-side is opened ------------------------------------------------
 
 
