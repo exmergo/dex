@@ -510,6 +510,36 @@ def test_a_package_macro_that_may_read_a_relation_is_unchecked(tmp_path):
             id="postgres-schema-only-the-derived-one",
         ),
         pytest.param(
+            "dbt_dev",
+            [
+                "`acme-dw`.`staging_dev`.`stg_orders`",
+                "`acme-dw`.`intermediate_dev`.`int_orders`",
+                "`acme-dw`.`marts_dev`.`fct_orders`",
+            ],
+            ["intermediate_dev", "marts_dev", "staging_dev"],
+            id="bigquery-layered-schemas",
+        ),
+        pytest.param(
+            "ANALYTICS.DEV",
+            [
+                '"ANALYTICS"."STAGING_DEV"."STG_ORDERS"',
+                '"ANALYTICS"."INTERMEDIATE_DEV"."INT_ORDERS"',
+                '"ANALYTICS"."MARTS_DEV"."FCT_ORDERS"',
+            ],
+            [
+                "ANALYTICS.INTERMEDIATE_DEV",
+                "ANALYTICS.MARTS_DEV",
+                "ANALYTICS.STAGING_DEV",
+            ],
+            id="snowflake-layered-schemas",
+        ),
+        pytest.param(
+            "dev",
+            ['"staging_dev"."stg_orders"', '"marts_dev"."fct_orders"'],
+            ["marts_dev", "staging_dev"],
+            id="postgres-layered-schemas",
+        ),
+        pytest.param(
             "dev.dbt_dev",
             ["prod.dbt_dev_inbox.x", "dev.dbt_devious.y", "dev.dbt_dev.z"],
             [],
@@ -519,10 +549,24 @@ def test_a_package_macro_that_may_read_a_relation_is_unchecked(tmp_path):
     ],
 )
 def test_derived_dev_scopes(dev, relations, expected):
-    """Namespaces dbt derives from the dev one, per connector spelling."""
+    """namespaces dbt derives from the dev one, per connector spelling."""
     from exmergo_dex_core.connect import derived_dev_scopes
 
     assert derived_dev_scopes(dev, relations) == expected
+
+
+def test_derived_dev_scopes_with_explicit_target_name():
+    """a custom dbt_target derives layer schemas ending with that target name."""
+    from exmergo_dex_core.connect import derived_dev_scopes
+
+    relations = [
+        "`acme-dw`.`staging_local`.`stg_orders`",
+        "`acme-dw`.`marts_local`.`fct_orders`",
+    ]
+    assert derived_dev_scopes("dbt_local", relations, target_name="local") == [
+        "marts_local",
+        "staging_local",
+    ]
 
 
 def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
@@ -543,6 +587,10 @@ def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
     assert seen == [["dbt_dev", "dbt_dev_inbox"]]
     assert widen_dev_reads(adapter, config, ["p.dbt_dev.x"]) == []
     assert len(seen) == 1, "nothing derived, so the adapter's dev read is untouched"
+
+    added_layered = widen_dev_reads(adapter, config, ["p.staging_dev.x"])
+    assert added_layered == ["staging_dev"]
+    assert seen == [["dbt_dev", "dbt_dev_inbox"], ["dbt_dev", "staging_dev"]]
 
 
 def test_with_dev_target_folds_every_existing_entry_once():
