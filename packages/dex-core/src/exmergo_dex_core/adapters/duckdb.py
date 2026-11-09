@@ -98,11 +98,13 @@ class DuckDBAdapter:
         memory_limit: str = DEFAULT_MEMORY_LIMIT,
         threads: int = DEFAULT_THREADS,
     ):
+        """open a read-only duckdb connection for the command lifetime."""
         self.path = str(path)
         self._memory_limit = memory_limit
         self._threads = threads
         self._conn = self._connect()
         self._database: str | None = None
+        self._objects: dict[str, ObjectMeta] = {}
         try:
             self._database = str(
                 self._conn.execute("SELECT current_database()").fetchone()[0]
@@ -187,20 +189,56 @@ class DuckDBAdapter:
         rows = self._run_select(sql)
         objects: list[ObjectMeta] = []
         for db, schema, name, est_size, col_count, obj_type in rows:
-            objects.append(
-                ObjectMeta(
-                    identifier=f"{db}.{schema}.{name}",
-                    object_type=obj_type,
-                    schema=schema,
-                    name=name,
-                    # byte_size stays None: DuckDB has no cheap per-object byte
-                    # size and a fabricated number would mislead ranking.
-                    row_count=int(est_size) if est_size is not None else None,
-                    byte_size=None,
-                    column_count=int(col_count) if col_count is not None else 0,
-                )
+            meta = ObjectMeta(
+                identifier=f"{db}.{schema}.{name}",
+                object_type=obj_type,
+                schema=schema,
+                name=name,
+                database=db,
+                # byte_size stays None: DuckDB has no cheap per-object byte
+                # size and a fabricated number would mislead ranking.
+                row_count=int(est_size) if est_size is not None else None,
+                byte_size=None,
+                column_count=int(col_count) if col_count is not None else 0,
             )
+            objects.append(meta)
+            self._objects[meta.identifier] = meta
         return objects
+
+    def _find_object_meta(self, identifier: str) -> ObjectMeta | None:
+        """find inventoried object meta matching identifier or its parts."""
+        if identifier in self._objects:
+            return self._objects[identifier]
+        for meta in self._objects.values():
+            if f"{meta.schema}.{meta.name}" == identifier:
+                return meta
+            if meta.name == identifier:
+                return meta
+            db = meta.database or self._current_database()
+            if (
+                f"{_quote_ident(db)}.{_quote_ident(meta.schema)}."
+                f"{_quote_ident(meta.name)}" == identifier
+            ):
+                return meta
+            if f"{_quote_ident(meta.schema)}.{_quote_ident(meta.name)}" == identifier:
+                return meta
+            if f"{meta.schema}.{_quote_ident(meta.name)}" == identifier:
+                return meta
+            if f"{db}.{meta.schema}.{_quote_ident(meta.name)}" == identifier:
+                return meta
+            if _quote_ident(meta.name) == identifier:
+                return meta
+        return None
+
+    def _get_object(self, identifier: str) -> ObjectMeta | None:
+        """resolve an identifier to its catalog object meta."""
+        if not self._objects:
+            self.list_objects()
+        meta = self._find_object_meta(identifier)
+        if meta is not None:
+            return meta
+        self.list_objects()
+        return self._find_object_meta(identifier)
 
     def list_namespace_objects(self, schema: str) -> list[str]:
         """Table and view names already in one schema of the attached file.
@@ -220,19 +258,32 @@ class DuckDBAdapter:
         return sorted(str(name) for (name,) in rows)
 
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
-        _db, schema, name = self._split(identifier)
+        """exact row count and column metadata for one object."""
+        meta_found = self._get_object(identifier)
+        if meta_found is not None:
+            schema = meta_found.schema
+            name = meta_found.name
+            db = meta_found.database or self._current_database()
+            obj_type = meta_found.object_type
+            canonical_ident = meta_found.identifier
+        else:
+            db, schema, name = self._split(identifier)
+            obj_type = "table"
+            canonical_ident = identifier
+
         columns = self.table_columns(identifier)
-        # Exact row count (one cheap aggregate), unlike the estimate in inventory.
-        # The only interpolation is the quoted+escaped identifier (never a value);
+        # exact row count (one cheap aggregate), unlike the estimate in inventory.
+        # the only interpolation is the quoted+escaped identifier (never a value);
         # the statement is parsed and refused if not a read-only SELECT.
         (row_count,) = self._run_select(
             f"SELECT COUNT(*) FROM {self._quote(identifier)}"  # noqa: S608
         )[0]
         meta = ObjectMeta(
-            identifier=identifier,
-            object_type="table",
+            identifier=canonical_ident,
+            object_type=obj_type,
             schema=schema,
             name=name,
+            database=db,
             row_count=int(row_count),
             byte_size=None,
             column_count=len(columns),
@@ -240,14 +291,15 @@ class DuckDBAdapter:
         return meta, columns
 
     def table_columns(self, identifier: str) -> list[ColumnMeta]:
-        """One object's columns from the catalog alone, with no row count.
+        """one object's columns from the catalog alone, with no row count."""
+        meta = self._get_object(identifier)
+        if meta is not None:
+            db = meta.database or self._current_database()
+            schema = meta.schema
+            name = meta.name
+        else:
+            db, schema, name = self._split(identifier)
 
-        ``table_metadata`` adds an exact ``COUNT(*)``, which scans a view; a
-        caller that needs only names and types (dbt's compile-time column
-        listing, #1154) reads this instead.
-        """
-
-        db, schema, name = self._split(identifier)
         col_rows = self._run_select(
             """
             SELECT column_name, data_type, is_nullable, column_index
@@ -532,12 +584,21 @@ class DuckDBAdapter:
 
     @staticmethod
     def _split(identifier: str) -> tuple[str, str, str]:
+        """split a three-part database.schema.name identifier from the right."""
         parts = identifier.rsplit(".", 2)
         if len(parts) != 3:
             raise ValueError(f"expected database.schema.name, got '{identifier}'")
         return parts[0], parts[1], parts[2]
 
     def _quote(self, identifier: str) -> str:
+        """quote an identifier's catalog components for duckdb statements."""
+        meta = self._get_object(identifier)
+        if meta is not None:
+            db = meta.database or self._current_database()
+            return (
+                f"{_quote_ident(db)}.{_quote_ident(meta.schema)}."
+                f"{_quote_ident(meta.name)}"
+            )
         return ".".join(_quote_ident(p) for p in self._split(identifier))
 
     def describe_query(self, sql: str) -> list[ColumnMeta]:
