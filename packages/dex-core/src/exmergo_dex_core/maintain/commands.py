@@ -1380,12 +1380,16 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
         )
         return [], plan_notes, reason
 
+    overrides = verify_mod.package_documented_overrides_for_project(
+        project_dir, declared_by_model.keys()
+    )
     findings, finding_notes = verify_mod.column_contract_findings(
         adapter,
         declared_by_model,
         model_relations,
         [o.identifier for o in live],
         undeclared,
+        package_documented=overrides,
     )
     return findings, plan_notes + finding_notes, None
 

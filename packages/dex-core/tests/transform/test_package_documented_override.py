@@ -283,6 +283,17 @@ def test_the_undeclared_override_plans_builds_and_keeps_the_package_entry(
     assert node["description"] == PACKAGE_DESCRIPTION
     assert node["patch_path"] == "tiny_pkg://models/pkg_task.yml"
 
+    # #1205: undeclared column on the override names the package entry and refusal.
+    [finding] = [
+        f
+        for f in built["data"]["verification"]["findings"]
+        if f["code"] == "column_undeclared" and f["identifier"] == "pkg_task"
+    ]
+    assert PACKAGE_ENTRY in finding["detail"]
+    assert "schema.yml" not in finding["detail"]
+    assert "the project cannot declare the override" in finding["detail"]
+    assert finding["data"]["package_entry"] == PACKAGE_ENTRY
+
     reader = project / "reader.json"
     reader.write_text(
         json.dumps(

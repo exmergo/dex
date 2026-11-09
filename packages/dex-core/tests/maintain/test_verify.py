@@ -358,6 +358,92 @@ def test_an_undeclared_column_is_reported_low_severity():
     assert "extra" in finding.detail
 
 
+def test_an_override_with_undeclared_columns_names_package_entry_and_refusal():
+    """#1205: undeclared column on an override names package entry, not schema.yml."""
+    from types import SimpleNamespace
+
+    override = SimpleNamespace(
+        model="a",
+        package="tiny_pkg",
+        package_entry="dbt_packages/tiny_pkg/models/a.yml",
+    )
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER"), ("extra", "VARCHAR")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+        package_documented={"a": override},
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_undeclared"
+    assert finding.severity == "low"
+    assert "schema.yml" not in finding.detail
+    assert "dbt_packages/tiny_pkg/models/a.yml" in finding.detail
+    assert "the project cannot declare the override" in finding.detail
+    assert finding.data["package_entry"] == "dbt_packages/tiny_pkg/models/a.yml"
+
+
+def test_an_override_with_missing_column_names_package_entry():
+    """#1205: missing column on an override names package entry, not schema.yml."""
+    from types import SimpleNamespace
+
+    override = SimpleNamespace(
+        model="a",
+        package="tiny_pkg",
+        package_entry="dbt_packages/tiny_pkg/models/a.yml",
+    )
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
+        declared_by_model={"a": {"id": "INTEGER", "email": "VARCHAR"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+        package_documented={"a": override},
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_missing"
+    assert "schema.yml" not in finding.detail
+    assert "dbt_packages/tiny_pkg/models/a.yml" in finding.detail
+    assert finding.data["package_entry"] == "dbt_packages/tiny_pkg/models/a.yml"
+
+
+def test_package_documented_overrides_for_project_reads_packages(tmp_path):
+    """#1205: package_documented_overrides_for_project finds overrides."""
+    from exmergo_dex_core.maintain.verify import (
+        package_documented_overrides_for_project,
+    )
+
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: proj\nversion: '1.0'\nconfig-version: 2\n"
+        "models:\n  tiny_pkg:\n    pkg_task:\n      +enabled: false\n"
+    )
+    pkg_dir = tmp_path / "dbt_packages" / "tiny_pkg"
+    (pkg_dir / "models").mkdir(parents=True)
+    (pkg_dir / "dbt_project.yml").write_text(
+        "name: tiny_pkg\nversion: '1.0'\nmodel-paths: [models]\n"
+    )
+    (pkg_dir / "models" / "pkg_task.sql").write_text("select 1 as id\n")
+    (pkg_dir / "models" / "pkg_task.yml").write_text(
+        "version: 2\nmodels:\n  - name: pkg_task\n    description: From vendor.\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "pkg_task.sql").write_text("select 1 as id\n")
+
+    overrides = package_documented_overrides_for_project(
+        tmp_path, ["pkg_task", "other"]
+    )
+    assert "pkg_task" in overrides
+    assert "other" not in overrides
+    assert overrides["pkg_task"].package == "tiny_pkg"
+    assert (
+        overrides["pkg_task"].package_entry
+        == "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    )
+
+
 def test_a_declared_type_that_disagrees_is_a_medium_severity_mismatch():
     findings, _notes = column_contract_findings(
         _ColumnAdapter({"db.main.a": [("id", "VARCHAR")]}),

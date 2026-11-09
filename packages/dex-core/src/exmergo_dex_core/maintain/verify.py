@@ -40,9 +40,10 @@ bounded metadata) alone.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
@@ -489,17 +490,63 @@ def built_model_relations(project_dir: Path, scope: set[str]) -> dict[str, str]:
     }
 
 
+def package_documented_overrides_for_project(
+    project_dir: Path, models: Iterable[str]
+) -> dict[str, Any]:
+    """the models in ``models`` that are project overrides of a package model."""
+
+    from types import SimpleNamespace
+
+    from ..transform.package_overrides import documented_overrides
+
+    wanted = {m for m in models if m}
+    if not wanted:
+        return {}
+
+    try:
+        project_yml = (project_dir / "dbt_project.yml").read_text(encoding="utf-8")
+    except OSError:
+        project_yml = None
+
+    overrides: dict[str, Any] = documented_overrides(project_dir, wanted, project_yml)
+    nodes = _manifest_nodes(project_dir) or {}
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        name = manifest_node_label(uid, node)
+        if name in overrides or name not in wanted:
+            continue
+        patch = node.get("patch_path")
+        pkg = node.get("package_name")
+        if isinstance(patch, str) and isinstance(pkg, str) and "://" in patch:
+            patch_pkg, _, rel = patch.partition("://")
+            if patch_pkg and patch_pkg != pkg:
+                overrides[name] = SimpleNamespace(
+                    model=name,
+                    package=patch_pkg,
+                    package_entry=f"dbt_packages/{patch_pkg}/{rel}",
+                )
+    return overrides
+
+
 def column_contract_findings(
     adapter,
     declared_by_model: dict[str, dict[str, str | None]],
     model_relations: dict[str, str],
     live_identifiers: list[str],
     undeclared: int,
+    *,
+    package_documented: Mapping[str, Any] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """:func:`column_contract_check`, as findings and notes alone."""
 
     check = column_contract_check(
-        adapter, declared_by_model, model_relations, live_identifiers, undeclared
+        adapter,
+        declared_by_model,
+        model_relations,
+        live_identifiers,
+        undeclared,
+        package_documented=package_documented,
     )
     return check.findings, check.notes
 
@@ -510,6 +557,8 @@ def column_contract_check(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     undeclared: int,
+    *,
+    package_documented: Mapping[str, Any] | None = None,
 ) -> ColumnContractCheck:
     """A built relation's actual columns against what its schema.yml declares,
     in both directions, plus a type check where a type is declared (#230).
@@ -580,7 +629,16 @@ def column_contract_check(
             declared_lower, actual_lower, connector=connector
         )
 
+        override = (package_documented or {}).get(model)
+        package_entry = getattr(override, "package_entry", None) or (
+            override.get("package_entry") if isinstance(override, dict) else None
+        )
+        declared_source = package_entry or "schema.yml"
+
         if missing:
+            finding_data: dict[str, Any] = {"model": model, "columns": missing}
+            if package_entry:
+                finding_data["package_entry"] = package_entry
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -589,26 +647,49 @@ def column_contract_check(
                     severity="high",
                     detail=(
                         f"'{model}' declares column(s) {', '.join(missing)} in "
-                        "schema.yml that the built relation does not have"
+                        f"{declared_source} that the built relation does not have"
                     ),
-                    data={"model": model, "columns": missing},
+                    data=finding_data,
                 )
             )
         if extra:
+            if package_entry:
+                detail = (
+                    f"'{model}' builds column(s) {', '.join(extra)} that "
+                    f"{package_entry} does not declare; the project "
+                    "cannot declare the override"
+                )
+                finding_data = {
+                    "model": model,
+                    "columns": extra,
+                    "package_entry": package_entry,
+                }
+            else:
+                detail = (
+                    f"'{model}' builds column(s) {', '.join(extra)} that "
+                    "schema.yml does not declare"
+                )
+                finding_data = {"model": model, "columns": extra}
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="column_undeclared",
                     identifier=model,
                     severity="low",
-                    detail=(
-                        f"'{model}' builds column(s) {', '.join(extra)} that "
-                        "schema.yml does not declare"
-                    ),
-                    data={"model": model, "columns": extra},
+                    detail=detail,
+                    data=finding_data,
                 )
             )
         if mismatched:
+            finding_data = {
+                "model": model,
+                "mismatches": [
+                    {"column": name, "declared": d, "actual": a}
+                    for name, d, a in mismatched
+                ],
+            }
+            if package_entry:
+                finding_data["package_entry"] = package_entry
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -621,19 +702,13 @@ def column_contract_check(
                             f"{name} as {declared_type}"
                             for name, declared_type, _ in mismatched
                         )
-                        + " in schema.yml, but the built relation has "
+                        + f" in {declared_source}, but the built relation has "
                         + ", ".join(
                             f"{name} as {actual_type}"
                             for name, _, actual_type in mismatched
                         )
                     ),
-                    data={
-                        "model": model,
-                        "mismatches": [
-                            {"column": name, "declared": d, "actual": a}
-                            for name, d, a in mismatched
-                        ],
-                    },
+                    data=finding_data,
                 )
             )
 

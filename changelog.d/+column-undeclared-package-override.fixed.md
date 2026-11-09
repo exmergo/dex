@@ -1,0 +1,1 @@
+**column contract reports undeclared columns on package-documented overrides as gaps in the package entry.** when an override of a package-documented model builds columns not listed in the package's documentation, verify now names the package's yaml file and notes that the project cannot declare the override rather than asking for a project entry that dbt refuses.

@@ -700,9 +700,17 @@ def _column_contract(
         )
 
     relations = verify_mod.built_model_relations(project_dir, scope)
+    overrides = verify_mod.package_documented_overrides_for_project(
+        project_dir, declared.keys()
+    )
     # The no-columns count is reported by name in the record above.
     check = verify_mod.column_contract_check(
-        adapter, declared, relations, [meta.identifier for meta in live], 0
+        adapter,
+        declared,
+        relations,
+        [meta.identifier for meta in live],
+        0,
+        package_documented=overrides,
     )
     result.findings.extend(check.findings)
     result.warnings.extend(check.notes)
