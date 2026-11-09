@@ -3,6 +3,8 @@ applied through `transform apply`, never written by reconcile itself."""
 
 from __future__ import annotations
 
+import pytest
+
 
 def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
@@ -11,11 +13,87 @@ def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+def test_cardinality_contraction_advice_does_not_invent_a_new_value():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison.page",
+        detail="dimension 'page' narrowed: ~80 -> 77 distinct values",
+        exact=False,
+        data={"distinct_before": 80, "distinct_after": 77},
+    )
+
+    action = _advisory(finding).action
+    assert "missing categories" in action
+    assert "new categorical value" not in action
+    assert "approximate" in action
+
+
+def test_cardinality_expansion_advice_does_not_claim_a_specific_new_value():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        identifier="comparison.page",
+        detail="dimension 'page' expanded: 77 -> 80 distinct values",
+        data={"distinct_before": 77, "distinct_after": 80},
+    )
+
+    action = _advisory(finding).action
+    assert "additional categories" in action
+    assert "new categorical value" not in action
+    assert "approximate" not in action
+
+
+def test_cardinality_advice_without_counts_stays_neutral():
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dimension_cardinality_changed",
+        detail="cardinality changed",
+        data={},
+    )
+
+    action = _advisory(finding).action
+    assert "population changed" in action
+    assert "missing categories" not in action
+    assert "additional categories" not in action
+
+
+_INTENDED_CHURN = (
+    "definition or model changes since the baseline are recorded but "
+    "not reconciled: if the current project state is intended, run "
+    "`explore map` then `maintain snapshot` to accept it as the new "
+    "baseline; otherwise repair the project through `transform plan`"
+)
+
+_GRAIN_FIRST_CHURN = (
+    "definition or model changes since the baseline are recorded but "
+    "not reconciled: repair the project through `transform plan` "
+    "before accepting a baseline, because a high-severity grain "
+    "finding is in this check; once the repair holds and the project "
+    "state is intended, run `explore map` then `maintain snapshot` "
+    "to accept it as the new baseline"
+)
+
+
+def _churn_warning(warnings: list[str]) -> str:
+    return next(w for w in warnings if w.startswith("definition or model changes"))
+
+
 def test_model_findings_warn_toward_resnapshot_rather_than_propose_a_fix():
     """A model added/removed/changed (#164's transform_drift) gets the same
     treatment as a semantic definition_* finding: it is the project's own
-    edit, so there is no warehouse-side fix to propose, only a nudge to
-    re-baseline if the change is intended."""
+    edit, so there is no warehouse-side fix to propose. The warning names
+    both ways forward: accept the state after `explore map`, or repair it
+    through `transform plan`."""
 
     from exmergo_dex_core.maintain.drift import DriftFinding
     from exmergo_dex_core.maintain.reconcile import build
@@ -45,7 +123,51 @@ def test_model_findings_warn_toward_resnapshot_rather_than_propose_a_fix():
 
     assert proposals == []
     assert edits == []
-    assert any("re-run `maintain snapshot`" in w for w in warnings)
+    assert warnings == [_INTENDED_CHURN]
+    churn = warnings[0]
+    assert churn.index("`explore map`") < churn.index("`maintain snapshot`")
+    assert churn.index("`maintain snapshot`") < churn.index("`transform plan`")
+
+
+def test_high_severity_grain_finding_is_not_offered_a_snapshot_first():
+    """definition_changed beside a high-severity key_lost_uniqueness is a
+    regression, not a state to baseline. Snapshot must not be the first
+    branch. A grain finding below high still uses the intended-state path."""
+
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import build
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    definition = DriftFinding(
+        axis="semantic",
+        code="definition_changed",
+        severity="low",
+        detail="the definition of metric 'revenue' changed since the baseline",
+        data={"kind": "metric", "name": "revenue"},
+    )
+    lost_key = DriftFinding(
+        axis="grain",
+        code="key_lost_uniqueness",
+        identifier="db.main.orders",
+        column="order_id",
+        severity="high",
+        detail="order_id on db.main.orders is no longer unique",
+    )
+    snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        connector="duckdb",
+        warehouse=WarehouseBaseline(datasets=[]),
+    )
+
+    _proposals, _edits, warnings = build([definition, lost_key], snap, None, None)
+    churn = _churn_warning(warnings)
+    assert churn == _GRAIN_FIRST_CHURN
+    assert churn.index("`transform plan`") < churn.index("`explore map`")
+    assert churn.index("`explore map`") < churn.index("`maintain snapshot`")
+
+    damped = lost_key.model_copy(update={"severity": "medium"})
+    _proposals, _edits, warnings = build([definition, damped], snap, None, None)
+    assert _churn_warning(warnings) == _INTENDED_CHURN
 
 
 def test_drift_added_column_honors_pii_override():
@@ -417,6 +539,27 @@ def test_grain_drift_is_advisory_with_a_visibility_test(maintain_repo):
     assert "unique" in yml_diff["unified"]
 
 
+def test_staging_grain_drift_uses_existing_unique_test(maintain_repo):
+    """A drift on stg_orders must resolve its existing declaration."""
+    maintain_repo.dex("explore", "map", "--verify")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "INSERT INTO stg_orders SELECT * FROM stg_orders WHERE order_id <= 10"
+    )
+    rc, grain = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and any(
+        finding["code"] == "key_lost_uniqueness"
+        and finding["identifier"].endswith(".stg_orders")
+        for finding in grain["data"]["findings"]
+    ), grain
+
+    rc, payload = maintain_repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert payload["diffs"] == []
+    assert not any("stg_stg_orders" in warning for warning in payload["warnings"])
+    assert not any("add a `unique` test" in warning for warning in payload["warnings"])
+
+
 def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
     # The fixture's stg_orders.yml already tests order_id for uniqueness, so a
     # broken key already fails builds; reconcile does not add a redundant test.
@@ -440,9 +583,8 @@ def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
 # two the way dbt's semantics imply discards it and the plan applies having
 # changed nothing.
 #
-# Drift is induced on `orders` rather than on `stg_orders`, because the test edit
-# lands in the *staging model's* declaration: a finding on `stg_orders` resolves to
-# `stg_stg_orders.yml` and never reaches the check under test.
+# Drift is induced on `orders` here so the test edit is proposed on a different
+# model. Drift on `stg_orders` is separately covered by the regression above.
 
 _COMPOSITE_GRAIN = (
     "    tests:\n"
@@ -739,6 +881,9 @@ def test_the_no_format_fallback_answers_exactly_what_dbt_answers():
     staged = "models/staging/stg_orders"
     assert _placed(None, EditKind.MODEL_SQL, "orders") == f"{staged}.sql"
     assert _placed(None, EditKind.SCHEMA_YML, "orders") == f"{staged}.yml"
+    for kind, suffix in ((EditKind.MODEL_SQL, "sql"), (EditKind.SCHEMA_YML, "yml")):
+        assert _placed(None, kind, "stg_orders") == f"{staged}.{suffix}"
+        assert DbtProject().edit_path(kind, "stg_orders") == f"{staged}.{suffix}"
     # `None` is a complete answer, not a gap: reconcile proposes staging models
     # and their schema.yml, and a kind it does not propose gets no path this
     # class would be inventing.
@@ -946,6 +1091,121 @@ def test_no_test_is_invented_for_an_added_column(maintain_repo):
     assert added == ["+      - name: captured_at"], added
 
 
+def test_aliased_source_rename_is_covered_without_yaml_edit(maintain_repo):
+    """#983: model already maps renamed source column; do not stage YAML from source.
+
+    Loader renames ``status`` -> ``st``. Staging keeps its contract with
+    ``st as status``. SQL splices are no-ops; YAML must not drop ``status`` /
+    add ``st`` (that would break the model contract).
+    """
+
+    _edit_sql(maintain_repo, "        status,\n", "        st as status,\n")
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "ALTER TABLE orders ADD COLUMN st VARCHAR",
+        "UPDATE orders SET st = status",
+        "ALTER TABLE orders DROP status",
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    # No YAML (or SQL) diff for the absorbed rename.
+    yml_diffs = [
+        d for d in payload.get("diffs") or [] if d["path"].endswith("stg_orders.yml")
+    ]
+    assert not yml_diffs
+    covered = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["kind"] == "advisory" and p["finding_code"] == "schema_drift"
+    )
+    assert "already reflects" in covered["action"]
+
+
+def test_star_model_drop_still_stages_stale_yaml(maintain_repo):
+    """#1117 / CodeRabbit: star SQL no-op must not skip YAML removal.
+
+    ``select *`` cannot be rewritten to exclude a dropped source column, but the
+    model output no longer contains it. Stale YAML ``not_null`` on that column
+    would fail the build if reconcile reported the drift as covered.
+    """
+
+    (maintain_repo.root / _STG_SQL).write_text(
+        "select * from {{ source('main', 'orders') }}\n", encoding="utf-8"
+    )
+    yml = maintain_repo.root / _STG_YML
+    yml.write_text(
+        yml.read_text(encoding="utf-8") + "      - name: status\n"
+        "        tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql("ALTER TABLE orders DROP status")
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 1
+    assert "-      - name: status" in _diff(payload, _STG_YML)["unified"]
+    covered = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["kind"] == "advisory"
+        and p["finding_code"] == "schema_drift"
+        and "already reflects" in p["action"]
+    ]
+    assert not covered
+
+
+def test_hand_removed_sql_column_still_stages_stale_yaml(maintain_repo):
+    """#1117 / CodeRabbit: SQL already dropped the column; YAML must still go."""
+
+    _edit_sql(maintain_repo, "        status,\n", "")
+    yml = maintain_repo.root / _STG_YML
+    yml.write_text(
+        yml.read_text(encoding="utf-8") + "      - name: status\n"
+        "        tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql("ALTER TABLE orders DROP status")
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 1
+    assert "-      - name: status" in _diff(payload, _STG_YML)["unified"]
+
+
+def test_absorbed_alias_drop_does_not_warn_downstream_readers(maintain_repo):
+    """#1117 / CodeRabbit: preserved alias must not claim downstream will break."""
+
+    maintain_repo.edit(
+        "models/marts/fct_orders.sql",
+        "select order_id, status from {{ ref('stg_orders') }}\n",
+    )
+    _edit_sql(maintain_repo, "        status,\n", "        st as status,\n")
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "ALTER TABLE orders ADD COLUMN st VARCHAR",
+        "UPDATE orders SET st = status",
+        "ALTER TABLE orders DROP status",
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["mechanical_count"] == 0
+    assert not any("still read it" in w for w in payload.get("warnings") or [])
+
+
 def test_drift_the_project_already_reflects_is_advisory_and_stores_no_plan(
     maintain_repo,
 ):
@@ -1002,3 +1262,39 @@ def test_a_declaration_spelled_in_another_case_is_still_the_column(maintain_repo
 
     assert payload["data"]["mechanical_count"] == 1
     assert "-      - name: STATUS" in _diff(payload, _STG_YML)["unified"]
+
+
+@pytest.mark.parametrize(
+    ("vendor", "command"),
+    [
+        ("dbt", "semantic update"),
+        (None, "semantic update"),
+        ("ossie", "semantic ossie update"),
+        ("slayer", "semantic slayer update"),
+        ("cube", "semantic cube update"),
+    ],
+)
+def test_dangling_reference_names_the_vendor_authoring_command(vendor, command):
+    """#974: name the vendor's own authoring command, not dbt's."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dangling_reference",
+        identifier="orders.revenue",
+        detail="metric references a measure that is gone",
+    )
+    action = _advisory(finding, semantic_vendor=vendor).action
+    assert f"`{command}`" in action
+    if command != "semantic update":
+        assert "`semantic update`" not in action
+    assert "restore the model/column it references" in action
+
+
+def test_semantic_update_command_helper():
+    from exmergo_dex_core.maintain.reconcile import _semantic_update_command
+
+    assert _semantic_update_command("dbt") == "semantic update"
+    assert _semantic_update_command("OSSIE") == "semantic ossie update"
+    assert _semantic_update_command(None) == "semantic update"

@@ -14,6 +14,7 @@ from exmergo_dex_core.maintain.drift import (
     semantic_free_drift,
 )
 from exmergo_dex_core.maintain.snapshot import (
+    MetricDef,
     SemanticLayer,
     SemanticModelDef,
     Snapshot,
@@ -146,6 +147,8 @@ def test_definition_change_and_churn_are_reported(maintain_repo):
     # The dbt path names the file, which is the non-degraded half of the pair
     # asserted by test_a_pathless_definition_omits_its_provenance below.
     assert by_code["definition_changed"][0]["data"]["path"] == SEMANTIC_PATH
+    # #889: a changed metric names itself in impacted_metrics (no dependents here).
+    assert by_code["definition_changed"][0]["impacted_metrics"] == ["revenue"]
     assert {f["data"]["name"] for f in by_code["definition_added"]} == {
         "orders_shipped"
     }
@@ -248,6 +251,97 @@ def test_a_pathless_definition_omits_its_provenance():
     changed = [f for f in findings if f.code == "definition_changed"]
     assert len(changed) == 1
     assert changed[0].data == {"kind": "semantic_model", "name": "orders"}
+
+
+def test_metric_definition_changed_lists_itself_and_dependents():
+    """definition_changed for a metric fills impacted_metrics (#889).
+
+    annotate_impacts skips findings without a physical identifier, so the
+    generic hash loop must set the impact itself. A ratio that names the
+    changed metric as an input is included via the input_metrics closure.
+    """
+
+    baseline = SemanticLayer(
+        metrics=[
+            MetricDef(
+                name="ctr",
+                content_sha256="before",
+                input_measures=["clicks", "impressions"],
+            ),
+            MetricDef(
+                name="ctr_pct",
+                content_sha256="stable",
+                input_metrics=["ctr"],
+            ),
+        ]
+    )
+    current = SemanticLayer(
+        metrics=[
+            MetricDef(
+                name="ctr",
+                content_sha256="after",
+                input_measures=["impressions", "clicks"],
+            ),
+            MetricDef(
+                name="ctr_pct",
+                content_sha256="stable",
+                input_metrics=["ctr"],
+            ),
+        ]
+    )
+    snap = Snapshot(created_at="2024-01-01T00:00:00", semantic_layer=baseline)
+
+    findings = semantic_free_drift(None, current, [], snap)
+
+    changed = [f for f in findings if f.code == "definition_changed"]
+    assert len(changed) == 1
+    assert changed[0].data == {"kind": "metric", "name": "ctr"}
+    assert changed[0].impacted_metrics == ["ctr", "ctr_pct"]
+
+
+def test_semantic_model_definition_changed_lists_metrics_on_its_measures():
+    """A changed semantic model impacts metrics that draw on its measures."""
+
+    baseline = SemanticLayer(
+        semantic_models=[
+            SemanticModelDef(
+                name="orders",
+                content_sha256="before",
+                measures={"order_count": "order_id"},
+            )
+        ],
+        metrics=[
+            MetricDef(
+                name="order_volume",
+                content_sha256="stable",
+                input_measures=["order_count"],
+            )
+        ],
+    )
+    current = SemanticLayer(
+        semantic_models=[
+            SemanticModelDef(
+                name="orders",
+                content_sha256="after",
+                measures={"order_count": "order_id"},
+            )
+        ],
+        metrics=[
+            MetricDef(
+                name="order_volume",
+                content_sha256="stable",
+                input_measures=["order_count"],
+            )
+        ],
+    )
+    snap = Snapshot(created_at="2024-01-01T00:00:00", semantic_layer=baseline)
+
+    findings = semantic_free_drift(None, current, [], snap)
+
+    changed = [f for f in findings if f.code == "definition_changed"]
+    assert len(changed) == 1
+    assert changed[0].data == {"kind": "semantic_model", "name": "orders"}
+    assert changed[0].impacted_metrics == ["order_volume"]
 
 
 def _snapshot_with_two_semantic_models() -> tuple[Snapshot, SemanticLayer]:

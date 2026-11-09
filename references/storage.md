@@ -61,13 +61,13 @@ at runtime. Passing an explore-only store to a transform command refuses with a
 message naming the tier and the missing members, rather than failing on a missing
 attribute several frames down.
 
-Three capabilities sit alongside the tiers rather than inside them, and all are
+Four capabilities sit alongside the tiers rather than inside them, and all are
 optional: `SpendLock`, so the cumulative spend ceiling binds when two commands
-overlap; `SpendHistory`, so an over-ceiling refusal can say how far this
-connector's past estimates ran from what they actually billed; and the
-construction contract, so your backend can be named in configuration. A backend
-is a complete backend without any of them, and the first is one every concurrent
-host wants.
+overlap; `CacheLock`, so one command's cache write never reverts another's;
+`SpendHistory`, so an over-ceiling refusal can say how far this connector's past
+estimates ran from what they actually billed; and the construction contract, so
+your backend can be named in configuration. A backend is a complete backend
+without any of them, and the two locks are ones every concurrent host wants.
 
 ## Writing one
 
@@ -93,8 +93,9 @@ class MyStore:
         return self.locator(Document.CACHE)
 
     def spend_since(self, cutoff_iso, *, field="billed_bytes", connector=None):
-        return spend_total(self._entries("spend"), cutoff_iso,
-                           field=field, connector=connector)
+        return spend_total(
+            self._entries("spend"), cutoff_iso, field=field, connector=connector
+        )
 
     def locator(self, document: Document) -> str:
         return f"mystore://{self.tenant}/{document.value}"
@@ -116,9 +117,10 @@ identically, which is a property you want in a guard.
 
 ## Serializing the spend admission
 
-One optional capability, and the only place in this seam where skipping something
-costs correctness rather than convenience. If your backend can be reached by more
-than one command at a time, implement it.
+One optional capability, and one of the two places in this seam where skipping
+something costs correctness rather than convenience (the other is
+[serializing cache writes](#serializing-cache-writes)). If your backend can be
+reached by more than one command at a time, implement it.
 
 ```python
 from contextlib import contextmanager
@@ -164,6 +166,35 @@ skip the lock on anything serving concurrent requests.
 `SpendLockContract` in the conformance suite is the executable version of all of
 the above.
 
+## Serializing cache writes
+
+The second lock, for the cache document rather than the ledger:
+
+```python
+class MyStore:
+    @contextmanager
+    def cache_lock(self, *, timeout: float = 30.0):
+        with self._cache_lock_for(self.tenant, timeout=timeout):
+            yield
+```
+
+**What dex does with it.** Every command that writes the cache re-reads it inside
+one `cache_lock`, folds its own profiles into what it finds, keeps any stored
+profile newer than the copy it carried, and saves before releasing. Without that,
+a command that loaded the cache when it started and saved when it finished would
+overwrite every profile another command wrote in between, a PII flag a refresh had
+just raised included. It is held across a load, an in-memory merge and a save,
+never across a warehouse query.
+
+**The same properties as the spend lock.** It excludes, it is re-entrant for one
+holder, it raises the builtin `TimeoutError`, and it is scoped to this store's
+cache. It must also never contend with `spend_lock`: a holder can take one inside
+the other. The filesystem and SQLite backends hold it on `.dex/cache.lock`, apart
+from `.dex/spend.lock`.
+
+**Without it your backend still works.** dex still re-reads the cache before it
+merges, which narrows the window to the merge itself without closing it.
+
 ## Reading the ledger back
 
 A second optional capability, and a gentler one: skipping it costs a sentence,
@@ -172,8 +203,11 @@ not correctness.
 ```python
 class MyStore:
     def spend_entries(self, *, connector=None, limit=500):
-        entries = [e for e in self._entries("spend")
-                   if connector is None or e.get("connector") == connector]
+        entries = [
+            e
+            for e in self._entries("spend")
+            if connector is None or e.get("connector") == connector
+        ]
         return entries[-limit:]
 ```
 

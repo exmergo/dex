@@ -432,13 +432,25 @@ def test_an_unset_removes_only_the_bytes_the_setting_occupies(before, key, after
             "budget: &b\n  ceiling: 5\nother: *b\n", "budget.ceiling", id="anchor"
         ),
         pytest.param("budget:\n\tceiling: 5\n", "budget.ceiling", id="tabs"),
-        pytest.param("connector: a\nconnector: b\n", "connector", id="duplicated-key"),
         pytest.param("budget: [\n", "budget", id="does-not-parse"),
     ],
 )
 def test_a_removal_dex_cannot_span_is_refused_rather_than_rewritten(text, key):
     with pytest.raises(ConfigEditError, match="by hand"):
         ConfigDocument(text).without(key)
+
+
+def test_without_duplicated_key_removes_earlier_occurrence_and_keeps_winner():
+    doc = ConfigDocument("connector: a\nconnector: b\n")
+    assert doc.without("connector").text == "connector: b\n"
+
+    doc_triple = ConfigDocument("connector: a\nconnector: b\nconnector: c\n")
+    assert doc_triple.without("connector").text == "connector: c\n"
+
+    assert doc.without("connector").without("connector").text == ""
+
+    nested = ConfigDocument("snowflake:\n  wh: a\n  wh: b\n")
+    assert nested.without("snowflake.wh").text == "snowflake:\n  wh: b\n"
 
 
 def test_the_nearest_written_key_is_named_for_one_the_file_does_not_write():

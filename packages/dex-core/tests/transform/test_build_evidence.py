@@ -73,6 +73,72 @@ def node(name: str, status: str = "success", **extra) -> dict:
     return {"unique_id": f"model.dex_test.{name}", "status": status, **extra}
 
 
+@pytest.mark.parametrize("status", ["success", "error", "failed", "skipped", "unknown"])
+def test_coverage_distinguishes_observation_from_execution(project, edits, status):
+    """Coverage distinguishes observation from execution."""
+
+    from exmergo_dex_core import host
+
+    write_run_results(project, [node("mart", status), node("other")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.coverage.covered == ["mart"]
+    assert evidence.coverage.missing == []
+    assert evidence.coverage.built == (["mart"] if status == "success" else [])
+    assert evidence.coverage.not_built == ([] if status == "success" else ["mart"])
+    # The outcome and `generated` agree with the partition (#1104, #1105).
+    assert (
+        evidence.outcome
+        is {
+            "success": BuildOutcome.VALIDATED,
+            "error": BuildOutcome.FAILED,
+            "failed": BuildOutcome.FAILED,
+            "skipped": BuildOutcome.PARTIAL,
+            "unknown": BuildOutcome.INDETERMINATE,
+        }[status]
+    )
+    assert ("dev.main.mart" in evidence.generated) is (status == "success")
+    assert host.recompute_outcome(evidence.data()) == evidence.outcome
+    assert host.verify_build_evidence(evidence.data()).outcome == evidence.outcome
+    legacy = evidence.data()
+    del legacy["coverage"]["built"]
+    del legacy["coverage"]["not_built"]
+    if status == "skipped":
+        # A producer from before the partition could not tell a skipped
+        # requirement beside passing nodes from a built one, and said so.
+        assert host.recompute_outcome(legacy) is BuildOutcome.VALIDATED
+        legacy["outcome"] = "validated"
+    assert host.verify_build_evidence(legacy).coverage.built is None
+    assert host.verify_build_evidence(legacy).digests == evidence.digests
+
+
+def test_missing_requirement_is_not_built(project, edits):
+    """Missing requirement is not built."""
+
+    write_run_results(project, [node("other")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.coverage.built == []
+    assert evidence.coverage.not_built == ["mart"]
+    assert evidence.coverage.missing == ["mart"]
+
+
+@pytest.mark.parametrize(
+    "partition",
+    [
+        {"built": ["mart"], "not_built": ["mart"]},
+        {"built": [], "not_built": []},
+        {"built": ["mart", "mart"], "not_built": []},
+        {"built": ["mart"]},
+    ],
+)
+def test_coverage_refuses_an_inconsistent_partition(partition):
+    """Coverage refuses an inconsistent partition."""
+
+    from exmergo_dex_core.transform.evidence import BuildCoverage
+
+    with pytest.raises(ValueError):
+        BuildCoverage(required=["mart"], covered=["mart"], **partition)
+
+
 @pytest.fixture
 def project(dbt_project_dir: Path) -> Path:
     (dbt_project_dir / "models" / "staging" / "mart.sql").write_text(
@@ -433,9 +499,41 @@ def test_a_versioned_model_answers_to_every_name_dbt_selects_it_by(dbt_project_d
         assert evidence.selection.matched == ["dim_customers.v2"]
         assert evidence.selection.complete is True, select
         assert evidence.coverage.missing == [], select
+        assert evidence.coverage.built == ["dim_customers_v2"], select
+        assert evidence.coverage.not_built == [], select
 
     missed = build_evidence(dbt_project_dir, target="dev", select="dim_customers.v1")
     assert missed.selection.unmatched == ["dim_customers.v1"]
+
+
+def test_unversioned_requirement_needs_every_matched_version_to_succeed(project):
+    """Unversioned requirement needs every matched version to succeed."""
+
+    write_manifest_nodes(
+        project,
+        {
+            f"model.dex_test.mart.v{v}": {
+                "name": "mart",
+                "resource_type": "model",
+                "version": v,
+            }
+            for v in (1, 2)
+        },
+    )
+    write_run_results(
+        project,
+        [
+            {"unique_id": "model.dex_test.mart.v1", "status": "success"},
+            {"unique_id": "model.dex_test.mart.v2", "status": "skipped"},
+        ],
+    )
+    edit = PlanEdit(
+        path="models/staging/mart.yml", kind=EditKind.SCHEMA_YML, new_content=SCHEMA
+    )
+    coverage = build_evidence(project, target="dev", edits=[edit]).coverage
+    assert coverage.covered == ["mart"]
+    assert coverage.built == []
+    assert coverage.not_built == ["mart"]
 
 
 def test_a_metric_only_edit_requires_the_model_behind_its_measure(project):
@@ -571,3 +669,159 @@ def test_a_macro_only_plan_is_coverage_undetermined(project):
     evidence = build_evidence(project, target="dev", edits=edits)
     assert evidence.outcome is BuildOutcome.COVERAGE_UNDETERMINED
     assert evidence.coverage.undetermined is True
+
+
+def test_a_skipped_model_over_a_surviving_relation_is_not_generated(project, edits):
+    """#1104: the manifest still names the skipped model's relation, which an
+    earlier run left in the target; this run did not produce it."""
+
+    write_run_results(
+        project, [node("other", "error", message="boom"), node("mart", "skipped")]
+    )
+    evidence = build_evidence(project, target="dev", edits=edits)
+
+    assert evidence.outcome is BuildOutcome.FAILED
+    assert evidence.nodes[1].relation == "dev.main.mart"
+    assert evidence.generated == []
+    assert evidence.coverage.not_built == ["mart"]
+
+
+def test_an_all_skipped_run_generates_nothing(project, edits):
+    write_run_results(project, [node("mart", "skipped"), node("other", "skipped")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+
+    assert evidence.outcome is BuildOutcome.SKIPPED
+    assert evidence.generated == []
+
+
+@pytest.mark.parametrize("status", ["partial success", "no-op", "unknown", "Weird"])
+@pytest.mark.parametrize("with_plan", [True, False])
+def test_an_unrecognized_status_is_indeterminate(project, edits, status, with_plan):
+    """#1105: a status outside the known sets is neither a pass nor a failure,
+    with a plan or without one, and its relation is not generated."""
+
+    from exmergo_dex_core import host
+
+    write_run_results(project, [node("mart", status), node("other")])
+    evidence = build_evidence(project, target="dev", edits=edits if with_plan else None)
+
+    assert evidence.outcome is BuildOutcome.INDETERMINATE
+    assert evidence.errors == []
+    assert evidence.generated == ["dev.main.other"]
+    if with_plan:
+        assert evidence.coverage.built == []
+        assert evidence.coverage.not_built == ["mart"]
+    forged = evidence.data()
+    forged["outcome"] = "validated"
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence(forged)
+
+
+def test_a_failure_outranks_an_unrecognized_status(project, edits):
+    write_run_results(
+        project, [node("mart", "partial success"), node("other", "error")]
+    )
+    assert build_evidence(project, target="dev", edits=edits).outcome is (
+        BuildOutcome.FAILED
+    )
+
+
+def test_passing_and_warning_tests_still_validate(project, edits):
+    """A test says `pass` or `warn`, never `success`; the allow-list must keep
+    a build with tests validated."""
+
+    write_run_results(
+        project,
+        [
+            node("mart"),
+            {"unique_id": "test.dex_test.unique_mart_id", "status": "pass"},
+            {"unique_id": "test.dex_test.not_null_mart_id", "status": "warn"},
+            {"unique_id": "unit_test.dex_test.mart.test_mart", "status": "pass"},
+        ],
+    )
+    evidence = build_evidence(project, target="dev", edits=edits)
+
+    assert evidence.outcome is BuildOutcome.VALIDATED
+    assert evidence.generated == ["dev.main.mart"]
+
+
+def test_the_issue_document_recomputes_to_indeterminate():
+    """The reproduction on #1105, verbatim but for the expected outcome."""
+
+    from exmergo_dex_core import host
+
+    document = {
+        "outcome": "validated",
+        "nodes": [{"unique_id": "model.p.mart", "name": "mart", "status": "unknown"}],
+        "coverage": {
+            "required": ["mart"],
+            "covered": ["mart"],
+            "built": [],
+            "not_built": ["mart"],
+        },
+    }
+    assert host.recompute_outcome(document) is host.BuildOutcome.INDETERMINATE
+    with pytest.raises(host.BuildEvidenceError, match="indeterminate"):
+        host.verify_build_evidence(document)
+    document["outcome"] = "indeterminate"
+    assert host.verify_build_evidence(document).outcome is (
+        host.BuildOutcome.INDETERMINATE
+    )
+
+
+def test_status_kind_is_an_allow_list():
+    from exmergo_dex_core.transform.evidence import status_kind
+
+    assert status_kind("success") == "succeeded"
+    assert status_kind("PASS") == "succeeded"
+    assert status_kind("warn") == "succeeded"
+    assert status_kind("runtime error") == "failed"
+    assert status_kind("skipped") == "skipped"
+    assert status_kind("partial success") == "unrecognized"
+    assert status_kind("") == "unrecognized"
+
+
+def test_a_node_message_never_carries_the_value_a_cast_failed_on():
+    """dbt relays the warehouse's words for a model that fails on a cast, and
+    those words quote the row's value (#1070)."""
+
+    from exmergo_dex_core.transform.evidence import _node_message
+
+    message = _node_message(
+        "Runtime Error in model fct_orders (models/fct_orders.sql)\n"
+        "  Conversion Error: Could not convert string 'zq_sentinel_7' to INT32"
+    )
+    assert message is not None
+    assert "zq_sentinel_7" not in message
+    assert "Could not convert string <value withheld> to INT32" in message
+
+
+def test_a_disabled_model_is_read_from_the_manifest_by_name_and_version():
+    """What a build never runs, which ``read_build_evidence`` drops from
+    ``required`` when the plan edited it (#1156)."""
+
+    from exmergo_dex_core.transform.evidence import _disabled_models
+
+    manifest = {
+        "disabled": {
+            "model.shop.legacy": [{"name": "legacy"}],
+            "model.shop.dim_teams.v2": [{"name": "dim_teams", "version": 2}],
+            "seed.shop.old": [{"name": "old"}],
+        }
+    }
+    assert _disabled_models(manifest) == {"legacy", "dim_teams", "dim_teams.v2"}
+    assert _disabled_models(None) == set()
+
+
+def test_one_disabled_version_does_not_excuse_the_enabled_one():
+    """A bare requirement stays owed while any version of it is enabled."""
+
+    from exmergo_dex_core.transform.evidence import _disabled_models
+
+    manifest = {
+        "nodes": {"model.shop.dim_teams.v1": {"name": "dim_teams", "version": 1}},
+        "disabled": {
+            "model.shop.dim_teams.v2": [{"name": "dim_teams", "version": 2}],
+        },
+    }
+    assert _disabled_models(manifest) == {"dim_teams.v2"}

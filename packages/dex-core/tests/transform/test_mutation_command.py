@@ -1,16 +1,11 @@
-"""`transform test --mutate`: what it refuses for free, what it runs, and where.
+"""Mutation command guards, routing and budgets, with recorded dbt invocations.
 
-Two halves. The first fakes the dbt subprocess, so the refusals, the argv, the
-environment and the budget loop are asserted without a warehouse. The second
-runs real dbt against DuckDB, because the properties that matter most here are
-properties of dbt's own behaviour: that an ephemeral mutant still gets its tests
-run, and that nothing is written to the project or the warehouse while it
-happens. Faking dbt cannot establish either.
+Real dbt acceptance cases live in test_mutation_coverage.py,
+test_mutation_equivalence.py and test_mutation_downstream.py.
 """
 
 from __future__ import annotations
 
-import hashlib
 import importlib
 import json
 import shutil
@@ -21,7 +16,6 @@ import pytest
 
 pytest.importorskip("sqlglot")
 
-from exmergo_dex_core.config import DexConfig
 from exmergo_dex_core.dbt_project import load
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Reason, reason_for
@@ -31,27 +25,7 @@ from exmergo_dex_core.transform import commands as transform_commands
 from exmergo_dex_core.transform import mutation
 from exmergo_dex_core.transform.test_scaffold import unit_test_scaffold_edits
 
-MODEL_SQL = """select
-    o.id,
-    o.amount,
-    c.region,
-    case when o.amount > 100 then 'large' else 'small' end as band
-from {{ ref('stg_orders') }} o
-inner join {{ ref('stg_customers') }} c on o.cid = c.id
-where o.status <> 'cancelled'
-"""
-
-
-def _engine(project: Path, connector: str = "duckdb", **kwargs) -> DexEngine:
-    return DexEngine(
-        connector=connector,
-        repo_root=str(project.parent),
-        store=FilesystemStore(project.parent),
-        config=DexConfig(
-            connector=connector, dbt_target="dev", dbt_project_dir=project.name
-        ),
-        **kwargs,
-    )
+from .mutation_helpers import MODEL_SQL, _engine, _tree_digest
 
 
 def _skip_dev_target_check(monkeypatch) -> None:
@@ -63,18 +37,6 @@ def _skip_dev_target_check(monkeypatch) -> None:
         "check",
         lambda *a, **k: [],
     )
-
-
-def _tree_digest(root: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or any(
-            part in {"target", "logs", ".git"} for part in path.parts
-        ):
-            continue
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 # --- the faked-dbt half --------------------------------------------------------
@@ -284,6 +246,19 @@ def test_the_selection_flags_are_pinned_rather_than_inherited(
         (
             _manifest(config={"materialized": "ephemeral", "sql_header": "set x=1"}),
             "sql_header",
+        ),
+        # A window is the only thing to mutate, and its bound is one dex cannot
+        # shift: the refusal names it rather than implying a window nothing can
+        # break (#1112).
+        (
+            _manifest(
+                compiled_code=(
+                    "select count(a) over (order by d range between interval "
+                    "(lookback) day preceding and current row) as n "
+                    'from "d"."m"."stg_orders"'
+                )
+            ),
+            r"untested: INTERVAL \(lookback\) DAY \(non_literal_offset\)",
         ),
     ],
 )
@@ -787,6 +762,9 @@ class _UptimeStandIn:
     def quote(self) -> float:
         return self.pending()
 
+    def admit(self) -> None:
+        pass
+
     def observe(self, seconds: float, *, span: float | None = None) -> None:
         self.observed.append((seconds, span))
 
@@ -993,301 +971,7 @@ def test_the_downstream_flags_need_a_mutation_run(project, capsys):
     assert "need --mutate" in envelope["errors"][0]
 
 
-# --- the real-dbt half ---------------------------------------------------------
-
-
-@pytest.fixture
-def measurable_project(tmp_path: Path, duckdb_file: Path) -> Path:
-    """A project whose one mart has a suite worth measuring, on real DuckDB."""
-
-    duckdb = pytest.importorskip("duckdb")
-    warehouse = tmp_path / "dev.duckdb"
-    shutil.copy(duckdb_file, warehouse)
-    con = duckdb.connect(str(warehouse))
-    con.execute(
-        "create or replace table main.raw_orders as select * from (values "
-        "(1, 7, 100.0::double, 'placed'), (2, 7, 10.0::double, 'placed'), "
-        "(3, 8, 20.0::double, 'cancelled')) t(id, cid, amount, status)"
-    )
-    con.execute(
-        "create or replace table main.raw_customers as select * from (values "
-        "(7, 'eu'), (8, 'us')) t(id, region)"
-    )
-    con.close()
-
-    project = tmp_path / "analytics"
-    (project / "models").mkdir(parents=True)
-    (project / "dbt_project.yml").write_text(
-        'name: p\nversion: "1.0.0"\nprofile: p\nmodel-paths: ["models"]\n',
-        encoding="utf-8",
-    )
-    (project / "profiles.yml").write_text(
-        f"p:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
-        f"      path: {warehouse}\n",
-        encoding="utf-8",
-    )
-    (project / "models" / "stg_orders.sql").write_text(
-        "select id, cid, amount, status from main.raw_orders", encoding="utf-8"
-    )
-    (project / "models" / "stg_customers.sql").write_text(
-        "select id, region from main.raw_customers", encoding="utf-8"
-    )
-    (project / "models" / "fct.sql").write_text(MODEL_SQL, encoding="utf-8")
-    return project
-
-
-def _schema_yml(unit_test: bool) -> str:
-    base = """version: 2
-models:
-  - name: fct
-    columns:
-      - name: id
-        data_tests: [not_null]
-"""
-    if not unit_test:
-        return base
-    return (
-        base
-        + """
-unit_tests:
-  - name: fct_pins_its_rules
-    model: fct
-    given:
-      - input: ref('stg_orders')
-        rows:
-          - {id: 1, cid: 7, amount: 100.0, status: 'placed'}
-          - {id: 2, cid: 7, amount: 10.0, status: 'placed'}
-          - {id: 3, cid: 8, amount: 20.0, status: 'cancelled'}
-          - {id: 4, cid: 99, amount: 30.0, status: 'placed'}
-      - input: ref('stg_customers')
-        rows:
-          - {id: 7, region: 'eu'}
-    expect:
-      rows:
-        - {id: 1, region: 'eu', band: 'small'}
-        - {id: 2, region: 'eu', band: 'small'}
-"""
-    )
-
-
-@pytest.mark.parametrize("with_unit_test", [False, True])
-def test_a_stronger_suite_catches_more_planted_defects(
-    measurable_project: Path, with_unit_test: bool
-):
-    """The acceptance the issue asks for, both directions in one test: a model
-    carrying only a `not_null` lets the defects through, and adding one unit test
-    that pins the model's actual rules catches most of them."""
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "schema.yml").write_text(
-        _schema_yml(with_unit_test), encoding="utf-8"
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct")
-    counts = result.counts
-    assert counts["generated"] >= 4
-    if with_unit_test:
-        assert counts["killed"] > counts["survived"], result.mutants
-        assert result.score > 0.5
-    else:
-        assert counts["killed"] == 0
-        assert counts["survived"] == counts["generated"]
-        assert result.score == 0.0
-
-
-def test_every_kind_of_test_gets_to_answer_for_the_mutant(measurable_project: Path):
-    """Generic, singular and unit tests all run against an ephemeral mutant. If
-    any kind were silently dropped, its defects would all read as survivors."""
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "schema.yml").write_text(
-        _schema_yml(True), encoding="utf-8"
-    )
-    (measurable_project / "tests").mkdir()
-    (measurable_project / "tests" / "no_null_region.sql").write_text(
-        "select id from {{ ref('fct') }} where region is null", encoding="utf-8"
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct")
-    names = {test["name"] for test in result.baseline["tests"]}
-    assert "not_null_fct_id" in names
-    assert "no_null_region" in names
-    assert "fct_pins_its_rules" in names
-
-
-def test_mutation_testing_on_model_referenced_by_semantic_model(
-    measurable_project: Path,
-):
-    """Regression for #727: transform test --mutate fails on any model a
-    semantic model refs because an ephemeral mutant has no relation name.
-    The referencing semantic model must be dropped from the shadow copy so
-    dbt can compile and run data tests on the mutant."""
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "metricflow_time_spine.sql").write_text(
-        "select date '2020-01-01' + cast(i as integer) as date_day "
-        "from range(365) t(i)",
-        encoding="utf-8",
-    )
-    (measurable_project / "models" / "semantic.yml").write_text(
-        "version: 2\n"
-        "semantic_models:\n"
-        "  - name: metricflow_time_spine\n"
-        "    model: ref('metricflow_time_spine')\n"
-        "    primary_entity: date_day\n"
-        "    dimensions:\n"
-        "      - name: date_day\n"
-        "        type: time\n"
-        "        type_params:\n"
-        "          time_granularity: day\n"
-        "  - name: fct_sem\n"
-        "    model: ref('fct')\n"
-        "    entities:\n"
-        "      - name: id\n"
-        "        type: primary\n"
-        "    dimensions:\n"
-        "      - name: region\n"
-        "        type: categorical\n",
-        encoding="utf-8",
-    )
-    (measurable_project / "models" / "schema.yml").write_text(
-        _schema_yml(False), encoding="utf-8"
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct")
-    assert result.counts["generated"] >= 4
-    assert any(
-        "semantic models referencing 'fct' were omitted" in w for w in result.warnings
-    )
-    semantic_file = measurable_project / "models" / "semantic.yml"
-    assert semantic_file.is_file()
-    assert "fct_sem" in semantic_file.read_text(encoding="utf-8")
-
-
-def test_a_mutation_run_writes_nothing_and_materializes_nothing(
-    measurable_project: Path,
-):
-    """The two guarantees the safety spine turns on: the project is a byte for
-    byte match afterwards, and the dev warehouse gained no relation."""
-
-    duckdb = pytest.importorskip("duckdb")
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "schema.yml").write_text(
-        _schema_yml(True), encoding="utf-8"
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    warehouse = measurable_project.parent / "dev.duckdb"
-
-    def relations():
-        con = duckdb.connect(str(warehouse), read_only=True)
-        try:
-            return set(
-                con.execute(
-                    "select table_schema, table_name from information_schema.tables"
-                ).fetchall()
-            )
-        finally:
-            con.close()
-
-    before_tree, before_relations = _tree_digest(measurable_project), relations()
-    result = engine.test_mutations("fct")
-
-    assert result.equivalence["self_check"] == "reproducible", "nothing was compared"
-    assert _tree_digest(measurable_project) == before_tree
-    assert relations() == before_relations
-
-
-def test_survivors_are_labelled_by_what_the_dev_data_can_tell_apart(
-    measurable_project: Path,
-):
-    """The issue's acceptance, on real dbt and real DuckDB, under a `not_null`
-    suite that lets every defect through.
-
-    Every order's customer exists, so the inner join turned left produces the
-    same rows, and no amount is above 100, so the dropped `large` branch changes
-    nothing either: both are equivalent on this data and need a fixture. The
-    dropped status filter brings the cancelled order back and the boundary flip
-    re-bands the order sitting on 100, so the data already tells those apart.
-    """
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "schema.yml").write_text(
-        _schema_yml(False), encoding="utf-8"
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct")
-
-    labels = {m["operator"]: m["equivalence"] for m in result.mutants}
-    assert labels["join_type"]["status"] == "equivalent"
-    assert labels["join_type"]["only_in_mutant"] == 0
-    assert labels["join_type"]["baseline_rows"] == 2
-    assert labels["case_branch"]["status"] == "equivalent"
-    assert labels["predicate_drop"]["status"] == "distinguishable"
-    assert labels["predicate_drop"]["only_in_mutant"] == 1
-    assert labels["predicate_drop"]["only_in_baseline"] == 0
-    assert labels["comparison"]["status"] == "distinguishable"
-    assert labels["comparison"]["only_in_mutant"] == 1
-    assert labels["comparison"]["only_in_baseline"] == 1
-
-    ranked = [m["equivalence"]["status"] for m in result.mutants]
-    assert ranked == sorted(ranked, key=["distinguishable", "equivalent"].index)
-    assert result.equivalence["self_check"] == "reproducible"
-    assert result.counts["survived"] == result.counts["generated"]
-    assert result.score == 0.0, "an equivalent survivor still counts against the suite"
-
-
-def test_a_model_that_does_not_reproduce_itself_is_caught_by_the_self_check(
-    measurable_project: Path,
-):
-    """`random()` differs between two evaluations of the same model, so any
-    mutant would look different from it. The self-check is what notices."""
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "fct_noisy.sql").write_text(
-        "select id, random() as jitter from {{ ref('stg_orders') }} where amount > 5",
-        encoding="utf-8",
-    )
-    (measurable_project / "models" / "schema.yml").write_text(
-        "version: 2\nmodels:\n  - name: fct_noisy\n    columns:\n"
-        "      - name: id\n        data_tests: [not_null]\n",
-        encoding="utf-8",
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct_noisy")
-
-    assert result.equivalence["self_check"] == "not_reproducible"
-    assert all(
-        m["equivalence"]["status"] == "not_checked"
-        for m in result.mutants
-        if m["status"] == "survived"
-    )
-
-
-def test_the_cap_narrows_the_run_and_reports_what_it_cut(measurable_project: Path):
-    pytest.importorskip("dbt.adapters.duckdb")
-    (measurable_project / "models" / "schema.yml").write_text(
-        _schema_yml(False), encoding="utf-8"
-    )
-    engine = _engine(measurable_project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct", max_mutants=2)
-    assert result.counts["generated"] == 2
-    assert result.cap["limit"] == 2
-    assert sum(result.cap["elided"].values()) > 0
-    assert any("not run" in w and "cap" in w for w in result.warnings)
+# --- batch spend ------------------------------------------------------------
 
 
 def test_the_batch_reports_one_spend_rather_than_a_sum_of_flags():
@@ -1570,172 +1254,7 @@ def test_clickhouse_cloud_mutation_fails_before_first_run_when_capacity_unproved
     assert not [c for c in calls if c["argv"][1] == "test"]
 
 
-# --- downstream tests (#648) ---------------------------------------------------
-
-#: A mart that only counts the model's rows per region. Its singular test pins
-#: every count the mart publishes, which is the coverage the issue had to
-#: duplicate one hop upstream because the mutation run never consulted it.
-SUMMARY_SQL = "select region, count(*) as n from {{ ref('fct') }} group by 1"
-
-SUMMARY_TEST = """with s as (select * from {{ ref('fct_summary') }})
-select 'unexpected' as problem from s where not (region = 'eu' and n = 2)
-union all
-select 'missing' from (select count(*) as c from s) t where c <> 1
-"""
-
-
-def _with_summary(project: Path) -> Path:
-    (project / "models" / "schema.yml").write_text(_schema_yml(False), encoding="utf-8")
-    (project / "models" / "fct_summary.sql").write_text(SUMMARY_SQL, encoding="utf-8")
-    (project / "tests").mkdir(exist_ok=True)
-    (project / "tests" / "assert_summary_counts.sql").write_text(
-        SUMMARY_TEST, encoding="utf-8"
-    )
-    return project
-
-
-def _with_versioned_summary(project: Path) -> Path:
-    """Same mart and count pin as `_with_summary`, declared as dbt model version 1.
-
-    The SQL lives at `fct_summary_v1.sql` and `schema.yml` names it
-    `fct_summary` with `versions: [{v: 1}]`. The singular test still refs the
-    unversioned name; routing must report the version label `fct_summary.v1`.
-    """
-
-    schema = """version: 2
-models:
-  - name: fct
-    columns:
-      - name: id
-        data_tests: [not_null]
-  - name: fct_summary
-    latest_version: 1
-    versions:
-      - v: 1
-"""
-    (project / "models" / "schema.yml").write_text(schema, encoding="utf-8")
-    (project / "models" / "fct_summary_v1.sql").write_text(
-        SUMMARY_SQL, encoding="utf-8"
-    )
-    (project / "tests").mkdir(exist_ok=True)
-    (project / "tests" / "assert_summary_counts.sql").write_text(
-        SUMMARY_TEST, encoding="utf-8"
-    )
-    return project
-
-
-def test_a_defect_a_downstream_test_catches_is_reported_apart(
-    measurable_project: Path,
-):
-    """The issue's acceptance on real dbt and DuckDB: `fct` carries only a
-    `not_null`, so every defect survives its own suite, but the dropped status
-    filter brings a cancelled order back and the mart's count test sees it.
-    That defect is `caught_downstream`, and `score` reads exactly what it reads
-    without the downstream tests."""
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    engine = _engine(_with_summary(measurable_project))
-    engine.build(target="dev")
-
-    routed = engine.test_mutations("fct")
-    alone = engine.test_mutations("fct", downstream=False)
-
-    assert routed.downstream["enabled"] is True, routed.downstream
-    assert routed.downstream["models"] == ["fct_summary"]
-    assert routed.downstream["tests"] == ["assert_summary_counts"]
-    statuses = {m["operator"]: m for m in routed.mutants}
-    drop = statuses["predicate_drop"]
-    assert drop["status"] == "caught_downstream"
-    assert drop["caught_by"] == []
-    assert drop["caught_downstream_by"] == ["assert_summary_counts"]
-    # The inner join where every key resolves changes no count in the mart.
-    assert statuses["join_type"]["status"] == "survived"
-
-    assert routed.counts["caught_downstream"] >= 1
-    assert routed.score == alone.score == 0.0
-    assert routed.score_with_downstream > 0.0
-    assert alone.score_with_downstream is None
-    assert alone.downstream["enabled"] is False
-    assert "--no-downstream" in alone.downstream["reason"]
-    assert alone.counts["caught_downstream"] == 0
-    assert any("caught by tests on the models downstream" in w for w in routed.warnings)
-
-
-def test_routing_through_a_downstream_model_writes_and_materializes_nothing(
-    measurable_project: Path,
-):
-    """The mart is made ephemeral in the copy, not rebuilt: the project is a
-    byte for byte match afterwards and the dev warehouse gained no relation and
-    lost none, the mart's own view included."""
-
-    duckdb = pytest.importorskip("duckdb")
-    pytest.importorskip("dbt.adapters.duckdb")
-    engine = _engine(_with_summary(measurable_project))
-    engine.build(target="dev")
-    warehouse = measurable_project.parent / "dev.duckdb"
-
-    def relations():
-        con = duckdb.connect(str(warehouse), read_only=True)
-        try:
-            return set(
-                con.execute(
-                    "select table_schema, table_name, table_type "
-                    "from information_schema.tables"
-                ).fetchall()
-            )
-        finally:
-            con.close()
-
-    before_tree, before_relations = _tree_digest(measurable_project), relations()
-    result = engine.test_mutations("fct")
-
-    assert result.downstream["enabled"] is True
-    assert _tree_digest(measurable_project) == before_tree
-    assert relations() == before_relations
-
-
-def test_a_model_with_only_downstream_tests_is_measured(measurable_project: Path):
-    """With no test of its own, every defect used to be refused as unmeasurable.
-    A mart test that reads it is a test that can catch it."""
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    project = _with_summary(measurable_project)
-    (project / "models" / "schema.yml").unlink()
-    engine = _engine(project)
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct")
-    assert result.counts["killed"] == 0
-    assert result.counts["caught_downstream"] >= 1
-    assert result.score == 0.0
-
-    with pytest.raises(mutation.MutationError, match="has no tests"):
-        engine.test_mutations("fct", downstream=False)
-
-
-def test_a_versioned_downstream_model_is_routed_by_its_version_label(
-    measurable_project: Path,
-):
-    """A versioned mart is selected by its dbt label, not the bare name.
-
-    `--downstream` walks the child map and feeds `--select` the labels
-    `manifest_node_label` produces. For a model with `versions:`, that label is
-    `name.vN`. Pinning it here keeps a refactor of the selector from dropping
-    versioned projects silently.
-    """
-
-    pytest.importorskip("dbt.adapters.duckdb")
-    engine = _engine(_with_versioned_summary(measurable_project))
-    engine.build(target="dev")
-
-    result = engine.test_mutations("fct")
-
-    assert result.downstream["enabled"] is True, result.downstream
-    assert result.downstream["models"] == ["fct_summary.v1"]
-    statuses = {m["operator"]: m for m in result.mutants}
-    drop = statuses["predicate_drop"]
-    assert drop["status"] == "caught_downstream"
-    assert drop["caught_downstream_by"] == ["assert_summary_counts"]
+# --- downstream routing, faked -----------------------------------------------
 
 
 class _DownstreamCopy:
@@ -2027,3 +1546,319 @@ def test_downstream_tests_are_priced_with_the_mutant_spliced_beneath_the_mart():
     assert every["(baseline)"] > kept["(baseline)"]
     dropped = next(m for m in batch.mutants if m.operator == "predicate_drop")
     assert kept[f"{dropped.id} predicate_drop"] < kept["(baseline)"]
+
+
+# --- the incremental branch (#1132) --------------------------------------------
+
+
+def _incremental_batch():
+    """A batch with one full-build filter and a watermark in the branch."""
+
+    this = mutation.ParentRelation(rendered=mutation.THIS_SENTINEL, jinja="{{ this }}")
+    full = mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    branch = mutation.prepare(
+        "select a from t where a > 1 and a >= (select max(a) from "  # noqa: S608
+        f"{mutation.THIS_SENTINEL})",
+        dialect="duckdb",
+        parents=[this],
+    )
+    return mutation.enumerate_mutants(full, incremental=branch)
+
+
+class _ProgramCopy:
+    """A copy whose tests answer by which program the model file holds.
+
+    The full build's not_null passes on everything. The incremental unit test
+    passes on the branch's identity only, so it fails on every branch mutant,
+    and a baseline that sent it the full build would leave it nothing to
+    testify with."""
+
+    def __init__(self, batch):
+        self.branch_identity = batch.incremental.identity
+        self.body = ""
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def write(self, _path, text):
+        self.body = text
+
+    def test(self, select, exclude=()):
+        self.calls.append((select, list(exclude)))
+        if select.startswith("unit_test:"):
+            status = "pass" if self.body == self.branch_identity else "fail"
+            return {
+                "nodes": [
+                    {
+                        "unique_id": "unit_test.p.fct.fct_incremental",
+                        "name": "fct_incremental",
+                        "status": status,
+                        "execution_time": 1.0,
+                    }
+                ]
+            }
+        assert self.body != self.branch_identity
+        return {
+            "nodes": [
+                {
+                    "unique_id": "test.p.not_null.abc",
+                    "name": "not_null",
+                    "status": "pass",
+                    "execution_time": 1.0,
+                }
+            ]
+        }
+
+
+def _incremental_test():
+    """The one unit test that runs the branch in these cases."""
+
+    from exmergo_dex_core.transform.commands import IncrementalUnitTest
+
+    return IncrementalUnitTest(
+        unique_id="unit_test.p.fct.fct_incremental",
+        name="fct_incremental",
+        select="fct_incremental",
+    )
+
+
+_INCREMENTAL_TEST = _incremental_test()
+
+
+def _run(shadow, batch, project, **kwargs):
+    """Run `_run_mutants` free and locally, overriding only what a case needs."""
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.commands import _run_mutants
+
+    defaults = {
+        "model": "fct",
+        "paradigm": Paradigm.FREE_LOCAL,
+        "connector": "duckdb",
+        "store": FilesystemStore(project.parent),
+        "ceiling": None,
+        "estimate": None,
+        "mutation_mod": mutation,
+        "incremental_tests": [_INCREMENTAL_TEST],
+    }
+    result = _run_mutants(shadow, "models/fct.sql", batch, **{**defaults, **kwargs})
+    return result, result.pop("_meta")
+
+
+def test_each_program_runs_against_its_own_tests_and_is_scored_apart(project):
+    """Full runs exclude the branch's test; branch runs select only it."""
+
+    batch = _incremental_batch()
+    shadow = _ProgramCopy(batch)
+
+    result, (runs, _spend, _warnings) = _run(shadow, batch, project)
+
+    full_runs = [call for call in shadow.calls if call[0] == "fct"]
+    branch_runs = [call for call in shadow.calls if call[0] != "fct"]
+    assert len(full_runs) == len(batch.mutants) + 1
+    assert all("unit_test:fct_incremental" in exclude for _, exclude in full_runs)
+    assert {select for select, _ in branch_runs} == {"unit_test:fct_incremental"}
+    assert len(branch_runs) == len(batch.incremental.mutants) + 1
+    assert runs == len(shadow.calls)
+    assert result["counts"]["survived"] == len(batch.mutants)
+    assert result["score"] == 0.0
+    branch = result["incremental"]
+    assert branch["counts"]["killed"] == len(batch.incremental.mutants)
+    assert branch["score"] == 1.0
+    assert branch["cap"]["generated"] == len(batch.incremental.mutants)
+
+
+def test_a_model_tested_only_through_its_branch_runs_no_full_build_mutant(project):
+    """When every test overrides is_incremental, nothing runs the full build:
+    its mutants survive by construction, not compared, without a run."""
+
+    from exmergo_dex_core.transform.commands import _EquivalenceCheck
+
+    batch = _incremental_batch()
+    shadow = _ProgramCopy(batch)
+
+    result, (_runs, _spend, warnings) = _run(
+        shadow,
+        batch,
+        project,
+        full_tests=False,
+        equivalence=_EquivalenceCheck(reason="no test runs the full build"),
+    )
+
+    assert all(select != "fct" for select, _ in shadow.calls)
+    assert result["baseline"] == {"tests": [], "excluded": []}
+    assert {m["status"] for m in result["mutants"]} == {"survived"}
+    assert {m["equivalence"]["status"] for m in result["mutants"]} == {"not_checked"}
+    assert result["incremental"]["score"] == 1.0
+    assert any("runs its full build" in w for w in warnings)
+
+
+def test_a_budget_spent_on_the_full_build_leaves_the_branch_not_run(project):
+    """The full build runs first, so a spent budget reaches the branch as not_run."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    batch = _incremental_batch()
+    shadow = _ProgramCopy(batch)
+    prices = {"(baseline)": 10.0, **{m.id: 10.0 for m in batch.mutants}}
+    prices.update({m.id: 0.0 for m in batch.incremental.mutants})
+
+    result, (_runs, _spend, warnings) = _run(
+        shadow,
+        batch,
+        project,
+        paradigm=Paradigm.COMPUTE_TIME,
+        connector="snowflake",
+        ceiling=5.0,
+        prices=prices,
+    )
+
+    assert all(select == "fct" for select, _ in shadow.calls)
+    branch = result["incremental"]
+    assert branch["counts"]["not_run"] == len(batch.incremental.mutants)
+    assert branch["score"] is None
+    assert "budget" in branch["reason"]
+    assert any("before the incremental branch ran" in w for w in warnings)
+
+
+def test_the_branch_runs_unit_tests_only_and_prices_at_zero():
+    """Unit tests read fixtures, so the branch's runs are priced at zero."""
+
+    from exmergo_dex_core.transform.commands import _price_mutations
+
+    batch = _incremental_batch()
+    _estimate, per_table, prices, _notes = _price_mutations(
+        _TextPricedAdapter(),
+        _PricingCopy(None),
+        "models/fct.sql",
+        batch,
+        {"name": "fct"},
+        mutation,
+        incremental_tests=[_INCREMENTAL_TEST],
+    )
+
+    assert per_table["(incremental branch unit tests)"] == 0.0
+    assert prices["(incremental baseline)"] == 0.0
+    assert all(prices[m.id] == 0.0 for m in batch.incremental.mutants)
+    assert all(prices[m.id] > 0.0 for m in batch.mutants)
+
+
+def _versioned_manifest(*, full_unit_test: bool):
+    """A model at two versions, each with the incremental unit test dbt
+    instantiates once per version, and optionally a full-build one on v1."""
+
+    units = {}
+    for version in (1, 2):
+        units[f"unit_test.p.fct.check_v{version}"] = {
+            "name": "check",
+            "model": "fct",
+            "version": version,
+            "depends_on": {"nodes": [f"model.p.fct.v{version}"]},
+            "overrides": {"macros": {"is_incremental": True}},
+        }
+    if full_unit_test:
+        units["unit_test.p.fct.bands_v1"] = {
+            "name": "bands",
+            "model": "fct",
+            "version": 1,
+            "depends_on": {"nodes": ["model.p.fct.v1"]},
+            "overrides": {"macros": {"is_incremental": False}},
+        }
+    nodes = {
+        f"model.p.fct.v{v}": {
+            "name": "fct",
+            "unique_id": f"model.p.fct.v{v}",
+            "version": v,
+            "resource_type": "model",
+        }
+        for v in (1, 2)
+    }
+    return {"nodes": nodes, "unit_tests": units}
+
+
+def test_a_versioned_models_branch_tests_are_this_versions_instances():
+    """dbt runs one instance of a unit test per version, named <name>_v<N>, and
+    its selector matches the definition's name. Only the mutated version's
+    instance is the branch's test, reported under the name a run gives it."""
+
+    from exmergo_dex_core.transform.commands import _incremental_unit_tests
+
+    manifest = _versioned_manifest(full_unit_test=False)
+
+    tests = _incremental_unit_tests(manifest, manifest["nodes"]["model.p.fct.v1"])
+
+    assert [(t.unique_id, t.name, t.select) for t in tests] == [
+        ("unit_test.p.fct.check_v1", "check_v1", "check")
+    ]
+
+
+@pytest.mark.parametrize("full_unit_test", [False, True])
+def test_a_versioned_model_runs_its_full_build_only_with_a_full_build_test(
+    full_unit_test,
+):
+    """Compared by unique id: v2's incremental test and v1's own incremental
+    test never count as a test of v1's full build."""
+
+    from exmergo_dex_core.transform.commands import (
+        _incremental_unit_tests,
+        _runs_full_build,
+    )
+
+    manifest = _versioned_manifest(full_unit_test=full_unit_test)
+    node = manifest["nodes"]["model.p.fct.v1"]
+
+    runs = _runs_full_build(manifest, node, _incremental_unit_tests(manifest, node))
+
+    assert runs is full_unit_test
+
+
+def test_only_the_mutated_versions_instance_testifies_for_the_branch(project):
+    """The selector also runs the other version's instance, and any same-named
+    unit test on another model, which read their own files and pass against
+    every mutant; they are left out of the baseline and the verdicts."""
+
+    from exmergo_dex_core.transform.commands import IncrementalUnitTest
+
+    batch = _incremental_batch()
+
+    class _BothVersions(_ProgramCopy):
+        """Reports the other version's instance beside this version's."""
+
+        def test(self, select, exclude=()):
+            summary = super().test(select, exclude)
+            if select.startswith("unit_test:"):
+                summary["nodes"] = [
+                    {
+                        **summary["nodes"][0],
+                        "unique_id": "unit_test.p.fct.check_v1",
+                        "name": "check_v1",
+                    },
+                    {
+                        "unique_id": "unit_test.p.fct.check_v2",
+                        "name": "check_v2",
+                        "status": "pass",
+                        "execution_time": 1.0,
+                    },
+                    # a same-named test on another model, which the selector
+                    # also matches and whose status must not overwrite v1's
+                    {
+                        "unique_id": "unit_test.p.other.check_v1",
+                        "name": "check_v1",
+                        "status": "pass",
+                        "execution_time": 1.0,
+                    },
+                ]
+            return summary
+
+    shadow = _BothVersions(batch)
+    test = IncrementalUnitTest("unit_test.p.fct.check_v1", "check_v1", "check")
+
+    result, _meta = _run(shadow, batch, project, incremental_tests=[test])
+
+    branch = result["incremental"]
+    assert {select for select, _ in shadow.calls if select != "fct"} == {
+        "unit_test:check"
+    }
+    assert branch["tests"] == ["check_v1"]
+    assert [t["name"] for t in branch["baseline"]["tests"]] == ["check_v1"]
+    assert branch["counts"]["killed"] == len(batch.incremental.mutants)
+    for mutant in branch["mutants"]:
+        assert mutant["caught_by"] == ["check_v1"]

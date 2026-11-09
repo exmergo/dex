@@ -280,10 +280,9 @@ def build_tables(seed: int = DEMO_SEED) -> tuple[DemoTable, ...]:
         )
 
     # --- products: a mixed-shape candidate key, and a name that is not a person
-    # `sku` is unique and non-null, which is what makes it a candidate key and
-    # therefore eligible for the value-shape check. That eligibility is why the
-    # mixed shapes cannot ride on `order_items.order_item_id` below: that column
-    # is deliberately not unique, so it would never be looked at this way.
+    # `sku` is unique and non-null, so it is a proven candidate key for the
+    # value-shape check. `order_items.order_item_id` below is BIGINT (and not
+    # unique); the shape check is string-only, so that column stays out of it.
     products: list[tuple] = []
     for i in range(1, 301):
         sku = (

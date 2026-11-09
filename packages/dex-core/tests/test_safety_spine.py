@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -4686,6 +4687,8 @@ def _sf_adapter(
     confirmed=True,
     databases=None,
     scope_override=None,
+    suspend_after_command=False,
+    ledger=None,
 ):
     from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
     from exmergo_dex_core.config import SnowflakeTarget
@@ -4698,15 +4701,22 @@ def _sf_adapter(
         session_spent=0.0,
         confirmed=confirmed,
         connector="snowflake",
+        record=ledger.append if ledger is not None else None,
+        history=(lambda: list(ledger)) if ledger is not None else None,
     )
     return SnowflakeAdapter(
         connection=fake_sf_connection,
         cost_gate=gate,
-        target=SnowflakeTarget(warehouse="DEX_WH", databases=databases or []),
+        target=SnowflakeTarget(
+            warehouse="DEX_WH",
+            databases=databases or [],
+            suspend_after_command=suspend_after_command,
+        ),
         account="TESTORG-TESTACCT",
         auth_method="named_connection:key_pair",
         scope_override=scope_override,
         clock=fake_sf_connection.clock,
+        wall_clock=fake_sf_connection.clock.wall,
     )
 
 
@@ -5044,6 +5054,381 @@ def test_the_dev_target_is_read_only_by_the_command_that_asked(
     assert all(o.identifier.startswith("SHOP.PUBLIC.") for o in explored.list_objects())
 
 
+def _dev_built_engine(monkeypatch, fake_sf_connection, **engine_kwargs):
+    """A Snowflake engine whose allowlist reads SHOP.PUBLIC while dbt builds
+    into SHOP.DBT_DEV, holding the one model only a dev build wrote (#893)."""
+
+    from fakes.snowflake import FakeSnowflakeTable
+
+    import exmergo_dex_core.connect as connect_mod
+    from exmergo_dex_core.config import DexConfig, SnowflakeTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import MemoryStore
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="DBT_DEV",
+            name="STG_ORDERS",
+            columns=[("ID", "FIXED", False)],
+            rows=10,
+        )
+    )
+    adapter = _sf_adapter(fake_sf_connection, databases=["SHOP.PUBLIC"])
+    monkeypatch.setattr(connect_mod, "open_adapter", lambda **_kwargs: adapter)
+    return DexEngine(
+        config=DexConfig(
+            connector="snowflake",
+            snowflake=SnowflakeTarget(
+                warehouse="DEX_WH",
+                databases=["SHOP.PUBLIC"],
+                dev_database="SHOP",
+                dev_schema="DBT_DEV",
+            ),
+        ),
+        store=MemoryStore(),
+        **engine_kwargs,
+    )
+
+
+def test_profile_reaches_a_dev_only_build_for_one_command(
+    monkeypatch, fake_sf_connection
+):
+    # Family 2 (#893): a model whose only build is the dev one is outside the
+    # allowlist, so a plain profile cannot name it. `--target dev` reads the dev
+    # namespace for that command, and the cost guard still prices the scan
+    # before anything runs; the next command reads the committed scope again.
+    from exmergo_dex_core.errors import RequestError
+    from exmergo_dex_core.explore.commands import profile
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    with pytest.raises(RequestError, match="no object named"):
+        profile(engine, ["DBT_DEV.STG_ORDERS"])
+    with pytest.raises(ConfirmationRequiredError):
+        profile(engine, ["DBT_DEV.STG_ORDERS"], target="dev")
+    assert fake_sf_connection.data_statements == []
+    assert engine.config.snowflake.databases == ["SHOP.PUBLIC"]
+    with pytest.raises(RequestError, match="no object named"):
+        profile(engine, ["DBT_DEV.STG_ORDERS"])
+
+
+def test_a_dev_profile_never_clears_an_ordinary_query(monkeypatch, fake_sf_connection):
+    # Family 2 (#893): `explore profile --target dev` caches what it profiled so
+    # drafting can read it, but `explore query` reads the committed allowlist,
+    # and a cached dev profile must not clear a relation that allowlist does not
+    # reach. Nothing runs against the dev namespace.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.errors import DexError
+    from exmergo_dex_core.explore.commands import query
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    engine.store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier="SHOP.DBT_DEV.STG_ORDERS",
+                    columns=[ColumnProfile(name="ID", data_type="NUMBER")],
+                )
+            ]
+        )
+    )
+    with pytest.raises(DexError):
+        query(engine, "SELECT ID FROM SHOP.DBT_DEV.STG_ORDERS")
+    assert fake_sf_connection.data_statements == []
+    cached = engine.store.load_cache()
+    assert cached is not None
+    assert [d.identifier for d in cached.datasets] == ["SHOP.DBT_DEV.STG_ORDERS"]
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "scopes", "held_back"),
+    [
+        # A `--scope` that narrows past the dev namespace holds its profiles
+        # back, though the committed allowlist reaches it.
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            ["SHOP.PUBLIC"],
+            ["SHOP.DBT_DEV.STG_ORDERS"],
+        ),
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            None,
+            [],
+        ),
+        # A bare BigQuery dev dataset is the configured project's; the same
+        # dataset name in another allowlisted project is a source.
+        (
+            "bigquery",
+            {
+                "project": "shop",
+                "datasets": ["other.dbt_dev"],
+                "dev_dataset": "dbt_dev",
+            },
+            None,
+            ["shop.dbt_dev.stg_orders"],
+        ),
+    ],
+)
+def test_dev_profiles_are_held_back_from_the_scope_a_query_reads(
+    connector, target, scopes, held_back
+):
+    # Family 2 (#893): the cache a query adjudicates on reads what this
+    # command's scope reads, and `--scope` only ever narrows it.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.explore.commands import _without_dev_profiles
+    from exmergo_dex_core.storage import MemoryStore
+
+    dev = (
+        "SHOP.DBT_DEV.STG_ORDERS"
+        if connector == "snowflake"
+        else ("shop.dbt_dev.stg_orders")
+    )
+    source = (
+        "SHOP.PUBLIC.ORDERS" if connector == "snowflake" else ("other.dbt_dev.orders")
+    )
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier=name, columns=[ColumnProfile(name="id", data_type="INT")]
+            )
+            for name in (dev, source)
+        ]
+    )
+    engine = DexEngine(
+        config=DexConfig.model_validate({"connector": connector, connector: target}),
+        store=MemoryStore(),
+        scopes=scopes,
+    )
+    kept = [d.identifier for d in _without_dev_profiles(engine, cache).datasets]
+    assert sorted({dev, source} - set(kept)) == held_back
+    assert source in kept
+
+
+def _cache_dev_profile(
+    engine, *, pii: bool = False, identifier: str = "SHOP.DBT_DEV.STG_ORDERS"
+) -> None:
+    """What `explore profile --target dev` leaves behind: a profile of the
+    dev-built model, its columns as the warehouse reports them."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+
+    adapter = engine._adapter("explore profile", reads_dev_target=True)
+    adapter.read_dev_target([identifier.rsplit(".", 1)[0]])
+    _meta, metadata = adapter.table_metadata(identifier)
+    columns = [
+        ColumnProfile(
+            name=c.name,
+            data_type=c.data_type,
+            nullable=c.nullable,
+            pii=(
+                PIIFlag(category="email", confidence=0.95)
+                if pii and c.name == "EMAIL"
+                else None
+            ),
+        )
+        for c in metadata
+    ]
+    engine.store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(identifier=identifier, columns=columns),
+            ]
+        )
+    )
+
+
+def test_query_without_target_names_the_dev_namespace_and_the_flag(
+    monkeypatch, fake_sf_connection
+):
+    """A dev relation without the flag is refused naming the namespace and flag."""
+
+    # #1133: the plain query used to say "not in the exploration cache; run
+    # `explore profile`", which a caller who just ran `explore profile --target
+    # dev` had already done. It names the namespace and the flag instead, from
+    # the names alone, and nothing runs.
+    from exmergo_dex_core.explore.commands import query
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    _cache_dev_profile(engine)
+    for name in ("SHOP.DBT_DEV.STG_ORDERS", "DBT_DEV.STG_ORDERS"):
+        with pytest.raises(QueryRefusedError) as refused:
+            query(engine, f"SELECT COUNT(*) FROM {name}")  # noqa: S608
+        message = str(refused.value)
+        assert "SHOP.DBT_DEV" in message
+        assert "--target dev" in message
+        assert "exploration cache" not in message
+    assert fake_sf_connection.data_statements == []
+    # A neighbour in the same batch that reads a source still answers.
+    from exmergo_dex_core.explore.commands import query_batch
+
+    fake_sf_connection.row_resolver = lambda sql: [{"n": 1}]
+    batch = query_batch(
+        engine,
+        [
+            "SELECT COUNT(*) FROM SHOP.DBT_DEV.STG_ORDERS",
+            "SELECT COUNT(*) FROM SHOP.DBT_DEV_INBOX.THREADS",
+        ],
+    )
+    assert [r.status for r in batch.results] == ["refused", "refused"]
+    assert "--target dev" in (batch.results[1].error or "")
+    assert "derives from it (SHOP.DBT_DEV_INBOX)" in (batch.results[1].error or "")
+
+
+def test_query_reads_a_dev_only_build_for_one_command(monkeypatch, fake_sf_connection):
+    """`--target dev` reads the dev namespace for one call only."""
+
+    # #1133: `--target dev` reads the dev namespace for this call, under the
+    # same cost handshake, and the next call reads the committed scope again.
+    # Nothing is written back to config.
+    from exmergo_dex_core.explore.commands import query
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    _cache_dev_profile(engine)
+    sql = "SELECT COUNT(*) - COUNT(DISTINCT ID) AS DUPES FROM SHOP.DBT_DEV.STG_ORDERS"
+    with pytest.raises(ConfirmationRequiredError):
+        query(engine, sql, target="dev")
+    assert fake_sf_connection.data_statements == []
+
+    engine.confirmed = True
+    engine.budget = 600.0
+    fake_sf_connection.row_resolver = lambda sql: [{"DUPES": 0}]
+    result = query(engine, sql, target="dev")
+    assert result.cells == [[0]]
+    assert any("DBT_DEV" in s.sql.upper() for s in fake_sf_connection.data_statements)
+    assert engine.config.snowflake.databases == ["SHOP.PUBLIC"]
+
+    ran = len(fake_sf_connection.data_statements)
+    with pytest.raises(QueryRefusedError, match="--target dev"):
+        query(engine, sql)
+    assert len(fake_sf_connection.data_statements) == ran
+
+
+def test_query_refuses_a_prod_target_before_anything_opens(
+    monkeypatch, fake_sf_connection
+):
+    """A prod-looking target is refused before any statement."""
+
+    from exmergo_dex_core.explore.commands import query, query_batch
+    from exmergo_dex_core.transform.build import ProdTargetRefusedError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    for target in ("prod", "production", "staging"):
+        with pytest.raises(ProdTargetRefusedError):
+            query(engine, "SELECT 1", target=target)
+        with pytest.raises(ProdTargetRefusedError):
+            query_batch(engine, ["SELECT 1"], target=target)
+    assert fake_sf_connection.statements == []
+
+
+def test_query_on_the_dev_target_keeps_the_pii_gate_and_values_free_mode(
+    monkeypatch, fake_sf_connection
+):
+    """The PII gate and values-free mode hold under `--target dev`."""
+
+    # #1133: the dev namespace is read like any other relation; the firewall,
+    # the PII gate and values-free mode are unchanged.
+    from exmergo_dex_core.explore.commands import query
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError
+    from exmergo_dex_core.values_free import ResultMode, ValuesFreeError
+
+    engine = _dev_built_engine(
+        monkeypatch, fake_sf_connection, confirmed=True, budget=600.0
+    )
+    fake_sf_connection.tables[-1].columns.append(("EMAIL", "TEXT", True))
+    _cache_dev_profile(engine, pii=True)
+    with pytest.raises(QueryRefusedError, match="PII"):
+        query(engine, "SELECT EMAIL FROM SHOP.DBT_DEV.STG_ORDERS", target="dev")
+    with pytest.raises(ValuesFreeError):
+        query(
+            engine,
+            "SELECT ID FROM SHOP.DBT_DEV.STG_ORDERS",
+            target="dev",
+            result_mode=ResultMode.VALUES_FREE,
+        )
+    assert fake_sf_connection.data_statements == []
+    fake_sf_connection.row_resolver = lambda sql: [{"N": 10}]
+    result = query(
+        engine,
+        "SELECT COUNT(*) AS N FROM SHOP.DBT_DEV.STG_ORDERS",
+        target="dev",
+        result_mode=ResultMode.VALUES_FREE,
+    )
+    assert result.cells == [[10]]
+
+
+def test_query_on_the_dev_target_reads_a_namespace_dbt_derived(
+    monkeypatch, fake_sf_connection, tmp_path
+):
+    """A namespace dbt derived from the dev one is read and named."""
+
+    # #1133 with #1155: a package's `+schema` builds into DBT_DEV_<name>. Its
+    # model is the build's own output, so `--target dev` reads that namespace
+    # too, for the project's manifest relations, and says so.
+    import json
+
+    from fakes.snowflake import FakeSnowflakeTable
+
+    from exmergo_dex_core.explore.commands import query
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="DBT_DEV_INBOX",
+            name="THREADS",
+            columns=[("ID", "FIXED", False)],
+            rows=6,
+        )
+    )
+    project = tmp_path / "shop"
+    (project / "target").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text("name: shop\nprofile: shop\n")
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.inbox.threads": {
+                        "resource_type": "model",
+                        "relation_name": '"SHOP"."DBT_DEV_INBOX"."THREADS"',
+                    }
+                }
+            }
+        )
+    )
+    engine = _dev_built_engine(
+        monkeypatch,
+        fake_sf_connection,
+        confirmed=True,
+        budget=600.0,
+        repo_root=str(tmp_path),
+    )
+    engine.config.dbt_project_dir = "shop"
+    _cache_dev_profile(engine, identifier="SHOP.DBT_DEV_INBOX.THREADS")
+    fake_sf_connection.row_resolver = lambda sql: [{"N": 6}]
+    result = query(
+        engine, "SELECT COUNT(*) AS N FROM SHOP.DBT_DEV_INBOX.THREADS", target="dev"
+    )
+    assert result.cells == [[6]]
+    assert any("SHOP.DBT_DEV_INBOX" in note for note in result.notes), result.notes
+
+
+def test_profile_refuses_a_prod_target(monkeypatch, fake_sf_connection):
+    from exmergo_dex_core.explore.commands import profile
+    from exmergo_dex_core.transform.build import ProdTargetRefusedError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    with pytest.raises(ProdTargetRefusedError):
+        profile(engine, ["DBT_DEV.STG_ORDERS"], target="prod")
+    assert fake_sf_connection.data_statements == []
+
+
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
@@ -5107,9 +5492,131 @@ def test_select_only_guard_rejects_snowflake_writes_and_ddl():
         "COPY INTO @mystage/x FROM (SELECT 1)",
         "CALL d.proc()",
         "ALTER WAREHOUSE wh SET WAREHOUSE_SIZE = 'X-Large'",
+        # The one ALTER WAREHOUSE dex issues itself (#664) is no exception: it
+        # comes from a typed adapter method, never through the firewall.
+        'ALTER WAREHOUSE "DEX_WH" SUSPEND',
+        "ALTER WAREHOUSE wh RESUME",
     ):
         with pytest.raises(NotSelectOnlyError):
             assert_select_only(bad, dialect="snowflake")
+
+
+# Every statement the Snowflake adapter may issue that is not a SELECT or a SHOW
+# (issue #664). The suspend is the only one that acts on the account rather than
+# on dex's own session, and it is pinned to the configured warehouse by name.
+_SNOWFLAKE_NON_SELECT = (
+    re.compile(r'^USE WAREHOUSE "DEX_WH"$'),
+    re.compile(r"^ALTER SESSION SET QUERY_TAG = 'dex'$"),
+    re.compile(r"^ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = \d+$"),
+    re.compile(r'^ALTER WAREHOUSE "DEX_WH" SUSPEND$'),
+)
+
+
+def _sf_one_command(adapter) -> None:
+    adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    adapter.cost_gate.settle()
+
+
+def _sf_suspends(connection) -> list[str]:
+    return [
+        s.sql
+        for s in connection.statements
+        if s.sql.upper().startswith("ALTER WAREHOUSE")
+    ]
+
+
+def test_snowflake_issues_only_a_fixed_set_of_non_select_statements(
+    fake_sf_connection,
+):
+    # Family 1: read-only against data. Across a whole command with
+    # snowflake.suspend_after_command on, everything that is not a SELECT or a
+    # SHOW matches the fixed set, and the suspend it adds names the pin.
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    others = [
+        s.sql.strip()
+        for s in fake_sf_connection.statements
+        if not s.sql.strip().upper().startswith(("SELECT", "SHOW "))
+    ]
+    assert 'ALTER WAREHOUSE "DEX_WH" SUSPEND' in others
+    for sql in others:
+        assert any(p.match(sql) for p in _SNOWFLAKE_NON_SELECT), sql
+
+
+def test_snowflake_never_suspends_when_the_setting_is_off(fake_sf_connection):
+    adapter = _sf_adapter(fake_sf_connection, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == []
+    assert fake_sf_connection.warehouses[0].state == "STARTED"
+
+
+def test_snowflake_never_suspends_a_warehouse_it_did_not_wake(fake_sf_connection):
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == []
+
+
+def test_snowflake_never_suspends_a_busy_warehouse(fake_sf_connection):
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    fake_sf_connection.warehouses[0].queued = 1
+    adapter.cost_gate.settle()
+    assert _sf_suspends(fake_sf_connection) == []
+
+
+def test_snowflake_never_suspends_a_warehouse_with_auto_resume_off(
+    fake_sf_connection,
+):
+    # With AUTO_RESUME off, a suspend would make every query anyone sends
+    # afterwards fail until someone resumes the warehouse by hand.
+    fake_sf_connection.warehouses[0].auto_resume = False
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == []
+    assert fake_sf_connection.warehouses[0].state == "STARTED"
+
+
+def test_snowflake_never_suspends_a_resume_that_was_not_its_own(fake_sf_connection):
+    from fakes.snowflake import _iso
+
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    fake_sf_connection.warehouses[0].resumed_on = _iso(
+        fake_sf_connection.clock.wall() + 600
+    )
+    adapter.cost_gate.settle()
+    assert _sf_suspends(fake_sf_connection) == []
+
+
+def test_snowflake_never_suspends_a_warehouse_other_than_the_pin(fake_sf_connection):
+    from fakes.snowflake import FakeWarehouse
+
+    other = FakeWarehouse(name="OTHER_WH", state="STARTED")
+    fake_sf_connection.warehouses.append(other)
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == ['ALTER WAREHOUSE "DEX_WH" SUSPEND']
+    assert other.state == "STARTED" and other.suspends == 0
+
+    # And the typed method refuses outright when SHOW's spelling of the
+    # warehouse is not the pin (SHOW ... LIKE treats `_` as a wildcard).
+    adapter._warehouse_info["name"] = "DEXXWH"
+    assert adapter._suspend_warehouse() == "failed"
+    assert _sf_suspends(fake_sf_connection) == ['ALTER WAREHOUSE "DEX_WH" SUSPEND']
 
 
 def test_snowflake_unconfirmed_scan_never_executes(fake_sf_connection):
@@ -6893,7 +7400,9 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
     grain = [f for f in payload["data"]["findings"] if f["axis"] == "grain"]
     # `severity_floor_applied`/`grain_min_rows` (#280) are config-derived flags,
     # not row-derived values, so they belong on this allowlist same as the rest.
-    # `joins` (#779) names relations and columns, never their values.
+    # `joins` (#779) names relations and columns, never their values, and so
+    # does `still_unique_as` (#780): the combination a lost key still holds as.
+    # `grain_holds` (#780) is a boolean read off the grain's distinct count.
     assert grain and all(
         set(f["data"])
         <= {
@@ -6903,6 +7412,8 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
             "severity_floor_applied",
             "grain_min_rows",
             "joins",
+            "still_unique_as",
+            "grain_holds",
         }
         or f["code"] != "key_lost_uniqueness"
         for f in grain
@@ -7636,30 +8147,29 @@ def _ossie_repo(root, document_text: str) -> None:
 
 _OSSIE_DOCUMENT = """
 version: "0.2.0.dev0"
-semantic_model:
-  - name: people
-    datasets:
-      - name: customers
-        source: demo.main.customers
-        fields:
-          - name: email
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: email
-          - name: masked_email
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: "LOWER(email)"
-      - name: leaked
-        source: "SELECT email FROM demo.main.customers"
-        fields:
-          - name: email
-            expression:
-              dialects:
-                - dialect: ANSI_SQL
-                  expression: email
+name: people
+datasets:
+  - name: customers
+    source: demo.main.customers
+    fields:
+      - name: email
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: email
+      - name: masked_email
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "LOWER(email)"
+  - name: leaked
+    source: "SELECT email FROM demo.main.customers"
+    fields:
+      - name: email
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: email
 """
 
 
@@ -7854,7 +8364,9 @@ def test_ossie_reads_are_confined_to_the_repository(tmp_path):
     from exmergo_dex_core.ossie import OssieSemanticLayer
 
     outside = tmp_path.parent / "escape.ossie.yaml"
-    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    outside.write_text(
+        "version: '0.2.0.dev0'\nname: outside\ndatasets: []\n", encoding="utf-8"
+    )
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -7913,34 +8425,33 @@ def _ossie_billed_repo(root, *, session_ceiling: float | None = None) -> None:
     (root / "billed.ossie.yaml").write_text(
         """
 version: "0.2.0.dev0"
-semantic_model:
-  - name: shop
-    datasets:
-      - name: orders
-        source: test-proj.shop.customers
-        primary_key: [id]
-        fields:
-          - name: id
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: id}]
-      - name: events
-        source: test-proj.shop.events
-        primary_key: [id]
-        fields:
-          - name: id
-            expression:
-              dialects: [{dialect: BIGQUERY, expression: id}]
-    relationships:
-      - name: events_to_orders
-        from: events
-        to: orders
-        from_columns: [id]
-        to_columns: [id]
-      - name: orders_to_orders
-        from: orders
-        to: orders
-        from_columns: [id]
-        to_columns: [id]
+name: shop
+datasets:
+  - name: orders
+    source: test-proj.shop.customers
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: id}]
+  - name: events
+    source: test-proj.shop.events
+    primary_key: [id]
+    fields:
+      - name: id
+        expression:
+          dialects: [{dialect: BIGQUERY, expression: id}]
+relationships:
+  - name: events_to_orders
+    from: events
+    to: orders
+    from_columns: [id]
+    to_columns: [id]
+  - name: orders_to_orders
+    from: orders
+    to: orders
+    from_columns: [id]
+    to_columns: [id]
 """,
         encoding="utf-8",
     )
@@ -8114,7 +8625,9 @@ def test_a_post_plan_symlink_cannot_move_an_ossie_write_out_of_the_repository(
 
     _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
     outside = tmp_path.parent / "escaped.ossie.yaml"
-    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    outside.write_text(
+        "version: '0.2.0.dev0'\nname: outside\ndatasets: []\n", encoding="utf-8"
+    )
     before = outside.read_bytes()
 
     edits = tmp_path / "symlink-edits.json"

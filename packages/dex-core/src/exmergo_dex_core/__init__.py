@@ -54,6 +54,8 @@ from typing import TYPE_CHECKING
 _EXPORTS = {
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
+    "BuildEvidenceError": "transform.evidence",
+    "CacheLock": "storage",
     "CacheRequiredError": "explore.commands",
     "CacheUnreadableError": "storage.base",
     "CeilingRequiredError": "guards.cost_guard",
@@ -68,6 +70,8 @@ _EXPORTS = {
     "ConnectorError": "errors",
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
+    "CubeDependencyError": "cube.dependency",
+    "CubeTransportDependencyError": "cube.transport",
     "CredentialDiscoveryError": "connect",
     "DEMO_FILENAME": "demo",
     "Dataset": "cache",
@@ -82,14 +86,18 @@ _EXPORTS = {
     "DexError": "errors",
     "DialectDependencyError": "guards.dialect",
     "Document": "storage",
+    "ExpectationError": "transform.expected_change",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "IncompatibleArtifactsError": "transform.artifact_runtime",
     "InvalidConfigError": "config_document",
     "LedgerUnreadableError": "guards.cost_guard",
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
     "MissingPackagesError": "transform.build",
+    "PlanDeclaresMissingPackagesError": "transform.build",
+    "ModelVersionError": "transform.model_versions",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
     "OssieDependencyError": "ossie.loader",
@@ -144,6 +152,8 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScopeError,
         SemanticSource,
     )
+    from .cube.dependency import CubeDependencyError
+    from .cube.transport import CubeTransportDependencyError
     from .demo import (
         DEMO_FILENAME,
         DemoDependencyError,
@@ -197,6 +207,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     )
     from .slayer.dependency import SlayerDependencyError
     from .storage import (
+        CacheLock,
         CacheUnreadableError,
         Document,
         ExploreStore,
@@ -209,7 +220,14 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         StoreContext,
         StoreFactory,
     )
-    from .transform.build import MissingPackagesError
+    from .transform.artifact_runtime import IncompatibleArtifactsError
+    from .transform.build import (
+        MissingPackagesError,
+        PlanDeclaresMissingPackagesError,
+    )
+    from .transform.evidence import BuildEvidenceError
+    from .transform.expected_change import ExpectationError
+    from .transform.model_versions import ModelVersionError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -232,6 +250,8 @@ __all__ = [
     "DEMO_FILENAME",
     "BaselineUnreadableError",
     "BudgetExhaustedError",
+    "BuildEvidenceError",
+    "CacheLock",
     "CacheRequiredError",
     "CacheUnreadableError",
     "CeilingRequiredError",
@@ -247,6 +267,8 @@ __all__ = [
     "Cost",
     "CostGuardError",
     "CredentialDiscoveryError",
+    "CubeDependencyError",
+    "CubeTransportDependencyError",
     "Dataset",
     "DeclarationError",
     "DemoDependencyError",
@@ -259,19 +281,23 @@ __all__ = [
     "DexError",
     "DialectDependencyError",
     "Document",
+    "ExpectationError",
     "ExploreStore",
     "FilesystemStore",
+    "IncompatibleArtifactsError",
     "InvalidConfigError",
     "LedgerUnreadableError",
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
     "MissingPackagesError",
+    "ModelVersionError",
     "NoBaselineError",
     "NoConnectorSelectedError",
     "OssieDependencyError",
     "OverCeilingError",
     "Paradigm",
+    "PlanDeclaresMissingPackagesError",
     "PlanDigestMismatchError",
     "PlanDocumentError",
     "PlanError",

@@ -17,6 +17,16 @@
 # release workflow only verifies all this; it never writes back. Run this, review
 # the diff, commit, then tag.
 #
+# Last, it regenerates claude/, the plugin folder the Claude directory reads. The
+# directory scans only that folder, so it has to hold everything the plugin loads:
+# the skills (tracked files only, copied after their pins move), the Claude
+# manifest, the license, and the README with its repository-relative links made
+# absolute, since README.md's targets are not in claude/. The installed folder has
+# no packages/dex-core beside its skills, so the wrappers install the engine they
+# pin from PyPI. claude/.claude-plugin/icon.png is the one file not regenerated:
+# the directory reads the icon once, when a listing is first saved. Nothing else
+# in claude/ is edited by hand; it moves with each release, not with main.
+#
 # Usage:
 #   scripts/prepare_release.sh <engine-version> [plugin-semver]
 #   scripts/prepare_release.sh 0.1.0a1
@@ -113,6 +123,20 @@ if [ -n "${PLUGIN_VERSION}" ]; then
   done
 fi
 
+CLAUDE_DIR="${ROOT}/claude"
+rm -rf "${CLAUDE_DIR}/skills"
+while IFS= read -r -d '' f; do
+  mkdir -p "${CLAUDE_DIR}/$(dirname "$f")"
+  cp "${ROOT}/${f}" "${CLAUDE_DIR}/${f}"
+done < <(git -C "${ROOT}" ls-files -z skills)
+mkdir -p "${CLAUDE_DIR}/.claude-plugin"
+cp "${ROOT}/.claude-plugin/plugin.json" "${CLAUDE_DIR}/.claude-plugin/plugin.json"
+cp "${ROOT}/LICENSE" "${CLAUDE_DIR}/LICENSE"
+perl -pe 's#\]\((?!https?://|\#|mailto:)(?:\./)?([^)\s]+)\)#](https://github.com/exmergo/dex/blob/main/$1)#g;
+          s#(src(?:set)?=")(?!https?://)([^"]+)"#$1https://raw.githubusercontent.com/exmergo/dex/main/$2"#g' \
+  "${ROOT}/README.md" >"${CLAUDE_DIR}/README.md"
+echo "regenerated claude/ (skills, .claude-plugin/plugin.json, LICENSE, README.md)"
+
 # Towncrier deleted the fragments it used from the copy, so whatever is missing
 # there is exactly what this release consumed.
 if [ -n "${built}" ]; then
@@ -128,8 +152,9 @@ fi
 
 echo
 echo "Review the whole release, then commit it together (-a includes the deleted"
-echo "fragments). The pull request carries the no-changelog label:"
+echo "fragments; git add claude picks up a file new to claude/). The pull request"
+echo "carries the no-changelog label:"
 echo "  git status && git diff"
-echo "  git commit -am \"Release ${ENGINE_VERSION}\""
+echo "  git add claude && git commit -am \"Release ${ENGINE_VERSION}\""
 echo "Once it is merged, tag the merged commit:"
 echo "  git tag v${ENGINE_VERSION} <merged-commit> && git push origin v${ENGINE_VERSION}"

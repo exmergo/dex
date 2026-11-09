@@ -1,0 +1,26 @@
+version: 2
+models:
+  - name: account_ticket_summary
+    description: One row per account with how many tickets it opened and when it last opened one.
+    config:
+      meta:
+        dex:
+          grain: [account_id]
+          population:
+            rule: Every account, including those that never opened a ticket; tickets naming no known account are left out.
+          assumptions:
+            - decision: Which table drives the summary
+              chosen: accounts, with tickets left-joined so an account with none counts zero
+              evidence: request
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key}}}
+      - name: account_name
+        config: {meta: {dex: {role: attribute}}}
+      - name: ticket_count
+        description: Tickets the account has opened; zero when it never opened one.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count, null_rule: never}}}
+      - name: last_ticket_opened_on
+        description: The open date of the account's most recent ticket.
+        config: {meta: {dex: {role: time, null_rule: NULL when the account never opened a ticket}}}

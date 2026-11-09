@@ -27,16 +27,24 @@ not drafted as non-null.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from ..cache import ColumnProfile, Dataset, DexCache, match_identifier
+from ..cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    Relationship,
+    match_identifier,
+)
 from ..guards.pii_meta import entry_meta
-from .declarations import DEX_META_KEY, model_sql_path
+from .declarations import DEX_META_KEY, model_sql_path, snapshot_defined
 
 if TYPE_CHECKING:
     from ..references import ReferenceIndex
@@ -96,9 +104,17 @@ class _Reading:
 
     origins: dict[str, _Origin] = field(default_factory=dict)
     produced: list[str] | None = None
+    #: Output column name (lowered) to the expression that produces it, for a
+    #: reader that needs more than lineage (a cast's type, say).
+    expressions: dict[str, Any] = field(default_factory=dict)
     grain: list[str] | None = None
     grain_evidence: str | None = None
     grain_withheld: str | None = None
+    #: Every key the statement's output provably carries, not only the one the
+    #: grain preference picked. The contradiction check matches a declared
+    #: grain against this set, so an edit that strips a key of its proof still
+    #: contradicts a declaration resting on it (#1079).
+    proven_grains: list[list[str]] | None = None
     #: Columns the SQL filters or branches on, resolved to their upstream origin:
     #: (relation, column) -> the clauses that use it.
     used: dict[tuple[str, str], set[str]] = field(default_factory=dict)
@@ -111,6 +127,15 @@ class _Reading:
     #: Bare column names the SQL filters on, for the population hint.
     filtered: list[str] = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
+    #: The relations that decide which rows exist: the FROM relation followed
+    #: through CTEs and subqueries, plus what a RIGHT, FULL or CROSS join keeps.
+    driving: list[str] = field(default_factory=list)
+    #: The subset of ``driving`` written as a literal name, not through jinja.
+    driving_literal: list[str] = field(default_factory=list)
+    #: Why the driving relations could not be read in full, when they could not.
+    driving_unread: str | None = None
+    #: The statement manufactures its rows and names no warehouse relation.
+    generated_sql: bool = False
     incomplete: list[str] = field(default_factory=list)
     #: Placeholder identifier -> the dbt relation name it stands for.
     tokens: dict[str, str] = field(default_factory=dict)
@@ -127,20 +152,30 @@ def draft(
     domain_cap: int = 25,
     cumulative: Mapping[str, set[str]] | None = None,
     cache_note: str | None = None,
+    dev_namespace: str | None = None,
     index: Callable[[], ReferenceIndex] | None = None,
     prior: Mapping[str, str] | None = None,
+    package_documented: Mapping[str, Mapping[str, str]] | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
 
     ``files`` is the project as it reads once the plan lands. ``cache`` has had
     any ``pii_overrides`` applied already. ``cumulative`` maps a cache identifier
     to the columns the cumulative detector flagged there. ``cache_note`` says
-    why the cache is absent, where it is. ``index`` builds the reference index
+    why the cache is absent, where it is. ``dev_namespace`` is the namespace dbt
+    dev builds write into when the source allowlist does not reach it, so the
+    command an unprofiled project model is named with is one that can find its
+    dev build (#893). ``index`` builds the reference index
     of that same project state, called at most once and only when a model uses
     a column precedent can be read for; without it no precedent is drafted.
     ``prior`` is the project as it reads before the plan; with it, a model that
     already exists also carries ``contradictions`` (see :mod:`.contradictions`),
     whose warnings the caller renders once row attribution has run.
+    ``package_documented`` names, by model, the overrides of a package model
+    the package documents (``package`` and ``package_entry``): dbt gives such an
+    override the package's YAML entry and allows it none of its own, so it owes
+    no intent and its entry says where its documentation lives (#1161).
     """
 
     model_paths = list(model_paths)
@@ -161,15 +196,25 @@ def draft(
         if sql_path is None:
             continue
         declared = read_declared(files, model)
-        reading = read(files[sql_path], cache, dialect=dialect, vars=vars)
+        reading = read(
+            files[sql_path],
+            cache,
+            dialect=dialect,
+            vars=vars,
+            files=files,
+            model_paths=model_paths,
+        )
         drafted = _drafted(
             reading,
             cache,
             files,
             model_paths,
+            model=model,
             domain_cap=domain_cap,
             cumulative=cumulative,
             cache_note=cache_note,
+            dev_namespace=dev_namespace,
+            packaged=packaged,
         )
         if reading.usages and (found := reference_index()) is not None:
             precedent = _precedent(
@@ -177,7 +222,8 @@ def draft(
             )
             if precedent:
                 drafted["precedent"] = precedent
-        missing = _missing(declared, reading)
+        documented = (package_documented or {}).get(model)
+        missing = [] if documented else _missing(declared, reading)
         found = _contradictions(
             model,
             reading,
@@ -190,6 +236,7 @@ def draft(
             vars=vars,
             cumulative=cumulative,
             warnings=warnings,
+            index=reference_index,
         )
         model_warnings = _warnings(
             model,
@@ -200,11 +247,27 @@ def draft(
             grain_judged=any(c["check"] == "grain" for c in found or []),
         )
         model_warnings.extend(_literal_warnings(model, reading, cache))
+        if (
+            not documented
+            and not declared.get("history")
+            and _reads_snapshot_history(files[sql_path], files)
+        ):
+            missing.append("history")
+            model_warnings.append(
+                f"'{model}' reads a snapshot's versions and declares no `history`: "
+                "whether the first observation is a transition, the NULL-status "
+                "policy, its entities and its timestamp provenance stay unstated, "
+                "and verification cannot check them"
+            )
         out[model] = {
             "drafted": _untoken(drafted, reading.tokens),
             "declared": declared,
             "missing": _untoken(missing, reading.tokens),
         }
+        if documented:
+            out[model]["package_documented"] = dict(documented)
+        if isinstance(declared.get("population"), dict):
+            out[model]["population_contract"] = population_contract(declared)
         if found is not None:
             out[model]["contradictions"] = found
         warnings.extend(_untoken(model_warnings, reading.tokens))
@@ -224,20 +287,30 @@ def _contradictions(
     vars: Mapping[str, Any] | None,
     cumulative: Mapping[str, set[str]],
     warnings: list[str],
+    index: Callable[[], ReferenceIndex | None],
 ) -> list[dict[str, Any]] | None:
     """What this edit contradicts in the model's declaration, or None where
-    there is nothing to compare: a model the plan creates has no prior."""
+    there is nothing to report. A model the plan creates has no prior to compare,
+    so only the rule that needs none applies: its declared parent (#1029)."""
 
     if prior is None:
         return None
     prior_path = model_sql_path(prior, model_paths, model)
-    if prior_path is None:
-        return None
-    from .contradictions import check
+    from .contradictions import check, check_new
 
     # Commentary on the plan, like the draft around it: a defect here is a
     # warning naming the exception, never a draft or a plan that fails to exist.
     try:
+        if prior_path is None:
+            created = check_new(
+                model,
+                reading=reading,
+                declared=declared,
+                files=files,
+                model_paths=model_paths,
+                index=index,
+            )
+            return [item.as_dict() for item in created] or None
         found = check(
             model,
             prior_reading=read(prior[prior_path], cache, dialect=dialect, vars=vars),
@@ -249,6 +322,7 @@ def _contradictions(
             model_paths=model_paths,
             cache=cache,
             cumulative=cumulative,
+            index=index,
         )
     except Exception as exc:
         warnings.append(
@@ -257,6 +331,22 @@ def _contradictions(
         )
         return None
     return [item.as_dict() for item in found]
+
+
+def population_contract(declared: Mapping[str, Any]) -> str:
+    """What the declared population is, to anything that could check it.
+
+    ``executable`` states a parent or filters verification can measure. ``prose``
+    is a rule only, which nothing can run. Whether a measurement actually ran is
+    the build's to say, under ``data.verification``.
+    """
+
+    population = declared.get("population")
+    if not isinstance(population, dict):
+        return "none"
+    if population.get("parent") or population.get("filters"):
+        return "executable"
+    return "prose" if population.get("rule") else "none"
 
 
 def _untoken(value: Any, tokens: Mapping[str, str]) -> Any:
@@ -279,8 +369,31 @@ def _untoken(value: Any, tokens: Mapping[str, str]) -> Any:
 
 
 def read_declared(files: Mapping[str, str], model: str) -> dict[str, Any]:
-    """What the model's YAML entry declares, in the declaration's own shape."""
+    """What the model's YAML entry declares, in the declaration's own shape.
 
+    A version (its label ``dim_teams.v2``, or the file stem that builds it) is
+    read from its effective entry, the shared entry merged with the version's
+    the way dbt merges them (#895); the bare name of a versioned model is its
+    shared top-level entry.
+    """
+
+    from .. import model_versions as mv
+
+    vmap = mv.cached_version_map(files)
+    base, version = mv.split_label(model)
+    if version is not None and mv.lookup(vmap, base) is not None:
+        label: str | None = model
+    elif mv.lookup(vmap, model) is not None:
+        label = None
+    else:
+        label = mv.label_for_stem(model, vmap)
+    if label is not None:
+        base, version = mv.split_label(label)
+        versioned = mv.lookup(vmap, base)
+        item = versioned.version(version) if versioned and version else None
+        if versioned is None or item is None:
+            return {}
+        return _declared_from(mv.effective_entry(versioned.entry, item.item))
     for path in sorted(files):
         if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
             continue
@@ -302,7 +415,7 @@ def _declared_from(entry: dict[str, Any]) -> dict[str, Any]:
         out["description"] = entry["description"]
     dex = entry_meta(entry).get(DEX_META_KEY)
     if isinstance(dex, dict):
-        for key in ("grain", "population", "assumptions"):
+        for key in ("grain", "population", "assumptions", "history"):
             if dex.get(key):
                 out[key] = dex[key]
     columns: dict[str, Any] = {}
@@ -331,7 +444,15 @@ def read(
     *,
     dialect: str,
     vars: Mapping[str, Any] | None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
 ) -> _Reading:
+    """Read one model's SQL statically.
+
+    ``files`` and ``model_paths`` let profile lookups resolve a relation to the
+    model's configured alias; readers without them still read everything that
+    needs no alias.
+    """
     reading = _Reading()
     try:
         from ..guards import dialect as dialect_guard
@@ -374,8 +495,19 @@ def read(
         )
         return reading
 
-    _Lineage(tree, relations, cache, reading).run()
+    _Lineage(
+        tree, relations, cache, reading, files=files, model_paths=model_paths
+    ).run()
     return reading
+
+
+def _keeps_joined_rows(join: Any) -> bool:
+    """Whether a join keeps every row of the relation it joins in."""
+
+    words = join.side.split()
+    if "right" in words or "full" in words or "cross" in words:
+        return True
+    return join.on is None and not join.using
 
 
 class _Lineage:
@@ -387,6 +519,8 @@ class _Lineage:
         relations: Mapping[str, str],
         cache: DexCache | None,
         reading: _Reading,
+        files: Mapping[str, str] | None = None,
+        model_paths: list[str] | None = None,
     ) -> None:
         from .. import sql_shape
 
@@ -395,6 +529,8 @@ class _Lineage:
         self.relations = relations
         self.cache = cache
         self.reading = reading
+        self.files = files or {}
+        self.model_paths = list(model_paths or [])
         self.ctes = {
             name: scope
             for name, scope in sql_shape.scopes(tree).items()
@@ -406,6 +542,7 @@ class _Lineage:
         from sqlglot import expressions as exp
 
         shape = self.shape
+        self._read_driving()
         if shape.SET_OPERATIONS and isinstance(self.tree, shape.SET_OPERATIONS):
             self.reading.incomplete.append(
                 "the model is a set operation (UNION and the like), so no column "
@@ -424,6 +561,10 @@ class _Lineage:
             )
         else:
             self.reading.produced = list(outputs)
+            self.reading.expressions = {
+                name: self.resolve_expression(self.tree, expression)
+                for name, expression in outputs.items()
+            }
             for name, expression in outputs.items():
                 origin = self.origin(self.tree, expression)
                 if origin is not None:
@@ -431,22 +572,88 @@ class _Lineage:
 
         keys, evidence = self.keys(self.tree)
         if keys:
-            self.reading.grain = sorted(keys[0], key=self._output_order(outputs))
-            self.reading.grain_evidence = evidence
+            chosen, note = self._grain_choice(keys)
+            order = self._output_order(outputs)
+            self.reading.grain = sorted(chosen, key=order)
+            self.reading.proven_grains = [sorted(key, key=order) for key in keys]
+            self.reading.grain_evidence = (
+                evidence if note is None else f"{evidence}; {note}"
+            )
         else:
             self.reading.grain_withheld = evidence
 
         for scope in [*self.ctes.values(), self.tree]:
-            self._collect_usage(scope)
+            if shape.SET_OPERATIONS and isinstance(scope, shape.SET_OPERATIONS):
+                for branch in shape.select_branches(scope):
+                    self._collect_usage(branch)
+            else:
+                self._collect_usage(scope)
 
-        # Every relation the statement reads, in the order it names them: the
-        # `ref()`/`source()` calls, and any table written into the SQL directly.
-        named = []
+        # Warehouse relations only, in the order the statement names them.
+        # ``range()`` and ``read_csv_auto()`` parse as a table with an empty
+        # name, and a VALUES clause is not a table at all. Neither is a
+        # relation ``explore profile`` can read.
+        named: list[str] = []
+        parentless = False
         for table in self.tree.find_all(exp.Table):
             kind, target = self.target(table)
-            if kind == "physical" and target not in named:
+            if kind == "generated":
+                parentless = True
+                continue
+            if kind == "physical" and target and target not in named:
                 named.append(target)
+        if any(True for _ in self.tree.find_all(exp.Values)):
+            parentless = True
         self.reading.relations = named
+        self.reading.generated_sql = parentless and not named
+
+    def _read_driving(self) -> None:
+        """Walk the FROM chain to the relations the model's rows come from.
+
+        A RIGHT, FULL or CROSS join keeps the joined side's rows too, so a date
+        spine crossed with a parent is driven by that parent as well.
+        """
+
+        from sqlglot import expressions as exp
+
+        reading = self.reading
+        seen: set[int] = set()
+        pending = [self.tree]
+        while pending:
+            scope = pending.pop()
+            if id(scope) in seen:
+                continue
+            seen.add(id(scope))
+            if not isinstance(scope, exp.Select):
+                reading.driving_unread = (
+                    "it is driven by a set operation (UNION and the like), which "
+                    "has no single driving relation"
+                )
+                continue
+            driving = self.shape.from_relation(scope)
+            if driving is None:
+                reading.driving_unread = "it selects from nothing"
+                continue
+            keeping = [
+                join.relation
+                for join in self.shape.joins(scope)
+                if _keeps_joined_rows(join)
+            ]
+            for relation in (driving, *keeping):
+                kind, target = self.target(relation)
+                if kind == "scope":
+                    pending.append(target)
+                elif kind == "physical":
+                    if target not in reading.driving:
+                        reading.driving.append(target)
+                    literal = relation.name not in self.relations
+                    if literal and target not in reading.driving_literal:
+                        reading.driving_literal.append(target)
+                elif relation is driving:
+                    reading.driving_unread = (
+                        "its driving relation is generated in SQL or is not a "
+                        "table or subquery dex can follow"
+                    )
 
     @staticmethod
     def _output_order(outputs: dict[str, Any] | None):
@@ -487,14 +694,23 @@ class _Lineage:
         return relation.alias_or_name.lower()
 
     def target(self, relation: Any) -> tuple[str, Any]:
-        """``("physical", name)``, ``("scope", select)`` or ``("unknown", None)``."""
+        """``("physical", name)``, ``("scope", select)``, ``("generated", None)``
+        or ``("unknown", None)``.
+
+        ``generated`` is a table function or VALUES clause. sqlglot gives the
+        table an empty name, and that empty string is not a warehouse relation.
+        """
 
         from sqlglot import expressions as exp
 
+        if isinstance(relation, exp.Values):
+            return "generated", None
         if isinstance(relation, exp.Subquery) and isinstance(relation.this, exp.Select):
             return "scope", relation.this
         if isinstance(relation, exp.Table):
             name = relation.name
+            if not name and not relation.db and not relation.catalog:
+                return "generated", None
             if not relation.db and name in self.relations:
                 return "physical", self.relations[name]
             if not relation.db and name.lower() in self.ctes:
@@ -523,6 +739,14 @@ class _Lineage:
         if id(select) in self._outputs:
             return self._outputs[id(select)]
         self._outputs[id(select)] = None  # a cycle reads as unreadable
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            out = {
+                name.lower(): exp.column(name)
+                for name in getattr(select, "named_selects", [])
+                if name and name != "*"
+            }
+            self._outputs[id(select)] = out or None
+            return self._outputs[id(select)]
         out: dict[str, Any] = {}
         sources = self.sources(select)
         for projection in select.expressions:
@@ -545,12 +769,58 @@ class _Lineage:
             ]
             if not expanded:
                 return None
+            # A star carries its own reshaping: EXCLUDE/EXCEPT drop columns,
+            # REPLACE keeps the name but changes the expression, RENAME moves
+            # the name. The star itself holds them. A modifier may name its
+            # column qualified (`a.id`); a qualified name matches that source
+            # alone, a bare one every source the star expands.
+            star_node = star.this if isinstance(star, exp.Column) else star
+            excluded = {
+                (column.table.lower() or "", column.name.lower())
+                for column in star_node.args.get("except_") or []
+                if isinstance(column, exp.Column)
+            }
+            replaced = {
+                replacement.alias.lower(): replacement
+                for replacement in star_node.args.get("replace") or []
+                if isinstance(replacement, exp.Alias)
+            }
+            renamed = {
+                (
+                    replacement.this.table.lower() or "",
+                    replacement.this.name.lower(),
+                ): replacement
+                for replacement in star_node.args.get("rename") or []
+                if isinstance(replacement, exp.Alias)
+                and isinstance(replacement.this, exp.Column)
+            }
             for alias, relation in expanded:
                 columns = self.columns_of(relation)
                 if columns is None:
                     return None
                 for column in columns:
-                    out.setdefault(column.lower(), exp.column(column, table=alias))
+                    name = column.lower()
+                    if (alias, name) in excluded or ("", name) in excluded:
+                        continue
+                    move = renamed.get((alias, name)) or renamed.get(("", name))
+                    if move is not None:
+                        # RENAME moves the name; a REPLACE of the same column
+                        # still decides what it produces (Snowflake runs both),
+                        # so the replacement expression carries the new name.
+                        replacement = replaced.get(name)
+                        produced = (
+                            replacement.this
+                            if replacement is not None
+                            else exp.column(column, table=alias)
+                        )
+                        out.setdefault(
+                            move.alias.lower(), exp.alias_(produced, move.alias)
+                        )
+                        continue
+                    if name in replaced:
+                        out.setdefault(name, replaced[name])
+                        continue
+                    out.setdefault(name, exp.column(column, table=alias))
         self._outputs[id(select)] = out
         return out
 
@@ -562,6 +832,8 @@ class _Lineage:
         from sqlglot import expressions as exp
 
         if depth > 32:
+            return None
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
             return None
         node = expression.this if isinstance(expression, exp.Alias) else expression
         while isinstance(node, exp.Paren):
@@ -586,6 +858,30 @@ class _Lineage:
         if carried is not None and carried.outer_join is None:
             carried.outer_join = outer
         return carried
+
+    def resolve_expression(self, select: Any, expression: Any, depth: int = 0) -> Any:
+        """Resolve a column expression back through CTEs to its producing expression."""
+        if depth > 32:
+            return expression
+        from sqlglot import expressions as exp
+
+        node = expression.this if isinstance(expression, exp.Alias) else expression
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+            return expression
+        found = self.source_of(select, node)
+        if found is None:
+            return expression
+        _alias, relation, _join = found
+        kind, target = self.target(relation)
+        if kind != "scope":
+            return expression
+        outputs = self.outputs(target)
+        inner = None if outputs is None else outputs.get(node.name.lower())
+        if inner is None:
+            return expression
+        return self.resolve_expression(target, inner, depth + 1)
 
     def source_of(self, select: Any, column: Any) -> tuple[str, Any, Any] | None:
         sources = self.sources(select)
@@ -635,6 +931,8 @@ class _Lineage:
 
         if depth > 32:
             return [], "the CTE chain is too deep to follow"
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            return [], "it is a set operation, so no key was carried through it"
         outputs = self.outputs(select)
         if outputs is None:
             return [], "the SELECT list could not be read"
@@ -699,7 +997,47 @@ class _Lineage:
                 f"the key of {self._display(driving)} ({base_evidence}) is not "
                 "selected unchanged"
             )
+        if base_evidence.endswith("carried through unchanged"):
+            return carried, base_evidence
         return carried, f"{base_evidence}, carried through unchanged"
+
+    def _grain_choice(
+        self, keys: list[frozenset[str]]
+    ) -> tuple[frozenset[str], str | None]:
+        """Which proven key drafts as the grain, and the note to append.
+
+        A candidate with no PII-flagged column wins over a flagged one, so a
+        profiled email never silently becomes the grain; when every proven
+        candidate is flagged, the first still drafts and the evidence names
+        the flag, so the proposal shows why it chose the column.
+        """
+
+        for key in keys:
+            if not self._pii_columns(key):
+                return key, None
+        flagged = ", ".join(sorted(self._pii_columns(keys[0])))
+        return keys[0], f"{flagged} is flagged as PII in the profile"
+
+    def _pii_columns(self, key: frozenset[str]) -> list[str]:
+        """The key's output columns whose origin profile carries a PII flag.
+
+        Columns with no readable origin or no profile count as unflagged, so
+        without a cache the draft degrades to the first proven key. The origin
+        relation resolves through its model's configured alias, so a profile
+        stored under ``config(alias=…)`` still reads (#1079).
+        """
+        flagged: list[str] = []
+        for name in sorted(key):
+            origin = self.reading.origins.get(name.lower())
+            if origin is None:
+                continue
+            dataset = _dataset_for_model(
+                self.cache, origin.relation, self.files, self.model_paths
+            )
+            profile = _column(dataset, origin.column)
+            if profile is not None and profile.pii is not None:
+                flagged.append(name)
+        return flagged
 
     def relation_keys(
         self, relation: Any, depth: int
@@ -707,6 +1045,8 @@ class _Lineage:
         kind, target = self.target(relation)
         if kind == "scope":
             return self.keys(target, depth + 1)
+        if kind == "generated":
+            return [], "it is generated in SQL, so no key of it is proven"
         if kind != "physical":
             return [], "its driving relation is not one dex can follow"
         dataset = dataset_for(self.cache, target)
@@ -716,7 +1056,14 @@ class _Lineage:
         if not proven:
             return [], f"{target} has no proven unique key in the cache"
         lowered = [frozenset(c.lower() for c in key) for key in proven]
-        return lowered, (f"{', '.join(proven[0])} is a proven unique key of {target}")
+        # The evidence cites every proven key, not just the first: the grain
+        # choice may prefer a later candidate (a PII-flagged first key, #1079),
+        # and the citation must name the key it proves.
+        shown = " + ".join(", ".join(key) for key in proven)
+        verb = (
+            "is a proven unique key" if len(proven) == 1 else "are proven unique keys"
+        )
+        return lowered, f"{shown} {verb} of {target}"
 
     def _equated(self, join: Any, joined_alias: str) -> frozenset[str]:
         """Joined-side columns the ON (or USING) requires equal to something."""
@@ -810,6 +1157,20 @@ class _Lineage:
                     self.reading.filtered.append(column.name.lower())
             for conjunct in _conjuncts(node.this):
                 self._fragment(select, conjunct, clause)
+        # A column compared to literals inside a join's ON decides which joined
+        # rows count, the way a WHERE does for the driving ones, and it is where a
+        # filter has to live under a LEFT JOIN that must keep every parent. The
+        # key equalities beside it compare two columns and are not usages.
+        for join in select.args.get("joins") or []:
+            on = join.args.get("on")
+            if on is None:
+                continue
+            for conjunct in _conjuncts(on):
+                if _compared_literals(conjunct) is None:
+                    continue
+                for column in conjunct.find_all(exp.Column):
+                    self._use(select, column, "join")
+                self._fragment(select, conjunct, "join")
         for case in select.find_all(exp.Case):
             for branch in case.args.get("ifs") or []:
                 for column in branch.this.find_all(exp.Column):
@@ -952,6 +1313,86 @@ def _literal(node: Any) -> str | Decimal | None:
 # --- cache reads --------------------------------------------------------------------
 
 
+_SQL_CONFIG_ALIAS = re.compile(
+    r"""\{\{[\s\S]*?\bconfig\s*\([\s\S]*?\balias\s*=\s*(['\"])([^'\"]+)\1""",
+    re.IGNORECASE,
+)
+
+
+def _literal_model_aliases(
+    files: Mapping[str, str], model_paths: list[str]
+) -> dict[str, str]:
+    """Map a lowercased relation alias to the model stem that declares it.
+
+    Only literal aliases are resolved: ``config(alias='…')`` in SQL, and
+    ``config: alias:`` on a model's YAML entry. A Jinja expression, a
+    ``generate_alias_name`` macro, or a non-literal ``+alias`` cannot be
+    known from the repository alone and is left out so the draft never
+    invents a parent.
+    """
+
+    roots = [PurePosixPath(p) for p in model_paths]
+    out: dict[str, str] = {}
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if candidate.suffix == ".sql" and any(r in candidate.parents for r in roots):
+            match = _SQL_CONFIG_ALIAS.search(content)
+            if match:
+                out[match.group(2).lower()] = candidate.stem
+            continue
+        if not path.endswith((".yml", ".yaml")) or path.endswith("dbt_project.yml"):
+            continue
+        try:
+            data = yaml.safe_load(content) or {}
+        except yaml.YAMLError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for entry in data.get("models") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            config = entry.get("config") or {}
+            alias = config.get("alias") if isinstance(config, dict) else None
+            if (
+                isinstance(name, str)
+                and isinstance(alias, str)
+                and alias
+                and "{{" not in alias
+            ):
+                out[alias.lower()] = name
+    return out
+
+
+def _alias_of_model(
+    files: Mapping[str, str], model_paths: list[str], model: str
+) -> str | None:
+    """The literal alias a model declares, or ``None`` when it has none."""
+
+    wanted = model.lower()
+    for alias, stem in _literal_model_aliases(files, model_paths).items():
+        if stem.lower() == wanted:
+            return alias
+    return None
+
+
+def _dataset_for_model(
+    cache: DexCache | None,
+    name: str,
+    files: Mapping[str, str],
+    model_paths: list[str],
+) -> Dataset | None:
+    """Cache dataset for a model name, falling back to its literal alias."""
+
+    found = dataset_for(cache, name)
+    if found is not None:
+        return found
+    alias = _alias_of_model(files, model_paths, name)
+    if alias is None:
+        return None
+    return dataset_for(cache, alias)
+
+
 def dataset_for(cache: DexCache | None, name: str) -> Dataset | None:
     """The cache's one dataset ``name`` resolves to, or None (absent or ambiguous)."""
 
@@ -996,6 +1437,9 @@ def _drafted(
     domain_cap: int,
     cumulative: Mapping[str, set[str]],
     cache_note: str | None,
+    model: str | None = None,
+    dev_namespace: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1004,9 +1448,20 @@ def _drafted(
         drafted["grain"] = {"value": None, "withheld": reading.grain_withheld}
 
     columns: dict[str, Any] = {}
-    for name, origin in reading.origins.items():
+    candidates = (
+        reading.produced if reading.produced is not None else list(reading.origins)
+    )
+    for name in candidates:
         facts = _column_facts(
-            name, origin, reading, cache, files, model_paths, cumulative=cumulative
+            name,
+            reading.origins.get(name),
+            reading,
+            cache,
+            files,
+            model_paths,
+            cumulative=cumulative,
+            model=model,
+            packaged=packaged,
         )
         if facts:
             columns[name] = facts
@@ -1023,7 +1478,7 @@ def _drafted(
 
     inputs = []
     for relation in reading.relations:
-        dataset = dataset_for(cache, relation)
+        dataset = _dataset_for_model(cache, relation, files, model_paths)
         entry: dict[str, Any] = {"relation": relation}
         if dataset is not None and dataset.columns:
             entry["profiled"] = True
@@ -1036,13 +1491,31 @@ def _drafted(
                 else []
             )
             if len(ambiguous) > 1:
+                # Profiling again cannot help: every candidate is profiled
+                # already, and a bare name matches all of them (#893).
                 entry["reason"] = (
                     f"it matches {len(ambiguous)} relations in the cache "
-                    f"({', '.join(ambiguous)})"
+                    f"({', '.join(ambiguous)}), and a ref() is read by name, so "
+                    "no profile run can settle which one it means"
+                )
+            elif (
+                dev_namespace is not None
+                and model_sql_path(files, model_paths, relation) is not None
+            ):
+                # A project model's dev build is outside the allowlist, so only
+                # a read of the dev namespace finds it; qualified, so a prod
+                # copy the allowlist does reach cannot make it ambiguous.
+                built = _alias_of_model(files, model_paths, relation) or relation
+                entry["reason"] = cache_note or (
+                    "the cache has not profiled it, and its dev build in "
+                    f"{dev_namespace} is outside the source allowlist"
+                )
+                entry["command"] = (
+                    f"explore profile {dev_namespace}.{built} --target dev"
                 )
             else:
                 entry["reason"] = cache_note or "the cache has not profiled it"
-            entry["command"] = f"explore profile {relation}"
+                entry["command"] = f"explore profile {relation}"
         inputs.append(entry)
     if inputs:
         drafted["inputs"] = inputs
@@ -1053,87 +1526,204 @@ def _drafted(
 
 def _column_facts(
     name: str,
-    origin: _Origin,
+    origin: _Origin | None,
     reading: _Reading,
     cache: DexCache | None,
     files: Mapping[str, str],
     model_paths: list[str],
     *,
     cumulative: Mapping[str, set[str]],
+    model: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
-    dataset = dataset_for(cache, origin.relation)
-    profile = _column(dataset, origin.column)
-    source = f"{origin.relation}.{origin.column}"
-    facts: dict[str, Any] = {"from": source}
+    facts: dict[str, Any] = {}
+    if origin is not None:
+        dataset = _dataset_for_model(cache, origin.relation, files, model_paths)
+        profile = _column(dataset, origin.column)
+        source: str | None = f"{origin.relation}.{origin.column}"
+        facts["from"] = source
+    else:
+        dataset = None
+        profile = None
+        source = None
 
     if reading.grain == [name]:
         facts["role"] = {
             "value": "key",
             "evidence": f"the model's drafted grain: {reading.grain_evidence}",
         }
-    elif dataset is not None and cache is not None:
+    elif origin is not None and dataset is not None and cache is not None:
         reference = _verified_reference(
-            cache, dataset, origin.column, files, model_paths
+            cache,
+            dataset,
+            origin.column,
+            files,
+            model_paths,
+            model=model,
+            packaged=packaged,
         )
+        if model is not None and not _reachable(
+            reference, files, model_paths, packaged
+        ):
+            # A staging model's column comes from a raw table, whose joins on a
+            # warehouse reach only other raw tables (#892). Once the model is
+            # built, its own relation's joins reach the models beside it.
+            built = _dataset_for_model(cache, model, files, model_paths)
+            if built is not None and built is not dataset:
+                own = _verified_reference(
+                    cache,
+                    built,
+                    name,
+                    files,
+                    model_paths,
+                    model=model,
+                    packaged=packaged,
+                )
+                if _reachable(own, files, model_paths, packaged):
+                    reference = own
         if reference is not None and reference[0] is not None:
             facts["role"] = {"value": "foreign_key", "evidence": reference[1]}
             facts["references"] = {"value": reference[0], "evidence": reference[1]}
         elif reference is not None:
             facts["references"] = {"value": None, "withheld": reference[1]}
 
-    if profile is None:
-        return facts
+    if origin is not None and profile is not None and source is not None:
+        if profile.pii is not None:
+            facts["pii"] = {
+                "value": {
+                    "category": profile.pii.category.value,
+                    "confidence": profile.pii.confidence,
+                },
+                "evidence": f"flagged on {source} by the profile",
+            }
 
-    if profile.pii is not None:
-        facts["pii"] = {
-            "value": {
-                "category": profile.pii.category.value,
-                "confidence": profile.pii.confidence,
-            },
-            "evidence": f"flagged on {source} by the profile",
-        }
+        if origin.outer_join is not None:
+            facts["nullable"] = {
+                "value": True,
+                "evidence": (
+                    f"it comes from the outer side of the {origin.outer_join}; a row "
+                    "with no match carries NULL here"
+                ),
+            }
+        elif profile.null_fraction == 0.0:
+            facts["nullable"] = {
+                "value": False,
+                "evidence": (
+                    f"{source} held no NULL when profiled, and no outer join sits "
+                    "between it and this column"
+                ),
+            }
+        elif profile.null_fraction is not None:
+            facts["nullable"] = {
+                "value": True,
+                "evidence": (
+                    f"{source} was {profile.null_fraction:.1%} NULL when profiled"
+                ),
+            }
 
-    if origin.outer_join is not None:
-        facts["nullable"] = {
-            "value": True,
-            "evidence": (
-                f"it comes from the outer side of the {origin.outer_join}; a row "
-                "with no match carries NULL here"
-            ),
-        }
-    elif profile.null_fraction == 0.0:
-        facts["nullable"] = {
-            "value": False,
-            "evidence": (
-                f"{source} held no NULL when profiled, and no outer join sits "
-                "between it and this column"
-            ),
-        }
-    elif profile.null_fraction is not None:
-        facts["nullable"] = {
-            "value": True,
-            "evidence": f"{source} was {profile.null_fraction:.1%} NULL when profiled",
-        }
+        if dataset is not None and origin.column.lower() in {
+            c.lower() for c in cumulative.get(dataset.identifier, set())
+        }:
+            facts["additivity"] = {
+                "value": "semi_additive",
+                "evidence": (
+                    f"the cumulative check found {source} never decreasing within an "
+                    "entity over time; summing it across rows multiplies the true value"
+                ),
+            }
 
-    if dataset is not None and origin.column.lower() in {
-        c.lower() for c in cumulative.get(dataset.identifier, set())
-    }:
-        facts["additivity"] = {
-            "value": "semi_additive",
-            "evidence": (
-                f"the cumulative check found {source} never decreasing within an "
-                "entity over time; summing it across rows multiplies the true value"
-            ),
-        }
+        unit = _unit_shape(name, profile)
+        if unit is not None:
+            facts["unit"] = {
+                "value": unit[0],
+                "evidence": (
+                    f"{unit[1]} in {source}; a hypothesis about the unit, not a "
+                    "certified one"
+                ),
+            }
 
-    unit = _unit_shape(name, profile)
-    if unit is not None:
-        facts["unit"] = {
-            "value": unit[0],
-            "evidence": f"{unit[1]} in {source}; a hypothesis about the unit, not a "
-            "certified one",
-        }
+    if "additivity" not in facts:
+        computed = _computed_additivity(reading.expressions.get(name))
+        if computed is not None:
+            facts["additivity"] = computed
+
     return facts
+
+
+def _is_running_frame(spec: Any) -> bool:
+    """Whether a window frame forms a running total."""
+    if spec is None:
+        return True
+    kind = str(spec.args.get("kind") or "").lower()
+    if kind not in ("rows", "range"):
+        return False
+    start = str(spec.args.get("start") or "").upper()
+    start_side = str(spec.args.get("start_side") or "").lower()
+    if start != "UNBOUNDED" or start_side != "preceding":
+        return False
+    if spec.args.get("exclude") is not None:
+        return False
+    end = spec.args.get("end")
+    end_str = str(end).upper() if end is not None else None
+    end_side = spec.args.get("end_side")
+    end_side_str = str(end_side).upper() if end_side is not None else None
+    if end_str not in (None, "CURRENT ROW"):
+        return False
+    return end_side_str in (None, "CURRENT ROW")
+
+
+def _computed_additivity(expression: Any) -> dict[str, str] | None:
+    """Semi-additive fact when ``expression`` is a running sum/count window."""
+    if expression is None:
+        return None
+    from sqlglot import expressions as exp
+
+    node = expression.this if isinstance(expression, exp.Alias) else expression
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if not isinstance(node, exp.Window):
+        return None
+
+    func = node.this
+    while isinstance(func, exp.Paren):
+        func = func.this
+    if isinstance(func, exp.Sum) or (
+        isinstance(func, exp.Anonymous) and func.name.lower() == "sum"
+    ):
+        agg_name = "sum"
+    elif isinstance(func, exp.Count) or (
+        isinstance(func, exp.Anonymous) and func.name.lower() == "count"
+    ):
+        agg_name = "count"
+    else:
+        return None
+
+    order = node.args.get("order")
+    if order is None or not order.expressions:
+        return None
+
+    spec = node.args.get("spec")
+    if not _is_running_frame(spec):
+        return None
+
+    partitions = [
+        p.name if isinstance(p, exp.Column) else p.sql().lower()
+        for p in (node.args.get("partition_by") or [])
+    ]
+    orders = [
+        (o.this.name if isinstance(o.this, exp.Column) else o.this.sql().lower())
+        if isinstance(o, exp.Ordered)
+        else (o.name if isinstance(o, exp.Column) else o.sql().lower())
+        for o in order.expressions
+    ]
+    part_str = ", ".join(partitions)
+    ord_str = ", ".join(orders)
+    if partitions:
+        window_desc = f"over {part_str} ordered by {ord_str}"
+    else:
+        window_desc = f"ordered by {ord_str}"
+    evidence = f"a running {agg_name} {window_desc}"
+    return {"value": "semi_additive", "evidence": evidence}
 
 
 def _verified_reference(
@@ -1142,6 +1732,9 @@ def _verified_reference(
     column: str,
     files: Mapping[str, str],
     model_paths: list[str],
+    *,
+    model: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> tuple[str | None, str] | None:
     """The reference a verified join supports: ``(target, evidence)``, or
     ``(None, why)`` for a join that was measured and did not hold.
@@ -1150,40 +1743,179 @@ def _verified_reference(
     whose values mostly miss. A declared ``references`` renders a dbt
     ``relationships`` test, which fails on a single orphan, so only a join
     measured with none is drafted as one.
+
+    A column usually joins to several relations once a project is built: the raw
+    table, the staging model over it, and the dimension downstream. Every one is
+    weighed rather than whichever the cache lists first. A parent whose column is
+    measured not unique is no key to reference, and the model itself is no
+    parent. Of the clean joins left, a model of this project comes first (a
+    ``references`` names something ``ref()`` can reach), then a seed or snapshot,
+    then a model, seed or snapshot of an installed package (``packaged`` names
+    its package, #1155), then the model nearest this one in the project tree,
+    so a mart references the dimension beside it and a staging model the
+    staging model beside it.
     """
 
-    for edge in cache.relationships:
-        if (
-            not edge.verified
-            or edge.from_dataset != dataset.identifier
-            or len(edge.from_columns) != 1
-            or edge.from_columns[0].lower() != column.lower()
-        ):
-            continue
-        parent = edge.to_dataset.rsplit(".", 1)[-1]
-        target = f"{parent}.{edge.to_columns[0]}"
-        joined = (
+    candidates = [
+        edge
+        for edge in cache.relationships
+        if edge.verified
+        and edge.from_dataset == dataset.identifier
+        and len(edge.from_columns) == 1
+        and edge.from_columns[0].lower() == column.lower()
+    ]
+    if not candidates:
+        return None
+    here = model_sql_path(files, model_paths, model) if model else None
+
+    def joined(edge: Relationship) -> str:
+        return (
             f"the join {dataset.identifier}.{column} -> {edge.to_dataset}."
             f"{edge.to_columns[0]}"
         )
-        if edge.orphan_fraction is None:
-            return None, (
-                f"{joined} was probed with no non-NULL value to match, so it "
+
+    def rank(edge: Relationship) -> tuple[int, int, str]:
+        parent = _project_name(files, model_paths, edge.to_dataset)
+        path = model_sql_path(files, model_paths, parent)
+        if path is not None:
+            kind = 0
+        elif _is_seed_or_snapshot(files, model_paths, parent):
+            kind = 1
+        elif packaged is not None and packaged(parent) is not None:
+            kind = 2
+        else:
+            kind = 3
+        shared = 0
+        if path is not None and here is not None:
+            for a, b in zip(
+                PurePosixPath(here).parent.parts,
+                PurePosixPath(path).parent.parts,
+                strict=False,
+            ):
+                if a != b:
+                    break
+                shared += 1
+        return (kind, -shared, parent.lower())
+
+    clean: list[Relationship] = []
+    held: list[str] = []
+    for edge in candidates:
+        parent = edge.to_dataset.rsplit(".", 1)[-1]
+        if model is not None and parent.lower() == model.lower():
+            continue
+        target = next(
+            (d for d in cache.datasets if d.identifier == edge.to_dataset), None
+        )
+        target_column = _column(target, edge.to_columns[0])
+        if target_column is not None and target_column.is_unique is False:
+            held.append(
+                f"{joined(edge)} was verified, but {edge.to_columns[0]} is not "
+                f"unique in {edge.to_dataset}, so it is no key to reference"
+            )
+        elif edge.orphan_fraction is None:
+            held.append(
+                f"{joined(edge)} was probed with no non-NULL value to match, so it "
                 "proves nothing"
             )
-        if edge.orphan_fraction > 0:
-            return None, (
-                f"{joined} was verified with {edge.orphan_fraction:.1%} of its "
+        elif edge.orphan_fraction > 0:
+            held.append(
+                f"{joined(edge)} was verified with {edge.orphan_fraction:.1%} of its "
                 "values unmatched; a relationships test on it would fail"
             )
-        evidence = f"{joined} was verified, no orphans"
-        if model_sql_path(files, model_paths, parent) is None:
-            evidence += (
-                f"; {parent} is not a model of this project, so declare `references` "
-                "only once one stands for it"
-            )
-        return target, evidence
-    return None
+        else:
+            clean.append(edge)
+    if not clean:
+        return (None, held[0]) if held else None
+
+    edge = min(clean, key=rank)
+    parent = _project_name(files, model_paths, edge.to_dataset)
+    parent_column = edge.to_columns[0]
+    if parent != edge.to_dataset.rsplit(".", 1)[-1] and parent_column.isupper():
+        # A warehouse that folds unquoted names to upper case reports the
+        # project's own lower-case model and column in capitals.
+        parent_column = parent_column.lower()
+    target = f"{parent}.{parent_column}"
+    evidence = f"{joined(edge)} was verified, no orphans"
+    package = packaged(parent) if packaged is not None else None
+    if package is not None and model_sql_path(files, model_paths, parent) is None:
+        evidence += f"; {parent} is defined by the installed package {package}"
+    elif model_sql_path(files, model_paths, parent) is None:
+        evidence += (
+            f"; {parent} is not a model of this project, so declare `references` "
+            "only once one stands for it"
+        )
+    if len(clean) > 1:
+        others = sorted(
+            {e.to_dataset.rsplit(".", 1)[-1] for e in clean if e is not edge}
+        )
+        evidence += f" (also clean: {', '.join(others)})"
+    return target, evidence
+
+
+def _reachable(
+    reference: tuple[str | None, str] | None,
+    files: Mapping[str, str],
+    model_paths: list[str],
+    packaged: Callable[[str], str | None] | None = None,
+) -> bool:
+    """Whether a drafted reference names something ``ref()`` reaches: a model,
+    seed or snapshot of this project or of an installed package, rather than a
+    raw table."""
+
+    if reference is None or reference[0] is None:
+        return False
+    parent = reference[0].rsplit(".", 1)[0]
+    return (
+        model_sql_path(files, model_paths, parent) is not None
+        or _is_seed_or_snapshot(files, model_paths, parent)
+        or (packaged is not None and packaged(parent) is not None)
+    )
+
+
+def _project_name(
+    files: Mapping[str, str], model_paths: list[str], identifier: str
+) -> str:
+    """The relation ``identifier`` names, spelled as the project spells it.
+
+    Snowflake reports ``STG_CUSTOMERS`` for the model a project writes as
+    ``stg_customers.sql``; a comparison by exact case would miss every model on
+    a warehouse that folds unquoted names to upper case.
+    """
+
+    name = identifier.rsplit(".", 1)[-1]
+    roots = [PurePosixPath(p) for p in model_paths]
+    for path in files:
+        candidate = PurePosixPath(path)
+        if candidate.suffix not in (".sql", ".csv"):
+            continue
+        if candidate.stem.lower() != name.lower():
+            continue
+        if candidate.suffix == ".csv" or any(r in candidate.parents for r in roots):
+            return candidate.stem
+    aliases = _literal_model_aliases(files, model_paths)
+    if name.lower() in aliases:
+        return aliases[name.lower()]
+    return name
+
+
+def _is_seed_or_snapshot(
+    files: Mapping[str, str], model_paths: list[str], name: str
+) -> bool:
+    """A seed (``<name>.csv``) or a snapshot block named ``name`` outside the
+    model paths, read from the files alone."""
+
+    roots = [PurePosixPath(p) for p in model_paths]
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if any(root in candidate.parents for root in roots):
+            continue
+        if candidate.suffix == ".csv" and candidate.stem == name:
+            return True
+        if candidate.suffix == ".sql" and re.search(
+            rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}", content
+        ):
+            return True
+    return False
 
 
 def _unit_shape(name: str, profile: ColumnProfile) -> tuple[str, str] | None:
@@ -1372,6 +2104,27 @@ def _closest(literal: str | Decimal, values: list[Any], limit: int = 3) -> list[
 # --- what is missing ------------------------------------------------------------------
 
 
+#: SQL that walks a snapshot's versions, rather than reading its current rows.
+_VERSION_WALK = re.compile(
+    r"\b(lag|lead|row_number|dbt_valid_from|dbt_updated_at)\b", re.IGNORECASE
+)
+
+
+def _reads_snapshot_history(sql: str, files: Mapping[str, str]) -> bool:
+    """A model that refs a snapshot and walks its versions, read from the text.
+
+    Only ever raises a warning, so the cost of a wrong answer is one sentence. A
+    model that only takes the current row (`dbt_valid_to is null`) is not one.
+    """
+
+    if not _VERSION_WALK.search(sql):
+        return False
+    return any(
+        snapshot_defined(files, name)
+        for name in re.findall(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", sql)
+    )
+
+
 def _missing(declared: dict[str, Any], reading: _Reading) -> list[str]:
     missing = [name for name in INTENT_FIELDS if not declared.get(name)]
     stated = {k.lower(): v for k, v in (declared.get("columns") or {}).items()}
@@ -1439,33 +2192,90 @@ def _warnings(
                 f"'{model}' declares no assumptions, so no decision it rests on is "
                 "recorded"
             )
-    measures = sorted(
-        {
-            entry.split(".")[1]
-            for entry in missing
-            if entry.startswith("columns.") and not entry.endswith(".role")
-        }
-    )
-    if measures:
-        out.append(
-            f"'{model}' declares measure(s) {', '.join(measures)} without their "
-            "aggregation, additivity or unit"
+    measure_fields: dict[str, set[str]] = {}
+    for entry in missing:
+        if entry.startswith("columns.") and not entry.endswith(".role"):
+            _, column, field = entry.split(".", 2)
+            measure_fields.setdefault(column, set()).add(field)
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for column, fields in sorted(measure_fields.items()):
+        absent = tuple(
+            field for field in ("aggregation", "additivity", "unit") if field in fields
         )
-    unprofiled = [i["relation"] for i in drafted.get("inputs", []) if not i["profiled"]]
+        groups.setdefault(absent, []).append(column)
+    for fields, columns in groups.items():
+        plural = len(columns) > 1
+        out.append(
+            f"'{model}' declares {'measures' if plural else 'measure'} "
+            f"{', '.join(columns)} without {'their' if plural else 'its'} "
+            f"{', '.join(fields)}"
+        )
+    unprofiled = [
+        i for i in drafted.get("inputs", []) if not i["profiled"] and i["relation"]
+    ]
     if unprofiled:
+        runnable = [i["command"] for i in unprofiled if i.get("command")]
+        stuck = [i for i in unprofiled if not i.get("command")]
         out.append(
-            f"'{model}' reads {', '.join(unprofiled)}, which the cache has not "
-            "profiled, so nothing was drafted from it; run "
-            + ", ".join(f"`explore profile {r}`" for r in unprofiled)
+            f"'{model}' reads {', '.join(i['relation'] for i in unprofiled)}, "
+            "which the cache has not profiled, so nothing was drafted from it"
+            + ("; run " + ", ".join(f"`{c}`" for c in runnable) if runnable else "")
+            + "".join(f"; {i['relation']}: {i['reason']}" for i in stuck)
         )
+    elif reading.generated_sql:
+        out.append(f"'{model}' is generated in SQL; nothing to draft from")
     # A contradiction already says the same thing about this edit, with the side
     # that looks stale, so the generic disagreement would only repeat it.
     if (grain_declared := declared.get("grain")) and not grain_judged:
         grain = (drafted.get("grain") or {}).get("value")
-        if grain and sorted(c.lower() for c in grain_declared) != sorted(grain):
-            out.append(
-                f"'{model}' declares grain [{', '.join(grain_declared)}] and dex "
-                f"drafted [{', '.join(grain)}] from the SQL and the cache; one of "
-                "them is wrong"
+        # The declaration is accepted against every proven key, not only the one
+        # the draft picked: the pick may pass over a proven key for its PII flag
+        # (#1079), and the contradiction check already reads the declaration that
+        # way, so warning here would send the two the opposite way.
+        proven = (
+            reading.proven_grains
+            if reading.proven_grains is not None
+            else ([grain] if grain else [])
+        )
+        if (
+            grain
+            and sorted(c.lower() for c in grain_declared) != sorted(grain)
+            and not any(
+                {c.lower() for c in key} == {c.lower() for c in grain_declared}
+                for key in proven
             )
+        ):
+            out.append(_grain_disagreement(model, grain_declared, grain))
     return out
+
+
+def _grain_disagreement(model: str, declared: list[str], drafted: list[str]) -> str:
+    """Say how a declared grain and the drafted one differ.
+
+    A declared grain narrower than the drafted one is often right: the SQL groups
+    by a key and an attribute the key determines (``group by customer_id,
+    country_code``), so the key alone is the grain. Calling one of them wrong
+    there would push an agent to declare the wider, weaker grain, so the
+    narrower case names the condition under which it holds instead.
+    """
+
+    shown, draft = ", ".join(declared), ", ".join(drafted)
+    narrower = {c.lower() for c in declared}
+    wider = {c.lower() for c in drafted}
+    if narrower < wider:
+        rest = ", ".join(c for c in drafted if c.lower() not in narrower)
+        return (
+            f"'{model}' declares grain [{shown}], narrower than the [{draft}] dex "
+            f"drafted from the SQL and the cache; it holds only if [{shown}] "
+            f"determines {rest}, which a uniqueness test on [{shown}] proves at build"
+        )
+    if wider < narrower:
+        return (
+            f"'{model}' declares grain [{shown}], wider than the [{draft}] dex "
+            f"drafted from the SQL and the cache; if [{draft}] is already unique, "
+            "it is the grain and the extra columns are attributes"
+        )
+    return (
+        f"'{model}' declares grain [{shown}] and dex drafted [{draft}] from the "
+        "SQL and the cache; one of them is wrong"
+    )

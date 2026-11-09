@@ -1,0 +1,45 @@
+version: 2
+models:
+  - name: daily_revenue
+    description: One row per order date with the orders and revenue the store kept.
+    config:
+      meta:
+        dex:
+          grain:
+            - order_date
+          population:
+            rule: Orders that were not cancelled or returned.
+            filters:
+              - column: status
+                excludes: [cancelled, returned]
+          assumptions:
+            - decision: Which order statuses count as revenue
+              chosen: all but cancelled and returned
+              evidence: precedent
+              detail: every revenue model reading stg_orders.status excludes cancelled and returned
+    columns:
+      - name: order_date
+        description: The date the orders were placed.
+        data_tests: [unique, not_null]
+        config:
+          meta:
+            dex:
+              role: time
+      - name: order_count
+        description: Kept orders placed that day.
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: count
+      - name: revenue
+        description: Total amount of the kept orders placed that day.
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: currency:USD

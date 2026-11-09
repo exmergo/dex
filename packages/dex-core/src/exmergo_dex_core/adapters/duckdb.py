@@ -102,6 +102,33 @@ class DuckDBAdapter:
         self._memory_limit = memory_limit
         self._threads = threads
         self._conn = self._connect()
+        self._database: str | None = None
+        try:
+            self._database = str(
+                self._conn.execute("SELECT current_database()").fetchone()[0]
+            )
+        except Exception:
+            self._database = None
+
+    def _current_database(self) -> str:
+        if self._database is None and self._conn is not None:
+            self._database = str(
+                self._conn.execute("SELECT current_database()").fetchone()[0]
+            )
+        return self._database or "memory"
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside the attached DuckDB database.
+
+        DuckDB inspects a single local file; --scope is rejected, so every
+        schema in this database is within what this command looked at (#984).
+        """
+        token = namespace.strip().lower()
+        db = self._current_database().lower()
+        if "." in token:
+            ns_db = token.split(".")[0]
+            return ns_db == db
+        return True
 
     def _connect(self):
         # Imported lazily so the base package import does not require the [duckdb]
@@ -193,25 +220,8 @@ class DuckDBAdapter:
         return sorted(str(name) for (name,) in rows)
 
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
-        db, schema, name = self._split(identifier)
-        col_rows = self._run_select(
-            """
-            SELECT column_name, data_type, is_nullable, column_index
-            FROM duckdb_columns()
-            WHERE database_name = ? AND schema_name = ? AND table_name = ?
-            ORDER BY column_index
-            """,
-            [db, schema, name],
-        )
-        columns = [
-            ColumnMeta(
-                name=cname,
-                data_type=str(dtype),
-                nullable=bool(is_nullable),
-                ordinal=int(idx),
-            )
-            for cname, dtype, is_nullable, idx in col_rows
-        ]
+        _db, schema, name = self._split(identifier)
+        columns = self.table_columns(identifier)
         # Exact row count (one cheap aggregate), unlike the estimate in inventory.
         # The only interpolation is the quoted+escaped identifier (never a value);
         # the statement is parsed and refused if not a read-only SELECT.
@@ -228,6 +238,34 @@ class DuckDBAdapter:
             column_count=len(columns),
         )
         return meta, columns
+
+    def table_columns(self, identifier: str) -> list[ColumnMeta]:
+        """One object's columns from the catalog alone, with no row count.
+
+        ``table_metadata`` adds an exact ``COUNT(*)``, which scans a view; a
+        caller that needs only names and types (dbt's compile-time column
+        listing, #1154) reads this instead.
+        """
+
+        db, schema, name = self._split(identifier)
+        col_rows = self._run_select(
+            """
+            SELECT column_name, data_type, is_nullable, column_index
+            FROM duckdb_columns()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?
+            ORDER BY column_index
+            """,
+            [db, schema, name],
+        )
+        return [
+            ColumnMeta(
+                name=cname,
+                data_type=str(dtype),
+                nullable=bool(is_nullable),
+                ordinal=int(idx),
+            )
+            for cname, dtype, is_nullable, idx in col_rows
+        ]
 
     def column_aggregates(
         self,
@@ -501,6 +539,42 @@ class DuckDBAdapter:
 
     def _quote(self, identifier: str) -> str:
         return ".".join(_quote_ident(p) for p in self._split(identifier))
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, in order, without executing it."""
+
+        assert_select_only(sql, dialect=self.dialect)
+        try:
+            rows = self._conn.execute(f"DESCRIBE ({sql})").fetchall()
+        except Exception as exc:
+            refusal = _refusal(exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
+        columns: list[ColumnMeta] = []
+        for ordinal, row in enumerate(rows):
+            columns.append(
+                ColumnMeta(
+                    name=str(row[0]),
+                    data_type=str(row[1]),
+                    nullable=str(row[2]).upper() == "YES",
+                    ordinal=ordinal,
+                )
+            )
+        return columns
+
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        # dex-built session statement, a constant; allowed on a read-only
+        # connection, since it changes the session and not the database.
+        self._conn.execute("SET TimeZone = 'UTC'")
 
     def run_query(
         self,

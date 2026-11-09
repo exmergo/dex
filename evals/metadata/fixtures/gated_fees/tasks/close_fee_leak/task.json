@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "ledger_daily"
+  ],
+  "prompt": "Our `enable_platform_fees` variable is meant to hide everything about platform fees outside staging when it is set to false, and it is on by default. A deployment that runs with it off still sees a fee column somewhere. Find it and fix it. Every other column, and every row, should stay the same whichever way the variable is set, and the default build should not change."
+}

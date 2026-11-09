@@ -1,0 +1,55 @@
+{
+  "models": {
+    "daily_revenue": {
+      "grain": [
+        "order_date"
+      ],
+      "population": {
+        "column": "status",
+        "domain": [
+          "placed",
+          "shipped",
+          "completed",
+          "cancelled",
+          "returned"
+        ],
+        "excluded": [
+          "cancelled",
+          "returned"
+        ]
+      },
+      "columns": {
+        "order_date": {
+          "role": [
+            "time",
+            "key"
+          ]
+        },
+        "order_count": {
+          "role": "measure",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "revenue": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "currency:*"
+        }
+      },
+      "assumption_evidence": "precedent"
+    }
+  },
+  "checks": [
+    {
+      "name": "revenue matches the kept orders",
+      "expect": 0,
+      "sql": "select count(*) from main.daily_revenue d full outer join (select cast(ordered_at as date) as order_date, count(*) as order_count, sum(amount) as revenue from raw.orders where status not in ('cancelled', 'returned') group by 1) e using (order_date) where d.revenue is distinct from e.revenue"
+    },
+    {
+      "name": "order_count matches the kept orders",
+      "expect": 0,
+      "sql": "select count(*) from main.daily_revenue d full outer join (select cast(ordered_at as date) as order_date, count(*) as order_count, sum(amount) as revenue from raw.orders where status not in ('cancelled', 'returned') group by 1) e using (order_date) where d.order_count is distinct from e.order_count"
+    }
+  ]
+}

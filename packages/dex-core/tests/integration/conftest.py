@@ -162,11 +162,18 @@ def assert_ok(rc: int, envelope: dict) -> dict:
     first, alone, makes the surviving line the one worth reading.
     """
 
-    assert rc == 0, (
+    assert rc == 0, why(envelope)
+    return envelope
+
+
+def why(envelope: dict) -> str:
+    """An envelope's errors first, alone, for an assertion message (see
+    :func:`assert_ok` for why the whole envelope is the wrong message)."""
+
+    return (
         f"errors={envelope.get('errors')} reason={envelope.get('reason')} "
         f"warnings={envelope.get('warnings')}"
     )
-    return envelope
 
 
 def _snowflake_enabled() -> bool:
@@ -183,6 +190,25 @@ def _snowflake_enabled() -> bool:
 
 @pytest.fixture(autouse=True)
 def _require_cloud_env(request):
+    if request.node.get_closest_marker("cube"):
+        # Ahead of every warehouse branch: a Cube test needs its renderer as
+        # well as its warehouse, and one without `postgres` runs on DuckDB.
+        warehouse = (
+            "postgres" if request.node.get_closest_marker("postgres") else "duckdb"
+        )
+        required = ["CUBEJS_API_SECRET", f"DEX_TEST_CUBE_URL_{warehouse.upper()}"]
+        if warehouse == "postgres":
+            required.append("DEX_TEST_PG_DSN")
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            pytest.skip(
+                f"Cube integration disabled: set {', '.join(missing)} (run "
+                f"scripts/setup_cube_dev.sh --db {warehouse}, then source "
+                "~/.cache/dex-dogfood/cube.env)"
+            )
+        pytest.importorskip("httpx")
+        pytest.importorskip("psycopg" if warehouse == "postgres" else "duckdb")
+        return
     if request.node.get_closest_marker("snowflake"):
         if not _snowflake_enabled():
             pytest.skip(
@@ -484,9 +510,9 @@ def assert_downstream_run(run_cli, capsys, root: str, budget: float) -> dict:
 
     mutate = ["--repo-root", root, "transform", "test", "--mutate", DOWNSTREAM_PROBE]
     rc, unasked = run_cli(mutate, capsys)
-    assert unasked["status"] == "needs_confirmation", unasked
+    assert unasked["status"] == "needs_confirmation", why(unasked)
     rc, asked = run_cli([*mutate, "--downstream"], capsys)
-    assert asked["status"] == "needs_confirmation", asked
+    assert asked["status"] == "needs_confirmation", why(asked)
     lines_key = next(k for k in asked["data"] if k.startswith("per_table_"))
     assert (
         asked["data"][lines_key]["(baseline)"]
@@ -497,7 +523,7 @@ def assert_downstream_run(run_cli, capsys, root: str, budget: float) -> dict:
     rc, alone = run_cli(
         [*mutate, "--max-mutants", "1", "--confirm", "--budget", str(budget)], capsys
     )
-    assert rc == 0, alone
+    assert rc == 0, why(alone)
     off = alone["data"]["downstream"]
     assert off["enabled"] is False and "--downstream" in off["reason"], off
     assert alone["data"]["score_with_downstream"] is None
@@ -505,7 +531,7 @@ def assert_downstream_run(run_cli, capsys, root: str, budget: float) -> dict:
     rc, routed = run_cli(
         [*mutate, "--downstream", "--confirm", "--budget", str(budget)], capsys
     )
-    assert rc == 0, routed
+    assert rc == 0, why(routed)
     data = routed["data"]
     assert data["downstream"]["enabled"] is True, data["downstream"]
     assert data["downstream"]["models"] == [DOWNSTREAM_MART], data["downstream"]

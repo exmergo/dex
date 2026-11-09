@@ -1,0 +1,19 @@
+version: 2
+models:
+  - name: stg_subscriptions
+    description: One row per subscription.
+    columns:
+      - name: subscription_id
+        data_tests: [unique, not_null]
+  - name: stg_activity
+    description: One row per activity event on a subscription.
+    columns:
+      - name: activity_id
+        data_tests: [unique, not_null]
+      - name: subscription_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscriptions')
+                field: subscription_id

@@ -1,0 +1,5 @@
+{
+  "name": "seeded_prerequisite",
+  "seed": 1057,
+  "description": "The same upgraded tiny_tasks package, but the task data is a seed the project loads, so the project owns the input. dbt infers its all-empty due_at column as integer. Contrasting requests: modify our data (a supported, authorized change through +column_types), or leave the data and its types alone and adapt the project."
+}

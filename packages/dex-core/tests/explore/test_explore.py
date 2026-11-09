@@ -1260,6 +1260,76 @@ def test_map_drops_relation_deleted_from_the_warehouse_between_maps(
     assert any(i.endswith(".orders") for i in identifiers)
 
 
+def test_map_drops_relation_when_whole_schema_is_dropped_between_maps(
+    tmp_path: Path, capsys
+):
+    """#984: a relation whose whole schema was dropped from the warehouse
+    between two `explore map` runs must be dropped from the cache rather than
+    carried forward as out-of-scope; a subsequent maintain snapshot and
+    maintain check then report no table_dropped findings."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA legacy")
+    conn.execute("CREATE TABLE legacy.stg_orders (id INTEGER)")
+    conn.execute("CREATE SCHEMA marts")
+    conn.execute("CREATE TABLE marts.orders (id INTEGER)")
+    conn.close()
+
+    argv = ["explore", "map", "--path", str(path)]
+    payload1 = _run(argv, capsys)
+    assert payload1["data"]["profiled_count"] == 2
+
+    # The operator drops the entire legacy schema outside dex.
+    conn = duckdb.connect(str(path))
+    conn.execute("DROP SCHEMA legacy CASCADE")
+    conn.close()
+
+    payload2 = _run(argv, capsys)
+    data = payload2["data"]
+    assert data["dropped_count"] == 1
+    assert data["out_of_scope_carried_count"] == 0
+    assert any("stg_orders" in w for w in payload2["warnings"])
+
+    cache = FilesystemStore(tmp_path).load_cache()
+    identifiers = {d.identifier for d in cache.datasets}
+    assert not any(i.endswith(".stg_orders") for i in identifiers)
+    assert any(i.endswith(".orders") for i in identifiers)
+
+    # maintain snapshot followed by maintain check reports no table_dropped.
+    _run(["maintain", "snapshot", "--path", str(path)], capsys)
+    check_payload = _run(["maintain", "check", "--path", str(path)], capsys)
+    findings = check_payload["data"]["findings"]
+    table_dropped = [f for f in findings if f.get("code") == "table_dropped"]
+    assert not any("stg_orders" in f.get("detail", "") for f in table_dropped)
+
+
+def test_compute_observed_namespaces_includes_prior_namespace_in_scope():
+    """#984: when an adapter reports a prior namespace is in scope, it is
+    included in observed_namespaces even if inventory found no objects in it."""
+
+    from exmergo_dex_core.explore.commands import _compute_observed_namespaces
+
+    class _StubAdapter:
+        name = "duckdb"
+
+        def in_scope(self, namespace: str) -> bool:
+            return namespace.startswith("db.legacy")
+
+    prior = DexCache(
+        datasets=[
+            _stub_dataset("db.legacy.stg_orders"),
+            _stub_dataset("db.other.customers"),
+        ]
+    )
+    metas = [_stub_meta("db.marts.orders")]
+    observed = _compute_observed_namespaces(metas, prior, _StubAdapter())
+    assert "db.marts" in observed
+    assert "db.legacy" in observed
+    assert "db.other" not in observed
+
+
 def test_carry_forward_relationships_still_carries_a_truly_unscoped_edge():
     from exmergo_dex_core.explore.commands import _carry_forward_relationships
 
@@ -2225,3 +2295,29 @@ def test_map_still_warns_when_every_profile_is_a_cache_hit(
         "the same warning, from carried profiles"
     )
     assert len(orphaned) == 1, orphaned
+
+
+@pytest.mark.parametrize("command", ["map", "profile"])
+def test_reserved_word_column_gets_a_quote_note(tmp_path: Path, command: str):
+    """A DuckDB column named `window` passed explore silently, then broke dbt's
+    generic tests on the first build (#651)."""
+
+    import duckdb
+
+    from exmergo_dex_core import DexEngine
+
+    warehouse = tmp_path / "reserved.duckdb"
+    conn = duckdb.connect(str(warehouse))
+    conn.execute('CREATE TABLE events (id INTEGER, "window" VARCHAR, kind VARCHAR)')
+    conn.execute("INSERT INTO events VALUES (1, 'day', 'a'), (2, 'week', 'b')")
+    conn.close()
+
+    with DexEngine(connector="duckdb", path=str(warehouse)) as engine:
+        result = engine.map() if command == "map" else engine.profile("events")
+
+    objects = result.objects if command == "map" else result.datasets
+    notes = [note for obj in objects for note in obj.data_quality]
+    reserved = [note for note in notes if "reserved words" in note]
+    assert len(reserved) == 1, notes
+    assert "window" in reserved[0] and "kind" not in reserved[0]
+    assert "quote: true" in reserved[0]

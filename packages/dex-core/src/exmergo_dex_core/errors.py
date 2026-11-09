@@ -127,7 +127,8 @@ class StatementStage(str, Enum):
     A code rather than prose because a host branches on it: an agent loop rewrites
     a statement after ``plan`` and has a different decision to make after
     ``run``. Only an adapter that can tell its two doors apart sets one (BigQuery
-    today), so an unset stage means the adapter did not say, never either value.
+    and ClickHouse today), so an unset stage means the adapter did not say, never
+    either value.
     It lives here, beside :class:`WarehouseQueryError`, for the reason that class
     does: the envelope reads it from the tier of imports that works on an install
     with no connector extra at all.
@@ -154,11 +155,12 @@ class WarehouseQueryError(DexError):
     ``detail`` is the server's own words, which is the whole diagnostic value:
     the adapter trims them to one line and caps their length before they get
     here, because a driver will happily append the statement, a caret diagram,
-    or its entire error payload. They can still quote the fragment of a value
-    that offended the server (``Invalid digit, Value 'p'``), the same way an
-    agent SQL failure's message already does; that is a diagnostic the server
-    volunteered, not a profile of the column, and suppressing it is what made
-    this class of failure undiagnosable in the first place.
+    or its entire error payload. A conversion, parse or range failure quotes the
+    value that offended the server (``Invalid digit, Value 'p'``), and that value
+    came from a row, so the adapter masks it
+    (``Invalid digit, Value <value withheld>``) and keeps every other word: what
+    failed and what type was expected stay diagnosable, and the row's value
+    never reaches an envelope (#1070, :mod:`~exmergo_dex_core.value_mask`).
 
     The adapter knows the server's words but not what the statement was for;
     only the caller that built it knows which object it was reading. So the

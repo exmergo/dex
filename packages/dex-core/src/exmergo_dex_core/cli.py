@@ -13,9 +13,7 @@ command runs against that engine and hands back a result the shim wraps in an
 envelope. Dogfooding the API this way is what stops the two surfaces drifting.
 
 ``connect test``, the ``explore`` group, the authoring surface (``transform``,
-``semantic``), and the ``maintain`` group are live. ``viz preview`` returns a
-valid envelope with status ``not_implemented`` until the Viz integration lands,
-so the contract, the wrappers, and the eval harness stay exercisable.
+``semantic``), and the ``maintain`` group are live.
 """
 
 from __future__ import annotations
@@ -82,7 +80,12 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "rename",
         "remove",
         "place",
+        # Declarations for models that already exist (#501): opt-in, one capped
+        # plan per call, repo-and-cache only.
+        "declare",
         "test",
+        # Whether a stored plan keeps a model's results (#856).
+        "compare",
         # The host boundary (#441): a plan a second process can carry and check,
         # what that plan depends on, what its edits actually contain, and what
         # the warehouse will enforce on the build that validates it. Every one is
@@ -112,7 +115,6 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # (#224), unlike every other maintain subcommand above.
         "verify",
     ],
-    "viz": ["preview"],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
     # and a file that cannot build one is exactly when these are needed.
@@ -122,6 +124,11 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     # that creates a data file, which is why it lives on its own path (see
     # `demo/warehouse.py`) rather than anywhere near a connector.
     "demo": [],
+    # procedure: the agent procedure (#502), the one text every SKILL.md and
+    # AGENTS.md carries between markers. No subcommands, and routed in `main`
+    # before an engine is built, like `config`: an agent with only the package,
+    # or a harness with no project yet, must be able to get it.
+    "procedure": [],
 }
 
 
@@ -268,10 +275,11 @@ _GROUP_HELP: dict[str, str] = {
     "transform": "author and refactor dbt models, tests, and the semantic layer",
     "semantic": "define dbt or native semantic layers as reviewable diffs",
     "maintain": "detect drift against the last snapshot and propose the fix",
-    "viz": "preview the semantic layer (not yet implemented)",
     "config": "read, check and change .dex/config.yml, as reviewable diffs",
     "demo": "create a seeded local DuckDB warehouse to try dex against "
     "(no credentials, no network)",
+    "procedure": "print the agent procedure, or the block to paste into "
+    "CLAUDE.md / AGENTS.md (no connection)",
 }
 
 #: (group, subcommand) -> (summary, description). The summary is the one line
@@ -352,7 +360,11 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
     ),
     ("transform", "deps"): (
         "install or refresh dbt packages",
-        "Run dbt deps inside the project. Repo-confined, with no warehouse spend.",
+        "Run dbt deps inside the project. It installs the packages the project "
+        "already declares in packages.yml, at the versions package-lock.yml pins "
+        "where the lockfile matches that file (dbt resolves them again where it "
+        "does not); it does not install or upgrade a tool. Repo-confined, with no "
+        "warehouse spend.",
     ),
     ("transform", "plans"): (
         "list stored plans, newest first",
@@ -387,12 +399,26 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "target, define it there, and thread it down. --explain stores no "
         "plan. Repo-only and free.",
     ),
+    ("transform", "declare"): (
+        "propose declarations for models that already exist",
+        "Store one plan proposing the measured facts (grain, keys, joins, "
+        "running totals) each selected model does not yet declare, plus any "
+        "intent the --edits-file declarations supply. Capped at 25 models; "
+        "every skipped model is named. Repo-only and free.",
+    ),
     ("transform", "test"): (
         "scaffold a unit test, or mutation-test existing tests",
         "--scaffold plans a unit_tests skeleton for a model. --mutate plants "
         "one defect at a time and reports which ones no test caught; "
         "--downstream also counts the tests of the models that read it. "
         "Mutation runs dbt on the dev target and is billed on metered connectors.",
+    ),
+    ("transform", "compare"): (
+        "compare a model before and after a stored plan",
+        "Compile the model with and without the plan, then compare output "
+        "columns and the exact row multiset on the same dev inputs. Returns "
+        "counts, never rows. equivalent holds for the compared inputs only. "
+        "Scans go through --confirm --budget on metered connectors.",
     ),
     ("transform", "export"): (
         "export a stored plan as a portable, digested document",
@@ -442,6 +468,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "configures, with SLayer's own model, then store a plan. Needs the "
         "[slayer] extra. Repo-only.",
     ),
+    ("semantic", "cube"): (
+        "plan whole-file edits to the configured Cube model files",
+        "Validate whole plain-YAML Cube model files at the paths "
+        "semantic.cube.files configures, with dex's port of Cube's model rules, "
+        "then store a plan. Needs the [cube] extra. No Cube server, no "
+        "warehouse. Repo-only.",
+    ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
         "Pin the current map and fingerprint the project layers as the "
@@ -484,10 +517,6 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "Check build status, column contracts, row population, grain and join "
         "contracts against the built relations. Mostly free metadata; view row "
         "counts and join probes are offered with an estimate.",
-    ),
-    ("viz", "preview"): (
-        "preview the semantic layer (not yet implemented)",
-        "Not yet implemented: returns a not_implemented envelope.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -547,6 +576,8 @@ ranks what matters, profiles it, and infers how the tables join.
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """The argparse tree for every group and subcommand."""
+
     parser = argparse.ArgumentParser(
         prog="dex",
         description=(
@@ -592,6 +623,20 @@ def _build_parser() -> argparse.ArgumentParser:
                 help="DuckDB file to create, refused if it exists "
                 "(default: dex_demo.duckdb)",
             )
+        if group == "procedure":
+            gp.add_argument(
+                "--block",
+                action="store_true",
+                help="also return data.block, ready to paste into CLAUDE.md or "
+                "AGENTS.md",
+            )
+            gp.add_argument(
+                "--check",
+                action="append",
+                metavar="FILE",
+                default=None,
+                help="report whether FILE carries the current procedure (repeatable)",
+            )
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
             for name in subcommands:
@@ -632,6 +677,12 @@ def _build_parser() -> argparse.ArgumentParser:
                             "setting or block to remove, including keys dex does not "
                             "read"
                         ),
+                    )
+                    sp.add_argument(
+                        "--duplicate",
+                        action="store_true",
+                        default=False,
+                        help="remove only ignored duplicate occurrences of key(s)",
                     )
                 if group == "maintain" and name == "snapshot":
                     sp.add_argument(
@@ -704,6 +755,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="DATASETS",
                         help=(
                             "run each statement once per dataset, substituted for {ds}"
+                        ),
+                    )
+                    # A model `transform build` just wrote lives in the dev
+                    # namespace, outside the source scope (#1133); this reads it
+                    # for one command, as `explore profile --target dev` does.
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "also read this dbt dev target's namespace; "
+                            "prod-looking targets are refused"
                         ),
                     )
                 if group == "explore" and name == "cluster":
@@ -918,6 +980,17 @@ def _build_parser() -> argparse.ArgumentParser:
                             "(billed)"
                         ),
                     )
+                    # A model whose only build is the dev one lives where dex
+                    # does not read (#893); this reads it for one command, as
+                    # `maintain verify --target dev` does.
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "also read this dbt dev target's namespace; "
+                            "prod-looking targets are refused"
+                        ),
+                    )
                     # Default summarizes each dataset's columns to the ones that
                     # carry a finding (#288); --columns all restores the full list.
                     sp.add_argument(
@@ -964,13 +1037,26 @@ def _build_parser() -> argparse.ArgumentParser:
                 transform_positional = {
                     "init": ("name", "name of the dbt project to create"),
                     "plan": ("intent", "one line saying what the edits are for"),
-                    "apply": ("plan-id", "plan to apply (default: latest unapplied)"),
+                    "apply": (
+                        "plan-id",
+                        "plan to apply "
+                        "(default: latest unapplied, named in data.resolved_plan)",
+                    ),
                     "macro": ("macro", "shipped macro to scaffold (omit to list them)"),
-                    "export": ("plan-id", "plan to export (default: latest unapplied)"),
-                    "ground": ("plan-id", "plan to ground (default: latest unapplied)"),
+                    "export": (
+                        "plan-id",
+                        "plan to export "
+                        "(default: latest unapplied, named in data.resolved_plan)",
+                    ),
+                    "ground": (
+                        "plan-id",
+                        "plan to ground "
+                        "(default: latest unapplied, named in data.resolved_plan)",
+                    ),
                     "classify": (
                         "plan-id",
-                        "plan to classify (default: latest unapplied)",
+                        "plan to classify "
+                        "(default: latest unapplied, named in data.resolved_plan)",
                     ),
                 }
                 if group == "transform" and name in transform_positional:
@@ -1110,6 +1196,24 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="refuse missing dbt packages instead of installing them",
                     )
+                    # Explicit because it may reach the network: an ordinary build
+                    # never reinstalls what is already there (#860).
+                    sp.add_argument(
+                        "--cold-deps",
+                        action="store_true",
+                        default=False,
+                        help="reinstall packages in an isolated copy and build from it",
+                    )
+                    # dbt's own flag, for the one case an incremental build
+                    # cannot handle: its logic changed, and the rows the old
+                    # logic wrote stay until the model is rebuilt (#1015).
+                    sp.add_argument(
+                        "--full-refresh",
+                        action="store_true",
+                        default=False,
+                        help="rebuild selected incremental models after their "
+                        "logic changed",
+                    )
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is
                     # each of these used", which is the shape of a rename. `--kind`
@@ -1207,6 +1311,90 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=False,
                         help="return the reasoning without storing a plan",
+                    )
+                if group == "transform" and name == "declare":
+                    # The selector `maintain verify` takes: model names, repeated
+                    # or comma-separated; none selects every model.
+                    sp.add_argument(
+                        "objects",
+                        nargs="*",
+                        metavar="model",
+                        help="model to declare (default: every model in the project)",
+                    )
+                    sp.add_argument(
+                        "--edits-file",
+                        default=None,
+                        metavar="FILE",
+                        help="payload whose `declarations` supply intent for the plan",
+                    )
+                    # Only ever narrows, like --max-mutants: the ceiling is what
+                    # keeps a project-wide selector a diff somebody can review.
+                    sp.add_argument(
+                        "--limit",
+                        type=int,
+                        default=None,
+                        metavar="N",
+                        help="propose at most N models (can only lower the cap of 25)",
+                    )
+                    sp.add_argument(
+                        "--intent",
+                        default=None,
+                        help="one line saying what the plan is for",
+                    )
+                if group == "transform" and name == "compare":
+                    sp.add_argument(
+                        "plan_id",
+                        nargs="?",
+                        default=None,
+                        help=(
+                            "stored plan id "
+                            "(default: latest unapplied, named in data.resolved_plan)"
+                        ),
+                    )
+                    sp.add_argument(
+                        "--model",
+                        default=None,
+                        metavar="MODEL",
+                        help="the model whose results should not change",
+                    )
+                    sp.add_argument(
+                        "--map",
+                        action="append",
+                        default=None,
+                        metavar="OLD=NEW",
+                        help="a baseline output column the plan renames (repeatable)",
+                    )
+                    sp.add_argument(
+                        "--key",
+                        action="append",
+                        default=None,
+                        metavar="COLUMN",
+                        help="baseline key column, repeatable; default: declared grain",
+                    )
+                    sp.add_argument(
+                        "--accept-type",
+                        action="append",
+                        default=None,
+                        metavar="COLUMN",
+                        help="baseline column whose type may change in its family",
+                    )
+                    expect = sp.add_mutually_exclusive_group()
+                    expect.add_argument(
+                        "--expect",
+                        default=None,
+                        metavar="JSON",
+                        help="JSON: the rows the plan may add, remove and change",
+                    )
+                    expect.add_argument(
+                        "--expect-file",
+                        default=None,
+                        metavar="PATH",
+                        help='read --expect\'s JSON from a file ("-" reads stdin)',
+                    )
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help="dbt dev target to read; prod-looking targets are refused",
                     )
                 if group == "transform" and name == "test":
                     # Two modes, and they are opposites: `--scaffold` writes a
@@ -1351,6 +1539,15 @@ def _build_parser() -> argparse.ArgumentParser:
                             "dbt selector to verify (default: the whole project)"
                             if name == "verify"
                             else "object to check (default: the whole project)"
+                        ),
+                    )
+                if group == "maintain" and name == "verify":
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "dbt dev target to verify against; "
+                            "prod-looking targets are refused"
                         ),
                     )
                 if group == "maintain" and name == "reconcile":
@@ -1513,7 +1710,9 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "rename"): "cmd_rename",
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
+        ("transform", "declare"): "cmd_declare",
         ("transform", "test"): "cmd_test",
+        ("transform", "compare"): "cmd_compare",
         ("transform", "export"): "cmd_export",
         ("transform", "ground"): "cmd_ground",
         ("transform", "classify"): "cmd_classify",
@@ -1556,7 +1755,10 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # gating it on the dialect engine would make the offline apply need a
         # dependency it never uses, in the one environment least able to install
         # one.
-        if getattr(args, "plan_file", None):
+        # `is not None`, not truthiness: `--plan-file ""` (an empty substitution)
+        # must reach the document path's refusal, not fall through to applying
+        # the latest stored plan (#1103).
+        if getattr(args, "plan_file", None) is not None:
             from .transform.commands import cmd_apply_document
 
             return cmd_apply_document(args, engine)
@@ -1590,7 +1792,7 @@ def _apply_authors_sql(args: argparse.Namespace, engine: Any) -> bool:
     try:
         store = engine.require_full_store("applying a plan")
         plan_id = getattr(args, "argument", None)
-        if not plan_id:
+        if plan_id is None:
             latest = store.latest_plan(None)
             if latest is None:
                 return True
@@ -1685,6 +1887,13 @@ def main(argv: list[str] | None = None) -> int:
 
             require_allowed(result_mode, _command_label(args))
             envelope = cmd_config(args)
+        elif args.group == "procedure":
+            # No engine either: the procedure is package data, and it must reach
+            # an agent before any project, config or connector exists (#502).
+            from .procedure.commands import cmd_procedure
+
+            require_allowed(result_mode, _command_label(args))
+            envelope = cmd_procedure(args)
         else:
             # One engine per process, built from the resolved repo root. The default
             # backend is what lets the subcommands stay stateless across invocations:

@@ -26,6 +26,7 @@ from exmergo_dex_core.adapters.databricks import (
 )
 from exmergo_dex_core.config import DatabricksTarget
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -483,6 +484,7 @@ def _aggregate_resolver(sql: str):
     for i in range(10):
         values[f"nn_{i}"] = 100
         values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"d_{i}"] = 100 if i == 0 else 40
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
     return [values]
@@ -594,22 +596,63 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_databricks)
     assert data_statements(fake_databricks) == []
 
 
+def test_profile_never_counts_a_skipped_column_exactly(fake_databricks):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = _aggregate_resolver
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    columns = {c.name: c for c in profile(adapter, ["shop.core.events"])[0].columns}
+    for name in ("payload", "labels"):
+        assert columns[name].null_fraction == 0.0
+        assert columns[name].distinct_count is None
+    statements = [s.sql for s in data_statements(fake_databricks)]
+    assert "COUNT(DISTINCT `payload`)" not in " ".join(statements)
+    assert "COUNT(DISTINCT `labels`)" not in " ".join(statements)
+
+
+def test_exact_distinct_counts_ride_with_count_star(fake_databricks):
+    """exact distinct count selects count(*) to refresh the row count (#946)."""
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [{"n_total": 120, "d_0": 120}]
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    counts = adapter.exact_distinct_counts("shop.core.customers", ["id"])
+    assert counts == {"id": 120}
+    stmts = data_statements(fake_databricks)
+    assert len(stmts) == 1
+    sql = stmts[0].sql
+    assert "COUNT(*) AS n_total" in sql
+    assert "COUNT(DISTINCT `id`) AS d_0" in sql
+    meta, _ = adapter.table_metadata("shop.core.customers")
+    assert meta.row_count == 120
+
+
 def test_distinct_combination_counts_batch_into_one_guarded_statement(
     fake_databricks,
 ):
+    """composite distinct probe selects count(*) to refresh the row count (#946)."""
+
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     warm(fake_databricks)
-    fake_databricks.connection.row_resolver = lambda sql: [{"d_0": 97, "d_1": 100}]
+    fake_databricks.connection.row_resolver = lambda sql: [
+        {"n_total": 137, "d_0": 97, "d_1": 100}
+    ]
     adapter = make_adapter(fake_databricks, ceiling=100_000.0)
     counts = adapter.distinct_combination_counts(
         "shop.core.customers", [["id", "email"], ["email", "id"]]
     )
     assert counts == {("id", "email"): 97, ("email", "id"): 100}
+    meta, _ = adapter.table_metadata("shop.core.customers")
+    assert meta.row_count == 137
     stmts = data_statements(fake_databricks)
     assert len(stmts) == 1
-    assert "SELECT DISTINCT" in stmts[0].sql
-    assert assert_select_only(stmts[0].sql, dialect="databricks") == stmts[0].sql
+    sql = stmts[0].sql
+    assert "(SELECT COUNT(*) FROM `shop`.`core`.`customers`) AS n_total" in sql
+    assert "SELECT DISTINCT" in sql
+    assert assert_select_only(sql, dialect="databricks") == sql
     assert adapter.distinct_combination_counts("shop.core.customers", []) == {}
 
 
@@ -628,6 +671,72 @@ def test_distinct_combination_counts_degrade_when_budget_cannot_cover(
         for note in adapter.table_notes("shop.core.customers")
     )
     assert data_statements(fake_databricks) == []
+
+
+def test_databricks_distinct_probes_judge_key_and_join_without_numrows(
+    fake_databricks,
+):
+    """tables with no numrows from describe detail capture row count during
+    distinct probes so maintain grain detects lost keys and join fanout
+    without warnings (#946)."""
+
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.drift import (
+        GrainPlan,
+        JoinCardinalityCheck,
+        grain_drift,
+    )
+
+    warm(fake_databricks)
+    # simulate a databricks table whose describe detail has no numrows
+    for t in fake_databricks.connection.tables:
+        if t.identifier == "shop.core.customers":
+            t.rows = None
+
+    def resolver(sql: str) -> list[dict]:
+        """simulated query results for distinct and row count probes (#946)."""
+        if "SELECT DISTINCT" in sql or "d_0" in sql:
+            return [{"n_total": 50, "d_0": 45}]
+        return [{"n_total": 50}]
+
+    fake_databricks.connection.row_resolver = resolver
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+
+    dataset = Dataset(
+        identifier="shop.core.customers",
+        grain=["id"],
+        candidate_keys=[["id"]],
+    )
+    plan = GrainPlan(
+        key_checks=[(dataset, ["id"], None)],
+        fanout_pairs=[],
+        composite_checks=[],
+        declared_composite_checks=[],
+        notes=[],
+        join_cardinality_checks=[
+            JoinCardinalityCheck(
+                relationship="orders->customers:customer_id=id",
+                cardinality="many_to_one",
+                model="orders",
+                to_model="customers",
+                side_model="customers",
+                identifier="shop.core.customers",
+                columns=["id"],
+                row_count=None,
+            )
+        ],
+    )
+    findings = grain_drift(adapter, plan, min_rows=10)
+    codes = {f.code for f in findings}
+    assert "key_lost_uniqueness" in codes
+    assert "join_cardinality_exceeded" in codes
+    assert not any("nothing counted" in note for note in plan.notes)
+    (key_finding,) = [f for f in findings if f.code == "key_lost_uniqueness"]
+    assert key_finding.data["distinct_count"] == 45
+    assert key_finding.data["row_count"] == 50
+    (join_finding,) = [f for f in findings if f.code == "join_cardinality_exceeded"]
+    assert join_finding.data["distinct_count"] == 45
+    assert join_finding.data["row_count"] == 50
 
 
 def test_value_domain_counts_batch_into_one_guarded_statement(fake_databricks):

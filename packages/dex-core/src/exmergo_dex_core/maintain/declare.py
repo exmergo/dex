@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from ..adapters.project import PlacingProject
 from ..cache import ColumnProfile
@@ -419,7 +419,11 @@ class DeclarationEdits:
                     "make the change by hand or with `transform plan`"
                 )
                 continue
-            original = self._view.files[path].content if self._original(path) else None
+            original = (
+                self._view.files[path].content
+                if (self._view and self._original(path))
+                else None
+            )
             if original is not None and content == original:
                 continue
             built.append(PlanEdit(path=path, kind=staged.kind, new_content=content))
@@ -498,7 +502,7 @@ class DeclarationEdits:
                 return f"'{model}' declares {found} rather than {columns}"
         for (model, column), wanted in staged.tests.items():
             entry = entries.get(model, {})
-            found = next(
+            found_col = next(
                 (
                     c
                     for c in entry.get("columns") or []
@@ -506,11 +510,11 @@ class DeclarationEdits:
                 ),
                 None,
             )
-            if found is None:
+            if found_col is None:
                 return f"'{model}.{column}' is no longer declared"
             listed = [
                 t if isinstance(t, str) else next(iter(t), "")
-                for t in (found.get("tests") or found.get("data_tests") or [])
+                for t in (found_col.get("tests") or found_col.get("data_tests") or [])
             ]
             if listed != wanted:
                 return f"'{model}.{column}' tests are {listed} rather than {wanted}"

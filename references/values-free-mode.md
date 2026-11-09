@@ -148,7 +148,12 @@ mode, an error reaching the caller carries its class (`reason`) and a stable cod
 | Any other refusal dex wrote | unchanged words (they name objects, columns, numbers and fixes) and a code |
 
 The replacement does not chain the original, so a traceback does not print the
-words it exists to drop. The query ledger records the code in place of the words
+words it exists to drop. A refusal a command catches and reports rather than
+raises is held to the same rule: a join probe `explore relationships --verify`
+or `explore map --verify` could not run names the edge and the exception type,
+never the warehouse's message, in the notes and in the dataset's
+`data_quality`. Outside the mode those words are kept with any value they quote
+masked ([`pii-policy.md`](pii-policy.md#warehouse-error-text)). The query ledger records the code in place of the words
 too. It still records each statement's SQL, which is the agent's own text.
 
 ## The cache
@@ -168,6 +173,7 @@ release it pins:
 
 ```python
 from exmergo_dex_core.values_free_conformance import ValuesFreeContract
+
 
 class TestDexValuesFree(ValuesFreeContract):
     pass
@@ -195,3 +201,18 @@ query count per run.
 - **Small counts.** A count of one identifies a row.
 - **An aggregate over one row is that row's value.** `select avg(salary) from t
   where id = 42` is accepted and returns a salary.
+
+## Population prose in local catalogs
+
+Ossie, SLayer and Cube catalogs, and the local dbt catalog
+(`explore semantic list --local`, read from `target/semantic_manifest.json`),
+omit Dex-generated population sentences in every result mode, including sentences
+in existing files and compiled artifacts, with no rebuild. Catalog reads are
+connectionless and cannot establish that population values are safe. The authored
+description prefix is preserved when the generated suffix matches its structured
+`dex.population` metadata. A stale or malformed suffix causes the description to
+be withheld with a value-free note. This happens before catalog search. Files and
+drift fingerprints are unchanged. Use `explore profile|map --use-project` for the
+structured population, screened by the declaration withholding policy. A
+description with no `dex.population` metadata is never edited, even when it says
+`Population:`. The hosted dbt Cloud catalog is not covered.

@@ -9,11 +9,13 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.row_attribution import (
     MAX_CHANGES_PER_MODEL,
     UnattributableError,
+    classify,
     naming_resolver,
     render_model_sql,
 )
@@ -181,6 +183,127 @@ def test_an_added_source_relation_is_reported_on_the_same_footing(
     assert added[0]["delta"] is not None
 
 
+def test_a_join_to_an_existing_cte_is_reported_and_measured(
+    attributable_project, plan_edit, capsys
+):
+    """Restoring an inner join to a CTE (e.g. to deduplicate rows) is reported
+    as a join change with its measured delta, rather than dropped because the
+    relation is a CTE."""
+
+    repo, warehouse = attributable_project
+    cte_model_without_join = (
+        "{{ config(materialized='table') }}\n"
+        "with latest as (\n"
+        "    select customer_id, max(order_id) as latest_order_id\n"
+        "    from {{ source('raw', 'raw_orders') }}\n"
+        "    group by customer_id\n"
+        "),\n"
+        "base as (\n"
+        "    select * from {{ source('raw', 'raw_orders') }}\n"
+        ")\n"
+        "select base.order_id, base.customer_id, base.total_revenue\n"
+        "from base\n"
+    )
+    cte_model_with_join = cte_model_without_join.replace(
+        "from base\n",
+        "from base\ninner join latest on base.order_id = latest.latest_order_id\n",
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(
+        cte_model_without_join, encoding="utf-8"
+    )
+    payload = plan_edit(cte_model_with_join)
+    model = _attribution(_plan(repo, warehouse, payload, capsys))
+    added = _by_kind(model, "join_added")
+    assert len(added) == 1, model["changes"]
+    assert "latest" in added[0]["detail"]
+    assert added[0]["attributed"] is True
+    assert added[0]["delta"] is not None
+    assert added[0]["delta"] < 0, "deduplicating join reduces rows"
+    assert model["net_delta"] == added[0]["delta"]
+
+
+def test_a_model_over_an_inline_values_list_is_measured(
+    attributable_project, plan_edit, capsys
+):
+    """A comparison-window model builds its windows with ``cross join (values
+    ...)``. The list is self-contained, so attribution counts the model as it
+    counts one over a CTE, rather than refusing every change on it as reading an
+    unsupported source."""
+
+    repo, warehouse = attributable_project
+    windowed_model = (
+        "{{ config(materialized='table') }}\n"
+        "with base as (\n"
+        "    select raw_orders.*, windows.window_days\n"
+        "    from {{ source('raw', 'raw_orders') }}\n"
+        "    cross join (values (7), (28)) as windows (window_days)\n"
+        "    where status != 'CANCELLED' and total_revenue > 0\n"
+        ")\n"
+        "select order_id, customer_id, total_revenue, window_days from base\n"
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(windowed_model, encoding="utf-8")
+    payload = plan_edit(
+        windowed_model.replace(
+            "where status != 'CANCELLED' and total_revenue > 0",
+            "where not is_cancelled and total_revenue > 0",
+        )
+    )
+    model = _attribution(_plan(repo, warehouse, payload, capsys))
+    swap = _by_kind(model, "predicate_replaced")
+    assert len(swap) == 1, model["changes"]
+    assert swap[0]["attributed"] is True, swap[0]
+    assert swap[0]["delta"] not in (None, 0)
+    assert swap[0]["rows"] == model["baseline_rows"] + swap[0]["delta"]
+    # Every order appears once per window, so the whole model is counted too.
+    assert model["baseline_rows"] is not None and model["baseline_rows"] % 2 == 0
+    assert model["net_delta"] == model["authored_rows"] - model["baseline_rows"]
+
+
+def test_attribution_after_built_relation_and_project_drift(
+    attributable_project, plan_edit, capsys
+):
+    """A model built into the warehouse that has drifted from the authored SQL
+    in the project still reports row attribution when edited."""
+
+    duckdb = pytest.importorskip("duckdb")
+    repo, warehouse = attributable_project
+    conn = duckdb.connect(str(warehouse))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS fct_orders AS "
+        "SELECT order_id, customer_id, total_revenue "
+        "FROM raw_orders WHERE total_revenue > 0"
+    )
+    conn.close()
+
+    drifted_sql = (
+        "{{ config(materialized='table') }}\n"
+        "with latest as (\n"
+        "    select customer_id, max(order_id) as latest_order_id\n"
+        "    from {{ source('raw', 'raw_orders') }}\n"
+        "    group by customer_id\n"
+        "),\n"
+        "base as (\n"
+        "    select * from {{ source('raw', 'raw_orders') }}\n"
+        ")\n"
+        "select base.order_id, base.customer_id, base.total_revenue\n"
+        "from base\n"
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(drifted_sql, encoding="utf-8")
+
+    restored_sql = drifted_sql.replace(
+        "from base\n",
+        "from base\ninner join latest on base.order_id = latest.latest_order_id\n",
+    )
+    payload = plan_edit(restored_sql)
+    envelope = _plan(repo, warehouse, payload, capsys)
+    assert "row_attribution" in envelope["data"]
+    model = _attribution(envelope)
+    added = _by_kind(model, "join_added")
+    assert len(added) == 1, model["changes"]
+    assert added[0]["attributed"] is True
+    assert added[0]["delta"] is not None
+
+
 def test_a_changed_driving_relation_is_reported(
     attributable_project, plan_edit, capsys
 ):
@@ -308,6 +431,12 @@ def test_a_jinja_conditional_says_it_could_not_be_attributed(
     attributable_project, plan_edit, capsys
 ):
     repo, warehouse = attributable_project
+    # Control-flow validation now compiles against a coherent, existing dev
+    # target; the attribution itself remains static and reports its limitation.
+    profile_path = repo / "analytics" / "profiles.yml"
+    profiles = yaml.safe_load(profile_path.read_text())
+    profiles["shop"]["outputs"]["dev"]["path"] = str(warehouse)
+    profile_path.write_text(yaml.safe_dump(profiles))
     payload = plan_edit(
         PRIOR_MODEL.replace(
             "and total_revenue > 0",
@@ -438,6 +567,332 @@ def test_a_free_connector_measures_without_being_asked(
     model = _attribution(_plan(repo, warehouse, payload, capsys))
     assert model["baseline_rows"] is not None
     assert any(c["delta"] is not None for c in model["changes"])
+
+
+# --- set operations (#1163) ------------------------------------------------------
+
+#: A UNION ALL inside a CTE. Attribution compares SELECT with SELECT, so a
+#: predicate added to one branch used to report nothing at all.
+UNION_CTE_MODEL = """{{ config(materialized='table') }}
+with base as (
+    select order_id, customer_id, total_revenue
+    from {{ source('raw', 'raw_orders') }}
+    where status != 'CANCELLED'
+    union all
+    select order_id, customer_id, total_revenue
+    from {{ source('raw', 'raw_orders') }}
+    where is_cancelled
+)
+select order_id, customer_id, total_revenue from base
+"""
+
+#: The same UNION ALL as the final select.
+UNION_FINAL_MODEL = """{{ config(materialized='table') }}
+select order_id, customer_id, total_revenue
+from {{ source('raw', 'raw_orders') }}
+where status != 'CANCELLED'
+union all
+select order_id, customer_id, total_revenue
+from {{ source('raw', 'raw_orders') }}
+where is_cancelled
+"""
+
+
+def _set_operation_entry(model: dict, scope: str) -> dict:
+    (entry,) = _by_kind(model, "unattributable")
+    assert entry["scope"] == scope
+    assert entry["attributed"] is False
+    assert entry["detail"] == (
+        f"the set operation in `{scope}` changed and its branches were not compared"
+    )
+    assert "UNION, INTERSECT or EXCEPT" in entry["reason"]
+    return entry
+
+
+def _static_attribution(envelope: dict) -> str:
+    (entry,) = envelope["data"]["refactor_comparison_offer"]["per_model"]
+    assert entry["model"] == "fct_orders"
+    return entry["static_attribution"]
+
+
+def test_a_where_added_in_one_branch_of_a_union_cte_is_unattributable(
+    attributable_project, plan_edit, capsys
+):
+    repo, warehouse = attributable_project
+    (repo / "analytics" / MODEL_PATH).write_text(UNION_CTE_MODEL, encoding="utf-8")
+    payload = plan_edit(
+        UNION_CTE_MODEL.replace(
+            "where is_cancelled", "where is_cancelled and total_revenue > 0"
+        )
+    )
+    envelope = _plan(repo, warehouse, payload, capsys)
+    model = _attribution(envelope)
+    assert len(model["changes"]) == 1, model["changes"]
+    _set_operation_entry(model, "base")
+    # The whole-model net still says how much moved.
+    assert model["net_delta"] is not None
+    assert _static_attribution(envelope) == "unattributed"
+    assert envelope["data"]["refactor_comparison_offer"]["recommended_before_apply"]
+
+
+def test_a_where_added_in_one_branch_of_a_union_final_select_is_unattributable(
+    attributable_project, plan_edit, capsys
+):
+    repo, warehouse = attributable_project
+    (repo / "analytics" / MODEL_PATH).write_text(UNION_FINAL_MODEL, encoding="utf-8")
+    payload = plan_edit(
+        UNION_FINAL_MODEL.replace(
+            "where is_cancelled", "where is_cancelled and total_revenue > 0"
+        )
+    )
+    envelope = _plan(repo, warehouse, payload, capsys)
+    model = _attribution(envelope)
+    assert len(model["changes"]) == 1, model["changes"]
+    _set_operation_entry(model, "(final select)")
+    assert model["net_delta"] is not None
+    assert _static_attribution(envelope) == "unattributed"
+
+
+def test_an_unchanged_union_scope_reports_nothing(
+    attributable_project, plan_edit, capsys
+):
+    """An edit beside the UNION, to column expressions only, moves no rows and
+    must not be reported because a set operation is present."""
+
+    repo, warehouse = attributable_project
+    (repo / "analytics" / MODEL_PATH).write_text(UNION_CTE_MODEL, encoding="utf-8")
+    payload = plan_edit(
+        UNION_CTE_MODEL.replace(
+            "select order_id, customer_id, total_revenue from base",
+            "select order_id, customer_id, round(total_revenue, 1) as revenue\n"
+            "from base",
+        )
+    )
+    envelope = _plan(repo, warehouse, payload, capsys)
+    assert envelope["status"] == "ok"
+    assert "row_attribution" not in envelope["data"]
+    assert _static_attribution(envelope) == "none"
+
+
+@pytest.mark.parametrize("operator", ["union all", "union", "intersect", "except"])
+def test_every_set_operation_is_named_when_a_branch_changes(operator):
+    branches = f"select id from orders_a {operator} select id from orders_b"  # noqa: S608
+    prior = f"with merged as ({branches})\nselect id from merged\n"
+    changes, unresolved = classify(
+        prior, prior.replace("from orders_b", "from orders_b where active"), "duckdb"
+    )
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [("merged", "unattributable")]
+
+
+@pytest.mark.parametrize(
+    ("prior", "authored"),
+    [
+        (
+            "select id from orders_a",
+            "select id from orders_a union all select id from orders_b",
+        ),
+        (
+            "select id from orders_a union all select id from orders_b",
+            "select id from orders_a",
+        ),
+    ],
+    ids=["select_to_union", "union_to_select"],
+)
+def test_a_scope_that_becomes_or_stops_being_a_set_operation_is_named(prior, authored):
+    changes, unresolved = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+def test_a_union_that_only_drops_qualifiers_or_recases_reports_nothing():
+    prior = (
+        "select orders_a.id from orders_a union all select orders_b.id from orders_b"
+    )
+    authored = "select ID from orders_a union all select id from orders_b"
+    assert classify(prior, authored, "duckdb") == ([], [])
+
+
+def test_a_union_branch_whose_string_literal_is_recased_is_named():
+    """Identifier case is folded, string literals are not: ``'OPEN'`` and
+    ``'open'`` can select different rows."""
+
+    prior = (
+        "select id from orders_a where status = 'OPEN'\n"
+        "union all select id from orders_b"
+    )
+    authored = prior.replace("'OPEN'", "'open'")
+    changes, unresolved = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+def test_a_union_branch_whose_quoted_identifier_is_recased_is_named():
+    """A quoted identifier keeps its case: in Postgres ``"Status"`` and
+    ``"status"`` are two columns, so the edit can select different rows."""
+
+    prior = (
+        'select id from orders_a where "Status" = 1\nunion all select id from orders_b'
+    )
+    authored = prior.replace('"Status"', '"status"')
+    changes, unresolved = classify(prior, authored, "postgres")
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+def test_a_union_that_requotes_nothing_and_recases_unquoted_names_reports_nothing():
+    prior = (
+        'select ID from orders_a where "Status" = 1\nunion all select id from orders_b'
+    )
+    authored = prior.replace("select ID", "select id")
+    assert classify(prior, authored, "postgres") == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("prior", "authored"),
+    [
+        (
+            'select id from orders_a where "IsActive"(id)\n'
+            "union all select id from orders_b",
+            'select id from orders_a where "isactive"(id)\n'
+            "union all select id from orders_b",
+        ),
+        (
+            'select "A".id from orders "A" join flags "a" on "A".id = "a".id\n'
+            'where "A".active union all select id from orders_b',
+            'select "A".id from orders "A" join flags "a" on "A".id = "a".id\n'
+            'where "a".active union all select id from orders_b',
+        ),
+    ],
+    ids=["quoted_function", "quoted_alias"],
+)
+def test_a_union_branch_whose_quoted_name_is_recased_is_named(prior, authored):
+    """A quoted function name or alias keeps its case: ``"IsActive"(id)`` and
+    ``"isactive"(id)`` can call two functions, and ``"A"`` and ``"a"`` can
+    alias the two sides of one join."""
+
+    changes, unresolved = classify(prior, authored, "postgres")
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+def test_a_union_branch_whose_unquoted_function_is_recased_reports_nothing():
+    prior = (
+        "select id from orders_a where IsActive(id)\nunion all select id from orders_b"
+    )
+    authored = prior.replace("IsActive", "isactive")
+    assert classify(prior, authored, "postgres") == ([], [])
+
+
+#: One UNION branch joins two relations that both carry ``active``.
+JOINED_UNION = (
+    "select a.id from orders a join flags b on a.id = b.id where {}\n"
+    "union all select id from orders_b"
+)
+
+
+def test_a_union_branch_reading_the_other_join_side_is_named():
+    """``a.active`` and ``b.active`` are different columns: dropping the
+    qualifier would read the edit as notation."""
+
+    changes, unresolved = classify(
+        JOINED_UNION.format("a.active"), JOINED_UNION.format("b.active"), "duckdb"
+    )
+    assert changes == []
+    assert [(u.scope, u.kind) for u in unresolved] == [
+        ("(final select)", "unattributable")
+    ]
+
+
+@pytest.mark.parametrize(
+    "authored",
+    [
+        JOINED_UNION.format("a.active")
+        .replace("orders a", "orders o")
+        .replace("a.", "o."),
+        "select l.id from orders l join flags r on l.id = r.id where l.active\n"
+        "union all select id from orders_b",
+    ],
+    ids=["renamed_alias", "renamed_both_aliases"],
+)
+def test_a_joined_union_branch_that_only_renames_aliases_reports_nothing(authored):
+    prior = JOINED_UNION.format("a.active")
+    assert classify(prior, authored, "duckdb") == ([], [])
+
+
+def test_a_self_joined_union_branch_reading_the_other_side_is_named():
+    prior = (
+        "select l.id from orders l join orders r on l.parent_id = r.id where {}\n"
+        "union all select id from orders_b"
+    )
+    changes, unresolved = classify(
+        prior.format("l.active"), prior.format("r.active"), "duckdb"
+    )
+    assert changes == []
+    assert [u.scope for u in unresolved] == ["(final select)"]
+
+
+#: A UNION branch whose EXISTS subquery reads one relation and correlates to
+#: the outer select.
+CORRELATED_UNION = (
+    "select a.id from orders a join orders_b b on a.k = b.k\n"
+    "where exists (select 1 from flags f where f.id = {})\n"
+    "union all select id from orders_c"
+)
+
+
+@pytest.mark.parametrize(
+    ("prior", "authored"),
+    [
+        (CORRELATED_UNION.format("a.id"), CORRELATED_UNION.format("b.id")),
+        (CORRELATED_UNION.format("a.id"), CORRELATED_UNION.format("f.id")),
+        (
+            "select a.id from orders a\n"
+            "where exists (select 1 from flags f where f.id = a.id)\n"
+            "union all select id from orders_c",
+            "select a.id from orders a\n"
+            "where exists (select 1 from flags f where f.id = f.id)\n"
+            "union all select id from orders_c",
+        ),
+    ],
+    ids=["outer_join_side", "outer_to_inner", "single_outer_to_inner"],
+)
+def test_a_correlated_reference_moved_in_a_union_branch_is_named(prior, authored):
+    """A qualifier that names an outer relation is resolved there, not dropped
+    because the subquery itself reads one relation."""
+
+    changes, unresolved = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert [u.scope for u in unresolved] == ["(final select)"]
+
+
+def test_a_correlated_union_branch_that_only_renames_the_outer_alias_reports_nothing():
+    prior = CORRELATED_UNION.format("a.id")
+    authored = prior.replace("orders a ", "orders o ").replace("a.", "o.")
+    assert classify(prior, authored, "duckdb") == ([], [])
+
+
+def test_a_set_operation_beside_an_isolable_change_keeps_both():
+    prior = (
+        "with merged as (select id from orders_a union all select id from orders_b)\n"
+        "select id from merged where id > 0\n"
+    )
+    authored = prior.replace("from orders_b", "from orders_b where active").replace(
+        "id > 0", "id > 1"
+    )
+    changes, unresolved = classify(prior, authored, "duckdb")
+    assert [(c.scope, c.kind) for c in changes] == [
+        ("(final select)", "predicate_replaced")
+    ]
+    assert [u.scope for u in unresolved] == ["merged"]
 
 
 # --- the rendering seam ----------------------------------------------------------

@@ -1,0 +1,60 @@
+{
+  "models": {
+    "rpt_team_activity": {
+      "grain": [
+        "team_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "team_id": {
+          "role": "key"
+        },
+        "member_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "active_member_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "event_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every team is present",
+      "expect": 12,
+      "sql": "select count(*) from main.rpt_team_activity"
+    },
+    {
+      "name": "no member was dropped to make the build pass",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.members) - (select sum(member_count) from main.rpt_team_activity)"
+    },
+    {
+      "name": "active members are the ones who have not left",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.members where left_on is null) - (select sum(active_member_count) from main.rpt_team_activity)"
+    },
+    {
+      "name": "event counts are unchanged",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.events) - (select sum(event_count) from main.rpt_team_activity)"
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true
+  }
+}

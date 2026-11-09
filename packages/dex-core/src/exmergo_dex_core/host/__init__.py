@@ -73,17 +73,25 @@ _EXPORTS = {
     "BuildCoverage": "transform.evidence",
     "BuildDigests": "transform.evidence",
     "BuildEvidence": "transform.evidence",
+    "BuildEvidenceError": "transform.evidence",
     "BuildNode": "transform.evidence",
     "BuildOutcome": "transform.evidence",
     "BuildSelection": "transform.evidence",
     "PlanDrift": "transform.evidence",
     "build_evidence": "transform.evidence",
     "plan_drift": "transform.evidence",
+    "recompute_outcome": "transform.evidence",
     "required_nodes": "transform.evidence",
+    "verify_build_evidence": "transform.evidence",
+    # What a build established, bounded to lead its payload (#855).
+    "BuildCompletion": "transform.completion",
+    "COMPLETION_BUDGET_BYTES": "transform.completion",
+    "summarize_completion": "transform.completion",
     # What a guarded build may install and may run.
     "DeclaredPackage": "transform.build",
     "DependencyPolicy": "transform.build",
     "MissingPackagesError": "transform.build",
+    "PlanDeclaresMissingPackagesError": "transform.build",
     "declared_packages": "transform.build",
     "installed_packages": "transform.build",
     "missing_packages": "transform.build",
@@ -139,6 +147,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         DeclaredPackage,
         DependencyPolicy,
         MissingPackagesError,
+        PlanDeclaresMissingPackagesError,
         declared_packages,
         installed_packages,
         missing_packages,
@@ -151,17 +160,25 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         classify_content,
         classify_edit,
     )
+    from ..transform.completion import (
+        COMPLETION_BUDGET_BYTES,
+        BuildCompletion,
+        summarize_completion,
+    )
     from ..transform.evidence import (
         BuildCoverage,
         BuildDigests,
         BuildEvidence,
+        BuildEvidenceError,
         BuildNode,
         BuildOutcome,
         BuildSelection,
         PlanDrift,
         build_evidence,
         plan_drift,
+        recompute_outcome,
         required_nodes,
+        verify_build_evidence,
     )
     from ..transform.grounding import (
         AmbiguousReference,
@@ -198,14 +215,17 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
 #: contract without executing anything. `tests/test_host_contract.py` asserts the
 #: two stay in step and that every name resolves.
 __all__ = [
+    "COMPLETION_BUDGET_BYTES",
     "PLAN_DOCUMENT_SCHEMA_VERSION",
     "AmbiguousReference",
     "ArtifactClass",
     "ArtifactClassification",
     "ArtifactSignal",
+    "BuildCompletion",
     "BuildCoverage",
     "BuildDigests",
     "BuildEvidence",
+    "BuildEvidenceError",
     "BuildNode",
     "BuildOutcome",
     "BuildSelection",
@@ -225,6 +245,7 @@ __all__ = [
     "MissingReference",
     "NotSelectOnlyError",
     "Paradigm",
+    "PlanDeclaresMissingPackagesError",
     "PlanDigestMismatchError",
     "PlanDocumentError",
     "PlanDrift",
@@ -258,9 +279,12 @@ __all__ = [
     "plan_document",
     "plan_drift",
     "reason_for",
+    "recompute_outcome",
     "required_nodes",
     "source_digest",
+    "summarize_completion",
     "unverifiable_packages",
+    "verify_build_evidence",
     "verify_plan_document",
 ]
 

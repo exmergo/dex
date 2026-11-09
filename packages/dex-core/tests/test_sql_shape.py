@@ -96,6 +96,9 @@ def test_equality_columns_of_no_condition_is_empty():
         ),
         ("select * from t semi join u on t.id = u.id", "a semi join"),
         ("select * from t anti join u on t.id = u.id", "a anti join"),
+        ("select count(*) from t", "a scalar aggregate"),
+        ("select count(distinct a) as n from t", "a scalar aggregate"),
+        ("select sum(a), max(b) from t", "a scalar aggregate"),
     ],
 )
 def test_reducing_clauses_names_every_honest_reason_to_hold_fewer_rows(
@@ -106,6 +109,36 @@ def test_reducing_clauses_names_every_honest_reason_to_hold_fewer_rows(
 
 def test_a_plain_projection_has_no_reason_to_hold_fewer_rows():
     assert sql_shape.reducing_clauses(_parse("select a, b from t")) == []
+
+
+def test_a_window_aggregate_is_not_a_scalar_aggregate():
+    """COUNT(*) OVER () keeps one row per input; it must not silence real
+    row loss the way a collapsing COUNT(*) would (#1098)."""
+
+    assert sql_shape.reducing_clauses(_parse("select count(*) over () from t")) == []
+    assert (
+        sql_shape.reducing_clauses(
+            _parse("select a, count(*) over (partition by a) from t")
+        )
+        == []
+    )
+
+
+def test_an_aggregate_inside_a_scalar_subquery_does_not_reduce_the_outer_select():
+    """The subquery collapses its own input; the outer select still projects
+    one row per driving row (#1098)."""
+
+    assert (
+        sql_shape.reducing_clauses(
+            _parse("select a, (select count(*) from u) as n from t")
+        )
+        == []
+    )
+
+
+def test_a_grouped_aggregate_is_named_as_group_by_not_a_scalar_aggregate():
+    clauses = sql_shape.reducing_clauses(_parse("select a, count(*) from t group by a"))
+    assert clauses == ["a GROUP BY"]
 
 
 def test_an_ordinary_join_is_not_a_reducing_clause():
@@ -186,3 +219,185 @@ def test_set_predicates_rebuilds_each_clause_it_can_read(clause):
 def test_group_by_reports_its_expressions_as_written():
     tree = _parse("select a, count(*) from t group by a")
     assert sql_shape.group_by(tree) == ["a"]
+
+
+def test_bigquery_group_by_alias_expands_only_in_the_outer_query_scope():
+    """An outer alias must not replace a same-named nested-query column."""
+
+    tree = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers "
+        "group by (select last_name from archive)",
+        read="bigquery",
+    )
+
+    (key,) = sql_shape.group_by_key(tree, "bigquery")
+
+    assert "upper" not in key.lower()
+    assert "last_name" in key.lower()
+
+
+def test_bigquery_group_by_outer_projection_alias_keeps_its_expression():
+    """The projection alias expands before source-column canonicalization."""
+
+    alias = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers group by last_name",
+        read="bigquery",
+    )
+    source_column = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers group by singers.last_name",
+        read="bigquery",
+    )
+
+    (alias_key,) = sql_shape.group_by_key(alias, "bigquery")
+    (source_key,) = sql_shape.group_by_key(source_column, "bigquery")
+
+    assert "upper" in alias_key.lower()
+    assert alias_key != source_key
+
+
+def test_scopes_includes_set_operation_ctes():
+    sql = (
+        "with named as (select 1 as a), "
+        "residual as (select 2 as a), "
+        "combined as (select * from named union all select * from residual) "
+        "select * from combined"
+    )
+    scopes = sql_shape.scopes(_parse(sql))
+    assert set(scopes) == {"named", "residual", "combined", sql_shape.MAIN_SCOPE}
+    assert isinstance(scopes["combined"], sql_shape.SET_OPERATIONS)
+
+
+def test_select_branches_flattens_set_operations():
+    plain = _parse("select 1")
+    assert len(sql_shape.select_branches(plain)) == 1
+
+    union = _parse("select 1 union all select 2 union all select 3")
+    branches = sql_shape.select_branches(union)
+    assert len(branches) == 3
+    assert [b.sql() for b in branches] == ["SELECT 1", "SELECT 2", "SELECT 3"]
+
+    assert sql_shape.select_branches(None) == []
+
+
+def test_from_relation_handles_non_select():
+    assert sql_shape.from_relation(None) is None
+    union = _parse("select 1 union all select 2")
+    assert sql_shape.from_relation(union) is None
+
+
+# --- a guarded cast where the dialect has no safe one (#1075) -----------------
+
+
+@pytest.mark.parametrize(
+    ("target", "low", "high"),
+    [
+        ("SMALLINT", -32768, 32767),
+        ("INT", -2147483648, 2147483647),
+        ("BIGINT", -9223372036854775808, 9223372036854775807),
+    ],
+)
+def test_a_postgres_integer_cast_is_guarded_by_shape_and_range(target, low, high):
+    sql = f"select try_cast(k as {target}) from t"  # noqa: S608
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    rendered = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="postgres")
+    assert "TRY_CAST" not in rendered
+    assert f"BETWEEN {low} AND {high}" in rendered
+    assert 'COLLATE "C" ~ \'' in rendered
+
+
+def test_a_cast_nested_in_a_guarded_one_is_guarded_too():
+    tree = sqlglot.parse_one(
+        "select try_cast(try_cast(k as bigint) as int) from t", read="duckdb"
+    )
+    rendered = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="postgres")
+    assert "CAST(k AS BIGINT)" not in rendered
+    assert "BETWEEN -9223372036854775808 AND 9223372036854775807" in rendered
+    dated = sqlglot.parse_one(
+        "select try_cast(try_cast(k as date) as int) from t", read="duckdb"
+    )
+    with pytest.raises(sql_shape.NoSafeCastError):
+        sql_shape.with_safe_casts(dated, "postgres")
+
+
+def test_a_postgres_cast_to_another_type_still_raises():
+    for target in ("DATE", "DECIMAL(10, 2)", "DOUBLE", "TINYINT"):
+        sql = f"select try_cast(k as {target}) from t"  # noqa: S608
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        with pytest.raises(sql_shape.NoSafeCastError):
+            sql_shape.with_safe_casts(tree, "postgres")
+
+
+def test_the_range_test_casts_a_total_argument():
+    """The NUMERIC cast inside the range test reads a CASE that falls back to
+    '0', so a value the shape test rejects never reaches it (#307)."""
+
+    tree = sqlglot.parse_one("select try_cast(k as int) from t", read="duckdb")
+    guarded = sql_shape.with_safe_casts(tree, "postgres")
+    (between,) = list(guarded.find_all(sqlglot.exp.Between))
+    inner = between.this
+    assert isinstance(inner, sqlglot.exp.Cast)
+    assert inner.args["to"].is_type("decimal")
+    assert isinstance(inner.this, sqlglot.exp.Case)
+    assert inner.this.args["default"] == sqlglot.exp.Literal.string("0")
+
+
+_SHARED_VALUES = [
+    ("7", 7),
+    (" -0042 ", -42),
+    ("99999999999999999999999", None),
+    ("12a", None),
+    ("1.5", None),
+    ("", None),
+    (None, None),
+]
+
+
+@pytest.mark.parametrize(
+    ("target", "low", "high"),
+    [
+        ("SMALLINT", -(2**15), 2**15 - 1),
+        ("INT", -(2**31), 2**31 - 1),
+        ("BIGINT", -(2**63), 2**63 - 1),
+    ],
+)
+def test_the_guarded_cast_returns_null_for_what_would_not_convert(target, low, high):
+    """Evaluated on DuckDB for the CASE and range logic: what the cast would
+    reject or overflow on is NULL, and every integer in range converts, up to
+    each bound and not one past it. DuckDB's regex classes are ASCII only,
+    unlike Postgres's locale-aware ones, so whitespace handling is proven by
+    the live Postgres integration suite."""
+
+    duckdb = pytest.importorskip("duckdb")
+    values = [
+        *_SHARED_VALUES,
+        (f"+{high}", high),
+        (str(low), low),
+        (str(high + 1), None),
+        (str(low - 1), None),
+    ]
+    sql = f"select try_cast(k as {target}) from t"  # noqa: S608
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    guarded = sql_shape.with_safe_casts(tree, "postgres").sql(dialect="duckdb")
+    # Postgres NUMERIC has no precision limit; DuckDB's bare DECIMAL is (18, 3).
+    guarded = guarded.replace("AS DECIMAL)", "AS DECIMAL(38, 0))")
+    rows = ", ".join("(NULL)" if v is None else f"('{v}')" for v, _ in values)
+    sql = guarded.replace("FROM t", f"FROM (VALUES {rows}) AS t(k)")
+    got = [row[0] for row in duckdb.connect().execute(sql).fetchall()]
+    assert got == [expected for _, expected in values]
+
+
+def test_scope_identifiers_preserves_quoted_mixed_case_cte_names():
+    """scope_identifiers retains original casing and quotes on cte identifiers."""
+    sql = (
+        'with "Orders_Clean" as (select 1 as id), '
+        "raw as (select 2 as id) "
+        'select * from "Orders_Clean"'
+    )
+    tree = _parse(sql)
+    idents = sql_shape.scope_identifiers(tree)
+    assert idents["orders_clean"].this == "Orders_Clean"
+    assert idents["orders_clean"].quoted is True
+    assert idents["raw"].this == "raw"
+    assert not idents["raw"].quoted
+    assert sql_shape.scope_identifier(tree, "orders_clean").this == "Orders_Clean"
+    assert sql_shape.scope_identifier(tree, "orders_clean").quoted is True

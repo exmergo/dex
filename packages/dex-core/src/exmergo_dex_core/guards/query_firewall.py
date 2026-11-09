@@ -426,6 +426,38 @@ def _override_suggestion(taint: _Taint, cache: DexCache) -> str:
 _HISTORICAL_READ_ARGS = ("version", "when", "changes")
 
 
+def _require_query_shape(node: exp.Expression) -> None:
+    """Check a query body before reading SELECT/set-operation attributes."""
+
+    while isinstance(node, exp.Subquery):
+        node = node.this
+    if not isinstance(node, _QUERY_ROOTS):
+        raise QueryRefusedError(
+            f"unsupported query shape: {type(node).__name__}; use SELECT queries "
+            "over profiled tables, and `explore inventory` / `explore profile` "
+            "for introspection"
+        )
+
+
+def _validate_nested_query_shapes(root: exp.Expression) -> None:
+    """Validate bodies even where taint analysis discards their values.
+
+    In particular a metadata statement in an unused CTE or a measuring
+    aggregate's argument must not bypass shape validation. Metadata nodes can
+    also sit under Paren rather than Subquery, so inspect them independently
+    of the query-body positions.
+    """
+
+    for node in root.walk():
+        if isinstance(node, (exp.Describe, exp.Pragma, exp.Show)):
+            _require_query_shape(node)
+        if isinstance(node, (exp.CTE, exp.Subquery)):
+            _require_query_shape(node.this)
+        elif isinstance(node, _QUERY_ROOTS) and not isinstance(node, exp.Select):
+            _require_query_shape(node.left)
+            _require_query_shape(node.right)
+
+
 def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
     """Prove a statement is one read-only SELECT and return its parsed root.
 
@@ -454,6 +486,7 @@ def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
             f"only SELECT queries may run here, got {type(root).__name__}; use "
             "`explore inventory` / `explore profile` for introspection"
         )
+    _validate_nested_query_shapes(root)
     # Refused wherever it appears, a WHERE subquery included, because the cache
     # and every PII verdict in it describe each table as it is now. A past
     # snapshot keeps the schema it had then, so a column dropped since (and so
@@ -559,6 +592,7 @@ def _query_outputs(
     subquery's own sources do not have, and never shadow one they do.
     """
 
+    _require_query_shape(node)
     # sqlglot attaches a WITH clause to the query root. For a plain query that
     # root is a Select, but for UNION/INTERSECT/EXCEPT it is the set operation.
     # Register CTEs here so both sides of any query shape resolve the same local
@@ -589,7 +623,6 @@ def _query_outputs(
         }
     if isinstance(node, exp.Subquery):
         return _query_outputs(node.this, local_env, known, tables, dialect, correlated)
-    raise QueryRefusedError(f"unsupported query shape: {type(node).__name__}")
 
 
 #: Select arguments that hold the query's own sources or projections, which the
@@ -742,6 +775,8 @@ def _resolve_sources(
                     f"duplicate source alias '{key}'; give each unnest its own alias"
                 )
             sources[key] = outputs
+        elif isinstance(node, exp.Values):
+            sources[alias] = _values_source(node)
         else:
             raise QueryRefusedError(
                 f"unsupported FROM source: {type(node).__name__}; query cached "
@@ -756,6 +791,46 @@ def _resolve_sources(
             )
         sources[key] = outputs
     return sources
+
+
+def _values_source(node: exp.Values) -> _Outputs:
+    """Admit an inline ``VALUES`` list as a FROM source, or refuse it.
+
+    A list of literal rows (``cross join (values (7), (28)) as w (window_days)``)
+    is self-contained: it reads no relation and carries no profile, so it needs
+    nothing from the cache and its columns carry no taint. What it must not be
+    is a side door. A row that reads a column or a subquery would reach data by
+    a path the resolution above never saw, so the rows must be plain literals (not
+    even a constant expression), and the columns must be named so every reference
+    to them resolves by name rather than by a dialect's positional default
+    (``col0`` here, ``column1`` there).
+    """
+
+    table_alias = node.args.get("alias")
+    columns = [c.name.lower() for c in table_alias.columns] if table_alias else []
+    if not columns:
+        raise QueryRefusedError(
+            "alias the VALUES list and name its columns, e.g. "
+            "(VALUES (7), (28)) AS windows (window_days)"
+        )
+    for row in node.expressions:
+        for cell in row.expressions if isinstance(row, exp.Tuple) else [row]:
+            # Parentheses and a minus on a number still wrap a literal, and
+            # ClickHouse parses each cell as a one-element tuple.
+            negated = False
+            while isinstance(cell, (exp.Neg, exp.Paren)) or (
+                isinstance(cell, exp.Tuple) and len(cell.expressions) == 1
+            ):
+                negated = negated or isinstance(cell, exp.Neg)
+                cell = cell.expressions[0] if isinstance(cell, exp.Tuple) else cell.this
+            if not isinstance(cell, (exp.Literal, exp.Null, exp.Boolean)) or (
+                negated and not cell.is_number
+            ):
+                raise QueryRefusedError(
+                    "VALUES rows must be plain literals; an expression, column, "
+                    "subquery or relation inside one is not allowed"
+                )
+    return {name: set() for name in columns}
 
 
 def _array_join_source(

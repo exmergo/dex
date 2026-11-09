@@ -157,8 +157,11 @@ compute_unit_hours = seconds * compute_units_per_hour / 3600
 ```
 
 The capacity read is cached for one command and fails closed when it is denied,
-empty, malformed, partial, or inconsistent. dex never substitutes a configured
-replica count, a guessed tier, or a public price. When
+empty, malformed, partial, or inconsistent. A service resuming from idle answers
+on one replica before the others join, so an unproved read is retried for about
+15 seconds before the refusal, which then names the server's reason; a denied
+grant refuses at once. dex never substitutes a configured replica count, a
+guessed tier, or a public price. When
 `compute_unit_price_usd` is present, estimates and settled spend also carry a USD
 translation using that supplied rate.
 
@@ -362,6 +365,19 @@ identifier, which here means two parts (`database.table`) rather than three: a
 document written as `database.schema.table` reads cleanly and links to nothing on
 ClickHouse while linking on DuckDB. See
 [Apache Ossie compatibility](ossie-compatibility.md).
+
+## Statement refusals
+
+A server-side statement error raises `WarehouseQueryError`, with the server's
+numeric error code when available and `stage: run` for the query execution door.
+The diagnostic is limited to the first non-empty line and capped, as on the other
+connectors. `maintain verify` can therefore report a refused grain measurement
+against its model and continue checking the others. In values-free mode the
+server's message is withheld and the envelope reports `warehouse_refused`.
+
+The existing named errors for missing tables, insufficient grants, unreachable
+servers, timeouts and budget/read limits keep their behavior. An unexpected
+client-side programming error is not classified as a server refusal.
 
 ## Testing
 

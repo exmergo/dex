@@ -173,6 +173,11 @@ class FakeClickHouseConnection:
             for i, gib in enumerate(memory)
         ]
         self.capacity_denied = capacity_denied
+        # Answers the capacity probe gives before settling on `capacity_rows`,
+        # one per read: an exception is raised, a list is returned as the rows.
+        # A waking Cloud service looks like this for a few seconds.
+        self.capacity_warmup: list[Exception | list[dict]] = []
+        self.slept: list[float] = []
         self.grants_readable = grants_readable
         self.role_grants_readable = role_grants_readable
         self.queries: list[FakeQuery] = []
@@ -260,6 +265,11 @@ class FakeClickHouseConnection:
                 ACCESS_DENIED,
                 "not enough privileges for system.asynchronous_metrics",
             )
+        if self.capacity_warmup:
+            answer = self.capacity_warmup.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return self._result(list(answer))
         return self._result(list(self.capacity_rows))
 
     def _system_tables(self, sql: str):

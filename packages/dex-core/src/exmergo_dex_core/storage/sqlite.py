@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 from ..cache import DexCache
 from ..errors import ConfigurationError
 from .base import Document, StoreContext, spend_total
+from .filesystem import CACHE_LOCK_FILE, hold_file_lock
 
 if TYPE_CHECKING:
     from ..maintain.drift import DriftReport
@@ -395,6 +396,21 @@ class SqliteStore:
                 conn.execute("COMMIT")
         finally:
             _process_lock(key).release()
+
+    @contextmanager
+    def cache_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
+        """Serialize a cache read-merge-write across every process holding this file.
+
+        A file lock beside the database rather than a `BEGIN IMMEDIATE`: the
+        holder reads and writes the cache on ``_conn`` inside the block, and a
+        write transaction held open on another connection would block that very
+        write. The lock file is the one :class:`~.filesystem.FilesystemStore`
+        uses, so two backends pointed at one `.dex/` still exclude each other.
+        """
+
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        with hold_file_lock(self.dex_dir / CACHE_LOCK_FILE, "cache", timeout):
+            yield
 
     # --- plans ----------------------------------------------------------------
 

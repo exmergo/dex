@@ -792,7 +792,10 @@ class DbtProject:
         suffix = {_EditKind.MODEL_SQL: "sql", _EditKind.SCHEMA_YML: "yml"}.get(kind)
         if suffix is None:
             return None
-        convention = f"models/staging/stg_{model}.{suffix}"
+        node = model if model.startswith("stg_") else f"stg_{model}"
+        # Findings can name a built staging relation rather than its source.
+        # Do not turn stg_orders into a second, nonexistent stg_stg_orders.
+        convention = f"models/staging/{node}.{suffix}"
         try:
             view = self.load()
         except dbt_project.DbtProjectError:
@@ -800,7 +803,6 @@ class DbtProject:
         from ..transform.declarations import model_sql_path, schema_path
 
         files = {path: source.content for path, source in view.files.items()}
-        node = f"stg_{model}"
         found = (
             model_sql_path(files, view.model_paths, node)
             if kind is _EditKind.MODEL_SQL

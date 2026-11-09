@@ -1,0 +1,11 @@
+name: clinic
+version: "1.0.0"
+profile: clinic
+model-paths: ["models"]
+
+models:
+  clinic:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

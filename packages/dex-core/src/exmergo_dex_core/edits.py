@@ -96,13 +96,17 @@ class SemanticEditValidation(BaseModel):
     """What a semantic layer's own validator says about a proposed plan.
 
     ``defined`` and ``updated`` classify the names the edits touch, which is how
-    ``define`` and ``update`` hold to their promise. ``notes`` and ``warnings``
+    ``define`` and ``update`` hold to their promise. ``unchanged`` names an
+    element an edited document carries whose definition did not move, where the
+    layer keeps several in one document; a layer with one per document leaves it
+    empty. ``notes`` and ``warnings``
     ride the plan's envelope as they are. A plan the validator refuses never
     reaches this value: the validator raises, naming why, and nothing is stored.
     """
 
     defined: list[str] = Field(default_factory=list)
     updated: list[str] = Field(default_factory=list)
+    unchanged: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 

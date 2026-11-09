@@ -20,9 +20,12 @@ from exmergo_dex_core.adapters.snowflake import (
     SnowflakeAdapter,
     SnowflakeConnectionError,
 )
+from exmergo_dex_core.command_args import with_uptime
 from exmergo_dex_core.config import SnowflakeTarget
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
+    UPTIME_LINE,
     ConfirmationRequiredError,
     CostGate,
     OverCeilingError,
@@ -37,6 +40,7 @@ def make_adapter(
     session_ceiling: float | None = None,
     session_spent: float = 0.0,
     record=None,
+    history=None,
     target: SnowflakeTarget | None = None,
     scope_override: list[str] | None = None,
 ) -> SnowflakeAdapter:
@@ -49,6 +53,7 @@ def make_adapter(
         connector="snowflake",
         command="explore profile",
         record=record,
+        history=history,
     )
     return SnowflakeAdapter(
         connection=connection,
@@ -58,6 +63,7 @@ def make_adapter(
         auth_method="named_connection:key_pair",
         scope_override=scope_override,
         clock=connection.clock,
+        wall_clock=connection.clock.wall,
     )
 
 
@@ -121,6 +127,30 @@ def test_database_allowlist_scopes_inventory(fake_sf_connection):
     assert all(o.identifier.startswith("SHOP.") for o in adapter.list_objects())
 
 
+def test_a_database_scope_never_inventories_information_schema(fake_sf_connection):
+    # SHOW ... IN DATABASE lists the database's INFORMATION_SCHEMA views beside
+    # its own objects; profiling them would scan Snowflake's catalog as data.
+    from fakes.snowflake import FakeSnowflakeTable
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="INFORMATION_SCHEMA",
+            name="COLUMNS",
+            columns=[("COLUMN_NAME", "TEXT", True)],
+            kind="view",
+        )
+    )
+    adapter = make_adapter(
+        fake_sf_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SHOP"]),
+    )
+
+    objects = adapter.list_objects()
+    assert objects
+    assert all(o.schema != "INFORMATION_SCHEMA" for o in objects)
+
+
 def test_table_metadata_parses_show_columns_types(fake_sf_connection):
     adapter = make_adapter(fake_sf_connection)
     meta, columns = adapter.table_metadata("SHOP.PUBLIC.EVENTS")
@@ -138,16 +168,21 @@ def test_table_metadata_parses_show_columns_types(fake_sf_connection):
 # --- estimation (free) and the resume floor ------------------------------------------
 
 
-def test_profile_estimate_is_heuristic_and_carries_the_resume_floor(
+def test_profile_estimate_is_heuristic_and_the_handshake_adds_the_resume_floor(
     fake_sf_connection,
 ):
     adapter = make_adapter(fake_sf_connection)
     total, per_table = adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
-    # 5 GB over the conservative X-Small rate, one batch.
+    # 5 GB over the conservative X-Small rate, one batch, and nothing else:
+    # the warehouse's uptime belongs to the command, not to a statement.
     scan = per_table["SHOP.PUBLIC.CUSTOMERS"]
     assert scan > 1.0
-    # DEX_WH is suspended, so the total carries the 60-second resume minimum.
-    assert total == pytest.approx(scan + _RESUME_MINIMUM_SECONDS)
+    assert total == pytest.approx(scan)
+    # DEX_WH is suspended, so what the caller is shown carries the 60-second
+    # resume minimum on a line of its own.
+    shown, lines, _uptime = with_uptime(adapter, total, per_table)
+    assert shown == pytest.approx(scan + _RESUME_MINIMUM_SECONDS)
+    assert lines[UPTIME_LINE] == pytest.approx(_RESUME_MINIMUM_SECONDS)
     assert data_statements(fake_sf_connection) == []
 
 
@@ -161,7 +196,8 @@ def test_a_running_warehouse_quotes_its_idle_tail_and_no_resume_minimum(
     fake_sf_connection.warehouses[0].auto_suspend = 10
     adapter = make_adapter(fake_sf_connection)
     total, per_table = adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
-    assert total == pytest.approx(per_table["SHOP.PUBLIC.CUSTOMERS"] + 10)
+    shown, _lines, _uptime = with_uptime(adapter, total, per_table)
+    assert shown == pytest.approx(per_table["SHOP.PUBLIC.CUSTOMERS"] + 10)
 
 
 def _wide_blob_table():
@@ -197,12 +233,11 @@ def test_profile_estimate_excludes_blob_columns_from_batch_count(fake_sf_connect
     total_included, per_included = adapter.profile_estimate(
         ["SHOP.PUBLIC.SESSIONS"], include_blobs={"shop.public.sessions.payload"}
     )
-    # 1 batch (50 cols) vs 2 batches (51 cols). The idle tail is quoted once,
-    # into the first estimate only, so the ratio is read off the scans.
+    # 1 batch (50 cols) vs 2 batches (51 cols).
     assert per_included["SHOP.PUBLIC.SESSIONS"] == pytest.approx(
         2 * per_excluded["SHOP.PUBLIC.SESSIONS"]
     )
-    assert total_excluded == pytest.approx(per_excluded["SHOP.PUBLIC.SESSIONS"] + 60)
+    assert total_excluded == pytest.approx(per_excluded["SHOP.PUBLIC.SESSIONS"])
     assert total_included == pytest.approx(per_included["SHOP.PUBLIC.SESSIONS"])
 
 
@@ -221,15 +256,32 @@ def test_resume_floor_counts_once_across_many_estimates(fake_sf_connection):
     """A command that prices many statements resumes a suspended warehouse at
     most once, so summing per-statement estimates must not multiply the floor
     in (verified live: mutation coverage priced 39 statements and quoted 2,379
-    seconds, of which 2,340 were floors)."""
+    seconds, of which 2,340 were floors). The estimators leave it out and the
+    handshake adds it once."""
 
     adapter = make_adapter(fake_sf_connection)
     sql = 'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"'
     first = adapter.query_estimate(sql)
     second = adapter.query_estimate(sql)
-    assert first == pytest.approx(second + _RESUME_MINIMUM_SECONDS)
-    total, per_table = adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
-    assert total == pytest.approx(per_table["SHOP.PUBLIC.CUSTOMERS"])
+    assert first == pytest.approx(second)
+    shown, _lines, _uptime = with_uptime(adapter, first + second, None)
+    assert shown == pytest.approx(first + second + _RESUME_MINIMUM_SECONDS)
+
+
+def test_a_discarded_estimate_does_not_take_the_uptime_quote(fake_sf_connection):
+    """Issue #936: a phase priced and then thrown away (a profile with nothing
+    stale) used to take the once-per-command overhead, so the next phase the
+    caller saw quoted statement time alone and the run billed the tail."""
+
+    adapter = make_adapter(fake_sf_connection)
+    adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])  # priced, never shown
+    probe = adapter.query_estimate('SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"')
+    shown, _lines, uptime = with_uptime(adapter, probe, None)
+    assert shown == pytest.approx(probe + _RESUME_MINIMUM_SECONDS)
+    # Quoted again until a gate admits it, then never again this command.
+    assert with_uptime(adapter, probe, None)[0] == pytest.approx(shown)
+    uptime.admit()
+    assert with_uptime(adapter, probe, None)[0] == pytest.approx(probe)
 
 
 def test_describe_estimate_translates_to_credits(fake_sf_connection):
@@ -547,7 +599,8 @@ def test_uptime_is_booked_once_per_command_and_afresh_for_the_next(
     _one_query(adapter)
     adapter.cost_gate.settle()
     adapter.cost_gate.settle()
-    assert len(entries) == 2
+    # The statement, the claim on the resume cycle, and the uptime.
+    assert [e["billed_seconds"] for e in entries] == pytest.approx([1.0, 0.0, 60.0])
 
     adapter.cost_gate = CostGate(
         paradigm=Paradigm.COMPUTE_TIME,
@@ -561,7 +614,7 @@ def test_uptime_is_booked_once_per_command_and_afresh_for_the_next(
     )
     sql = 'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
     # The warehouse is running now: the second command quotes the tail alone.
-    assert adapter.query_estimate(sql) == pytest.approx(
+    assert with_uptime(adapter, adapter.query_estimate(sql), None)[0] == pytest.approx(
         adapter._statement_estimate(sql) + 60
     )
     _one_query(adapter)
@@ -593,8 +646,10 @@ def test_a_budget_under_the_idle_tail_refuses_before_anything_runs(
 
 def test_the_estimate_says_what_its_uptime_line_is(fake_sf_connection):
     adapter = make_adapter(fake_sf_connection)
-    estimate = adapter.query_estimate(
-        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    estimate, _lines, _uptime = with_uptime(
+        adapter,
+        adapter.query_estimate('SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'),
+        None,
     )
     notes = adapter.describe_estimate(estimate)["notes"]
     assert any(
@@ -615,6 +670,415 @@ def test_capabilities_report_auto_suspend_and_warn_when_it_is_off(
     caps = make_adapter(fake_sf_connection).capabilities()
     assert caps["budget"]["warehouse"]["auto_suspend_seconds"] is None
     assert any("AUTO_SUSPEND is off on DEX_WH" in w for w in caps["warnings"])
+
+
+# --- issue #664: suspend after the command, cycle-aware accounting ------------------
+
+
+def _ledgered(connection, entries: list[dict], *, suspend: bool = False, **kwargs):
+    """One command's adapter on a ledger every command in the test shares, the
+    way consecutive dex commands share `.dex/spend.jsonl`."""
+
+    return make_adapter(
+        connection,
+        record=entries.append,
+        history=lambda: list(entries),
+        target=SnowflakeTarget(warehouse="DEX_WH", suspend_after_command=suspend),
+        **kwargs,
+    )
+
+
+def _claim(entries: list[dict]) -> dict:
+    """The latest claim on a resume cycle in the ledger."""
+
+    return [e for e in entries if e.get("warehouse_claim")][-1]["warehouse_claim"]
+
+
+def _suspends(connection) -> list[str]:
+    return [
+        s.sql
+        for s in connection.statements
+        if s.sql.strip().upper().startswith("ALTER WAREHOUSE")
+    ]
+
+
+@pytest.fixture
+def tail_600(fake_sf_connection):
+    """Snowflake's default AUTO_SUSPEND, where a tail is ten resume minimums,
+    and one-second statements."""
+
+    fake_sf_connection.warehouses[0].auto_suspend = 600
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    return fake_sf_connection
+
+
+def test_a_command_that_woke_the_warehouse_suspends_it_and_pays_no_tail(tail_600):
+    entries: list[dict] = []
+    adapter = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    _one_query(adapter)
+    billed, notes = _settled(adapter)
+
+    # One second of work, floored at the 60-second resume minimum, no tail.
+    assert billed == pytest.approx(_RESUME_MINIMUM_SECONDS)
+    assert tail_600.warehouses[0].state == "SUSPENDED"
+    assert _suspends(tail_600) == ['ALTER WAREHOUSE "DEX_WH" SUSPEND']
+    assert "suspend_after_command" in notes[0]
+    assert "no idle tail is charged" in notes[0]
+    claim = _claim(entries)
+    assert claim["warehouse"] == "DEX_WH"
+    assert claim["suspend"] == "suspended"
+    assert claim["auto_suspend"] == 600
+
+
+def test_suspend_is_off_by_default_and_never_issued(tail_600):
+    entries: list[dict] = []
+    adapter = _ledgered(tail_600, entries, ceiling=1200.0)
+    _one_query(adapter)
+    billed, _notes = _settled(adapter)
+    assert billed == pytest.approx(601.0)
+    assert _suspends(tail_600) == []
+    assert tail_600.warehouses[0].state == "STARTED"
+    assert _claim(entries)["suspend"] is None
+
+
+def test_a_warehouse_that_was_already_running_is_never_suspended(tail_600):
+    tail_600.warehouses[0].state = "STARTED"
+    adapter = _ledgered(tail_600, [], suspend=True, ceiling=1200.0)
+    _one_query(adapter)
+    billed, _notes = _settled(adapter)
+    assert _suspends(tail_600) == []
+    assert billed == pytest.approx(601.0)
+
+
+def test_a_warehouse_other_queries_are_using_is_never_suspended(tail_600):
+    adapter = _ledgered(tail_600, [], suspend=True, ceiling=1200.0)
+    _one_query(adapter)
+    tail_600.warehouses[0].running = 1
+    billed, notes = _settled(adapter)
+    assert _suspends(tail_600) == []
+    assert tail_600.warehouses[0].state == "STARTED"
+    assert billed == pytest.approx(_RESUME_MINIMUM_SECONDS)
+    assert "Other queries were running" in notes[0]
+
+
+def test_a_resume_that_was_not_this_commands_is_never_suspended(tail_600):
+    """The warehouse suspended and another session woke it again while this
+    command ran: ``resumed_on`` moved, but not during this command's first
+    statement, so the warehouse is theirs."""
+
+    from fakes.snowflake import _iso
+
+    adapter = _ledgered(tail_600, [], suspend=True, ceiling=1200.0)
+    _one_query(adapter)
+    tail_600.warehouses[0].resumed_on = _iso(tail_600.clock.wall() + 3600)
+    _settled(adapter)
+    assert _suspends(tail_600) == []
+
+
+def test_without_operate_the_suspend_is_skipped_and_the_tail_is_charged(tail_600):
+    tail_600.warehouses[0].operate_granted = False
+    entries: list[dict] = []
+    adapter = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    _one_query(adapter)
+    billed, notes = _settled(adapter)
+    assert billed == pytest.approx(601.0)
+    assert tail_600.warehouses[0].state == "STARTED"
+    assert any("GRANT OPERATE ON WAREHOUSE DEX_WH" in n for n in notes)
+    assert _claim(entries)["suspend"] == "refused_grant"
+
+
+def test_the_quote_counts_on_a_suspend_only_once_one_has_worked(tail_600):
+    """The first command cannot know the grant holds, so it quotes the tail
+    and settles what the suspend did; the next one quotes the resume minimum."""
+
+    entries: list[dict] = []
+    sql = 'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    first = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    work = first.query_estimate(sql)
+    assert with_uptime(first, work, None)[0] == pytest.approx(work + 600)
+    _one_query(first)
+    _settled(first)
+
+    second = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    shown = with_uptime(second, work, None)[0]
+    assert shown == pytest.approx(work + _RESUME_MINIMUM_SECONDS)
+    notes = second.describe_estimate(shown)["notes"]
+    assert any("no idle tail is quoted" in n for n in notes)
+
+    # A refusal recorded since puts the tail back in the quote.
+    tail_600.warehouses[0].operate_granted = False
+    _one_query(second)
+    _settled(second)
+    # Its tail runs out and the warehouse suspends on its own.
+    tail_600.clock.now += 700.0
+    tail_600.warehouses[0].state = "SUSPENDED"
+    third = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    assert with_uptime(third, work, None)[0] == pytest.approx(work + 600)
+
+
+def test_a_command_inside_the_tail_a_previous_one_paid_pays_the_gap_and_its_span(
+    tail_600,
+):
+    """Two commands thirty seconds apart: the first paid a 600-second tail the
+    warehouse never idled through, so the second owes only what it adds to
+    that claim, and the pair settles one tail between them."""
+
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, ceiling=1200.0)
+    _one_query(first)  # t = 0 .. 1
+    assert _settled(first)[0] == pytest.approx(601.0)
+
+    tail_600.clock.now += 30.0
+    second = _ledgered(tail_600, entries, ceiling=1200.0)
+    sql = 'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    work = second.query_estimate(sql)
+    assert with_uptime(second, work, None)[0] == pytest.approx(work + 30.0)
+    notes = second.describe_estimate(work + 30.0)["notes"]
+    assert any("a previous dex command already paid for" in n for n in notes)
+    _one_query(second)  # t = 31 .. 32
+    billed, settle_notes = _settled(second)
+    assert billed == pytest.approx(31.0)  # the 30-second gap plus its own second
+    assert "same resume cycle already paid" in settle_notes[0]
+    # Uptime 0 .. 632 is exactly what the two commands settled together.
+    assert 601.0 + billed == pytest.approx(32.0 + 600.0)
+
+
+def test_a_command_after_the_claimed_tail_ran_out_pays_its_own_tail(tail_600):
+    """Other users kept the warehouse up past the tail dex paid for: dex claims
+    its own statement time plus one tail, never their uptime."""
+
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, ceiling=1200.0)
+    _one_query(first)
+    _settled(first)
+    tail_600.clock.now += 900.0
+    second = _ledgered(tail_600, entries, ceiling=1200.0)
+    _one_query(second)
+    assert _settled(second)[0] == pytest.approx(601.0)
+
+
+def test_a_new_resume_cycle_ignores_the_previous_cycles_claim(tail_600):
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, ceiling=1200.0)
+    _one_query(first)
+    _settled(first)
+    tail_600.warehouses[0].state = "SUSPENDED"
+    tail_600.clock.now += 30.0
+    second = _ledgered(tail_600, entries, ceiling=1200.0)
+    _one_query(second)
+    assert _settled(second)[0] == pytest.approx(601.0)
+
+
+def test_a_command_resumed_mid_run_bills_the_resume_minimum_from_that_statement(
+    fake_sf_connection,
+):
+    """When another command suspends the warehouse mid-run, this command's next
+    statement wakes it and bills at least 60 seconds of uptime from that second
+    resume (#938)."""
+
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    fake_sf_connection.warehouses[0].resumed_on = "2026-01-01T00:00:00-08:00"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)
+
+    # Another command suspends the warehouse between statements.
+    fake_sf_connection.warehouses[0].state = "SUSPENDED"
+    fake_sf_connection.clock.now += 5.0
+
+    _one_query(adapter)
+    billed, notes = _settled(adapter)
+    # Statement 1 (1.0s) + statement 2 resume cycle (max(1.0 + 10, 60) = 60.0s).
+    assert billed == pytest.approx(61.0)
+    assert any("resumed DEX_WH" in n for n in notes)
+
+
+def test_sharing_a_warehouse_when_another_command_suspends_mid_run(
+    fake_sf_connection,
+):
+    """Two Dex commands share a warehouse: command A resumes it and suspends it
+    when done. Command B found it running, but runs statement 2 after A suspended
+    it. Command B resumes it and settles at least 60 seconds of uptime from that
+    second statement (#938)."""
+
+    entries: list[dict] = []
+    fake_sf_connection.warehouses[0].state = "SUSPENDED"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    a = _ledgered(fake_sf_connection, entries, suspend=True, ceiling=1200.0)
+    _one_query(a)  # A resumes the warehouse at t = 0 .. 1
+
+    # B starts while the warehouse is running.
+    b = _ledgered(fake_sf_connection, entries, ceiling=1200.0)
+    assert b.warehouse_uptime.before["state"] == "STARTED"
+    _one_query(b)  # B statement 1 at t = 1 .. 2
+
+    # A finishes and suspends the warehouse.
+    _settled(a)
+    assert fake_sf_connection.warehouses[0].state == "SUSPENDED"
+
+    fake_sf_connection.clock.now += 3.0
+    _one_query(b)  # B statement 2 wakes it at t = 5 .. 6
+    billed, notes = _settled(b)
+    # B statement 1 is 1.0s.
+    # B statement 2 resumes the warehouse: floor is 60.0s.
+    assert billed == pytest.approx(61.0)
+    assert any("resumed DEX_WH" in n for n in notes)
+
+
+def test_a_resume_caused_by_another_session_charges_no_resume_minimum(
+    fake_sf_connection,
+):
+    """When resumed_on moves but resumed_at is outside every statement window of
+    this command, another session woke the warehouse, so no resume minimum is
+    charged to this command (#938)."""
+
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    fake_sf_connection.warehouses[0].resumed_on = "2026-01-01T00:00:00-08:00"
+    fake_sf_connection.warehouses[0].auto_suspend = 10
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)  # Statement 1 at t = 0 .. 1
+
+    # Another session woke the warehouse at t = 60, far from both statements.
+    from fakes.snowflake import _iso
+
+    fake_sf_connection.warehouses[0].resumed_on = _iso(
+        fake_sf_connection.clock.EPOCH + 60.0
+    )
+    fake_sf_connection.clock.now += 120.0  # t = 121
+
+    _one_query(adapter)  # Statement 2 at t = 121 .. 122
+    billed, notes = _settled(adapter)
+    # Warehouse was already running; no resume minimum from this command.
+    assert billed == pytest.approx(132.0)
+    assert not any("resumed DEX_WH" in n for n in notes)
+    assert any("DEX_WH was already running" in n for n in notes)
+
+
+def test_capabilities_recommend_a_short_auto_suspend_without_changing_it(tail_600):
+    caps = make_adapter(tail_600).capabilities()
+    assert caps["budget"]["warehouse"]["suspend_after_command"] == {
+        "enabled": False,
+        "last_outcome": None,
+    }
+    (warning,) = caps["warnings"]
+    assert "idles 600 seconds" in warning
+    assert "AUTO_SUSPEND = 60" in warning
+    assert "`dex config set snowflake.suspend_after_command true`" in warning
+    assert "`GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE <dex role>`" in warning
+    assert "never changes AUTO_SUSPEND" in warning
+    assert not any("OPERATE" in g for g in caps["required_grants"])
+    assert _suspends(tail_600) == []
+
+
+@pytest.mark.parametrize(
+    ("role", "spelled"),
+    [("DEX_READER", "DEX_READER"), ("analytics team", '"analytics team"')],
+)
+def test_the_tail_advice_names_the_session_role_in_the_grant(tail_600, role, spelled):
+    """The login response carries the role, so the grant to copy is complete."""
+
+    tail_600.role = role
+    (warning,) = make_adapter(tail_600).capabilities()["warnings"]
+    assert f"`GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE {spelled}`" in warning
+
+
+def test_capabilities_report_the_last_suspend_and_name_a_missing_grant(tail_600):
+    entries: list[dict] = []
+    tail_600.warehouses[0].operate_granted = False
+    adapter = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    _one_query(adapter)
+    _settled(adapter)
+
+    caps = _ledgered(tail_600, entries, suspend=True).capabilities()
+    assert caps["budget"]["warehouse"]["suspend_after_command"] == {
+        "enabled": True,
+        "last_outcome": "refused_grant",
+    }
+    assert any("OPERATE" in g for g in caps["required_grants"])
+    assert any("GRANT OPERATE ON WAREHOUSE DEX_WH" in w for w in caps["warnings"])
+
+
+def test_the_estimate_names_the_fix_when_the_tail_dominates(tail_600):
+    adapter = make_adapter(tail_600, ceiling=1200.0)
+    work = adapter.query_estimate(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    )
+    shown, lines, _ = with_uptime(adapter, work, {"probe": work})
+    notes = adapter.describe_estimate(shown, lines)["notes"]
+    advice = next(n for n in notes if "own work is about" in n)
+    assert "600-second AUTO_SUSPEND" in advice
+    assert "AUTO_SUSPEND = 60" in advice
+    assert "never changes AUTO_SUSPEND" in advice
+    # The setting is off, so the advice offers it; no suspend has been refused,
+    # so it names no grant (issue #1021).
+    assert "`dex config set snowflake.suspend_after_command true`" in advice
+    assert "GRANT OPERATE" not in advice
+
+
+def _estimate_notes(adapter) -> list[str]:
+    work = adapter.query_estimate(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
+    )
+    shown, lines, _ = with_uptime(adapter, work, {"probe": work})
+    return adapter.describe_estimate(shown, lines)["notes"]
+
+
+def test_the_first_estimate_with_suspend_on_says_why_it_quotes_the_tail(tail_600):
+    """Issue #1021: the setting is on and the role may suspend, but no suspend
+    has worked yet, so the tail is quoted. The note says why, and the advice
+    does not recommend the setting or the grant the role already has."""
+
+    # A one-second estimate, so the resume minimum alone outweighs the work and
+    # only the no-tail rule keeps the advice out once a suspend has worked.
+    tail_600.tables[0].bytes = 5_000_000
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    notes = _estimate_notes(first)
+    assert any(
+        "dex has not yet seen a suspend of DEX_WH succeed" in n
+        and "quoted the resume minimum instead" in n
+        for n in notes
+    )
+    advice = next(n for n in notes if "own work is about" in n)
+    assert "AUTO_SUSPEND = 60" in advice
+    assert "dex config set" not in advice
+    assert "GRANT OPERATE" not in advice
+    _one_query(first)
+    _settled(first)
+
+    # Once a suspend has worked the quote carries no tail, so no tail advice.
+    notes = _estimate_notes(_ledgered(tail_600, entries, suspend=True, ceiling=1200.0))
+    assert any("no idle tail is quoted" in n for n in notes)
+    assert not any("own work is about" in n for n in notes)
+    assert not any("has not yet seen a suspend" in n for n in notes)
+
+
+def test_after_a_refused_suspend_the_estimate_names_only_the_grant(tail_600):
+    tail_600.warehouses[0].operate_granted = False
+    entries: list[dict] = []
+    first = _ledgered(tail_600, entries, suspend=True, ceiling=1200.0)
+    _one_query(first)
+    _settled(first)
+    # Its tail runs out and the warehouse suspends on its own.
+    tail_600.clock.now += 700.0
+    tail_600.warehouses[0].state = "SUSPENDED"
+
+    notes = _estimate_notes(_ledgered(tail_600, entries, suspend=True, ceiling=1200.0))
+    advice = next(n for n in notes if "own work is about" in n)
+    assert "`GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE <dex role>`" in advice
+    assert "dex config set" not in advice
+    assert not any("has not yet seen a suspend" in n for n in notes)
 
 
 def test_session_remainder_binds_across_commands(fake_sf_connection):
@@ -655,6 +1119,7 @@ def _aggregate_resolver(sql: str):
     for i in range(10):
         values[f"nn_{i}"] = 100
         values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"d_{i}"] = 100 if i == 0 else 40
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
     return [values]
@@ -763,6 +1228,21 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_sf_connecti
         for note in adapter.table_notes("SHOP.PUBLIC.CUSTOMERS")
     )
     assert data_statements(fake_sf_connection) == []
+
+
+def test_profile_never_counts_a_skipped_column_exactly(fake_sf_connection):
+    """A skipped type reports no distinct count, which the engine must not take
+    for a column the catalog knows nothing about (#1050)."""
+
+    fake_sf_connection.row_resolver = _aggregate_resolver
+    adapter = make_adapter(fake_sf_connection, ceiling=100_000.0)
+    columns = {c.name: c for c in profile(adapter, ["SHOP.PUBLIC.EVENTS"])[0].columns}
+    for name in ("PAYLOAD", "LABELS"):
+        assert columns[name].null_fraction == 0.0
+        assert columns[name].distinct_count is None
+    statements = [s.sql for s in data_statements(fake_sf_connection)]
+    assert 'COUNT(DISTINCT "PAYLOAD")' not in " ".join(statements)
+    assert 'COUNT(DISTINCT "LABELS")' not in " ".join(statements)
 
 
 def test_distinct_combination_counts_batch_into_one_guarded_statement(
@@ -1439,13 +1919,15 @@ def test_forgetting_metadata_keeps_the_session_and_the_uptime_quote(
     fake_sf_connection.row_resolver = lambda sql: [{"n": 1}]
     adapter = make_adapter(fake_sf_connection)
     sql = 'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"'
-    first = adapter.query_estimate(sql)
+    first = with_uptime(adapter, adapter.query_estimate(sql), None)[0]
     adapter.run_query(sql, max_rows=10, timeout_seconds=200)
-    warm = adapter.query_estimate(sql)
+    warm = with_uptime(adapter, adapter.query_estimate(sql), None)[0]
     assert first == pytest.approx(warm + 60)
 
     adapter.forget_metadata()
-    assert adapter.query_estimate(sql) == pytest.approx(warm)
+    assert with_uptime(adapter, adapter.query_estimate(sql), None)[0] == pytest.approx(
+        warm
+    )
     adapter.run_query(sql, max_rows=10, timeout_seconds=200)
     assert len([u for u in fake_sf_connection.used if "USE WAREHOUSE" in u]) == 1
 
@@ -1591,3 +2073,33 @@ def test_a_host_cap_binds_over_a_higher_committed_session_ceiling(fake_sf_connec
             timeout_seconds=30,
         )
     assert data_statements(fake_sf_connection) == []
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_sf_connection):
+    fake_sf_connection.row_resolver = lambda sql: FakeResult(rows=[{"n": 1}])
+    adapter = make_adapter(fake_sf_connection)
+    _one_query(adapter)
+    assert "TIMEZONE" not in fake_sf_connection.session_parameters
+
+    adapter.pin_utc_session()
+    _one_query(adapter)
+    assert fake_sf_connection.session_parameters["TIMEZONE"] == "UTC"
+
+
+def test_snowflake_in_scope_respects_databases_and_scopes(multi_db_connection):
+    """#984: a snowflake namespace is in scope if it lies inside the resolved scopes."""
+
+    adapter = make_adapter(
+        multi_db_connection, target=SnowflakeTarget(databases=["RAW"])
+    )
+    assert adapter.in_scope("RAW.PUBLIC") is True
+    assert adapter.in_scope("raw.legacy") is True
+    assert adapter.in_scope("SAMPLE.PUBLIC") is False
+
+    scoped = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(databases=["RAW"]),
+        scope_override=["RAW.PUBLIC"],
+    )
+    assert scoped.in_scope("RAW.PUBLIC") is True
+    assert scoped.in_scope("RAW.STAGING") is False

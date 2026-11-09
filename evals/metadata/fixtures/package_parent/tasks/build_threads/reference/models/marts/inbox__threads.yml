@@ -1,0 +1,52 @@
+version: 2
+models:
+- name: inbox__threads
+  description: One row per conversation, with how many parts it has and when the latest was created.
+  config:
+    meta:
+      dex:
+        grain:
+        - conversation_id
+        population:
+          rule: Every conversation the vendor still has, including ones with no parts.
+          parent:
+            model: stg_inbox__conversations
+            key:
+              conversation_id: conversation_id
+        assumptions:
+        - decision: Which relation drives the mart
+          chosen: stg_inbox__conversations, with parts left-joined so a conversation with none counts zero
+          evidence: default
+          detail: The parts table keeps parts of deleted conversations, so it cannot say which conversations exist.
+  columns:
+  - name: conversation_id
+    data_tests:
+    - unique
+    - not_null
+    - relationships:
+        arguments:
+          to: ref('stg_inbox__conversations')
+          field: conversation_id
+    config:
+      meta:
+        dex:
+          role: key
+          references: stg_inbox__conversations.conversation_id
+  - name: state
+    config:
+      meta:
+        dex:
+          role: dimension
+  - name: part_count
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: sum
+          additivity: additive
+          unit: count
+  - name: last_part_at
+    config:
+      meta:
+        dex:
+          role: time

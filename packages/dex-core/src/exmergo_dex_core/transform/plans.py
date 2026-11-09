@@ -13,14 +13,16 @@ re-planning the same change is idempotent and yields the same id.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..diffs import file_diff
 from ..edits import ApplyResult, Edit, EditOp, content_hash
@@ -101,6 +103,37 @@ class TransformPlan(BaseModel):
     edit_target: str = "project"
     edits: list[PlanEdit]
     applied_at: str | None = None
+    # The existing models this plan rewrites, each with what static row
+    # attribution could say about it (`attributed`, `unattributed`, `none`),
+    # recorded when the plan offered `transform compare` (#1049). None on a plan
+    # that rewrites no existing model, and on plans stored before the field.
+    refactor_models: dict[str, str] | None = None
+    # The last `transform compare` verdict per model (status, reason_code,
+    # compared_at, input_scope, compiled digests), so `transform apply` and a
+    # `--for-plan` build can say whether a rewrite was compared. Bookkeeping
+    # about the plan rather than part of it: the portable document and its
+    # digest carry the edits alone, so recording a verdict moves no digest.
+    comparisons: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Per model, the identifier conversions the plan adds and what each did to
+    # the model's entities when planned (#861): status, reason_code, column and
+    # the conversion as authored. Bookkeeping like `comparisons`, outside the
+    # digest, so a `--for-plan` build can carry an undeclared loss or an
+    # unchecked conversion into its completion obligations.
+    identifier_conversions: dict[str, list[dict[str, Any]]] | None = None
+    # Per model, the changes the plan makes beside its request that an
+    # assumption must record (#1115): a population change, a removed output,
+    # a changed cast, aggregate or NULL treatment, each `declared` or
+    # `undeclared`, plus `unchecked` where the edit could not be read.
+    # Bookkeeping outside the digest, read by a `--for-plan` build.
+    change_scope: dict[str, list[dict[str, Any]]] | None = None
+    # The retirement contract (#858): which flag value's behavior survives and
+    # what each output must hold. Intent rather than bookkeeping, so unlike the
+    # two above it travels in the plan document and, where present, its digest.
+    retirement: dict[str, Any] | None = None
+    # The toggle contract (#1113): a flag that stays live, its on and off values
+    # and the columns it governs, plus the producers the plan's compile found.
+    # Intent like `retirement`, so it travels in the plan document and digest.
+    toggle: dict[str, Any] | None = None
 
 
 def contained_key(rel_path: str, surface: list[str]) -> str:
@@ -278,6 +311,8 @@ def admit_edit(
     *,
     cache: Any = None,
     pii_overrides: Any = None,
+    compiled: Any = None,
+    defer_compilation: bool = False,
 ) -> list[str]:
     """Every check that can refuse one dbt-shaped edit, and the warnings it
     raises. Stores nothing, writes nothing, reads no subprocess.
@@ -329,7 +364,13 @@ def admit_edit(
         return []
     from .validate import validate_edit
 
-    return validate_edit(edit, cache=cache, pii_overrides=pii_overrides)
+    return validate_edit(
+        edit,
+        cache=cache,
+        pii_overrides=pii_overrides,
+        compiled=compiled,
+        defer_compilation=defer_compilation,
+    )
 
 
 def plan(
@@ -344,6 +385,8 @@ def plan(
     edit_target: str = "project",
     pii_overrides: Any = None,
     conventions: ConventionWarnings | None = None,
+    dialect: str | None = None,
+    compiled_models: Any = None,
 ) -> tuple[TransformPlan, list[dict[str, Any]], list[str]]:
     """Validate agent-authored edits and store them as a plan. Writes no source file.
 
@@ -380,6 +423,10 @@ def plan(
     directly gets the same reading a configured repo gets by default; switching
     one off is a choice a project makes, not something a caller falls into by
     not passing it.
+
+    ``dialect`` is the connector's sqlglot dialect, which
+    :func:`reserved_column_warnings` checks column names against. Absent, that
+    check is skipped.
     """
 
     if not edits:
@@ -443,11 +490,11 @@ def plan(
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
     diffs: list[dict[str, Any]] = []
-    # Read at most once, and only when a seed is actually in the plan: the cache
-    # is a stored document, and every other kind has no use for it.
+    # Read at most once, and only when something needs it: a seed in the plan, or
+    # a star the contract comparison can only read through a profile.
     cached: list[Any] = []
 
-    def seed_cache() -> Any:
+    def read_cache() -> Any:
         if not cached:
             from ..storage import CacheUnreadableError, readable_cache
 
@@ -461,7 +508,8 @@ def plan(
                 warnings.append(
                     f"the exploration cache could not be read ({exc}), so a "
                     "seed's columns were checked against their own names only, "
-                    "not against columns a profile already flagged"
+                    "not against columns a profile already flagged, and a `*` "
+                    "over a relation was not read through a profile"
                 )
         return cached[0]
 
@@ -476,8 +524,9 @@ def plan(
                     edit,
                     view,
                     project,
-                    cache=seed_cache() if edit.kind is EditKind.SEED_CSV else None,
+                    cache=read_cache() if edit.kind is EditKind.SEED_CSV else None,
                     pii_overrides=pii_overrides,
+                    compiled=(compiled_models or {}).get(edit.path),
                 )
             )
         else:
@@ -549,6 +598,9 @@ def plan(
             file_diff(edit.path, current.content if current else None, edit.new_content)
         )
 
+    if dbt_shaped:
+        _append_scaffold_gitkeep_deletes(project, view, pinned, diffs)
+
     # The whole-plan delete guard: a delete is refused if any file that survives
     # the plan still refers to a deleted model. Run against the pinned edits so
     # an update in this same plan that removes the offending ref is honored.
@@ -565,7 +617,11 @@ def plan(
         from .scaffold import missing_macro_warnings
 
         warnings.extend(missing_macro_warnings(edits, view))
-        warnings.extend(column_contract_warnings(edits, view))
+        warnings.extend(
+            column_contract_warnings(edits, view, cache=read_cache, dialect=dialect)
+        )
+        if dialect is not None:
+            warnings.extend(reserved_column_warnings(edits, dialect))
 
         # The one plan-time check that reads a convention rather than a
         # declaration, and the only one a project can switch off, because it is
@@ -688,6 +744,99 @@ _BREAKS_ON_DELETE = frozenset(
 )
 
 
+def _append_scaffold_gitkeep_deletes(
+    project: Path,
+    _view: DbtProjectView,
+    pinned: list[PlanEdit],
+    diffs: list[dict[str, Any]],
+) -> None:
+    """Drop a Dex-scaffolded empty ``.gitkeep`` once a folder gets its first file.
+
+    ``transform init`` leaves ``.gitkeep`` in ``models/staging``, ``marts``, and
+    (with layered schemas) ``intermediate``. When a plan upserts the first real
+    file into one of those folders and the only thing still there is an empty
+    ``.gitkeep``, include a ``delete`` for it in the same plan so apply removes
+    it under the plan/apply guard (issue #653). A non-empty keeper, a folder that
+    already holds other files, or a keeper the plan already touches is left alone.
+    """
+
+    already = {edit.path for edit in pinned}
+    # Folders this plan is creating a file into (upsert whose path is new or
+    # replacing content under models/).
+    candidate_dirs: set[str] = set()
+    for edit in pinned:
+        if edit.op is not EditOp.UPSERT:
+            continue
+        parent = PurePosixPath(edit.path).parent.as_posix()
+        if parent == "." or not parent.startswith("models/"):
+            continue
+        # Only the layer folders init scaffolds keepers into, not arbitrary nests.
+        parts = parent.split("/")
+        if len(parts) != 2 or parts[1] not in {"staging", "intermediate", "marts"}:
+            continue
+        candidate_dirs.add(parent)
+
+    for folder in sorted(candidate_dirs):
+        keep_rel = f"{folder}/.gitkeep"
+        if keep_rel in already:
+            continue
+        keep_path = project / keep_rel
+        if not keep_path.is_file():
+            continue
+        try:
+            content = keep_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if content != "":
+            continue
+        # Folder must hold only this keeper on disk (the plan's new files are not
+        # written yet). Anything else means a human already filled the folder.
+        siblings = [p.name for p in (project / folder).iterdir() if p.is_file()]
+        if siblings != [".gitkeep"]:
+            continue
+        pinned.append(
+            PlanEdit(
+                path=keep_rel,
+                op=EditOp.DELETE,
+                kind=EditKind.MODEL_SQL,
+                old_content_hash=content_hash(content),
+            )
+        )
+        diffs.append(file_diff(keep_rel, content, None))
+
+
+def _package_models_restored(
+    root: Path, names: set[str], project_yml: str | None
+) -> dict[str, str]:
+    """The deleted names an installed package defines as a model that the
+    project's ``dbt_project.yml`` after the plan leaves enabled, by package.
+
+    Deleting a project override of a package model hands the name back to the
+    package, the reverse of the repair the #860 recipe describes (#1083 needs
+    it when a project adaptation gives way to repairing the data). A ref with no
+    package argument then resolves to the package's model, so it does not
+    dangle. dbt reads ``enabled`` from the most specific level of
+    ``models.<package>.<folder>...<model>``, and that is what is read here; a
+    package model disabled after the plan is not restored. Package SQL that
+    disables itself with ``config(enabled=false)`` is not read, which can only
+    leave a name restored that dbt then reports as missing at parse time.
+    """
+
+    if not names:
+        return {}
+    from .package_overrides import package_models
+
+    text = project_yml
+    if text is None:
+        with contextlib.suppress(OSError, UnicodeError):
+            text = (root / "dbt_project.yml").read_text(encoding="utf-8")
+    restored: dict[str, str] = {}
+    for model in package_models(root, names, text):
+        if model.enabled:
+            restored.setdefault(model.name, model.package)
+    return restored
+
+
 def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]:
     """Refuse a plan whose deletions would orphan a ``ref()``, atomically.
 
@@ -714,7 +863,11 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     because no edit the caller could make would make it resolvable.
 
     Packages are not scanned. The question is whether *this project* still points
-    at what it is deleting, and a package cannot be edited to fix it anyway.
+    at what it is deleting, and a package cannot be edited to fix it anyway. A
+    package does answer one case: deleting a project model that overrides a
+    package model of the same name, which the project leaves enabled after the
+    plan, hands the name back to the package, so a ref to it does not dangle
+    (see :func:`_package_models_restored`).
     """
 
     from ..dbt_project import SourceFile, node_files, node_name
@@ -767,11 +920,34 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     )
     index = ReferenceIndex(after, scan_packages=False)
 
+    restored = _package_models_restored(
+        root, deleted_models, surviving.get("dbt_project.yml")
+    )
+    # A file that goes while the post-change `versions:` keeps its name
+    # referable (`dim_teams.sql` renamed to `dim_teams_v1.sql` under a
+    # versioned `dim_teams`) leaves every `ref('dim_teams')` resolving (#859).
+    from ..model_versions import version_map
+
+    still_versioned = {
+        base
+        for base, model in version_map(surviving, view.model_paths).items()
+        if any(item.file is not None for item in model.versions)
+    }
+    deleted_models -= still_versioned
     danglers: dict[str, list[str]] = {}
     for model in sorted(deleted_models):
         for kind in ("model", "seed", "snapshot"):
             for reference in index.references_to(model, kind)[0]:
                 if reference.form not in _BREAKS_ON_DELETE:
+                    continue
+                provider = restored.get(model)
+                if (
+                    kind == "model"
+                    and provider is not None
+                    and reference.qualifier in (None, provider)
+                ):
+                    # The project's override goes and the package's own model of
+                    # the same name, enabled after this plan, answers the ref.
                     continue
                 danglers.setdefault(reference.path, []).append(
                     f"{model} (line {reference.line}, {reference.form})"
@@ -826,7 +1002,13 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     return warnings
 
 
-def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[str]:
+def column_contract_warnings(
+    edits: list[PlanEdit],
+    view: DbtProjectView,
+    *,
+    cache: Callable[[], Any] | None = None,
+    dialect: str | None = None,
+) -> list[str]:
     """Warn when a model's authored SELECT list diverges from what its
     schema.yml declares, in either direction (issue #214).
 
@@ -844,10 +1026,12 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
     together in the same plan are compared against each other, not against a
     stale on-disk declaration.
 
-    Where the authored SELECT list cannot be resolved statically (a bare
-    ``select *``, a qualified ``t.*``, or an unaliased macro call standing in
-    for a column), the comparison is skipped and that is said outright,
-    rather than guessed at.
+    A star is followed to what it mirrors (#643): a CTE, a subquery, the other
+    models of this project as this plan leaves them, then a cached profile, named
+    in any warning that rests on one, since a profile can be stale. ``cache`` is
+    called only when a star needs it. Where the columns still cannot be resolved,
+    the comparison is skipped and the warning says which case it was, rather than
+    guessing.
     """
 
     schema_sources = {
@@ -859,6 +1043,8 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
         if edit.kind is EditKind.SCHEMA_YML and edit.new_content is not None:
             schema_sources[edit.path] = edit.new_content
 
+    from ..model_versions import entry_variants
+
     declared_by_model: dict[str, list[str]] = {}
     for content in schema_sources.values():
         try:
@@ -867,20 +1053,30 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
             continue
         if not isinstance(parsed, dict):
             continue
-        for entry in parsed.get("models") or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
+        # A version is held to its own columns, the shared ones its
+        # include/exclude admits plus its own (#859).
+        variants = [
+            variant
+            for raw in parsed.get("models") or []
+            if isinstance(raw, dict)
+            for variant in entry_variants(raw)
+        ]
+        for name, entry in variants:
             columns = [
                 column["name"]
                 for column in entry.get("columns") or []
                 if isinstance(column, dict) and isinstance(column.get("name"), str)
             ]
             if columns:
-                declared_by_model[entry["name"]] = columns
+                declared_by_model[name] = columns
 
     from ..dbt_project import column_contract_divergence
+    from ..model_versions import cached_version_map, label_for_file
+    from .select_list import resolve_select_list
 
     warnings: list[str] = []
+    catalog = _ProjectCatalog(edits, view, schema_sources, cache, dialect)
+    versions = cached_version_map(catalog.files, view.model_paths)
     for edit in edits:
         if (
             edit.kind is not EditKind.MODEL_SQL
@@ -888,21 +1084,31 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
             or edit.new_content is None
         ):
             continue
-        model = Path(edit.path).stem
+        model = label_for_file(edit.path, versions) or Path(edit.path).stem
         declared = declared_by_model.get(model)
         if not declared:
             continue
         declared_lower = {c.lower(): None for c in declared}
 
-        produced = select_columns(edit.new_content)
+        resolved = resolve_select_list(
+            edit.new_content,
+            dialect=dialect,
+            relation_columns=catalog.reader(frozenset({model.lower()})),
+        )
+        produced = resolved.columns
         if produced is None:
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) for {model}, but "
-                "the SELECT list could not be resolved statically (a `select "
-                "*`/`t.*`, or a macro standing in for a column); the "
-                "contract comparison was skipped"
+                f"the SELECT list could not be resolved statically ({resolved.reason}"
+                "); the contract comparison was skipped"
             )
             continue
+        basis = (
+            " (a `*` was read from the cached profile of "
+            f"{', '.join(resolved.read_from)}, which may be stale)"
+            if resolved.read_from
+            else ""
+        )
 
         # No type info on either side here: a SELECT list names no types at
         # all, so this call never resolves a mismatch, only the two name-only
@@ -913,12 +1119,181 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
         if missing:
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) {', '.join(missing)} "
-                f"for {model} that the SELECT list does not produce"
+                f"for {model} that the SELECT list does not produce{basis}"
             )
         if extra:
             warnings.append(
                 f"{edit.path}: the SELECT list produces column(s) "
-                f"{', '.join(extra)} not declared in schema.yml for {model}"
+                f"{', '.join(extra)} not declared in schema.yml for {model}{basis}"
+            )
+    return warnings
+
+
+class _ProjectCatalog:
+    """What a star over a relation reads, for the contract comparison.
+
+    A project model is read from its own SQL as this plan leaves it, which beats
+    any profile: a profile predates the plan. A model this plan changes or removes
+    is never read from the cache, for the same reason. Everything else, and a
+    model whose SQL cannot be read, comes from the cache when it has a profile.
+    """
+
+    def __init__(
+        self,
+        edits: list[PlanEdit],
+        view: DbtProjectView,
+        schema_sources: dict[str, str],
+        cache: Callable[[], Any] | None,
+        dialect: str | None,
+    ) -> None:
+        from .declarations import post_change_files
+
+        self.files = post_change_files(view, edits)
+        self.model_paths = view.model_paths
+        self.schema_sources = schema_sources
+        self.cache = cache
+        self.dialect = dialect
+        from ..model_versions import cached_version_map, label_for_file
+
+        vmap = cached_version_map(self.files, self.model_paths)
+        self.changed = {
+            (label_for_file(edit.path, vmap) or Path(edit.path).stem).lower()
+            for edit in edits
+            if edit.kind is EditKind.MODEL_SQL
+        } | {
+            Path(edit.path).stem.lower()
+            for edit in edits
+            if edit.kind is EditKind.MODEL_SQL
+        }
+
+    def reader(self, stack: frozenset[str]) -> Callable[[Any], Any]:
+        return lambda relation: self._columns(relation, stack)
+
+    def _columns(self, relation: Any, stack: frozenset[str]) -> Any:
+        from .declarations import model_sql_path
+        from .select_list import RelationColumns, resolve_select_list
+
+        inner: str | None = None
+        if relation.kind == "ref" and len(relation.parts) == 1:
+            model = relation.label.lower()
+            if model in stack:
+                return RelationColumns(reason=f"a ref() cycle through {relation.name}")
+            path = model_sql_path(self.files, self.model_paths, relation.label)
+            if path is not None:
+                resolved = resolve_select_list(
+                    self.files[path],
+                    dialect=self.dialect,
+                    relation_columns=self.reader(stack | {model}),
+                )
+                if resolved.columns is not None:
+                    return RelationColumns(
+                        sorted(resolved.columns), read_from=resolved.read_from
+                    )
+                inner = resolved.reason
+            if model in self.changed:
+                return RelationColumns(
+                    reason=(
+                        f"a `*` over {relation}, which this plan changes and whose "
+                        f"own columns could not be read ({inner or 'it is removed'})"
+                    )
+                )
+        return self._profiled(relation, inner)
+
+    def _profiled(self, relation: Any, inner: str | None) -> Any:
+        from .drafting import _dataset_for_model, dataset_for
+        from .select_list import RelationColumns
+
+        cache = self.cache() if self.cache is not None else None
+        if relation.kind == "ref":
+            dataset = _dataset_for_model(
+                cache, relation.name, self.files, self.model_paths
+            )
+        elif relation.kind == "source":
+            dataset = dataset_for(cache, self._source_identifier(relation))
+        else:
+            dataset = dataset_for(cache, str(relation))
+        if dataset is None or not dataset.columns:
+            why = f"; its own SELECT list holds {inner}" if inner else ""
+            return RelationColumns(
+                reason=(
+                    f"a `*` over {relation} with no single cached profile{why}; "
+                    f"`dex explore profile {relation.name}` would supply one"
+                )
+            )
+        return RelationColumns(
+            [column.name for column in dataset.columns],
+            read_from=[dataset.identifier],
+        )
+
+    def _source_identifier(self, relation: Any) -> str:
+        """``schema.identifier`` as the project's YAML names this source table, or
+        the bare table name where the YAML does not say so literally."""
+
+        source = relation.parts[0] if len(relation.parts) > 1 else None
+        for content in self.schema_sources.values():
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError:
+                continue
+            entries = parsed.get("sources") if isinstance(parsed, dict) else None
+            for entry in entries or []:
+                if not isinstance(entry, dict) or entry.get("name") != source:
+                    continue
+                for table in entry.get("tables") or []:
+                    if isinstance(table, dict) and table.get("name") == relation.name:
+                        schema = entry.get("schema") or source
+                        identifier = table.get("identifier") or relation.name
+                        if "{{" in f"{schema}{identifier}":
+                            return relation.name
+                        return f"{schema}.{identifier}"
+        return relation.name
+
+
+def reserved_column_warnings(edits: list[PlanEdit], dialect: str) -> list[str]:
+    """Warn when a schema.yml in this plan puts generic tests on a column whose
+    name ``dialect`` reserves, without ``quote: true`` (issue #651).
+
+    dbt writes the column bare into the test's SQL, so the test fails to compile
+    on the first build. Both ``models:`` and ``sources:`` tables are read, since
+    the case that prompted this was a source column.
+    """
+
+    from ..reserved_words import reserved_column_names
+
+    warnings: list[str] = []
+    for edit in edits:
+        if edit.kind is not EditKind.SCHEMA_YML or edit.new_content is None:
+            continue
+        try:
+            parsed = yaml.safe_load(edit.new_content)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        # (table entry, how the warning names it): a source table by
+        # `source.table`, the way `source()` does.
+        tables = [(m, "") for m in parsed.get("models") or []]
+        for source in parsed.get("sources") or []:
+            if isinstance(source, dict):
+                prefix = f"{source.get('name')}."
+                tables += [(t, prefix) for t in source.get("tables") or []]
+        for table, prefix in tables:
+            if not isinstance(table, dict):
+                continue
+            tested = [
+                column["name"]
+                for column in table.get("columns") or []
+                if isinstance(column, dict)
+                and isinstance(column.get("name"), str)
+                and (column.get("tests") or column.get("data_tests"))
+                and column.get("quote") is not True
+            ]
+            name = f"{prefix}{table.get('name')}"
+            warnings.extend(
+                f"{edit.path}: column {column} of {name} is a reserved word in "
+                f"{dialect} and has tests but no `quote: true`; dbt writes it "
+                "unquoted, so the tests fail to compile"
+                for column in reserved_column_names(dialect, tested)
             )
     return warnings
 
@@ -927,45 +1302,19 @@ def select_columns(sql: str) -> set[str] | None:
     """The lowercased output column names of a model's outermost SELECT, or
     ``None`` if they cannot be resolved statically.
 
-    Unresolvable covers a bare ``select *``, a qualified ``t.*``, an unaliased
-    macro call standing in for a column (indistinguishable from a real column
-    once jinja is stripped to a placeholder, and can expand to any number of
-    real columns), a set operation (a UNION's branches can each project
-    differently), and anything that fails to parse. An *aliased* macro call
-    (``{{ some_macro(x) }} as total``) is resolvable: the alias is the real
-    output name regardless of what expression computed it.
+    Follows a star through this statement's own CTEs and subqueries and no further
+    (:mod:`.select_list`): callers refuse on this answer, so it never rests on a
+    cached profile. Unresolvable covers a star over a relation, an unaliased macro
+    call standing in for a column (indistinguishable from a real column once jinja
+    is stripped to a placeholder, and can expand to any number of real columns),
+    and anything that fails to parse. An *aliased* macro call (``{{ some_macro(x) }}
+    as total``) is resolvable: the alias is the real output name regardless of what
+    expression computed it.
     """
 
-    import sqlglot
-    from sqlglot import expressions as exp
+    from .select_list import resolve_select_list
 
-    from .validate import _PLACEHOLDER, strip_jinja
-
-    stripped = strip_jinja(sql)
-    if not stripped:
-        return None
-    try:
-        parsed = sqlglot.parse_one(stripped, read="duckdb")
-    except Exception:
-        return None
-
-    node = parsed
-    while isinstance(node, (exp.With, exp.Subquery)):
-        node = node.this
-    if not isinstance(node, exp.Select):
-        return None
-
-    columns: set[str] = set()
-    for projection in node.expressions:
-        if isinstance(projection, exp.Star):
-            return None
-        if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
-            return None
-        name = projection.alias_or_name
-        if not name or _PLACEHOLDER in name:
-            return None
-        columns.add(name.lower())
-    return columns or None
+    return resolve_select_list(sql).columns
 
 
 def _plan_id(

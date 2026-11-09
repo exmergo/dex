@@ -239,6 +239,22 @@ def test_probe_statements_transpiles_to_postgres_and_stays_select_only():
     assert "balances" in sql
 
 
+def test_probe_statements_use_lag_in_frame_on_clickhouse():
+    """ClickHouse has no LAG, and its lagInFrame fills a partition's first row
+    with 0 rather than NULL unless told otherwise, which would count every
+    entity's first row as an observation."""
+
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    candidate = CumulativeCandidate("account_id", "snapshot_date", ["balance"])
+    dataset = Dataset(identifier="app.balances", columns=[])
+    [sql] = probe_statements([(dataset, candidate)], "clickhouse")
+    assert "LAG(" not in sql.upper().replace("LAGINFRAME(", "")
+    assert 'lagInFrame(toNullable("balance"), 1, NULL)' in sql
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" in sql
+    assert_select_only(sql, dialect="clickhouse")
+
+
 def test_probe_statements_is_identity_on_duckdb():
     candidate = CumulativeCandidate("account_id", "snapshot_date", ["balance"])
     dataset = Dataset(identifier="db.main.balances", columns=[])
@@ -473,10 +489,52 @@ def test_check_cumulative_run_twice_does_not_duplicate_the_note(tmp_path: Path, 
     cumulative_notes = [n for n in dataset["data_quality"] if "looks cumulative" in n]
     assert len(cumulative_notes) == 1
 
-    # And the duplicate-free state is what actually persisted.
     data = _run(
         ["explore", "profile", "account_activity", "--path", str(path)], capsys
     )["data"]
     [dataset] = data["datasets"]
     cumulative_notes = [n for n in dataset["data_quality"] if "looks cumulative" in n]
     assert len(cumulative_notes) == 1
+
+
+def test_sparse_daily_counts_with_ties_not_flagged_as_cumulative(tmp_path: Path):
+    """Sparse daily counts (e.g. 0s and 1s) with flat ties between occasional
+    bumps are not misread as a running total merely because consecutive zeros
+    do not decrease (#945)."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "sparse.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE search_stats ("
+        "site_id INTEGER, stat_date DATE, clicks INTEGER, running_clicks INTEGER)"
+    )
+    # 200 daily rows: clicks is sparse (mostly 0s and occasional 1s),
+    # running_clicks is a genuine cumulative sum with flat days between events.
+    rows = []
+    c = 0
+    for day in range(200):
+        stat_date = date(2026, 1, 1) + timedelta(days=day)
+        daily = 1 if day % 5 == 0 else 0
+        c += daily
+        rows.append((1, stat_date, daily, c))
+    conn.executemany("INSERT INTO search_stats VALUES (?, ?, ?, ?)", rows)
+    conn.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as run_profile
+
+    adapter = DuckDBAdapter(db_path)
+    try:
+        identifiers = [m.identifier for m in adapter.list_objects()]
+        [dataset] = run_profile(adapter, identifiers)
+        candidate, _ = find_candidate(dataset)
+        assert candidate is not None
+        assert set(candidate.measures) == {"clicks", "running_clicks"}
+
+        fractions = measure_fractions(adapter, dataset.identifier, candidate)
+        measure_notes = cumulative_measure_notes(candidate, fractions)
+    finally:
+        adapter.close()
+
+    assert any(n.startswith("running_clicks ") for n in measure_notes)
+    assert not any(n.startswith("clicks ") for n in measure_notes)

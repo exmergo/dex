@@ -1,0 +1,47 @@
+{
+  "models": {
+    "account_event_rate": {
+      "grain": [
+        "account_id"
+      ],
+      "columns": {
+        "account_id": {
+          "role": "key"
+        },
+        "event_count": {
+          "role": "measure",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "events_per_day": {
+          "additivity": "non_additive"
+        }
+      }
+    }
+  },
+  "attribution": {
+    "decision_pattern": "(no|zero|without)[ -](\\w+ )?events?|event-?less|inactive|population|which accounts",
+    "evidence": [
+      "request"
+    ],
+    "forbidden": [
+      "contract",
+      "precedent",
+      "data",
+      "default"
+    ],
+    "max_assumptions": 6
+  },
+  "checks": [
+    {
+      "name": "every account present",
+      "expect": 30,
+      "sql": "select count(*) from main.account_event_rate"
+    },
+    {
+      "name": "zero-event accounts count zero",
+      "expect": 10,
+      "sql": "select count(*) from main.account_event_rate where event_count = 0"
+    }
+  ]
+}

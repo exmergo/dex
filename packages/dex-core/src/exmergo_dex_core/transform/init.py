@@ -39,6 +39,7 @@ from ..config import (
     load_config,
     save_config,
 )
+from ..config_document import ABSENT, ConfigDocument
 from ..dbt_project import (
     PROFILES_FILE,
     PROJECT_FILE,
@@ -77,6 +78,13 @@ class InitResult(BaseModel):
     diffs: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# A BigQuery project id: letters, digits, dots and hyphens, optionally in the
+# legacy domain-scoped form (``example.com:my-project``).
+_BIGQUERY_PROJECT_ID = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9.\-]*(?::[A-Za-z0-9][A-Za-z0-9\-]*)?"
+)
+
+
 def sanitize_project_name(raw: str) -> str:
     """Reduce free-form input to a valid dbt project name (lowercase,
     underscores, no leading digit)."""
@@ -99,6 +107,7 @@ def init_project(
     repo_root: Path | str = ".",
     layered_schemas: bool = False,
     in_place: bool = False,
+    project: str | None = None,
 ) -> InitResult:
     """Render a fresh dbt project skeleton and record the choices in config.
 
@@ -113,6 +122,10 @@ def init_project(
     shipped ``generate_schema_name`` macro override, and per-folder ``+schema:``
     config, so each layer builds into its own ``<layer>_<target name>`` schema
     instead of one shared dev namespace.
+
+    ``project`` is the explicit BigQuery project (the CLI's ``--project``). It
+    wins over a configured or discovered one, and both the rendered profile and
+    the saved config carry it, so the choice is stated once and stays ambient.
     """
 
     root = Path(repo_root)
@@ -146,6 +159,25 @@ def init_project(
         )
 
     config = load_config(root) or DexConfig()
+    # An explicit value must not read as "flag absent" when it is blank, and a
+    # malformed id would otherwise reach the rendered profile and the config.
+    if project is not None and not _BIGQUERY_PROJECT_ID.fullmatch(project):
+        raise InitError(
+            "--project needs a BigQuery project id: letters, digits, dots and "
+            "hyphens, or the legacy domain-scoped form example.com:my-project"
+        )
+    if project:
+        if connector != "bigquery":
+            raise InitError(
+                f"--project is BigQuery vocabulary and has no meaning for the "
+                f"{connector} connector"
+            )
+        # The explicit choice wins over a configured or discovered one. Writing
+        # it onto the target here is what makes the rendered profile, the saved
+        # config and the envelope's connection attribution agree.
+        config.bigquery = (config.bigquery or BigQueryTarget()).model_copy(
+            update={"project": project}
+        )
     from ..connect import assert_deployment_supported
     from ..errors import ConfigurationError
 
@@ -193,7 +225,7 @@ def init_project(
     diffs = [file_diff(rel, None, content) for rel, content in files.items()]
     for rel, content in files.items():
         write_project_file(root / rel, content)
-    save_config(config, root)
+    _persist_init_config(config, root, config_path, old_config)
     diffs.append(
         file_diff(config_rel, old_config, config_path.read_text(encoding="utf-8"))
     )
@@ -209,6 +241,63 @@ def init_project(
         created=created,
         diffs=diffs,
     )
+
+
+# Attributes init writes back onto an existing connector block. A model
+# default the profile never assigned stays off this list, so loading the file
+# cannot grow it (``clickhouse.deployment``, ``trino.deployment``).
+_INIT_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
+    "duckdb": ("path",),
+    "bigquery": ("project", "dev_dataset", "location"),
+    "snowflake": ("dev_database", "dev_schema"),
+    "databricks": ("dev_catalog", "dev_schema"),
+    "postgres": ("dev_schema",),
+    "redshift": ("dev_schema",),
+    "clickhouse": ("dev_database",),
+    "trino": ("dev_schema",),
+}
+
+
+def _persist_init_config(
+    config: DexConfig,
+    root: Path,
+    config_path: Path,
+    old_config: str | None,
+) -> None:
+    """Write the keys ``init`` sets into ``.dex/config.yml``.
+
+    A repo with no config keeps ``save_config``: there is nothing to preserve. A
+    repo that already has one is amended through ``ConfigDocument`` (the same
+    in-place editor ``dex config set`` uses), so comments, key order, unread
+    keys, and explicit nulls survive. Only the keys ``init`` itself changes are
+    touched. Those are the project pointers and the connector fields named in
+    ``_INIT_CONFIG_FIELDS``.
+    """
+
+    if old_config is None:
+        save_config(config, root)
+        return
+
+    document = ConfigDocument.read(config_path)
+    amendments: list[tuple[str, Any]] = [
+        ("connector", config.connector),
+        ("dbt_project_dir", config.dbt_project_dir),
+        ("dbt_target", config.dbt_target),
+    ]
+    block = getattr(config, config.connector, None)
+    if block is not None:
+        for field in _INIT_CONFIG_FIELDS[config.connector]:
+            value = getattr(block, field)
+            if value is not None:
+                amendments.append((f"{config.connector}.{field}", value))
+    for key, value in amendments:
+        if value is None:
+            continue
+        current = document.written(key)
+        if current is not ABSENT and current == value:
+            continue
+        document = document.with_value(key, value)
+    document.write(config_path)
 
 
 # --- per-connector profile renderers -------------------------------------------
@@ -339,7 +428,14 @@ def _bigquery_profile(
 def _resolve_init_project(target: BigQueryTarget, root: Path) -> str | None:
     """The connect-time resolution chain, minus the hard ADC requirement: init
     only renders config, so absent credentials degrade to "not found" rather
-    than an auth error."""
+    than an auth error.
+
+    A project the target already names (configured, or set from ``--project``)
+    settles it before any credential lookup, which no discovery could improve
+    on and which would otherwise make init depend on ADC for nothing."""
+
+    if target.project:
+        return target.project
 
     from ..connect import (
         CredentialDiscoveryError,
@@ -553,6 +649,42 @@ def _databricks_profile(
 _DEFAULT_PG_DEV_SCHEMA = "dbt_dev"
 
 
+def identity_notes(connector: str, config: DexConfig, root: Path) -> list[str]:
+    """Where the profile builds as one role and dex reads as another, say so:
+    a privilege granted to one says nothing about the other, and the split
+    would otherwise surface as a build refusal about the wrong role (#904)."""
+
+    from ..connect import CredentialDiscoveryError
+
+    target = getattr(config, connector, None)
+    if connector not in ("postgres", "redshift") or target is None or not target.user:
+        return []
+    try:
+        if connector == "postgres":
+            from ..connect import resolve_postgres_connection
+
+            _params, method = resolve_postgres_connection(target, os.environ, root)
+            if method.split(":", 1)[0] == "dbt_profile":
+                return []
+            reads_as = _pg_connection_fields(target, method).get("user")
+        else:
+            from ..connect import resolve_redshift_connection
+
+            params, method, _compute = resolve_redshift_connection(
+                target, os.environ, root
+            )
+            reads_as = None if method.startswith("iam") else params.get("user")
+    except CredentialDiscoveryError:
+        return []
+    if reads_as is None or reads_as == target.user:
+        return []
+    return [
+        f"the profile builds as {connector}.user '{target.user}', but dex itself "
+        f"reads as '{reads_as}': two identities, so a privilege granted to one "
+        "says nothing about the other"
+    ]
+
+
 def _postgres_profile(
     project_name: str,
     path: str | None,
@@ -578,7 +710,9 @@ def _postgres_profile(
     fields = _pg_connection_fields(target, method)
     host = fields.get("host")
     dbname = fields.get("dbname")
-    user = fields.get("user")
+    # A committed postgres.user is the build identity: the one place a role
+    # separate from dex's own read identity can be stated (#904).
+    user = target.user or fields.get("user")
     if not host or not dbname or not user:
         missing = ", ".join(
             name
@@ -748,7 +882,8 @@ def _redshift_profile(
     else:
         host = params.get("host")
         dbname = params.get("database")
-        user = params.get("user")
+        # The build identity, as in Postgres (#904).
+        user = target.user or params.get("user")
         if not host or not dbname or not user:
             missing = ", ".join(
                 name

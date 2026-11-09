@@ -149,20 +149,8 @@ def validate_plan(
             "semantic.slayer.models"
         )
 
-    from .loader import formula_problems, validate_model_contents
-
-    validated = validate_model_contents(prospective)
     edited = set(paths)
-    refusals = [*validated.errors, *_strict_warnings(validated, edited)]
-    skipped_formulas = False
-    for loaded in validated.models:
-        if loaded.file not in edited:
-            continue
-        found = formula_problems(loaded)
-        if found is None:
-            skipped_formulas = True
-        else:
-            refusals.extend(found)
+    validated, refusals, skipped_formulas = refusals_for(prospective, edited)
     if refusals:
         listed = "\n  ".join(d.render() for d in refusals)
         raise ValueError(
@@ -213,6 +201,34 @@ def validate_plan(
     return SemanticEditValidation(
         defined=defined, updated=updated, notes=notes, warnings=warnings
     )
+
+
+def refusals_for(
+    prospective: dict[str, str], edited: set[str]
+) -> tuple[LoadResult, list[Diagnostic], bool]:
+    """Validate a prospective model set the way authoring does.
+
+    Returns the load result, every diagnostic that refuses it (the reader's
+    errors, plus the strict warnings and formula problems of the files in
+    ``edited``), and whether formulas went unparsed for want of the [sql] extra.
+    Shared with the derivation, which holds a model it proposes but cannot yet
+    write to exactly the checks a plan writing it would run.
+    """
+
+    from .loader import formula_problems, validate_model_contents
+
+    validated = validate_model_contents(prospective)
+    refusals = [*validated.errors, *_strict_warnings(validated, edited)]
+    skipped_formulas = False
+    for loaded in validated.models:
+        if loaded.file not in edited:
+            continue
+        found = formula_problems(loaded)
+        if found is None:
+            skipped_formulas = True
+        else:
+            refusals.extend(found)
+    return validated, refusals, skipped_formulas
 
 
 def write_edits(

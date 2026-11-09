@@ -5,9 +5,11 @@
 only what its host uses; the sibling modules are the backends. Callers receive a
 store; only the entry point picks which one.
 
-It also holds three separate, optional contracts that sit alongside the tiers
+It also holds four separate, optional contracts that sit alongside the tiers
 rather than inside them: :class:`~.base.SpendLock`, which lets the cost gate make
 the spend admission atomic so the cumulative ceiling binds under concurrency;
+:class:`~.base.CacheLock`, which keeps one command's cache write from reverting
+another's;
 :class:`~.base.SpendHistory`, which hands the ledger's entries back so an
 over-ceiling refusal can say how far this connector's past estimates ran from
 what they billed; and the construction contract (:class:`~.base.StoreFactory`
@@ -23,6 +25,7 @@ this package. It is deliberately not imported here: it needs pytest, and a bare
 """
 
 from .base import (
+    CacheLock,
     CacheUnreadableError,
     Document,
     ExploreStore,
@@ -42,6 +45,7 @@ from .sqlite import SqliteStore
 
 __all__ = [
     "DEX_DIR",
+    "CacheLock",
     "CacheUnreadableError",
     "Document",
     "ExploreStore",

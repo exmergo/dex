@@ -9,12 +9,16 @@ whitelist, so a misconfigured ``dbt_target: prod`` still refuses.
 dbt runs as a subprocess rather than in-process: dbt logs to stdout, and the
 command contract is exactly one JSON envelope there, so the run is isolated and
 only a sanitized summary crosses the boundary. Node results come from dbt's own
-``target/run_results.json`` artifact, not from scraping log text.
+``run_results.json`` in the artifact directory for this build, not from
+scraping log text. That directory is ``<project>/target`` unless the caller
+named a runtime or an artifact directory.
 """
 
 from __future__ import annotations
 
 import contextlib
+import csv
+import hashlib
 import json
 import os
 import re
@@ -22,7 +26,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -38,11 +44,25 @@ from ..dbt_project import (
     contained_path,
     manifest_node_label,
     profiles_dir,
+    strip_relation_quoting,
+    types_equal,
 )
 from ..dbt_project import load as load_project
 from ..envelope import Cost, EstimateQuality, Paradigm, redact
 from ..errors import DexError, PrerequisiteError
-from ..guards.cost_guard import preflight
+from ..guards.cost_guard import UPTIME_LINE, preflight
+from ..value_mask import mask_values
+from .artifact_runtime import (
+    DEFAULT_ARTIFACT_POLICY,
+    artifact_paths,
+    clear_run_results,
+    dbt_runtime_key,
+    prepare_artifact_dir,
+    readable_artifact_dir,
+    resolve_build_artifact_dir,
+    sanitize_artifact_directory,
+    shared_target_dir,
+)
 
 # Names that mean production no matter what the config says. The build target
 # must additionally be on the allowlist (dev or the configured dbt_target); this
@@ -56,6 +76,9 @@ _PARSE_TIMEOUT_SECONDS = 120.0
 # Envelope hygiene for dbt output: enough of each message to act on, never a
 # multi-KB traceback, never the same message twice.
 _MESSAGE_MAX_CHARS = 400
+# Appended when a message is cut at the cap, so a reader knows the rest exists
+# rather than taking the cut for the whole of what dbt said.
+_MESSAGE_CUT_NOTE = f"... (cut at {_MESSAGE_MAX_CHARS} characters)"
 _MESSAGE_CAP = 20
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
@@ -123,6 +146,13 @@ def build(
     timeout: float = _DBT_TIMEOUT_SECONDS,
     dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
     approved_functions: frozenset[str] | None = None,
+    runtime_key: str | None = None,
+    artifact_directory: Path | str | None = None,
+    artifact_policy: str = DEFAULT_ARTIFACT_POLICY,
+    relation_columns: RelationColumns | None = None,
+    full_refresh: bool = False,
+    run_cwd: Path | None = None,
+    seed_history_directory: Path | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -143,6 +173,31 @@ def build(
     the others) is the backstop. The gate here is defense in depth: the command
     layer has already run the confirm handshake from the same estimate, and this
     re-check binds every caller of the engine regardless.
+
+    Where dbt writes is decided once, before anything runs, and every dbt
+    invocation below gets it as ``--target-path`` (issue #1014).
+    ``artifact_directory`` names it outright. ``runtime_key`` is the older
+    spelling from #883: reuse a clean shared target path, isolate on a
+    collision. Otherwise ``artifact_policy`` decides, through
+    :func:`~.artifact_runtime.resolve_build_artifact_dir`: ``isolated`` (the
+    default) is Dex's own ``<target-path>/dex/<runtime>``, and ``shared`` is the
+    project's target path, refused when another runtime left it incompatible.
+    The summary names the directory under ``artifact_directory``.
+
+    ``full_refresh`` passes ``--full-refresh`` to ``dbt build``, which rebuilds
+    each selected incremental model and seed from scratch (issue #1015). The
+    summary's ``full_refresh`` then names them, with any whose own
+    ``full_refresh: false`` config makes dbt ignore the flag. The stale-seed
+    pre-step is skipped, since the build itself now refreshes every seed it
+    selects.
+
+    ``relation_columns`` reads the dev target: it takes seed relation names and
+    returns the columns of each one that exists, each a name or a ``(name,
+    type)`` pair. With it, a seed whose CSV header or declared ``column_types``
+    no longer match its relation (see :func:`stale_seeds`) is rebuilt with
+    ``dbt seed --full-refresh`` right before the build, and the summary says so
+    under ``full_refresh``. Injected like ``dev_target_check``, and for the same
+    reason; without it the build runs as it always has.
     """
 
     assert_dev_target(target, configured_target)
@@ -153,6 +208,22 @@ def build(
     # against the cwd we pin below: a relative project dir would otherwise
     # double (dbt would look for project/project and fail).
     project = Path(project_dir).resolve()
+
+    # Resolved ahead of every gate: it is free, and a shared directory another
+    # runtime left incompatible refuses here, before anyone weighs a budget.
+    if artifact_directory is not None:
+        artifacts = Path(artifact_directory)
+        if not artifacts.is_absolute():
+            artifacts = project / artifacts
+        artifacts.mkdir(parents=True, exist_ok=True)
+    elif runtime_key is not None:
+        artifacts = prepare_artifact_dir(
+            project,
+            runtime_key,
+            shared_relative=str(shared_target_dir(project)),
+        )
+    else:
+        artifacts = resolve_build_artifact_dir(project, artifact_policy)
 
     target_warnings = dev_target_check() if dev_target_check is not None else []
 
@@ -193,9 +264,7 @@ def build(
                 "deps": {"ran": True, "success": False},
             }, cost
 
-    argv = [
-        _dbt_executable(),
-        "build",
+    flags = [
         "--target",
         target,
         "--project-dir",
@@ -204,42 +273,174 @@ def build(
         str(profiles_dir(project).resolve()),
         "--log-format",
         "json",
+        "--target-path",
+        str(artifacts),
     ]
+    # A copy's logs go with it, and a failure's "full output" line names the file.
+    detached = (
+        run_cwd is not None and Path(run_cwd).resolve() != Path(project).resolve()
+    )
+    log_file = None
+    if detached:
+        log_file = Path(artifacts) / "logs" / "dbt.log"
+        flags += ["--log-path", str(log_file.parent)]
+    argv = [_dbt_executable(), "build", *flags]
     if select:
         argv += ["--select", select]
+    if full_refresh:
+        argv.append("--full-refresh")
 
     # A hard compile-time/parse-time failure (a Jinja context error, for
     # instance) dies before dbt ever reaches node execution, so it never
-    # (re)writes target/run_results.json -- a stale one left over from a prior
+    # (re)writes run_results.json -- a stale one left over from a prior
     # successful build would otherwise still be sitting there, and _summarize
     # would report its node results as if they belonged to this invocation
-    # (issue #76). Clearing it first means "file absent" always means "this
-    # invocation wrote nothing", never "an old invocation's results carried
-    # over".
-    (project / "target" / "run_results.json").unlink(missing_ok=True)
+    # (issue #76). Clearing the resolved directory first means "file absent"
+    # always means "this invocation wrote nothing", never "an old invocation's
+    # results carried over". The shared directory is left untouched when this
+    # runtime was isolated away from it.
+    from .seed_history import remember_seed_types
+
+    seed_history_directory = seed_history_directory or artifacts
+    prior_seed_types: dict[str, dict[str, str]] = {}
+    try:
+        prior_seed_types = remember_seed_types(
+            artifacts, seed_history_directory, target
+        )
+    except (OSError, ValueError) as exc:
+        target_warnings = [*target_warnings, f"could not read seed type history: {exc}"]
+    clear_run_results(artifacts)
 
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
     # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
     # against whatever directory the caller happened to launch from.
+    # A cold checkout builds a copy and keeps cwd at the real project, for the
+    # relative DuckDB path the comment above is about (see `ShadowRun`).
     run = runner or _default_runner(
-        timeout, project, env=_build_env(connector, paradigm, ceiling)
+        timeout, run_cwd or project, env=_build_env(connector, paradigm, ceiling)
     )
+    stale: list[dict[str, Any]] = []
+    # A requested full refresh rebuilds every seed the build selects, stale or
+    # not, so the pre-step would only drop the same tables twice.
+    if relation_columns is not None and not full_refresh:
+        try:
+            stale = _seeds_to_refresh(
+                project,
+                artifacts,
+                flags,
+                select,
+                run,
+                relation_columns,
+                prior_seed_types=prior_seed_types,
+            )
+        except Exception as exc:
+            # Reported, never raised: a check that cannot read the dev target
+            # must not break a build dbt could run, nor go quiet about it.
+            target_warnings = [
+                *target_warnings,
+                "could not compare seed headers and column types with the dev target "
+                f"({type(exc).__name__}: {exc}); a seed whose columns changed "
+                "fails as dbt reports it, and a changed column_types entry "
+                "may not apply",
+            ]
     if approved_functions:
         from ..adapters import get_dialect
 
-        _compile_project(project, target=target, select=select, runner=run)
-        _assert_compiled_functions(
+        _compile_project(
             project,
+            target=target,
+            select=select,
+            runner=run,
+            artifacts=artifacts,
+            full_refresh=full_refresh,
+        )
+        _assert_compiled_functions(
+            artifacts,
             dialect=get_dialect(connector or "duckdb"),
             approved_functions=approved_functions,
         )
         # Compilation also writes run_results; it is not build evidence.
-        (project / "target" / "run_results.json").unlink(missing_ok=True)
+        clear_run_results(artifacts)
+    # After every gate above, so a refused build has dropped nothing.
+    refreshed: list[str] = []
+    if stale:
+        seed_argv = [_dbt_executable(), "seed", "--full-refresh", *flags]
+        seed_argv += ["--select", " ".join(_exact_seed(node) for node in stale)]
+        clear_run_results(artifacts)
+        seeded = _summarize(
+            project, target, run(seed_argv), artifact_directory=artifacts
+        )
+        try:
+            remember_seed_types(artifacts, seed_history_directory, target)
+        except (OSError, ValueError) as exc:
+            target_warnings = [
+                *target_warnings,
+                f"could not save seed type history: {exc}",
+            ]
+        refreshed = [node["name"] for node in seeded["nodes"]]
+        if not seeded["success"]:
+            seeded["full_refresh"] = {
+                "seeds": refreshed or [str(node["name"]) for node in stale],
+                "success": False,
+            }
+            return seeded, cost
+        # The build that follows reloads these seeds and tests them, so its own
+        # results are the evidence; the refresh's are not.
+        clear_run_results(artifacts)
     completed = run(argv)
 
-    summary = _summarize(project, target, completed)
+    summary = _summarize(
+        project,
+        target,
+        completed,
+        artifact_directory=artifacts,
+        log_file=log_file,
+        label_root=run_cwd if detached else None,
+    )
+    if select is not None:
+        summary.setdefault("selection", select)
+    try:
+        remember_seed_types(artifacts, seed_history_directory, target)
+    except (OSError, ValueError) as exc:
+        target_warnings = [*target_warnings, f"could not save seed type history: {exc}"]
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
+    if full_refresh:
+        rebuilt = full_refresh_nodes(artifacts)
+        summary["full_refresh"] = {
+            "requested": True,
+            **rebuilt,
+            "success": bool(summary["success"]),
+        }
+        if not select:
+            target_warnings = [
+                *target_warnings,
+                full_refresh_unselected_warning(rebuilt),
+            ]
+    elif refreshed:
+        summary["full_refresh"] = {"seeds": refreshed, "success": True}
+        reasons = {
+            str(node["name"]): node.get("dex_stale_reason", "header") for node in stale
+        }
+        by_header = [name for name in refreshed if reasons.get(name) != "column_types"]
+        by_types = [name for name in refreshed if reasons.get(name) == "column_types"]
+        if by_header:
+            target_warnings = [
+                *target_warnings,
+                f"rebuilt {', '.join(by_header)} with dbt seed --full-refresh before "
+                "the build: its CSV header no longer matched the columns of its "
+                "relation in the dev target, and a changed header either fails to "
+                "load into the table dbt already built or loads values into the "
+                "wrong columns",
+            ]
+        if by_types:
+            target_warnings = [
+                *target_warnings,
+                f"rebuilt {', '.join(by_types)} with dbt seed --full-refresh before "
+                "the build: its declared column_types no longer matched the column "
+                "types of its relation in the dev target, and a reload into the "
+                "table dbt already built keeps the old types",
+            ]
     if target_warnings:
         # Notes, not failure causes: kept out of `messages`, whose first entry
         # is promoted to the envelope's error line on failure.
@@ -247,9 +448,160 @@ def build(
     return summary, cost
 
 
+#: A reader of the dev target: seed relation names to the columns of each one
+#: that exists, in order. A column is its name, or ``(name, type)`` where the
+#: reader knows the type, which is what lets a declared ``column_types`` change
+#: count as stale (issue #1083).
+RelationColumns = Callable[[list[str]], dict[str, list[Any]]]
+
+
+def _column_name_and_type(column: Any) -> tuple[str, str | None]:
+    """Read a column name with an optional metadata type."""
+
+    if isinstance(column, (tuple, list)):
+        name, data_type = column[0], column[1] if len(column) > 1 else None
+        return str(name), str(data_type) if data_type else None
+    return str(column), None
+
+
+def stale_seeds(
+    manifest_path: Path,
+    project: Path,
+    relation_columns: RelationColumns,
+    *,
+    prior_seed_types: dict[str, dict[str, str]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """The seeds whose CSV header or declared column types no longer match the
+    relation they load into, as ``unique_id`` to manifest node. Each node
+    returned carries ``dex_stale_reason``: ``header`` or ``column_types``.
+
+    dbt reloads a seed into the table it already built unless told to rebuild
+    it, so a header that gained or lost a column fails to load (issue #943), and
+    on dbt-duckdb, which loads by position, one that reordered its columns loads
+    each value under the wrong name. Likewise a ``column_types`` entry changed
+    after the table was built is ignored: the reload keeps the old column type,
+    so a type repair to the project's own input data silently does nothing
+    (issue #1083). Only ``--full-refresh`` recreates the table. Names compare
+    case-insensitively, since a warehouse may fold them, and in order; types
+    compare through :func:`types_equal`, so an equivalent spelling is not a
+    change, and only where the reader reports one. A seed whose relation does not
+    exist yet is not stale: dbt creates it. ``prior_seed_types`` records the last
+    successful load, so deleting a type declaration also triggers a refresh and
+    restores CSV inference. A missing history entry makes no removal claim.
+    """
+
+    nodes: dict[str, Any] = {}
+    with contextlib.suppress(OSError, json.JSONDecodeError, AttributeError):
+        nodes = json.loads(manifest_path.read_text(encoding="utf-8")).get("nodes") or {}
+    seeds = {
+        strip_relation_quoting(node["relation_name"]): (unique_id, node)
+        for unique_id, node in nodes.items()
+        if isinstance(node, dict)
+        and node.get("resource_type") == "seed"
+        and node.get("fqn")
+        and node.get("relation_name")
+        and node.get("original_file_path")
+    }
+    if not seeds:
+        return {}
+    live = relation_columns(list(seeds))
+    stale: dict[str, dict[str, Any]] = {}
+    for relation, (unique_id, node) in seeds.items():
+        columns = live.get(relation)
+        if not columns:
+            continue
+        delimiter = (node.get("config") or {}).get("delimiter") or ","
+        csv_file = Path(node.get("root_path") or project) / node["original_file_path"]
+        try:
+            with csv_file.open(encoding="utf-8-sig", newline="") as handle:
+                header = next(csv.reader(handle, delimiter=delimiter), [])
+        except OSError:
+            continue
+        live_columns = [_column_name_and_type(column) for column in columns]
+        if [name.lower() for name, _ in live_columns] != [h.lower() for h in header]:
+            stale[unique_id] = {**node, "dex_stale_reason": "header"}
+            continue
+        declared = (node.get("config") or {}).get("column_types") or {}
+        from .seed_history import column_types
+
+        removed = set((prior_seed_types or {}).get(unique_id, {})) - set(
+            column_types(node.get("config") or {})
+        )
+        if removed:
+            stale[unique_id] = {**node, "dex_stale_reason": "column_types"}
+            continue
+        live_types = {name.lower(): data_type for name, data_type in live_columns}
+        if isinstance(declared, dict) and any(
+            isinstance(declared_type, str)
+            and live_types.get(str(name).strip('"`').lower())
+            and not types_equal(
+                declared_type, live_types[str(name).strip('"`').lower()]
+            )
+            for name, declared_type in declared.items()
+        ):
+            stale[unique_id] = {**node, "dex_stale_reason": "column_types"}
+    return stale
+
+
+def _seeds_to_refresh(
+    project: Path,
+    artifacts: Path,
+    flags: list[str],
+    select: str | None,
+    run: Runner,
+    relation_columns: RelationColumns,
+    *,
+    prior_seed_types: dict[str, dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """The manifest node of each stale seed this build selects.
+
+    A full refresh drops the table, so a seed the build would not select is left
+    alone. dex does not evaluate dbt's selector language, which includes a
+    project's default selector, so ``dbt ls`` answers which seeds the build
+    selects. It parses afresh for this target, so neither a cleaned target
+    directory nor a manifest another target left behind decides which table a
+    seed loads into.
+    """
+
+    argv = [_dbt_executable(), "ls", "--quiet", "--resource-type", "seed"]
+    argv += ["--output", "json", "--output-keys", "unique_id", *flags]
+    if select:
+        argv += ["--select", select]
+    listed: set[str] = set()
+    for line in (run(argv).stdout or "").splitlines():
+        # Under --log-format json each printed node is a PrintEvent whose
+        # message is that node's own JSON.
+        with contextlib.suppress(ValueError, TypeError, KeyError, AttributeError):
+            event = json.loads(line)
+            if event["info"]["name"] == "PrintEvent":
+                listed.add(json.loads(event["data"]["msg"])["unique_id"])
+    if not listed:
+        return []
+    stale = stale_seeds(
+        artifact_paths(artifacts).manifest,
+        project,
+        relation_columns,
+        prior_seed_types=prior_seed_types,
+    )
+    return [stale[unique_id] for unique_id in sorted(stale) if unique_id in listed]
+
+
+def _exact_seed(node: dict[str, Any]) -> str:
+    """A dbt selection matching this one seed and nothing else.
+
+    dbt's fqn method also matches an fqn without its package and as a prefix,
+    which reaches a same-named seed in another package or the seeds in a
+    directory of the same name, so the package and the file name pin it.
+    """
+
+    fqn = [str(part) for part in node["fqn"]]
+    name = Path(node["original_file_path"]).name
+    return f"package:{fqn[0]},fqn:{'.'.join(fqn)},file:{name}"
+
+
 @contextlib.contextmanager
 def shadow_project(
-    project_dir: Path | str, edits: Sequence[Edit] = ()
+    project_dir: Path | str, edits: Sequence[Edit] = (), *, skip_packages: bool = False
 ) -> Iterator[Path]:
     """A throwaway copy of the project with ``edits`` overlaid, yielded by path.
 
@@ -262,20 +614,37 @@ def shadow_project(
     macros. Warehouse files deliberately are not: they can be huge, and a copy of
     a database is not the database, so a caller that needs the real warehouse must
     reach it through the profile rather than through the tree. ``.dex`` matters
-    when the project is the repo root.
+    when the project is the repo root. ``skip_packages`` leaves ``dbt_packages/``
+    out, for a caller about to install it afresh.
     """
 
     project = Path(project_dir).resolve()
     view = load_project(project)
+    by_name = shutil.ignore_patterns(".git", ".venv", ".dex", "*.duckdb", "*.db")
+    # A configured target-path holds artifacts as surely as `target/` does,
+    # Dex's own isolated ones included (issue #1014). It is skipped by its full
+    # path: `target-path: models/target` must not skip `models/`.
+    packages = packages_dir(project).resolve()
+    artifacts: Path | None = None
+    with contextlib.suppress(ValueError, OSError):
+        configured = shared_target_dir(project).resolve()
+        if configured != project and configured.is_relative_to(project):
+            artifacts = configured
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        skipped = set(by_name(directory, names))
+        # At the root only: `models/logs/` is a folder of models, not dbt's logs.
+        if Path(directory).resolve() == project:
+            skipped.update(name for name in names if name in ("target", "logs"))
+        if artifacts is not None and Path(directory).resolve() == artifacts.parent:
+            skipped.update(name for name in names if name == artifacts.name)
+        if skip_packages and Path(directory).resolve() == packages.parent:
+            skipped.update(name for name in names if name == packages.name)
+        return skipped
+
     with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
         shadow = Path(tmp) / (project.name or "project")
-        shutil.copytree(
-            project,
-            shadow,
-            ignore=shutil.ignore_patterns(
-                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
-            ),
-        )
+        shutil.copytree(project, shadow, ignore=ignore)
         for edit in edits:
             edit_path = contained_path(shadow, edit.path, view)
             if edit.op is EditOp.DELETE:
@@ -295,6 +664,7 @@ def shadow_parse(
     target: str | None = None,
     runner: Runner | None = None,
     timeout: float = _PARSE_TIMEOUT_SECONDS,
+    keep_manifest: bool = False,
 ) -> dict[str, Any]:
     """Validate proposed edits with dbt's own parser, without touching the project.
 
@@ -312,6 +682,10 @@ def shadow_parse(
     validates today should not go on to warn about them for the first time at
     `transform build` (#55). On failure, ``messages`` are the parse errors
     (dbt's own summary event leads if present; see :func:`_collect_messages`).
+
+    ``keep_manifest`` adds ``manifest``, the parsed ``manifest.json`` of the
+    post-change copy (``None`` where it could not be read), for a caller that
+    must confirm what dbt resolved rather than what the files suggest (#859).
     """
 
     # Absolute so --profiles-dir (pointing at the real project) does not
@@ -360,9 +734,19 @@ def shadow_parse(
         ]
         if target:
             argv += ["--target", target]
+        manifest_dir = shadow / ".dex-parse-target"
+        if keep_manifest:
+            argv += ["--target-path", str(manifest_dir)]
         run = runner or _default_runner(timeout, shadow)
         completed = run(argv)
         success = completed.returncode == 0
+        manifest: dict[str, Any] | None = None
+        if keep_manifest and success:
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(
+                    (manifest_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                manifest = loaded if isinstance(loaded, dict) else None
         # Collected unconditionally: a passing parse can still have logged
         # deprecation notices, which the caller surfaces as plan-time warnings
         # rather than letting the author discover them for the first time at
@@ -370,7 +754,15 @@ def shadow_parse(
         messages = _collect_messages(completed)
         if not success and not messages:
             messages = ["dbt parse failed"]
-    return {"available": True, "reason": None, "success": success, "messages": messages}
+    result: dict[str, Any] = {
+        "available": True,
+        "reason": None,
+        "success": success,
+        "messages": messages,
+    }
+    if keep_manifest:
+        result["manifest"] = manifest
+    return result
 
 
 # dbt reads these from the environment, and each one can silently change which
@@ -438,6 +830,11 @@ def _child_environ(*, isolated: bool = False) -> dict[str, str]:
     withheld = set(_CHILD_ENV_WITHHELD)
     if isolated:
         withheld.update(_ISOLATED_ENV_SCRUBBED)
+        # dbt 1.12 reads each of these first as `DBT_ENGINE_<NAME>`, so the old
+        # name alone would leave the setting in place.
+        withheld.update(
+            name.replace("DBT_", "DBT_ENGINE_", 1) for name in _ISOLATED_ENV_SCRUBBED
+        )
     env = {key: value for key, value in os.environ.items() if key not in withheld}
     # dbt writes a `.user.yml` into the profiles directory when usage tracking
     # is on, and the profiles directory here is often the real project.
@@ -607,14 +1004,54 @@ class ShadowRun:
             raise DbtRunError("dbt wrote no manifest for the copied project")
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def compile(self, select: str) -> dict[str, Any]:
-        """Compile one selection in the copy and return the manifest dbt wrote."""
+    def compile(
+        self, select: str, *, vars_: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Compile one selection in the copy and return the manifest dbt wrote.
 
-        completed = self._invoke("compile", "--select", select)
+        ``vars_`` overrides project variables for this compile alone, which is
+        how a flag's branch is compiled without touching any file (#858).
+        """
+
+        extra = ("--vars", json.dumps(dict(vars_))) if vars_ else ()
+        completed = self._invoke("compile", "--select", select, *extra)
         if completed.returncode != 0:
             messages = _collect_messages(completed)
             raise DbtRunError(messages[0] if messages else "dbt compile failed")
         return self.manifest()
+
+    def compile_isolating(
+        self,
+        select: str,
+        *,
+        vars_: Mapping[str, Any] | None = None,
+        max_isolated: int = 10,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Compile a selection, setting aside each node whose own compile fails.
+
+        dbt stops a compile at the first node that fails and then writes no
+        compiled SQL for any node, so one broken model would leave a whole
+        project unjudged. Each node dbt names as failing is excluded by its path
+        and the compile is run again, at most ``max_isolated`` times, so a
+        model that does not compile is that model's problem alone. Returns the
+        manifest and ``{original_file_path: message}`` for the nodes set aside.
+        A failure dbt pins on no node (a parse error, no profile) still raises.
+        """
+
+        extra = ["--vars", json.dumps(dict(vars_))] if vars_ else []
+        isolated: dict[str, str] = {}
+        while True:
+            args = ["--select", select, *extra]
+            for path in isolated:
+                args += ["--exclude", f"path:{path}"]
+            completed = self._invoke("compile", *args)
+            if completed.returncode == 0:
+                return self.manifest(), isolated
+            failed = _failed_node(completed)
+            if failed is None or failed[0] in isolated or len(isolated) >= max_isolated:
+                messages = _collect_messages(completed)
+                raise DbtRunError(messages[0] if messages else "dbt compile failed")
+            isolated[failed[0]] = failed[1]
 
     def test(
         self, select: str, *, exclude: Sequence[str] = ()
@@ -637,7 +1074,12 @@ class ShadowRun:
         results = self._require_shadow() / "target" / "run_results.json"
         if not results.is_file():
             return None
-        return _summarize(self._require_shadow(), self.target, completed)
+        return _summarize(
+            self._require_shadow(),
+            self.target,
+            completed,
+            read_from=self._require_shadow() / "target",
+        )
 
     def show(
         self, select: str
@@ -661,7 +1103,12 @@ class ShadowRun:
         summary = None
         if results.is_file():
             summary = {
-                **_summarize(self._require_shadow(), self.target, completed),
+                **_summarize(
+                    self._require_shadow(),
+                    self.target,
+                    completed,
+                    read_from=self._require_shadow() / "target",
+                ),
                 "messages": [],
             }
         if completed.returncode != 0:
@@ -715,17 +1162,64 @@ class ShadowRun:
         return self.shadow
 
 
-def has_package_spec(project_dir: Path | str) -> bool:
+#: The project-root files that decide which packages a project declares and
+#: where dbt installs them. A plan's edit to any of them is read in place of the
+#: file on disk when the package check runs against the post-edit tree (#1166).
+PACKAGE_DECIDING_FILES = ("packages.yml", "dependencies.yml", "dbt_project.yml")
+
+#: Root-relative file name to post-edit text, ``None`` where the edit deletes it.
+PackageOverlay = Mapping[str, str | None]
+
+
+def _root_text(
+    project: Path, name: str, overlay: PackageOverlay | None = None
+) -> str | None:
+    """A project-root file's text, as a plan would leave it where ``overlay``
+    says, and as it stands on disk otherwise. ``None`` means it does not exist."""
+
+    if overlay is not None and name in overlay:
+        return overlay[name]
+    candidate = project / name
+    if not candidate.is_file():
+        return None
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def package_overlay(edits: Iterable[Edit]) -> dict[str, str | None]:
+    """The edits that change which packages are declared, keyed by file name.
+
+    Only a project-root ``packages.yml``, ``dependencies.yml`` or
+    ``dbt_project.yml`` counts: the first two declare the packages and the last
+    can move ``packages-install-path``. A delete maps to ``None``.
+    """
+
+    overlay: dict[str, str | None] = {}
+    for edit in edits:
+        path = Path(edit.path)
+        if path.parent != Path() or path.name not in PACKAGE_DECIDING_FILES:
+            continue
+        overlay[path.name] = (
+            None if edit.op is EditOp.DELETE else (edit.new_content or "")
+        )
+    return overlay
+
+
+def has_package_spec(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> bool:
     """True when the project declares dbt packages (packages.yml, or a
     dependencies.yml with a ``packages:`` key)."""
 
     project = Path(project_dir)
-    if (project / "packages.yml").is_file():
+    if _root_text(project, "packages.yml", overlay) is not None:
         return True
-    dependencies = project / "dependencies.yml"
-    if dependencies.is_file():
+    text = _root_text(project, "dependencies.yml", overlay)
+    if text is not None:
         try:
-            parsed = yaml.safe_load(dependencies.read_text(encoding="utf-8"))
+            parsed = yaml.safe_load(text)
         except yaml.YAMLError:
             return False
         return isinstance(parsed, dict) and bool(parsed.get("packages"))
@@ -749,18 +1243,39 @@ class DeclaredPackage(BaseModel):
     install_name: str | None = None
 
     def describe(self) -> str:
-        return f"{self.name}@{self.version}" if self.version else self.name
+        name = _without_userinfo(self.name)
+        return f"{name}@{self.version}" if self.version else name
 
 
-def _package_entries(project: Path) -> list[dict[str, Any]]:
+def _without_userinfo(value: str) -> str:
+    """Drop credentials from a URL before it is named in an error.
+
+    ``https://TOKEN@github.com/org/repo.git`` is a valid git package, and a
+    caller who can run a plan can read its refusal. Keep the host and path so
+    the message still names the package, but never the token; ``git@host:path``
+    is a user name, not a secret, and has no ``://``.
+    """
+
+    if "://" not in value:
+        return value
+    scheme, rest = value.split("://", 1)
+    authority, separator, tail = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[-1]
+    return f"{scheme}://{authority}{separator}{tail}"
+
+
+def _package_entries(
+    project: Path, overlay: PackageOverlay | None = None
+) -> list[dict[str, Any]]:
     """The raw ``packages:`` list, from whichever file declares it."""
 
     for filename in ("packages.yml", "dependencies.yml"):
-        candidate = project / filename
-        if not candidate.is_file():
+        text = _root_text(project, filename, overlay)
+        if text is None:
             continue
         try:
-            parsed = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+            parsed = yaml.safe_load(text)
         except yaml.YAMLError:
             continue
         if isinstance(parsed, dict) and isinstance(parsed.get("packages"), list):
@@ -768,7 +1283,9 @@ def _package_entries(project: Path) -> list[dict[str, Any]]:
     return []
 
 
-def declared_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+def declared_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> list[DeclaredPackage]:
     """Every package the project declares, in the three forms dbt accepts.
 
     Read rather than resolved: this says what the project asks for, not what a
@@ -778,7 +1295,7 @@ def declared_packages(project_dir: Path | str) -> list[DeclaredPackage]:
 
     project = Path(project_dir)
     packages: list[DeclaredPackage] = []
-    for entry in _package_entries(project):
+    for entry in _package_entries(project, overlay):
         if isinstance(entry.get("package"), str):
             name = entry["package"]
             packages.append(
@@ -826,17 +1343,45 @@ def _version_text(value: Any) -> str | None:
     return str(value)
 
 
-def installed_packages(project_dir: Path | str) -> set[str]:
-    """What is actually in ``dbt_packages/``, by directory and by declared name.
+def package_install_dir(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> Path:
+    """Where dbt installs declared packages, honoring ``packages-install-path``.
+
+    dbt defaults to ``dbt_packages/`` beside the project; a project may move it.
+    Checking the default unconditionally would refuse a project whose packages
+    are installed where dbt was told to put them.
+    """
+
+    project = Path(project_dir)
+    configured: str | None = None
+    text = _root_text(project, "dbt_project.yml", overlay)
+    if text is not None:
+        try:
+            parsed = yaml.safe_load(text)
+        except yaml.YAMLError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("packages-install-path")
+            if isinstance(value, str) and value.strip():
+                configured = value.strip()
+    return project / (configured or "dbt_packages")
+
+
+def installed_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> set[str]:
+    """What is actually in the package directory, by directory and by declared name.
 
     Both, because dbt installs a hub package into a directory named after the
     package's second segment while the package's own ``dbt_project.yml`` may say
     something else, and a check that reads only one of them reports a present
-    package as absent.
+    package as absent. Honours ``packages-install-path`` via
+    :func:`package_install_dir`.
     """
 
     installed: set[str] = set()
-    root = Path(project_dir) / "dbt_packages"
+    root = package_install_dir(project_dir, overlay=overlay)
     if not root.is_dir():
         return installed
     for child in root.iterdir():
@@ -855,7 +1400,9 @@ def installed_packages(project_dir: Path | str) -> set[str]:
     return installed
 
 
-def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+def missing_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> list[DeclaredPackage]:
     """Declared packages this project does not have installed.
 
     An empty ``dbt_packages/`` means every declaration is missing, which is the
@@ -866,10 +1413,10 @@ def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
     """
 
     project = Path(project_dir)
-    declared = declared_packages(project)
+    declared = declared_packages(project, overlay=overlay)
     if not declared:
         return []
-    installed = installed_packages(project)
+    installed = installed_packages(project, overlay=overlay)
     if not installed:
         return declared
     return [
@@ -879,12 +1426,18 @@ def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
     ]
 
 
-def unverifiable_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+def unverifiable_packages(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> list[DeclaredPackage]:
     """Declared packages whose presence dex cannot check by name."""
 
-    if not installed_packages(project_dir):
+    if not installed_packages(project_dir, overlay=overlay):
         return []
-    return [p for p in declared_packages(project_dir) if p.install_name is None]
+    return [
+        p
+        for p in declared_packages(project_dir, overlay=overlay)
+        if p.install_name is None
+    ]
 
 
 class MissingPackagesError(PrerequisiteError):
@@ -901,6 +1454,8 @@ class MissingPackagesError(PrerequisiteError):
         self,
         packages: list[DeclaredPackage],
         unverifiable: list[DeclaredPackage] | None = None,
+        *,
+        lead: str = "this build may not install dependencies",
     ):
         self.packages = packages
         self.unverifiable = unverifiable or []
@@ -917,37 +1472,195 @@ class MissingPackagesError(PrerequisiteError):
                 + " by name, so those may be missing too"
             )
         super().__init__(
-            f"this build may not install dependencies, and {detail}. "
+            f"{lead}, and {detail}. "
             "Run `transform deps` "
             "where the network is available, or bake dbt_packages/ into the "
-            "environment before the build"
+            "environment before the build. `transform deps` installs the "
+            "packages the project already declares (at the versions "
+            "package-lock.yml pins, where it matches packages.yml): it is not "
+            "installing or upgrading a tool"
         )
 
 
-def assert_packages_installed(project_dir: Path | str) -> None:
+def assert_packages_installed(
+    project_dir: Path | str,
+    *,
+    unverifiable_is_fatal: bool = True,
+    overlay: PackageOverlay | None = None,
+    lead: str | None = None,
+) -> None:
     """Check every declaration, even when some packages are already installed.
 
     REFUSE cannot establish an installation whose declared name is unknown;
     report that uncertainty instead of admitting it as an installed package.
-    The interactive installation heuristic remains separate.
+    The interactive installation heuristic remains separate. A caller that
+    only needs to know whether something declared is *missing* (a plan, which
+    still runs schema checks when dbt cannot parse) passes
+    ``unverifiable_is_fatal=False``: a git package's directory name is not
+    determined by its URL, so refusing on it would refuse the whole project.
+    ``overlay`` reads the package-deciding files as a plan would leave them
+    (:func:`package_overlay`), so the check is of the post-edit tree.
     """
 
-    missing = missing_packages(project_dir)
-    unverifiable = unverifiable_packages(project_dir)
-    if missing or unverifiable or needs_deps(project_dir):
-        raise MissingPackagesError(missing, unverifiable)
+    missing = missing_packages(project_dir, overlay=overlay)
+    unverifiable = unverifiable_packages(project_dir, overlay=overlay)
+    shortfall = has_package_shortfall(project_dir, overlay=overlay)
+    if (
+        missing
+        or (unverifiable_is_fatal and unverifiable)
+        or needs_deps(project_dir, overlay=overlay)
+        or shortfall
+    ):
+        # A count shortfall is a definite absence somewhere, so the packages dex
+        # could not check are worth naming even when the caller tolerates an
+        # unverifiable installation on its own.
+        extra = {"lead": lead} if lead else {}
+        raise MissingPackagesError(
+            missing,
+            unverifiable if (unverifiable_is_fatal or shortfall) else [],
+            **extra,
+        )
 
 
-def needs_deps(project_dir: Path | str) -> bool:
-    """True when declared packages are not installed yet (dbt_packages/ missing
-    or empty). Lockfile staleness is not tracked; `transform deps` is the
-    explicit refresh."""
+class PlanDeclaresMissingPackagesError(MissingPackagesError):
+    """A plan refused because its own edit declares a package not installed (#1166).
+
+    dbt cannot parse or compile the plan's other edits against a declaration
+    whose package is absent, and a plan installs nothing, since installing can
+    reach the network. The way through is two plans: the ``packages.yml``
+    change on its own (which needs no parse), applied, then ``transform deps``,
+    then the rest.
+    """
+
+    def __init__(
+        self,
+        declared_by_plan: list[DeclaredPackage],
+        already_declared: list[DeclaredPackage] | None = None,
+        unverifiable: list[DeclaredPackage] | None = None,
+    ):
+        self.declared_by_plan = declared_by_plan
+        already = already_declared or []
+        unchecked = unverifiable or []
+        # Not super().__init__: the message is this refusal's own, and the
+        # attributes a caller reads are the parent's.
+        self.packages = [*declared_by_plan, *already]
+        self.unverifiable = unchecked
+        message = (
+            "this plan declares dbt packages that are not installed: "
+            + ", ".join(p.describe() for p in declared_by_plan)
+            + ". dbt cannot parse the plan's other edits without them, and a "
+            "plan installs nothing. Plan the packages.yml change on its own and "
+            "apply it, run `transform deps` where the network is available, then "
+            "plan the rest"
+        )
+        if already:
+            message += (
+                "; the project already declares these, also not installed: "
+                + ", ".join(p.describe() for p in already)
+            )
+        if unchecked:
+            message += (
+                "; dex could not check "
+                + ", ".join(p.describe() for p in unchecked)
+                + " by name, so those may be missing too"
+            )
+        PrerequisiteError.__init__(self, message)
+
+
+def _package_key(package: DeclaredPackage) -> tuple[str, str]:
+    """What makes two declarations the same package across the two trees."""
+
+    return package.source, package.name
+
+
+def assert_plan_packages_installed(
+    project_dir: Path | str, edits: Iterable[Edit]
+) -> None:
+    """The plan-time package check, read against the post-edit tree (#1166).
+
+    #1060's check read the declarations on disk, so a plan whose own
+    ``packages_yml`` edit added a package passed it and then failed in dbt's
+    words. Here the plan's edits to the package-deciding files are read in place
+    of the disk copies: a package the plan declares is checked, and one the plan
+    stops declaring no longer refuses it. A package the plan adds and dex cannot
+    check by name (git, tarball) is named whenever the installed count proves
+    something declared is absent.
+    """
+
+    overlay = package_overlay(edits)
+    lead = "a plan installs nothing"
+    try:
+        assert_packages_installed(
+            project_dir, unverifiable_is_fatal=False, overlay=overlay, lead=lead
+        )
+    except MissingPackagesError as exc:
+        if not overlay:
+            raise
+        before = {_package_key(p) for p in declared_packages(project_dir)}
+        added = [
+            p
+            for p in declared_packages(project_dir, overlay=overlay)
+            if _package_key(p) not in before
+        ]
+        added_keys = {_package_key(p) for p in added}
+        named = {_package_key(p) for p in exc.packages}
+        ours = [p for p in added if _package_key(p) in named]
+        # An added package dex cannot check by name, refused only when the count
+        # (or an empty install directory) proves an absence it may account for.
+        ours_unchecked = [
+            p for p in added if p.install_name is None and _package_key(p) not in named
+        ]
+        theirs = [p for p in exc.packages if _package_key(p) not in added_keys]
+        unchecked = [p for p in exc.unverifiable if _package_key(p) not in added_keys]
+        if ours:
+            # The plan's unverifiable additions ride along as "may be missing".
+            raise PlanDeclaresMissingPackagesError(
+                ours, theirs, [*unchecked, *ours_unchecked]
+            ) from None
+        if ours_unchecked and not theirs:
+            # Nothing already declared explains the absence the count proves.
+            raise PlanDeclaresMissingPackagesError(
+                ours_unchecked, [], unchecked
+            ) from None
+        raise
+
+
+def has_package_shortfall(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> bool:
+    """True when fewer packages are installed than the project declares.
+
+    A git declaration's install directory name is unknown, so it can never be
+    named as missing and a partly installed project would otherwise look
+    complete. The count needs no name: every declaration installs into one
+    directory of its own, so an installation that is missing one of them cannot
+    reach the number of declarations.
+    """
 
     project = Path(project_dir)
-    if not has_package_spec(project):
+    declared = declared_packages(project, overlay=overlay)
+    if not declared:
         return False
-    packages_dir = project / "dbt_packages"
-    return not packages_dir.is_dir() or not any(packages_dir.iterdir())
+    root = package_install_dir(project, overlay=overlay)
+    if not root.is_dir():
+        return False
+    installed = sum(1 for child in root.iterdir() if child.is_dir())
+    return installed < len(declared)
+
+
+def needs_deps(
+    project_dir: Path | str, *, overlay: PackageOverlay | None = None
+) -> bool:
+    """True when declared packages are not installed yet (install path missing
+    or empty). Lockfile staleness is not tracked; `transform deps` is the
+    explicit refresh. Honours ``packages-install-path`` via
+    :func:`package_install_dir`."""
+
+    project = Path(project_dir)
+    if not has_package_spec(project, overlay=overlay):
+        return False
+    install_dir = package_install_dir(project, overlay=overlay)
+    return not install_dir.is_dir() or not any(install_dir.iterdir())
 
 
 def deps(
@@ -978,13 +1691,322 @@ def deps(
     messages: list[str] = []
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
-    packages_dir = project / "dbt_packages"
+    install_dir = package_install_dir(project)
     return {
         "success": completed.returncode == 0,
         "returncode": completed.returncode,
-        "packages_dir_exists": packages_dir.is_dir() and any(packages_dir.iterdir()),
+        "packages_dir_exists": install_dir.is_dir() and any(install_dir.iterdir()),
         "messages": messages,
     }
+
+
+#: How many paths one list of ``installed_edits`` names before counting the rest.
+_COLD_EDIT_NAMES = 20
+_LOCK_FILE = "package-lock.yml"
+_SPEC_FILES = ("packages.yml", "dependencies.yml")
+#: Never part of what a package ships, wherever they sit.
+_TREE_SKIPPED = frozenset({".git", "__pycache__"})
+#: dbt's own output, at a package's root only: `models/logs/` holds models.
+_PACKAGE_OUTPUT = frozenset({"target", "logs"})
+
+
+class ColdReinstallError(DbtRunError):
+    """The explicit reinstall failed, so nothing was built from the old tree."""
+
+    def __init__(self, message: str, report: dict[str, Any]):
+        super().__init__(message)
+        self.report = report
+
+
+@dataclass
+class ColdCheckout:
+    """A copy of the project holding only what ``dbt deps`` installed."""
+
+    path: Path
+    report: dict[str, Any]
+
+
+def _file_digest(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def packages_dir(project_dir: Path | str) -> Path:
+    """Where dbt installs this project's packages: ``packages-install-path``, or
+    ``dbt_packages``. A templated value falls back to the default."""
+
+    project = Path(project_dir)
+    configured = _configured_install_path(project)
+    if not isinstance(configured, str) or not configured or _is_templated(configured):
+        configured = "dbt_packages"
+    return project / configured
+
+
+def _configured_install_path(project: Path) -> Any:
+    """``packages-install-path`` as written, before dbt renders it."""
+
+    with contextlib.suppress(OSError, yaml.YAMLError, AttributeError):
+        parsed = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+        return parsed.get("packages-install-path")
+    return None
+
+
+def _is_templated(value: Any) -> bool:
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _keep_local_packages_reachable(shadow: Path, project: Path) -> bool:
+    """Make each relative ``local:`` package resolve from the copy. True if the
+    lockfile had to go.
+
+    dbt reads a ``local:`` path against the project directory, and the copy is
+    somewhere else. A link beside the copy keeps the path, the spec and the
+    lockfile's hash of that spec exactly as written, so every other package still
+    installs at its pin. A path climbing out of the temporary directory cannot be
+    linked, so it is rewritten to absolute, which changes the spec's hash: the
+    lockfile is dropped and the caller says so.
+    """
+
+    rewrote = False
+    # Unresolved like `place` below: /var and /private/var are one directory on macOS.
+    boundary = shadow.parent
+    for name in _SPEC_FILES:
+        path = shadow / name
+        if not path.is_file():
+            continue
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+        entries = parsed.get("packages") if isinstance(parsed, dict) else None
+        changed = False
+        for entry in entries or []:
+            local = entry.get("local") if isinstance(entry, dict) else None
+            if not isinstance(local, str) or Path(local).is_absolute():
+                continue
+            real = (project / local).resolve()
+            place = Path(os.path.normpath(shadow / local))
+            if place.exists():
+                continue
+            if place.is_relative_to(boundary):
+                place.parent.mkdir(parents=True, exist_ok=True)
+                place.symlink_to(real, target_is_directory=True)
+            else:
+                entry["local"] = str(real)
+                changed = True
+        if changed:
+            path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+            rewrote = True
+    if rewrote:
+        (shadow / _LOCK_FILE).unlink(missing_ok=True)
+    return rewrote
+
+
+def _file_digests(root: Path) -> dict[str, str]:
+    """Each file a package holds, by relative path, without following a link."""
+
+    digests: dict[str, str] = {}
+    for directory, names, files in os.walk(root):
+        at_root = Path(directory) == root
+        names[:] = [
+            n
+            for n in names
+            if n not in _TREE_SKIPPED and not (at_root and n in _PACKAGE_OUTPUT)
+        ]
+        for name in files:
+            path = Path(directory) / name
+            if path.is_file():
+                digests[path.relative_to(root).as_posix()] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+    return digests
+
+
+def _package_tree(root: Path, linked: Iterable[str]) -> dict[str, str]:
+    """Every file under an install directory, keyed ``<package>/<path>``."""
+
+    found: dict[str, str] = {}
+    if not root.is_dir():
+        return found
+    skipped = set(linked)
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and not child.is_symlink() and child.name not in skipped:
+            for rel, digest in _file_digests(child).items():
+                found[f"{child.name}/{rel}"] = digest
+    return found
+
+
+def _capped(paths: list[str]) -> dict[str, Any]:
+    return {
+        "count": len(paths),
+        "paths": paths[:_COLD_EDIT_NAMES],
+        "elided": max(0, len(paths) - _COLD_EDIT_NAMES),
+    }
+
+
+def _linked_packages(*roots: Path) -> list[str]:
+    return sorted(
+        {
+            child.name
+            for root in roots
+            if root.is_dir()
+            for child in root.iterdir()
+            if child.is_symlink()
+        }
+    )
+
+
+def _compare_installed(project: Path, shadow: Path) -> dict[str, Any]:
+    """What the install directory holds that a reinstall does not reproduce."""
+
+    installed = packages_dir(project)
+    fresh = packages_dir(shadow)
+    linked = _linked_packages(installed, fresh)
+    if not installed.is_dir():
+        return {
+            "compared": False,
+            "reason": "no packages were installed here, so there is nothing to lose",
+            **{key: _capped([]) for key in ("changed", "added", "removed")},
+            "not_compared": linked,
+        }
+    before = _package_tree(installed, linked)
+    after = _package_tree(fresh, linked)
+    changed: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+    for rel in sorted(set(before) | set(after)):
+        if rel not in after:
+            added.append(rel)
+        elif rel not in before:
+            removed.append(rel)
+        elif before[rel] != after[rel]:
+            changed.append(rel)
+    return {
+        "compared": True,
+        "changed": _capped(changed),
+        "added": _capped(added),
+        "removed": _capped(removed),
+        "not_compared": linked,
+    }
+
+
+def _locked_packages(shadow: Path) -> list[dict[str, Any]]:
+    """Name, source kind and pin of each locked package, never its URL, which may
+    carry a credential."""
+
+    path = shadow / _LOCK_FILE
+    if not path.is_file():
+        return []
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    entries = parsed.get("packages") if isinstance(parsed, dict) else None
+    out = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        source = next(
+            (
+                k
+                for k in ("package", "git", "local", "tarball", "private")
+                if k in entry
+            ),
+            "unknown",
+        )
+        pin = entry.get("revision") or entry.get("version")
+        name = entry.get("name") or (entry["package"] if source == "package" else None)
+        out.append({"name": name, "source": source, "pin": _version_text(pin)})
+    return out
+
+
+@contextlib.contextmanager
+def cold_checkout(
+    project_dir: Path | str, *, runner: Runner | None = None
+) -> Iterator[ColdCheckout]:
+    """The project copied without ``dbt_packages/``, then installed afresh (#860).
+
+    The explicit proof that a repair survives a reinstall: the real project's
+    packages are never touched, and whatever the build reads from a package here
+    came from ``dbt deps``. Honours the project's lockfile. May reach the network,
+    which is why only ``--cold-deps`` ever calls this. A failed install raises
+    rather than falling back to the installed tree.
+    """
+
+    project = Path(project_dir).resolve()
+    with shadow_project(project, skip_packages=True) as shadow:
+        # dbt renders a templated path (`env_var()`) to somewhere only it can name,
+        # so nothing here can show that `dbt deps` would write inside the copy.
+        if _is_templated(_configured_install_path(shadow)):
+            reason = (
+                "packages-install-path is templated, so dex cannot show that a "
+                "reinstall stays isolated from the installed packages"
+            )
+            raise ColdReinstallError(
+                reason, {"ran": True, "reinstalled": False, "reason": reason}
+            )
+        # An absolute or far-climbing packages-install-path names the same directory
+        # from the copy as from the project, so `dbt deps` would write over it.
+        if not Path(os.path.normpath(packages_dir(shadow))).is_relative_to(
+            shadow.parent
+        ):
+            reason = (
+                "packages-install-path points outside the project, so a reinstall "
+                "cannot be isolated from the installed packages"
+            )
+            raise ColdReinstallError(
+                reason, {"ran": True, "reinstalled": False, "reason": reason}
+            )
+        had_lock = (project / _LOCK_FILE).is_file()
+        rewrote = _keep_local_packages_reachable(shadow, project)
+        lock_before = _file_digest(shadow / _LOCK_FILE)
+        summary = deps(shadow, runner=runner)
+        report: dict[str, Any] = {
+            "ran": True,
+            "reinstalled": bool(summary["success"]),
+            "reinstalled_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "dbt_runtime": dbt_runtime_key(),
+        }
+        if not summary["success"]:
+            messages = summary.get("messages") or []
+            report["reason"] = (
+                "dbt deps failed in the isolated copy, so nothing was built; the "
+                "installed packages were not used in its place"
+            )
+            raise ColdReinstallError(
+                "dbt deps failed in the isolated copy"
+                + (f": {messages[0]}" if messages else ""),
+                report,
+            )
+        lock_after = _file_digest(shadow / _LOCK_FILE)
+        fresh_digests = _package_tree(packages_dir(shadow), ())
+        tree_digest = hashlib.sha256(
+            json.dumps(fresh_digests, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        report.update(
+            packages=_locked_packages(shadow),
+            lock_digest=lock_after,
+            installed_tree_digest=tree_digest,
+            installed_edits=_compare_installed(project, shadow),
+        )
+        notes = []
+        if rewrote and had_lock:
+            notes.append(
+                "a relative local: package climbs out of the copy's directory, so its "
+                "path was rewritten and package-lock.yml dropped in the copy; this "
+                "reinstall resolved every package's version afresh"
+            )
+        elif lock_before is None or lock_before != lock_after:
+            notes.append(
+                "the project has no lockfile matching its package spec, so this "
+                "reinstall resolved its versions afresh; commit package-lock.yml "
+                "for a reinstall that reproduces this one"
+            )
+        linked = report["installed_edits"]["not_compared"]
+        if linked:
+            notes.append(
+                f"{', '.join(linked)}: dbt links a local package rather than "
+                "copying it, so an edit through the install directory writes to its "
+                "source and a reinstall keeps it; this run cannot detect such an edit"
+            )
+        if notes:
+            report["notes"] = notes
+        yield ColdCheckout(shadow, report)
 
 
 _COMPILE_TIMEOUT_SECONDS = 300.0
@@ -995,10 +2017,6 @@ _COMPILE_TIMEOUT_SECONDS = 300.0
 # scan nothing; everything else (operations, analyses, sources) issues no billed
 # build statement.
 _PRICED_RESOURCE_TYPES = {"model", "snapshot", "test"}
-
-#: The breakdown line for what a warehouse bills a command as a whole rather
-#: than any statement in it: Snowflake's resume minimum and idle tail.
-UPTIME_LINE = "(warehouse uptime)"
 
 
 def compile_estimate(
@@ -1012,6 +2030,8 @@ def compile_estimate(
     timeout: float = _COMPILE_TIMEOUT_SECONDS,
     approved_functions: frozenset[str] | None = None,
     overhead: float = 0.0,
+    artifact_directory: Path | str | None = None,
+    full_refresh: bool = False,
 ) -> tuple[float, dict[str, float], list[str]]:
     """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
 
@@ -1040,12 +2060,25 @@ def compile_estimate(
     :data:`UPTIME_LINE`, so the breakdown says where it went and a build with
     nothing to scan still quotes it.
 
+    ``artifact_directory`` is where the compile writes and where its artifacts
+    are read back, the directory the build itself will write (issue #1014); by
+    default the one :func:`~.artifact_runtime.resolve_build_artifact_dir`
+    resolves for the isolated policy. ``full_refresh`` compiles with
+    ``--full-refresh``, so ``is_incremental()`` renders false and each
+    incremental node is priced as the full rebuild the build will run rather
+    than as a batch (issue #1015).
+
     Raises :class:`DbtRunError` when ``dbt compile`` itself fails: that same
     failure would sink the build, and the caller degrades to no-estimate so dbt's
     own error is what the user sees, not a masked one from here.
     """
 
     project = Path(project_dir).resolve()
+    artifacts = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else resolve_build_artifact_dir(project)
+    )
     estimator = getattr(adapter, "query_estimate", None)
     if estimator is None and not approved_functions:
         return (
@@ -1059,10 +2092,12 @@ def compile_estimate(
         target=target,
         select=select,
         runner=runner or _default_runner(timeout, project, env),
+        artifacts=artifacts,
+        full_refresh=full_refresh,
     )
     if approved_functions:
         _assert_compiled_functions(
-            project, dialect=adapter.dialect, approved_functions=approved_functions
+            artifacts, dialect=adapter.dialect, approved_functions=approved_functions
         )
     if estimator is None:
         return (
@@ -1071,7 +2106,7 @@ def compile_estimate(
             ["connector exposes no estimator; build cost not priced upfront"],
         )
 
-    compiled = _compiled_nodes(project)
+    compiled = _compiled_nodes(artifacts)
     total = 0.0
     per_node: dict[str, float] = {}
     skipped: list[str] = []
@@ -1096,13 +2131,82 @@ def compile_estimate(
         )
     if not per_node and not skipped and overhead <= 0:
         notes.append("no scanning build nodes to price; the estimate is zero")
+    if full_refresh:
+        rebuilt = full_refresh_nodes(artifacts)
+        if rebuilt["models"] or rebuilt["seeds"]:
+            notes.append(
+                "priced as a full refresh: "
+                f"{_count(len(rebuilt['models']), 'incremental model')} and "
+                f"{_count(len(rebuilt['seeds']), 'seed')} are priced as the full "
+                "rebuild they will run, not as an incremental batch"
+            )
+        if not select:
+            notes.append(full_refresh_unselected_warning(rebuilt))
     if overhead > 0:
         per_node[UPTIME_LINE] = overhead
         total += overhead
     return total, per_node, notes
 
 
-def compiled_model_ids(project: Path) -> set[str]:
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def full_refresh_nodes(artifact_directory: Path | str) -> dict[str, list[str]]:
+    """What a ``--full-refresh`` run over this selection rebuilds from scratch.
+
+    Read from the artifacts of the run (a build's, or the compile that priced
+    it, which selects the same nodes): ``models`` are the selected incremental
+    models and ``seeds`` the selected seeds. ``not_refreshed`` names the ones
+    whose own ``full_refresh: false`` config makes dbt ignore the flag, so a
+    caller does not read the rows they keep as rebuilt. A table or a view is
+    rebuilt by every build and is not listed; a snapshot ignores the flag.
+    """
+
+    paths = artifact_paths(artifact_directory)
+    found: dict[str, list[str]] = {"models": [], "seeds": [], "not_refreshed": []}
+    try:
+        results = json.loads(paths.run_results.read_text(encoding="utf-8"))["results"]
+        nodes = json.loads(paths.manifest.read_text(encoding="utf-8"))["nodes"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return found
+    for result in results if isinstance(results, list) else []:
+        unique_id = str((result or {}).get("unique_id", ""))
+        node = nodes.get(unique_id) if isinstance(nodes, dict) else None
+        if not isinstance(node, dict):
+            continue
+        config = node.get("config") or {}
+        kind = node.get("resource_type")
+        if kind == "seed":
+            bucket = "seeds"
+        elif kind == "model" and config.get("materialized") == "incremental":
+            bucket = "models"
+        else:
+            continue
+        label = manifest_node_label(unique_id, node)
+        if config.get("full_refresh") is False:
+            found["not_refreshed"].append(label)
+        else:
+            found[bucket].append(label)
+    return {key: sorted(set(names)) for key, names in found.items()}
+
+
+def full_refresh_unselected_warning(rebuilt: dict[str, list[str]]) -> str:
+    """The warning a ``--full-refresh`` with no ``--select`` carries."""
+
+    models = _count(len(rebuilt["models"]), "incremental model")
+    seeds = _count(len(rebuilt["seeds"]), "seed")
+    return (
+        "--full-refresh with no --select rebuilds every incremental model and "
+        "seed dbt's default selection reaches (the whole project, unless a "
+        f"default selector narrows it): {models} and {seeds}. Name the models "
+        "whose logic changed with --select to rebuild only those"
+    )
+
+
+def compiled_model_ids(
+    project: Path, artifact_directory: Path | str | None = None
+) -> set[str]:
     """The models dbt's last compile selected, by unique id.
 
     The same ``run_results.json`` the estimate is built from, which is what
@@ -1110,7 +2214,12 @@ def compiled_model_ids(project: Path) -> set[str]:
     ``--select`` narrows the compile, so it narrows this too.
     """
 
-    run_results = project / "target" / "run_results.json"
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else readable_artifact_dir(project)
+    )
+    run_results = artifact_paths(directory).run_results
     if not run_results.is_file():
         return set()
     try:
@@ -1125,11 +2234,18 @@ def compiled_model_ids(project: Path) -> set[str]:
 
 
 def _compile_project(
-    project: Path, *, target: str, select: str | None, runner: Runner
+    project: Path,
+    *,
+    target: str,
+    select: str | None,
+    runner: Runner,
+    artifacts: Path,
+    full_refresh: bool = False,
 ) -> None:
-    """Compile the selection afresh; never reuse a prior invocation's results."""
+    """Compile the selection afresh into ``artifacts``; never reuse a prior
+    invocation's results."""
 
-    (project / "target" / "run_results.json").unlink(missing_ok=True)
+    clear_run_results(artifacts)
     argv = [
         _dbt_executable(),
         "compile",
@@ -1141,9 +2257,13 @@ def _compile_project(
         str(profiles_dir(project).resolve()),
         "--log-format",
         "json",
+        "--target-path",
+        str(artifacts),
     ]
     if select:
         argv += ["--select", select]
+    if full_refresh:
+        argv.append("--full-refresh")
     completed = runner(argv)
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
@@ -1151,7 +2271,7 @@ def _compile_project(
 
 
 def _assert_compiled_functions(
-    project: Path, *, dialect: str, approved_functions: frozenset[str]
+    artifacts: Path, *, dialect: str, approved_functions: frozenset[str]
 ) -> None:
     """Adjudicate every selected SQL node before pricing or building it.
 
@@ -1163,8 +2283,9 @@ def _assert_compiled_functions(
     from ..guards.sql_guard import NotSelectOnlyError, RefusalReason
 
     try:
-        results = json.loads((project / "target/run_results.json").read_text())
-        manifest = json.loads((project / "target/manifest.json").read_text())
+        paths = artifact_paths(artifacts)
+        results = json.loads(paths.run_results.read_text())
+        manifest = json.loads(paths.manifest.read_text())
         selected = results["results"]
         nodes = manifest["nodes"]
         if not isinstance(selected, list) or not isinstance(nodes, dict):
@@ -1192,7 +2313,12 @@ def _assert_compiled_functions(
         raise DbtRunError(f"cannot enforce guards.approved_functions: {exc}") from exc
 
 
-def dynamic_bound_nodes(project_dir: Path | str, *, dialect: str) -> dict[str, str]:
+def dynamic_bound_nodes(
+    project_dir: Path | str,
+    *,
+    dialect: str,
+    artifact_directory: Path | str | None = None,
+) -> dict[str, str]:
     """The incremental nodes whose batch filter a dry run prices unpruned.
 
     An incremental model's batch filter is usually a watermark computed by a
@@ -1215,7 +2341,12 @@ def dynamic_bound_nodes(project_dir: Path | str, *, dialect: str) -> dict[str, s
     from sqlglot import expressions as exp
 
     bounded: dict[str, str] = {}
-    for label, node, code in _priced_manifest_nodes(Path(project_dir).resolve()):
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else readable_artifact_dir(Path(project_dir).resolve())
+    )
+    for label, node, code in _priced_manifest_nodes(directory):
         if (node.get("config") or {}).get("materialized") != "incremental":
             continue
         try:
@@ -1247,13 +2378,13 @@ def dynamic_bound_nodes(project_dir: Path | str, *, dialect: str) -> dict[str, s
     return bounded
 
 
-def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
+def _compiled_nodes(artifacts: Path) -> list[tuple[str, str]]:
     """The (label, compiled SQL) of each priced node dbt just compiled."""
 
-    return [(label, code) for label, _node, code in _priced_manifest_nodes(project)]
+    return [(label, code) for label, _node, code in _priced_manifest_nodes(artifacts)]
 
 
-def _priced_manifest_nodes(project: Path) -> list[tuple[str, dict[str, Any], str]]:
+def _priced_manifest_nodes(artifacts: Path) -> list[tuple[str, dict[str, Any], str]]:
     """The (label, manifest node, compiled SQL) of each priced node.
 
     The selected set comes from compile's ``run_results.json`` (which honors the
@@ -1262,8 +2393,8 @@ def _priced_manifest_nodes(project: Path) -> list[tuple[str, dict[str, Any], str
     without compiled SQL contribute no billed statement and are dropped here.
     """
 
-    run_results = project / "target" / "run_results.json"
-    manifest = project / "target" / "manifest.json"
+    paths = artifact_paths(artifacts)
+    run_results, manifest = paths.run_results, paths.manifest
     if not run_results.is_file() or not manifest.is_file():
         return []
     compiled_ids = [
@@ -1479,6 +2610,60 @@ _VALIDATION_HEADER = re.compile(r"^\d+ validation errors? for .+$")
 # terminal, but unreadable noise once that text crosses into a JSON envelope.
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
+#: dbt's header for one node's failure: "Compilation Error in model x (path)".
+_NODE_FAILURE = re.compile(
+    r"Error in (?:model|seed|snapshot|analysis|test|unit_test|sql_operation) "
+    r"\S+ \(([^)\n]+)\)"
+)
+
+
+def _failed_node(completed: subprocess.CompletedProcess) -> tuple[str, str] | None:
+    """The file of the node a failed dbt run names, and why it failed.
+
+    The reason is the first line of dbt's message after its header, redacted
+    and value-masked, so a warehouse error cannot carry a value out.
+    """
+
+    texts: list[str] = []
+    for line in (completed.stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            texts.append(line)
+            continue
+        msg = (event.get("info") or {}).get("msg")
+        if msg:
+            texts.append(str(msg))
+    texts.append(completed.stderr or "")
+    for text in texts:
+        clean = _ANSI_ESCAPE.sub("", text)
+        found = _NODE_FAILURE.search(clean)
+        if found is None:
+            continue
+        rest = [
+            part.strip() for part in clean[found.end() :].splitlines() if part.strip()
+        ]
+        reason = rest[0] if rest else found.group(0)
+        return found.group(1).strip(), redact(mask_values(reason))[:300]
+    return None
+
+
+def _detail_lines(lines: list[str]) -> list[str]:
+    """The lines that continue a cause, up to a blank line, another generic
+    header, or the traceback and compiled-code pointers that follow it."""
+
+    details: list[str] = []
+    for candidate in lines:
+        s = candidate.strip()
+        if (
+            not s
+            or _GENERIC_HEADER.match(s)
+            or s.startswith(("Traceback", "compiled code at", "compiled SQL at"))
+        ):
+            break
+        details.append(s)
+    return details
+
 
 def _collect_messages(
     completed: subprocess.CompletedProcess, log_hint: Path | None = None
@@ -1511,20 +2696,11 @@ def _collect_messages(
             continue
         msg = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
         msg_lines = msg.splitlines()
-        first_line = msg_lines[0].strip() if msg_lines else msg.strip()
+        # A unit test's failure opens with blank lines before its diff, so the
+        # first line with something on it is the one that names the failure.
+        first_line = next((ln.strip() for ln in msg_lines if ln.strip()), msg.strip())
         if _VALIDATION_HEADER.match(first_line):
-            details = []
-            for candidate in msg_lines[1:]:
-                s = candidate.strip()
-                if (
-                    not s
-                    or _GENERIC_HEADER.match(s)
-                    or s.startswith(
-                        ("Traceback", "compiled code at", "compiled SQL at")
-                    )
-                ):
-                    break
-                details.append(s)
+            details = _detail_lines(msg_lines[1:])
             if details:
                 first_line = f"{first_line}: {': '.join(details)}"
         elif _GENERIC_HEADER.match(first_line):
@@ -1536,25 +2712,24 @@ def _collect_messages(
                     break
             if idx is not None:
                 cause = msg_lines[idx].strip()
+                details = _detail_lines(msg_lines[idx + 1 :])
                 if _VALIDATION_HEADER.match(cause):
-                    details = []
-                    for candidate in msg_lines[idx + 1 :]:
-                        s = candidate.strip()
-                        if (
-                            not s
-                            or _GENERIC_HEADER.match(s)
-                            or s.startswith(
-                                ("Traceback", "compiled code at", "compiled SQL at")
-                            )
-                        ):
-                            break
-                        details.append(s)
                     if details:
                         cause = f"{cause}: {': '.join(details)}"
+                elif details:
+                    # The cause can go on: a duplicate schema.yml entry names
+                    # the files to fix on the lines after "in one of these
+                    # files:", and the first line alone sends the reader
+                    # looking for them (#1160).
+                    cause = " ".join([cause, *details])
                 sep = "" if first_line.endswith(":") else ":"
                 first_line = f"{first_line}{sep} {cause}"
+        # A model that fails on a cast fails in the warehouse's words, which
+        # can quote the row's value; masked before the cap so a cut cannot
+        # strand a value without its closing quote (#1070).
+        first_line = mask_values(first_line)
         if len(first_line) > _MESSAGE_MAX_CHARS:
-            first_line = first_line[:_MESSAGE_MAX_CHARS] + "..."
+            first_line = first_line[:_MESSAGE_MAX_CHARS] + _MESSAGE_CUT_NOTE
             trimmed = True
         if first_line != msg:
             trimmed = True
@@ -1581,7 +2756,7 @@ def _collect_messages(
     messages = primary + deprecations
 
     if not messages and completed.stderr:
-        messages.append(redact(completed.stderr.strip().splitlines()[-1]))
+        messages.append(redact(mask_values(completed.stderr.strip().splitlines()[-1])))
     if len(messages) > _MESSAGE_CAP:
         messages = messages[:_MESSAGE_CAP]
         trimmed = True
@@ -1618,8 +2793,28 @@ def _show_preview(
     return None
 
 
+def _logged_invocation_id(completed: subprocess.CompletedProcess) -> str | None:
+    """The invocation id dbt's ``--log-format json`` stamps on its log lines."""
+
+    for line in (completed.stdout or "").splitlines():
+        if not line.startswith("{"):
+            continue
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            found = (json.loads(line).get("info") or {}).get("invocation_id")
+            if found:
+                return str(found)
+    return None
+
+
 def _summarize(
-    project: Path, target: str, completed: subprocess.CompletedProcess
+    project: Path,
+    target: str,
+    completed: subprocess.CompletedProcess,
+    *,
+    artifact_directory: Path | None = None,
+    read_from: Path | None = None,
+    log_file: Path | None = None,
+    label_root: Path | None = None,
 ) -> dict[str, Any]:
     """Reduce a dbt run to a sanitized summary; raw log text stays behind.
 
@@ -1627,6 +2822,19 @@ def _summarize(
     label the manifest gives it. The id is the only unambiguous identifier (it
     names the resource type and the package, and it is what `run_results.json`
     can be cross-referenced on); the name is what a reader scans.
+
+    ``artifact_directory``, when passed, is the directory this build resolved.
+    The summary then carries that directory's publishable label. A caller that
+    omits it reads ``read_from`` when given (a shadow copy's own directory,
+    which no environment variable may redirect) and otherwise the newest
+    artifacts on disk (:func:`~.artifact_runtime.readable_artifact_dir`), and
+    gets no label.
+
+    Results another invocation wrote are never reported as this one's (issue
+    #1014). dbt's JSON log names the invocation on every line. When the
+    ``run_results.json`` on disk names a different one, its nodes are dropped
+    and the run is a failure that says so, rather than a success borrowed from
+    an earlier or a foreign run.
     """
 
     nodes: list[dict[str, Any]] = []
@@ -1634,10 +2842,19 @@ def _summarize(
     bytes_billed = 0.0
     saw_billing = False
     elapsed_seconds: float | None = None
-    run_results = project / "target" / "run_results.json"
+    paths = artifact_paths(
+        artifact_directory or read_from or readable_artifact_dir(project)
+    )
+    run_results = paths.run_results
+    foreign: str | None = None
     if run_results.is_file():
         document = json.loads(run_results.read_text(encoding="utf-8"))
         results = document.get("results", [])
+        written_by = (document.get("metadata") or {}).get("invocation_id")
+        logged = _logged_invocation_id(completed)
+        if written_by and logged and str(written_by) != logged:
+            foreign = str(written_by)
+            results = []
         # dbt writes this at the top of run_results, not inside `metadata`.
         if isinstance(elapsed := document.get("elapsed_time"), (int, float)):
             elapsed_seconds = float(elapsed)
@@ -1646,9 +2863,7 @@ def _summarize(
         manifest_nodes: dict[str, Any] = {}
         with contextlib.suppress(OSError, json.JSONDecodeError, AttributeError):
             manifest_nodes = (
-                json.loads(
-                    (project / "target" / "manifest.json").read_text(encoding="utf-8")
-                ).get("nodes")
+                json.loads(paths.manifest.read_text(encoding="utf-8")).get("nodes")
                 or {}
             )
         for result in results:
@@ -1674,16 +2889,36 @@ def _summarize(
 
     messages: list[str] = []
     if completed.returncode != 0:
-        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+        messages = _collect_messages(
+            completed, log_hint=log_file or project / "logs" / "dbt.log"
+        )
+    if foreign is not None:
+        label = sanitize_artifact_directory(
+            paths.directory, project_root=label_root or project
+        )
+        messages = [
+            f"the run results in {label} "
+            f"belong to another dbt invocation ({foreign}), not this run's; none "
+            "of its nodes are reported, and the build is not a success",
+            *messages,
+        ]
 
     summary = {
         "target": target,
-        "success": completed.returncode == 0,
+        "success": completed.returncode == 0 and foreign is None,
         "returncode": completed.returncode,
         "nodes": nodes,
         "counts": counts,
         "messages": messages,
     }
+    if run_results.is_file():
+        select_arg = (document.get("args") or {}).get("select")
+        if select_arg:
+            summary["selection"] = (
+                " ".join(select_arg)
+                if isinstance(select_arg, list)
+                else str(select_arg)
+            )
     # Internal hand-offs, not envelope shape: `_shape_build_result` pops these to
     # ledger the build and report it under `data.spend`, the one key every billed
     # command reports spend under (issue #276). `bytes_billed` is present only
@@ -1695,4 +2930,14 @@ def _summarize(
         summary["bytes_billed"] = bytes_billed
     if elapsed_seconds is not None:
         summary["elapsed_seconds"] = elapsed_seconds
+    if artifact_directory is not None:
+        summary["artifact_directory"] = sanitize_artifact_directory(
+            paths.directory, project_root=label_root or project
+        )
+    # An internal hand-off like `bytes_billed`, popped by the command layer
+    # before shaping: the evidence read is held to the invocation this run
+    # logged, so a foreign run_results never yields evidence either.
+    logged_id = _logged_invocation_id(completed)
+    if artifact_directory is not None and logged_id is not None:
+        summary["logged_invocation_id"] = logged_id
     return summary

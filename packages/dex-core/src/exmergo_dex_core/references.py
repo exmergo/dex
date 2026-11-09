@@ -166,6 +166,11 @@ class ReferenceIndex:
         #: this list to explain why it cannot rule out a missing definition;
         #: references and rewrites treat skipped YAML as an incomplete index.
         self.unread: list[str] = []
+        #: Files whose SQL the column scan could not parse once its Jinja was
+        #: blanked. Each also stands in ``limits`` for every existing reader.
+        #: It bounds column references only: a ``var()``, ``ref()`` or macro
+        #: call is found by the Jinja scan, which read these files (#1172).
+        self.column_unread: list[str] = []
 
         self._scan(view, package=None)
         if scan_packages:
@@ -284,9 +289,11 @@ class ReferenceIndex:
 
         return [ref for ref in self._indeterminate if ref.kind == kind]
 
-    def readers_of(self, relation: str) -> list[str]:
+    def readers_of(self, relation: str, *, packages: bool = False) -> list[str]:
         """Files in this project that read ``relation`` through ``ref()`` or
-        ``source()``, sorted.
+        ``source()``, sorted. ``packages`` also counts the files of installed
+        packages, where the index scanned them, for a lineage question that
+        crosses into a package (#1155).
 
         ``relation`` is matched the way a model's SQL is rendered for reading:
         by the last argument, so ``orders`` is read by ``ref('orders')``,
@@ -306,7 +313,15 @@ class ReferenceIndex:
                 reference.path
                 for reference in references
                 if reference.form in ("ref_call", "source_call")
-                and reference.package is None
+                and (
+                    reference.package is None
+                    # A package file reads for the project only where the
+                    # project does not shadow the model it defines.
+                    or (
+                        packages
+                        and not self._project_defines(node_name(reference.path))
+                    )
+                )
             )
         return sorted(paths)
 
@@ -365,6 +380,71 @@ class ReferenceIndex:
         """
 
         return self._node_kinds.get(node)
+
+    def _add_edge(self, path: str, target: str, *, package: str | None) -> None:
+        """Record that the node ``path`` defines reads ``target`` through ``ref()``.
+
+        A package model the project shadows with its own of the same name is
+        not the node dbt builds (#1155): its edges would otherwise merge into
+        the project's node, which is keyed by the same name, and claim lineage
+        the project's SQL never states. The project is scanned first, so its
+        nodes are known by the time a package's are read.
+        """
+
+        source = node_name(path)
+        if source == target:
+            return
+        if package is not None and self._project_defines(source):
+            return
+        self._model_refs[source].add(target)
+
+    def _project_defines(self, name: str) -> bool:
+        """Whether this project, rather than an installed package, defines the
+        node ``name``: a model, seed or snapshot file, or a Python model, a
+        versioned model's base name or a snapshot declared in YAML (#1155).
+
+        A package model of that name is then shadowed, so it is no node dbt
+        builds, and nothing it reads or ``ref()``s is the project's lineage.
+        """
+
+        if name in self._node_kinds:
+            return True
+        return any(
+            reference.package is None
+            for kind in ("model", "seed", "snapshot")
+            for reference in self._declared.get((kind, name), ())
+        )
+
+    def package_node_kind(self, node: str) -> tuple[str, str] | None:
+        """``(kind, package)`` for a node only an installed package defines.
+
+        The counterpart of :meth:`node_kind` for a lineage question (#1155): a
+        packaged model is no node dex edits, but it is one the project reads, so
+        its ``ref()`` edges are walked the same way. ``None`` where the project
+        defines the name itself (its override wins, a Python model or a versioned
+        base name included) or nothing does, and always when the index was built
+        without scanning packages.
+        """
+
+        if self._project_defines(node):
+            return None
+        for kind in ("model", "seed", "snapshot"):
+            for reference in self.definitions_of(node, kind):
+                if reference.package is not None:
+                    return kind, reference.package
+        return None
+
+    def package_file_of(self, node: str) -> str | None:
+        """The file an installed package defines ``node`` in, relative to the
+        project, or ``None``."""
+
+        found = self.package_node_kind(node)
+        if found is None:
+            return None
+        for reference in self.definitions_of(node, found[0]):
+            if reference.package == found[1]:
+                return reference.path
+        return None
 
     def definitions_of(self, name: str, kind: str) -> list[Reference]:
         """Every place ``name`` is *defined* as ``kind``, project and packages.
@@ -579,8 +659,8 @@ class ReferenceIndex:
                     qualifier=args[0] if target and len(args) > 1 else None,
                 )
             )
-            if target and node_name(path) != target:
-                self._model_refs[node_name(path)].add(target)
+            if target:
+                self._add_edge(path, target, package=package)
             return
         resolved = len(args) >= 2 and None not in args[-2:]
         self._record(
@@ -683,8 +763,8 @@ class ReferenceIndex:
                     qualifier=call.args[0] if target and len(call.args) > 1 else None,
                 )
             )
-            if target and node_name(path) != target:
-                self._model_refs[node_name(path)].add(target)
+            if target:
+                self._add_edge(path, target, package=package)
             return
         if call.callee == "source":
             resolved = len(call.args) >= 2 and None not in call.args[-2:]
@@ -804,7 +884,8 @@ class ReferenceIndex:
         try:
             parsed = sqlglot.parse_one(blanked)
         except Exception:
-            self.limits.append(f"{path}: dex could not parse the SQL for columns")
+            self.limits.append(column_parse_limit(path))
+            self.column_unread.append(path)
             return
         if parsed is None:
             return
@@ -1298,27 +1379,35 @@ class ReferenceIndex:
         declared = any(
             (root / name).is_file() for name in ("packages.yml", "dependencies.yml")
         )
-        packages_dir = root / "dbt_packages"
-        if declared and not packages_dir.is_dir():
+        from .transform.build import packages_dir as resolve_packages_dir
+
+        install_root = resolve_packages_dir(root)
+        try:
+            install_rel = install_root.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            # Absolute / outside-project install path: keep a stable label.
+            install_rel = install_root.name or "dbt_packages"
+        if declared and not install_root.is_dir():
             self.limits.append(
                 "packages are declared but not installed, so package contents "
                 "were not scanned; run `transform deps` first"
             )
             return
-        if not packages_dir.is_dir():
+        if not install_root.is_dir():
             return
-        for entry in sorted(packages_dir.iterdir()):
+        for entry in sorted(install_root.iterdir()):
             if not (entry / "dbt_project.yml").is_file():
                 continue
+            prefix = f"{install_rel}/{entry.name}/"
             try:
                 self._scan(
                     load_project(entry),
                     package=entry.name,
-                    prefix=f"dbt_packages/{entry.name}/",
+                    prefix=prefix,
                 )
             except Exception:
                 self.limits.append(f"package '{entry.name}' could not be read")
-                self.unread.append(f"dbt_packages/{entry.name}/")
+                self.unread.append(prefix)
 
 
 class _ScalarLines:
@@ -1391,6 +1480,12 @@ class _ScalarLines:
 #: put a token nobody typed into a reference report and into a plan's dependency
 #: graph.
 JINJA_PLACEHOLDER = "_dx"
+
+
+def column_parse_limit(path: str) -> str:
+    """The limit a file whose SQL the column scan could not parse stands under."""
+
+    return f"{path}: dex could not parse the SQL for columns"
 
 
 def blank_jinja(content: str) -> str:

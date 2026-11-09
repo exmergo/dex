@@ -32,7 +32,9 @@ permissions:
   contents: read
 
 jobs:
-  tests:
+  # The whole suite in one job: a weekly canary has no merge to unblock, so it
+  # does not need ci.yml's parallel groups or their coverage gate.
+  windows:
     runs-on: windows-latest
     # The full suite took just under eighteen minutes on a Windows workstation
     # with every extra installed; a hosted runner is slower. A bound well above
@@ -47,15 +49,15 @@ jobs:
       # does not override it, so a plain checkout rewrites every text file
       # with CRLF. Three tests hash the bundled Ossie schema's bytes and the
       # loader records that hash as provenance, so a CRLF checkout reads as
-      # "the bundled schema moved" (its sha256 becomes bea4565d... instead of
-      # the recorded 27aab111...). The wheel ships LF, so the job checks out
+      # "the bundled schema moved" (its sha256 becomes 70aec8d9... instead of
+      # the recorded 2cf11e3c...). The wheel ships LF, so the job checks out
       # what the wheel ships. Before checkout, because that is when the
       # conversion happens.
       - name: Check out with the bytes the repository holds
         run: git config --global core.autocrlf false
         working-directory: ${{ github.workspace }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           python-version: "3.14"
@@ -67,16 +69,40 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 90
+    env:
+      # A version request alone can select the runner's Homebrew Python. Its
+      # OpenSSL 4 build has no ssl.PROTOCOL_TLSv1, which Snowflake 4.8.0's
+      # vendored urllib3 still references at import. Use uv's managed build
+      # throughout setup, sync, tests and their isolated packaging subprocesses.
+      # Track the upstream fix as SNOW-4232077; see CONTRIBUTING.md.
+      UV_MANAGED_PYTHON: "true"
     defaults:
       run:
         working-directory: packages/dex-core
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           python-version: "3.14"
       - name: Sync (every optional capability + dev extras)
         run: uv sync --locked --extra all --extra dev --python 3.14
+      - name: Interpreter and TLS stack under test
+        run: |
+          uv run --no-sync python - <<'PY'
+          import importlib.metadata
+          import ssl
+          import sys
+
+          print("Python:", sys.version, flush=True)
+          print("Executable:", sys.executable, flush=True)
+          print("Base executable:", sys._base_executable, flush=True)
+          print("OpenSSL:", ssl.OPENSSL_VERSION, flush=True)
+          print("PROTOCOL_TLSv1 present:", hasattr(ssl, "PROTOCOL_TLSv1"), flush=True)
+          print("snowflake-connector-python:", importlib.metadata.version("snowflake-connector-python"), flush=True)
+          import snowflake.connector
+
+          print("Snowflake connector import: OK", flush=True)
+          PY
       - name: Tier-1 unit tests
         run: uv run --no-sync pytest -q

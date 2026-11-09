@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: stg_inbox__conversations
+    description: One row per conversation.
+    columns:
+      - name: conversation_id
+        data_tests: [unique, not_null]
+  - name: stg_inbox__conversation_parts
+    description: One row per conversation part.
+    columns:
+      - name: part_id
+        data_tests: [unique, not_null]

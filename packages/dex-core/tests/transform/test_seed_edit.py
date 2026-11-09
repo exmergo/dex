@@ -11,9 +11,11 @@ and the wording of the fix it names.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cache import (
     ColumnProfile,
@@ -383,3 +385,371 @@ def test_a_dev_build_materializes_an_applied_seed(
         assert rows == [("FR", "EUR"), ("IT", "EUR"), ("US", "USD")]
     finally:
         con.close()
+
+
+def _plan_and_apply(tmp_path: Path, capsys, intent: str, *entries: dict) -> None:
+    payload = _edits_file(tmp_path, *entries)
+    argv = ["--repo-root", str(tmp_path), "transform", "plan", intent]
+    rc, envelope = _run([*argv, "--edits-file", str(payload)], capsys)
+    assert rc == 0, envelope["errors"]
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, envelope["errors"]
+
+
+def _brand_terms(header: str, rows: str) -> list[dict]:
+    """The seed CSV and the `+column_types` that type every one of its columns."""
+
+    types = "".join(f"        {column}: varchar\n" for column in header.split(","))
+    project_yml = (
+        "name: dex_test\n"
+        'version: "1.0.0"\n'
+        "profile: dex_test\n"
+        'model-paths: ["models"]\n'
+        "seeds:\n"
+        "  dex_test:\n"
+        "    brand_terms:\n"
+        f"      +column_types:\n{types}"
+    )
+    return [
+        {
+            "path": "seeds/brand_terms.csv",
+            "kind": "seed_csv",
+            "content": f"{header}\n{rows}",
+        },
+        {"path": "dbt_project.yml", "kind": "project_yml", "content": project_yml},
+    ]
+
+
+@pytest.mark.parametrize("cleaned", [False, True], ids=["built", "after_dbt_clean"])
+def test_a_seed_that_gains_a_column_is_rebuilt_with_full_refresh(
+    dbt_project_dir: Path, tmp_path: Path, capsys, cleaned: bool
+):
+    # dbt loads a seed into the table it already built, so a CSV that gained a
+    # column failed to load, its reader was skipped, and only a `dbt seed
+    # --full-refresh` outside dex could finish the change (issue #943). A
+    # cleaned target directory leaves no manifest naming the old table, and the
+    # table is still there.
+    duckdb = pytest.importorskip("duckdb")
+    build = ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"]
+
+    reader = {
+        "path": "models/staging/brand_reader.sql",
+        "kind": "model_sql",
+        "content": "select * from {{ ref('brand_terms') }}\n",
+    }
+    _plan_and_apply(
+        tmp_path,
+        capsys,
+        "add the brand terms",
+        *_brand_terms("term,match_type", "acme,exact\nwidget,phrase\n"),
+        reader,
+    )
+    rc, envelope = _run([*build, "--confirm"], capsys)
+    assert rc == 0, envelope["errors"]
+
+    _plan_and_apply(
+        tmp_path,
+        capsys,
+        "tag each brand term with its property",
+        *_brand_terms(
+            "term,match_type,property", "acme,exact,web\nwidget,phrase,app\n"
+        ),
+    )
+    if cleaned:
+        shutil.rmtree(dex_target(dbt_project_dir))
+    rc, envelope = _run([*build, "--verify", "--confirm"], capsys)
+    assert rc == 0, envelope["errors"]
+    statuses = {n["name"]: n["status"] for n in envelope["data"]["nodes"]}
+    assert statuses["brand_terms"] == "success"
+    assert statuses["brand_reader"] == "success"
+    assert envelope["data"]["full_refresh"] == {
+        "seeds": ["brand_terms"],
+        "success": True,
+    }
+    assert any(
+        "brand_terms" in warning and "--full-refresh" in warning
+        for warning in envelope["warnings"]
+    )
+
+    con = duckdb.connect(str(tmp_path / "dev.duckdb"), read_only=True)
+    try:
+        rows = con.execute("select * from brand_reader order by term").fetchall()
+        assert rows == [("acme", "exact", "web"), ("widget", "phrase", "app")]
+    finally:
+        con.close()
+
+    # Only a changed header earns the rebuild: the next build reuses the table.
+    rc, envelope = _run([*build, "--confirm"], capsys)
+    assert rc == 0, envelope["errors"]
+    assert "full_refresh" not in envelope["data"]
+
+
+def _a_seed_the_last_manifest_names(project: Path) -> str:
+    """A seed whose CSV reads `term,property`, in a manifest dbt might have
+    left behind. Returns its unique_id."""
+
+    seeds = project / "seeds"
+    seeds.mkdir()
+    (seeds / "brand_terms.csv").write_text("term,property\nacme,web\n")
+    target = dex_target(project)
+    target.mkdir(parents=True)
+    uid = "seed.dex_test.brand_terms"
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    uid: {
+                        "name": "brand_terms",
+                        "resource_type": "seed",
+                        "fqn": ["dex_test", "brand_terms"],
+                        "relation_name": '"dev"."main"."brand_terms"',
+                        "original_file_path": "seeds/brand_terms.csv",
+                        "config": {"delimiter": ","},
+                    }
+                }
+            }
+        )
+    )
+    return uid
+
+
+@pytest.mark.parametrize("selected", [True, False], ids=["selected", "not_selected"])
+def test_only_a_seed_the_build_selects_is_refreshed(
+    dbt_project_dir: Path, selected: bool
+):
+    # A full refresh drops the seed's table, so a seed the build leaves out is
+    # left alone. Which seeds it selects is dbt's answer (`dbt ls`, default
+    # selectors included), never a second reading of the selector here.
+    import importlib
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    uid = _a_seed_the_last_manifest_names(dbt_project_dir)
+    printed = {
+        "info": {"name": "PrintEvent"},
+        "data": {"msg": json.dumps({"unique_id": uid})},
+    }
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]):
+        calls.append(argv)
+        listing = json.dumps(printed) if argv[1] == "ls" and selected else ""
+        return subprocess.CompletedProcess(argv, 0, listing, "")
+
+    build_module.build(
+        dbt_project_dir,
+        target="dev",
+        confirmed=True,
+        select="brand_reader+ tag:nightly",
+        runner=runner,
+        relation_columns=lambda relations: {
+            relation: ["term"] for relation in relations
+        },
+    )
+    listed = calls[0]
+    assert listed[1] == "ls"
+    assert listed[listed.index("--select") + 1] == "brand_reader+ tag:nightly"
+    commands = [argv[1] for argv in calls]
+    if not selected:
+        assert commands == ["ls", "build"]
+        return
+    assert commands == ["ls", "seed", "build"]
+    seed = calls[1]
+    assert "--full-refresh" in seed
+    assert seed[seed.index("--select") + 1] == (
+        "package:dex_test,fqn:dex_test.brand_terms,file:brand_terms.csv"
+    )
+
+
+def test_dbt_is_asked_even_when_the_last_manifest_shows_no_change(
+    dbt_project_dir: Path,
+):
+    # A manifest another target left behind can name a table that still matches
+    # the CSV while the one this target loads into does not, so the last
+    # manifest never stands in for dbt's own answer.
+    import importlib
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    _a_seed_the_last_manifest_names(dbt_project_dir)
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    build_module.build(
+        dbt_project_dir,
+        target="dev",
+        confirmed=True,
+        runner=runner,
+        relation_columns=lambda relations: {r: ["term", "property"] for r in relations},
+    )
+    assert [argv[1] for argv in calls] == ["ls", "build"]
+
+
+def test_a_seed_check_that_cannot_read_the_dev_target_warns_and_builds(
+    dbt_project_dir: Path,
+):
+    # The check is best effort, so a failure to read the dev target must not
+    # stop a build dbt could run; it must not go quiet either.
+    import importlib
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    uid = _a_seed_the_last_manifest_names(dbt_project_dir)
+    printed = {
+        "info": {"name": "PrintEvent"},
+        "data": {"msg": json.dumps({"unique_id": uid})},
+    }
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]):
+        calls.append(argv)
+        listing = json.dumps(printed) if argv[1] == "ls" else ""
+        return subprocess.CompletedProcess(argv, 0, listing, "")
+
+    def unreadable(relations: list[str]) -> dict[str, list[str]]:
+        raise OSError("database is locked")
+
+    summary, _cost = build_module.build(
+        dbt_project_dir,
+        target="dev",
+        confirmed=True,
+        runner=runner,
+        relation_columns=unreadable,
+    )
+    assert [argv[1] for argv in calls] == ["ls", "build"]
+    assert any(
+        "OSError: database is locked" in note for note in summary.get("notes", [])
+    )
+
+
+def _due_dates(column_types: str | None) -> list[dict]:
+    """A seed whose `due_at` is empty on every row, so dbt infers an integer,
+    and the `dbt_project.yml` that optionally types it."""
+
+    project_yml = (
+        'name: dex_test\nversion: "1.0.0"\nprofile: dex_test\nmodel-paths: ["models"]\n'
+    )
+    if column_types:
+        project_yml += (
+            "seeds:\n"
+            "  dex_test:\n"
+            "    task_data:\n"
+            f"      +column_types:\n        due_at: {column_types}\n"
+        )
+    return [
+        {
+            "path": "seeds/task_data.csv",
+            "kind": "seed_csv",
+            "content": "task_id,due_at\n1,\n2,\n",
+        },
+        {"path": "dbt_project.yml", "kind": "project_yml", "content": project_yml},
+    ]
+
+
+def test_a_seed_whose_declared_column_type_changed_is_rebuilt(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # dbt reloads a seed into the table it already built, so a `column_types`
+    # entry added after the first build is ignored and the column keeps the
+    # type inferred from the CSV. That is the one route by which a project can
+    # change its own input data's type (issue #1083), and it did nothing.
+    """A seed whose declared column type changed is rebuilt."""
+
+    duckdb = pytest.importorskip("duckdb")
+    build = ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"]
+
+    def due_at_type() -> str:
+        """Read the fixture seed column type after the dev build."""
+
+        con = duckdb.connect(str(tmp_path / "dev.duckdb"), read_only=True)
+        try:
+            return con.execute(
+                "select data_type from information_schema.columns "
+                "where table_name = 'task_data' and column_name = 'due_at'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+    _plan_and_apply(tmp_path, capsys, "add the task data", *_due_dates(None))
+    rc, envelope = _run([*build, "--confirm"], capsys)
+    assert rc == 0, envelope["errors"]
+    assert due_at_type() == "INTEGER"
+
+    _plan_and_apply(tmp_path, capsys, "type due_at", *_due_dates("timestamp"))
+    rc, envelope = _run([*build, "--confirm"], capsys)
+    assert rc == 0, envelope["errors"]
+    assert envelope["data"]["full_refresh"] == {"seeds": ["task_data"], "success": True}
+    assert any(
+        "task_data" in warning and "column_types" in warning
+        for warning in envelope["warnings"]
+    )
+    assert due_at_type() == "TIMESTAMP"
+
+    # The type now matches, so the next build reuses the table.
+    rc, envelope = _run([*build, "--confirm"], capsys)
+    assert rc == 0, envelope["errors"]
+    assert "full_refresh" not in envelope["data"]
+
+    # A narrow build must not forget the seed's applied declaration.
+    rc, envelope = _run([*build, "--select", "stg_customers"], capsys)
+    assert rc == 0, envelope["errors"]
+    _plan_and_apply(tmp_path, capsys, "restore CSV type inference", *_due_dates(None))
+    rc, envelope = _run(build, capsys)
+    assert rc == 0, envelope["errors"]
+    assert envelope["data"]["full_refresh"]["seeds"] == ["task_data"]
+    assert due_at_type() == "INTEGER"
+    rc, envelope = _run(build, capsys)
+    assert rc == 0, envelope["errors"]
+    assert "full_refresh" not in envelope["data"]
+
+
+def _typed_seed_manifest(project: Path, column_types: dict) -> str:
+    """Give the fixture seed the declared column types under test."""
+
+    uid = _a_seed_the_last_manifest_names(project)
+    manifest = dex_target(project) / "manifest.json"
+    document = json.loads(manifest.read_text())
+    document["nodes"][uid]["config"]["column_types"] = column_types
+    manifest.write_text(json.dumps(document))
+    return uid
+
+
+@pytest.mark.parametrize(
+    ("column_types", "live", "stale"),
+    [
+        (
+            {"property": "timestamp"},
+            [("term", "VARCHAR"), ("property", "INTEGER")],
+            True,
+        ),
+        ({"PROPERTY": "int"}, [("term", "VARCHAR"), ("property", "INTEGER")], False),
+        (
+            {"property": "varchar"},
+            [("term", "VARCHAR"), ("property", "VARCHAR")],
+            False,
+        ),
+        ({"property": "timestamp"}, ["term", "property"], False),
+        ({}, [("term", "VARCHAR"), ("property", "INTEGER")], False),
+    ],
+    ids=["changed", "equivalent_spelling", "same", "untyped_reader", "undeclared"],
+)
+def test_a_declared_column_type_is_stale_only_when_it_differs(
+    dbt_project_dir: Path, column_types: dict, live: list, stale: bool
+):
+    """A declared column type is stale only when it differs."""
+
+    import importlib
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    uid = _typed_seed_manifest(dbt_project_dir, column_types)
+    found = build_module.stale_seeds(
+        dex_target(dbt_project_dir) / "manifest.json",
+        dbt_project_dir,
+        lambda relations: dict.fromkeys(relations, live),
+    )
+    assert (uid in found) is stale
+    if stale:
+        assert found[uid]["dex_stale_reason"] == "column_types"

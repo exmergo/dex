@@ -23,6 +23,19 @@ Include the affected version, a description of the issue, and the steps to
 reproduce it. Please do not include real credentials or raw warehouse data in
 your report; a sanitized reproduction is enough.
 
+### Human accountability
+
+We welcome agent-generated and AI-assisted security reports, provided a human
+has reviewed and validated the finding and takes responsibility for the
+submission.
+
+To have your report reviewed, you must be willing to join a short call with us
+to explain the finding and walk through its reproduction. This helps us assess
+good faith and keep our limited security review time focused on actionable
+reports.
+
+Email security@exmergo.com with your report and availability to arrange the call.
+
 ## What to expect
 
 - We aim to acknowledge your report within 3 business days.

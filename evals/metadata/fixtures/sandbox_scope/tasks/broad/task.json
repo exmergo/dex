@@ -1,0 +1,9 @@
+{
+  "kind": "fix",
+  "models": [
+    "dim_accounts",
+    "account_usage_daily",
+    "region_account_summary"
+  ],
+  "prompt": "Accounts flagged `is_sandbox` are internal test tenants. Remove them from every mart model: the account directory, daily usage and the region summary, which should still list every region. Build on dev when you are done."
+}

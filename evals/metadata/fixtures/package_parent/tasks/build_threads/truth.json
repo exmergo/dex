@@ -1,0 +1,61 @@
+{
+  "models": {
+    "inbox__threads": {
+      "grain": [
+        "conversation_id"
+      ],
+      "population": {
+        "filters": "none",
+        "parent": "stg_inbox__conversations"
+      },
+      "columns": {
+        "conversation_id": {
+          "role": "key"
+        },
+        "state": {
+          "role": [
+            "dimension",
+            "attribute"
+          ]
+        },
+        "part_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "last_part_at": {
+          "role": [
+            "time",
+            "attribute"
+          ]
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every conversation is in the mart, including the three with no parts",
+      "expect": 10,
+      "sql": "select count(*) from main.inbox__threads"
+    },
+    {
+      "name": "no deleted conversation is in the mart",
+      "expect": 0,
+      "sql": "select count(*) from main.inbox__threads where conversation_id not in (select conversation_id from raw.conversations)"
+    },
+    {
+      "name": "a conversation with no parts counts zero, not NULL",
+      "expect": 3,
+      "sql": "select count(*) from main.inbox__threads where part_count = 0 and last_part_at is null"
+    },
+    {
+      "name": "part counts and last part match",
+      "expect": 0,
+      "sql": "select count(*) from main.inbox__threads t join (select c.conversation_id, count(p.part_id) as n, max(p.created_at) as last_at from raw.conversations c left join raw.conversation_parts p using (conversation_id) group by 1) e using (conversation_id) where t.part_count is distinct from e.n or t.last_part_at is distinct from e.last_at"
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true
+  }
+}

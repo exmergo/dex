@@ -1,0 +1,10 @@
+version: 2
+sources:
+  - name: raw
+    schema: raw
+    description: >-
+      Delivered nightly by our ingestion vendor, who owns these tables. The
+      project reads them and never writes them.
+    tables:
+      - name: task_data
+        description: One row per task, as the vendor delivers it.

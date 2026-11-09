@@ -524,7 +524,7 @@ class ConfigDocument:
         _assign(expected, parts, value)
         return self._verified(_splice(self.text, edits), expected, key, warnings)
 
-    def without(self, key: str) -> ConfigDocument:
+    def without(self, key: str, *, duplicate_only: bool = False) -> ConfigDocument:
         """A new document with ``key`` removed, or this one when it is absent.
 
         Removes the key's own lines, its value and any comment written inside
@@ -534,10 +534,25 @@ class ConfigDocument:
         separates its blocks with blank lines, one separator goes with the
         entry, so the file keeps one blank line between the blocks that remain
         and gains none at its top or end.
+
+        If ``key`` is written more than once, removes the earlier occurrence(s)
+        that YAML ignored and keeps the winning value.
         """
 
         self._require_editable()
         parts = key.split(".")
+        dup = self._locate_duplicate(parts)
+        if dup is not None:
+            mapping, duplicate_indices, _ = dup
+            edits: list[tuple[int, int, str]] = []
+            for idx in duplicate_indices:
+                edits.extend(self._removal(mapping, idx))
+            expected = copy.deepcopy(self._mapping())
+            return self._verified(_splice(self.text, edits), expected, key, [])
+
+        if duplicate_only:
+            return self
+
         chain = self._locate(parts)
         if chain is None:
             return self
@@ -552,6 +567,15 @@ class ConfigDocument:
         expected = copy.deepcopy(self._mapping())
         _prune(expected, parts[: level + 1])
         return self._verified(_splice(self.text, edits), expected, key, [])
+
+    def duplicate_problems(self, key: str | None = None) -> list[ConfigProblem]:
+        """Problems where a key is set more than once, optionally for ``key``."""
+
+        return [
+            problem
+            for problem in self.problems()
+            if problem.kind == "duplicate_key" and (key is None or problem.key == key)
+        ]
 
     # --- reading, internals -----------------------------------------------------
 
@@ -1107,6 +1131,32 @@ class ConfigDocument:
         )
         lines = [" " * pad + line if line else line for line in dumped.splitlines()]
         return self._newline.join(lines) + self._newline
+
+    def _locate_duplicate(
+        self, parts: list[str]
+    ) -> tuple[yaml.MappingNode, list[int], int] | None:
+        """Find duplicate occurrences for ``parts``.
+
+        Returns (mapping_node, duplicate_indices, winning_index) if the key is
+        duplicated, where duplicate_indices are the earlier (ignored) positions in
+        mapping_node.value and winning_index is the last (winning) position.
+        Returns None if no part is duplicated.
+        """
+        node = self._root
+        for part in parts:
+            if not isinstance(node, yaml.MappingNode):
+                return None
+            matches = [
+                position
+                for position, (key_node, _value) in enumerate(node.value)
+                if isinstance(key_node, yaml.ScalarNode) and key_node.value == part
+            ]
+            if not matches:
+                return None
+            if len(matches) > 1:
+                return (node, matches[:-1], matches[-1])
+            node = node.value[matches[0]][1]
+        return None
 
     def _locate(self, parts: list[str]) -> list[tuple[yaml.MappingNode, int]] | None:
         """The mapping and pair index at each level of ``parts``, or None."""

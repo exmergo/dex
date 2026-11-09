@@ -1,0 +1,5 @@
+{
+  "name": "refactor_prerequisite",
+  "seed": 1114,
+  "description": "Teams, their members, and the chat handles some members have. A team summary counts members through a project macro and counts members with a handle separately. The tiny_roster package (served from a local git repository) was upgraded and its member model coalesces a timestamp with a column the vendor delivers all NULL and typed integer, so nothing downstream builds: a refactor of the summary has no baseline until that prerequisite is repaired. Some teams have no members, and some handles belong to no member."
+}

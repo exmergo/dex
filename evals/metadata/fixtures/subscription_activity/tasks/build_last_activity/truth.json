@@ -1,0 +1,54 @@
+{
+  "models": {
+    "rpt_subscription_activity": {
+      "grain": [
+        "subscription_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "subscription_id": {
+          "role": "key"
+        },
+        "last_activity_at": {
+          "role": [
+            "time",
+            "attribute"
+          ]
+        },
+        "activity_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every subscription is present, including one with no activity",
+      "expect": 12,
+      "sql": "select count(*) from main.rpt_subscription_activity"
+    },
+    {
+      "name": "only real subscriptions",
+      "expect": 0,
+      "sql": "select count(*) from main.rpt_subscription_activity where subscription_id not in (select subscription_id from raw.subscriptions)"
+    },
+    {
+      "name": "a subscription with no activity counts zero, not NULL",
+      "expect": 1,
+      "sql": "select count(*) from main.rpt_subscription_activity where activity_count = 0 and last_activity_at is null"
+    },
+    {
+      "name": "activity counts and last activity match",
+      "expect": 0,
+      "sql": "select count(*) from main.rpt_subscription_activity r join (select s.subscription_id, count(a.activity_id) as n, max(a.occurred_at) as last_at from raw.subscriptions s left join raw.activity a using (subscription_id) group by 1) e using (subscription_id) where r.activity_count is distinct from e.n or r.last_activity_at is distinct from e.last_at"
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true
+  }
+}

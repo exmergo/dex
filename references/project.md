@@ -370,6 +370,13 @@ leaving it out, because each entry then claims a column is unique on its own, wh
 is a stronger claim than the one you made and the one that gets acted on. The
 conformance suite checks both shapes.
 
+`model_declarations` is optional in the same spirit. It maps a model to what its
+own declaration says (grain, population, and each column's role, unit,
+additivity and `references`), and `explore --use-project` reports it on the
+relation the model builds and turns each `references` into a declared join. A
+format with no declarations leaves it empty, and exploration then reports
+nothing rather than a guessed declaration.
+
 ## What reconcile writes into a declaration
 
 Your file is one a person wrote and nothing regenerates, so dex splices it: the bytes
@@ -435,9 +442,11 @@ rather than offered.
 `_staging.yml` included) and the folder that already holds its SQL, using the same
 lookup `transform place` and model declarations use. The
 `models/staging/stg_<table>.<suffix>` convention answers only for a model the project
-does not have yet. Reconcile and declarations therefore agree on where a model lives,
-and a re-scaffold that would land beside a model the project keeps elsewhere is
-refused as misplaced rather than written as a second copy.
+does not have yet. A drift finding for a table already named `stg_orders` resolves
+`stg_orders.yml`, not `stg_stg_orders.yml`; reconcile can therefore see an existing
+`unique` test instead of advising the user to add it again. Reconcile and declarations
+agree on where a model lives, and a re-scaffold that would land beside a model the
+project keeps elsewhere is refused as misplaced rather than written as a second copy.
 
 ## Declaring what a model means
 

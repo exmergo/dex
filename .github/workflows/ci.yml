@@ -8,20 +8,36 @@ permissions:
   contents: read
 
 jobs:
+  # The test groups, read from packages/dex-core/tests/ci_groups.py rather than
+  # listed here, so a group added there cannot be missing from the matrix below.
+  test-groups:
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: groups
+        run: echo "groups=$(python3 scripts/check_test_groups.py matrix)" >> "$GITHUB_OUTPUT"
+
   # Tier 1: engine correctness + the safety-critical assertions. Deterministic,
-  # fast, free (DuckDB is the test engine). The merge gate.
-  tests:
+  # fast, free (DuckDB is the test engine). Split into parallel groups by test
+  # file (tests/ci_groups.py); the `tests` job below is the merge gate, and it
+  # proves the groups ran the whole suite between them.
+  test:
+    name: test (${{ matrix.python-version }}, ${{ matrix.group }})
+    needs: test-groups
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        group: ${{ fromJSON(needs.test-groups.outputs.groups) }}
     defaults:
       run:
         working-directory: packages/dex-core
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           # Never the runner's system Python. The sync below names it too, and
@@ -44,8 +60,50 @@ jobs:
         run: uv sync --locked --extra all --extra dev --python ${{ matrix.python-version }}
       - name: Interpreter and stack under test
         run: uv run --no-sync python -c "import sys, dbt.version, duckdb, sqlglot, certifi; print(sys.version); print('dbt-core', dbt.version.__version__, 'duckdb', duckdb.__version__, 'sqlglot', sqlglot.__version__, 'certifi', certifi.__version__)"
-      - name: Tier-1 unit tests
-        run: uv run --no-sync pytest -q
+      # The report lists what this group collected, selected and ran, for the
+      # `tests` gate to check against every other group's.
+      - name: Tier-1 unit tests (${{ matrix.group }})
+        run: >-
+          uv run --no-sync pytest -q --durations=15
+          --ci-group ${{ matrix.group }}
+          --ci-group-report "$RUNNER_TEMP/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.json"
+          --junitxml "$RUNNER_TEMP/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.xml"
+      - name: Upload the group report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-group-${{ matrix.python-version }}-${{ matrix.group }}
+          # JSON proves coverage; JUnit records every test's duration so a slow
+          # file can be identified without another profiling run.
+          path: |
+            ${{ runner.temp }}/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.json
+            ${{ runner.temp }}/ci-group-${{ matrix.python-version }}-${{ matrix.group }}.xml
+          if-no-files-found: error
+          retention-days: 3
+
+  # The merge gate for the test groups: green only when every group passed and,
+  # between them, they ran every test a single `pytest` would have, once each.
+  # Splitting the suite is the one way a test could stop running with nothing
+  # failing, so this is checked from what the groups report rather than trusted
+  # from how they were cut. always() so a failed or cancelled group fails this
+  # rather than skipping it, since a skipped check reads as passing.
+  tests:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ci-group-*
+          path: ci-group-reports
+      - name: Every group ran, and together they ran the whole suite
+        run: python3 scripts/check_test_groups.py verify ci-group-reports
+      - name: Every group passed
+        if: needs.test.result != 'success'
+        run: |
+          echo "test groups finished with: ${{ needs.test.result }}"
+          exit 1
 
   # The safety spine is broken out as its own gate so a regression on a
   # safety-critical assertion is unmistakable in the checks list. Strict: an
@@ -62,7 +120,7 @@ jobs:
         working-directory: packages/dex-core
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           python-version: "3.14"
@@ -88,7 +146,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -118,19 +176,92 @@ jobs:
           node -e "console.log('testing mermaid', require('mermaid/package.json').version)"
           node check_mermaid_syntax.mjs "$RUNNER_TEMP/mermaid-fixtures"
 
-  # The Tier-2 eval harness scoring core (triggering, output-quality, uplift math),
-  # exercised with fake backends: deterministic, free, no model in the loop. The
-  # live Claude-driven evals run on release, not here. Stdlib only, so uvx supplies
-  # pytest and the harness needs no install.
+  # The eval groups, read from evals/tests/eval_groups.py rather than listed
+  # here, so a group added there cannot be missing from the matrix below.
+  eval-groups:
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: groups
+        run: echo "groups=$(python3 scripts/check_test_groups.py matrix --suite evals)" >> "$GITHUB_OUTPUT"
+
+  # The Tier-2 eval harness's tests: the scoring core (triggering, output-quality,
+  # uplift math) with fake backends, and the metadata-quality eval (#492), whose
+  # every task's reference answer is scored and built with dbt. No agent, no model
+  # in the loop and no spend; the live Claude-driven evals run on release, not
+  # here. The dbt builds take minutes, so the tests are split into parallel groups
+  # (evals/tests/eval_groups.py), test by test since almost all of the time is
+  # one file, and the `evals` job below is the merge gate.
+  # Run in the engine's environment, which the metadata eval needs (DuckDB, PyYAML
+  # and dbt through the [duckdb] extra), so nothing skips for a missing extra.
+  # Pinned to 3.13: on the runner's default 3.14, dbt's parse fails importing
+  # pydantic.v1, so every reference answer would fail the build gate on the
+  # interpreter rather than on the declaration under test.
+  eval:
+    name: eval (${{ matrix.group }})
+    needs: eval-groups
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.eval-groups.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      # The report lists what this group collected, selected, ran and skipped,
+      # for the `evals` gate to check against every other group's.
+      - name: Eval tests (${{ matrix.group }})
+        run: >-
+          uv run --python 3.13 --project packages/dex-core --locked --extra duckdb
+          --with pytest pytest evals/tests -q --durations=10
+          --eval-group ${{ matrix.group }}
+          --eval-group-report "$RUNNER_TEMP/eval-group-${{ matrix.group }}.json"
+          --junitxml "$RUNNER_TEMP/eval-group-${{ matrix.group }}.xml"
+      - name: Upload the group report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eval-group-${{ matrix.group }}
+          # JSON proves coverage; JUnit records every test's duration so the
+          # groups can be rebalanced without another profiling run.
+          path: |
+            ${{ runner.temp }}/eval-group-${{ matrix.group }}.json
+            ${{ runner.temp }}/eval-group-${{ matrix.group }}.xml
+          if-no-files-found: error
+          retention-days: 3
+
+  # The merge gate for the eval groups: green only when every group passed and,
+  # between them, they ran every eval once each with none skipped. always() so a
+  # failed or cancelled group fails this rather than skipping it, since a skipped
+  # check reads as passing.
   evals:
+    needs: eval
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
-      - name: Eval scoring-core tests
+      # The harness is stdlib only, so it also has to work with nothing but
+      # pytest; the tests needing an extra skip here and run in the groups above.
+      - name: Eval scoring core with no install
         run: uvx pytest evals -q
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: eval-group-*
+          path: eval-group-reports
+      - name: Every group ran, and together they ran every eval
+        run: python3 scripts/check_test_groups.py verify eval-group-reports --suite evals
+      - name: Every group passed
+        if: needs.eval.result != 'success'
+        run: |
+          echo "eval groups finished with: ${{ needs.eval.result }}"
+          exit 1
 
   # On brand for Exmergo (easter egg): all shipped prose is em-dash free. That
   # includes the documentation site's own pages and its config, where the site

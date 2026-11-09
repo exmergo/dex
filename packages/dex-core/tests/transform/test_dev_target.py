@@ -979,6 +979,37 @@ def test_the_postgres_privilege_is_asked_of_the_profile_role(
     assert "TO ci_builder;" in message
 
 
+def test_a_refusal_where_a_build_identity_is_committed_leads_with_it(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A profile still naming the role dex reads with, while postgres.user
+    commits the build identity, is a stale render: the refusal points at the
+    committed identity before offering any grant (#904)."""
+
+    pytest.importorskip("psycopg")
+    from fakes.postgres import FakeRole
+
+    role = FakeRole(name="dex_ro", schema_privileges={"dbt_dev": {"USAGE"}})
+    _connection, adapter, config = _postgres(dbt_project_dir, role)
+    config.postgres.user = "dbt_dev"
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert "postgres.user" in message and "dbt_dev" in message
+    assert message.index("dbt_dev") < message.index("GRANT USAGE")
+    assert "GRANT USAGE, CREATE ON SCHEMA dbt_dev TO dex_ro;" in message
+
+
+def test_the_redshift_refusal_names_the_committed_identity_the_same_way():
+    message = dev_target._identity_refusal(
+        "redshift", "user", "dbt_dev", "dex_ro", 'CREATE on "dbt_dev"', "dbt_dev"
+    )
+    assert message.startswith("redshift user dex_ro")
+    assert message.index("dbt_dev") < message.index("GRANT USAGE")
+
+
 def _redshift(dbt_project_dir: Path, user, *, profile_extra: str = ""):
     pytest.importorskip("redshift_connector")
     from fakes.redshift import FakeRedshiftConnection, FakeRedshiftTable

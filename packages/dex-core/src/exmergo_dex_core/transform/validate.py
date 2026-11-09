@@ -1,14 +1,17 @@
 """Per-kind validation of agent-authored edits, before they become a plan.
 
-Model SQL must be a single read-only SELECT once its jinja is stripped (defense in
-depth: the same guard the adapters apply to generated SQL). YAML edits must parse
+Model SQL must be a single read-only SELECT, compiled by dbt for control flow
+and otherwise checked with Jinja stripped (defense in depth: the same guard the
+adapters apply to generated SQL). YAML edits must parse
 to a mapping. Semantic YAML gets a further MetricFlow-shape check in
 ``semantic.py``; this module owns the checks common to every plan producer.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import sqlglot
@@ -137,6 +140,44 @@ _JINJA_STMT = re.compile(r"\{%.*?%\}", re.DOTALL)
 _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _PLACEHOLDER = "__dex_jinja__"
 
+
+def needs_compilation(content: str) -> bool:
+    """Control flow cannot be reduced to SQL by deleting its delimiters."""
+
+    return any(
+        re.match(r"\{%\s*-?\s*(?:for|if)\b", block)
+        for block in _JINJA_STMT.findall(_JINJA_COMMENT.sub("", content))
+    )
+
+
+@dataclass(frozen=True)
+class CompiledModel:
+    """Fresh, internal evidence bound to the authored file and its SQL dialect."""
+
+    path: str
+    source_sha256: str
+    sql: str
+    target: str
+    dialect: str
+
+    def check(self, edit: PlanEdit) -> None:
+        if (
+            self.path != edit.path
+            or self.source_sha256
+            != hashlib.sha256(edit.new_content.encode()).hexdigest()
+            or not self.sql.strip()
+        ):
+            raise EditValidationError(
+                f"{edit.path}: compiled validation is stale or empty"
+            )
+        try:
+            assert_select_only(
+                self.sql, dialect=self.dialect, deny_external_reads=False
+            )
+        except Exception as exc:
+            raise EditValidationError(f"{edit.path}: compiled SQL: {exc}") from exc
+
+
 # Macro definition delimiters, tolerant of whitespace-control markers. A macro
 # file is jinja, not SQL, so its shape check is structural: definitions only,
 # nothing loose between them. dbt's own parser is the authoritative gate.
@@ -167,6 +208,81 @@ _SNAPSHOT_BLOCK = re.compile(
     r"\{%-?\s*snapshot\s.*?\{%-?\s*endsnapshot\s*-?%\}", re.DOTALL
 )
 _CONFIG_CALL = re.compile(r"\{\{-?\s*config\s*\(", re.DOTALL)
+_CONFIG_CALL_CLOSE = re.compile(r"\s*-?\}\}")
+_LEADING_COMMENT_OR_WS = re.compile(r"\s+|--[^\r\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def _match_config_call(text: str, start: int) -> int | None:
+    """If text[start:] begins with a config(...) call closing with -?}},
+    return the end index in text, else None.
+
+    Handles single and double-quoted strings with escape characters so
+    parentheses inside string arguments do not close the call early (#1003).
+    """
+
+    m = _CONFIG_CALL.match(text, start)
+    if not m:
+        return None
+    pos = m.end()
+    depth = 1
+    in_quote = None
+    escape = False
+
+    while pos < len(text) and depth > 0:
+        ch = text[pos]
+        if in_quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_quote:
+                in_quote = None
+        else:
+            if ch in ("'", '"'):
+                in_quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+        pos += 1
+
+    if depth != 0:
+        return None
+
+    close_m = _CONFIG_CALL_CLOSE.match(text, pos)
+    if not close_m:
+        return None
+    return close_m.end()
+
+
+def _strip_leading_config_headers(sql: str) -> str:
+    """Blank out recognized leading config() headers before the SQL query starts
+    with spaces (#1003), preserving line and column coordinates for downstream
+    parsing.
+    """
+
+    pos = 0
+    chars = list(sql)
+
+    while pos < len(sql):
+        comment_match = _LEADING_COMMENT_OR_WS.match(sql, pos)
+        if comment_match:
+            pos = comment_match.end()
+            continue
+
+        config_end = _match_config_call(sql, pos)
+        if config_end is not None:
+            for i in range(pos, config_end):
+                if chars[i] not in ("\n", "\r"):
+                    chars[i] = " "
+            pos = config_end
+            continue
+
+        break
+
+    return "".join(chars)
+
+
 # The strategies dbt ships, and the field each one cannot work without: a
 # timestamp strategy compares an updated-at column, a check strategy compares a
 # named column list. Naming the required field in the refusal is the difference
@@ -178,18 +294,21 @@ def strip_jinja(sql: str) -> str:
     """Reduce a dbt model to plain SQL for the SELECT-only check.
 
     Inline expressions (``{{ ref(...) }}``) become an identifier placeholder;
-    statement and comment blocks are removed. Before the query starts, a
-    placeholder-only line is dropped at the top level (a ``{{ config(...) }}``
-    header). Once the first SQL ``SELECT`` or ``WITH`` token has started the
-    query, it is preserved as an identifier so a line-broken ``ref()`` remains
-    parseable. Inside parentheses it becomes a placeholder subquery, because
-    there it is a macro rendering a whole SELECT
+    statement and comment blocks are removed. Recognized leading
+    ``{{ config(...) }}`` headers are blanked out (#1003) before expression
+    replacement so queries following on the same or separate lines both parse
+    cleanly. Before the query starts, any remaining placeholder-only line is
+    dropped at the top level. Once the first SQL ``SELECT`` or ``WITH`` token
+    has started the query, it is preserved as an identifier so a line-broken
+    ``ref()`` remains parseable. Inside parentheses it becomes a placeholder
+    subquery, because there it is a macro rendering a whole SELECT
     (``from ( {{ unpivot_json_object(...) }} )``), and dropping it would leave
     unparseable SQL. Depth counting is naive about parens inside string literals;
     a miscount only ever refuses, never admits.
     """
 
     text = _JINJA_COMMENT.sub("", sql)
+    text = _strip_leading_config_headers(text)
     text = _JINJA_STMT.sub("", text)
     text = _JINJA_EXPR.sub(_PLACEHOLDER, text)
     # Token lines locate the query without mistaking keywords in comments or
@@ -294,7 +413,11 @@ def _assert_query_only(path: str, content: str, noun: str) -> list[str]:
         assert_select_only(stripped, deny_external_reads=False)
     except Exception as exc:
         raise EditValidationError(f"{path}: {exc}") from exc
-    called = _external_read(stripped)
+    return _external_read_warnings(path, stripped, noun)
+
+
+def _external_read_warnings(path: str, sql: str, noun: str) -> list[str]:
+    called = _external_read(sql)
     if called is not None:
         return [
             f"{path}: {noun} calls {called}, which reads a file, a URL, another "
@@ -672,6 +795,8 @@ def validate_edit(
     *,
     cache: object | None = None,
     pii_overrides: object | None = None,
+    compiled: CompiledModel | None = None,
+    defer_compilation: bool = False,
 ) -> list[str]:
     """Validate one edit for its kind. Returns warnings; raises on a hard failure.
 
@@ -745,7 +870,19 @@ def validate_edit(
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:
-        warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
+        if needs_compilation(edit.new_content):
+            if compiled is not None:
+                compiled.check(edit)
+                warnings.extend(
+                    _external_read_warnings(edit.path, compiled.sql, "compiled model")
+                )
+            elif not defer_compilation:
+                raise EditValidationError(
+                    f"{edit.path}: Jinja control flow requires dbt compilation; "
+                    "use transform plan with an installed dbt adapter and a dev profile"
+                )
+        else:
+            warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
     else:
         try:
             parsed = yaml.safe_load(edit.new_content)

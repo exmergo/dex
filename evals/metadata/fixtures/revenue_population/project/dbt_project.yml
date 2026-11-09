@@ -1,0 +1,11 @@
+name: shop
+version: "1.0.0"
+profile: shop
+model-paths: ["models"]
+
+models:
+  shop:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

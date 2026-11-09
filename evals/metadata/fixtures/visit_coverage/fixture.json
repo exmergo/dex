@@ -1,0 +1,5 @@
+{
+  "name": "visit_coverage",
+  "description": "Clinic visits over four weeks with days on which nobody came: a daily table that skips those days, where filling them in must keep what each count and average meant.",
+  "seed": 11150
+}

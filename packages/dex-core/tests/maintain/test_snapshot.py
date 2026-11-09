@@ -525,3 +525,18 @@ def test_the_two_unreadable_states_are_told_apart_without_reading_prose():
 
     assert versioned.schema_version == 99
     assert unparseable.schema_version is None
+
+
+def test_snapshot_project_only_reports_carried_forward(maintain_repo):
+    """--project-only reports data.baseline.carried_forward: true;
+    full reports false.
+    """
+    full_payload = maintain_repo.snapshot()
+    assert full_payload["status"] == "ok"
+    assert full_payload["data"]["baseline"]["carried_forward"] is False
+
+    rc, project_only_payload = maintain_repo.dex(
+        "maintain", "snapshot", "--project-only"
+    )
+    assert rc == 0 and project_only_payload["status"] == "ok"
+    assert project_only_payload["data"]["baseline"]["carried_forward"] is True

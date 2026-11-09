@@ -36,18 +36,25 @@ class LayerFingerprint(BaseModel):
     source_count: int | None = None
     semantic_model_count: int | None = None
     metric_count: int | None = None
+    #: Models whose declaration was fingerprinted (#497), or on a native
+    #: semantic layer the definitions whose declaration was (#995). ``None``
+    #: when the format does not read declarations, so the next run reports the
+    #: declaration axis as unchecked; ``0`` when it does and none are declared.
+    declared_model_count: int | None = None
 
     def transform_data(self) -> dict[str, Any]:
         return {
             "file_count": self.file_count,
             "model_count": self.model_count,
             "source_count": self.source_count,
+            "declared_model_count": self.declared_model_count,
         }
 
     def semantic_data(self) -> dict[str, Any]:
         return {
             "semantic_model_count": self.semantic_model_count,
             "metric_count": self.metric_count,
+            "declared_model_count": self.declared_model_count,
         }
 
 
@@ -113,9 +120,14 @@ class DriftResult(Result):
     snapshot_created_at: str | None = None
     warehouse_from: str = ""
     drift_path: str = ""
+    #: Whether the semantic axis's declaration focus compared the two sides
+    #: (#497), and why not when it did not. ``None`` on a command that does not
+    #: run that focus, which leaves the key out of the payload rather than
+    #: reporting a check that was never attempted.
+    declaration_drift: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload = {
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "axes_run": sorted(self.by_axis),
@@ -132,6 +144,9 @@ class DriftResult(Result):
             },
             "drift_path": self.drift_path,
         }
+        if self.declaration_drift is not None:
+            payload["declaration_drift"] = self.declaration_drift
+        return payload
 
 
 class VerifyResult(Result):
@@ -152,13 +167,43 @@ class VerifyResult(Result):
 
     findings: list[DriftFinding] = Field(default_factory=list)
     suppressed: dict[str, str] = Field(default_factory=dict)
+    target: str | None = None
+    judged_namespace: str | None = None
+    manifest_target: str | None = None
+    #: One record per join the project writes (#857): declared, measured,
+    #: contradicted or unchecked. ``None`` when the axis did not run at all.
+    join_coverage: list[dict] | None = None
+    #: One record per declared ``population.parent`` (#857).
+    parent_population: list[dict] | None = None
+    #: One record per declared ``history`` temporal contract (#1027).
+    temporal_contracts: list[dict] | None = None
+    #: One record per declared grain key (#1223): ``proven``, ``broken``,
+    #: ``not_applicable``, ``unchecked`` or ``not_planned``, each with a
+    #: ``reason`` code where it was not judged. ``None`` when the grain class
+    #: did not run at all, which ``suppressed["grain"]`` then says.
+    grain_coverage: list[dict] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.grain_coverage is not None:
+            payload["grain_coverage"] = self.grain_coverage
+        if self.join_coverage is not None:
+            payload["join_coverage"] = self.join_coverage
+        if self.parent_population:
+            payload["parent_population"] = self.parent_population
+        if self.temporal_contracts:
+            payload["temporal_contracts"] = self.temporal_contracts
+        if self.target is not None:
+            payload["target"] = self.target
+        if self.judged_namespace is not None:
+            payload["judged_namespace"] = self.judged_namespace
+        if self.manifest_target is not None:
+            payload["manifest_target"] = self.manifest_target
+        return payload
 
 
 class ReconcileResult(Result):

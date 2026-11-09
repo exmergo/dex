@@ -234,7 +234,7 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
             "Query a semantic layer with dex explore semantic: list metrics, read "
             "dimension values, and run governed metric queries on dbt, dbt Cloud, "
             "or Apache Ossie.",
-            "Overview",
+            "Catalog and queries",
         ),
     ),
     ReferencePage(
@@ -246,6 +246,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
             "it validates, what it derives for exploration and drift, and what it "
             "declines to claim.",
             "Apache Ossie",
+        ),
+    ),
+    ReferencePage(
+        "cube-compatibility.md",
+        "semantic-layers/cube",
+        PageMeta(
+            "Cube compatibility",
+            "How dex reads, validates and authors Cube YAML model files with no "
+            "Cube server: the ported rules, compiled-only files, the catalog "
+            "mapping and derived cubes.",
+            "Cube",
         ),
     ),
     ReferencePage(
@@ -423,13 +434,6 @@ GENERATED_PAGES: dict[str, PageMeta] = {
         "diffs.",
         "maintain",
     ),
-    "cli/viz": PageMeta(
-        "dex viz",
-        "Reference for dex viz preview, which is not yet implemented and returns a "
-        "not_implemented envelope, with the flags it accepts and the shape of what "
-        "it prints.",
-        "viz",
-    ),
     "cli/config": PageMeta(
         "dex config",
         "Reference for dex config: read every effective setting, validate "
@@ -443,6 +447,12 @@ GENERATED_PAGES: dict[str, PageMeta] = {
         "realistic data quality problems, no credentials or network, to try every "
         "dex command on.",
         "demo",
+    ),
+    "cli/procedure": PageMeta(
+        "dex procedure",
+        "Reference for dex procedure: print the agent procedure every dex skill "
+        "carries, the block to paste into CLAUDE.md or AGENTS.md, and a stale check.",
+        "procedure",
     ),
     "changelog": PageMeta(
         "Changelog",
@@ -892,6 +902,17 @@ def render_cli_reference(
             sections += _tables(group_parser, shared, f"dex {name}", gaps)
         else:
             sub_summaries = {c.dest: c.help or "" for c in subs._choices_actions}
+            command_rows = [
+                f"| [`dex {name} {sub}`](#dex-{name}-{sub}) | "
+                f"{_cell(sub_summaries.get(sub, ''))} |"
+                for sub in subs.choices
+            ]
+            sections.append(
+                "Choose a command, then expand its usage and options. " + footer
+            )
+            sections.append(
+                "| Command | What it does |\n| --- | --- |\n" + "\n".join(command_rows)
+            )
             for sub_name, sub_parser in subs.choices.items():
                 command = f"dex {name} {sub_name}"
                 if not sub_summaries.get(sub_name):
@@ -901,8 +922,13 @@ def render_cli_reference(
                 sections.append(f"## {command}")
                 if sub_parser.description:
                     sections.append(_cli_prose(sub_parser.description))
-                sections.append(_synopsis(command, sub_parser, shared))
-                sections += _tables(sub_parser, shared, command, gaps)
+                details = [_synopsis(command, sub_parser, shared)]
+                details += _tables(sub_parser, shared, command, gaps)
+                sections.append(
+                    f'<Accordion title="Usage and options for {command}">\n\n'
+                    + "\n\n".join(details)
+                    + "\n\n</Accordion>"
+                )
         sections.append(footer)
         pages[f"cli/{name}"] = "\n\n".join(s for s in sections if s) + "\n"
     return pages, gaps

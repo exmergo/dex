@@ -779,3 +779,42 @@ def test_a_near_unique_anchor_is_drawn_without_claiming_a_key():
     line = next(row for row in mermaid.splitlines() if "order_item_id" in row)
     for mark in (" PK", " UK", " FK"):
         assert mark not in line, line
+
+
+def test_diagram_with_objects_and_zero_edges_refuses_naming_full(tmp_path, capsys):
+    from exmergo_dex_core.storage import FilesystemStore
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="shop.main.fact_a",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+            ),
+            Dataset(
+                identifier="shop.main.fact_b",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+            ),
+        ],
+        relationships=[],
+    )
+    FilesystemStore(repo).save_cache(cache)
+
+    refusal = _run(
+        ["explore", "diagram", "--repo-root", str(repo)],
+        capsys,
+        expect_error=True,
+    )
+    assert refusal["reason"] == "prerequisite"
+    assert "holds profiled objects but no edges" in refusal["errors"][0]
+    assert "--full" in refusal["errors"][0]
+
+    full = _run(
+        ["explore", "diagram", "--full", "--repo-root", str(repo)],
+        capsys,
+    )
+    assert full["data"]["entity_count"] == 2
+    assert full["data"]["edge_count"] == 0
+    assert "fact_a" in full["data"]["mermaid"]
+    assert "fact_b" in full["data"]["mermaid"]

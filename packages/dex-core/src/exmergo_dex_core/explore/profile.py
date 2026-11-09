@@ -703,13 +703,22 @@ def _hex_shape_label(agg: ColumnAggregate) -> str:
     return f"hexadecimal ({lo}-{hi} characters, mixed length)"
 
 
-def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str | None:
-    """A candidate-key column that mixes two or more value shapes (numeric,
+def _heterogeneous_key_note(
+    col_name: str,
+    agg: ColumnAggregate | None,
+    *,
+    proven_key: bool = True,
+) -> str | None:
+    """A key-shaped column that mixes two or more value shapes (numeric,
     UUID, hex of at least the length floor, or an unclassified remainder) in
     a meaningful share each -- the shape that survives a partial migration or
     a merged upstream, where a downstream cast, join, or filter silently
     drops the group it was not written for. Fractions and a length-derived
     shape label only; never a value.
+
+    Proven candidate keys keep the historical wording; id-shaped columns that
+    are not proven unique (#1072) use ``looks like a key`` so a repair of a
+    nullable or non-unique identifier still carries profile evidence.
 
     The consequence named follows the groups reported, not the raw
     fractions: the cast warning only when numeric is one of them, since with
@@ -746,9 +755,8 @@ def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str |
             "a join or filter written for one shape will silently miss the "
             "other group(s)"
         )
-    return (
-        f"{col_name} is a candidate key but mixes value shapes: {parts}; {consequence}"
-    )
+    role = "is a candidate key but" if proven_key else "looks like a key but"
+    return f"{col_name} {role} mixes value shapes: {parts}; {consequence}"
 
 
 def _boolean_shaped_flag_note(
@@ -1035,6 +1043,8 @@ def profile(
         if notes_for is not None:
             data_quality.extend(notes_for(identifier))
 
+        from .relationships import is_id_shaped
+
         for col in columns:
             agg = aggregates.get(col.name)
             pii = _refine_confidence(
@@ -1047,8 +1057,11 @@ def profile(
                 data_quality.extend(
                     _type_contradiction_notes(col.name, col.data_type, agg)
                 )
-                if _is_candidate_key(col.name, agg, composite_members):
-                    key_note = _heterogeneous_key_note(col.name, agg)
+                proven_key = _is_candidate_key(col.name, agg, composite_members)
+                if proven_key or is_id_shaped(col.name):
+                    key_note = _heterogeneous_key_note(
+                        col.name, agg, proven_key=proven_key
+                    )
                     if key_note is not None:
                         data_quality.append(key_note)
                 flag_note = _boolean_shaped_flag_note(
@@ -1110,9 +1123,21 @@ def _escalate_near_unique(
     unique within approximation noise, so uniqueness verdicts (and the grain and
     data-quality notes derived from them) rest on proof, not on HLL error.
 
-    Bounded: at most ``_EXACT_DISTINCT_CAP`` columns per table (the smallest
-    approx-to-non-null gaps win), all in one batched adapter call. An adapter
-    without ``exact_distinct_counts`` degrades to the approximate signals.
+    A second pass covers columns the catalog says nothing about at all
+    (Postgres views and tables nobody has analyzed report no planner
+    statistics, so their adapter sets ``distinct_count_missing``): a null-free
+    column with no count is exactly a column that could prove as a
+    single-column key, and leaving it unmeasured is what used to leave the
+    grain unknown and the candidate keys empty. Those columns have no
+    approximation to rank by, so id-shaped names go first and the rest follow
+    scan order. A column of a type the adapter skips reports no count either
+    and is never sent, since one the warehouse cannot group would fail the
+    whole statement (#1050).
+
+    Bounded: at most ``_EXACT_DISTINCT_CAP`` columns per table across both
+    passes (the near-unique pass wins the slots first), all in one batched
+    adapter call. An adapter without ``exact_distinct_counts`` degrades to
+    the approximate signals.
     """
 
     if not row_count:
@@ -1121,25 +1146,46 @@ def _escalate_near_unique(
     if exact_counts is None:
         return aggregates
 
-    candidates: list[tuple[int, str, int]] = []
-    for agg in aggregates.values():
-        if agg.distinct_count is None or agg.distinct_count_exact:
-            continue
-        non_null = (
+    def _non_null(agg: ColumnAggregate) -> int:
+        return (
             round((1 - agg.null_fraction) * row_count)
             if agg.null_fraction is not None
             else row_count
         )
+
+    candidates: list[tuple[int, str, int]] = []
+    catalog_blind: list[str] = []
+    for agg in aggregates.values():
+        if agg.distinct_count_exact:
+            continue
+        if agg.distinct_count is None:
+            if agg.distinct_count_missing and agg.null_fraction in (0.0, None):
+                catalog_blind.append(agg.name)
+            continue
+        non_null = _non_null(agg)
         if non_null <= 0:
             continue
         if agg.distinct_count >= NEAR_UNIQUE_RATIO * non_null:
             gap = abs(non_null - agg.distinct_count)
             candidates.append((gap, agg.name, non_null))
-    if not candidates:
+    if not candidates and not catalog_blind:
         return aggregates
 
     candidates.sort(key=lambda c: c[0])
     chosen = candidates[:_EXACT_DISTINCT_CAP]
+    if len(chosen) < _EXACT_DISTINCT_CAP and catalog_blind:
+        # Imported here: relationships imports NEAR_UNIQUE_RATIO from this
+        # module, so a module-level import would be circular.
+        from .relationships import is_id_shaped
+
+        blind_ranked = sorted(
+            catalog_blind,
+            key=lambda name: (not is_id_shaped(name), list(aggregates).index(name)),
+        )
+        for name in blind_ranked[: _EXACT_DISTINCT_CAP - len(chosen)]:
+            chosen.append((0, name, _non_null(aggregates[name])))
+    if not chosen:
+        return aggregates
     exact = exact_counts(identifier, [name for _gap, name, _nn in chosen])
 
     escalated = dict(aggregates)

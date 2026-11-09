@@ -5,13 +5,14 @@ and the simulated server (statement_timeout)."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("psycopg")
 
-from fakes.postgres import FakePostgresTable, FakeResult
+from fakes.postgres import FakePostgresConnection, FakePostgresTable, FakeResult
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
 from exmergo_dex_core.adapters.postgres import (
@@ -26,6 +27,7 @@ from exmergo_dex_core.connect import (
     resolve_postgres_connection,
 )
 from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -432,7 +434,8 @@ def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
         "dexdb.shop.customers", columns, shape_stats={"email"}
     )
     sql = fake_pg_connection.data_statements[0].sql
-    assert '"email" ~ \'' in sql
+    assert '("email"::text COLLATE "C") ~ \'' in sql
+    assert '"email" ~' not in sql
     for alias in ("su_1", "sp_1", "st_1"):
         assert f" AS {alias}" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
@@ -444,6 +447,56 @@ def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
     assert by_name["id"].upper_vocab_fraction is None
     assert by_name["id"].person_shape_fraction is None
     assert by_name["id"].avg_token_count is None
+
+
+def _c(col: str) -> str:
+    return f'("{col}"::text COLLATE "C")'
+
+
+def test_shape_probes_read_c_collated_text(fake_pg_connection):
+    """Every regex and substring search reads the column as C-collated text
+    (#1096): Postgres refuses both under a nondeterministic collation, and the
+    refusal fails the statement for the whole table. Counts, MIN/MAX and an
+    integer column's numeric comparisons keep the column itself."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = make_adapter(fake_pg_connection)
+    columns = [
+        ColumnMeta(name="code", data_type="text", nullable=True, ordinal=1),
+        ColumnMeta(name="padded", data_type="character(6)", nullable=True, ordinal=2),
+        ColumnMeta(name="n", data_type="bigint", nullable=True, ordinal=3),
+    ]
+    every = {"code", "padded", "n"}
+    sql, _plan = adapter._build_aggregate_sql(
+        "dexdb.shop.customers",
+        columns,
+        safe=every,
+        shape={"code", "padded"},
+        type_req=every,
+        key_shape_req={"code", "padded"},
+        temporal_req=set(),
+    )
+    assert assert_select_only(sql, dialect="postgres") == sql
+    # Every regex operand is a column read as C text, whatever wraps it.
+    regex_count = sql.count(" ~ '")
+    assert regex_count, "the probes were requested, so a regex must render"
+    collated = re.findall(r'\("(\w+)"::text COLLATE "C"\) ~ \'', sql)
+    assert len(collated) == regex_count
+    assert set(collated) == {"code", "padded"}
+    for col in ("code", "padded"):
+        assert f'"{col}" ~' not in sql
+        assert f'REPLACE("{col}"' not in sql
+        assert f'LENGTH("{col}")' not in sql
+        assert f"REPLACE({_c(col)}, ' ', '')" in sql
+        assert f"LENGTH({_c(col)})" in sql
+        assert f'COUNT("{col}") AS' in sql
+        assert f'MIN("{col}") AS' in sql
+        assert f'MAX("{col}") AS' in sql
+    # The integer branch compares numbers: no regex, no text cast.
+    assert _c("n") not in sql
+    assert 'MIN(CASE WHEN "n" BETWEEN' in sql
 
 
 def test_degraded_types_get_non_null_counts_only(fake_pg_connection):
@@ -513,6 +566,143 @@ def test_missing_stats_notes_analyze(fake_pg_connection):
     assert any("ANALYZE" in note for note in adapter.table_notes("dexdb.shop.events"))
 
 
+def _events_rows(sql):
+    if "COUNT(DISTINCT" in sql:
+        return FakeResult(rows=[{"n_total": 50, "d_0": 50}], seconds=0.5)
+    return FakeResult(rows=[{"n_total": 50, "nn_0": 50, "nn_1": 50}], seconds=0.5)
+
+
+def test_missing_stats_measured_note_replaces_analyze_note(fake_pg_connection):
+    # Issue #896: once an exact scan measures the columns the catalog had
+    # none for, the ANALYZE note must not still claim they are unavailable.
+    fake_pg_connection.row_resolver = _events_rows
+    adapter = make_adapter(fake_pg_connection, ceiling=5000.0)
+    _meta, columns = adapter.table_metadata("dexdb.shop.events")
+    adapter.column_aggregates("dexdb.shop.events", columns)
+    assert adapter.exact_distinct_counts("dexdb.shop.events", ["id"]) == {"id": 50}
+    notes = adapter.table_notes("dexdb.shop.events")
+    assert not any("ANALYZE" in note for note in notes)
+    assert any("id" in note and "measured with an exact scan" in note for note in notes)
+
+
+def test_missing_stats_partial_measurement_keeps_analyze_note(fake_pg_connection):
+    # Only the measured column leaves the unavailable note; the rest keep it.
+    from fakes.postgres import FakePostgresConnection
+
+    connection = FakePostgresConnection(
+        tables=[
+            FakePostgresTable(
+                schema="shop",
+                name="plain",
+                columns=[("id", "bigint", True), ("code", "text", True)],
+                reltuples=-1.0,
+                total_bytes=1000,
+            )
+        ],
+        database="dexdb",
+    )
+
+    def _plain_rows(sql):
+        if "COUNT(DISTINCT" in sql:
+            return FakeResult(rows=[{"n_total": 40, "d_0": 40}], seconds=0.5)
+        return FakeResult(rows=[{"n_total": 40, "nn_0": 40, "nn_1": 40}], seconds=0.5)
+
+    connection.row_resolver = _plain_rows
+    adapter = make_adapter(connection, ceiling=5000.0)
+    _meta, columns = adapter.table_metadata("dexdb.shop.plain")
+    adapter.column_aggregates("dexdb.shop.plain", columns)
+    assert adapter.exact_distinct_counts("dexdb.shop.plain", ["id"]) == {"id": 40}
+    notes = adapter.table_notes("dexdb.shop.plain")
+    assert any("1 column(s)" in note and "ANALYZE" in note for note in notes)
+    assert any("id" in note and "measured with an exact scan" in note for note in notes)
+
+
+def test_exact_distinct_counts_skips_degraded(fake_pg_connection):
+    # `maintain verify` and `maintain drift` send key columns directly, and a
+    # degraded column (jsonb here) among them must not fail the whole statement:
+    # Postgres cannot COUNT(DISTINCT) every degraded type.
+    fake_pg_connection.row_resolver = _events_rows
+    adapter = make_adapter(fake_pg_connection, ceiling=5000.0)
+    assert adapter.exact_distinct_counts("dexdb.shop.events", ["id", "payload"]) == {
+        "id": 50
+    }
+    exact_statements = [
+        s.sql for s in fake_pg_connection.data_statements if "COUNT(DISTINCT" in s.sql
+    ]
+    assert exact_statements
+    assert all("payload" not in sql for sql in exact_statements)
+
+
+def _unanalyzed_table(columns: list[tuple[str, str, bool]]) -> FakePostgresConnection:
+    connection = FakePostgresConnection(
+        tables=[
+            FakePostgresTable(
+                schema="shop",
+                name="wide",
+                columns=columns,
+                reltuples=-1.0,
+                total_bytes=1000,
+            )
+        ],
+        database="dexdb",
+    )
+
+    def rows(sql: str) -> FakeResult:
+        if "COUNT(DISTINCT" in sql:
+            return FakeResult(rows=[{"n_total": 40, "d_0": 40}], seconds=0.5)
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(
+            rows=[{a: None if a[:3] in ("mn_", "mx_") else 40 for a in aliases}],
+            seconds=0.5,
+        )
+
+    connection.row_resolver = rows
+    return connection
+
+
+def test_profile_measures_a_catalog_blind_column():
+    connection = _unanalyzed_table([("id", "bigint", False)])
+    adapter = make_adapter(connection, ceiling=5000.0)
+    column = profile(adapter, ["dexdb.shop.wide"])[0].columns[0]
+    assert column.distinct_count == 40
+    assert column.distinct_count_exact is True
+
+
+def test_profile_does_not_measure_an_empty_block_sample(fake_pg_connection):
+    """No rows means no count for any column, whatever the catalog holds, and
+    that is no reason to scan the whole table (#1050)."""
+
+    def empty_sample(sql: str) -> FakeResult:
+        aliases = re.findall(r" AS (\w+)", sql)
+        return FakeResult(rows=[dict.fromkeys(aliases, 0)], seconds=0.5)
+
+    fake_pg_connection.row_resolver = empty_sample
+    adapter = make_adapter(
+        fake_pg_connection,
+        ceiling=5000.0,
+        target=PostgresTarget(max_full_profile_bytes=1),
+    )
+    dataset = profile(adapter, ["dexdb.shop.customers"])[0]
+    assert dataset.columns[0].distinct_count is None
+    assert not [
+        s.sql for s in fake_pg_connection.data_statements if "COUNT(DISTINCT" in s.sql
+    ]
+
+
+def test_degraded_columns_take_no_slot_from_a_catalog_blind_one():
+    """Degraded columns report no count either; sent to the exact pass they would
+    fill its slots and be dropped there, leaving this column unmeasured (#1050)."""
+
+    connection = _unanalyzed_table(
+        [(f"j{i}", "jsonb", False) for i in range(8)] + [("code", "text", False)]
+    )
+    adapter = make_adapter(connection, ceiling=5000.0)
+    columns = {c.name: c for c in profile(adapter, ["dexdb.shop.wide"])[0].columns}
+    assert columns["code"].distinct_count == 40
+    assert columns["code"].distinct_count_exact is True
+    assert columns["j0"].distinct_count is None
+
+
 def test_exact_count_from_scan_supersedes_reltuples(fake_pg_connection):
     fake_pg_connection.row_resolver = lambda sql: FakeResult(
         rows=[{"n_total": 137, "nn_0": 137, "nn_1": 137, "nn_2": 1, "nn_3": 1}],
@@ -572,13 +762,17 @@ def test_distinct_combination_counts_batch_into_one_guarded_statement(
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     fake_pg_connection.row_resolver = lambda sql: FakeResult(
-        rows=[{"d_0": 97, "d_1": 100}], seconds=0.5
+        rows=[{"n_total": 137, "d_0": 97, "d_1": 100}], seconds=0.5
     )
     adapter = make_adapter(fake_pg_connection)
     counts = adapter.distinct_combination_counts(
         "dexdb.shop.customers", [["id", "email"], ["email", "id"]]
     )
     assert counts == {("id", "email"): 97, ("email", "id"): 100}
+    # The combination statement rides COUNT(*) along (#849), so the scan
+    # supplies the exact total the same way the aggregate scan does.
+    meta, _ = adapter.table_metadata("dexdb.shop.customers")
+    assert meta.row_count == 137
     stmts = fake_pg_connection.data_statements
     assert len(stmts) == 1
     sql = stmts[0].sql
@@ -1027,3 +1221,31 @@ def test_a_host_cap_inside_the_estimate_lets_the_statement_run_capped(
     # from the higher per-command ceiling.
     assert statement.session_timeout_ms is not None
     assert statement.session_timeout_ms <= 120_000
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_pg_connection):
+    """Cube's rendered SQL reads a zone-less timestamp through the session time
+    zone its own driver sets to UTC, so the governed Cube path asks for one."""
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(rows=[{"n": 1}])
+    adapter = make_adapter(fake_pg_connection)
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert "timezone" not in fake_pg_connection.session_parameters
+
+    adapter.pin_utc_session()
+    adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
+    assert fake_pg_connection.session_parameters["timezone"] == "UTC"
+
+
+def test_postgres_in_scope_respects_schemas_and_database(fake_pg_connection):
+    """#984: a postgres namespace is in scope if its database matches and
+    its schema lies in the configured scope (or all schemas if unrestricted)."""
+
+    adapter = make_adapter(fake_pg_connection)
+    assert adapter.in_scope("dexdb.shop") is True
+    assert adapter.in_scope("dexdb.legacy") is True
+    assert adapter.in_scope("other_db.shop") is False
+
+    scoped = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
+    assert scoped.in_scope("dexdb.shop") is True
+    assert scoped.in_scope("dexdb.legacy") is False

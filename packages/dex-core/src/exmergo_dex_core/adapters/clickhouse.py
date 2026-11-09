@@ -52,11 +52,13 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
+from collections.abc import Sequence
 from typing import Any
 
 from ..config import ClickHouseTarget
 from ..envelope import EstimateQuality, Paradigm
-from ..errors import ConnectorError
+from ..errors import ConnectorError, StatementStage
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -67,6 +69,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -83,6 +86,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
     with_dev_target,
 )
 
@@ -294,6 +298,10 @@ class ClickHouseAdapter:
     # model of the scan and still a model, on both deployments.
     estimate_quality = EstimateQuality.APPROXIMATE
     dialect = DIALECT
+    # Seconds between capacity re-reads while a waking service's replicas join;
+    # about 15s in all before the probe refuses.
+    _CAPACITY_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    _sleep = staticmethod(time.sleep)
 
     def __init__(
         self,
@@ -333,7 +341,7 @@ class ClickHouseAdapter:
         from clickhouse_connect.driver import exceptions as ch_exceptions
 
         self._ch_exceptions = ch_exceptions
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._server_version: str | None = None
         self._notes: dict[str, list[str]] = {}
@@ -420,6 +428,24 @@ class ClickHouseAdapter:
         if self._capacity is not None:
             return self._capacity
         self._assert_deployment()
+        # A service waking from idle answers on one replica before the others
+        # have joined, so clusterAllReplicas fails or answers in part for a few
+        # seconds. That is not a capacity anyone can bill against, so the probe
+        # is re-read on a short, bounded schedule and still refuses at the end;
+        # a denied grant is not going to change and refuses at once.
+        for delay in self._CAPACITY_RETRY_DELAYS:
+            try:
+                self._capacity = self._measure_capacity()
+                return self._capacity
+            except ClickHouseConnectionError as exc:
+                server_error = getattr(exc.__cause__, "__cause__", None)
+                if getattr(server_error, "code", None) == _ACCESS_DENIED_CODE:
+                    raise
+            self._sleep(delay)
+        self._capacity = self._measure_capacity()
+        return self._capacity
+
+    def _measure_capacity(self) -> dict[str, object]:
         try:
             rows = self._catalog(
                 "SELECT hostName() AS replica, toFloat64(value) AS memory_bytes, "
@@ -429,7 +455,11 @@ class ClickHouseAdapter:
                 "ORDER BY replica"
             )
         except Exception as exc:
-            raise ClickHouseConnectionError(_CAPACITY_REFUSAL) from exc
+            # The server's reason, already trimmed by the translation, so a
+            # refusal that is not about grants does not read as one.
+            raise ClickHouseConnectionError(
+                f"{_CAPACITY_REFUSAL}; the probe failed: {exc}"
+            ) from exc
         if not rows:
             raise ClickHouseConnectionError(
                 f"{_CAPACITY_REFUSAL}; the probe returned no rows"
@@ -470,14 +500,13 @@ class ClickHouseAdapter:
             raise ClickHouseConnectionError(
                 f"{_CAPACITY_REFUSAL}; the derived compute rate was invalid"
             )
-        self._capacity = {
+        return {
             "replica_count": len(replicas),
             "total_memory_gib": round(total_memory_gib, 6),
             "compute_units_per_hour": round(compute_units_per_hour, 6),
             "source": _CAPACITY_SOURCE,
             "approximate": True,
         }
-        return self._capacity
 
     def _require_cloud_capacity(self) -> None:
         if self.target.deployment == "cloud":
@@ -651,7 +680,7 @@ class ClickHouseAdapter:
         self._resolved_databases: list[str] | None = None
         self._visible_databases: set[str] | None = None
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_database``, the database this command's build writes into,
         or stop reading it with ``None``.
 
@@ -662,10 +691,19 @@ class ClickHouseAdapter:
         changed.
         """
 
-        scope = scope.strip() if scope else None
+        scope = dev_target_entries(scope, str)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a namespace lies inside this ClickHouse scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            token = token.split(".")[0]
+        if not self.target.databases:
+            return True
+        return token in {d.lower() for d in self._resolve_databases()}
 
     def _resolve_databases(self) -> list[str]:
         visible = self._databases()
@@ -1324,6 +1362,26 @@ class ClickHouseAdapter:
 
     # --- execution (the single billed door) --------------------------------------
 
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from ``DESCRIBE`` of it, which reads no
+        data. A statement Cloud would have to wake for is held to the same
+        capacity check as any other."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        self._require_cloud_capacity()
+        result = self._client.query(
+            f"DESCRIBE ({checked})", settings=dict(_SESSION_SETTINGS)
+        )
+        return [
+            ColumnMeta(
+                name=str(row[0]),
+                data_type=str(row[1]),
+                nullable=str(row[1]).startswith("Nullable("),
+                ordinal=ordinal,
+            )
+            for ordinal, row in enumerate(result.result_rows)
+        ]
+
     def run_query(
         self,
         sql: str,
@@ -1491,6 +1549,12 @@ class ClickHouseAdapter:
             return ConnectorError(
                 "the ClickHouse server could not be reached; the endpoint may "
                 "be down or unreachable from here"
+            )
+        if isinstance(exc, self._ch_exceptions.DatabaseError):
+            return warehouse_refusal(
+                str(exc),
+                code=str(code) if code is not None else None,
+                stage=StatementStage.RUN,
             )
         return exc
 

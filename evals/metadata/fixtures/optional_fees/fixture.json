@@ -1,0 +1,5 @@
+{
+  "name": "optional_fees",
+  "seed": 1113,
+  "description": "A marketplace that charges merchants a platform fee on each order, with an order fact table, a merchant revenue mart, a finance ledger nothing in the marts reads, and a fee-dispute report over a table that is still empty. Some deployments do not charge fees, so the fee has to become a switch: every fee column gone from every reporting model when it is off, today's numbers unchanged when it is on. Gating only the mart leaves the ledger and the empty report still exposing fees, which no row comparison can see."
+}

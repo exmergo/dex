@@ -14,7 +14,7 @@ _RENDERERS: dict[str, tuple[str, str, str]] = {
     "bigquery": ("big_query", "BigQuerySqlPlanRenderer", "BIGQUERY"),
     "snowflake": ("snowflake", "SnowflakeSqlPlanRenderer", "SNOWFLAKE"),
     "databricks": ("databricks", "DatabricksSqlPlanRenderer", "DATABRICKS"),
-    "postgres": ("postgres", "PostgresSqlPlanRenderer", "POSTGRES"),
+    "postgres": ("postgres", "PostgresSQLSqlPlanRenderer", "POSTGRES"),
     "redshift": ("redshift", "RedshiftSqlPlanRenderer", "REDSHIFT"),
     "trino": ("trino", "TrinoSqlPlanRenderer", "TRINO"),
 }
@@ -89,7 +89,7 @@ def metricflow_engine(
 
     from ... import dbt_project
 
-    manifest_path = project / dbt_project.SEMANTIC_MANIFEST_PATH
+    manifest_path = dbt_project.semantic_manifest_file(project)
     if not manifest_path.is_file():
         raise SemanticBackendError(
             "no compiled semantic manifest at target/semantic_manifest.json; "

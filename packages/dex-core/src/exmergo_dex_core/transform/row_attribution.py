@@ -103,6 +103,41 @@ class ModelAttribution(BaseModel):
 
 
 @dataclass
+class ExtraProbe:
+    """One aggregate statement another plan-time diagnostic needs measured.
+
+    Carried through :func:`attribute` rather than run on its own, so a plan is
+    priced and confirmed once however many diagnostics want counts: the
+    firewall, the estimate, the handshake and the spend stamp are the ones row
+    attribution already runs. ``label`` is the per-table key the estimate is
+    itemized under. Exactly one of ``row`` (the statement's single row, by
+    output column, lowercased) and ``error`` (a reason code and a sentence that
+    never carries warehouse text) is set once the batch has been settled; both
+    stay unset when nothing tried to run it.
+    """
+
+    sql: str
+    label: str
+    row: dict[str, Any] | None = None
+    error: tuple[str, str] | None = None
+
+
+def counting_decision(
+    engine: DexEngine, requested: bool | None
+) -> tuple[bool, bool, str | None]:
+    """Whether plan-time counts run, whether that is free, and the connector.
+
+    The one rule every plan-time measurement follows: counted where counting is
+    free, named only where it is not, unless ``--attribute-rows`` or
+    ``--no-attribute-rows`` says otherwise.
+    """
+
+    connector = engine.connector or engine.config.connector
+    free = is_free_connector(connector)
+    return (free if requested is None else requested), free, connector
+
+
+@dataclass
 class AttributionOutcome:
     """What :func:`attribute` produced, plus the two things its caller settles.
 
@@ -526,15 +561,17 @@ def _join_changes(
     """
 
     # A join onto a renamed CTE is the same bookkeeping _source_changes skips.
+    renamed_prior = prior_ctes - authored_ctes
+    renamed_authored = authored_ctes - prior_ctes
     before = {
         j.key: j
         for j in sql_shape.joins(prior)
-        if not sql_shape.names_a_cte(j.relation, prior_ctes)
+        if not sql_shape.names_a_cte(j.relation, renamed_prior)
     }
     after = {
         j.key: j
         for j in sql_shape.joins(authored)
-        if not sql_shape.names_a_cte(j.relation, authored_ctes)
+        if not sql_shape.names_a_cte(j.relation, renamed_authored)
     }
     changes: list[_Change] = []
 
@@ -621,8 +658,10 @@ def _rejoin_on(select: exp.Select, key: str, on: exp.Expression | None) -> None:
 
 
 def _grain_changes(
-    scope: str, prior: exp.Select, authored: exp.Select
+    scope: str, prior: exp.Select, authored: exp.Select, dialect: str
 ) -> list[_Change]:
+    """Report DISTINCT or GROUP BY edits that can change a scope's row grain."""
+
     changes: list[_Change] = []
     was_distinct = prior.args.get("distinct") is not None
     is_distinct = authored.args.get("distinct") is not None
@@ -642,7 +681,9 @@ def _grain_changes(
         )
 
     before, after = sql_shape.group_by(prior), sql_shape.group_by(authored)
-    if before != after:
+    if sql_shape.group_by_key(prior, dialect) != sql_shape.group_by_key(
+        authored, dialect
+    ):
         group = authored.args.get("group")
         changes.append(
             _Change(
@@ -709,6 +750,29 @@ def _source_changes(
     ]
 
 
+def changed_set_operations(
+    prior: Mapping[str, exp.Expression], authored: Mapping[str, exp.Expression]
+) -> list[str]:
+    """Scopes both versions share where either side is a set operation and the
+    two differ, sorted.
+
+    A UNION, INTERSECT or EXCEPT on either side counts, so a scope that becomes
+    a set operation or stops being one is here too. Table qualifiers and case
+    are ignored, so re-aliasing a branch is not a change.
+    """
+
+    return sorted(
+        name
+        for name in prior.keys() & authored.keys()
+        if not (
+            isinstance(prior[name], exp.Select)
+            and isinstance(authored[name], exp.Select)
+        )
+        and sql_shape.unqualified_key(prior[name])
+        != sql_shape.unqualified_key(authored[name])
+    )
+
+
 def classify(
     prior_sql: str, authored_sql: str, dialect: str
 ) -> tuple[list[_Change], list[RowPopulationChange]]:
@@ -768,6 +832,26 @@ def classify(
         )
         for name in sorted(prior_scopes.keys() - authored_scopes.keys())
     )
+    # The comparison below reads SELECT against SELECT, so a changed set
+    # operation would otherwise report nothing and read as an edit that moves no
+    # rows (#1163).
+    unresolved.extend(
+        RowPopulationChange(
+            scope=name,
+            kind="unattributable",
+            detail=(
+                f"the set operation in `{name}` changed and its branches were "
+                "not compared"
+            ),
+            attributed=False,
+            reason=(
+                "row attribution compares a SELECT with a SELECT, and a UNION, "
+                "INTERSECT or EXCEPT is not compared branch by branch, so any "
+                "row-population effect it has is folded into the whole-model net"
+            ),
+        )
+        for name in changed_set_operations(prior_scopes, authored_scopes)
+    )
 
     for name in prior_scopes.keys() & authored_scopes.keys():
         before, after = prior_scopes[name], authored_scopes[name]
@@ -777,7 +861,7 @@ def classify(
         for clause in ("where", "having", "qualify"):
             changes.extend(_clause_changes(name, before, after, clause, dialect))
         changes.extend(_join_changes(name, before, after, prior_ctes, authored_ctes))
-        changes.extend(_grain_changes(name, before, after))
+        changes.extend(_grain_changes(name, before, after, dialect))
 
     # A stable order so a re-plan of the same edit reports the same sequence:
     # the final select last, since that is where a reader ends up looking.
@@ -857,6 +941,7 @@ def attribute(
     edits: list[PlanEdit],
     *,
     requested: bool | None = None,
+    extra: list[ExtraProbe] | None = None,
 ) -> AttributionOutcome:
     """Report the row-population consequence of each authored change that has one.
 
@@ -865,20 +950,27 @@ def attribute(
     attribute and why. ``requested`` is the tri-state behind ``--attribute-rows``:
     None follows the connector (counted where counting is free, named only where
     it is not), True counts and prices, False never counts.
+
+    ``extra`` carries other diagnostics' aggregate statements into the same
+    priced batch (see :class:`ExtraProbe`). Building them is the caller's job,
+    and only when counting is on.
     """
+
+    extra = list(extra or [])
 
     candidates = [
         edit
         for edit in edits
         if edit.kind is EditKind.MODEL_SQL and edit.op is EditOp.UPSERT
     ]
-    if not candidates:
+    if not candidates and not extra:
         return AttributionOutcome()
 
     dialect = get_dialect(engine.connector or engine.config.connector)
     try:
         view = load_project(engine.project_dir())
     except Exception as exc:
+        _fail_extra(extra, "probe_failed", "the dbt project could not be read")
         return AttributionOutcome(
             warnings=[
                 "could not read the dbt project to compare the authored models "
@@ -886,9 +978,7 @@ def attribute(
             ]
         )
 
-    connector = engine.connector or engine.config.connector
-    free = is_free_connector(connector)
-    counting = free if requested is None else requested
+    counting, free, connector = counting_decision(engine, requested)
     # Choosing the resolver here, once, is what keeps classification and counting
     # reading the same SQL. The cache is loaded only when counting, so the
     # named-only path stays free of both the store read and the connection.
@@ -915,7 +1005,7 @@ def attribute(
         if model is not None:
             models.append(model)
 
-    if not models:
+    if not models and not extra:
         return AttributionOutcome()
 
     for model in models:
@@ -953,9 +1043,19 @@ def attribute(
         )
         for model in models:
             model.record.changes.extend(_named_only(model.changes, hint))
+        _fail_extra(extra, "counting_off", hint)
         return AttributionOutcome(models=[m.record for m in models], warnings=warnings)
 
-    return _count(engine, models, dialect, warnings)
+    return _count(engine, models, dialect, warnings, extra)
+
+
+def _fail_extra(extra: list[ExtraProbe], code: str, reason: str) -> None:
+    """Mark every extra probe that neither answered nor failed as failed with ``code``
+    and ``reason``.
+    """
+    for probe in extra:
+        if probe.row is None and probe.error is None:
+            probe.error = (code, reason)
 
 
 def _prepare(
@@ -1041,6 +1141,7 @@ def _count(
     models: list[_Model],
     dialect: str,
     warnings: list[str],
+    extra: list[ExtraProbe] | None = None,
 ) -> AttributionOutcome:
     """Build, guard, price, and run the counts. Every failure degrades in place.
 
@@ -1082,7 +1183,14 @@ def _count(
             except (UnattributableError, sqlglot.errors.ParseError) as exc:
                 _mark(model.record.changes[position], _reason(exc))
 
-    if not statements or cache is None:
+    extra = list(extra or [])
+    if cache is None:
+        _fail_extra(
+            extra,
+            "unprofiled_input",
+            "there is no exploration cache; run `explore map` first",
+        )
+    if (not statements and not extra) or cache is None:
         return AttributionOutcome(models=records, warnings=warnings)
 
     limits = engine.config.query
@@ -1094,8 +1202,16 @@ def _count(
             _refuse(records, statement, _reason(exc))
             continue
         approved.append((statement, inspected.sql))
+    approved_extra: list[tuple[ExtraProbe, str]] = []
+    for probe in extra:
+        try:
+            inspected = inspect_query(probe.sql, cache, limits, dialect=dialect)
+        except QueryRefusedError as exc:
+            probe.error = ("probe_refused", _reason(exc))
+            continue
+        approved_extra.append((probe, inspected.sql))
 
-    if not approved:
+    if not approved and not approved_extra:
         return AttributionOutcome(models=records, warnings=warnings)
 
     from .. import command_args
@@ -1108,24 +1224,88 @@ def _count(
             f"({type(exc).__name__}: {exc}); the changes are named, not measured"
         )
         _mark_all(records, "no connection was available to measure it")
+        _fail_extra(extra, "probe_failed", "no connection was available to run it")
         return AttributionOutcome(models=records, warnings=warnings)
 
     estimator = getattr(adapter, "query_estimate", None)
-    estimate = sum(estimator(sql) for _statement, sql in approved) if estimator else 0.0
+
+    def price(sql: str) -> float:
+        """The estimated cost of running ``sql``, zero where the connector gives no
+        estimate.
+        """
+        return float(estimator(sql)) if estimator else 0.0
+
+    # Priced one statement at a time, because pricing can fail on its own: a
+    # dry run (BigQuery's estimate) refuses a statement that does not compile,
+    # and the prior model of a repair is often exactly that. One unpriceable
+    # statement takes down what depended on it, never the whole batch.
+    from ..guards.cost_guard import CostGuardError
+
+    per_table: dict[str, float] = {}
+    priced: list[tuple[_Statement, str]] = []
+    for statement, sql in approved:
+        try:
+            cost = price(sql)
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            _refuse(
+                records,
+                statement,
+                f"the count could not be priced ({type(exc).__name__}; the "
+                "warehouse's message is withheld because it can quote a value)",
+            )
+            continue
+        priced.append((statement, sql))
+        key = "(row-population attribution)"
+        per_table[key] = per_table.get(key, 0.0) + cost
+    priced_extra: list[tuple[ExtraProbe, str]] = []
+    for probe, sql in approved_extra:
+        try:
+            cost = price(sql)
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            probe.error = (
+                "probe_failed",
+                f"the statement could not be priced ({type(exc).__name__})",
+            )
+            continue
+        priced_extra.append((probe, sql))
+        per_table[probe.label] = per_table.get(probe.label, 0.0) + cost
+    approved, approved_extra = priced, priced_extra
+    if not approved and not approved_extra:
+        return AttributionOutcome(models=records, warnings=warnings)
+    estimate = sum(per_table.values())
+    notes = []
+    if approved:
+        notes.append(
+            f"{len(approved)} row count(s) would attribute this edit's "
+            "row-population change to the change that caused it"
+        )
+    if approved_extra:
+        notes.append(
+            f"{len(approved_extra)} aggregate statement(s) would measure the "
+            "identifier conversions this edit adds"
+        )
+    notes.append(
+        "the plan is already stored, so re-running confirmed measures it "
+        "without re-planning"
+    )
     pending = command_args.confirmation_request(
         "transform plan",
         adapter,
         estimate,
-        per_table={"(row-population attribution)": estimate},
-        notes=[
-            f"{len(approved)} row count(s) would attribute this edit's "
-            "row-population change to the change that caused it; the plan is "
-            "already stored, so re-running confirmed measures it without "
-            "re-planning"
-        ],
+        per_table=per_table,
+        notes=["; ".join(notes)],
     )
     if pending is not None:
         _mark_all(records, "awaiting confirmation of the spend to measure it")
+        _fail_extra(
+            extra,
+            "awaiting_confirmation",
+            "awaiting confirmation of the spend to measure it",
+        )
         return AttributionOutcome(models=records, warnings=warnings, pending=pending)
 
     counts: dict[tuple[int, int | None, bool], int] = {}
@@ -1148,7 +1328,37 @@ def _count(
                 if statement.change is not None
                 else "the count did not run"
             )
-            _refuse(records, statement, f"{context}: {_reason(exc)}")
+            # The warehouse's words are withheld: a failed cast quotes the value
+            # it could not convert, and a count must carry nothing row-level
+            # (#861). The exception type still says which kind of failure it was.
+            _refuse(
+                records,
+                statement,
+                f"{context} ({type(exc).__name__}; the warehouse's message is "
+                "withheld because it can quote a value)",
+            )
+
+    for probe, sql in approved_extra:
+        try:
+            result = adapter.run_query(
+                sql, max_rows=1, timeout_seconds=limits.timeout_seconds
+            )
+        except Exception as exc:
+            # The warehouse's words are withheld on purpose: a failed cast names
+            # the value it could not convert, and that value is an identifier
+            # this diagnostic promises never to return.
+            probe.error = (
+                "probe_failed",
+                f"the statement did not run ({type(exc).__name__})",
+            )
+            continue
+        if not result.cells:
+            probe.error = ("probe_failed", "the statement returned no row")
+            continue
+        probe.row = {
+            str(name).lower(): value
+            for name, value in zip(result.columns, result.cells[0], strict=False)
+        }
 
     _settle(records, counts)
     return AttributionOutcome(models=records, warnings=warnings, adapter=adapter)

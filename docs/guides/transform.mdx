@@ -1,0 +1,264 @@
+---
+title: Transform a dbt project
+sidebarTitle: Transform
+description: Take a model change from verified source data through a reviewable plan, apply it, and build on dev. Check the resulting rows before calling the change done.
+---
+
+**Outcome:** a reviewed project change, built on dev, with evidence that its
+rows match the request. You need a connected warehouse and a dbt project with a
+dev target. Start with [Connect your data](/dex/connect) if either is missing.
+
+## 1. State what the model should mean
+
+Tell the agent the grain and population you want, not just the model name:
+
+```text
+Use Dex to create a customer summary with one row per customer, including
+customers who have no orders. Include an order count of zero for those
+customers. Show me the plan and verify the resulting rows on dev.
+```
+
+The agent should profile the source relations and verify the joins before
+writing the SQL. It records the model's meaning in a declaration: grain,
+population, column roles, units, and any assumptions it had to make.
+
+<Accordion title="Start a new dbt project">
+
+After connecting and exploring, use `dex transform init analytics` to create a
+project named `analytics`. This command creates the project files and records
+the connection in configuration, returning the changes as diffs. It refuses to
+overwrite an existing project. Existing projects are discovered from the
+repository; `dbt_project_dir` can select one when the repository holds several.
+
+The generated dev profile still needs a valid target. For DuckDB, a new dev file
+that reads sources must be populated before the build can succeed. Follow the
+[DuckDB dev-target guidance](/dex/connectors/duckdb#dev-target-seeding-convention).
+
+</Accordion>
+
+## 2. Review the plan
+
+The agent submits the edits and declarations together:
+
+```bash
+dex transform plan "Create a customer summary" --edits-file edits.json
+```
+
+`edits.json` is the agent's prepared change, not a file Dex creates from this
+command alone. The result includes a plan ID, diffs, warnings, and declaration
+feedback. Resolve missing intent and contradictions, then plan again before
+applying. For an existing model, also review row attribution: a refactor should
+preserve its results.
+
+When the plan rewrites a model that already exists, it carries
+`data.refactor_comparison_offer`. If the change is meant to keep that model's
+results (a refactor, an extracted intermediate, a cleanup), compare before
+applying, because applying discards the baseline:
+
+```bash
+dex transform compare PLAN_ID --model account_summary
+```
+
+`equivalent` holds for the relations named in `input_scope` at `compared_at`.
+`different` means the rewrite changed the rows or the schema: fix it, or state an
+intended rename with `--map` or type change with `--accept-type`. `not_checked`
+is not a pass: its `reason_code` names what to repair, such as a parent whose last
+build failed. The offer says so before you compare: `baseline_ready: false`
+names each blocked input and its owner. Repair it in a plan of its own, apply
+and build that plan (with `--cold-deps` where a package owns the failing model),
+then compare the refactor's plan, which you have not applied yet:
+
+```bash
+dex transform plan "override the package model" --edits-file repair.json
+dex transform apply REPAIR_PLAN_ID
+dex transform build --target dev --verify --cold-deps --for-plan REPAIR_PLAN_ID
+dex transform compare PLAN_ID --model account_summary
+```
+
+Putting the repair in the refactor's own plan leaves the comparison nothing
+built to read, so Dex warns and names the split (`mixed_with_repair`). The
+verdict's `inputs_built_by` names the latest build among its upstream models;
+other inputs may come from earlier builds. `transform deps` installs the packages
+the project already declares, at the versions `package-lock.yml` pins where it
+matches `packages.yml`; that is not installing or upgrading a tool. The offer's `static_attribution` says when this comparison is the
+only evidence a refactor kept its results, for example when the model's SQL
+calls a macro. A change meant to alter results needs no comparison. The verdict
+is recorded on the plan, and `transform apply` reports it.
+
+When the plan adds a cast or a `lower`, `upper` or `trim` to an identifier, such
+as a `try_cast(product_id as integer) is not null` that makes a broken join
+compile, it reports the conversion under `data.identifier_conversions`, with
+counts and their denominator. The counts show how many identifiers do not
+convert, how many collapse into one key (`7` and `007`), and how many the prior
+model held that the authored one does not, even when the row count is unchanged.
+A text identifier may be a second legitimate scheme rather than bad data, and
+Dex does not decide which. An `undeclared` conversion needs a decision: keep
+the other scheme (compare as text, normalize, use a bridge or a namespace), or
+record the exclusion as an assumption naming its `column`. On DuckDB the counts
+are free. Elsewhere they need `--attribute-rows` and are priced with row
+attribution.
+
+A repair is meant to change some behavior and keep the rest, and
+`data.change_scope` shows where those lines fall. For each existing model the
+plan rewrites, it says whether the row population is `changed`, `kept` or
+`unchecked`, and it names each output the plan removes, retypes, re-aggregates or
+re-NULLs. Re-aggregating covers `count(*)` becoming `count(visit_id)`, and
+re-NULLing covers a `coalesce` added to an average. The report is free and reads
+no data.
+
+A change no assumption records is `undeclared` and raises a warning. If the
+request asked for it, record it as an assumption naming its `column`. If not,
+undo it.
+
+For a request such as "exclude sandbox accounts from our metrics", the
+`population` lists show which edited models now filter and which ones the edit
+leaves alone. They read each model's own SQL, so check a roster's rows on the
+build as well. Whether the account directory filters too is a decision to record
+rather than a side effect, and when the request leaves it open it is a `default`.
+
+Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)
+when you need to construct the edits payload yourself.
+
+## 3. Apply the reviewed plan
+
+Replace `PLAN_ID` with the ID returned by planning:
+
+```bash
+dex transform apply PLAN_ID
+```
+
+This writes project files. If a file changed after planning, re-plan against its
+current content so the diff you review is the one you apply.
+
+## 4. Build and verify on dev
+
+```bash
+dex transform build --target dev --verify --for-plan PLAN_ID
+```
+
+On a metered connector, review the estimate and follow the
+[cost confirmation flow](/dex/guardrails/cost-controls). A successful dbt build
+is only part of the result. Read `data.completion` first. It is the first key
+of the payload and is held to 4 KiB, so it survives a cut-off read even when
+hundreds of nodes follow it. With `--for-plan`, its `deliverables` say which of
+the nodes the plan changed were built, failed, skipped, missing or stale (and,
+when dbt reports a status Dex does not recognize, such as a microbatch model's
+`partial success`, `unrecognized`), and `blocked` names what stopped each one. A skipped report is not done, even if dev
+still holds a table from an earlier run. `assurance.build_only` lists what built
+with nothing checking its rows, and `assurance.failed_checks.checks` says which
+kind of check failed on each model: a data test by name, or a verification
+record such as `join_coverage` with its finding and join. An INNER join used as
+a filter is not a failure when the declaration says so: name the driving key in
+an assumption's `column` or a `population.filters` entry. Without `--for-plan`, `coverage` is `unknown`.
+
+`data.verification.scope` lists the models this run built successfully;
+`scope_not_built` names the other reported models. In the evidence block,
+`coverage.covered` includes failed and skipped nodes present in run results.
+Use `coverage.built` and `coverage.not_built` to distinguish successful execution.
+`generated` lists only the relations this run's successful nodes produced, and
+an unrecognized node status makes the outcome `indeterminate`, never `validated`.
+
+When something upstream stopped the build, `data.prerequisites` names the failed
+node's owner (your project or an installed package), whether the plan could have
+caused it, and the repairs dbt supports for it. An edit under `dbt_packages/` is
+not one of them, because the next `dbt deps` replaces it. Add `--cold-deps` to
+reinstall packages into an isolated copy and build from there, which proves the
+repair survives and lists anything your installed tree held that a reinstall does
+not reproduce. It may reach the network, so a normal build never does it.
+
+Each prerequisite's `previous_run` gives its earlier status and run context when
+available. This history survives pricing and confirmation retries without an
+extra build. It may describe a different selection or source tree, so it does
+not establish whether the plan caused the failure or change `plan_relation`.
+
+The [command contract](/dex/reference/command-contract) gives every
+field. Then read `data.outcome` (only `validated` means every required node ran
+and passed) and `data.verification.ran`, its findings,
+and `suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
+need investigation before the change is finished. `data.verification.column_contract`
+says which built models had their columns compared with `schema.yml`, which declare
+none, and which could not be checked and why.
+
+<Accordion title="Rebuild an incremental model from its full history">
+
+Use `--full-refresh` when the requested change requires rebuilding the selected
+incremental relation, rather than processing its next batch:
+
+```bash
+dex transform build --target dev --select fct_orders --full-refresh --verify
+```
+
+A full refresh drops and rebuilds selected incremental relations on dev. It can
+scan substantially more data. Review the full-rebuild estimate before approving
+it; this flag is not a routine fix for a failed build.
+
+A model configured with `full_refresh: false` is not rebuilt: check
+`data.full_refresh.not_refreshed` before treating a selected relation as
+rebuilt. With `--verify`, a rebuilt incremental model's row count is compared
+with its driving parent, as a table's is, but not every model gets the comparison:
+a microbatch model, and one whose compiled SQL or driving parent Dex cannot
+resolve, are skipped and named in `warnings`, and a check that did not run is
+listed under `data.verification.suppressed`. Read both before relying on it. Even
+where it ran, these are counts: a green verification does not show the rebuilt
+values are right, so check them before accepting the change, for example with
+`dex explore profile <relation> --target dev --refresh`.
+
+A full refresh runs only the model's full build, never its
+`{% if is_incremental() %}` branch. If the problem is rows the next incremental
+run skips or loads twice, prove that branch with the unit test
+`dex transform test --scaffold <model>` writes for an incremental model, which
+overrides `is_incremental` and puts rows before, on and after the watermark.
+Then build again without `--full-refresh`.
+
+</Accordion>
+
+<Accordion title="Add or change a feature flag">
+
+A flag that stays live, as in "hide the fee columns when `enable_fees` is
+false", has to hold on both values in every model of the project. That includes
+models that do not feed the mart you changed, such as a ledger nothing else
+reads, a model that inherits a column through `select *`, or a model whose
+table is empty. State it with a `toggle` key beside the edits in the
+`transform plan` payload:
+
+```json
+{"edits": [...],
+ "toggle": {"variable": "enable_fees", "on_value": true, "off_value": false,
+            "columns": ["fee_amount"], "exempt_models": ["stg_orders"]}}
+```
+
+Dex compiles every model at each value without probing any table's rows (a
+compile-time macro such as `run_query` can still query the warehouse), and
+`data.toggle`
+names each model that still outputs a governed column with the flag off or loses
+one with it on. `transform compare` checks the on value against today's results.
+After `transform build --verify --for-plan <plan-id>`,
+`data.verification.toggle` judges each built relation's columns at the value
+that build used, so an empty table is checked too. The other value is reported
+as not built.
+
+Removing a flag is a different change: use a `retirement` contract on
+`dex transform remove var`, which states which behavior survives. Where Dex
+cannot finish scanning the project for the flag's readers (Jinja-heavy macros,
+packages such as `dbt_utils`), add `"scope": "authored"` to that contract: the
+outputs it names are still checked, and reference discovery is reported as
+unchecked rather than complete.
+
+</Accordion>
+
+<Accordion title="Find the dbt artifacts">
+
+By default, Dex writes dbt artifacts under `target/dex/<dbt-version>/` rather
+than mixing them with another runtime's artifacts. The build result's
+`data.artifact_directory` names the directory used. Follow that path when
+investigating a failure instead of assuming the project's previous manifest
+describes this run. See the
+[build command contract](/dex/reference/command-contract).
+
+</Accordion>
+
+## Keep it correct
+
+Once the change is verified, [establish a maintenance baseline](/dex/guides/maintain).
+For refactoring tools, test scaffolding, mutation testing, and every build flag,
+see [`dex transform`](/dex/cli/transform).

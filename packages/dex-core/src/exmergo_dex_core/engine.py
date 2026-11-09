@@ -103,6 +103,7 @@ if TYPE_CHECKING:
         ApplyResult,
         BuildResult,
         ClassificationResult,
+        DeclareResult,
         DepsResult,
         GroundingResult,
         InitResult,
@@ -115,6 +116,7 @@ if TYPE_CHECKING:
         PlanResult,
         PreflightResult,
         PropagationResult,
+        RefactorComparisonResult,
     )
     from .transform.semantic import DefinitionEdit
 
@@ -1102,6 +1104,7 @@ class DexEngine:
         check_cumulative: bool = False,
         show_all_columns: bool = False,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> ProfileResult:
         from .explore import commands as explore
 
@@ -1116,6 +1119,7 @@ class DexEngine:
             use_project=use_project,
             check_cumulative=check_cumulative,
             result_mode=mode,
+            target=target,
         )
 
     def relationships(
@@ -1178,19 +1182,27 @@ class DexEngine:
         *,
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryResult:
         """One SELECT through the query firewall.
 
         In values-free mode only an aggregate-only statement runs (see
         :mod:`.guards.values_free_shape`); any other shape is refused with a
         :class:`~.values_free.ValuesFreeError` naming the rule, and no cell.
+        ``target='dev'`` also reads the dev namespace for this call (#1133).
         """
 
         from .explore import commands as explore
 
         mode = self.resolve_result_mode(result_mode)
         return call_withholding(
-            mode, explore.query, self, sql, auto_profile=auto_profile, result_mode=mode
+            mode,
+            explore.query,
+            self,
+            sql,
+            auto_profile=auto_profile,
+            result_mode=mode,
+            target=target,
         )
 
     def query_batch(
@@ -1198,6 +1210,7 @@ class DexEngine:
         *sql: str,
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryBatchResult:
         """Several statements in one call, each with its own verdict.
 
@@ -1217,6 +1230,7 @@ class DexEngine:
             list(sql),
             auto_profile=auto_profile,
             result_mode=mode,
+            target=target,
         )
 
     def query_across(
@@ -1225,11 +1239,14 @@ class DexEngine:
         targets: list[str],
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryBatchResult:
         """Each statement once per target dataset, in one call (#545).
 
         Each statement names its dataset as ``{ds}``; every result carries the
         ``target`` it ran against. See :func:`.explore.commands.query_across`.
+        ``target='dev'`` is the dbt dev target, not an ``--across`` dataset: it
+        also reads the dev namespace for this call (#1133).
         """
 
         from .explore import commands as explore
@@ -1243,6 +1260,7 @@ class DexEngine:
             targets,
             auto_profile=auto_profile,
             result_mode=mode,
+            target=target,
         )
 
     def cluster(
@@ -1387,10 +1405,15 @@ class DexEngine:
 
         return maintain.reconcile(self, drift_class)
 
-    def verify(self, objects: list[str] | None = None) -> VerifyResult:
+    def verify(
+        self,
+        objects: list[str] | None = None,
+        *,
+        target: str | None = None,
+    ) -> VerifyResult:
         from .maintain import commands as maintain
 
-        return maintain.verify(self, objects)
+        return maintain.verify(self, objects, target=target)
 
     # --- transform --------------------------------------------------------
     #
@@ -1436,6 +1459,36 @@ class DexEngine:
             declarations=declarations,
             scaffold=scaffold,
             attribute_rows=attribute_rows,
+        )
+
+    def compare(
+        self,
+        plan_id: str | None = None,
+        *,
+        model: str | None = None,
+        column_mapping: dict[str, str] | None = None,
+        key_columns: list[str] | None = None,
+        target: str | None = None,
+        accepted_type_changes: list[str] | None = None,
+        expectation: dict[str, Any] | str | None = None,
+    ) -> RefactorComparisonResult:
+        """One model before and after a stored plan, on the same dev inputs.
+
+        ``expectation`` states an intended change (#1157), and the verdict is
+        then ``as_expected`` or ``unexpected``.
+        """
+
+        from .transform.refactor_compare import compare
+
+        return compare(
+            self,
+            plan_id,
+            model=model,
+            column_mapping=column_mapping,
+            key_columns=key_columns,
+            target=target,
+            accepted_type_changes=accepted_type_changes,
+            expectation=expectation,
         )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:
@@ -1554,6 +1607,20 @@ class DexEngine:
 
         return transform.place(self, column, targets, expression, explain=explain)
 
+    def declare(
+        self,
+        models: list[str] | None = None,
+        *,
+        declarations: list[Any] | None = None,
+        limit: int | None = None,
+        intent: str | None = None,
+    ) -> DeclareResult:
+        from .transform import commands as transform
+
+        return transform.declare(
+            self, models, declarations=declarations, limit=limit, intent=intent
+        )
+
     def build(
         self,
         *,
@@ -1563,6 +1630,9 @@ class DexEngine:
         for_plan: str | None = None,
         for_plan_document: Any = None,
         dependencies: Any = None,
+        full_refresh: bool = False,
+        artifacts: str | None = None,
+        cold_deps: bool = False,
     ) -> BuildResult:
         """Run ``dbt build`` against the dev target, cost-surfaced first.
 
@@ -1576,6 +1646,16 @@ class DexEngine:
         :class:`~.transform.build.DependencyPolicy`; the default installs missing
         packages as it always has, and ``REFUSE`` names them and stops, which is
         the right outcome in a sandbox with no network.
+        ``full_refresh`` passes ``--full-refresh`` to dbt, rebuilding the selected
+        incremental models and seeds from scratch, and prices them that way.
+        ``cold_deps`` reinstalls the packages into an isolated copy and builds from
+        it, proving a repair survives a reinstall; it may reach the network, and it
+        is refused with a ``dependencies`` policy that refuses to install.
+
+        ``artifacts`` overrides ``transform.artifacts`` for this call:
+        ``isolated`` writes Dex's own ``<target-path>/dex/<runtime>`` directory,
+        ``shared`` the project's target path, refused when another dbt runtime
+        left it incompatible.
         """
 
         from .transform import commands as transform
@@ -1590,6 +1670,9 @@ class DexEngine:
             for_plan=for_plan,
             for_plan_document=for_plan_document,
             dependencies=dependencies or DependencyPolicy.INSTALL,
+            full_refresh=full_refresh,
+            cold_deps=cold_deps,
+            artifacts=artifacts,
         )
 
     def test_mutations(
@@ -1699,31 +1782,69 @@ class DexEngine:
         )
 
     def semantic_native(
-        self, vendor: str, mode: str, intent: str, edits: list[PlanEdit]
+        self,
+        vendor: str,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
     ) -> PlanResult:
         """Plan native semantic-document edits on the semantic-layer axis.
 
         ``vendor`` must be the configured ``semantic.vendor``, and its layer
-        validates the edits in its own format.
+        validates the edits in its own format. ``declarations`` (#927) annotate
+        the models they name through the layer's derivation hook, and are
+        refused by a layer that has none.
         """
 
         from .transform import native_semantic
 
-        return native_semantic.semantic_native(self, vendor, intent, edits, mode=mode)
+        return native_semantic.semantic_native(
+            self, vendor, intent, edits, mode=mode, declarations=declarations
+        )
 
     def semantic_ossie(
-        self, mode: str, intent: str, edits: list[PlanEdit]
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
     ) -> PlanResult:
         """`semantic ossie`: :meth:`semantic_native` for a native Ossie layer."""
 
-        return self.semantic_native("ossie", mode, intent, edits)
+        return self.semantic_native(
+            "ossie", mode, intent, edits, declarations=declarations
+        )
 
     def semantic_slayer(
-        self, mode: str, intent: str, edits: list[PlanEdit]
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
     ) -> PlanResult:
         """`semantic slayer`: :meth:`semantic_native` for SLayer model files."""
 
-        return self.semantic_native("slayer", mode, intent, edits)
+        return self.semantic_native(
+            "slayer", mode, intent, edits, declarations=declarations
+        )
+
+    def semantic_cube(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic cube`: :meth:`semantic_native` for Cube model files."""
+
+        return self.semantic_native(
+            "cube", mode, intent, edits, declarations=declarations
+        )
 
     # --- lifecycle ------------------------------------------------------------
 

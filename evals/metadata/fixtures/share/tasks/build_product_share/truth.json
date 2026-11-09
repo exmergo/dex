@@ -1,0 +1,44 @@
+{
+  "models": {
+    "product_region_share": {
+      "grain": [
+        "region",
+        "product_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "revenue": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "currency:*"
+        },
+        "share_of_region": {
+          "role": "measure",
+          "additivity": "non_additive",
+          "unit": "fraction"
+        },
+        "product_id": {
+          "role": [
+            "foreign_key",
+            "key"
+          ]
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "shares sum to one within each region",
+      "expect": 0,
+      "sql": "select count(*) from (select region, sum(share_of_region) as s from main.product_region_share group by 1) where abs(s - 1) > 1e-9"
+    },
+    {
+      "name": "revenue matches the sales",
+      "expect": 0,
+      "sql": "select count(*) from main.product_region_share p full outer join (select region, product_id, sum(amount) as revenue from raw.sales group by 1, 2) e using (region, product_id) where p.revenue is distinct from e.revenue"
+    }
+  ]
+}

@@ -256,3 +256,98 @@ def test_a_budget_that_cannot_cover_the_batch_falls_back_to_the_separate_probes(
         "distinct-count escalation skipped" in note
         for note in adapter.table_notes(ORDERS)
     )
+
+
+EVENTS = "test-proj.shop.events"
+
+
+def _events_client():
+    """A table baselined with one tenant, where `day` then lost uniqueness and
+    `(tenant, day)` still holds. Only the batched statement may run."""
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="events",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("tenant", "STRING"),
+            bigquery.SchemaField("day", "INTEGER"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    client = FakeBigQueryClient(project="test-proj", tables=[table])
+
+    def resolve(sql: str) -> list[dict]:
+        assert "kd_0" in sql, f"only the batched statement should run: {sql}"
+        row = {"n_total": 100, "kd_0": 50, "kd_1": 100, "cd_0": 100}
+        for index in range(3):
+            row[f"nn_{index}"] = 100
+            row[f"nd_{index}"] = 50
+        return [row]
+
+    client.row_resolver = resolve
+    return client
+
+
+def _events_snapshot() -> Snapshot:
+    now = datetime.now(UTC).isoformat()
+    return Snapshot(
+        created_at=now,
+        connector="bigquery",
+        warehouse=WarehouseBaseline(
+            datasets=[
+                Dataset(
+                    identifier=EVENTS,
+                    row_count=100,
+                    columns=[
+                        ColumnProfile(
+                            name="id", data_type="INTEGER", distinct_count=100
+                        ),
+                        ColumnProfile(
+                            name="tenant", data_type="STRING", distinct_count=1
+                        ),
+                        ColumnProfile(
+                            name="day", data_type="INTEGER", distinct_count=100
+                        ),
+                    ],
+                    candidate_keys=[["id"], ["day"]],
+                    grain=["id"],
+                    profiled_at=now,
+                )
+            ]
+        ),
+        warehouse_from="cache",
+    )
+
+
+def test_the_widening_of_a_lost_key_rides_the_tables_one_statement():
+    """#780 on BigQuery: the combination that widens a lost incidental key is
+    one more scalar subquery in the table's batched statement, so it adds no
+    statement and no second billing floor."""
+
+    client = _events_client()
+    adapter = _adapter(client)
+    plan = drift_mod.grain_plan(adapter, _events_snapshot())
+    assert [combos for _ds, combos, _rows in plan.widening_checks] == [
+        [["tenant", "day"]]
+    ]
+
+    batched = drift_mod.batched_probes(adapter, plan)
+    assert batched[EVENTS].combinations == [["tenant", "day"]]
+    estimate, _per_table = drift_mod.grain_estimate(adapter, plan, batched)
+    assert estimate == 10 * MB
+
+    findings = drift_mod.grain_drift(
+        adapter, plan, probes=drift_mod.run_batched_probes(adapter, batched)
+    )
+    (finding,) = [f for f in findings if f.code == "key_lost_uniqueness"]
+    assert finding.column == "day"
+    assert finding.severity == "medium"
+    assert finding.data["still_unique_as"] == ["tenant", "day"]
+    # The grain's distinct count is a key the same statement already carried.
+    assert finding.data["grain_holds"] is True
+    assert len(_executed(client)) == 1

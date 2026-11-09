@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "shipments_loaded"
+  ],
+  "prompt": "Shipments that were loaded more than a day after they shipped are missing from `shipments_loaded`. Include them, with how many days each took to load, and keep every other shipment as it is. Build it on dev when you are done."
+}

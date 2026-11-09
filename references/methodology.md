@@ -1,5 +1,8 @@
 # Methodology: making sense of a warehouse without enumerating it
 
+Start with [Explore a warehouse](https://docs.exmergo.com/dex/guides/explore) for the workflow.
+This reference explains how Dex selects tables and measures their structure.
+
 dex explores the way an analytics engineer does: it ranks what matters, drills in
 selectively, builds understanding from aggregates rather than rows, infers how
 tables relate, and persists a draft map. The guiding constraint is sense-making,
@@ -269,7 +272,8 @@ see whether anything complains. `transform test --mutate` plants one defect at a
 time, drawn from the same taxonomy the rest of this document is organised around:
 a boundary comparison that now includes or excludes its edge, a filter dropped or
 inverted, an inner join where a left join was meant, a missing `CASE` branch, an
-inverted ratio, a window frame off by one, a `sum` reporting a `max`. Each is
+inverted ratio, a window frame off by one (a calendar window both one day
+wider and one day narrower), a `sum` reporting a `max`. Each is
 built and the model's own tests are run against it. A defect nothing catches is
 reported as a gap in the suite, described as the defect rather than as a diff,
 because the reader's next step is to write a test and not to reread SQL they

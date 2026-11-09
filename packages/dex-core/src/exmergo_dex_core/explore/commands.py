@@ -43,6 +43,11 @@ from ..cache import (
     CACHE_SCHEMA_VERSION,
     ColumnProfile,
     Dataset,
+    DatasetDeclaration,
+    DeclaredColumn,
+    DeclaredFilter,
+    DeclaredParent,
+    DeclaredRows,
     DexCache,
     Relationship,
     RelationshipKind,
@@ -78,6 +83,7 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..guards.values_free_shape import assert_values_free_shape
 from ..progress import ProgressReporter
+from ..reserved_words import reserved_column_names
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..semantic_catalog import (
     EntityInfo,
@@ -123,7 +129,7 @@ from .results import (
     RankedObject,
     RelationshipsResult,
 )
-from .summary import summarize_map, summarize_skipped
+from .summary import MAX_DECLARED_COLUMNS, summarize_map, summarize_skipped
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -490,6 +496,173 @@ class _ObjectGap:
         )
 
 
+def _dev_relation_test(engine: DexEngine) -> tuple[str, Callable[[str], bool]] | None:
+    """The dev namespace this command's source scope does not reach, and a test
+    for whether a relation name lies in it or in a namespace dbt derives from it.
+
+    ``None`` where the scope reaches the dev namespace (an empty allowlist reads
+    everything, so it is a source like any other there), where no dev namespace
+    is configured, and on DuckDB, which reads its whole file. A derived namespace
+    (``<dev schema>_<name>``, where a package or a folder sets ``+schema``,
+    #1155) counts only where the scope does not reach it either.
+
+    Names are compared aligned at the end, case-insensitively, so a name written
+    with fewer parts than the dev namespace (``dbt_dev.orders``) matches it, and
+    one written with more must agree on every part the dev namespace spells. A
+    bare BigQuery dev dataset lives in the configured project, as the adapter
+    reads it; a dataset of that name in another project is not it. This only
+    ever decides what is held back or how a refusal is worded: it widens no read.
+    """
+
+    from ..adapters.base import scope_within
+    from ..connect import dev_namespace_outside_allowlist, source_scope
+
+    connector = engine.connector or engine.config.connector
+    if not connector:
+        return None
+    target = getattr(engine.config, connector, None)
+    dev = dev_namespace_outside_allowlist(connector, target, engine.scopes)
+    if dev is None:
+        return None
+    committed = source_scope(connector, target, engine.scopes)
+    project = engine.project or getattr(target, "project", None)
+    wanted = dev.lower().split(".")
+    if connector == "bigquery" and len(wanted) == 1 and project:
+        wanted = [str(project).lower(), *wanted]
+
+    def in_dev(name: str) -> bool:
+        """Whether ``name`` lies in the dev namespace or one derived from it."""
+        namespace = name.lower().split(".")[:-1]
+        if not namespace:
+            return False
+        span = min(len(namespace), len(wanted))
+        ours, theirs = namespace[-span:], wanted[-span:]
+        if ours[:-1] != theirs[:-1]:
+            return False
+        if ours[-1] == theirs[-1]:
+            return True
+        if not ours[-1].startswith(theirs[-1] + "_"):
+            return False
+        # A derived namespace the scope reaches is a source like any other.
+        spelled = ".".join(namespace)
+        return not (
+            scope_within(spelled, committed) or scope_within(namespace[-1], committed)
+        )
+
+    return dev, in_dev
+
+
+def _without_dev_profiles(engine: DexEngine, cache: DexCache) -> DexCache:
+    """The cache as a command reading only the source allowlist may adjudicate on.
+
+    `explore profile --target dev` caches what it profiles (#893), so drafting
+    can read a dev-only build. A command that runs SQL through the ordinary
+    adapter must not clear a relation on those entries: the firewall would admit
+    a relation the source scope does not reach, and the adapter would run it
+    without ever having agreed to read that namespace. Only the dev namespace
+    outside the scope this command reads (the allowlist, or the ``--scope``
+    narrowing it), and the namespaces dbt derives from it, are held back; one
+    that scope reaches is a source like any other. A copy, so the entries stay
+    in the cache for drafting.
+    """
+
+    reach = _dev_relation_test(engine)
+    if reach is None:
+        return cache
+    _dev, in_dev = reach
+    kept = [d for d in cache.datasets if not in_dev(d.identifier)]
+    if len(kept) == len(cache.datasets):
+        return cache
+    return cache.model_copy(update={"datasets": kept})
+
+
+def _dev_namespace_refusal(engine: DexEngine, names: list[str]) -> str | None:
+    """The refusal for a statement naming a dev-built relation without
+    ``--target dev`` (#1133), or ``None`` when it names none.
+
+    Without it the firewall answers that the relation is not in the exploration
+    cache and names `explore profile`, which a caller who just ran
+    `explore profile --target dev` has already done: the advice loops. The dev
+    namespace is outside the source scope on purpose, so the answer is the one
+    flag that reads it for one command.
+    """
+
+    reach = _dev_relation_test(engine)
+    if reach is None:
+        return None
+    dev, in_dev = reach
+    named = [name for name in names if in_dev(name)]
+    if not named:
+        return None
+    leaf = dev.lower().rsplit(".", 1)[-1]
+    derived = sorted(
+        {
+            name.rsplit(".", 1)[0]
+            for name in named
+            if name.lower().split(".")[-2] != leaf
+        }
+    )
+    where = f"the dev namespace '{dev}'"
+    if derived:
+        where += f" or a namespace dbt derives from it ({', '.join(derived)})"
+    return (
+        f"'{', '.join(named)}' is in {where}, where `transform build` writes. It "
+        "is outside the source scope, so `explore query` reads it only for one "
+        "command: rerun with `--target dev`"
+    )
+
+
+def _dev_build_relations(engine: DexEngine) -> list[str]:
+    """The relations the project's manifest says it builds, or none when there is
+    no dbt project or manifest to read."""
+
+    from ..transform.verify import _manifest_relations
+
+    try:
+        project_dir = Path(engine.project_dir())
+    except DexError:
+        return []
+    try:
+        return _manifest_relations(project_dir)
+    except (OSError, ValueError):
+        return []
+
+
+def _dev_target_adapter(engine: DexEngine, command: str) -> tuple[Adapter, list[str]]:
+    """The adapter for one command that reads the dev target, with the notes
+    saying what it read (#893, #1133).
+
+    The dev namespace, and the namespaces dbt derives from it for the project's
+    own models (#1155: a package's ``+schema`` builds into
+    ``<dev schema>_<name>``), read for this command only; the next call to
+    ``engine._adapter`` clears both. Nothing is written back to config, and the
+    cost gate is the command's own.
+    """
+
+    from .. import connect
+
+    adapter = engine._adapter(command, reads_dev_target=True)
+    if getattr(engine, "_dev_target_read", None) is None:
+        return adapter, [
+            "--target dev widened nothing: "
+            + (
+                "DuckDB's dev target is the file this connection already reads"
+                if adapter.name == "duckdb"
+                else f"no dev namespace is configured under `{adapter.name}:` in "
+                ".dex/config.yml"
+            )
+        ]
+    derived = connect.widen_dev_reads(
+        adapter, engine.config, _dev_build_relations(engine)
+    )
+    if not derived:
+        return adapter, []
+    return adapter, [
+        "also read the namespace(s) dbt derived from the dev namespace for this "
+        f"project's models: {', '.join(derived)}"
+    ]
+
+
 def _object_gap(
     adapter: Adapter, prior: DexCache | None, named: list[str]
 ) -> _ObjectGap:
@@ -623,14 +796,22 @@ def _profile_into_cache(
         raise _budget_exhausted(store, adapter, accumulated, len(identifiers)) from None
 
     _annotate_grain(
-        profiled, defs, high_null_fraction=config.profile_high_null_fraction
+        profiled,
+        defs,
+        high_null_fraction=config.profile_high_null_fraction,
+        dialect=adapter.dialect,
     )
     if withhold:
         for dataset in profiled:
             withhold_values(dataset)
-    cache, stats = _merge_profiles(prior, profiled, adapter.name, now)
-    locator = store.save_cache(cache, now=now)
-    note = _persist_note(stats, len(profiled), keeps_relationships=True)
+    merged: dict = {}
+
+    def _fold(latest: DexCache | None) -> DexCache:
+        cache, merged["stats"] = _merge_profiles(latest, profiled, adapter.name, now)
+        return cache
+
+    cache, locator = _save_over_latest(store, now, prior, _fold)
+    note = _persist_note(merged["stats"], len(profiled), keeps_relationships=True)
     return profiled, cache, locator, note
 
 
@@ -643,6 +824,7 @@ def profile(
     check_cumulative: bool = False,
     show_all_columns: bool = False,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> ProfileResult:
     """Profile the named objects, reusing fresh cached profiles where they exist.
 
@@ -664,15 +846,34 @@ def profile(
     In values-free mode (#591) every dataset returned has its column values
     withheld, whether it was scanned now or served from the cache, and a scan
     writes its profile to the cache without them.
+
+    ``target`` is dev-target only (#893), as on `maintain verify`: passing
+    ``target='dev'`` reads the dev namespace for the length of this command,
+    so a model whose only build is the dev one can be profiled for drafting
+    without adding the namespace dbt writes into to the source allowlist.
+    ``--scope`` still only narrows, nothing is written back to config, and the
+    cost guard applies as on any profile. Prod-looking targets are refused. The
+    namespaces dbt derives from the dev one for the project's models (a
+    package's ``+schema``, #1155) are read too, and named in ``notes``.
     """
 
+    reads_dev_target = False
+    if target is not None:
+        from ..transform.build import assert_dev_target
+
+        assert_dev_target(target, engine.config.dbt_target)
+        reads_dev_target = True
     mode = engine.resolve_result_mode(result_mode)
     values_free = mode is ResultMode.VALUES_FREE
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
     blob_paths = blob_override_paths(config.blob_overrides)
-    adapter = engine._adapter("explore profile")
+    dev_notes: list[str] = []
+    if reads_dev_target:
+        adapter, dev_notes = _dev_target_adapter(engine, "explore profile")
+    else:
+        adapter = engine._adapter("explore profile")
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
@@ -718,18 +919,22 @@ def profile(
     # query` on that table must work without a second warehouse scan. Only the
     # freshly profiled are merged; the reused already live in the cache untouched,
     # and prior relationships are preserved because profile runs no inference pass.
+    # Measurement only. Declared grain and semantic exposure are read from the
+    # project at output time, on a copy, so the cache does not keep a claim the
+    # next run would have to refresh to drop (#926).
     profiled, cache, locator, persist_note = _profile_into_cache(
-        store, adapter, config, defs, stale, prior, now, withhold=values_free
+        store, adapter, config, None, stale, prior, now, withhold=values_free
     )
 
     # Freshly profiled plus fresh-cached: the full requested set, whether scanned
-    # this run or served from the cache. Only the freshly profiled needed
-    # annotation; the fresh-cached carry their keys and grain from the write that
-    # stored them.
+    # this run or served from the cache. The cache holds the measurement. Project
+    # grain claims and semantic exposure are applied to both halves below, when
+    # --use-project asks, so a cache hit and a rescan answer the same way (#926).
     datasets = profiled + list(fresh_reused.values())
 
     notes = [persist_note]
     notes.extend(_override_notes(datasets))
+    notes.extend(dev_notes)
     if fresh_reused:
         window = config.profile_freshness_hours
         notes.append(
@@ -765,6 +970,7 @@ def profile(
                 # a double append on the freshly profiled path, where they are
                 # the same object.
                 cache_by_id = {d.identifier: d for d in cache.datasets}
+                measured_notes: dict[str, list[str]] = {}
                 measured = 0
                 try:
                     for dataset, candidate in candidates:
@@ -789,6 +995,9 @@ def profile(
                                 and text not in cache_entry.data_quality
                             ):
                                 cache_entry.data_quality.append(text)
+                            measured_notes.setdefault(dataset.identifier, []).append(
+                                text
+                            )
                             notes.append(f"{dataset.identifier}: {text}")
                         measured += 1
                 except OverCeilingError:
@@ -799,13 +1008,43 @@ def profile(
                         "and re-run to finish (a re-run re-profiles first)"
                     )
                 finally:
-                    locator = store.save_cache(cache, now=now)
+                    cache, locator = _save_over_latest(
+                        store,
+                        now,
+                        cache,
+                        lambda latest: _with_notes(latest, cache, measured_notes),
+                    )
             else:
                 notes.append(
                     "cumulative-measure check saved unverified; the check "
                     "awaits confirmation (see hint)"
                 )
 
+    if use_project:
+        # Copies: the objects in `datasets` include the ones just saved. Project
+        # claims must not land back in the cache.
+        datasets = [dataset.model_copy(deep=True) for dataset in datasets]
+        _apply_declared_profile(
+            datasets,
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
+        catalog = _semantic_catalog(engine, True)
+        if catalog is not None:
+            _annotate_semantic_exposure(datasets, catalog)
+        else:
+            for dataset in datasets:
+                dataset.semantic_models = []
+        notes.extend(defs.declaration_notes)
+        datasets, declaration_notes = _apply_declarations(
+            datasets,
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+            values_free=values_free,
+        )
+        notes.extend(declaration_notes)
+        if not show_all_columns:
+            notes.extend(_declared_column_cap_notes(datasets, "--columns all"))
     if values_free:
         # A fresh full entry was served as it is cached; the scanned ones are
         # already withheld. Copies, so the cache document is not touched.
@@ -838,6 +1077,7 @@ def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             show_all_columns=getattr(args, "columns", None) == "all",
             use_project=getattr(args, "use_project", False),
             check_cumulative=getattr(args, "check_cumulative", False),
+            target=getattr(args, "target", None),
         )
     )
 
@@ -896,10 +1136,8 @@ def relationships(
     metas = inventory_mod.inventory(adapter)
     connector = adapter.name
     # See map()'s identical computation: tells carry-forward "out of this
-    # run's scope" apart from "gone from the warehouse" (issue #149).
-    observed_namespaces = {
-        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
-    }
+    # run's scope" apart from "gone from the warehouse" (issues #149, #984).
+    observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
     # Skip re-scanning objects whose cached profile is still fresh (same
     # connector, schema unchanged, within the freshness window); only the stale
     # remainder is estimated, confirmed, and profiled below.
@@ -982,11 +1220,23 @@ def relationships(
     )
 
     # Annotate before persisting so cached datasets carry candidate_keys and
-    # grain, the same shape a `map`-written cache has. Only the freshly profiled
-    # need it; the fresh-cached already carry theirs from the cache write.
+    # grain, the same shape a `map`-written cache has. Measurement is only
+    # recomputed for a fresh scan; a cache hit already has it.
     _annotate_grain(
-        profiled, defs, high_null_fraction=config.profile_high_null_fraction
+        profiled,
+        defs,
+        high_null_fraction=config.profile_high_null_fraction,
+        dialect=adapter.dialect,
     )
+    # A cache hit was measured by whoever wrote it. `profile` no longer bakes
+    # project grain into that write (#926), so a reused profile still has to
+    # take the claim before this command saves.
+    if use_project and fresh_reused:
+        _apply_declared_profile(
+            list(fresh_reused.values()),
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
 
     # Fold same-lineage duplicates before the merge, as `map` does, so the folded
     # set flows into both the cache and the result. Relationships profiles the
@@ -998,6 +1248,16 @@ def relationships(
 
     identifiers = [d.identifier for d in datasets]
     declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    declaration_edges, declaration_edge_notes = rel_mod.declaration_relationships(
+        defs, identifiers
+    )
+    declared, declaration_already_declared = _fold_semantic_edges(
+        declared, declaration_edges, adopt_declared_by=True
+    )
+    declared_notes.extend(declaration_edge_notes)
+    declared_notes.extend(
+        _declaration_join_notes(declaration_edges, declaration_already_declared)
+    )
     native_edges, native_edge_notes = _native_semantic_edges(
         engine,
         use_project,
@@ -1026,8 +1286,21 @@ def relationships(
     # joins a cooperative project cares most about. Merging first also means no
     # measurement can be lost to the "declared wins over the same inferred edge"
     # rule: at merge time nothing has been measured yet.
+    # A join that names a column its dataset's profile no longer has can never
+    # be probed: the batch SQL would fail to bind and take the whole command
+    # down (issue #924). Check the columns against the profiled datasets first
+    # so the failure stays off the wire -- the edge becomes a finding (surfaced
+    # below beside orphan findings) and everything sound is still measured. The
+    # estimate and the run share the filtered pool, so the priced set and the
+    # run set stay the same set.
+    missing_column_findings = []
+    probe_refused = []
     if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, rels)
+        rel_mod.adopt_profiled_spelling(rels, datasets)
+        missing_column_findings = rel_mod.missing_column_findings(rels, datasets)
+        missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
+        verify_pool = [rel for rel in rels if id(rel) not in missing_column_ids]
+        probe_cost, candidates, objects = _verify_estimate(adapter, verify_pool)
         verify_pending = command_args.verify_handshake(
             "explore relationships",
             adapter,
@@ -1036,14 +1309,15 @@ def relationships(
             object_count=objects,
         )
         if verify_pending is None:
-            probed = rel_mod.probe_candidates(rels)
+            probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
-                    rels,
+                    verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
+                    withhold=values_free,
                 )
                 verify_reporter.done()
             except OverCeilingError:
@@ -1127,7 +1401,10 @@ def relationships(
     reusable = prior if prior and prior.provenance.connector == connector else None
     examined = {d.identifier for d in datasets}
     rels, carried_relationships = _carry_forward_relationships(
-        reusable, examined, rels, observed_namespaces=observed_namespaces
+        reusable,
+        examined,
+        rels,
+        observed_namespaces=observed_namespaces,
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -1140,7 +1417,7 @@ def relationships(
     notes.extend(defs.notes)
     if confirmed:
         notes.append(
-            f"{confirmed} inferred join(s) match declared tests; kept as declared"
+            f"{confirmed} inferred join(s) match declared joins; kept as declared"
         )
     if verify and inferred and verify_pending is None and verify_warning is None:
         notes.append(
@@ -1154,6 +1431,23 @@ def relationships(
     notes.extend(text for _rel, text in orphan_findings)
     datasets_by_id = {d.identifier: d for d in datasets}
     for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join naming a column the warehouse does not have is the same shape of
+    # drift as a catastrophic orphan rate: surfaced in notes and mirrored onto
+    # the child dataset's data_quality so it survives into the cache (issue
+    # #924). Only `--verify` computes it, because only a probe would fail.
+    notes.extend(text for _rel, text in missing_column_findings)
+    for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: surfaced in notes and mirrored onto the child
+    # dataset's data_quality so it survives into the cache (issue #933).
+    notes.extend(text for _rel, text in probe_refused)
+    for rel, text in probe_refused:
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
@@ -1175,7 +1469,9 @@ def relationships(
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
-            "dataset mapped alongside its source)"
+            "dataset mapped alongside its source), so each foreign key keeps its "
+            "join to the parent in its own schema and drops the same join to a "
+            "parent of that entity in another"
         )
     notes.extend(_generic_name_notes(suppressed))
     notes.extend(_affix_match_notes(affix_matches))
@@ -1209,18 +1505,25 @@ def relationships(
     if values_free:
         for dataset in profiled:
             withhold_values(dataset)
-    cache, stats = _merge_profiles(
-        prior,
-        datasets,
-        connector,
-        now,
-        relationships=rels,
-        observed_namespaces=observed_namespaces,
+    merged: dict = {}
+
+    def _fold(latest: DexCache | None) -> DexCache:
+        cache, merged["stats"] = _merge_profiles(
+            latest,
+            datasets,
+            connector,
+            now,
+            relationships=rels,
+            observed_namespaces=observed_namespaces,
+        )
+        if catalog is not None:
+            _annotate_semantic_exposure(cache.datasets, catalog)
+        return cache
+
+    _cache, locator = _save_over_latest(store, now, prior, _fold)
+    notes.append(
+        _persist_note(merged["stats"], len(datasets), keeps_relationships=False)
     )
-    if catalog is not None:
-        _annotate_semantic_exposure(cache.datasets, catalog)
-    locator = store.save_cache(cache, now=now)
-    notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
     result = RelationshipsResult(
         relationships=rels,
@@ -1291,6 +1594,7 @@ class _Batch:
     adapter: Adapter | None = None
     profiled: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 def query(
@@ -1299,6 +1603,7 @@ def query(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> QueryResult:
     """Run one caller-authored SELECT through the query firewall.
 
@@ -1307,11 +1612,24 @@ def query(
     produces cannot drift from the one it produced before batching existed. A
     refusal is raised here rather than reported, because with one statement there
     is no surviving neighbor for a status field to protect.
+
+    ``target`` is dev-target only (#1133), as on `explore profile`: ``'dev'``
+    reads the dev namespace, and the namespaces dbt derives from it for the
+    project's models, for this one command, so a model `transform build` just
+    wrote can be checked with an aggregate. The firewall, the PII gate,
+    values-free mode and the cost handshake are unchanged, ``--scope`` still only
+    narrows, nothing is written back to config, and prod-looking targets are
+    refused before anything opens.
     """
 
+    reads_dev_target = _reads_dev_target(engine, target)
     mode = engine.resolve_result_mode(result_mode)
     batch, shared = _run_statements(
-        engine, [(sql, None)], auto_profile=auto_profile, result_mode=mode
+        engine,
+        [(sql, None)],
+        auto_profile=auto_profile,
+        result_mode=mode,
+        reads_dev_target=reads_dev_target,
     )
     statement = batch[0]
     if statement.error is not None:
@@ -1319,6 +1637,7 @@ def query(
 
     record = statement.result
     record.result_mode = mode
+    record.notes.extend(shared.notes)
     command_args.stamp_spend(record, shared.adapter)
     if shared.profiled and command_args.cost_gate(shared.adapter) is not None:
         record.notes.append(
@@ -1334,6 +1653,7 @@ def query_batch(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> QueryBatchResult:
     """Run several caller-authored SELECTs through the query firewall, in order.
 
@@ -1354,10 +1674,15 @@ def query_batch(
     raise: nothing ran, so there is nothing to protect.
     """
 
+    reads_dev_target = _reads_dev_target(engine, target)
     mode = engine.resolve_result_mode(result_mode)
     prepared = [s if isinstance(s, tuple) else (s, None) for s in statements]
     batch, shared = _run_statements(
-        engine, prepared, auto_profile=auto_profile, result_mode=mode
+        engine,
+        prepared,
+        auto_profile=auto_profile,
+        result_mode=mode,
+        reads_dev_target=reads_dev_target,
     )
     result = QueryBatchResult(
         results=[
@@ -1400,6 +1725,7 @@ def query_batch(
         ],
         profiled_on_demand=shared.profiled,
         warnings=shared.warnings,
+        notes=list(shared.notes),
         result_mode=mode,
     )
     if shared.adapter is not None:
@@ -1412,12 +1738,37 @@ def query_batch(
     return result
 
 
+def _reads_dev_target(engine: DexEngine, target: str | None) -> bool:
+    """Whether this call reads the dev target, refusing any target but the dev
+    one before anything opens (#1133), as `explore profile --target` does."""
+
+    if target is None:
+        return False
+    from ..transform.build import assert_dev_target
+
+    assert_dev_target(target, engine.config.dbt_target)
+    return True
+
+
+def _uncached(names: list[str], cache: DexCache | None) -> bool:
+    """Whether the cache cannot speak for one of ``names``: no single profiled
+    entry matches it."""
+
+    if cache is None:
+        return bool(names)
+    profiled = [d.identifier for d in cache.datasets if d.columns]
+    return any(len(match_identifier(name, profiled)) != 1 for name in names)
+
+
 def _run_statements(
     engine: DexEngine,
     statements: list[tuple[str, int | None]],
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode = ResultMode.FULL,
+    adapter: Adapter | None = None,
+    handshake: Callable[..., None] | None = None,
+    reads_dev_target: bool = False,
 ) -> tuple[list[_Statement], _Batch]:
     """Drive every statement of one call through the firewall and the warehouse.
 
@@ -1461,7 +1812,27 @@ def _run_statements(
 
     batch = [_Statement(i, sql, line) for i, (sql, line) in enumerate(statements)]
     size = len(batch)
-    shared = _Batch()
+    shared = _Batch(adapter=adapter)
+    # Why the connection could not open, when it could not: a refusal for a
+    # relation the cache cannot speak for then says so, rather than naming an
+    # `explore map` that would fail the same way (#1133).
+    unreachable: DexError | None = None
+    reads: dict[int, list[str]] = {}
+
+    def visible_cache(value: DexCache) -> DexCache:
+        return value if reads_dev_target else _without_dev_profiles(engine, value)
+
+    def acquire_adapter() -> Adapter:
+        """The call's one adapter, opened on first use."""
+        # `--target dev` reads the dev namespace, and those dbt derives from it,
+        # for this command only (#1133); every other call reads the source scope.
+        if shared.adapter is None:
+            if reads_dev_target:
+                shared.adapter, notes = _dev_target_adapter(engine, "explore query")
+                shared.notes.extend(notes)
+            else:
+                shared.adapter = engine._adapter("explore query")
+        return shared.adapter
 
     def ledger(statement: _Statement, entry: dict) -> None:
         if values_free and "reason" in entry:
@@ -1486,11 +1857,33 @@ def _run_statements(
                     {"sql": statement.sql, "decision": "refused", "reason": ""},
                 )
 
+    if not reads_dev_target:
+        # A relation `transform build` wrote into the dev namespace is outside
+        # the source scope, so the firewall would call it uncached and name an
+        # `explore profile` the caller may already have run (#1133). Said here,
+        # from the names alone, before anything opens: the fix is the flag.
+        for statement in batch:
+            if not statement.live:
+                continue
+            try:
+                assert_query_shape(statement.sql, dialect=dialect)
+                names = referenced_relations(statement.sql, dialect=dialect)
+            except QueryRefusedError:
+                continue  # refused below, by the check that owns the shape
+            message = _dev_namespace_refusal(engine, names)
+            if message is None:
+                continue
+            exc = QueryRefusedError(message)
+            statement.stop(exc, "refused")
+            ledger(
+                statement,
+                {"sql": statement.sql, "decision": "refused", "reason": str(exc)},
+            )
+
     if auto:
         # Read-only first, before anything reaches the warehouse. Resolving a
         # relation introspects the live connection, and no agent-authored
         # statement earns that until it is proven to be a single SELECT.
-        reads: dict[int, list[str]] = {}
         for statement in batch:
             if not statement.live:
                 continue
@@ -1514,8 +1907,9 @@ def _run_statements(
         named = list(dict.fromkeys(name for names in reads.values() for name in names))
         if named:
             try:
-                shared.adapter = engine._adapter("explore query")
-            except DexError:
+                acquire_adapter()
+            except DexError as exc:
+                unreachable = exc
                 # No connection settles nothing, exactly as an unreadable column
                 # signature settles nothing inside `_object_gap`. That tolerance
                 # already exists one level down; it was missing here, at the
@@ -1531,7 +1925,11 @@ def _run_statements(
                 # unreachable. Only a refusal now returns without it.
                 shared.adapter = None
         if shared.adapter is not None:
-            gap = _object_gap(shared.adapter, cache, named)
+            gap = _object_gap(
+                shared.adapter,
+                None if cache is None else visible_cache(cache),
+                named,
+            )
             if gap.absent:
                 # Only the statements that named a missing object are refused; a
                 # neighbor that reads a table this connection has is unaffected by
@@ -1570,9 +1968,16 @@ def _run_statements(
                     at,
                     size,
                     withhold=values_free,
+                    handshake=handshake,
                 )
 
     if cache is None and any(statement.live for statement in batch):
+        if unreachable is not None:
+            raise CacheRequiredError(
+                "no exploration cache yet, and the connection could not be opened "
+                f"to profile what the statement reads on demand ({unreachable}); "
+                "fix the connection first, since `explore map` needs it too"
+            )
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` first so the query "
             "firewall knows the schema and the PII flags"
@@ -1582,7 +1987,10 @@ def _run_statements(
         # After the cache write, never before: mask_overridden edits the datasets
         # in place, and masking first would persist an in-memory override onto
         # objects this run never re-profiled.
-        cache = mask_overridden(cache, pii_override_paths(config.pii_overrides))
+        cache = mask_overridden(
+            visible_cache(cache),
+            pii_override_paths(config.pii_overrides),
+        )
     for statement in batch:
         if not statement.live:
             continue
@@ -1612,17 +2020,27 @@ def _run_statements(
                 # stored and re-raised by the caller rather than raised here.
                 wrapped.__cause__ = exc
                 exc = wrapped
+            elif unreachable is not None and _uncached(
+                reads.get(statement.index, []), cache
+            ):
+                wrapped = QueryRefusedError(
+                    f"{exc}. The connection could not be opened to profile it on "
+                    f"demand ({unreachable}); fix the connection first, since "
+                    "`explore map` and `explore profile` need it too"
+                )
+                wrapped.__cause__ = exc
+                exc = wrapped
             statement.stop(exc, "refused")
 
     live = [statement for statement in batch if statement.live]
     if live:
-        shared.adapter = shared.adapter or engine._adapter("explore query")
+        acquire_adapter()
         # Priced once, above, when a profile was needed: `preflight_command` sets
         # the reservation rather than adding to it, so a second handshake here
         # would release the profile's booking. Every statement still passes the
         # per-statement gate and the server-side cap on its way out.
         if not shared.profiled:
-            _price_statements(shared.adapter, live, size, ledger)
+            _price_statements(shared.adapter, live, size, ledger, handshake=handshake)
 
         _execute(
             engine,
@@ -1658,6 +2076,8 @@ def _price_statements(
     live: list[_Statement],
     size: int,
     ledger: Callable[[_Statement, dict], None],
+    *,
+    handshake: Callable[..., None] | None = None,
 ) -> None:
     """One handshake for the whole call, itemized per statement.
 
@@ -1676,7 +2096,7 @@ def _price_statements(
     }
     estimate = sum(per_statement.values())
     try:
-        command_args.billed_handshake(
+        (handshake or command_args.billed_handshake)(
             "explore query",
             adapter,
             estimate,
@@ -1903,6 +2323,7 @@ def _profile_for_statements(
     size: int,
     *,
     withhold: bool = False,
+    handshake: Callable[..., None] | None = None,
 ) -> tuple[DexCache, list[str], list[str]]:
     """Price and run the profiles a call needs, then hand back the new cache.
 
@@ -1933,7 +2354,7 @@ def _profile_for_statements(
     statement_estimate = sum(per_statement.values())
     subject = "this statement reads" if size == 1 else "these statements read"
     try:
-        command_args.billed_handshake(
+        (handshake or command_args.billed_handshake)(
             "explore query",
             adapter,
             profile_estimate + statement_estimate,
@@ -2017,6 +2438,7 @@ def query_across(
     *,
     auto_profile: bool | None = None,
     result_mode: ResultMode | None = None,
+    target: str | None = None,
 ) -> QueryBatchResult:
     """Run each template once per target, as one call under one handshake (#545).
 
@@ -2038,16 +2460,16 @@ def query_across(
     if not targets:
         raise RequestError("--across needs at least one target dataset")
     seen: set[str] = set()
-    for target in targets:
-        if not _ACROSS_TARGET.fullmatch(target):
+    for dataset in targets:
+        if not _ACROSS_TARGET.fullmatch(dataset):
             raise RequestError(
-                f"--across target '{target}' is not a dataset name; use letters, "
+                f"--across target '{dataset}' is not a dataset name; use letters, "
                 "digits, underscores and hyphens, dot-separated for a qualified "
                 "project.dataset"
             )
-        if target.lower() in seen:
-            raise RequestError(f"--across names '{target}' more than once")
-        seen.add(target.lower())
+        if dataset.lower() in seen:
+            raise RequestError(f"--across names '{dataset}' more than once")
+        seen.add(dataset.lower())
     for number, (sql, line) in enumerate(prepared, start=1):
         if ACROSS_PLACEHOLDER not in sql:
             where = f"line {line}" if line is not None else f"statement {number}"
@@ -2072,16 +2494,22 @@ def query_across(
     expanded: list[tuple[str, int | None]] = []
     labels: list[tuple[int, str]] = []
     for template_index, (sql, line) in enumerate(prepared):
-        for target in targets:
-            expanded.append((sql.replace(ACROSS_PLACEHOLDER, target), line))
-            labels.append((template_index, target))
+        for dataset in targets:
+            expanded.append((sql.replace(ACROSS_PLACEHOLDER, dataset), line))
+            labels.append((template_index, dataset))
 
     result = query_batch(
-        engine, expanded, auto_profile=auto_profile, result_mode=result_mode
+        engine,
+        expanded,
+        auto_profile=auto_profile,
+        result_mode=result_mode,
+        target=target,
     )
-    for statement, (template_index, target) in zip(result.results, labels, strict=True):
+    for statement, (template_index, dataset) in zip(
+        result.results, labels, strict=True
+    ):
         statement.template = template_index
-        statement.target = target
+        statement.target = dataset
     result.across = list(targets)
     return result
 
@@ -2101,19 +2529,33 @@ def _across_targets(args: argparse.Namespace) -> list[str] | None:
 def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     statements = _statements_from(args, engine)
     targets = _across_targets(args)
+    # `--target dev` (#1133), as on `explore profile`; not `--across`, whose
+    # targets are datasets substituted into the SQL.
+    dev = getattr(args, "target", None)
     if targets is not None:
         return _batch_envelope(
-            query_across(engine, statements, targets, auto_profile=_auto_profile(args))
+            query_across(
+                engine,
+                statements,
+                targets,
+                auto_profile=_auto_profile(args),
+                target=dev,
+            )
         )
     if len(statements) == 1:
         try:
             return to_envelope(
-                query(engine, statements[0][0], auto_profile=_auto_profile(args))
+                query(
+                    engine,
+                    statements[0][0],
+                    auto_profile=_auto_profile(args),
+                    target=dev,
+                )
             )
         except (QueryRefusedError, ValuesFreeError) as exc:
             return env.error_for(exc, f"query refused: {exc}")
     return _batch_envelope(
-        query_batch(engine, statements, auto_profile=_auto_profile(args))
+        query_batch(engine, statements, auto_profile=_auto_profile(args), target=dev)
     )
 
 
@@ -2267,11 +2709,9 @@ def map(
     baselined = _baselined_identifiers(store) if orphaned else set()
     # The schema/dataset namespaces this run's inventory actually saw, so
     # carry-forward can tell "out of this run's scope" from "gone from the
-    # warehouse" (issue #149) -- an identifier whose own namespace is here but
-    # who is itself absent from metas was looked at and is not there.
-    observed_namespaces = {
-        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
-    }
+    # warehouse" (issues #149, #984): an identifier whose own namespace is here
+    # but who is itself absent from metas was looked at and is not there.
+    observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
     # First-pass rank on cheap signals (no connectivity yet) to choose what to
     # profile; re-ranked with connectivity once relationships are known.
     first_pass = rank_mod.rank(metas, None, hints, orphaned)
@@ -2343,8 +2783,8 @@ def map(
         raise _budget_exhausted(store, adapter, accumulated, len(stale))
 
     # Freshly profiled plus fresh-cached: the full selected set, whether
-    # scanned this run or reused. Only the freshly profiled need annotation;
-    # the reused already carry theirs from the cache write that stored them.
+    # scanned this run or reused. Measurement is only recomputed for a fresh
+    # scan; a cache hit already has it.
     all_selected = profiled + list(fresh_reused.values())
     _annotate_grain(
         profiled,
@@ -2352,7 +2792,17 @@ def map(
         orphaned=orphaned,
         baselined=baselined,
         high_null_fraction=config.profile_high_null_fraction,
+        dialect=adapter.dialect,
     )
+    # Same as relationships: a profile cached by `explore profile` holds the
+    # measurement only, so a reused object still needs the project's grain
+    # before this map saves it (#926).
+    if use_project and fresh_reused:
+        _apply_declared_profile(
+            list(fresh_reused.values()),
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
     suppressed: list[rel_mod.SuppressedMatch] = []
     affix_matches: list[rel_mod.AffixMatch] = []
     inferred = rel_mod.infer_relationships(
@@ -2374,6 +2824,16 @@ def map(
     # about this warehouse, and both channels are read on the same terms.
     identifiers = [m.identifier for m in metas]
     declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    declaration_edges, declaration_edge_notes = rel_mod.declaration_relationships(
+        defs, identifiers
+    )
+    declared, declaration_already_declared = _fold_semantic_edges(
+        declared, declaration_edges, adopt_declared_by=True
+    )
+    declared_notes.extend(declaration_edge_notes)
+    declared_notes.extend(
+        _declaration_join_notes(declaration_edges, declaration_already_declared)
+    )
     native_edges, native_edge_notes = _native_semantic_edges(
         engine,
         use_project,
@@ -2398,8 +2858,23 @@ def map(
 
     # Verify the merged set: declared joins are probe candidates (issue #163)
     # and only exist from the merge above. Same ordering as `relationships`.
+    # A join naming a column its profile no longer has cannot be probed -- the
+    # batch SQL would fail to bind and take the whole command down (issue
+    # #924) -- so it is checked against the profiled/selected datasets first,
+    # reported as a finding below, and excluded from the verify pool; the
+    # estimate and the run share the filtered pool so they stay the same set.
+    missing_column_findings = []
+    probe_refused = []
     if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, relationship_set)
+        rel_mod.adopt_profiled_spelling(relationship_set, all_selected)
+        missing_column_findings = rel_mod.missing_column_findings(
+            relationship_set, all_selected
+        )
+        missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
+        verify_pool = [
+            rel for rel in relationship_set if id(rel) not in missing_column_ids
+        ]
+        probe_cost, candidates, objects = _verify_estimate(adapter, verify_pool)
         verify_pending = command_args.verify_handshake(
             "explore map",
             adapter,
@@ -2408,14 +2883,15 @@ def map(
             object_count=objects,
         )
         if verify_pending is None:
-            probed = rel_mod.probe_candidates(relationship_set)
+            probed = rel_mod.probe_candidates(verify_pool)
             verify_reporter = _reporter(len(probed), "verified", "joins")
             try:
-                rel_mod.verify_relationships(
+                probe_refused = rel_mod.verify_relationships(
                     adapter,
-                    relationship_set,
+                    verify_pool,
                     timeout_seconds=config.query.timeout_seconds,
                     progress=verify_reporter,
+                    withhold=values_free,
                 )
                 verify_reporter.done()
             except OverCeilingError:
@@ -2493,7 +2969,10 @@ def map(
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
     relationship_set, carried_relationships = _carry_forward_relationships(
-        reusable, examined, relationship_set, observed_namespaces=observed_namespaces
+        reusable,
+        examined,
+        relationship_set,
+        observed_namespaces=observed_namespaces,
     )
     final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
     # After inference, so it saw the same profiles in either mode.
@@ -2517,6 +2996,21 @@ def map(
         child = datasets_by_id.get(rel.from_dataset)
         if child is not None:
             child.data_quality.append(text)
+    # A join naming a column the warehouse does not have is the same shape of
+    # drift as a catastrophic orphan rate: surfaced in notes and mirrored onto
+    # the child dataset's data_quality so it survives into the cache (issue
+    # #924). Only `--verify` computes it, because only a probe would fail.
+    for rel, text in missing_column_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+    # A join the warehouse refused to probe even edge by edge is the same
+    # shape of finding: mirrored onto the child dataset's data_quality so it
+    # survives into the cache, and surfaced in notes further down (issue #933).
+    for rel, text in probe_refused:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
 
     # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
     # composed set rather than this run's profiles: the link is derived from the
@@ -2528,18 +3022,29 @@ def map(
 
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
+    listed_namespaces = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
+    dropped_namespaces = {id.rpartition(".")[0].lower() for id in dropped}
+    surviving_namespaces = {d.identifier.rpartition(".")[0].lower() for d in datasets}
     cache.provenance.inventory_namespaces = sorted(
-        {
-            *(reusable.provenance.inventory_namespaces if reusable else []),
-            *observed_namespaces,
-        }
+        (
+            {
+                *(reusable.provenance.inventory_namespaces if reusable else []),
+                *listed_namespaces,
+            }
+        )
+        - (dropped_namespaces - surviving_namespaces)
     )
     cache.provenance.created_at = (
         prior.provenance.created_at
         if prior and prior.provenance.created_at
         else now.isoformat()
     )
-    locator = store.save_cache(cache, now=now)
+    # Map composes the whole landscape, so it writes its own set rather than
+    # folding into the latest; only a profile another command wrote since this
+    # run began, newer than the one map carries, is kept over map's copy.
+    cache, locator = _save_over_latest(store, now, prior, lambda _latest: cache)
 
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -2557,9 +3062,11 @@ def map(
         )
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
+    notes.extend(text for _rel, text in missing_column_findings)
+    notes.extend(text for _rel, text in probe_refused)
     if confirmed:
         notes.append(
-            f"{confirmed} inferred join(s) match declared tests; kept as declared"
+            f"{confirmed} inferred join(s) match declared joins; kept as declared"
         )
     metric_hint_count = len(hints) - len(config.ranking_hints)
     if metric_hint_count > 0:
@@ -2639,7 +3146,9 @@ def map(
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
-            "dataset mapped alongside its source)"
+            "dataset mapped alongside its source), so each foreign key keeps its "
+            "join to the parent in its own schema and drops the same join to a "
+            "parent of that entity in another"
         )
     notes.extend(_generic_name_notes(suppressed))
     notes.extend(_affix_match_notes(affix_matches))
@@ -2674,14 +3183,28 @@ def map(
     # second. Two orderings derived from one cache inside one envelope would be a
     # bug, and rank alone does not break ties.
     top = sorted(datasets, key=lambda d: (-(d.rank_score or 0.0), d.identifier))[:5]
-    view = summarize_map(cache, detail=detail)
+    # The declaration overlay (#498) reads the repository, not the warehouse, so
+    # it runs over the composed set on a copy after the cache is saved: an object
+    # served from the cache is annotated as accurately as one just profiled, and
+    # nothing a declaration says is ever written into the cache.
+    displayed = cache
+    if use_project and defs.model_declarations:
+        displayed = cache.model_copy(deep=True)
+        displayed.datasets, declaration_notes = _apply_declarations(
+            displayed.datasets,
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+            values_free=values_free,
+        )
+        notes.extend(declaration_notes)
+    view = summarize_map(displayed, detail=detail)
     notes.extend(view.notes)
     if values_free:
-        handed_back = cache.model_copy(deep=True)
+        handed_back = displayed.model_copy(deep=True)
         for dataset in handed_back.datasets:
             withhold_values(dataset)
     else:
-        handed_back = cache
+        handed_back = displayed
     result = MapResult(
         cache=handed_back,
         cache_path=locator,
@@ -2792,7 +3315,11 @@ def cluster(
             # the opener at the bottom of this function, and raises there.
             adapter = None
     if adapter is not None:
-        gap = _object_gap(adapter, cache, [obj])
+        gap = _object_gap(
+            adapter,
+            None if cache is None else _without_dev_profiles(engine, cache),
+            [obj],
+        )
         if gap.absent:
             raise RequestError(gap.refusal())
         if gap.to_profile:
@@ -2835,6 +3362,7 @@ def cluster(
         )
 
     limits = config.cluster
+    cache = _without_dev_profiles(engine, cache)
     known = [d.identifier for d in cache.datasets if d.columns]
     matches = match_identifier(obj, known)
     if not matches:
@@ -3023,6 +3551,11 @@ def diagram(
 
     rendered = diagram_mod.render_er_mermaid(cache, full=full)
     if not rendered.entity_count:
+        if not full and cache.ranked_datasets(profiled_only=True, connected_only=False):
+            raise CacheRequiredError(
+                "the exploration cache holds profiled objects but no edges: "
+                "run `explore diagram --full` to draw the unjoined objects"
+            )
         raise CacheRequiredError(
             "the exploration cache holds no object that can be drawn: run "
             "`explore map` (or `explore profile <object>`) so objects carry "
@@ -3624,6 +4157,49 @@ def _relationship_matches(
     )
 
 
+#: How a contradiction note names a semantic layer that declared a key, by the
+#: declaration channel's `source`. A dbt key (`yaml`, `manifest`) is "the dbt
+#: project".
+_DECLARING_LAYER = {
+    "ossie": "the Ossie layer",
+    "slayer": "the SLayer layer",
+    "cube": "the Cube layer",
+}
+
+
+def _drop_metricflow_under_native_vendor(
+    engine: DexEngine, defs: dbt_project.ProjectDefinitions
+) -> dbt_project.ProjectDefinitions:
+    """Drop MetricFlow grain and metric lineage when a native vendor owns the layer.
+
+    Under ``semantic.vendor: ossie|slayer|cube`` the vendor layer is the
+    repository's one semantic layer (#922). ``explore`` still reads the dbt
+    project for transformation declarations (``config.meta.dex``, unique and
+    relationships tests), but MetricFlow-derived ``primary_entities`` and
+    ``metric_models`` must not fold into exploration beside that vendor. Under
+    ``vendor: dbt`` (or an unset vendor) the definitions are unchanged.
+    """
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor not in SEMANTIC_SOURCE_FACTORIES:
+        return defs
+    if (
+        not defs.primary_entities
+        and not defs.metric_models
+        and not defs.semantic_source
+    ):
+        return defs
+    return defs.model_copy(
+        update={
+            "primary_entities": {},
+            "metric_models": [],
+            "semantic_source": None,
+        }
+    )
+
+
 def _project_definitions(
     engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
@@ -3666,6 +4242,7 @@ def _project_definitions(
     # explore path, and `definitions()` is the channel declared keys and joins
     # reach dex through at all. Whichever format configuration named answers here.
     defs = engine.project_format().definitions()
+    defs = _drop_metricflow_under_native_vendor(engine, defs)
     return _fold_semantic_layer_keys(engine, defs)
 
 
@@ -3688,18 +4265,28 @@ def _fold_semantic_layer_keys(
     try:
         from .semantic import resolve_semantic_layer
 
-        keys, composite_keys = resolve_semantic_layer(
-            engine, local=True
-        ).declared_keys()
+        layer = resolve_semantic_layer(engine, local=True)
+        keys, composite_keys = layer.declared_keys()
+        declarations, declaration_notes = layer.declared_models()
     except (DexError, ValueError, OSError):
         return defs
-    if not keys and not composite_keys:
+    if not keys and not composite_keys and not declarations:
+        if declaration_notes:
+            return defs.model_copy(
+                update={
+                    "notes": [*defs.notes, *declaration_notes],
+                    "declaration_notes": declaration_notes,
+                }
+            )
         return defs
     return defs.model_copy(
         update={
             "present": True,
             "declared_keys": [*defs.declared_keys, *keys],
             "declared_composite_keys": [*defs.declared_composite_keys, *composite_keys],
+            "model_declarations": {**declarations, **defs.model_declarations},
+            "notes": [*defs.notes, *declaration_notes],
+            "declaration_notes": declaration_notes,
         }
     )
 
@@ -3846,6 +4433,238 @@ def _compose_semantic_catalogs(
     )
 
 
+def _apply_declarations(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions,
+    *,
+    high_null_fraction: float,
+    values_free: bool,
+) -> tuple[list[Dataset], list[str]]:
+    """Copies of ``datasets`` carrying the declaration of the model on each (#498).
+
+    The model's declaration (#491) is the richest statement the project makes
+    about its own relations: what one row is, which rows are in, what each
+    column means. Under ``--use-project`` each dataset a declared model resolves
+    to gets it as ``declaration``, and the declared grain becomes the reported
+    ``grain``, ahead of a semantic primary entity or a composite test, because
+    it is the model's own statement of what one row is. ``candidate_keys`` stays
+    measurement-only, so the claim and the evidence sit side by side, and
+    ``grain_status`` says how they compare. A data-quality note states where the
+    grain came from whenever it differs from the measured one.
+
+    Applied at output time to copies and never written to the cache, unlike
+    :func:`_annotate_grain`'s refinements. A profile is served from the cache for
+    hours, a declaration is edited in the repository at any moment, and a
+    declaration baked into a cached profile would outlive its removal. Reading
+    it again on every run is free: it is the repository, not the warehouse.
+
+    Population values are repository text, but they are column values all the
+    same: in values-free mode, and for a filter on a column profiling flagged as
+    personal data, the values and the free-text rule are withheld and named in
+    ``withheld_fields``.
+    """
+
+    if not defs.model_declarations:
+        return datasets, []
+    identifiers = [d.identifier for d in datasets]
+    by_identifier: dict[str, Any] = {}
+    precedence: list[str] = []
+    # dbt first: a native layer's declaration of a dbt model was derived from the
+    # model's YAML, so the YAML is the source and the layer the copy.
+    for model, declaration in sorted(
+        defs.model_declarations.items(),
+        key=lambda item: (item[1].source in _DECLARING_LAYER, item[0]),
+    ):
+        ident, _ambiguous = rel_mod.resolve_declared(
+            declaration.relation, model, identifiers
+        )
+        if ident is None:
+            continue
+        kept = by_identifier.setdefault(ident.lower(), declaration)
+        if kept is not declaration:
+            precedence.append(_declaration_precedence_note(ident, kept, declaration))
+
+    out: list[Dataset] = []
+    applied = 0
+    for dataset in datasets:
+        declaration = by_identifier.get(dataset.identifier.lower())
+        if declaration is None:
+            out.append(dataset)
+            continue
+        copy = dataset.model_copy(deep=True)
+        copy.declaration = _dataset_declaration(copy, declaration, values_free)
+        if copy.columns:
+            copy.findings = rel_mod.profile_findings(
+                copy, high_null_fraction=high_null_fraction
+            )
+        out.append(copy)
+        applied += 1
+
+    notes: list[str] = []
+    if applied:
+        notes.append(
+            f"{applied} object(s) carry their model's declaration from the project "
+            "(see declaration on each); a declared grain is reported as grain, with "
+            "candidate_keys still measured and grain_status comparing the two"
+        )
+    notes.extend(precedence)
+    return out, notes
+
+
+def _declaration_precedence_note(ident: str, kept: Any, dropped: Any) -> str:
+    """Which of two declarations of one relation is reported, and why."""
+
+    def layer(declaration: Any) -> str:
+        return _DECLARING_LAYER.get(declaration.source, "the dbt project")
+
+    note = (
+        f"{ident} is declared twice: {kept.model} from {layer(kept)} is reported "
+        f"over {dropped.model} from {layer(dropped)}"
+    )
+    if kept.source not in _DECLARING_LAYER:
+        note += ", since a layer's declaration is derived from the dbt model's"
+    if (
+        kept.grain
+        and dropped.grain
+        and {c.lower() for c in kept.grain} != {c.lower() for c in dropped.grain}
+    ):
+        note += (
+            f"; their grains disagree ({', '.join(kept.grain)} against "
+            f"{', '.join(dropped.grain)})"
+        )
+    return note
+
+
+def _declared_column_cap_notes(datasets: list[Dataset], lift: str) -> list[str]:
+    """The note counting declared columns the payload's per-object cap cuts."""
+
+    cut = sum(
+        max(0, len(d.declaration.columns) - MAX_DECLARED_COLUMNS)
+        for d in datasets
+        if d.declaration is not None
+    )
+    if not cut:
+        return []
+    return [
+        f"{cut} declared column(s) are not listed: each declaration reports at most "
+        f"{MAX_DECLARED_COLUMNS} columns, with the rest counted in its "
+        f"elided_column_count; {lift} lists every one"
+    ]
+
+
+def _dataset_declaration(
+    dataset: Dataset, declaration: Any, values_free: bool
+) -> DatasetDeclaration:
+    """``declaration`` as reported on ``dataset``, with its grain applied to it."""
+
+    live = {c.name.lower(): c for c in dataset.columns}
+    withheld: list[str] = []
+    flagged = {c.name.lower() for c in dataset.columns if c.pii is not None}
+    population = None
+    if declaration.population is not None:
+        rule = declaration.population.rule
+        if rule is not None and (
+            values_free
+            or any(f.column.lower() in flagged for f in declaration.population.filters)
+        ):
+            rule = None
+            withheld.append("population.rule")
+        filters: list[DeclaredFilter] = []
+        for item in declaration.population.filters:
+            hide = values_free or item.column.lower() in flagged
+            if hide and "population.filters[].values" not in withheld:
+                withheld.append("population.filters[].values")
+            filters.append(
+                DeclaredFilter(
+                    column=item.column,
+                    includes=None if hide else item.includes,
+                    excludes=None if hide else item.excludes,
+                )
+            )
+        stated_parent = declaration.population.parent
+        population = DeclaredRows(
+            rule=rule,
+            filters=filters,
+            parent=(
+                DeclaredParent(
+                    model=stated_parent.model,
+                    columns=list(stated_parent.key),
+                    parent_columns=list(stated_parent.key.values()),
+                )
+                if stated_parent is not None
+                else None
+            ),
+        )
+
+    history = None
+    if declaration.history is not None:
+        history = declaration.history.model_copy(deep=True)
+        if values_free or history.status.column.lower() in flagged:
+            history.status.target = None
+            withheld.append("history.status.target")
+
+    grain = declaration.grain
+    status = None
+    if grain:
+        status = _apply_declared_grain(dataset, grain, live)
+
+    return DatasetDeclaration(
+        model=declaration.model,
+        source=declaration.source,
+        grain=list(grain) if grain else None,
+        grain_status=status,
+        population=population,
+        history=history,
+        columns=[
+            DeclaredColumn(name=name, **meaning.model_dump())
+            for name, meaning in declaration.columns.items()
+        ],
+        withheld_fields=withheld,
+    )
+
+
+def _apply_declared_grain(
+    dataset: Dataset, grain: list[str], live: dict[str, ColumnProfile]
+) -> str:
+    """Report ``grain`` as ``dataset``'s grain where its columns exist; how it
+    compares with measurement."""
+
+    if not dataset.columns:
+        return "unprofiled"
+    missing = [c for c in grain if c.lower() not in live]
+    if missing:
+        dataset.data_quality.append(
+            f"declared grain ({', '.join(grain)}) names column(s) not in this "
+            f"relation ({', '.join(missing)}); not applied"
+        )
+        return "missing_columns"
+    resolved = [live[c.lower()].name for c in grain]
+    wanted = {c.lower() for c in resolved}
+    measured = [*dataset.composite_keys, *dataset.candidate_keys]
+    if any({c.lower() for c in key} == wanted for key in measured):
+        status = "proven"
+    elif len(resolved) == 1 and live[resolved[0].lower()].is_unique is False:
+        status = "contradicted"
+        dataset.data_quality.append(
+            f"{resolved[0]} is the model's declared grain but profiling found "
+            "duplicates"
+        )
+    else:
+        status = "unmeasured"
+    if [c.lower() for c in dataset.grain or []] != [c.lower() for c in resolved]:
+        if not dataset.grain:
+            origin = "measurement found no key of its own"
+        elif dataset.grain in dataset.candidate_keys:
+            origin = f"measured grain was {', '.join(dataset.grain)}"
+        else:
+            origin = f"another declaration states {', '.join(dataset.grain)}"
+        dataset.data_quality.append(
+            f"grain {', '.join(resolved)} comes from the model's declaration ({origin})"
+        )
+    dataset.grain = resolved
+    return status
+
+
 def _annotate_semantic_exposure(datasets: list[Dataset], catalog) -> int:
     """Mark each dataset with the semantic models that sit on it. Returns how many
     were exposed.
@@ -3937,7 +4756,10 @@ def _native_semantic_edges(
 
 
 def _fold_semantic_edges(
-    declared: list[Relationship], semantic: list[Relationship]
+    declared: list[Relationship],
+    semantic: list[Relationship],
+    *,
+    adopt_declared_by: bool = False,
 ) -> tuple[list[Relationship], int]:
     """Semantic edges added to the declared set, deduped against it.
 
@@ -3946,6 +4768,11 @@ def _fold_semantic_edges(
     same tier, so an edge in both is one edge; which of the two named it first is
     not a fact about the warehouse, and doubling it would inflate the connectivity
     ranking the same way a doubled declared/inferred pair would.
+
+    ``adopt_declared_by`` is for a model declaration's joins (#498): the #491
+    writer renders a ``relationships`` test for every ``references`` it writes,
+    so the usual case is a test edge with no ``declared_by`` of its own, and the
+    declaration's name is the provenance worth keeping on the one edge left.
     """
 
     known = {_relationship_edge_key(rel) for rel in declared}
@@ -3963,10 +4790,31 @@ def _fold_semantic_edges(
                 set(existing.declaration_sources) | set(rel.declaration_sources)
             )
             existing.declaration_sources = sources
+            if adopt_declared_by and existing.declared_by is None:
+                existing.declared_by = rel.declared_by
             continue
         known.add(_relationship_edge_key(rel))
         merged.append(rel)
     return merged, already
+
+
+def _declaration_join_notes(
+    edges: list[Relationship], already_declared: int
+) -> list[str]:
+    """What model declarations (#498) added to the declared joins."""
+
+    if not edges:
+        return []
+    notes = [
+        f"{len(edges)} declared join(s) come from model declarations "
+        "(a column's `references`); see declared_by on each"
+    ]
+    if already_declared:
+        notes.append(
+            f"{already_declared} of them are also declared by a relationships "
+            "test; counted once, with both sources in declaration_sources"
+        )
+    return notes
 
 
 def _semantic_join_notes(
@@ -4123,7 +4971,7 @@ def _carry_forward_relationships(
 
     ``observed_namespaces`` (see `_compose_datasets`) excludes an edge whose
     endpoint is gone from the warehouse rather than merely out of scope, so a
-    deleted relation's join does not resurrect either (issue #149).
+    deleted relation's join does not resurrect either (issues #149, #984).
     """
 
     if prior is None or not prior.relationships:
@@ -4131,11 +4979,10 @@ def _carry_forward_relationships(
     existing = {_relationship_edge_key(rel) for rel in relationships}
 
     def dropped(identifier: str) -> bool:
-        return (
-            observed_namespaces is not None
-            and identifier not in examined
-            and identifier.rpartition(".")[0].lower() in observed_namespaces
-        )
+        if identifier in examined:
+            return False
+        ns = identifier.rpartition(".")[0].lower()
+        return bool(observed_namespaces is not None and ns in observed_namespaces)
 
     carried = [
         rel
@@ -4253,39 +5100,50 @@ def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
     return merged
 
 
-def _annotate_grain(
-    datasets: list[Dataset],
-    defs: dbt_project.ProjectDefinitions | None = None,
-    *,
-    orphaned: set[str] | None = None,
-    baselined: set[str] | None = None,
-    high_null_fraction: float = 0.95,
-) -> None:
-    """Attach the interpretation layer to raw profiles: candidate keys, the likely
-    grain, the data-quality warnings an analyst would write (non-unique own
-    key, unknown grain), and the severity-ordered column findings (#291,
-    ``high_null_fraction`` is ``profile_high_null_fraction`` in
-    ``.dex/config.yml``). Shared by profile and map so a single-table profile
-    surfaces a broken grain without requiring a full map.
+def _is_declared_profile_note(text: str) -> bool:
+    """A data-quality note this module added from a project grain claim.
 
-    With project definitions, the declared truth refines the heuristics: a
-    semantic model's primary entity overrides the detected grain (noting any
-    disagreement), and a profiled column contradicting its declared ``unique``
-    test gets a data-quality note. A declared composite key (a model-level
-    ``unique_combination_of_columns`` test -- the one grain shape measurement
-    alone can miss or a column-level test cannot express at all) overrides the
-    detected grain too, unless the detected grain is already a measurement-
-    proven single column, in which case the proven single wins and the
-    composite is only noted. ``candidate_keys`` stays measurement-only: an
-    unmeasured declared key is a claim, and the cache is a drift baseline.
-    ``orphaned`` (map only) badges a relation no current model/source builds:
-    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
-    and otherwise as a new relation no source declares yet.
+    Measured notes stay. These are the ones a later read has to drop before
+    applying the project as it reads now, or a removed declaration survives in
+    the output for as long as the cache is fresh.
+    """
+
+    return (
+        "declared primary entity" in text
+        or "declared unique" in text
+        or "declared composite" in text
+        or "declared primary key" in text
+        or "composite keys are declared" in text
+        or "also declared for this table" in text
+    )
+
+
+def _apply_declared_profile(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None,
+    *,
+    high_null_fraction: float,
+) -> None:
+    """Project grain claims on ``datasets``, starting from the measured grain.
+
+    A semantic model's primary entity, a declared ``unique`` test, and a
+    declared composite key refine the heuristic the scan stored. They are not
+    part of the scan. ``explore profile`` applies this at read time, to cached
+    and fresh profiles alike, and does not write the result back (#926). Map
+    and relationships still persist it, because their cache is the artifact
+    those commands return.
+
+    Notes this function owns are removed first and the grain is put back to the
+    measurement, so running it again, or running it after the declaration was
+    deleted, cannot keep the old claim. ``candidate_keys`` stays measurement-only.
     """
 
     declared_grain: dict[str, str] = {}
-    declared_unique: dict[str, set[str]] = {}
+    # relation -> column -> the channel that declared it unique, so the
+    # contradiction note names where the claim lives.
+    declared_unique: dict[str, dict[str, str]] = {}
     declared_composite: dict[str, list[list[str]]] = {}
+    declared_primary: dict[str, list[str]] = {}
     if defs is not None and (
         defs.primary_entities or defs.declared_keys or defs.declared_composite_keys
     ):
@@ -4303,12 +5161,19 @@ def _annotate_grain(
                 key.relation, key.model, identifiers
             )
             if ident is not None:
-                declared_unique.setdefault(ident.lower(), set()).add(key.column.lower())
+                declared_unique.setdefault(ident.lower(), {}).setdefault(
+                    key.column.lower(), key.source
+                )
+                if key.primary:
+                    declared_primary.setdefault(ident.lower(), [key.column])
         for composite in defs.declared_composite_keys:
             ident, _ambiguous = rel_mod.resolve_declared(
                 composite.relation, composite.model, identifiers
             )
-            if ident is None:
+            if ident is None or composite.claim == "unique":
+                continue
+            if composite.claim == "primary":
+                declared_primary.setdefault(ident.lower(), list(composite.columns))
                 continue
             bucket = declared_composite.setdefault(ident.lower(), [])
             normalized = {c.lower() for c in composite.columns}
@@ -4316,25 +5181,11 @@ def _annotate_grain(
                 bucket.append(list(composite.columns))
 
     for ds in datasets:
+        ds.data_quality = [
+            note for note in ds.data_quality if not _is_declared_profile_note(note)
+        ]
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
-        # After candidate_keys, because the reported half has to come back in
-        # exactly its order; the probe's suppressed entries ride through.
-        ds.key_evidence = rel_mod.key_evidence(ds)
-        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
-        if orphaned and ds.identifier in orphaned:
-            if baselined and ds.identifier.lower() in baselined:
-                ds.data_quality.append(
-                    "no current dbt model or source builds this relation, though "
-                    "the project builds/sources others in this schema; likely "
-                    "orphaned residue of a rename or removal"
-                )
-            else:
-                ds.data_quality.append(
-                    "no dbt source declares this relation yet; add it to the "
-                    "sources file before modelling it"
-                )
-
         grain_column = declared_grain.get(ds.identifier.lower())
         if grain_column is not None:
             profiled = next(
@@ -4360,18 +5211,44 @@ def _annotate_grain(
                         f"primary entity ({origin})"
                     )
                 ds.grain = declared
+        declared_here = declared_unique.get(ds.identifier.lower(), {})
         for col in ds.columns:
-            if (
-                col.name.lower() in declared_unique.get(ds.identifier.lower(), set())
-                and col.is_unique is False
-            ):
+            source = declared_here.get(col.name.lower())
+            if source is not None and col.is_unique is False:
                 ds.data_quality.append(
-                    f"{col.name} is declared unique in the dbt project but "
+                    f"{col.name} is declared unique in "
+                    f"{_DECLARING_LAYER.get(source, 'the dbt project')} but "
                     "profiling found duplicates"
                 )
 
+        primary = declared_primary.get(ds.identifier.lower())
+        if primary:
+            live = {c.name.lower(): c.name for c in ds.columns}
+            resolved = [live.get(c.lower()) for c in primary]
+            if all(resolved):
+                chosen = [str(c) for c in resolved]
+                if ds.grain != chosen:
+                    origin = (
+                        f"heuristic suggested {', '.join(ds.grain)}"
+                        if ds.grain
+                        else "measurement found no key of its own"
+                    )
+                    ds.data_quality.append(
+                        f"grain {', '.join(chosen)} comes from the project's "
+                        f"declared primary key ({origin})"
+                    )
+                ds.grain = chosen
+            else:
+                missing = [
+                    c for c, r in zip(primary, resolved, strict=True) if r is None
+                ]
+                ds.data_quality.append(
+                    f"declared primary key ({', '.join(primary)}) names column(s) "
+                    f"not in this profile ({', '.join(missing)}); not applied"
+                )
+
         composite_candidates = declared_composite.get(ds.identifier.lower())
-        if composite_candidates:
+        if composite_candidates and not primary:
             live = {c.name.lower(): c.name for c in ds.columns}
             valid: list[list[str]] = []
             for cols in composite_candidates:
@@ -4435,6 +5312,70 @@ def _annotate_grain(
         )
 
 
+def _annotate_grain(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None = None,
+    *,
+    orphaned: set[str] | None = None,
+    baselined: set[str] | None = None,
+    high_null_fraction: float = 0.95,
+    dialect: str | None = None,
+) -> None:
+    """Attach the interpretation layer to raw profiles: candidate keys, the likely
+    grain, the data-quality warnings an analyst would write (non-unique own
+    key, unknown grain), and the severity-ordered column findings (#291,
+    ``high_null_fraction`` is ``profile_high_null_fraction`` in
+    ``.dex/config.yml``). Shared by profile and map so a single-table profile
+    surfaces a broken grain without requiring a full map.
+
+    With project definitions, the declared truth refines the heuristics: a
+    semantic model's primary entity overrides the detected grain (noting any
+    disagreement), and a profiled column contradicting its declared ``unique``
+    test gets a data-quality note. A declared composite key (a model-level
+    ``unique_combination_of_columns`` test -- the one grain shape measurement
+    alone can miss or a column-level test cannot express at all) overrides the
+    detected grain too, unless the detected grain is already a measurement-
+    proven single column, in which case the proven single wins and the
+    composite is only noted. ``candidate_keys`` stays measurement-only: an
+    unmeasured declared key is a claim, and the cache is a drift baseline.
+    ``orphaned`` (map only) badges a relation no current model/source builds:
+    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
+    and otherwise as a new relation no source declares yet. ``dialect`` (the
+    connector's) notes columns whose names it reserves (#651). Project grain
+    claims are :func:`_apply_declared_profile`, which this calls once the
+    measurement is on the dataset.
+    """
+
+    for ds in datasets:
+        ds.candidate_keys = rel_mod.candidate_keys(ds)
+        ds.grain = rel_mod.detect_grain(ds)
+        # After candidate_keys, because the reported half has to come back in
+        # exactly its order; the probe's suppressed entries ride through.
+        ds.key_evidence = rel_mod.key_evidence(ds)
+        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
+        if dialect is not None:
+            reserved = reserved_column_names(dialect, [c.name for c in ds.columns])
+            if reserved:
+                ds.data_quality.append(
+                    f"column(s) {', '.join(reserved)} are reserved words in "
+                    f"{dialect}; declare them with `quote: true` in dbt, or its "
+                    "generic tests on them fail to compile"
+                )
+        if orphaned and ds.identifier in orphaned:
+            if baselined and ds.identifier.lower() in baselined:
+                ds.data_quality.append(
+                    "no current dbt model or source builds this relation, though "
+                    "the project builds/sources others in this schema; likely "
+                    "orphaned residue of a rename or removal"
+                )
+            else:
+                ds.data_quality.append(
+                    "no dbt source declares this relation yet; add it to the "
+                    "sources file before modelling it"
+                )
+    _apply_declared_profile(datasets, defs, high_null_fraction=high_null_fraction)
+
+
 def _relationship_notes(
     datasets: list[Dataset],
     declared: list,
@@ -4449,17 +5390,29 @@ def _relationship_notes(
         f"inference examined {fk_columns} id-shaped column(s) "
         f"across {len(datasets)} profiled object(s)"
     ]
+    # A model declaration's `references` (#498) states a foreign key as surely
+    # as a relationships test does.
+    declares_keys = defs is not None and (
+        bool(defs.foreign_keys)
+        or any(
+            meaning.references
+            for declaration in defs.model_declarations.values()
+            for meaning in declaration.columns.values()
+        )
+    )
     if not declared:
-        if defs is not None and defs.present and defs.foreign_keys:
+        if defs is not None and defs.present and declares_keys:
             # The project declares foreign keys, but none resolved here; the
             # per-join notes from resolution say which and why.
             notes.append("no declared relationships resolved against this connection")
         elif defs is not None and not defs.present and defs.project_dir:
             notes.append("no declared relationships (dbt project present but unused)")
-        else:
+        elif defs is not None and defs.present and not declares_keys:
             notes.append(
-                "no declared relationships (no dbt project or no declared foreign keys)"
+                "no declared relationships (dbt project declares no foreign keys)"
             )
+        else:
+            notes.append("no declared relationships (no dbt project)")
     if fk_columns and not inferred:
         notes.append(
             "no id-shaped column matched a parent table by name; joins may exist "
@@ -4683,6 +5636,48 @@ def _split_fresh_stale(
     return stale, fresh
 
 
+def _compute_observed_namespaces(
+    metas: list[ObjectMeta],
+    prior: DexCache | None,
+    adapter: Adapter,
+) -> set[str]:
+    """The schema/dataset namespaces this run's inventory actually examined,
+    so carry-forward can tell "out of this run's scope" from "gone from the
+    warehouse" (issues #149, #984).
+
+    Starts from the namespaces of objects listed this run, and extends to any
+    namespace present in the prior cache that falls within what this run's
+    adapter scope inspected. If a schema was dropped entirely or left empty,
+    its former relations are recognized as dropped rather than carried forward
+    forever (#984), while namespaces outside a narrowed ``--scope`` remain
+    untouched (#111).
+    """
+    observed = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
+    in_scope = getattr(adapter, "in_scope", None)
+    if in_scope is None or prior is None:
+        return observed
+
+    candidate_namespaces: set[str] = set()
+    for ds in prior.datasets:
+        if "." in ds.identifier:
+            candidate_namespaces.add(ds.identifier.rpartition(".")[0].lower())
+    if prior.relationships:
+        for rel in prior.relationships:
+            if "." in rel.from_dataset:
+                candidate_namespaces.add(rel.from_dataset.rpartition(".")[0].lower())
+            if "." in rel.to_dataset:
+                candidate_namespaces.add(rel.to_dataset.rpartition(".")[0].lower())
+
+    for ns in candidate_namespaces:
+        if ns not in observed:
+            with contextlib.suppress(Exception):
+                if in_scope(ns):
+                    observed.add(ns)
+    return observed
+
+
 def _compose_datasets(
     metas: list[ObjectMeta],
     profiled: list[Dataset],
@@ -4751,7 +5746,10 @@ def _compose_datasets(
         if identifier in seen:
             continue
         namespace = identifier.rpartition(".")[0].lower()
-        if observed_namespaces is not None and namespace in observed_namespaces:
+        is_observed = (
+            observed_namespaces is not None and namespace in observed_namespaces
+        )
+        if is_observed:
             dropped.append(identifier)
             continue
         datasets.append(previous.model_copy(deep=True))
@@ -4761,6 +5759,102 @@ def _compose_datasets(
 
 # Sentinel: preserve the prior cache's relationships (profile has no inference
 # pass, so it has no business touching them).
+@contextlib.contextmanager
+def _cache_write_lock(store: ExploreStore):
+    """Hold the store's cache lock where it offers one (:class:`CacheLock`).
+
+    A store without one still gets the re-read in :func:`_save_over_latest`,
+    which narrows the window to the merge itself without closing it.
+    """
+
+    lock = getattr(store, "cache_lock", None)
+    if callable(lock):
+        with lock():
+            yield
+    else:
+        yield
+
+
+def _save_over_latest(
+    store: ExploreStore,
+    now: datetime,
+    prior: DexCache | None,
+    compose: Callable[[DexCache | None], DexCache],
+) -> tuple[DexCache, str]:
+    """Write the cache as ``compose`` builds it over the latest stored one.
+
+    Every cache write goes through here. A command loads the cache when it
+    starts and saves when it ends, and anything another command saved in
+    between (a refresh, a raised PII flag) was overwritten by the stale copy.
+    So the cache is re-read under the store's cache
+    lock, ``compose`` folds this run's work into that, any profile in it newer
+    than the one the composed cache carries is kept, and the result is saved
+    before the lock is released. Nothing inside reaches the warehouse.
+
+    ``prior`` stands in for the latest only when the stored cache can no longer
+    be read, which the load at the command's start already ruled out once.
+    """
+
+    with _cache_write_lock(store):
+        try:
+            latest = store.load_cache()
+        except ValueError:
+            latest = prior
+        cache = compose(latest)
+        _keep_newer_profiles(cache, latest)
+        locator = store.save_cache(cache, now=now)
+    return cache, locator
+
+
+def _profiled_later(candidate: str | None, current: str | None) -> bool:
+    if not candidate:
+        return False
+    if not current:
+        return True
+    try:
+        return datetime.fromisoformat(candidate) > datetime.fromisoformat(current)
+    except (TypeError, ValueError):
+        return False
+
+
+def _keep_newer_profiles(cache: DexCache, latest: DexCache | None) -> None:
+    """Keep the stored profile wherever it is newer than the one about to be saved.
+
+    The stored one was scanned after this run read the cache, by another
+    command; its measurement, PII flags included, supersedes the copy this run
+    carried. What this run derived rather than scanned (its rank and semantic
+    exposure) stays on the dataset.
+    """
+
+    if latest is None or latest.provenance.connector != cache.provenance.connector:
+        return
+    stored = {d.identifier: d for d in latest.datasets}
+    for index, dataset in enumerate(cache.datasets):
+        newer = stored.get(dataset.identifier)
+        if newer is None or newer is dataset:
+            continue
+        if not _profiled_later(newer.profiled_at, dataset.profiled_at):
+            continue
+        kept = newer.model_copy(deep=True)
+        kept.rank_score = dataset.rank_score
+        kept.semantic_models = list(dataset.semantic_models)
+        cache.datasets[index] = kept
+
+
+def _with_notes(
+    latest: DexCache | None, ours: DexCache, notes: dict[str, list[str]]
+) -> DexCache:
+    """The latest cache with this run's measured notes added to their datasets."""
+
+    if latest is None or latest.provenance.connector != ours.provenance.connector:
+        return ours
+    for dataset in latest.datasets:
+        for text in notes.get(dataset.identifier, []):
+            if text not in dataset.data_quality:
+                dataset.data_quality.append(text)
+    return latest
+
+
 def _profile_checkpointer(
     store: ExploreStore,
     prior: DexCache | None,
@@ -4786,8 +5880,12 @@ def _profile_checkpointer(
             # withheld one too, and nothing later writes its values back.
             withhold_values(ds)
         accumulated.append(ds)
-        cache, _ = _merge_profiles(prior, accumulated, connector, now)
-        store.save_cache(cache, now=now)
+        _save_over_latest(
+            store,
+            now,
+            prior,
+            lambda latest: _merge_profiles(latest, accumulated, connector, now)[0],
+        )
 
     return checkpoint, accumulated
 

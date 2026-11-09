@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import PostgresTarget
@@ -51,7 +51,8 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
-    distinct_combination_sql,
+    dev_target_entries,
+    distinct_combination_parts,
     is_blob_type,
     is_integer_type,
     is_string_type,
@@ -122,9 +123,27 @@ _ESTIMATE_QUALITY_NOTE = (
 )
 
 
-def _regexp_predicate(qcol: str, pattern: str) -> str:
+def _c_text(qcol: str) -> str:
+    """The column as text under the C collation: the operand every value-shape
+    probe reads (#1096).
+
+    Postgres refuses a regular expression and a substring search (``replace``)
+    under a nondeterministic collation, so one such column used to fail the
+    profile statement for its whole table. The shared patterns are ASCII with
+    explicit ranges, so C matches a text value exactly as its own collation
+    would. The cast to ``text`` matters as well: ``char(n)``'s regex operator
+    sees the padding (``'ab'::char(6) ~ '^[a-z]+$'`` is false) and ``citext``'s
+    ignores case, while ``text`` does neither, which is how every other
+    connector reads a string.
+    """
+
+    return f'({qcol}::text COLLATE "C")'
+
+
+def _regexp_predicate(operand: str, pattern: str) -> str:
+    # `operand` is the `_c_text` form, never a bare collatable column (#1096).
     # ~ matches substrings; the shared patterns' anchors make it a full match.
-    return f"{qcol} ~ '{pattern}'"
+    return f"{operand} ~ '{pattern}'"
 
 
 def _date_trunc_expr(qcol: str, unit: str) -> str:
@@ -201,10 +220,16 @@ class PostgresAdapter:
         from psycopg import errors as pg_errors
 
         self._pg_errors = pg_errors
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._database: str | None = None
         self._notes: dict[str, list[str]] = {}
+        # Columns the catalog had no planner statistics for, and columns an
+        # exact scan has since measured: `table_notes` reconciles the two so
+        # a measured column is never still reported as unavailable. Both
+        # survive `forget_metadata` like the notes themselves do.
+        self._missing_stats: dict[str, set[str]] = {}
+        self._exact_measured: dict[str, set[str]] = {}
         self._session_prepared = False
 
     # --- capabilities (free) ---------------------------------------------------
@@ -266,9 +291,31 @@ class PostgresAdapter:
     def table_notes(self, identifier: str) -> list[str]:
         """Data-quality notes the profiling run accumulated for one object
         (sampling degradation, skipped escalations, missing planner stats).
-        Merged into the dataset's ``data_quality`` by the profile engine."""
+        Merged into the dataset's ``data_quality`` by the profile engine.
 
-        return list(self._notes.get(identifier, []))
+        The missing-stats note is composed here, not at scan time: an exact
+        scan after the aggregate scan may have measured columns the catalog
+        had none for, and a note claiming those counts are unavailable until
+        ANALYZE runs would then be wrong. Columns still unmeasured keep
+        the unavailable note; measured ones get a note saying so.
+        """
+
+        notes = list(self._notes.get(identifier, []))
+        missing = self._missing_stats.get(identifier, set())
+        measured = self._exact_measured.get(identifier, set()) & missing
+        unmeasured = missing - measured
+        if unmeasured:
+            notes.append(
+                f"no planner statistics for {len(unmeasured)} column(s); distinct "
+                "counts are unavailable until ANALYZE runs on this table",
+            )
+        if measured:
+            notes.append(
+                "distinct counts for "
+                f"{', '.join(sorted(measured))} measured with an exact scan "
+                "because the catalog had none",
+            )
+        return notes
 
     def _load_inventory(self) -> None:
         if self._inventory_loaded:
@@ -400,7 +447,7 @@ class PostgresAdapter:
         self._resolved_schemas: list[str] | None = None
         self._visible_schemas: set[str] | None = None
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_schema``, the schema this command's build writes into,
         or stop reading it with ``None``.
 
@@ -411,10 +458,23 @@ class PostgresAdapter:
         changed.
         """
 
-        scope = scope.strip() if scope else None
+        scope = dev_target_entries(scope, str)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this Postgres scope (#984)."""
+        token = namespace.strip().lower()
+        if "." in token:
+            db, _, schema = token.partition(".")
+            if db != self._current_database().lower():
+                return False
+        else:
+            schema = token
+        if not self.target.schemas:
+            return True
+        return schema in {s.lower() for s in self._schema_scope()}
 
     def _resolve_schemas(self) -> list[str]:
         visible = self._schemas()
@@ -721,7 +781,7 @@ class PostgresAdapter:
                     sampled=sample_percent is not None,
                 )
             )
-        self._note_missing_stats(identifier, columns, stats)
+        self._record_missing_stats(identifier, columns, stats)
         return results
 
     def _distinct_row_basis(self, identifier: str, meta: ObjectMeta) -> int | None:
@@ -778,16 +838,24 @@ class PostgresAdapter:
             if wants_min_max:
                 select_parts.append(f"MIN({qcol}) AS mn_{i}")
                 select_parts.append(f"MAX({qcol}) AS mx_{i}")
+            # The shape probes read C-collated text (see `_c_text`); counts,
+            # MIN/MAX and the temporal probes keep the column itself, so MIN/MAX
+            # still order by the column's own collation.
+            text_col = _c_text(qcol)
+            is_string = is_string_type(col.data_type)
             wants_shape = (col.name in shape) and not degraded
             if wants_shape:
-                select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
+                select_parts.extend(
+                    shape_stat_expressions(text_col, i, _regexp_predicate)
+                )
             wants_type = (col.name in type_req) and not degraded
             if wants_type:
                 select_parts.extend(
                     type_contradiction_expressions(
-                        qcol,
+                        # The integer branch compares numbers and runs no regex.
+                        text_col if is_string else qcol,
                         i,
-                        is_string=is_string_type(col.data_type),
+                        is_string=is_string,
                         is_integer=is_integer_type(col.data_type),
                         regexp_predicate=_regexp_predicate,
                         bigint_type=_BIGINT_TYPE,
@@ -795,7 +863,9 @@ class PostgresAdapter:
                 )
             wants_key_shape = (col.name in key_shape_req) and not degraded
             if wants_key_shape:
-                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+                select_parts.extend(
+                    key_shape_expressions(text_col, i, _regexp_predicate)
+                )
             wants_temporal = (col.name in temporal_req) and not degraded
             if wants_temporal:
                 select_parts.extend(
@@ -876,6 +946,9 @@ class PostgresAdapter:
                     # pg_stats estimates are never a uniqueness verdict; the
                     # near-unique escalation proves keys with an exact scan.
                     distinct_count=distinct,
+                    distinct_count_missing=(
+                        wants_distinct and n_total > 0 and distinct is None
+                    ),
                     is_unique=None,
                     min_value=(
                         json_safe(values.get(f"mn_{i}")) if wants_min_max else None
@@ -897,20 +970,20 @@ class PostgresAdapter:
             )
         return aggregates
 
-    def _note_missing_stats(
+    def _record_missing_stats(
         self, identifier: str, columns: list[ColumnMeta], stats: dict[str, float]
     ) -> None:
-        missing = [
+        # Recorded, not noted: `table_notes` composes the note after any
+        # exact scan has had its chance to measure these columns, so a
+        # measured column is never reported as unavailable. A fresh
+        # aggregate scan starts a fresh measurement epoch: exact counts
+        # from an earlier run must not speak for this one.
+        self._exact_measured[identifier] = set()
+        self._missing_stats[identifier] = {
             col.name
             for col in columns
             if not self._is_degraded(col.data_type) and col.name not in stats
-        ]
-        if missing:
-            self._note(
-                identifier,
-                f"no planner statistics for {len(missing)} column(s); distinct "
-                "counts are unavailable until ANALYZE runs on this table",
-            )
+        }
 
     def exact_distinct_counts(
         self, identifier: str, columns: list[str]
@@ -919,11 +992,27 @@ class PostgresAdapter:
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let uniqueness verdicts stay
         approximate. A metered adapter never self-escalates past its ceiling.
+
+        Columns the adapter degrades (json, xml and friends, which the
+        aggregate scan itself refuses to count) are skipped, not counted:
+        `maintain verify` and `maintain drift` send key columns here directly,
+        and a degraded one among them would fail the whole statement.
+        A column the inventory does not know is kept, since its type cannot
+        be proven degraded. Measured columns are recorded so `table_notes`
+        can say they were measured because the catalog had none.
         """
 
         if not columns:
             return {}
-        meta, _ = self.table_metadata(identifier)
+        meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        measurable = [
+            name
+            for name in columns
+            if name not in types or not self._is_degraded(types[name])
+        ]
+        if not measurable:
+            return {}
         estimate = self._scan_seconds(meta.byte_size)
         if not self.cost_gate.try_charge(estimate):
             self._note(
@@ -936,7 +1025,7 @@ class PostgresAdapter:
         # row estimate to an exact count (grain verdicts compare against it).
         select_parts = ["COUNT(*) AS n_total"] + [
             f"COUNT(DISTINCT {_quote_ident(name)}) AS d_{i}"
-            for i, name in enumerate(columns)
+            for i, name in enumerate(measurable)
         ]
         sql = assert_select_only(
             f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}",  # noqa: S608
@@ -945,7 +1034,8 @@ class PostgresAdapter:
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
         self._exact_rows[identifier] = int(values["n_total"])
-        return {name: int(values[f"d_{i}"]) for i, name in enumerate(columns)}
+        self._exact_measured.setdefault(identifier, set()).update(measurable)
+        return {name: int(values[f"d_{i}"]) for i, name in enumerate(measurable)}
 
     def distinct_combination_counts(
         self, identifier: str, combinations: list[list[str]]
@@ -956,6 +1046,12 @@ class PostgresAdapter:
         can afford (they arrive best-ranked first) and says so, rather than
         giving up the grain wholesale. A metered adapter never self-escalates
         past its ceiling.
+
+        COUNT(*) rides along as one more scalar subquery in the same
+        statement, mirroring :meth:`exact_distinct_counts`: the grain
+        check reads the row count only after the scan ran, so a composite
+        grain on an unanalyzed table or a view is measured against the
+        exact total, never against the planner's estimate (#849).
         """
 
         if not combinations:
@@ -971,12 +1067,20 @@ class PostgresAdapter:
             self._note(identifier, note)
         if not probed:
             return {}
+        # The only interpolation is the quoted+escaped identifier (never a
+        # value); the statement is parsed and refused if not a read-only
+        # SELECT.
+        parts = [
+            f"(SELECT COUNT(*) FROM {self._quote(identifier)}) AS n_total",  # noqa: S608
+            *distinct_combination_parts(self._quote(identifier), probed, _quote_ident),
+        ]
         sql = assert_select_only(
-            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
+            f"SELECT {', '.join(parts)}",
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
+        self._exact_rows[identifier] = int(values["n_total"])
         return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
@@ -1029,6 +1133,19 @@ class PostgresAdapter:
         return result
 
     # --- execution (the single billed door) --------------------------------------
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from a ``LIMIT 0`` that reads no rows."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        _rows, labels, types = self._run_rows(
+            f"select * from ({checked}) as dex_describe limit 0",  # noqa: S608
+            fetch_rows=1,
+        )
+        return [
+            ColumnMeta(name=label, data_type=kind, nullable=True, ordinal=ordinal)
+            for ordinal, (label, kind) in enumerate(zip(labels, types, strict=True))
+        ]
 
     def run_query(
         self,
@@ -1110,6 +1227,17 @@ class PostgresAdapter:
         types = [self._description_type(d) for d in cursor.description]
         return rows, labels, types
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube's own drivers set the
+        session time zone to UTC, and a statement it renders reads a timestamp
+        with no zone through that setting, so run under another zone it buckets
+        rows differently. Only UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def _billed_cursor(self, timeout_seconds: float | None) -> tuple[Any, bool]:
         """A cursor prepared for spend: session read-only asserted, and the
         server-side statement timeout wound down to what remains of the
@@ -1120,6 +1248,9 @@ class PostgresAdapter:
         remaining = self.cost_gate.statement_cap(unit="database-second")
         self._ensure_session()
         cursor = self._conn.cursor()
+        if getattr(self, "_utc_session", False):
+            # dex-built session statement, a constant.
+            cursor.execute("SET timezone = 'UTC'")
         timeout_ms: int | None = None
         budget_bound = False
         if remaining is not None:

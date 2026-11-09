@@ -93,6 +93,15 @@ class SemanticLayer(Protocol):
         """
         ...
 
+    def declared_models(self) -> tuple[dict[str, Any], list[str]]:
+        """Declarations this layer states itself, by model, and notes (#977).
+
+        Empty on the same terms as :meth:`declared_keys`. The notes say what the
+        layer's metadata held that could not be read, since that metadata is
+        untrusted text and a malformed block must never raise.
+        """
+        ...
+
 
 def descriptor_from_backend(backend: Any) -> BackendDescriptor:
     """Read a descriptor, including compatibility for narrow test doubles."""
@@ -157,10 +166,22 @@ def values_gap(backend: Any) -> str:
     )
 
 
+# Which deployment an execution override selects, for the vendors where the two
+# are one axis: dbt's local artifact is the only thing dex can execute, and dbt
+# Cloud the only thing that executes for itself.
 _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
     "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"},
     "ossie": {EXECUTION_DEX: "local"},
     "slayer": {EXECUTION_DEX: "local"},
+}
+
+# The vendors whose deployment (where the layer runs) and execution (who runs
+# the SQL) are independent axes, and the executions each offers in this release.
+# Every Cube deployment serves the same REST API, so `--local` and `--api` choose
+# who executes and leave the configured deployment alone: Cube renders over
+# `/v1/sql` and dex executes, or Cube executes over `/v1/load` (#914).
+_INDEPENDENT_EXECUTIONS: dict[str, tuple[str, ...]] = {
+    "cube": (EXECUTION_DEX,),
 }
 
 
@@ -190,6 +211,12 @@ def _local_slayer(engine: Any) -> SemanticLayer:
     return LocalSlayerLayer.from_engine(engine)
 
 
+def _local_cube(engine: Any) -> SemanticLayer:
+    from .cube import LocalCubeLayer
+
+    return LocalCubeLayer.from_engine(engine)
+
+
 # Which backend answers for a resolved (vendor, deployment) pair. A table rather
 # than a chain of conditions, so a vendor is a row here and nowhere else, and so
 # a deployment that resolved is a deployment that gets used: the previous shape
@@ -204,6 +231,7 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("dbt", "dbt_cloud"): _hosted_dbt_cloud,
     ("ossie", "local"): _local_ossie,
     ("slayer", "local"): _local_slayer,
+    ("cube", "local"): _local_cube,
 }
 
 # Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
@@ -229,6 +257,12 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
         "Drop the source, or select a hosted dbt semantic layer with "
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),
+    ("cube", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Cube model files, which are files in this repository. "
+        "Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
 }
 
 
@@ -250,7 +284,20 @@ def resolve_semantic_layer(
             f"{', '.join(sorted(SEMANTIC_DEPLOYMENTS))}"
         )
 
-    if api or local:
+    configured = getattr(semantic, "deployment", None) or getattr(
+        semantic, "backend", None
+    )
+    if (api or local) and vendor in _INDEPENDENT_EXECUTIONS:
+        execution = EXECUTION_VENDOR if api else EXECUTION_DEX
+        if execution not in _INDEPENDENT_EXECUTIONS[vendor]:
+            raise SemanticBackendError(
+                f"semantic vendor '{vendor}' has no hosted execution (--api) in "
+                "this release: dex asks a Cube server to render SQL over /v1/sql "
+                "and executes it itself under the cost guard, and does not yet "
+                "have Cube execute a query over /v1/load. Drop --api"
+            )
+        deployment = canonical_semantic_deployment(configured or "local")
+    elif api or local:
         execution = EXECUTION_VENDOR if api else EXECUTION_DEX
         try:
             deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
@@ -260,9 +307,6 @@ def resolve_semantic_layer(
                 f"{'hosted' if api else 'local'} execution override"
             ) from exc
     else:
-        configured = getattr(semantic, "deployment", None) or getattr(
-            semantic, "backend", None
-        )
         deployment = canonical_semantic_deployment(configured or "local")
 
     build = _BACKENDS.get((vendor, deployment))

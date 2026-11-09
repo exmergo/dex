@@ -26,7 +26,9 @@ jobs:
   # the same script writes. If it does not, the tag was cut without
   # running the prepare script, and shipping it would couple the plugin to the
   # wrong engine version (especially once the public catalog pins this tag), so
-  # we fail before anything reaches PyPI. No writes, so branch protection is moot.
+  # we fail before anything reaches PyPI. It also re-runs the script on the tagged
+  # commit and fails on any difference, which is what proves the script ran. The
+  # re-run writes only to this job's checkout, so branch protection is moot.
   verify-coupling:
     runs-on: ubuntu-latest
     steps:
@@ -57,6 +59,52 @@ jobs:
             exit 1
           fi
           echo "All wrapper pins match ${VERSION}, and CHANGELOG.md has its section."
+      # The checks above name the commonest misses. This one is the whole
+      # contract: the script is idempotent for a version it already prepared
+      # (test_changelog.py holds it so), so re-running it on the tagged commit
+      # changes nothing exactly when the tag is what the script wrote. That covers
+      # every file it owns, including the manifests and the claude/ folder the
+      # Claude directory reads, without a list here that falls behind the script.
+      # The changelog section exists by now, so towncrier is never invoked.
+      - name: The tagged commit is exactly what prepare_release.sh writes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PLUGIN_VERSION="$(jq -r .version .claude-plugin/plugin.json)"
+          scripts/prepare_release.sh "${VERSION}" "${PLUGIN_VERSION}" >/dev/null
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "The tag differs from what prepare_release.sh ${VERSION} ${PLUGIN_VERSION} writes:"
+            git status --short
+            git --no-pager diff
+            echo "Run it, commit the result (git add claude && git commit -a), and re-tag."
+            exit 1
+          fi
+          echo "The tagged commit is what prepare_release.sh ${VERSION} ${PLUGIN_VERSION} writes."
+      # A stable tag ships the same version to every agent. A prerelease maps to
+      # a different semver spelling (0.1.0a1 is 0.1.0-alpha.1), so only stable
+      # tags are held to equality; the step above already holds the manifests to
+      # one another and to claude/.
+      - name: A stable tag's plugin manifests carry its version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "${VERSION}" in
+            *[!0-9.]*)
+              echo "${VERSION} is a prerelease; manifest equality is not required."
+              exit 0
+              ;;
+          esac
+          fail=0
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json plugin.json gemini-extension.json claude/.claude-plugin/plugin.json; do
+            found="$(jq -r .version "${manifest}")"
+            if [ "${found}" != "${VERSION}" ]; then
+              echo "${manifest} is at ${found}, not ${VERSION}."
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then
+            echo "Run scripts/prepare_release.sh ${VERSION} ${VERSION}, commit, and re-tag."
+            exit 1
+          fi
+          echo "Every plugin manifest is at ${VERSION}."
 
   publish:
     needs: [verify-coupling]
@@ -77,7 +125,7 @@ jobs:
           # hatch-vcs derives the version from the tag; it needs full history
           # and the tags, which the default shallow checkout omits.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Build sdist + wheel
         run: uv build
       - name: Assert built version matches the tag
@@ -175,7 +223,7 @@ jobs:
         working-directory: ${{ matrix.path }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Reserve the name on PyPI (once; no-op if it already exists)
         env:
           PROJECT: ${{ matrix.project }}

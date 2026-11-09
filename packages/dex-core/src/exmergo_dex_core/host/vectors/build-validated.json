@@ -66,7 +66,11 @@
         "basis": [
           "models/staging/mart.sql: builds 'mart'",
           "models/staging/mart.yml: documents mart"
-        ]
+        ],
+        "built": [
+          "mart"
+        ],
+        "not_built": []
       }
     }
   }

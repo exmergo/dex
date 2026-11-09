@@ -23,7 +23,12 @@ from ..errors import StatementStage
 from ..results import Result
 from ..values_free import COLUMN_VALUE_FIELDS
 from .semantic import SemanticCatalog
-from .summary import MapObject, SkippedObjects
+from .summary import (
+    MAX_DECLARED_COLUMNS,
+    MapObject,
+    SkippedObjects,
+    capped_declaration,
+)
 
 
 class InventoryEntry(BaseModel):
@@ -141,8 +146,15 @@ def _profile_dataset_payload(
         "findings": [f.model_dump(mode="json") for f in dataset.findings],
         "profiled_at": dataset.profiled_at,
         "semantic_models": dataset.semantic_models,
-        "suppressed_fields": suppressed,
     }
+    if dataset.declaration is not None:
+        # Only under --use-project and only where a declaration resolved (#498):
+        # absent otherwise, so a run without the flag reads exactly as before.
+        payload["declaration"] = capped_declaration(
+            dataset.declaration,
+            None if show_all_columns else MAX_DECLARED_COLUMNS,
+        ).model_dump(mode="json")
+    payload["suppressed_fields"] = suppressed
     if withheld:
         # Ahead of `columns`, for the reason `suppressed_fields` is: a truncated
         # read still says why the fields are not there.
@@ -345,7 +357,15 @@ class MapResult(Result):
             "pii_column_count": self.pii_column_count,
             "data_quality_note_count": self.data_quality_note_count,
             "top_objects": [o.model_dump(mode="json") for o in self.top_objects],
-            "objects": [o.model_dump(mode="json") for o in self.objects],
+            # `declaration` only where one resolved (#498), so a map without
+            # --use-project reads exactly as it did before the field existed.
+            "objects": [
+                o.model_dump(
+                    mode="json",
+                    exclude={"declaration"} if o.declaration is None else None,
+                )
+                for o in self.objects
+            ],
             "edges": [e.model_dump(mode="json") for e in self.edges],
             "conflicts": [c.model_dump(mode="json") for c in self.conflicts],
             "elided_object_count": self.elided_object_count,

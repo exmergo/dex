@@ -1,0 +1,28 @@
+version: 2
+models:
+  - name: daily_visits
+    description: Visits per day, one row for every day from the first to the last visit.
+    config:
+      meta:
+        dex:
+          grain: [visit_date]
+          population:
+            rule: "Every calendar day from the first to the last visit date, days with no visits included."
+          assumptions:
+            - decision: What a day with no visits counts
+              chosen: zero visits and a NULL average duration, as before
+              evidence: contract
+              column: visits
+              detail: the declared average is NULL when no visit has a duration, and visits stays a count
+    columns:
+      - name: visit_date
+        data_type: date
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key, null_rule: never}}}
+      - name: visits
+        data_type: bigint
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+      - name: avg_duration_minutes
+        data_type: double
+        description: Average recorded duration; NULL when no visit that day has one.
+        config: {meta: {dex: {role: measure, aggregation: avg, additivity: non_additive, unit: minutes}}}

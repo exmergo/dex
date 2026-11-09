@@ -68,6 +68,38 @@ def _log_entries(repo: Path) -> list[dict]:
 # --- the cache gate --------------------------------------------------------------
 
 
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+    ],
+)
+def test_nested_describe_is_a_guard_refusal_without_opening_a_warehouse(
+    tmp_path, capsys, monkeypatch, dialect, sql
+):
+    from exmergo_dex_core.engine import DexEngine
+
+    def unexpected_adapter(*args, **kwargs):
+        pytest.fail("unsupported nested statements must not open a warehouse")
+
+    monkeypatch.setattr(DexEngine, "_adapter", unexpected_adapter)
+    save_config(
+        DexConfig(connector=dialect, bigquery={"project": "test-project"}),
+        tmp_path,
+    )
+    payload = _run(
+        ["--repo-root", str(tmp_path), "explore", "query", sql],
+        capsys,
+        expect_error=True,
+    )
+    assert payload["reason"] == "guard"
+    assert "Describe" in payload["errors"][0]
+    assert "explore profile" in payload["errors"][0]
+    assert _log_entries(tmp_path)[-1]["decision"] == "refused"
+
+
 def test_query_without_cache_is_refused_with_the_fix(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
@@ -1182,3 +1214,132 @@ def test_query_batch_warehouse_error_reports_warehouse_refused_the_statement(
     assert results[1]["reason"] == "execution_failure"
     assert "the warehouse refused the statement:" in results[1]["error"]
     assert "dex built" not in results[1]["error"]
+
+
+def test_target_dev_answers_and_names_the_no_op_on_duckdb(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """On DuckDB the flag answers as before and notes it widened nothing."""
+
+    # #1133: the flag exists (an agent got `unrecognized arguments: --target
+    # dev`). DuckDB's dev target is the file it already reads, so the answer is
+    # the plain one and a note says the flag widened nothing.
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    sql = "SELECT COUNT(*) - COUNT(DISTINCT HOST_ID) AS dupes FROM RAW_LISTINGS"
+    plain = _query(sql, airbnb_duckdb, repo, capsys)["data"]
+    dev = _run(
+        [
+            "explore",
+            "query",
+            sql,
+            "--target",
+            "dev",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+    assert dev["cells"] == plain["cells"]
+    assert any("--target dev widened nothing" in note for note in dev["notes"])
+    assert not any("--target dev" in note for note in plain["notes"])
+
+    batch = _run(
+        [
+            "explore",
+            "query",
+            sql,
+            "SELECT COUNT(*) AS n FROM RAW_LISTINGS",
+            "--target",
+            "dev",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+    assert batch["ok_count"] == 2
+    assert any("--target dev widened nothing" in note for note in batch["notes"])
+
+
+@pytest.mark.parametrize("target", ["prod", "production"])
+def test_target_prod_is_refused_before_anything_runs(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, target: str
+):
+    """`--target prod` is refused and nothing is ledgered."""
+
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    before = (
+        (repo / ".dex" / QUERIES_FILE).read_text()
+        if (repo / ".dex" / QUERIES_FILE).exists()
+        else ""
+    )
+    payload = _run(
+        [
+            "explore",
+            "query",
+            "SELECT COUNT(*) FROM RAW_LISTINGS",
+            "--target",
+            target,
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+        expect_error=True,
+    )
+    assert "looks like production" in payload["errors"][0]
+    after = (
+        (repo / ".dex" / QUERIES_FILE).read_text()
+        if (repo / ".dex" / QUERIES_FILE).exists()
+        else ""
+    )
+    assert after == before
+
+
+def test_an_uncached_relation_behind_an_unopenable_connection_names_the_connection(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """An uncached relation behind a dead connection names the connection error."""
+
+    # #1133: with the warehouse unreachable (a DuckDB file another process holds
+    # locked, in the ADE-bench run), a relation the cache cannot speak for was
+    # refused as "not in the exploration cache; run `explore map`", which fails
+    # the same way. The refusal now carries why the on-demand profile could not
+    # run, and still refuses.
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    unreachable_warehouse(monkeypatch)
+
+    payload = _query(
+        "SELECT COUNT(*) FROM main_marts.fct_orders",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+
+    message = payload["errors"][0]
+    assert "not in the exploration cache" in message
+    assert "could not be opened" in message
+    assert "connector extra is not installed" in message
+    assert _log_entries(repo)[-1]["decision"] == "refused"
+
+
+def test_no_cache_behind_an_unopenable_connection_names_the_connection(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A missing cache behind a dead connection names the connection error."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    unreachable_warehouse(monkeypatch)
+
+    payload = _query(
+        "SELECT COUNT(*) FROM RAW_HOSTS", airbnb_duckdb, repo, capsys, expect_error=True
+    )
+    message = payload["errors"][0]
+    assert "no exploration cache yet" in message
+    assert "connector extra is not installed" in message

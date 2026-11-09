@@ -1,14 +1,17 @@
 # Querying the semantic layer (`explore semantic`)
 
+Start with [Use a semantic layer](https://docs.exmergo.com/dex/guides/semantic-layer) for the workflow.
+This reference covers catalog fields, backend configuration, and query support.
+
 dex can author a semantic layer (`transform` / `semantic define|update` for dbt,
 `semantic ossie define|update` for native Apache Ossie documents, `semantic slayer
-define|update` for SLayer model files) and detect drift
+define|update` for SLayer model files, `semantic cube define|update` for Cube
+model files) and detect drift
 in it (`maintain semantic`). `explore semantic` is the third piece: it *queries*
 the layer, so an agent can discover metrics and, where the layer defines a
-runtime, run governed metric queries. Four layers answer the same commands
-through one abstraction (a local dbt project, a hosted dbt Cloud deployment,
-native Apache Ossie documents, and SLayer model files), and the differences
-between them are load-bearing, so they are spelled out here.
+runtime, run governed metric queries. The catalog covers local dbt projects,
+hosted dbt Cloud deployments, and native Apache Ossie, SLayer, and Cube files.
+Query capabilities differ by backend; the sections below explain those limits.
 
 ## The three commands
 
@@ -409,8 +412,8 @@ Two configured axes, and one that is derived:
 
 | axis | values | what it decides | set how |
 |---|---|---|---|
-| `vendor` | `dbt`, `ossie`, `slayer` | which semantic-layer format answers | configured, ambient per repo |
-| `deployment` | `local`, `dbt_cloud` (`local` only for `ossie` and `slayer`) | which endpoint or artifact is read | configured |
+| `vendor` | `dbt`, `ossie`, `slayer`, `cube` | which semantic-layer format answers | configured, ambient per repo |
+| `deployment` | `local`, `dbt_cloud` (`local` only for `ossie`, `slayer` and `cube`) | which endpoint or artifact is read | configured |
 | `execution` | `dex`, `vendor` | **whether dex's cost guard applies** | derived, never configured |
 
 `execution` is the one the guards read, so it is reported on every result rather
@@ -670,6 +673,44 @@ before storing the plan. `define` refuses an existing semantic-model name;
 `update` refuses a new one; `plan` accepts and reports both. These commands do
 not remove models or files.
 
+Each document is one semantic model, flat at its root (`version`, `name`,
+`datasets`, `relationships`, `metrics`), as upstream's current schema requires. A
+document in the earlier wrapped shape, a `semantic_model` list of models, is
+refused by its own rule, `wrapped_document`, whose message names the migration:
+move the model's properties to the root, remove `semantic_model`, drop any
+root-level `dialects` and `vendors`, and split a file holding several models into
+one document per model, each listed in `semantic.ossie.files`.
+
+#### Declarations on a dataset
+
+The payload may also carry `declarations`, beside or instead of `edits`. Each
+names a dataset the payload or the layer already defines and is rendered into it
+field by field: the grain becomes `primary_key` on the fields exposing the grain
+columns (refused by name where no field exposes one, since a key names fields),
+descriptions are native, a declared aggregation becomes a dataset-scoped metric
+`<field>_<agg>`, a foreign key becomes a relationship to the parent dataset's
+field, population and assumptions go to the dataset's `ai_context` (the population
+sentence as `instructions`, the declaration under a structured `dex` key), and
+unit, NULL rule and additivity go to the field's `ai_context.dex`. Only that
+dataset's list item is rewritten and a relationship is appended, so every other
+byte of the document is kept; the result passes the same validation as an
+authored document. `custom_extensions` is never written, because its `data` is an
+opaque string and a declaration inside one could not be reviewed in a diff. The
+full mapping is in [Apache Ossie compatibility](ossie-compatibility.md#declarations).
+
+#### Derived from a declared dbt mart
+
+In a repository with a dbt project beside the Ossie layer, `transform plan` (and
+`transform declare`) on a declared mart derives an Ossie dataset for it under
+`data.semantic_proposal`, on the same mapping. It is appended to the configured
+document holding the datasets its foreign keys reference (or the only configured
+document, where it references none) and stored as a plan of its own on the Ossie
+layer, named by `data.semantic_proposal.plan_id`; apply both. Where the parents
+span documents or no document can hold it, it is proposed as a document of its
+own, validated the same way, with the `dex config set semantic.ossie.files` that
+adopts it. If that new document's path is already in `semantic.ossie.files`, it
+is included as a companion plan even before the file exists.
+
 The preservation contract is exact and predictable: Dex does not parse and
 re-serialize accepted content. Apply writes the authored bytes byte-for-byte,
 including comments, quoting, ordering, and whitespace; configured files absent
@@ -725,8 +766,8 @@ relation that is gone; a dimension or declared key naming a column that is gone;
 and a relationship whose endpoint or column pairs no longer resolve, which is
 `high` because a join nothing can resolve is a broken layer rather than a stale
 one. All of it is free. The command's billed half, dimension cardinality, needs a
-semantic model naming a transformation model, and an Ossie dataset names none, so
-that axis never offers a scan here.
+semantic model that records which of its dimensions are categorical, and an
+Ossie dataset records none, so that axis never offers a scan here.
 
 `maintain grain` is the one place Ossie's declarations meet the warehouse for
 money. A declared composite is measured as one composite through the identical
@@ -786,21 +827,27 @@ that any consumer can execute it.
 
 ### Which expression dex reads
 
-An Ossie field or metric may declare an expression per dialect, and the enum mixes
-SQL with languages that are not SQL. dex partitions it once: `ANSI_SQL`,
-`SNOWFLAKE`, `DATABRICKS` and `BIGQUERY` are read; `MDX`, `TABLEAU` and `MAQL` are
-preserved verbatim, never parsed, and never a source of a physical column claim.
-Upstream's own validator maintains the same partition.
+An Ossie field or metric states a portable top-level `sql` (written in
+`OSSIE_SQL_2026`, the one dialect the specification defines), an expression per
+dialect under `dialects`, or both. `Dialect` is an open string, so any token is
+valid. dex partitions it once: `OSSIE_SQL_2026`, `ANSI_SQL`, `SNOWFLAKE`,
+`DATABRICKS` and `BIGQUERY` are read; every other token (`MDX`, `TABLEAU`,
+`MAQL`, `DAX`, `THOUGHTSPOT`, or one no registry names) is preserved verbatim,
+never parsed, and never a source of a physical column claim. Upstream's own
+validator maintains the same partition.
 
 Selection is deterministic given a document and a connector:
 
 1. the active connector's own Ossie dialect, where it has one;
-2. the portable dialect, `ANSI_SQL`;
-3. the first declared SQL dialect, in the document's own order.
+2. `OSSIE_SQL_2026`, the top-level `sql` first, since upstream makes it
+   authoritative over an `OSSIE_SQL_2026` dialect entry;
+3. `ANSI_SQL`;
+4. the first other declared SQL dialect, in the document's own order.
 
 It never falls through to a non-SQL language. DuckDB, Postgres, Redshift,
-ClickHouse and Trino have no token in Ossie's enum, so they fall to the portable
-dialect, which is correct and is stated here rather than left to be inferred. Every
+ClickHouse and Trino have no Ossie dialect of their own, so they fall to the
+portable forms, which is correct and is stated here rather than left to be
+inferred. Every
 declared dialect is preserved on the element's `vendor_params`, along with the
 datatype, the AI context, and any custom extensions, so nothing the document says
 is dropped and nothing is smuggled into an unrelated field.
@@ -818,7 +865,7 @@ says which of them applies:
 | a computed expression | a column guessed out of an expression makes the PII gate screen the wrong column and report it as evidence |
 | a quoted identifier | an unquoted identifier is folded the way the warehouse folds it while a quoted one is exact, so the two need not name the same column and dex cannot tell which was meant |
 | a query-backed source | Ossie documents a source as `database.schema.table` **or a query** with no portable discriminator, and a query read as a relation would reach the PII gate as physical evidence that does not exist |
-| a field declaring only non-SQL dialects | dex does not read MDX, Tableau or MAQL, so it has nothing to resolve |
+| a field declaring only non-SQL dialects | dex does not read MDX, Tableau, DAX or any other non-SQL token, so it has nothing to resolve |
 
 The relation rule is the connector's own, so the same document links on DuckDB and
 does not on ClickHouse, whose relations are two parts rather than three.
@@ -839,7 +886,10 @@ absence from a field the author left blank:
 - **no metric-to-dataset reference.** Lineage comes only from qualified
   `dataset.field` references that resolve, and **when nothing resolves it is
   empty**: naming every dataset in the semantic model would be the maximal claim
-  dressed as a conservative one.
+  dressed as a conservative one. A dataset-scoped metric (`datasets[].metrics`) is
+  the exception the format itself makes: it belongs to one dataset, is listed as
+  `dataset.metric`, and its lineage is that dataset whenever it names one of the
+  dataset's fields.
 - **no grain vocabulary.** A categorical dimension states `queryable_granularities:
   []`, which is a fact. A time dimension leaves it unset, because Ossie was never
   asked and an empty list there would positively state that no grain is queryable.
@@ -851,7 +901,11 @@ absence from a field the author left blank:
 
 Ossie satisfies none of the project tiers and never becomes the transformation
 project, so this is the only route its declarations have into exploration. An
-Ossie-only repository still contributes all of it:
+Ossie-only repository still contributes all of it. A key and a relationship's
+`from_columns` and `to_columns` name **fields** (upstream's Name Resolution), so
+each member reaches the warehouse through its field's own physical link; a key or
+relationship any of whose fields links no column is opaque as a whole, named in a
+note, and never verified or probed:
 
 - a single-column `primary_key` or `unique_keys` entry becomes a declared unique
   key;
@@ -865,10 +919,13 @@ Ossie-only repository still contributes all of it:
 `explore map --use-project` marks each source relation with the Ossie semantic
 models sitting on it, and rewrites that mark on every read, so a dataset dropped
 from the layer clears rather than leaving a stale claim. `explore profile
---use-project` lets a declared key override the heuristic grain, noting the
-disagreement rather than replacing it silently, and
-`explore relationships --verify` measures a declared composite as one complete
-tuple. A measurement never revises a declared join's confidence: it stays at the
+--use-project` reports a declared `primary_key` as the grain at either arity,
+noting any disagreement with measurement rather than replacing it silently, and
+never reports a `unique_keys` entry as the grain. It also carries `declaration`,
+read from `ai_context.dex`, with no dbt project needed; SLayer and Cube do the same
+from `meta.dex`. Where a dbt model declares the same relation its declaration is
+reported, and `notes` says so. `explore relationships --verify` measures a declared
+composite as one complete tuple. A measurement never revises a declared join's confidence: it stays at the
 1.0 the document asserts, and a probe that finds the parent largely missing is
 reported as a finding instead.
 
@@ -968,6 +1025,40 @@ of them reaches the catalog, the declarations, or the fingerprint, since values
 reach agent context only through `explore query`'s firewall. `meta` is not carried
 either.
 
+### Derived from a declared dbt mart
+
+In a repository that keeps dbt for its models and SLayer for its semantics, a
+model declaration (`transform plan` with `declarations`, or `transform declare`) on
+a mart under `transform.marts_paths` derives the SLayer model it states, through
+the same per-vendor hook that derives a MetricFlow semantic model under
+`vendor: dbt`:
+
+- the grain is `primary_key: true` on each grain column, a composite grain
+  included;
+- a `foreign_key` with `references` is a `many_to_one` join to the SLayer model
+  already sitting on the parent's table, and where none does, no join is invented;
+- every declared column is a column, typed from the SQL's casts or the profiled
+  cache, and the first `time` column is the `default_time_dimension`;
+- a declared aggregation is a saved measure `<column>_<agg>` (formula
+  `<column>:<agg>`); a `semi_additive` measure is left to the author, since SLayer's
+  `last` is not a total across entities on the last period;
+- the population and assumptions sit in the model's `meta.dex`, units, NULL rules
+  and additivity in each column's, and the population also closes the model's
+  description as one sentence. It is never a `filters` entry: the mart's SQL
+  already enforces it.
+
+`sql_table` takes the `database.schema` the SLayer models on the project's other
+models share, else the relation the compiled dbt manifest names (with a note,
+since that is whatever target compiled it last), else the bare table name as a
+named limitation. The model is validated by exactly the checks `semantic slayer
+define` runs and read back through the SLayer catalog. Where its path,
+`models/<data_source>/<mart>.yaml`, is already under `semantic.slayer.models`, it is
+stored as a plan of its own on the SLayer layer beside the dbt plan
+(`data.semantic_proposal.plan_id`; apply both); otherwise it is proposed with the
+`dex config set` that adds the path. `semantic slayer define|update|plan` take
+`declarations` too, and there they annotate a model the payload or the layer
+already defines. Nothing opens SLayer storage, a datasource, or a warehouse.
+
 ### What SLayer's declarations reach in `explore`
 
 - a sole primary-key column, or a `unique` column, becomes a declared unique key;
@@ -977,7 +1068,9 @@ either.
   parent: the joining model is the child, except where `cardinality` is
   `one_to_many`. A single-pair join is also a foreign key, except where
   `cardinality` is `many_to_many`, which says the far side is not a key;
-- `explore map --use-project` marks each relation with the SLayer models on it.
+- `explore map --use-project` marks each relation with the SLayer models on it,
+  and `explore profile|map --use-project` report the primary key as the grain and
+  `meta.dex` as `declaration`.
 
 ### Governed `query` and `values`
 
@@ -1107,6 +1200,11 @@ reads the model files and the metadata dex captured through its own connection.
   match several and anything aggregated across the join is counted more than
   once. A `one_to_many` join is read the other way round. A join declaring no
   cardinality is named in `warnings` as unchecked, never passed silently.
+  Each join's orphans are measured as well. A join the baseline measured is
+  compared with its earlier fraction (`join_orphans_increased`); one declared
+  since, or already over the bound when the baseline was pinned, is held to a
+  20% orphan bound (`declared_join_orphans`). A `many_to_many` join states no
+  containment, so it is held to no bound.
 - **Schema.** SLayer's `validate-models` compares each `sql_table` model with the
   live schema through SLayer's own datasource connection, which carries
   credentials dex does not read. dex runs the same comparison instead, through
@@ -1196,6 +1294,86 @@ change deliberately instead. Keep SLayer tooling from writing the files dex owns
 Not in this release: propagating a rename or a removal, and grounding authored
 models against the warehouse or the exploration cache. Both stay dbt-only.
 
+## Cube models (`vendor: cube`)
+
+[Cube](https://github.com/cube-js/cube) keeps a semantic layer as cubes and views
+in YAML (or JavaScript) model files. Dex reads the configured plain-YAML files
+from the repository statically, validated by its own port of Cube's model rules.
+It needs no Node runtime, no Cube server and no `cube_dbt`, and reading the layer
+opens no warehouse connection and writes no file.
+
+```yaml
+semantic:
+  vendor: cube
+  cube:
+    files:                       # exact paths, relative to the repository root
+      - model/cubes/orders.yml
+      - model/cubes/customers.yml
+      - model/views/sales.yml
+    data_source: default         # the Cube data source dex is connected to
+    url: http://localhost:4000/cubejs-api   # the Cube server that renders queries; never a credential
+```
+
+`files` is an exact allowlist, like `semantic.ossie.files`: no globs, no absolute
+paths, no `..`, no duplicates. `.yml`, `.yaml` and `.js` are accepted;
+`globals.py`, `cube.py` and `cube.js` configure a Cube deployment rather than
+declare a model, and are refused by name. `url` may carry no user, password,
+query string or fragment, since the file is committed. `url` is read only by
+`explore semantic query|values`, which ask a Cube server to render SQL (see the
+query bullet below); it defaults to `http://localhost:4000/cubejs-api`. The `[cube]` extra is the
+dialect engine (`exmergo-dex-core[sql]`), which every connector extra already
+carries; selecting the vendor without it refuses by name with
+`reason: prerequisite`.
+
+In short:
+
+- **Plain YAML is read, nothing else is guessed.** A `.js` file, a YAML file
+  carrying Jinja and a cube or view using `extends` are compiled-only: named in
+  the catalog's `notes` and `compiled_only`, never translated.
+- **Each file is validated** by Dex's own port of Cube's model rules, and every
+  refusal names the file and the element.
+- **Cubes and views are semantic models.** Dimensions are keyed `cube.member`,
+  aggregating measures are measures and metrics, calculated measures are `ratio`
+  or `derived` metrics, and `primary_key` and joins reach `explore` through the
+  declaration channel at confidence 1.0. Cube has no entities, declared in
+  `unavailable`.
+- **`query` and `values`: Cube renders, Dex executes.** Dex asks the Cube server
+  at `url` to render the query over `/v1/sql` and runs the SQL through its own
+  connector under the PII gate and the cost guard, `execution: dex`. Before
+  rendering it holds every member the query names to the server's `/v1/meta`,
+  and refuses a server serving a different model, a plan read from a
+  pre-aggregation, more than one statement, or SQL rendered for another
+  warehouse. Members are `cube.member`; a time grouping names its dimension with
+  the grain suffix (`orders.ordered_at__month`); `--where` is Cube's JSON filter.
+  The token is minted from `CUBEJS_API_SECRET` (environment only); a host other
+  than loopback needs `DEX_CUBE_ALLOWED_HOSTS`. DuckDB, Postgres, BigQuery,
+  Snowflake and Redshift; needs `[cube]` and `[semantic-api]`. In full:
+  [Querying: Cube renders, Dex executes](cube-compatibility.md#querying-cube-renders-dex-executes).
+- **`semantic cube define|update|plan` authors the files** through plan/apply,
+  whole plain-YAML files written byte-for-byte, validated as one prospective set
+  by the same rules the reader runs, with a key Cube does not declare refused in
+  a file the plan writes. JS models, `globals.py`, `cube.py`/`cube.js` and
+  compiled-only files are refused by name. Declarations annotate a cube, rewriting
+  only its own entry in its file.
+- **A declared dbt mart derives a cube** of its own, `<dir>/<mart>.yml`:
+  `primary_key` on the grain dimensions, every other role a dimension, declared
+  aggregations as measures named after the column, `many_to_one` joins from
+  foreign keys to the cube on the parent's table, and the population as
+  `meta.dex` plus one sentence in the description, never a filter or a segment.
+  It is stored as a plan of its own beside the dbt plan where its path is already
+  in `semantic.cube.files`, and proposed with the `dex config set` that adds it
+  otherwise.
+
+- **Every `maintain` axis runs on the layer**, beside a dbt project or with
+  none, without a Cube server: compiled-only definitions recorded by their
+  content and never reported clean, `primary_key`s and each join's
+  `relationship` measured on the grain axis, categorical dimensions re-counted,
+  members' columns and types held to Dex's metadata on the schema axis, and the
+  removals planned through `semantic cube update` under `data.semantic_plan_id`.
+
+What Dex accepts, checks, maps and declines to claim, rule by rule, is in
+[Cube compatibility](cube-compatibility.md).
+
 ## Internal architecture
 
 The semantic surface is split into dependency-directed layers. The package root
@@ -1245,6 +1423,7 @@ from exmergo_dex_core.explore.semantic.conformance import (
     SemanticBackendContract,
     SemanticCatalogContract,
 )
+
 
 class TestMyBackend(SemanticBackendContract, SemanticCatalogContract):
     def make_backend(self):
@@ -1356,30 +1535,45 @@ in `tests/slayer_vendor/test_reader.py`, the catalog one against
 `REFERENCE_LAYER` seeded as SLayer model files.
 
 ## The asymmetry at a glance
-| | Local (`--local`) | Hosted (`--api`) | Native Ossie (`vendor: ossie`) | SLayer (`vendor: slayer`) |
-|---|---|---|---|---|
-| `execution` reported | `dex` | `vendor` | `dex` | `dex` |
-| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime | SLayer, as a dry run over the model files dex validated, in the connector's dialect |
-| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse | dex, through the active connector |
-| Needs a local dbt project | yes | no | no, and it never reads one | no, and it never reads one |
-| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing | the full handshake, ceiling enforced by dex |
-| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none | `.dex/` cache flags on the column behind each grouped and filtered dimension, joined filter columns included, name heuristic as the floor |
-| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies | disclosed on the result, naming the unprofiled relations |
-| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing | refused before spend, against the connection's own inventory, naming the model's `sql_table` |
-| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse | the connector's, never in context; SLayer reads none |
-| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name | `ConnectionSource` (the connector's); a `SemanticSource` is refused by name, since the layer is files in this repository |
-| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
-| Entity descriptions on `list` | no: not authorable from a dbt project (see above), so the field is structurally absent here | a description at most, never a label: the API supplies one where it has one | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
-| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else | name, label, description and `relation`; no `model_ref` and no default time dimension | name, description, `relation` and default time dimension; no label, `model_ref` or primary entity |
-| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads | yes, where the dataset source is one relation this connector can address | yes, where `sql_table` is fully qualified for the connector |
-| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier | on a dimension only; none for an expression or a quoted identifier |
-| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none | no measures at all, declared in `unavailable` | no measures at all, declared in `unavailable` |
-| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved | `declarations`, always: the format states no join graph to resolve through | `declarations`, always: a metric groups by its own model's columns |
-| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks | by SLayer at render time, for a filter's dotted columns only; a group-by stays on the root model |
-| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary | SLayer's built-in grains, applied to the model's `default_time_dimension` |
-| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead | SLayer's dimension-only query, no measure, executed here under the full handshake |
-| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason | not applicable: a dimension is a column of its own model; `--metric` scopes it to a metric's model |
-| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent | every configured document in full, whether or not a metric reads it | every configured model file in full, with a refused file named in `notes` |
-| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip | the configured documents in this repository, through the semantic-source seam | the configured model files in this repository, through the semantic-source seam |
-| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax | `[slayer]`, pinned to one SLayer release |
-| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts | yes, both runtime contracts, against a SLayer rendering of the reference layer |
+| | Local (`--local`) | Hosted (`--api`) | Native Ossie (`vendor: ossie`) | SLayer (`vendor: slayer`) | Cube (`vendor: cube`) |
+|---|---|---|---|---|---|
+| `execution` reported | `dex` | `vendor` | `dex` | `dex` | `dex` |
+| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime | SLayer, as a dry run over the model files dex validated, in the connector's dialect | a Cube server, over `/v1/sql`, which plans without executing; Dex holds every named member to its `/v1/meta` first |
+| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse | dex, through the active connector | dex, through the active connector, in a UTC session |
+| Needs a local dbt project | yes | no | no, and it never reads one | no, and it never reads one | no, and it never reads one |
+| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing | the full handshake, ceiling enforced by dex | the full handshake, ceiling enforced by dex |
+| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none | `.dex/` cache flags on the column behind each grouped and filtered dimension, joined filter columns included, name heuristic as the floor | `.dex/` cache flags on the column behind each grouped and filtered member, view members through their cube's column, name heuristic as the floor |
+| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the unprofiled relations |
+| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing | refused before spend, against the connection's own inventory, naming the model's `sql_table` | refused before spend, against the connection's own inventory; a relation no cube in the repository sits on is refused first |
+| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse | the connector's, never in context; SLayer reads none | the connector's, never in context and never handed to Cube; a JWT minted per request from `CUBEJS_API_SECRET`, never in context |
+| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name | `ConnectionSource` (the connector's); a `SemanticSource` is refused by name, since the layer is files in this repository | none: the layer is files in this repository; a `SemanticSource` is refused by name |
+| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
+| Entity descriptions on `list` | no: not authorable from a dbt project (see above), so the field is structurally absent here | a description at most, never a label: the API supplies one where it has one | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
+| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else | name, label, description and `relation`; no `model_ref` and no default time dimension | name, description, `relation` and default time dimension; no label, `model_ref` or primary entity | name, label (`title`), description, `relation` and default time dimension (a cube's only time dimension); no `model_ref` or primary entity |
+| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads | yes, where the dataset source is one relation this connector can address | yes, where `sql_table` is fully qualified for the connector | yes, from `sql_table`, or a `sql` that is a plain projection of one table; never on a view |
+| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier | on a dimension only; none for an expression or a quoted identifier | on dimensions and measures, traced through `{references}` and a `sql` cube's projection; none for an expression or a quoted identifier |
+| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none | no measures at all, declared in `unavailable` | no measures at all, declared in `unavailable` | resolved from the authored `sql`, so `sum` over `{CUBE}.amount` carries `amount`, and a `count` with no `sql` carries none |
+| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved | `declarations`, always: the format states no join graph to resolve through | `declarations`, always: a metric groups by its own model's columns | `declarations`, always: a metric groups by its cube's dimensions and those its joins reach |
+| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks | by SLayer at render time, for a filter's dotted columns only; a group-by stays on the root model | walked in declared direction for a metric's groupable list; planned by the Cube server at render time |
+| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary | SLayer's built-in grains, applied to the model's `default_time_dimension` | each time dimension's built-in and custom granularities, applied to the time dimension the query groups by |
+| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead | SLayer's dimension-only query, no measure, executed here under the full handshake | Cube's dimension-only query over `/v1/sql`, executed here under the full handshake |
+| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason | not applicable: a dimension is a column of its own model; `--metric` scopes it to a metric's model | Cube plans the join from the dimension's cube; `--metric` adds that measure and names it in `scoped_to` |
+| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent | every configured document in full, whether or not a metric reads it | every configured model file in full, with a refused file named in `notes` | every configured plain-YAML file in full; compiled-only files and elements named in `compiled_only` |
+| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip | the configured documents in this repository, through the semantic-source seam | the configured model files in this repository, through the semantic-source seam | the configured model files in this repository, through the semantic-source seam |
+| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax | `[slayer]`, pinned to one SLayer release | `[cube]` (the dialect engine; no Cube package), plus `[semantic-api]` to query |
+| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts | yes, both runtime contracts, against a SLayer rendering of the reference layer | yes, both runtime contracts and the four semantic-source contracts, against a Cube rendering of the reference layer |
+
+## Population prose in local catalogs
+
+Ossie, SLayer and Cube catalogs, and the local dbt catalog
+(`explore semantic list --local`, read from `target/semantic_manifest.json`),
+omit Dex-generated population sentences in every result mode, including sentences
+in existing files and compiled artifacts, with no rebuild. Catalog reads are
+connectionless and cannot establish that population values are safe. The authored
+description prefix is preserved when the generated suffix matches its structured
+`dex.population` metadata. A stale or malformed suffix causes the description to
+be withheld with a value-free note. This happens before catalog search. Files and
+drift fingerprints are unchanged. Use `explore profile|map --use-project` for the
+structured population, screened by the declaration withholding policy. A
+description with no `dex.population` metadata is never edited, even when it says
+`Population:`. The hosted dbt Cloud catalog is not covered.

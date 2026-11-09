@@ -1,0 +1,15 @@
+version: 2
+unit_tests:
+  - name: fct_depot_trailing_adds_up
+    model: fct_depot_trailing
+    given:
+      - input: ref('stg_pickups')
+        rows:
+          - {depot: harbour, pickup_date: '2025-04-01', parcels: 2}
+          - {depot: harbour, pickup_date: '2025-04-02', parcels: 3}
+          - {depot: harbour, pickup_date: '2025-04-03', parcels: 4}
+    expect:
+      rows:
+        - {depot: harbour, pickup_date: '2025-04-01', parcels_7d: 2}
+        - {depot: harbour, pickup_date: '2025-04-02', parcels_7d: 5}
+        - {depot: harbour, pickup_date: '2025-04-03', parcels_7d: 9}

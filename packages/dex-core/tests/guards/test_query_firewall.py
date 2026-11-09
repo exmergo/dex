@@ -5,11 +5,14 @@ is the point: the policy is static analysis."""
 from __future__ import annotations
 
 import pytest
+import sqlglot
 
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import QueryLimits
 from exmergo_dex_core.guards.query_firewall import (
     QueryRefusedError,
+    _query_outputs,
+    assert_query_shape,
     inspect_query,
 )
 
@@ -286,6 +289,73 @@ def test_pii_refusal_without_a_twin_still_refuses_cleanly(cache: DexCache):
 
 
 # --- refused: shape, resolution, and introspection -------------------------------
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+        "WITH unused AS (DESCRIBE SELECT 1 AS due_at) SELECT 1",
+        "SELECT * FROM ((DESCRIBE SELECT 1 AS due_at)) AS d",
+        "SELECT 1 UNION ALL (DESCRIBE SELECT 1 AS due_at)",
+        "SELECT (DESCRIBE SELECT 1 AS due_at)",
+        "SELECT COUNT((DESCRIBE SELECT 1 AS due_at))",
+    ],
+)
+def test_nested_introspection_is_refused_before_taint_analysis(sql, dialect, cache):
+    for inspect in (
+        lambda: assert_query_shape(sql, dialect=dialect),
+        lambda: inspect_query(sql, cache, LIMITS, dialect=dialect),
+    ):
+        with pytest.raises(QueryRefusedError, match="Describe") as exc:
+            inspect()
+        assert "explore profile" in str(exc.value)
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (DESCRIBE SELECT 1 AS due_at) AS d",
+        "WITH d AS (DESCRIBE SELECT 1 AS due_at) SELECT * FROM d",
+        "SELECT 1 UNION ALL (DESCRIBE SELECT 1 AS due_at)",
+    ],
+)
+def test_taint_walker_defensively_refuses_unsupported_query_nodes(sql, dialect):
+    # Parse independently: an early shape refusal must not hide a walker crash.
+    tree = sqlglot.parse_one(sql, dialect=dialect)
+    with pytest.raises(QueryRefusedError, match="Describe"):
+        _query_outputs(tree, {}, {}, set(), dialect)
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH d AS (SELECT 1 AS due_at) SELECT due_at FROM d",
+        "SELECT * FROM ((SELECT 1 AS due_at)) AS d",
+        "SELECT 1 AS due_at UNION ALL SELECT 2 AS due_at",
+        "WITH d AS (SELECT ID FROM RAW_LISTINGS) SELECT ID FROM d",
+    ],
+)
+def test_supported_nested_queries_still_pass(sql, dialect, cache):
+    assert inspect_query(sql, cache, LIMITS, dialect=dialect).sql
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        ("WITH d AS (SELECT NAME FROM RAW_HOSTS) SELECT NAME FROM d", "PII-flagged"),
+        ("WITH d AS (DELETE FROM RAW_HOSTS RETURNING ID) SELECT * FROM d", "write/DDL"),
+        ("WITH d AS (SELECT query('SELECT 1')) SELECT * FROM d", "not permitted"),
+    ],
+)
+def test_nested_shapes_do_not_weaken_existing_refusals(sql, message, dialect, cache):
+    with pytest.raises(QueryRefusedError, match=message):
+        inspect_query(sql, cache, LIMITS, dialect=dialect)
 
 
 @pytest.mark.parametrize(
@@ -896,6 +966,128 @@ def test_sub_threshold_flag_flows_through_the_unnest_as_a_warning(
         dialect="bigquery",
     )
     assert any("HINT" in warning for warning in inspected.warnings)
+
+
+# --- FROM-clause VALUES: literal rows, no cache needed ----------------------------
+
+
+VALUES_ALLOWED = [
+    (
+        "duckdb",
+        "SELECT ID, w.window_days FROM RAW_HOSTS "
+        "CROSS JOIN (VALUES (7), (28)) AS w (window_days)",
+    ),
+    (
+        "postgres",
+        "SELECT h.ID, w.window_days FROM RAW_HOSTS h, "
+        "(VALUES (7), (28)) AS w (window_days) WHERE w.window_days > 7",
+    ),
+    (
+        "snowflake",
+        "SELECT ID, n, label FROM RAW_HOSTS "
+        "CROSS JOIN (VALUES (7, 'week'), (28, 'month')) AS w (n, label)",
+    ),
+    ("duckdb", "SELECT w.* FROM RAW_HOSTS, (VALUES (7), (28)) AS w (window_days)"),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (-1, NULL, TRUE, 'x')) AS w (v, a, b, c)",
+    ),
+    ("duckdb", "SELECT w.v FROM RAW_HOSTS, (VALUES (-(1))) AS w (v)"),
+    (
+        "clickhouse",
+        "SELECT w.n FROM RAW_HOSTS, "
+        "(VALUES (7, 'week'), (28, 'month')) AS w (n, label)",
+    ),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql"), VALUES_ALLOWED)
+def test_values_source_allowed(dialect: str, sql: str, json_cache: DexCache):
+    inspected = inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert inspected.tables == ["db.main.RAW_HOSTS"]
+    assert not inspected.warnings
+
+
+VALUES_REFUSED = [
+    # A VALUES list with unnamed columns would resolve by a dialect's positional
+    # default; the firewall will not guess names.
+    ("duckdb", "SELECT * FROM RAW_HOSTS, (VALUES (7), (28)) AS w", "name its columns"),
+    ("duckdb", "SELECT * FROM RAW_HOSTS, (VALUES (7), (28))", "name its columns"),
+    # A row that reads a column or a subquery is a side door around resolution.
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (PROFILE)) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, "
+        "(VALUES ((SELECT PROFILE FROM RAW_HOSTS))) AS w (v)",
+        "must be plain literals",
+    ),
+    # Constant expressions are not literals either.
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (1 + 1)) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (UPPER('a'))) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (-'x')) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "duckdb",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (DATE '2020-01-01')) AS w (v)",
+        "must be plain literals",
+    ),
+    # Only a one-element tuple is unwrapped: a column cannot ride in a second slot.
+    (
+        "clickhouse",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES ((1, PROFILE))) AS w (v)",
+        "must be plain literals",
+    ),
+    (
+        "clickhouse",
+        "SELECT w.v FROM RAW_HOSTS, (VALUES (1 + 1)) AS w (v)",
+        "must be plain literals",
+    ),
+    # Its columns are the only names it has: a stray column is still unknown.
+    (
+        "duckdb",
+        "SELECT w.nope FROM RAW_HOSTS, (VALUES (7)) AS w (window_days)",
+        "does not exist",
+    ),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql", "fragment"), VALUES_REFUSED)
+def test_values_source_refused(
+    dialect: str, sql: str, fragment: str, json_cache: DexCache
+):
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert fragment.lower() in str(excinfo.value).lower()
+
+
+def test_values_source_does_not_launder_a_flagged_column(json_cache: DexCache):
+    """Joining a VALUES list changes nothing about what the tables carry: a
+    flagged column projected beside it is still refused as itself."""
+
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(
+            "SELECT PROFILE, w.window_days FROM RAW_HOSTS, "
+            "(VALUES (7)) AS w (window_days)",
+            json_cache,
+            LIMITS,
+            dialect="duckdb",
+        )
+    assert "PROFILE" in str(excinfo.value)
 
 
 # --- what a statement reads, ahead of the guard ----------------------------------

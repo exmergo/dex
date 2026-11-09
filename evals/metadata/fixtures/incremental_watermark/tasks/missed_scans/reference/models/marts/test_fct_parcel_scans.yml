@@ -1,0 +1,41 @@
+version: 2
+
+unit_tests:
+  - name: test_fct_parcel_scans
+    model: fct_parcel_scans
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('stg_parcel_scans')
+        rows:
+          - {hub_code: "NORTH", parcel_id: 5001, scan_id: 1, scanned_at: "2024-01-01 00:00:00"}
+          - {hub_code: "EAST", parcel_id: 5002, scan_id: 2, scanned_at: null}
+    expect:
+      rows:
+        - {scan_id: 1}
+        - {scan_id: 2}
+  - name: test_fct_parcel_scans_incremental
+    model: fct_parcel_scans
+    overrides:
+      macros:
+        is_incremental: true
+    given:
+      - input: ref('stg_parcel_scans')
+        rows:
+          # before the current watermark: outside the horizon
+          - {hub_code: "NORTH", parcel_id: 5001, scan_id: 1, scanned_at: "2024-01-01 00:00:00"}
+          # exactly on the current watermark: delivered late, must load
+          - {hub_code: "NORTH", parcel_id: 5002, scan_id: 2, scanned_at: "2024-01-02 00:00:00"}
+          # after the current watermark
+          - {hub_code: "SOUTH", parcel_id: 5003, scan_id: 3, scanned_at: "2024-01-03 00:00:00"}
+          # no timestamp: a full build loads it, an incremental run does not
+          - {hub_code: "EAST", parcel_id: 5004, scan_id: 4, scanned_at: null}
+      - input: this
+        format: sql
+        rows: |
+          select cast('2024-01-02 00:00:00' as TIMESTAMP) as scanned_at
+    expect:
+      rows:
+        - {scan_id: 2}
+        - {scan_id: 3}

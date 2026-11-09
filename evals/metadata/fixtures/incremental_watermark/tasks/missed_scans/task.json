@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "fct_parcel_scans"
+  ],
+  "prompt": "Ops says some parcel scans never make it into `fct_parcel_scans`. When the feed delivers a scan late with the same timestamp as the latest one we already loaded, the nightly run skips it, and the only way they show up is a full rebuild. Fix the model so the nightly incremental run picks them up, without loading any scan twice. The raw scan table belongs to the feed, so don't touch it."
+}

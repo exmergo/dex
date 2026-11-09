@@ -105,6 +105,20 @@ MANIFESTS = [
     "plugin.json",
     "gemini-extension.json",
 ]
+#: The shapes of link README.md holds: a picture source, a relative link, a `./`
+#: link, an absolute one, and an anchor. Only the relative ones change in claude/.
+README = (
+    '<img src="assets/preview-light.png" />\n'
+    "See [LICENSE](LICENSE), [AGENTS.md](./AGENTS.md),\n"
+    "[the docs](https://docs.exmergo.com/dex) and [Install](#install).\n"
+)
+README_IN_CLAUDE = (
+    '<img src="https://raw.githubusercontent.com/exmergo/dex/main/'
+    'assets/preview-light.png" />\n'
+    "See [LICENSE](https://github.com/exmergo/dex/blob/main/LICENSE),"
+    " [AGENTS.md](https://github.com/exmergo/dex/blob/main/AGENTS.md),\n"
+    "[the docs](https://docs.exmergo.com/dex) and [Install](#install).\n"
+)
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -147,6 +161,8 @@ def release_repo(tmp_path: Path) -> Path:
         path.write_text(
             '{\n  "name": "dex",\n  "version": "1.0.1"\n}\n', encoding="utf-8"
         )
+    (repo / "README.md").write_text(README, encoding="utf-8")
+    (repo / "LICENSE").write_text("Apache License\n", encoding="utf-8")
     _git(repo, "init", "--quiet")
     _git(repo, "add", "--all")
     _git(
@@ -256,6 +272,37 @@ def test_a_release_deletes_what_it_consumed_and_stages_nothing(release_repo):
     status = _git(release_repo, "status", "--porcelain").stdout.splitlines()
     assert " M CHANGELOG.md" in status
     assert " D changelog.d/554.fixed.md" in status
+
+
+@needs_release_tools
+def test_a_release_regenerates_the_claude_directory_folder(release_repo):
+    """claude/ is the folder the Claude directory reads, and it has to hold the
+    released skills, so it is copied after the pins move. A file it held that the
+    skills no longer track goes, and the icon, read once by the directory, stays."""
+
+    stale = release_repo / "claude" / "skills" / "explore" / "removed.md"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("dropped from skills/\n", encoding="utf-8")
+    icon = release_repo / "claude" / ".claude-plugin" / "icon.png"
+    icon.parent.mkdir(parents=True)
+    icon.write_bytes(b"\x89PNG")
+
+    result = _prepare(release_repo, "9.9.9", "9.9.9-rc.1")
+
+    assert result.returncode == 0, result.stderr
+    claude = release_repo / "claude"
+    for wrapper in WRAPPERS:
+        assert (claude / wrapper).read_text(encoding="utf-8") == (
+            'DEX_CORE_VERSION = "9.9.9"\n'
+        )
+    assert not stale.exists()
+    assert icon.read_bytes() == b"\x89PNG"
+    manifest = json.loads(
+        (claude / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert manifest["version"] == "9.9.9-rc.1"
+    assert (claude / "LICENSE").read_text(encoding="utf-8") == "Apache License\n"
+    assert (claude / "README.md").read_text(encoding="utf-8") == README_IN_CLAUDE
 
 
 @needs_release_tools

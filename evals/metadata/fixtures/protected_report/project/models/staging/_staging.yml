@@ -1,0 +1,16 @@
+version: 2
+models:
+  - name: stg_reports
+    description: One row per report, retaining the source's protected comments.
+    config:
+      meta:
+        contains_pii: true
+    columns:
+      - name: report_id
+        data_tests: [unique, not_null]
+      - name: comments
+        description: Protected free text; inspect through metadata and permitted aggregates only.
+        config:
+          meta:
+            contains_pii: true
+            pii_category: free_text

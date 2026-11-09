@@ -15,6 +15,8 @@ from exmergo_dex_core.errors import WarehouseQueryError
 from exmergo_dex_core.maintain import verify as verify_mod
 from exmergo_dex_core.maintain.verify import (
     build_status_findings,
+    built_model_relations,
+    column_contract_check,
     column_contract_findings,
     column_contract_plan,
     compile_check,
@@ -22,12 +24,19 @@ from exmergo_dex_core.maintain.verify import (
 )
 
 
-def _write_artifacts(project_dir: Path, nodes: dict, results: list[dict]) -> None:
+def _write_artifacts(
+    project_dir: Path,
+    nodes: dict,
+    results: list[dict],
+    *,
+    metadata: dict | None = None,
+) -> None:
     target = project_dir / "target"
     target.mkdir(parents=True, exist_ok=True)
-    (target / "manifest.json").write_text(
-        json.dumps({"nodes": nodes}), encoding="utf-8"
-    )
+    manifest: dict = {"nodes": nodes}
+    if metadata is not None:
+        manifest["metadata"] = metadata
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (target / "run_results.json").write_text(
         json.dumps({"results": results}), encoding="utf-8"
     )
@@ -162,7 +171,7 @@ def test_a_successful_node_reports_nothing(tmp_path: Path):
 
 
 def test_a_model_with_no_matching_relation_is_reported():
-    findings = missing_relation_findings(
+    findings, notes = missing_relation_findings(
         model_relations={"stg_orders": "db.main.stg_orders"},
         live_identifiers=["db.main.customers"],
         already_reported=set(),
@@ -171,15 +180,17 @@ def test_a_model_with_no_matching_relation_is_reported():
     assert findings[0].code == "no_relation"
     assert findings[0].identifier == "stg_orders"
     assert findings[0].data["relation_name"] == "db.main.stg_orders"
+    assert notes == []
 
 
 def test_a_model_with_a_matching_relation_is_quiet():
-    findings = missing_relation_findings(
+    findings, notes = missing_relation_findings(
         model_relations={"stg_orders": "db.main.stg_orders"},
         live_identifiers=["db.main.stg_orders"],
         already_reported=set(),
     )
     assert findings == []
+    assert notes == []
 
 
 def test_a_model_already_explained_by_a_build_status_finding_is_not_repeated():
@@ -187,12 +198,64 @@ def test_a_model_already_explained_by_a_build_status_finding_is_not_repeated():
     reporting that twice under a different code would say the same thing
     about the same node in two places."""
 
-    findings = missing_relation_findings(
+    findings, notes = missing_relation_findings(
         model_relations={"stg_orders": "db.main.stg_orders"},
         live_identifiers=[],
         already_reported={"stg_orders"},
     )
     assert findings == []
+    assert notes == []
+
+
+def test_a_model_in_dev_namespace_without_target_dev_is_reported_as_unchecked():
+    """#715: without --target dev, a model whose relation is in the dev
+    namespace is reported as unchecked in notes rather than no_relation."""
+
+    findings, notes = missing_relation_findings(
+        model_relations={"stg_orders": "db.dbt_dev.stg_orders"},
+        live_identifiers=["db.shop.customers"],
+        already_reported=set(),
+        dev_scope="dbt_dev",
+        judged_namespace="shop",
+        reads_dev_target=False,
+    )
+    assert findings == []
+    assert len(notes) == 1
+    assert "the relation check was not run for stg_orders" in notes[0]
+    assert "maintain verify --target dev" in notes[0]
+
+
+def test_a_model_in_dev_namespace_with_target_dev_is_checked():
+    """#715: with --target dev, built dev relations are matched and clean."""
+
+    findings, notes = missing_relation_findings(
+        model_relations={"stg_orders": "db.dbt_dev.stg_orders"},
+        live_identifiers=["db.dbt_dev.stg_orders"],
+        already_reported=set(),
+        dev_scope="dbt_dev",
+        judged_namespace="dbt_dev",
+        reads_dev_target=True,
+    )
+    assert findings == []
+    assert notes == []
+
+
+def test_a_model_in_dev_namespace_missing_with_target_dev_is_reported():
+    """#715: with --target dev, a model missing from the dev namespace is
+    reported as no_relation."""
+
+    findings, notes = missing_relation_findings(
+        model_relations={"stg_orders": "db.dbt_dev.stg_orders"},
+        live_identifiers=["db.dbt_dev.customers"],
+        already_reported=set(),
+        dev_scope="dbt_dev",
+        judged_namespace="dbt_dev",
+        reads_dev_target=True,
+    )
+    assert len(findings) == 1
+    assert findings[0].code == "no_relation"
+    assert findings[0].identifier == "stg_orders"
+    assert notes == []
 
 
 # --- column_contract_plan / column_contract_findings: pure (#230) --------------
@@ -201,8 +264,14 @@ def test_a_model_already_explained_by_a_build_status_finding_is_not_repeated():
 class _ColumnAdapter:
     """Just ``table_metadata``, keyed by identifier."""
 
-    def __init__(self, columns_by_identifier: dict[str, list[tuple[str, str]]]):
+    def __init__(
+        self,
+        columns_by_identifier: dict[str, list[tuple[str, str]]],
+        name: str = "duckdb",
+    ):
         self._columns = columns_by_identifier
+        self.name = name
+        self.dialect = name
 
     def table_metadata(self, identifier: str):
         cols = [
@@ -315,6 +384,106 @@ def test_a_matching_contract_reports_nothing():
         undeclared=0,
     )
     assert findings == []
+
+
+def test_bigquery_type_aliases_do_not_report_mismatch():
+    """#1033: BigQuery equivalent types (such as canonical int64 vs reported
+    INTEGER) are treated as matching rather than column_type_mismatch."""
+    from exmergo_dex_core.dbt_project import column_contract_divergence, types_equal
+
+    adapter = _ColumnAdapter(
+        {
+            "project.dataset.m": [
+                ("id", "INTEGER"),
+                ("is_active", "BOOLEAN"),
+                ("score", "FLOAT"),
+                ("title", "STRING"),
+                ("tags", "ARRAY<INTEGER>"),
+            ]
+        },
+        name="bigquery",
+    )
+    findings, notes = column_contract_findings(
+        adapter,
+        declared_by_model={
+            "m": {
+                "id": "int64",
+                "is_active": "bool",
+                "score": "float64",
+                "title": "string",
+                "tags": "ARRAY<INT64>",
+            }
+        },
+        model_relations={"m": "project.dataset.m"},
+        live_identifiers=["project.dataset.m"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert findings == []
+
+    # Also int vs INTEGER
+    assert types_equal("int", "INTEGER", connector="bigquery")
+
+    # Real mismatch is still reported
+    _missing, _extra, mismatched = column_contract_divergence(
+        {"id": "string"},
+        {"id": "INTEGER"},
+        connector="bigquery",
+    )
+    assert mismatched == [("id", "string", "INTEGER")]
+
+
+def test_duckdb_type_aliases_and_parameterized_types_match():
+    """#1033: DuckDB equivalent types and parameterized varchar(10) vs VARCHAR
+    match."""
+    from exmergo_dex_core.dbt_project import column_contract_divergence
+
+    adapter = _ColumnAdapter(
+        {
+            "db.main.m": [
+                ("id", "INTEGER"),
+                ("name", "VARCHAR"),
+                ("active", "BOOLEAN"),
+                ("amount", "DECIMAL(10,2)"),
+            ]
+        },
+        name="duckdb",
+    )
+    findings, notes = column_contract_findings(
+        adapter,
+        declared_by_model={
+            "m": {
+                "id": "int",
+                "name": "varchar(10)",
+                "active": "bool",
+                "amount": "decimal( 10, 2 )",
+            }
+        },
+        model_relations={"m": "db.main.m"},
+        live_identifiers=["db.main.m"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert findings == []
+
+    # Real mismatch is still reported
+    _missing, _extra, mismatched = column_contract_divergence(
+        {"id": "bigint", "name": "varchar(20)"},
+        {"id": "INTEGER", "name": "varchar(10)"},
+        connector="duckdb",
+    )
+    assert ("id", "bigint", "INTEGER") in mismatched
+    assert ("name", "varchar(20)", "varchar(10)") in mismatched
+
+
+def test_unnormalizable_type_falls_back_to_exact_match():
+    """#1033: Types Dex cannot normalize fall back to exact match and do not
+    silently pass."""
+    from exmergo_dex_core.dbt_project import types_equal
+
+    assert types_equal("CUSTOM_UDT", "custom_udt", connector="duckdb")
+    assert not types_equal("CUSTOM_UDT_A", "CUSTOM_UDT_B", connector="duckdb")
+    assert not types_equal("CUSTOM_UDT(10)", "CUSTOM_UDT", connector="duckdb")
 
 
 def test_undeclared_models_are_named_once_at_the_summary_level_not_per_model():
@@ -734,6 +903,176 @@ def test_a_refused_heuristic_escalation_is_a_note_too():
     assert findings == []
     assert len(notes) == 1
     assert "refused the distinct-count statement" in notes[0]
+
+
+# --- grain without a catalog count (#849) --------------------------------------
+
+
+class _RideAlongGrainAdapter(_GrainAdapter):
+    """Simulates the Postgres adapter: the catalog count is None (an
+    unanalyzed table, reltuples -1, or a view) until a distinct-count scan
+    runs, which rides COUNT(*) along and upgrades it to the exact total."""
+
+    def __init__(self, *, exact_totals, **kwargs):
+        super().__init__(**kwargs)
+        self._exact_totals = exact_totals
+        self._scanned: set[str] = set()
+
+    def table_metadata(self, identifier):
+        meta, cols = super().table_metadata(identifier)
+        if identifier in self._scanned:
+            meta = types.SimpleNamespace(
+                identifier=identifier, row_count=self._exact_totals[identifier]
+            )
+        return meta, cols
+
+    def exact_distinct_counts(self, identifier, columns):
+        result = super().exact_distinct_counts(identifier, columns)
+        if result:
+            self._scanned.add(identifier)
+        return result
+
+    def distinct_combination_counts(self, identifier, combinations):
+        result = super().distinct_combination_counts(identifier, combinations)
+        if result:
+            self._scanned.add(identifier)
+        return result
+
+    def column_aggregates(self, identifier, columns):
+        result = super().column_aggregates(identifier, columns)
+        if result:
+            self._scanned.add(identifier)
+        return result
+
+
+def test_declared_grain_is_measured_when_the_scan_supplies_the_count():
+    # A never-analyzed table (or a view, dbt's default materialization):
+    # the catalog has no count, so the old code reported the grain
+    # unmeasured without ever running the scan that would have supplied it.
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].code == "grain_broken"
+    assert findings[0].exact is True
+    assert findings[0].data["duplicate_count"] == 1
+
+
+def test_declared_composite_is_measured_when_the_scan_supplies_the_count():
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["order_id", "line_no"]},
+        combos={"db.main.a": {("order_id", "line_no"): 198}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [
+                verify_mod.GrainCandidate(
+                    columns=["order_id", "line_no"], source="unique_test_composite"
+                )
+            ]
+        },
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].data["duplicate_count"] == 2
+
+
+def test_declared_grain_compares_against_the_scans_exact_count_not_the_estimate():
+    # A stale planner estimate (210) must not stand in for the exact total
+    # (200) once the scan has run: the verdict is 1 duplicate, not 11.
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": 210},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].data["duplicate_count"] == 1
+
+
+def test_declared_grain_without_any_count_says_so_instead_of_blaming_the_connector():
+    # The scan ran fine; what is missing is the count. The note must say
+    # that, not that the connector could not run the scan.
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 199}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == [
+        "the grain could not be measured for a: no exact row count was available"
+    ]
+
+
+def test_declared_grain_with_a_declined_scan_keeps_the_connector_note():
+    # The scan itself was declined (a metered adapter out of budget), so
+    # the connector note is the accurate one and must survive the split.
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["id"]},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {"a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")]},
+        {"a": "db.main.a"},
+        ["db.main.a"],
+        {"a"},
+    )
+    assert findings == []
+    assert notes == [
+        "the grain could not be measured for a: the connector could not run "
+        "the distinct-count scan this needs"
+    ]
+
+
+def test_heuristic_grain_is_measured_when_the_aggregates_supply_the_count():
+    adapter = _RideAlongGrainAdapter(
+        row_counts={"db.main.a": None},
+        columns={"db.main.a": ["order_id"]},
+        approx={"db.main.a": {"order_id": (199, 0.0)}},
+        exact={"db.main.a": {"order_id": 199}},
+        exact_totals={"db.main.a": 200},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}
+    )
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].exact is True
+    assert findings[0].data["duplicate_count"] == 1
+    assert findings[0].data["source"] == "heuristic"
 
 
 # --- compile_check: wraps shadow_parse -------------------------------------------
@@ -1190,6 +1529,11 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "column_contract",
         "grain",
         "join_contract",
+        "unit",
+        "additivity",
+        "population",
+        "parent_population",
+        "temporal",
     }
 
 
@@ -1342,6 +1686,64 @@ def test_a_group_by_model_with_fewer_rows_is_not_reported(tmp_path: Path):
     assert findings == []
 
 
+def test_a_scalar_aggregate_model_with_one_row_is_not_reported(tmp_path: Path):
+    """#1098: COUNT(*) without a GROUP BY intentionally returns one row; that
+    is design, not unexplained loss."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "control",
+                'select count(*) as source_rows from "wh"."main"."stg_orders"',
+            )
+        },
+    )
+    assert checks[0].reducers == ("a scalar aggregate",)
+    findings, _ = _judge(checks, {"stg_orders": 5000, "control": 1})
+    assert findings == []
+
+
+def test_a_scalar_aggregate_behind_a_cte_is_not_reported(tmp_path: Path):
+    """#1098's reproduced shape: the aggregate lives in a CTE, the final
+    select only projects it. The driving-parent walk must still see the
+    reducer."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "control",
+                "with d as (select count(*) as source_rows from "
+                '"wh"."main"."stg_orders") '
+                "select 1 as control_id, source_rows from d",
+            )
+        },
+    )
+    assert "a scalar aggregate" in checks[0].reducers
+    findings, _ = _judge(checks, {"stg_orders": 5000, "control": 1})
+    assert findings == []
+
+
+def test_a_window_count_does_not_silence_real_row_loss(tmp_path: Path):
+    """#1098: COUNT(*) OVER () is not a scalar aggregate; a join that drops
+    rows must still surface."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "fct",
+                'select o.id, count(*) over () as n from "wh"."main"."stg_orders" o '
+                'inner join "wh"."main"."stg_customers" c on o.cid = c.id',
+            )
+        },
+    )
+    assert "a scalar aggregate" not in checks[0].reducers
+    findings, _ = _judge(checks, {"stg_orders": 200, "stg_customers": 40, "fct": 100})
+    assert [f.code for f in findings] == ["row_loss"]
+
+
 @pytest.mark.parametrize(
     ("sql", "reducer"),
     [
@@ -1387,6 +1789,205 @@ def test_a_model_that_fans_out_is_reported_with_its_join_key(tmp_path: Path):
     assert findings[0].data["join_keys"] == ["o.order_id = i.order_id"]
 
 
+# --- #841: fan-out that is the model's purpose -----------------------------------
+
+_ANCHORED = (
+    "with anchors as (select date_day as anchor_date "
+    'from "wh"."main"."metricflow_time_spine"), '
+    'daily as (select * from "wh"."main"."fct_daily") '
+    "select anchors.anchor_date, daily.page from anchors inner join daily "
+    "on daily.data_date >= anchors.anchor_date - 14 "
+    "and daily.data_date < anchors.anchor_date"
+)
+
+
+def test_a_join_with_no_readable_key_caps_its_fanout_at_medium(tmp_path: Path):
+    """#841: a range join expands on purpose as often as by mistake, and with
+    no key there is nothing to call wrong, so size alone never ranks it high."""
+
+    checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
+    findings, _ = _judge(
+        checks,
+        {"metricflow_time_spine": 2557, "fct_daily": 900, "fct_comparison": 19096},
+    )
+    assert [f.code for f in findings] == ["row_fanout"]
+    finding = findings[0]
+    assert finding.severity == "medium"
+    assert finding.data["join_key_read"] is False
+    assert finding.data["severity_cap_applied"] == "join_key_unread"
+    assert "dex could not read the join key" in finding.detail
+    assert "severity capped at medium" in finding.detail
+
+
+def test_a_fanout_inside_the_medium_band_with_no_key_says_no_cap(tmp_path: Path):
+    checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
+    findings, _ = _judge(
+        checks,
+        {"metricflow_time_spine": 100, "fct_daily": 900, "fct_comparison": 150},
+    )
+    assert findings[0].severity == "medium"
+    assert findings[0].data["join_key_read"] is False
+    assert "severity_cap_applied" not in findings[0].data
+
+
+def test_each_join_is_shown_beside_its_own_keys(tmp_path: Path):
+    """A key read off the second join was shown next to the first join's label
+    (#841): each join now carries the keys its own ON clause holds."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "fct",
+                'select o.id from "wh"."main"."stg_orders" o '
+                'inner join "wh"."main"."spine" s on o.ordered_at >= s.day '
+                'left join "wh"."main"."stg_items" i on o.id = i.order_id',
+            )
+        },
+    )
+    assert checks[0].keys_by_join == ((), ("o.id = i.order_id",))
+    findings, _ = _judge(
+        checks, {"stg_orders": 100, "spine": 10, "stg_items": 300, "fct": 400}
+    )
+    detail = findings[0].detail
+    assert (
+        "inner join to 'wh.main.spine' (dex could not read the join key) or the "
+        "left join to 'wh.main.stg_items' on o.id = i.order_id"
+    ) in detail
+    # One join's key is readable, so the size of the expansion still ranks it.
+    assert findings[0].severity == "high"
+    assert "join_key_read" not in findings[0].data
+
+
+def _fanout(severity: str = "high", code: str = "row_fanout", model: str = "fct"):
+    from exmergo_dex_core.maintain.drift import DriftFinding
+
+    return DriftFinding(
+        axis="row_population",
+        code=code,
+        identifier=model,
+        severity=severity,
+        detail=f"'{model}' has 400 rows against its driving parent",
+        data={"row_count": 400},
+    )
+
+
+def test_a_proven_declared_grain_caps_a_fanout_at_low():
+    """#841: the extra rows are the grain the model declares, proven unique on
+    this run, so the finding stays listed but stops ranking with a wrong key."""
+
+    proven = {"fct": {"columns": ["comparison_key"], "source": "declaration"}}
+    (finding,) = verify_mod.damp_fanout([_fanout()], proven)
+    assert finding.severity == "low"
+    assert finding.data["grain_proven"] == {
+        "columns": ["comparison_key"],
+        "source": "declaration",
+    }
+    assert finding.data["severity_cap_applied"] == "grain_proven"
+    assert finding.data["row_count"] == 400
+    assert "[comparison_key] is proven unique" in finding.detail
+
+
+def test_damping_leaves_other_models_and_other_codes_alone():
+    proven = {"fct": {"columns": ["id"], "source": "unique_test"}}
+    findings = [
+        _fanout(model="other"),
+        _fanout(code="row_loss"),
+        _fanout(severity="low"),
+    ]
+    assert verify_mod.damp_fanout(findings, proven) == findings
+
+
+def test_damping_skips_a_model_whose_other_grain_broke():
+    """One declared grain held and another broke: the duplicate the broken one
+    found is what the fan-out explains, so it keeps its rank."""
+
+    proven = {"fct": {"columns": ["id"], "source": "unique_test"}}
+    broken = _fanout(code="grain_broken")
+    findings = [_fanout(), broken]
+    assert verify_mod.damp_fanout(findings, proven) == findings
+
+
+def test_a_declared_grain_that_holds_is_recorded_as_proven():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200, "db.main.b": 200},
+        columns={"db.main.a": ["id"], "db.main.b": ["id"]},
+        exact={"db.main.a": {"id": 200}, "db.main.b": {"id": 199}},
+    )
+    proven: dict = {}
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {
+            "a": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+            "b": [verify_mod.GrainCandidate(columns=["id"], source="unique_test")],
+        },
+        {"a": "db.main.a", "b": "db.main.b"},
+        ["db.main.a", "db.main.b"],
+        {"a", "b"},
+        proven=proven,
+    )
+    assert proven == {"a": {"columns": ["id"], "source": "unique_test"}}
+    assert [f.identifier for f in findings] == ["b"]
+
+
+def test_a_naming_guess_is_never_recorded_as_proven():
+    """Only a declaration says what one row is; an id-shaped column that
+    happens to be unique says nothing about the model's intent."""
+
+    adapter = _GrainAdapter(
+        row_counts={"db.main.a": 200},
+        columns={"db.main.a": ["id"]},
+        exact={"db.main.a": {"id": 200}},
+        approx={"db.main.a": {"id": (200, 0.0)}},
+    )
+    proven: dict = {}
+    verify_mod.grain_findings(
+        adapter, {}, {"a": "db.main.a"}, ["db.main.a"], {"a"}, proven=proven
+    )
+    assert proven == {}
+
+
+def test_a_passing_uniqueness_test_proves_its_model_s_grain(tmp_path: Path):
+    """A build's own passing `unique` test proved the grain on the relation
+    that build wrote; a failing one proved nothing."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.a": {"name": "a", "resource_type": "model"},
+            "model.p.b": {"name": "b", "resource_type": "model"},
+            "model.p.c": {"name": "c", "resource_type": "model"},
+            "test.p.unique_a_id.1": {
+                "resource_type": "test",
+                "attached_node": "model.p.a",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.unique_b_id.2": {
+                "resource_type": "test",
+                "attached_node": "model.p.b",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.combo_c.3": {
+                "resource_type": "test",
+                "attached_node": "model.p.c",
+                "test_metadata": {
+                    "name": "unique_combination_of_columns",
+                    "kwargs": {"combination_of_columns": ["day", "page"]},
+                },
+            },
+        },
+        results=[
+            {"unique_id": "test.p.unique_a_id.1", "status": "pass"},
+            {"unique_id": "test.p.unique_b_id.2", "status": "fail"},
+            {"unique_id": "test.p.combo_c.3", "status": "pass"},
+        ],
+    )
+    assert verify_mod.passed_grain_tests(tmp_path) == {
+        "a": {"columns": ["id"], "source": "unique_test"},
+        "c": {"columns": ["day", "page"], "source": "unique_test_composite"},
+    }
+
+
 def test_a_union_is_not_mistaken_for_fanout(tmp_path: Path):
     """A set operation has more rows than either side by construction, and no
     single driving parent to compare against, so it is declared rather than
@@ -1417,15 +2018,15 @@ def test_cross_join_to_set_operation_cte_names_cte_in_detail(tmp_path: Path):
             "m.1": _model(
                 "windowed_orders",
                 "with windows as ("
-                '  select "w1" as window_id union all select "w2" as window_id'
+                "  select 'w1' as window_id union all select 'w2' as window_id"
                 ") "
                 'select * from "wh"."main"."stg_orders" cross join windows',
             ),
             "m.2": _model(
                 "anon_windowed_orders",
                 'select * from "wh"."main"."stg_orders" '
-                'cross join (select "w1" as window_id '
-                'union all select "w2" as window_id)',
+                "cross join (select 'w1' as window_id "
+                "union all select 'w2' as window_id)",
             ),
         },
     )
@@ -1518,6 +2119,69 @@ def test_an_incremental_model_is_skipped_and_the_note_says_why(tmp_path: Path):
     )
     assert checks == []
     assert "incremental" in notes[0] and "events" in notes[0]
+
+
+def test_only_a_model_this_run_recomputed_passes_the_incremental_skip(tmp_path: Path):
+    """`maintain verify` passes nothing here, so on its own it stays unchanged."""
+
+    target = tmp_path / "target"
+    target.mkdir()
+    incremental = {"materialized": "incremental"}
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "m.1": _model(
+                        "rebuilt",
+                        'select * from "wh"."main"."raw"',
+                        config=incremental,
+                    ),
+                    "m.2": _model(
+                        "kept", 'select * from "wh"."main"."raw"', config=incremental
+                    ),
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["rebuilt"]
+    )
+    assert [c.model for c in checks] == ["rebuilt"]
+    assert len(notes) == 1 and "kept" in notes[0] and "rebuilt" not in notes[0]
+
+    checks, notes, _ = verify_mod.row_population_plan(tmp_path, "duckdb")
+    assert checks == []
+    assert "kept" in notes[0] and "rebuilt" in notes[0]
+
+
+def test_a_same_named_copy_dbt_did_not_rebuild_keeps_the_skip(tmp_path: Path):
+    """The label is in the list because another package's copy was rebuilt."""
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.pkg.events": _model(
+                        "events",
+                        'select * from "wh"."main"."raw"',
+                        config={"materialized": "incremental", "full_refresh": False},
+                    )
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks, notes, _ = verify_mod.row_population_plan(
+        tmp_path, "duckdb", recomputed=["events"]
+    )
+    assert checks == []
+    assert "events" in notes[0]
 
 
 def test_an_ephemeral_model_contributes_nothing(tmp_path: Path):
@@ -1717,6 +2381,111 @@ def test_verify_reports_row_loss_end_to_end(
     assert "row_population" not in payload["data"]["suppressed"]
 
 
+def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
+    """#841's shape on a real warehouse: Monday anchors off a date spine,
+    range-joined to a daily fact, one row per anchor x day x page."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 100) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_daily AS SELECT DATE '2024-01-01' + i::INTEGER AS "
+        "data_date, p AS page FROM range(0, 100) t(i), (VALUES ('a'), ('b')) v(p)"
+    )
+    sql = (
+        "with anchors as (select date_day as anchor_date from "
+        '"warehouse"."main"."metricflow_time_spine" where dayofweek(date_day) = 1), '
+        'daily as (select * from "warehouse"."main"."fct_daily") '
+        "select anchors.anchor_date || '|' || daily.data_date || '|' || daily.page "
+        "as comparison_key, anchors.anchor_date, daily.data_date, daily.page "
+        "from anchors inner join daily "
+        "on daily.data_date >= anchors.anchor_date - 14 "
+        "and daily.data_date < anchors.anchor_date"
+    )
+    built = f"{sql} union all ({sql} limit 5)" if duplicate else sql
+    maintain_repo.sql(f"CREATE TABLE fct_comparison AS {built}")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.fct_comparison": {
+                "name": "fct_comparison",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_comparison"',
+                "compiled_code": sql,
+                "config": {"meta": {"dex": {"grain": ["comparison_key"]}}},
+            },
+            "model.maintain_test.fct_order_lines": {
+                "name": "fct_order_lines",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_order_lines"',
+                "compiled_code": (
+                    'select o.order_id from "warehouse"."main"."orders" o '
+                    'inner join "warehouse"."main"."orders" p '
+                    "on o.customer_id = p.customer_id"
+                ),
+            },
+        },
+        results=[],
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_order_lines AS SELECT o.order_id FROM orders o "
+        "JOIN orders p ON o.customer_id = p.customer_id"
+    )
+
+
+def test_verify_ranks_an_intended_expansion_low_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#841 end to end: the anchored comparison's declared grain is counted
+    unique, so its fan-out stays listed at low; a fan-out on a wrong key in the
+    same sweep, with no grain to speak for it, still ranks high."""
+
+    _anchored_comparison(maintain_repo)
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    fanouts = {
+        f["identifier"]: f
+        for f in payload["data"]["findings"]
+        if f["code"] == "row_fanout"
+    }
+    comparison = fanouts["fct_comparison"]
+    assert comparison["severity"] == "low"
+    assert comparison["data"]["grain_proven"] == {
+        "columns": ["comparison_key"],
+        "source": "declaration",
+    }
+    assert comparison["data"]["join_key_read"] is False
+    # One finding states one cap: the grain's replaces the unread key's.
+    assert comparison["detail"].count("severity capped") == 1
+    assert "severity capped at low" in comparison["detail"]
+    assert (
+        comparison["data"]["driving_parent"] == "warehouse.main.metricflow_time_spine"
+    )
+    assert fanouts["fct_order_lines"]["severity"] == "high"
+    assert not [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_comparison"
+    ]
+
+
+def test_verify_leaves_a_fanout_undamped_when_its_grain_broke(
+    maintain_repo, _assume_the_project_compiles
+):
+    _anchored_comparison(maintain_repo, duplicate=True)
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    by_code = {
+        f["code"]: f
+        for f in payload["data"]["findings"]
+        if f["identifier"] == "fct_comparison"
+    }
+    assert by_code["grain_broken"]["data"]["duplicate_count"] == 5
+    assert by_code["row_fanout"]["severity"] == "medium"
+    assert "grain_proven" not in by_code["row_fanout"]["data"]
+
+
 def test_verify_names_generated_sql_in_notes(
     maintain_repo, _assume_the_project_compiles
 ):
@@ -1881,7 +2650,27 @@ def test_a_range_join_is_skipped_and_stated():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "no conjunctive column-to-column equality" in skipped[0]
+    assert "no conjunctive column-to-column equality" in str(skipped[0])
+
+
+def test_a_join_that_filters_beside_its_keys_says_so_rather_than_no_key():
+    """`left join orders o on o.customer_id = c.id and o.status <> 'x'` has a
+    key; the skip is right (a probe of the key alone would count the orders the
+    filter excludes as matches, hiding customers left with none), and the reason
+    must not claim there is no key."""
+
+    candidates, skipped = verify_mod._model_joins(
+        _parsed(
+            'select c.id from "wh"."main"."customers" c '
+            'left join "wh"."main"."orders" o '
+            "on o.customer_id = c.id and o.status <> 'cancelled'"
+        ),
+        sql_shape,
+    )
+    assert candidates == []
+    assert len(skipped) == 1
+    assert "filters as well as pairing keys" in str(skipped[0])
+    assert "no conjunctive" not in str(skipped[0])
 
 
 def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
@@ -1899,7 +2688,7 @@ def test_an_or_condition_is_skipped_not_treated_as_a_composite_key():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "no conjunctive column-to-column equality" in skipped[0]
+    assert "no conjunctive column-to-column equality" in str(skipped[0])
 
 
 def test_a_cte_renamed_column_resolves_to_the_physical_one():
@@ -1931,7 +2720,7 @@ def test_a_cte_computed_column_is_unresolvable_and_skipped():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert "could not be resolved" in str(skipped[0])
 
 
 def test_a_select_star_cte_passes_the_column_through_unchanged():
@@ -1964,12 +2753,13 @@ def test_a_join_inside_a_joined_cte_is_also_visited():
         ),
         sql_shape,
     )
-    assert skipped == []
     pairs = {(c.from_relation, c.to_relation) for c in candidates}
-    assert pairs == {
-        ("wh.main.orders", "wh.main.customers"),
-        ("wh.main.customers", "wh.main.regions"),
-    }
+    assert pairs == {("wh.main.customers", "wh.main.regions")}
+    # The outer join reads `customers` through that inner join, which can drop
+    # customers, so it is not probed against the whole table (#1159).
+    (skip,) = skipped
+    assert skip.code == "filtered_cte"
+    assert "CTE `cust_regions`" in skip.reason
 
 
 def test_a_using_join_is_an_equality_candidate():
@@ -2005,18 +2795,20 @@ def test_a_chained_using_join_with_two_relations_in_scope_is_skipped():
     assert len(candidates) == 1
     assert candidates[0].to_relation == "wh.main.customers"
     assert len(skipped) == 1
-    assert "more than one relation already in scope" in skipped[0]
+    assert "more than one relation already in scope" in str(skipped[0])
 
 
 def test_a_cte_column_projected_from_a_joined_relation_resolves_correctly():
     # `c.region_id` inside the CTE comes from `customers`, joined there, not
-    # from the CTE's own FROM relation (`orders`, which has no region_id).
+    # from the CTE's own FROM relation (`orders`, which has no region_id). A
+    # RIGHT join keeps every customer, so the column resolves through; an
+    # inner join could drop some and would be `filtered_cte` (#1159).
     candidates, skipped = verify_mod._model_joins(
         _parsed(
             "with x as ("
             "  select o.order_id, c.region_id from "
             '  "wh"."main"."orders" o '
-            '  inner join "wh"."main"."customers" c on o.customer_id = c.id'
+            '  right join "wh"."main"."customers" c on o.customer_id = c.id'
             ") "
             'select * from x inner join "wh"."main"."regions" r '
             "on x.region_id = r.id"
@@ -2047,7 +2839,7 @@ def test_one_unresolvable_composite_component_skips_the_whole_join():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert "could not be resolved" in str(skipped[0])
 
 
 def test_a_join_inside_an_inline_subquery_is_still_visited():
@@ -2157,13 +2949,15 @@ def test_a_column_read_through_a_union_cte_is_unresolvable():
     )
     assert candidates == []
     assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert skipped[0].code == "set_operation_cte"
 
 
-def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
+def test_a_filtered_cte_is_measured_with_its_filter_not_unfiltered():
     # `where active = true` means the real join is against only the active
     # subset; probing the whole physical table instead can report a join
-    # healthy that has zero overlap once the filter is honored.
+    # healthy that has zero overlap once the filter is honored. A simple
+    # filter is carried onto the probe (#1085); any other reducer is still
+    # skipped as `filtered_cte` (tests/maintain/test_filtered_join_coverage.py).
     candidates, skipped = verify_mod._model_joins(
         _parsed(
             "with active_customers as ("
@@ -2174,9 +2968,11 @@ def test_a_filtered_cte_is_skipped_rather_than_measured_unfiltered():
         ),
         sql_shape,
     )
-    assert candidates == []
-    assert len(skipped) == 1
-    assert "could not be resolved" in skipped[0]
+    assert skipped == []
+    (candidate,) = candidates
+    assert candidate.to_relation == "wh.main.customers"
+    assert candidate.to_filters == ('"active" = TRUE',)
+    assert candidate.from_filters == ()
 
 
 def test_a_cross_join_is_silently_excluded():
@@ -2339,21 +3135,37 @@ class _FreeAdapter:
     dialect = "duckdb"
 
 
-def _fake_verify_relationships(fractions_by_from_column: dict[str, float]):
-    """A stand-in for `explore.relationships.verify_relationships` that sets
-    ``verified``/``orphan_fraction`` from a lookup keyed by the driving
-    column, instead of running the real probe SQL: #228's own logic (the
-    threshold grading, the finding shape, the handshake wiring) is what
-    these tests check, not the probe `explore relationships --verify`
-    already owns and already tests."""
+def _fake_measure_coverage(fractions_by_from_column: dict[str, float]):
+    """A stand-in for `explore.relationships.measure_coverage` that reports
+    100 eligible rows over 10 distinct keys per join, unmatched in the given
+    fraction, keyed by the driving column, instead of running the real probe
+    SQL: the grading, the finding shape and the handshake wiring are what
+    these tests check; the probe has tests of its own."""
 
-    def verify(adapter, relationships, *, timeout_seconds=30.0, progress=None):
+    from exmergo_dex_core.explore.relationships import JoinCoverageCounts
+
+    def measure(adapter, relationships, *, timeout_seconds=30.0):
+        measured = []
         for rel in relationships:
             fraction = fractions_by_from_column.get(rel.from_columns[0])
-            rel.verified = fraction is not None
-            rel.orphan_fraction = fraction
+            if fraction is None:
+                continue
+            measured.append(
+                (
+                    rel,
+                    JoinCoverageCounts(
+                        rows=100,
+                        null_key_rows=0,
+                        eligible_rows=100,
+                        matched_rows=round(100 * (1 - fraction)),
+                        eligible_keys=10,
+                        matched_keys=round(10 * (1 - fraction)),
+                    ),
+                )
+            )
+        return measured, []
 
-    return verify
+    return measure
 
 
 def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
@@ -2361,8 +3173,8 @@ def test_a_near_complete_orphan_rate_is_join_zero_overlap(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.95}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.95}),
     )
     candidates = {
         "fct_orders": [
@@ -2394,8 +3206,8 @@ def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.3}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.3}),
     )
     candidates = {
         "fct_orders": [
@@ -2404,7 +3216,7 @@ def test_a_moderate_orphan_rate_is_join_orphans_not_characterized_as_broken(
                 from_columns=("customer_id",),
                 to_relation="b",
                 to_columns=("id",),
-                side="left",
+                side="inner",
             )
         ]
     }
@@ -2421,8 +3233,8 @@ def test_a_healthy_join_reports_nothing(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.01}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.01}),
     )
     candidates = {
         "fct_orders": [
@@ -2468,8 +3280,8 @@ def test_the_handshake_defers_when_supplied(monkeypatch):
 
     monkeypatch.setattr(
         rel_mod,
-        "verify_relationships",
-        _fake_verify_relationships({"customer_id": 0.95}),
+        "measure_coverage",
+        _fake_measure_coverage({"customer_id": 0.95}),
     )
     candidates = {
         "fct_orders": [
@@ -2520,7 +3332,9 @@ def test_the_combined_handshake_prices_both_axes_in_one_ask(monkeypatch):
         join_cost_calls.append(1)
         return 5.0, 2
 
-    row_ask, join_ask = _combined_scan_handshake(adapter=object(), join_cost=join_cost)
+    row_ask, join_ask, _facts_ask = _combined_scan_handshake(
+        adapter=object(), join_cost=join_cost
+    )
 
     # row_ask runs first, the way `verify()` itself calls row population
     # before join contract.
@@ -2566,7 +3380,9 @@ def test_join_ask_alone_does_not_double_count_its_own_estimate(monkeypatch):
         join_cost_calls.append(1)
         return 5.0, 2
 
-    _row_ask, join_ask = _combined_scan_handshake(adapter=object(), join_cost=join_cost)
+    _row_ask, join_ask, _facts_ask = _combined_scan_handshake(
+        adapter=object(), join_cost=join_cost
+    )
     offer = join_ask(5.0, 2)  # row_ask never called: row had nothing to count
 
     assert offer == "offer"
@@ -2595,7 +3411,7 @@ def test_the_combined_handshake_names_only_the_axis_that_needs_one(monkeypatch):
         ),
     )
 
-    row_ask, _join_ask = _combined_scan_handshake(
+    row_ask, _join_ask, _facts_ask = _combined_scan_handshake(
         adapter=object(), join_cost=lambda: (5.0, 2)
     )
     offer = row_ask(0.0, 0)  # row population: nothing to count
@@ -2617,7 +3433,7 @@ def test_the_combined_handshake_returns_none_when_neither_axis_has_work(monkeypa
         lambda *a, **k: pytest.fail("should not be asked with nothing to price"),
     )
 
-    row_ask, join_ask = _combined_scan_handshake(
+    row_ask, join_ask, _facts_ask = _combined_scan_handshake(
         adapter=object(), join_cost=lambda: (0.0, 0)
     )
     assert row_ask(0.0, 0) is None
@@ -2633,7 +3449,7 @@ def _join_node(name: str, sql: str) -> dict:
     }
 
 
-def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
+def test_verify_reports_disjoint_keys_as_join_no_match_end_to_end(
     maintain_repo, _assume_the_project_compiles
 ):
     """#228's first acceptance bullet: a model joining two relations with
@@ -2656,9 +3472,13 @@ def test_verify_reports_disjoint_keys_as_join_zero_overlap_end_to_end(
     rc, payload = maintain_repo.dex("maintain", "verify")
     assert rc == 0 and payload["status"] == "ok", payload
     findings = payload["data"]["findings"]
-    assert findings[0]["code"] == "join_zero_overlap"
+    assert findings[0]["code"] == "join_no_match"
     assert findings[0]["severity"] == "high"
     assert findings[0]["data"]["orphan_fraction"] == 1.0
+    assert findings[0]["data"]["matched_rows"] == 0
+    (record,) = payload["data"]["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["coverage"] == {"rows": 0.0, "keys": 0.0}
 
 
 def test_verify_reports_nothing_for_a_healthy_join_end_to_end(
@@ -2714,13 +3534,45 @@ def test_verify_reports_sparse_orphans_as_join_orphans_not_broken_end_to_end(
     )
     rc, payload = maintain_repo.dex("maintain", "verify")
     assert rc == 0 and payload["status"] == "ok", payload
+    # A LEFT join keeps its unmatched rows, and nothing in the declaration
+    # says they must match: evidence on the record, not a finding (#857).
+    assert not any(
+        f["code"].startswith("join_") for f in payload["data"]["findings"]
+    ), payload["data"]["findings"]
+    (record,) = payload["data"]["join_coverage"]
+    assert record["status"] == "satisfied"
+    assert record["optional_unmatched"] is True
+    assert 0.1 < record["coverage"]["rows"] < 0.8
+
+
+def test_verify_reports_sparse_orphans_on_an_inner_join_as_join_orphans(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The same sparse right side behind an inner join drops the unmatched
+    rows, which is reported at its measured fraction against the stated
+    default threshold, and not characterized as broken."""
+
+    maintain_repo.sql("DELETE FROM customers WHERE id <= 10")
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _join_node(
+                "stg_orders",
+                'select o.order_id, c.name from "warehouse"."main"."stg_orders" o '
+                'inner join "warehouse"."main"."customers" c '
+                "on o.customer_id = c.id",
+            )
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
     findings = [f for f in payload["data"]["findings"] if f["code"] == "join_orphans"]
     assert len(findings) == 1
     assert findings[0]["severity"] == "medium"
     assert 0.2 <= findings[0]["data"]["orphan_fraction"] < 0.9
-    assert not any(
-        f["code"] == "join_zero_overlap" for f in payload["data"]["findings"]
-    )
+    assert findings[0]["data"]["threshold_source"] == "default"
+    assert findings[0]["data"]["threshold"] == 0.2
 
 
 def test_verify_states_a_skipped_non_equality_join_end_to_end(
@@ -3110,3 +3962,507 @@ def test_verify_suppression_names_uncompiled_models_end_to_end(
     suppressed = payload["data"]["suppressed"]["row_population"]
     assert "no compiled SQL found for stg_returns" in suppressed
     assert "run `dbt compile` or `dbt build`" in suppressed
+
+
+def test_maintain_verify_refuses_prod_target(maintain_repo):
+    """#715: maintain verify --target refuses production-looking targets."""
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.transform.build import ProdTargetRefusedError
+
+    engine = DexEngine(repo_root=maintain_repo.root)
+    with pytest.raises(ProdTargetRefusedError, match="looks like production"):
+        maintain_cmds.verify(engine, target="prod")
+
+    with pytest.raises(ProdTargetRefusedError, match="looks like production"):
+        maintain_cmds.verify(engine, target="production")
+
+    with pytest.raises(ProdTargetRefusedError, match="not the dev target"):
+        maintain_cmds.verify(engine, target="staging")
+
+    rc, payload = maintain_repo.dex("maintain", "verify", "--target", "prod")
+    assert rc != 0
+    assert payload["status"] == "error"
+    assert any("looks like production" in err for err in payload["errors"])
+
+
+def test_maintain_verify_without_target_dev_reports_dev_models_as_unchecked(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#715: without --target dev, a model that exists only in the dev namespace
+    is reported as unchecked with a note and pointer to --target dev, and never
+    as a high-severity no_relation finding. data names the judged namespace and
+    manifest target."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_returns": {
+                "name": "stg_returns",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_returns"',
+            }
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    data = payload["data"]
+    assert data["findings"] == []
+    assert data["manifest_target"] == "dev"
+    assert data["judged_namespace"] == "warehouse.main"
+    assert "target" not in data
+
+    suppressed = data["suppressed"]["no_relation"]
+    assert "outside the judged namespace (warehouse.main)" in suppressed
+    assert "maintain verify --target dev" in suppressed
+
+    warnings = payload["warnings"]
+    assert any(
+        "judged namespace 'warehouse.main'" in w and "maintain verify --target dev" in w
+        for w in warnings
+    )
+
+    notes = data["notes"]
+    assert any(
+        "the relation check was not run for stg_returns" in n
+        and "maintain verify --target dev" in n
+        for n in notes
+    )
+
+
+def test_maintain_verify_target_dev_reads_dev_namespace(tmp_path: Path):
+    """#715: maintain verify --target dev reads the dev namespace, judges models,
+    and returns judged_namespace and target in the result envelope."""
+
+    from exmergo_dex_core.adapters.base import ObjectMeta
+    from exmergo_dex_core.config import DexConfig, PostgresTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.storage import MemoryStore
+
+    class _DevAdapter:
+        name = "postgres"
+        dialect = "postgres"
+        paradigm = Paradigm.DB_LOAD
+        cost_gate = None
+        target = PostgresTarget(schemas=["shop"], dev_schema="dbt_dev")
+
+        def __init__(self):
+            self.dev_target = None
+
+        def read_dev_target(self, scope: str | None) -> None:
+            self.dev_target = scope
+
+        def list_objects(self, *, include_views: bool = True):
+            if self.dev_target == "dbt_dev":
+                return [
+                    ObjectMeta(
+                        identifier="dexdb.dbt_dev.stg_orders",
+                        object_type="table",
+                        schema="dbt_dev",
+                        name="stg_orders",
+                        row_count=10,
+                        byte_size=1024,
+                        column_count=2,
+                    )
+                ]
+            return [
+                ObjectMeta(
+                    identifier="dexdb.shop.customers",
+                    object_type="table",
+                    schema="shop",
+                    name="customers",
+                    row_count=100,
+                    byte_size=4096,
+                    column_count=3,
+                )
+            ]
+
+        def table_metadata(self, identifier: str):
+            from exmergo_dex_core.adapters.base import ColumnMeta
+
+            return (
+                ObjectMeta(
+                    identifier=identifier,
+                    object_type="table",
+                    schema=identifier.split(".")[1],
+                    name=identifier.split(".")[-1],
+                    row_count=10,
+                    byte_size=1024,
+                    column_count=2,
+                ),
+                [
+                    ColumnMeta(
+                        name="id", data_type="integer", nullable=False, ordinal=1
+                    ),
+                    ColumnMeta(
+                        name="order_id",
+                        data_type="integer",
+                        nullable=False,
+                        ordinal=2,
+                    ),
+                ],
+            )
+
+        def exact_distinct_counts(self, identifier: str, columns: list[str]):
+            return dict.fromkeys(columns, 10)
+
+        def distinct_combination_counts(
+            self, identifier: str, combinations: list[list[str]]
+        ):
+            return {tuple(c): 10 for c in combinations}
+
+    # Set up minimal project dir with compiled dev manifest
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    (project_dir / "dbt_project.yml").write_text("name: test_proj\nversion: '1.0'\n")
+    _write_artifacts(
+        project_dir,
+        nodes={
+            "model.test_proj.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"dexdb"."dbt_dev"."stg_orders"',
+                "columns": {
+                    "id": {"name": "id", "data_type": "integer"},
+                    "order_id": {"name": "order_id", "data_type": "integer"},
+                },
+            }
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+
+    adapter = _DevAdapter()
+    config = DexConfig(
+        connector="postgres",
+        dbt_project_dir=str(project_dir),
+        postgres=PostgresTarget(schemas=["shop"], dev_schema="dbt_dev"),
+    )
+    engine = DexEngine(config=config, store=MemoryStore(), repo_root=str(tmp_path))
+    engine._adapter_instance = adapter
+
+    # Without --target dev:
+    res_no_target = maintain_cmds.verify(engine)
+    assert res_no_target.findings == []
+    assert res_no_target.target is None
+    assert res_no_target.manifest_target == "dev"
+    assert res_no_target.judged_namespace == "dexdb.shop"
+    assert "no_relation" in res_no_target.suppressed
+    data_no_target = res_no_target.data()
+    assert "target" not in data_no_target
+    assert data_no_target["manifest_target"] == "dev"
+    assert data_no_target["judged_namespace"] == "dexdb.shop"
+
+    # With --target dev:
+    res_dev = maintain_cmds.verify(engine, target="dev")
+    assert adapter.dev_target == "dbt_dev"
+    assert res_dev.findings == []
+    assert res_dev.target == "dev"
+    assert res_dev.manifest_target == "dev"
+    assert res_dev.judged_namespace == "dbt_dev"
+    assert "no_relation" not in res_dev.suppressed
+    data_dev = res_dev.data()
+    assert data_dev["target"] == "dev"
+    assert data_dev["manifest_target"] == "dev"
+    assert data_dev["judged_namespace"] == "dbt_dev"
+
+
+def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
+    tmp_path: Path,
+):
+    """#1155: a declared parent that is a package seed built into
+    ``<dev schema>_<name>`` (a package's ``+schema``) is read by
+    ``maintain verify --target dev`` and judged, not reported unbuilt."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+    from exmergo_dex_core.config import DexConfig, PostgresTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.storage import MemoryStore
+
+    def meta(schema: str, name: str) -> ObjectMeta:
+        """Metadata for one built table."""
+        return ObjectMeta(
+            identifier=f"dexdb.{schema}.{name}",
+            object_type="table",
+            schema=schema,
+            name=name,
+            row_count=4,
+            byte_size=1024,
+            column_count=1,
+        )
+
+    class _DevAdapter:
+        name = "postgres"
+        dialect = "postgres"
+        paradigm = Paradigm.DB_LOAD
+        cost_gate = None
+        target = PostgresTarget(schemas=["shop"], dev_schema="dbt_dev")
+
+        def __init__(self):
+            self.reads: list = []
+            self.probes: list[str] = []
+
+        def read_dev_target(self, scope) -> None:
+            self.reads.append(scope)
+
+        def _namespaces(self) -> set[str]:
+            """The dev namespaces the last command asked to read."""
+            scope = self.reads[-1] if self.reads else None
+            return {scope} if isinstance(scope, str) else set(scope or ())
+
+        def list_objects(self, *, include_views: bool = True):
+            objects = [meta("shop", "customers")]
+            if "dbt_dev" in self._namespaces():
+                objects.append(meta("dbt_dev", "threads"))
+            if "dbt_dev_inbox" in self._namespaces():
+                objects.append(meta("dbt_dev_inbox", "inbox_states"))
+            return objects
+
+        def table_metadata(self, identifier: str):
+            return (
+                meta(*identifier.split(".")[1:]),
+                [ColumnMeta(name="state", data_type="text", nullable=False, ordinal=1)],
+            )
+
+        def exact_distinct_counts(self, identifier: str, columns: list[str]):
+            return dict.fromkeys(columns, 4)
+
+        def distinct_combination_counts(self, identifier, combinations):
+            return {tuple(c): 4 for c in combinations}
+
+        def run_query(self, sql: str, *, max_rows: int, timeout_seconds=None):
+            """Answer the parent probe: four parents, every one present."""
+
+            from exmergo_dex_core.adapters.base import QueryResult
+
+            if "dex_parents_present" not in sql:
+                raise RuntimeError("only the parent probe is answered here")
+            self.probes.append(sql)
+            counts = {
+                "dex_out_rows": 4,
+                "dex_out_keys": 4,
+                "dex_out_null": 0,
+                "dex_out_known": 4,
+                "dex_parent_keys": 4,
+                "dex_eligible_parents": 4,
+                "dex_parents_present": 4,
+            }
+            return QueryResult(
+                columns=list(counts),
+                types=["integer"] * len(counts),
+                cells=[list(counts.values())],
+                truncated=False,
+            )
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    (project_dir / "dbt_project.yml").write_text("name: test_proj\nversion: '1.0'\n")
+    parent = {"model": "inbox_states", "key": {"state": "state"}}
+    _write_artifacts(
+        project_dir,
+        nodes={
+            "model.test_proj.threads": {
+                "name": "threads",
+                "resource_type": "model",
+                "relation_name": '"dexdb"."dbt_dev"."threads"',
+                "config": {"meta": {"dex": {"population": {"parent": parent}}}},
+                "columns": {"state": {"name": "state", "data_type": "text"}},
+            },
+            "seed.tiny_inbox.inbox_states": {
+                "name": "inbox_states",
+                "resource_type": "seed",
+                "package_name": "tiny_inbox",
+                "relation_name": '"dexdb"."dbt_dev_inbox"."inbox_states"',
+            },
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+    adapter = _DevAdapter()
+    config = DexConfig(
+        connector="postgres",
+        dbt_project_dir=str(project_dir),
+        postgres=PostgresTarget(schemas=["shop"], dev_schema="dbt_dev"),
+    )
+    engine = DexEngine(config=config, store=MemoryStore(), repo_root=str(tmp_path))
+    engine._adapter_instance = adapter
+
+    result = maintain_cmds.verify(engine, target="dev")
+
+    assert adapter.reads[-1] == ["dbt_dev", "dbt_dev_inbox"], adapter.reads
+    assert any("dbt_dev_inbox" in note for note in result.notes)
+    unbuilt = [
+        reason
+        for reason in [
+            result.suppressed.get("parent_population", ""),
+            *(
+                r.get("reason") or ""
+                for r in result.data().get("parent_population") or []
+            ),
+        ]
+        if "was not built" in reason
+    ]
+    assert unbuilt == [], unbuilt
+    [probe] = adapter.probes
+    normalized = probe.replace('"', "").lower()
+    assert "dexdb.dbt_dev.threads" in normalized, probe
+    assert "dexdb.dbt_dev_inbox.inbox_states" in normalized, probe
+    [record] = result.data().get("parent_population") or []
+    assert record["parent_relation"] == "dexdb.dbt_dev_inbox.inbox_states"
+    assert record["status"] == "satisfied", record
+    assert "reason" not in record
+    assert record["measured"]["missing_parents"] == 0
+    assert record["measured"]["unexpected_keys"] == 0
+    assert record["measured"]["coverage"] == 1.0
+
+
+def test_a_model_whose_final_cte_is_a_union_is_unfollowable_not_unbuilt(tmp_path: Path):
+    sql = (
+        'with named as (select * from "wh"."main"."named"), '
+        'residual as (select * from "wh"."main"."residual"), '
+        "combined as ( "
+        "    select * from named "
+        "    union all "
+        "    select * from residual "
+        ") "
+        "select * from combined "
+        'cross join "wh"."main"."configured" '
+        'left join "wh"."main"."lookup" on combined.key = lookup.key'
+    )
+    nodes = {
+        "m.1": _model("fct_daily", sql),
+    }
+    checks, notes = _plan(tmp_path, nodes)
+    assert checks == []
+    assert len(notes) == 1
+    assert (
+        "no single driving parent could be identified for fct_daily "
+        "(it is driven by a set operation, so it has no single parent)"
+    ) in notes[0]
+
+
+def test_verify_suppression_when_model_is_driven_by_union_cte(
+    maintain_repo, _assume_the_project_compiles
+):
+    sql = (
+        "with named as (select 1 as id), "
+        "residual as (select 2 as id), "
+        "combined as ( "
+        "    select id from named "
+        "    union all "
+        "    select id from residual "
+        ") "
+        "select * from combined"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.fct_daily": {
+                "name": "fct_daily",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_daily"',
+                "compiled_code": sql,
+            }
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    suppressed = payload["data"]["suppressed"]["row_population"]
+    assert "it is driven by a set operation, so it has no single parent" in suppressed
+    warnings = payload.get("warnings", [])
+    assert not any("nothing built at combined" in w for w in warnings)
+
+
+# --- column contract from a build: scope by id, per-model failure (#1002) ------
+
+
+def test_the_column_contract_plan_scopes_by_unique_id_and_keeps_versions_apart(
+    tmp_path: Path,
+):
+    v1 = {**_node_with_columns("m", {"id": None}), "version": 1}
+    v2 = {**_node_with_columns("m", {"id": None, "x": None}), "version": 2}
+    _write_artifacts(
+        tmp_path,
+        {
+            "model.p.m.v1": v1,
+            "model.p.m.v2": v2,
+            "model.p.other": _node_with_columns("other", {"id": None}),
+            "model.p.bare": {"name": "bare", "resource_type": "model"},
+        },
+        [],
+    )
+    declared, undeclared, _ = column_contract_plan(tmp_path, scope={"model.p.m.v2"})
+    assert declared == {"m.v2": {"id": None, "x": None}}
+    assert undeclared == 0
+    declared, _, _ = column_contract_plan(tmp_path, scope={"other"})
+    assert set(declared) == {"other"}
+
+
+def test_built_model_relations_omit_an_ephemeral_model_and_out_of_scope_ones(
+    tmp_path: Path,
+):
+    _write_artifacts(
+        tmp_path,
+        {
+            "model.p.a": {"name": "a", "relation_name": '"db"."main"."a"'},
+            "model.p.b": {"name": "b", "relation_name": '"db"."main"."b"'},
+            "model.p.e": {"name": "e", "relation_name": None},
+        },
+        [],
+    )
+    assert built_model_relations(tmp_path, {"model.p.a", "model.p.e"}) == {
+        "a": "db.main.a"
+    }
+
+
+class _UnreadableAdapter(_ColumnAdapter):
+    def __init__(self, columns, failing: BaseException):
+        super().__init__(columns)
+        self._failing = failing
+
+    def table_metadata(self, identifier: str):
+        if identifier == "db.main.bad":
+            raise self._failing
+        return super().table_metadata(identifier)
+
+
+def test_one_unreadable_relation_does_not_lose_the_others():
+    check = column_contract_check(
+        _UnreadableAdapter(
+            {"db.main.good": [("id", "INTEGER"), ("x", "INTEGER")]},
+            RuntimeError("boom"),
+        ),
+        {"bad": {"id": None}, "good": {"id": None}, "gone": {"id": None}, "eph": {}},
+        {"bad": "db.main.bad", "good": "db.main.good", "gone": "db.main.gone"},
+        ["db.main.bad", "db.main.good"],
+        0,
+    )
+    assert check.checked == ["good"]
+    assert [f.code for f in check.findings] == ["column_undeclared"]
+    assert check.unchecked == {
+        "bad": "metadata_unreadable",
+        "eph": "no_relation",
+        "gone": "relation_not_found",
+    }
+    assert any("bad" in note and "boom" in note for note in check.notes)
+
+
+def test_a_cost_refusal_in_the_column_contract_is_not_swallowed():
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    with pytest.raises(CostGuardError):
+        column_contract_check(
+            _UnreadableAdapter({}, CostGuardError("over the ceiling")),
+            {"bad": {"id": None}},
+            {"bad": "db.main.bad"},
+            ["db.main.bad"],
+            0,
+        )

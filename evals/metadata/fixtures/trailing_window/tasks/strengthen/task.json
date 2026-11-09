@@ -1,0 +1,7 @@
+{
+  "kind": "test",
+  "models": [
+    "fct_depot_trailing"
+  ],
+  "prompt": "`fct_depot_trailing` already has a unit test, but nobody is sure it would catch a mistake in the trailing seven-day window. Make its tests trustworthy, and build on dev when you are done."
+}

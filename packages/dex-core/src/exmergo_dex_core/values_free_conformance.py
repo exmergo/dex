@@ -47,6 +47,7 @@ This module imports pytest, so nothing in the package imports it. Install the
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -61,6 +62,7 @@ from .engine import DexEngine
 from .errors import WarehouseQueryError
 from .results import Result, to_envelope
 from .storage import MemoryStore
+from .value_mask import VALUE_WITHHELD
 from .values_free import ResultMode, ValuesFreeCode, ValuesFreeError
 
 __all__ = [
@@ -307,6 +309,57 @@ _STATEMENT = (
     "[].target",
     "[].template",
 )
+#: A model's declaration under ``--use-project`` (#498). Repository text, not a
+#: table read, but a population filter's values and its free-text rule are column
+#: values all the same, so in the mode ``population.rule`` and each filter's
+#: ``includes``/``excludes`` are always null and named in ``withheld_fields``.
+_DECLARATION = (
+    "",
+    ".model",
+    ".source",
+    ".grain",
+    ".grain[]",
+    ".grain_status",
+    ".population",
+    ".population.rule",
+    ".population.filters",
+    ".population.filters[]",
+    ".population.filters[].column",
+    ".population.filters[].includes",
+    ".population.filters[].excludes",
+    ".population.parent",
+    ".population.parent.model",
+    ".population.parent.columns",
+    ".population.parent.columns[]",
+    ".population.parent.parent_columns",
+    ".population.parent.parent_columns[]",
+    ".columns",
+    ".columns[]",
+    ".columns[].name",
+    ".columns[].role",
+    ".columns[].unit",
+    ".columns[].additivity",
+    ".columns[].references",
+    ".history",
+    ".history.snapshot",
+    ".history.entity",
+    ".history.status",
+    ".history.status.column",
+    ".history.status.target",
+    ".history.initial_observation",
+    ".history.null_status",
+    ".history.population",
+    ".history.time",
+    ".history.time.column",
+    ".history.time.provenance",
+    ".history.measures",
+    ".history.measures.transition_count",
+    ".history.measures.latest_target_transition_at",
+    ".history.measures.first_target_at",
+    ".elided_column_count",
+    ".withheld_fields",
+    ".withheld_fields[]",
+)
 # Every result in the mode carries these.
 _COMMON = frozenset({"result_mode", "notes", "notes[]", "spend"})
 
@@ -360,6 +413,7 @@ KNOWN_FIELDS: dict[str, frozenset[str]] = {
         "[].profiled_at",
         "[].semantic_models",
         "[].semantic_models[]",
+        *(f"[].declaration{p}" for p in _DECLARATION),
         "[].suppressed_fields",
         "[].suppressed_fields[]",
         "[].withheld_fields",
@@ -464,6 +518,7 @@ KNOWN_FIELDS: dict[str, frozenset[str]] = {
         "[].candidate_key[]",
         "[].semantic_models",
         "[].semantic_models[]",
+        *(f"[].declaration{p}" for p in _DECLARATION),
         "[].columns",
         "[].columns[]",
         "[].columns[].name",
@@ -609,10 +664,20 @@ def build_sentinel_warehouse(path: str | Path) -> Path:
     return generate_fixture_warehouse(path, sentinel_tables())
 
 
-def find_sentinels(text: str) -> list[str]:
-    """The sentinels ``text`` contains, case-insensitively."""
+#: The fractional seconds of a time of day (``13:37:42.731950``). A payload carries
+#: the cache's own timestamps, whose microseconds can spell any five-digit numeric
+#: sentinel (#1225); the fixture's timestamps have none, so masking them hides no
+#: value the fixture seeded, and the date sentinel stays where it was.
+_FRACTIONAL_SECONDS = re.compile(r"(?<=\d\d:\d\d:\d\d)\.\d+")
 
-    lowered = text.lower()
+
+def find_sentinels(text: str) -> list[str]:
+    """The sentinels ``text`` contains, case-insensitively.
+
+    Fractional seconds are masked first, so a timestamp the run itself wrote is
+    never read as a seeded value."""
+
+    lowered = _FRACTIONAL_SECONDS.sub(".", text.lower())
     return [s for s in SENTINELS if s in lowered]
 
 
@@ -637,8 +702,12 @@ def _dump(value: Any) -> str:
 
 
 def _paths(value: Any, prefix: str = "") -> set[str]:
+    """Every key and subkey path present in ``value``."""
+
     found: set[str] = set()
     if isinstance(value, dict):
+        if prefix.endswith(".history.entity"):
+            return found
         for key, sub in value.items():
             path = f"{prefix}.{key}" if prefix else str(key)
             found.add(path)
@@ -864,18 +933,23 @@ class ValuesFreeContract:
         assert envelope.reason is env.Reason.EXECUTION_FAILURE
         assert envelope.data["code"] == ValuesFreeCode.WAREHOUSE_REFUSED.value
 
-    def test_the_same_cast_error_does_quote_the_value_outside_the_mode(
+    def test_the_same_cast_error_fails_outside_the_mode_with_its_words(
         self, full_engine
     ) -> None:
-        """The control: without it, a DuckDB release that stopped quoting the value
-        would pass the test above while proving nothing."""
+        """The control: without it, a release in which the cast stopped failing
+        would pass the test above while proving nothing. Outside the mode the
+        failure keeps the warehouse's words (a conversion failure, with the type
+        it expected) and the value they quote is masked (#1070)."""
 
         full_engine.profile(SENTINEL_TABLE)
 
         with pytest.raises(WarehouseQueryError) as failed:
             full_engine.query(CAST_FAILURE_QUERY)
 
-        assert find_sentinels(str(failed.value))
+        message = str(failed.value)
+        assert "convert" in message.lower()
+        assert VALUE_WITHHELD in message
+        assert not find_sentinels(message)
 
     # --- the mode itself ------------------------------------------------------
 

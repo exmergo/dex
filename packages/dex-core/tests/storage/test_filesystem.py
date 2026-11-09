@@ -16,6 +16,7 @@ import pytest
 
 from exmergo_dex_core import ConfigurationError
 from exmergo_dex_core.cache import Dataset, DexCache
+from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
 from exmergo_dex_core.storage import Document, FilesystemStore, StoreContext
 from exmergo_dex_core.storage.filesystem import (
     CACHE_FILE,
@@ -215,3 +216,35 @@ def test_the_lock_file_sits_beside_the_ledger_it_protects(tmp_path: Path):
     assert (tmp_path / DEX_DIR / "spend.lock").is_file()
     # Empty, and it stays that way: the lock is the inode, not the contents.
     assert (tmp_path / DEX_DIR / "spend.lock").read_text(encoding="utf-8") == ""
+
+
+def test_interrupted_write_leaves_previous_document_readable_and_cleans_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = FilesystemStore(tmp_path)
+    initial_snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        warehouse_from="metadata",
+        warehouse=WarehouseBaseline(datasets=[]),
+    )
+    store.save_snapshot(initial_snap)
+    assert store.load_snapshot() is not None
+
+    def fail_replace(self, target):
+        raise OSError("simulated power cut during replace")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated power cut"):
+        store.save_snapshot(
+            initial_snap.model_copy(update={"warehouse_from": "interrupted"})
+        )
+
+    # Previous snapshot remains intact and readable
+    loaded = store.load_snapshot()
+    assert loaded is not None
+    assert loaded.warehouse_from == "metadata"
+
+    # No temporary .tmp files left in .dex/
+    dex_dir = tmp_path / DEX_DIR
+    tmp_files = list(dex_dir.glob(".*.tmp"))
+    assert tmp_files == [], f"temp files were not cleaned up: {tmp_files}"

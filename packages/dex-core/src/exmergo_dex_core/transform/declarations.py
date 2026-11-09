@@ -37,15 +37,34 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
 
+from .. import model_versions as mv
 from ..dbt_project import DbtProjectView
-from ..errors import DexError
 from ..guards.pii_meta import entry_meta
+
+# The declaration model and its parser live in a leaf (#927), so a semantic
+# layer's own authoring route can read a declaration without importing the dbt
+# rewriter and sqlglot behind it. Re-exported here, where the dbt callers look.
+from ..semantic_declarations import Additivity as Additivity
+from ..semantic_declarations import Assumption as Assumption
+from ..semantic_declarations import ColumnDeclaration as ColumnDeclaration
+from ..semantic_declarations import Declaration as Declaration
+from ..semantic_declarations import DeclarationError as DeclarationError
+from ..semantic_declarations import Evidence as Evidence
+from ..semantic_declarations import Population as Population
+from ..semantic_declarations import PopulationFilter as PopulationFilter
+from ..semantic_declarations import Role as Role
+from ..semantic_declarations import parse_declarations as parse_declarations
+from .package_overrides import (
+    DocumentedOverride,
+    documented_overrides,
+    override_refusal,
+)
+from .package_targets import find_package_target
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     RewriteError,
@@ -66,130 +85,6 @@ from .rewrite import (
 DEX_META_KEY = "dex"
 
 
-class DeclarationError(DexError, ValueError):
-    """A declaration dex refuses, with the fix named in the message.
-
-    A ``ValueError`` as well, so it reaches the same request-error envelope every
-    other malformed payload does on the commands that already catch that.
-    """
-
-
-class Role(str, Enum):
-    KEY = "key"
-    FOREIGN_KEY = "foreign_key"
-    DIMENSION = "dimension"
-    TIME = "time"
-    MEASURE = "measure"
-    ATTRIBUTE = "attribute"
-
-
-class Additivity(str, Enum):
-    ADDITIVE = "additive"
-    # Does not add across time: a balance, a running or season-to-date total.
-    SEMI_ADDITIVE = "semi_additive"
-    # Does not add at all: a ratio, a share, a distinct count.
-    NON_ADDITIVE = "non_additive"
-
-
-class Evidence(str, Enum):
-    """Where a decision came from, strongest first."""
-
-    REQUEST = "request"
-    CONTRACT = "contract"
-    PRECEDENT = "precedent"
-    DATA = "data"
-    DEFAULT = "default"
-
-
-class _Strict(BaseModel):
-    # An unknown key is a typo far more often than a deliberate extension, and a
-    # typo silently dropped is a declaration that says less than its author meant.
-    model_config = ConfigDict(extra="forbid")
-
-
-class PopulationFilter(_Strict):
-    column: str
-    includes: list[str | int | float | bool] | None = None
-    excludes: list[str | int | float | bool] | None = None
-
-
-class Population(_Strict):
-    rule: str | None = None
-    filters: list[PopulationFilter] = []
-
-
-class ColumnDeclaration(_Strict):
-    role: Role | None = None
-    description: str | None = None
-    references: str | None = None
-    # `never`, or a sentence saying what NULL means in this column.
-    null_rule: str | None = None
-    aggregation: str | None = None
-    additivity: Additivity | None = None
-    # `currency:<ISO code>`, `fraction`, `percent`, `count`, or a plain unit.
-    unit: str | None = None
-
-
-class Assumption(_Strict):
-    decision: str | None = None
-    chosen: str | None = None
-    evidence: Evidence | None = None
-    detail: str | None = None
-
-
-class Declaration(_Strict):
-    model: str
-    description: str | None = None
-    grain: list[str] | None = None
-    population: Population | None = None
-    columns: dict[str, ColumnDeclaration] = {}
-    assumptions: list[Assumption] = []
-
-
-# --- reading the payload ------------------------------------------------------
-
-
-def parse_declarations(entries: Any) -> list[Declaration]:
-    """The payload's ``declarations`` list, validated, or a refusal naming the fix."""
-
-    if entries is None:
-        return []
-    if not isinstance(entries, list):
-        raise DeclarationError(
-            'declarations must be a list: {"declarations": [{"model": ...}, ...]}'
-        )
-    parsed: list[Declaration] = []
-    for index, entry in enumerate(entries):
-        try:
-            parsed.append(Declaration.model_validate(entry))
-        except ValidationError as exc:
-            raise DeclarationError(_validation_message(index, entry, exc)) from exc
-    seen: set[str] = set()
-    for declaration in parsed:
-        if declaration.model in seen:
-            raise DeclarationError(
-                f"'{declaration.model}' is declared twice in this payload; merge the "
-                "two into one declaration"
-            )
-        seen.add(declaration.model)
-    return parsed
-
-
-def _validation_message(index: int, entry: Any, exc: ValidationError) -> str:
-    model = entry.get("model") if isinstance(entry, dict) else None
-    where = f"declarations[{index}]" + (f" ('{model}')" if model else "")
-    problems = []
-    for error in exc.errors():
-        loc = ".".join(str(part) for part in error["loc"])
-        if error["type"] == "extra_forbidden":
-            problems.append(f"{loc} is not a declaration field")
-        elif error["type"] == "missing":
-            problems.append(f"{loc} is required")
-        else:
-            problems.append(f"{loc}: {error['msg']}")
-    return f"{where} is malformed: " + "; ".join(problems)
-
-
 # --- where a model is declared --------------------------------------------------
 
 
@@ -202,6 +97,11 @@ def schema_path(files: Mapping[str, str], model: str) -> str | None:
     model in one ``_staging.yml``.
     """
 
+    base, version = mv.split_label(model)
+    if version is not None:
+        versioned = mv.lookup(mv.cached_version_map(files), base)
+        if versioned is not None:
+            return versioned.yaml_path
     for path in sorted(files):
         if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
             continue
@@ -211,11 +111,134 @@ def schema_path(files: Mapping[str, str], model: str) -> str | None:
     return None
 
 
+def yaml_entry_paths(files: Mapping[str, str], model: str) -> list[str]:
+    """Every YAML file whose ``models:`` list has an entry named ``model``.
+
+    :func:`schema_path` stops at the first; this names them all, for a refusal
+    that has to point at every file dbt would read (#1161).
+    """
+
+    found: list[str] = []
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        if any(
+            block.form == "yaml_model_entry" and block.name == model
+            for block in yaml_blocks(files[path])
+        ):
+            found.append(path)
+    return found
+
+
+def package_documented_overrides(
+    view: DbtProjectView, files: Mapping[str, str], models: Iterable[str]
+) -> dict[str, DocumentedOverride]:
+    """The models in ``models`` that are, after the plan, project overrides of a
+    package model the package documents (see :mod:`.package_overrides`).
+
+    A version label is never one: a versioned package model is not overridable.
+    """
+
+    root = getattr(view, "root", None)
+    if not root:
+        return {}
+    wanted = {m for m in models if mv.split_label(m)[1] is None}
+    paths = _planned_model_paths(view.model_paths, files.get("dbt_project.yml"))
+    candidates = {m for m in wanted if model_sql_path(files, paths, m) is not None}
+    # A Python model is not on dex's editable surface, but an existing one is an
+    # override all the same, and its YAML entry collides just as a SQL one's does.
+    candidates |= _python_models(Path(root), paths, wanted - candidates)
+    if not candidates:
+        return {}
+    return documented_overrides(root, candidates, files.get("dbt_project.yml"))
+
+
+def _planned_model_paths(current: Iterable[str], project_yml: str | None) -> list[str]:
+    """The model paths now and as the plan's ``dbt_project.yml`` leaves them."""
+
+    paths = list(current)
+    try:
+        loaded = yaml.safe_load(project_yml or "") or {}
+    except yaml.YAMLError:
+        return paths
+    planned = loaded.get("model-paths") if isinstance(loaded, dict) else None
+    for path in planned if isinstance(planned, list) else []:
+        if isinstance(path, str) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _python_models(root: Path, model_paths: Iterable[str], names: set[str]) -> set[str]:
+    """The names in ``names`` a ``.py`` file under the project's model paths defines."""
+
+    found: set[str] = set()
+    if not names:
+        return found
+    for model_path in model_paths:
+        base = root / model_path
+        if not base.is_dir():
+            continue
+        found.update(p.stem for p in base.rglob("*.py") if p.stem in names)
+    return found
+
+
+def refuse_package_documented_entries(
+    view: DbtProjectView, edits: list[PlanEdit]
+) -> None:
+    """Refuse a plan that leaves a project YAML entry dbt would apply on top of
+    a package's.
+
+    An override of a model its package documents takes the package's entry, so
+    any project entry for the same name fails dbt's parse as a duplicate. This
+    says so in dex's words, naming both files, before dbt runs (#1161). Only the
+    names this plan touches are judged (a model it writes, an entry in a YAML
+    file it writes, or every entry once it edits ``dbt_project.yml``), so a plan
+    elsewhere in the project is not refused for a conflict it did not make.
+    """
+
+    files = post_change_files(view, edits)
+    touched_project = any(e.path == "dbt_project.yml" for e in edits)
+    touched_yaml = {
+        e.path
+        for e in edits
+        if e.op is EditOp.UPSERT and e.path.endswith((".yml", ".yaml"))
+    }
+    touched = {
+        PurePosixPath(e.path).stem
+        for e in edits
+        if e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT
+    }
+    entries: dict[str, list[str]] = {}
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        for block in yaml_blocks(files[path]):
+            if block.form != "yaml_model_entry" or not block.name:
+                continue
+            entries.setdefault(block.name, []).append(path)
+            if path in touched_yaml:
+                touched.add(block.name)
+    judged = set(entries) if touched_project else set(entries) & touched
+    overrides = package_documented_overrides(view, files, judged)
+    for model in sorted(overrides):
+        raise DeclarationError(
+            override_refusal(overrides[model], sorted(set(entries[model])))
+        )
+
+
 def model_sql_path(
     files: Mapping[str, str], model_paths: Iterable[str], model: str
 ) -> str | None:
-    """The ``.sql`` file that defines ``model``, if the project has one."""
+    """The ``.sql`` file that defines ``model``, if the project has one.
 
+    A version label (``dim_teams.v2``) is that version's file, and the bare name
+    of a versioned model is its default version's, the file an unversioned
+    ``ref()`` reads (#895).
+    """
+
+    versioned_path = _version_sql_path(files, model_paths, model)
+    if versioned_path is not None:
+        return versioned_path or None
     roots = [PurePosixPath(p) for p in model_paths]
     for path in sorted(files):
         candidate = PurePosixPath(path)
@@ -224,6 +247,25 @@ def model_sql_path(
         if any(root == candidate or root in candidate.parents for root in roots):
             return path
     return None
+
+
+def _version_sql_path(
+    files: Mapping[str, str], model_paths: Iterable[str], model: str
+) -> str | None:
+    """A versioned model's file for ``model``: ``None`` when ``model`` names no
+    versioned model, and ``""`` when it names one no ``.sql`` file builds."""
+
+    vmap = mv.cached_version_map(files, list(model_paths))
+    if not vmap:
+        return None
+    base, version = mv.split_label(model)
+    versioned = mv.lookup(vmap, base)
+    if versioned is None:
+        return None
+    item = versioned.version(version if version is not None else versioned.default)
+    if item is None or item.file is None or not item.file.endswith(".sql"):
+        return ""
+    return item.file
 
 
 # --- the whole pass -------------------------------------------------------------
@@ -245,6 +287,17 @@ def apply_declarations(
     """
 
     files = post_change_files(view, edits)
+    overrides = package_documented_overrides(
+        view, files, [d.model for d in declarations]
+    )
+    for declaration in declarations:
+        override = overrides.get(declaration.model)
+        if override is not None:
+            sql_path = model_sql_path(files, view.model_paths, declaration.model)
+            paths = yaml_entry_paths(files, declaration.model) or [
+                _default_schema_path(sql_path or "", declaration.model)
+            ]
+            raise DeclarationError(override_refusal(override, paths, declaring=True))
     warnings: list[str] = []
     for declaration in declarations:
         warnings.extend(
@@ -258,7 +311,7 @@ def apply_declarations(
         if path is None:
             path = _default_schema_path(sql_path or "", declaration.model)
         try:
-            files[path] = render(files.get(path), declaration)
+            files[path] = render(files.get(path), declaration, notes=warnings)
         except RewriteError as exc:
             raise DeclarationError(
                 f"dex could not write the declaration of '{declaration.model}' into "
@@ -299,7 +352,19 @@ def undeclared_model_warnings(
     """
 
     files = post_change_files(view, edits)
-    named = set(declared)
+    vmap = mv.cached_version_map(files, view.model_paths)
+    named = mv.expand(declared, vmap)
+    # An override of a model its package documents takes the package's entry
+    # and can carry no declaration of its own, so none is owed (#1161).
+    overrides = package_documented_overrides(
+        view,
+        files,
+        [
+            PurePosixPath(e.path).stem
+            for e in edits
+            if e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT
+        ],
+    )
     warnings: list[str] = []
     for edit in edits:
         if (
@@ -308,8 +373,8 @@ def undeclared_model_warnings(
             or not edit.path.endswith(".sql")
         ):
             continue
-        model = PurePosixPath(edit.path).stem
-        if model in named or _carries_declaration(files, model):
+        model = mv.label_for_file(edit.path, vmap) or PurePosixPath(edit.path).stem
+        if model in named or model in overrides or _carries_declaration(files, model):
             continue
         warnings.append(
             f"{edit.path}: this plan writes '{model}' and declares nothing about what "
@@ -343,22 +408,31 @@ def _check(
     pii_overrides: Any,
 ) -> list[str]:
     model = declaration.model
-    sql_path = model_sql_path(files, view.model_paths, model)
-    if sql_path is None:
-        raise DeclarationError(
-            f"'{model}' is not a model in this project or in this plan; declare a "
-            "model the project has, or add its SQL to the same payload"
-        )
-
     warnings: list[str] = []
-    produced = select_columns(files[sql_path])
-    if produced is None:
-        warnings.append(
-            f"{sql_path}: the SELECT list could not be read statically (a `select *` "
+    target = _version_target(declaration, files, view)
+    if target is not None:
+        sql_path, produced, unread = target
+        warnings.extend(
+            f"{path}: the SELECT list could not be read statically (a `select *` "
             f"or a macro standing in for a column), so the columns declared for "
             f"'{model}' were not checked against it"
+            for path in unread
         )
     else:
+        sql_path = model_sql_path(files, view.model_paths, model)
+        if sql_path is None:
+            raise DeclarationError(
+                f"'{model}' is not a model in this project or in this plan; declare "
+                "a model the project has, or add its SQL to the same payload"
+            )
+        produced = select_columns(files[sql_path])
+        if produced is None:
+            warnings.append(
+                f"{sql_path}: the SELECT list could not be read statically (a "
+                f"`select *` or a macro standing in for a column), so the columns "
+                f"declared for '{model}' were not checked against it"
+            )
+    if produced is not None:
         unknown = [c for c in declaration.columns if c.lower() not in produced]
         if unknown:
             raise DeclarationError(
@@ -378,7 +452,9 @@ def _check(
 
     for name, column in declaration.columns.items():
         if column.references is not None:
-            _check_reference(model, name, column.references, files, view)
+            warnings.extend(
+                _check_reference(model, name, column.references, files, view)
+            )
         elif column.role is Role.FOREIGN_KEY:
             warnings.append(
                 f"'{model}.{name}' is a foreign_key with no `references`, so no "
@@ -387,9 +463,137 @@ def _check(
 
     if declaration.population is not None:
         _check_filters(model, declaration.population, cache, pii_overrides)
+        parent = declaration.population.parent
+        if parent is not None:
+            warnings.extend(
+                _check_parent(model, declaration, parent, produced, files, view)
+            )
 
-    warnings.extend(_partial_intent(declaration, produced))
+    if declaration.history is not None:
+        warnings.extend(
+            _check_history(
+                model, declaration, produced, files, view, cache, pii_overrides
+            )
+        )
+
+    declared_columns = _declared_column_roles(files, declaration.model)
+    declared_columns.update(name.lower() for name in declaration.columns)
+    warnings.extend(_partial_intent(declaration, produced, declared_columns))
     return warnings
+
+
+#: Model-level dex keys dbt merges across a version and its shared entry by
+#: concatenating lists and merging mappings, so one stated at both levels is read
+#: back as neither statement.
+_MERGED_KEYS = ("grain", "population", "assumptions", "history")
+
+
+def _version_target(
+    declaration: Declaration, files: Mapping[str, str], view: DbtProjectView
+) -> tuple[str, set[str] | None, list[str]] | None:
+    """Where a declaration on a versioned model lands, and what it may name (#895).
+
+    ``None`` when the declaration names no versioned model. Otherwise the file
+    the column checks read (a version's SQL, or the YAML entry for the shared
+    entry), the columns the declaration may name, and the files whose SELECT list
+    could not be read. ``dim_teams.v2`` names one version; the bare
+    ``dim_teams`` names the shared top-level entry every version inherits, so its
+    columns are those any version produces and its grain one every version
+    produces. A version's file stem (``dim_teams_v2``) is refused with the label,
+    because a declaration under that name would create a second, plain entry.
+    """
+
+    model = declaration.model
+    vmap = mv.cached_version_map(files, view.model_paths)
+    base, version = mv.split_label(model)
+    versioned = mv.lookup(vmap, base)
+    if versioned is None:
+        if version is not None and "." in model:
+            raise DeclarationError(
+                f"'{model}' names a version, and the project declares no versioned "
+                f"model '{base}'; declare '{base}' under `models:` with a "
+                "`versions:` list first"
+            )
+        label = mv.label_for_stem(model, vmap)
+        if label is not None:
+            raise DeclarationError(
+                f"'{model}' is the file that builds '{label}', a version of a "
+                f'versioned model; declare it as "model": "{label}" so it '
+                "renders into that version's entry"
+            )
+        return None
+
+    model_dex = set(_model_dex(declaration))
+    if version is not None:
+        item = versioned.version(version)
+        if item is None:
+            raise DeclarationError(
+                f"'{model}' names version {version} of '{versioned.base}', which "
+                f"lists versions {', '.join(v.v for v in versioned.versions)}"
+            )
+        shared = _dex_of(versioned.entry)
+        clash = sorted(model_dex & set(shared) & set(_MERGED_KEYS))
+        if clash:
+            raise DeclarationError(
+                f"'{versioned.base}' states {', '.join(clash)} on its shared "
+                f"top-level entry, which dbt merges into every version (lists "
+                f"concatenated), so a {', '.join(clash)} declared on '{model}' "
+                "would be read back as neither. Move it off the shared entry and "
+                "declare it on each version instead"
+            )
+        if item.file is None or not item.file.endswith(".sql"):
+            return (versioned.yaml_path, None, [item.file] if item.file else [])
+        produced = select_columns(files[item.file])
+        return (item.file, produced, [] if produced is not None else [item.file])
+
+    clash = sorted(
+        {
+            key
+            for item in versioned.versions
+            for key in _dex_of(item.item)
+            if key in model_dex and key in _MERGED_KEYS
+        }
+    )
+    if clash:
+        raise DeclarationError(
+            f"a version of '{model}' states {', '.join(clash)} itself, and dbt "
+            "merges the shared entry into every version (lists concatenated), so "
+            f"a {', '.join(clash)} declared on the shared '{model}' would be read "
+            "back as neither. Declare it on each version (`<model>.v<N>`) instead"
+        )
+    union: set[str] = set()
+    every: set[str] | None = None
+    unread: list[str] = []
+    for item in versioned.versions:
+        produced = (
+            select_columns(files[item.file])
+            if item.file is not None and item.file.endswith(".sql")
+            else None
+        )
+        if produced is None:
+            unread.append(item.file or versioned.yaml_path)
+            continue
+        union |= produced
+        every = produced if every is None else every & produced
+    if unread:
+        return (versioned.yaml_path, None, unread)
+    missing_grain = [
+        g
+        for g in declaration.grain or []
+        if every is not None and g.lower() not in every
+    ]
+    if missing_grain:
+        raise DeclarationError(
+            f"'{model}' is versioned, and a grain declared on its shared entry "
+            f"applies to every version, but not every version produces "
+            f"{', '.join(missing_grain)}; declare the grain on each version"
+        )
+    return (versioned.yaml_path, union, [])
+
+
+def _dex_of(node: Any) -> dict[str, Any]:
+    dex = entry_meta(node).get(DEX_META_KEY) if isinstance(node, dict) else None
+    return dex if isinstance(dex, dict) else {}
 
 
 def _check_reference(
@@ -398,49 +602,276 @@ def _check_reference(
     target: str,
     files: Mapping[str, str],
     view: DbtProjectView,
-) -> None:
+    *,
+    claim: str | None = None,
+) -> list[str]:
+    """Refuse a reference whose parent or parent column neither the project nor
+    an installed package has, and return the warnings for what could not be
+    checked.
+
+    The project is looked up first, so a project override of a package model is
+    the parent, as it is for ``ref()``. A package model, seed or snapshot is the
+    parent only when the project defines none of that name (#1155): its column
+    is checked against the package's SQL where that can be read, and is
+    reported as unchecked where it cannot, since a staging model that lists its
+    columns through a macro is no reason to refuse a real parent.
+
+    ``claim`` is how the refusal names what made the reference, so a
+    ``population.parent`` key reads as that rather than as a column's
+    ``references``."""
+
+    said = claim or f"'{model}.{column}' references '{target}'"
     parent, _, parent_column = target.rpartition(".")
     if not parent or not parent_column:
-        raise DeclarationError(
-            f"'{model}.{column}' references '{target}'; write the target as "
-            "<model>.<column>"
-        )
+        raise DeclarationError(f"{said}; write the target as <model>.<column>")
     parent_sql = model_sql_path(files, view.model_paths, parent)
     if parent_sql is not None:
         produced = select_columns(files[parent_sql])
         if produced is not None and parent_column.lower() not in produced:
             raise DeclarationError(
-                f"'{model}.{column}' references '{target}', and {parent_sql} does not "
-                f"produce a column '{parent_column}'"
+                f"{said}, and {parent_sql} does not produce a column '{parent_column}'"
             )
-        return
+        return []
     if _is_seed_or_snapshot(files, view, parent):
-        return
-    raise DeclarationError(
-        f"'{model}.{column}' references '{target}', and the project has no model, "
-        f"seed or snapshot named '{parent}'"
+        return []
+    packaged = find_package_target(
+        view.root,
+        parent,
+        project_yml=files.get("dbt_project.yml"),
+        manifest=view.manifest,
     )
+    if packaged is not None:
+        if not packaged.enabled:
+            raise DeclarationError(
+                f"{said}, and {packaged.described()} is disabled in this project's "
+                "dbt_project.yml with no project model of that name, so dbt builds "
+                "no node called that; name the model that replaces it"
+            )
+        if packaged.columns is None:
+            return [
+                f"{said}: the columns of {packaged.described()} could not be read "
+                f"({packaged.unread}), so whether it produces '{parent_column}' was "
+                "not checked here; `transform build --verify` reads the built "
+                "relation"
+            ]
+        if parent_column.lower() not in packaged.columns:
+            raise DeclarationError(
+                f"{said}, and {packaged.described()} does not produce a column "
+                f"'{parent_column}'"
+            )
+        return []
+    raise DeclarationError(
+        f"{said}, and neither the project nor an installed package has a model, "
+        f"seed or snapshot named '{parent}'{_source_hint(files, parent)}"
+    )
+
+
+def _source_hint(files: Mapping[str, str], name: str) -> str:
+    """A clause saying ``name`` is a source, which a declaration cannot name."""
+
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        try:
+            loaded = yaml.safe_load(files[path])
+        except yaml.YAMLError:
+            continue
+        sources = loaded.get("sources") if isinstance(loaded, dict) else None
+        for source in sources if isinstance(sources, list) else []:
+            tables = source.get("tables") if isinstance(source, dict) else None
+            for table in tables if isinstance(tables, list) else []:
+                if isinstance(table, dict) and table.get("name") == name:
+                    return (
+                        f" ('{name}' is a table of source '{source.get('name')}', "
+                        "and a source is not a supported parent: name the staging "
+                        "model that selects from it)"
+                    )
+    return ""
+
+
+def _check_parent(
+    model: str,
+    declaration: Declaration,
+    parent: Any,
+    produced: set[str] | None,
+    files: Mapping[str, str],
+    view: DbtProjectView,
+) -> list[str]:
+    """Validate ``population.parent`` (#857): every output key column is one the
+    model produces, and every parent column is one the parent produces.
+
+    A parent that is the model itself is refused: a key set always equals
+    itself, so the check would prove nothing. A key that is not the declared
+    grain is a warning rather than a refusal, since a model may legitimately
+    hold one row per parent at a grain written differently, but the check then
+    counts entities the grain does not name.
+    """
+
+    if parent.model.lower() == model.lower():
+        raise DeclarationError(
+            f"'{model}' declares itself as its population.parent; name the model, "
+            "seed or snapshot its rows are drawn from"
+        )
+    if produced is not None:
+        unknown = [c for c in parent.key if c.lower() not in produced]
+        if unknown:
+            raise DeclarationError(
+                f"'{model}' declares population.parent key column(s) "
+                f"{', '.join(unknown)} that its SELECT list does not produce; the "
+                "key maps output columns to the parent's"
+            )
+    warnings: list[str] = []
+    for output_column, parent_column in parent.key.items():
+        warnings += _check_reference(
+            model,
+            output_column,
+            f"{parent.model}.{parent_column}",
+            files,
+            view,
+            claim=(
+                f"'{model}' declares population.parent {parent.model} keyed "
+                f"{output_column} -> {parent_column}"
+            ),
+        )
+    grain = [g.lower() for g in declaration.grain or []]
+    keys = [k.lower() for k in parent.key]
+    if grain and sorted(grain) != sorted(keys):
+        return [
+            *warnings,
+            f"'{model}' declares population.parent keyed on {', '.join(parent.key)} "
+            f"but its grain is {', '.join(declaration.grain or [])}; the parent "
+            "check counts entities by the key, so the two describe different rows "
+            "unless the key is the grain",
+        ]
+    return warnings
+
+
+def _check_history(
+    model: str,
+    declaration: Declaration,
+    produced: set[str] | None,
+    files: Mapping[str, str],
+    view: DbtProjectView,
+    cache: Any,
+    pii_overrides: Any,
+) -> list[str]:
+    """Validate a ``history`` block (#1027): a real snapshot, output columns the
+    model produces, and a target that is safe to commit. A policy left out is a
+    warning, since it is intent still owed rather than a malformed statement."""
+
+    history = declaration.history
+    if history is None:  # pragma: no cover - the caller only passes a history
+        return []
+    if not snapshot_defined(files, history.snapshot, view.snapshot_paths):
+        raise DeclarationError(
+            f"'{model}' declares history from '{history.snapshot}', and the project "
+            "has no snapshot by that name; a temporal contract is verified against "
+            "a dbt snapshot's versions"
+        )
+    measures = history.measures
+    named = [
+        *history.entity,
+        *(
+            column
+            for column in (
+                measures.transition_count,
+                measures.latest_target_transition_at,
+                measures.first_target_at,
+            )
+            if column is not None
+        ),
+    ]
+    if produced is not None:
+        unknown = [c for c in named if c.lower() not in produced]
+        if unknown:
+            raise DeclarationError(
+                f"'{model}' declares history column(s) {', '.join(unknown)} that its "
+                "SELECT list does not produce; `entity` keys and `measures` name "
+                "output columns of the model"
+            )
+    try:
+        _check_filters(
+            model,
+            Population(
+                filters=[
+                    PopulationFilter(
+                        column=history.status.column,
+                        includes=[history.status.target],
+                    )
+                ]
+            ),
+            cache,
+            pii_overrides,
+        )
+    except DeclarationError as exc:
+        raise DeclarationError(
+            f"'{model}' declares history on status column "
+            f"'{history.status.column}', whose target would be committed to git, "
+            f"and the column looks like personal data: {exc}"
+        ) from exc
+
+    owed: list[str] = []
+    if history.initial_observation is None:
+        owed.append("initial_observation (`baseline` or `transition`)")
+    if history.null_status is None:
+        owed.append("null_status (`ignore` or `state`)")
+    if history.population is None:
+        owed.append("population (`ever_target` or `all_observed`)")
+    timed = measures.latest_target_transition_at or measures.first_target_at
+    if timed and (history.time is None or history.time.provenance is None):
+        owed.append("time, with its provenance (`business` or `capture`)")
+    if owed:
+        return [
+            f"'{model}' declares history without stating {', '.join(owed)}; Dex "
+            "assumes no temporal policy, so verification reports what depends on "
+            "it as unchecked"
+        ]
+    return []
 
 
 def _is_seed_or_snapshot(
     files: Mapping[str, str], view: DbtProjectView, name: str
 ) -> bool:
     seed_roots = [PurePosixPath(p) for p in view.seed_paths]
-    snapshot_roots = [PurePosixPath(p) for p in view.snapshot_paths]
-    for path, content in files.items():
+    for path in files:
         candidate = PurePosixPath(path)
-        is_seed = (
+        if (
             candidate.suffix == ".csv"
             and candidate.stem == name
             and any(root in candidate.parents for root in seed_roots)
-        )
-        is_snapshot = (
-            candidate.suffix == ".sql"
-            and any(root in candidate.parents for root in snapshot_roots)
-            and re.search(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}", content)
-        )
-        if is_seed or is_snapshot:
+        ):
             return True
+    return snapshot_defined(files, name, view.snapshot_paths)
+
+
+def snapshot_defined(
+    files: Mapping[str, str], name: str, snapshot_paths: Iterable[str] | None = None
+) -> bool:
+    """Whether the project defines a snapshot called ``name``: a ``{% snapshot %}``
+    block (under ``snapshot_paths``, where given), or a ``snapshots:`` entry in a
+    YAML file, which is how dbt 1.9 and later define one."""
+
+    roots = (
+        None if snapshot_paths is None else [PurePosixPath(p) for p in snapshot_paths]
+    )
+    block = re.compile(rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}")
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if candidate.suffix == ".sql":
+            placed = roots is None or any(r in candidate.parents for r in roots)
+            if placed and block.search(content):
+                return True
+        elif candidate.suffix in (".yml", ".yaml") and "snapshots" in content:
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError:
+                continue
+            entries = parsed.get("snapshots") if isinstance(parsed, dict) else None
+            if any(
+                isinstance(entry, dict) and entry.get("name") == name
+                for entry in (entries if isinstance(entries, list) else [])
+            ):
+                return True
     return False
 
 
@@ -492,19 +923,46 @@ def _check_filters(
             )
 
 
-def _partial_intent(declaration: Declaration, produced: set[str] | None) -> list[str]:
+def _declared_column_roles(files: Mapping[str, str], model: str) -> set[str]:
+    """Column names that already have a role in the model's YAML declaration."""
+    declared: set[str] = set()
+
+    for _label, entry in _entries(files, {model}):
+        for column in entry.get("columns") or []:
+            if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+                continue
+
+            column_dex = entry_meta(column).get(DEX_META_KEY)
+            if isinstance(column_dex, dict) and column_dex.get("role"):
+                declared.add(column["name"].lower())
+
+    return declared
+
+
+def _partial_intent(
+    declaration: Declaration,
+    produced: set[str] | None,
+    declared_columns: set[str] | None = None,
+) -> list[str]:
     # A missing model-level field (description, grain, population, assumptions)
     # is warned once per field by `drafting`, which reads the post-change YAML
     # and so also counts what the entry declared before this payload.
     warnings = []
+
     if produced is not None:
-        declared = {c.lower() for c in declaration.columns}
-        undeclared = sorted(c for c in produced if c not in declared)
+        declared = (
+            {column.lower() for column in declaration.columns}
+            if declared_columns is None
+            else {column.lower() for column in declared_columns}
+        )
+        undeclared = sorted(column for column in produced if column not in declared)
+
         if undeclared:
             warnings.append(
                 f"'{declaration.model}' produces column(s) {', '.join(undeclared)} "
                 "with no declared role"
             )
+
     for index, assumption in enumerate(declaration.assumptions):
         absent = [
             field
@@ -516,21 +974,29 @@ def _partial_intent(declaration: Declaration, produced: set[str] | None) -> list
                 f"'{declaration.model}' assumption {index + 1} has no "
                 f"{', '.join(absent)}"
             )
+
     return warnings
 
 
 # --- rendering ------------------------------------------------------------------
 
 
-def render(content: str | None, declaration: Declaration) -> str:
+def render(
+    content: str | None, declaration: Declaration, *, notes: list[str] | None = None
+) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
     Each key is written by its own splice against a fresh parse of the text the
     previous splice produced, so no offset is ever measured against bytes that
-    have since moved.
+    have since moved. A version label (``dim_teams.v2``) renders into that item
+    of the model's ``versions:`` list (#895); ``notes`` collects what a reviewer
+    should be told about how (a column forked from the shared entry).
     """
 
     model = declaration.model
+    base, version = mv.split_label(model)
+    if version is not None and content is not None:
+        return _render_version(content, declaration, base, version, notes)
     text = _with_entry(content, model)
     entry = lambda root: _model_entry(root, model)  # noqa: E731
 
@@ -550,6 +1016,194 @@ def render(content: str | None, declaration: Declaration) -> str:
         if column["tests"]:
             text = _add_tests(text, locate, column["tests"])
     return text
+
+
+def _render_version(
+    content: str,
+    declaration: Declaration,
+    base: str,
+    version: str,
+    notes: list[str] | None,
+) -> str:
+    """Render a declaration into one item of ``base``'s ``versions:`` list.
+
+    The version's own ``description`` and ``config.meta.dex`` take the model
+    facts, and its own ``columns`` the column facts. A column the version only
+    inherits from the shared entry is overridden the way dbt reads an override:
+    excluded from the version's ``include``/``exclude`` element and written as
+    the version's own entry, carrying the inherited description, tests and meta
+    forward, since dbt replaces an inherited column wholesale with a same-named
+    version entry and would otherwise also parse its tests twice. A fact the
+    inherited entry already states forks nothing.
+    """
+
+    item = lambda root: _version_item(root, base, version)  # noqa: E731
+    text = content
+    if item(_compose(text)) is None:
+        raise RewriteError(f"it has no version {version} under '{base}'")
+    label = f"{base}.v{version}"
+    if declaration.description is not None:
+        text = _set_key(text, item, "description", declaration.description)
+    model_dex = _model_dex(declaration)
+    if model_dex:
+        text = _set_dex(text, item, model_dex)
+
+    for name, column in _rendered_columns(declaration).items():
+        text, owned = _ensure_version_column(text, base, version, name, column)
+        if not owned:
+            continue
+        if owned == "forked" and notes is not None:
+            notes.append(
+                f"'{label}.{name}' was inherited from the shared '{base}' entry; it "
+                f"is now excluded from v{version}'s include/exclude and declared as "
+                f"v{version}'s own column, with the inherited description and tests "
+                "carried over, so the declared facts apply to this version only"
+            )
+        locate = _version_column_locator(base, version, name)
+        if column["description"] is not None:
+            text = _set_key(text, locate, "description", column["description"])
+        if column["dex"]:
+            text = _set_dex(text, locate, column["dex"])
+        if column["tests"]:
+            text = _add_tests(text, locate, column["tests"])
+    return text
+
+
+def _ensure_version_column(
+    text: str, base: str, version: str, name: str, column: dict[str, Any]
+) -> tuple[str, str | None]:
+    """The version's own entry for ``name``: ``owned``, ``forked``, ``created``,
+    or ``None`` where the inherited entry already says everything declared."""
+
+    root = _compose(text)
+    if _version_column_locator(base, version, name)(root) is not None:
+        return text, "owned"
+    entry = _plain(_model_entry(root, base))
+    item = _plain(_version_item(root, base, version))
+    inherited = next(
+        (c for c in mv.inherited_columns(entry, item) if c.get("name") == name),
+        None,
+    )
+    if inherited is None:
+        return _append_version_column(text, base, version, {"name": name}), "created"
+    if _already_states(inherited, column):
+        return text, None
+    text = _exclude_from_version(text, base, version, name)
+    return _append_version_column(text, base, version, dict(inherited)), "forked"
+
+
+def _already_states(entry: Mapping[str, Any], column: dict[str, Any]) -> bool:
+    """Whether a column entry already carries every fact ``column`` would write."""
+
+    if (
+        column["description"] is not None
+        and entry.get("description") != column["description"]
+    ):
+        return False
+    dex = _dex_of(entry)
+    if any(dex.get(key) != value for key, value in column["dex"].items()):
+        return False
+    tests = entry.get("data_tests") or entry.get("tests") or []
+    present = {
+        t if isinstance(t, str) else next(iter(t), "")
+        for t in tests
+        if isinstance(t, (str, dict))
+    }
+    return all(_spec_name(spec) in present for spec in column["tests"])
+
+
+def _exclude_from_version(text: str, base: str, version: str, name: str) -> str:
+    """``text`` with ``name`` no longer inherited by version ``version``."""
+
+    root = _compose(text)
+    item_node = _version_item(root, base, version)
+    columns = _child(item_node, "columns")
+    item = _plain(item_node)
+    include, exclude, position = mv.include_exclude(item)
+    if isinstance(include, list):
+        rewritten: dict[str, Any] = {"include": [c for c in include if c != name]}
+    else:
+        # A version with no include/exclude element includes everything; it
+        # is written as `all`, the spelling dbt documents (an unquoted `*` is
+        # a YAML alias).
+        written = include if position is not None and include else "all"
+        rewritten = {"include": written, "exclude": [*exclude, name]}
+    if columns is None:
+        return _set_key(
+            text, lambda r: _version_item(r, base, version), "columns", [rewritten]
+        )
+    listed = columns[1]
+    if listed.flow_style or not listed.value:
+        raise RewriteError(f"version {version}'s `columns:` is not a block list")
+    if position is not None:
+        node = listed.value[position]
+        start, end = _item_span(text, node)
+        dash = text[start : node.start_mark.index]
+        dash_indent = dash[: len(dash) - len(dash.lstrip(" "))]
+        return splice(
+            text,
+            [
+                (
+                    start,
+                    before_trailing_blanks(text, end),
+                    _render_flow_item(rewritten, dash_indent),
+                )
+            ],
+        )
+    first = listed.value[0]
+    start, _end = _item_span(text, first)
+    line = text[start : first.start_mark.index]
+    dash_indent = line[: len(line) - len(line.lstrip(" "))]
+    return splice(text, [(start, start, _render_flow_item(rewritten, dash_indent))])
+
+
+def _render_flow_item(value: dict[str, Any], dash_indent: str) -> str:
+    """An include/exclude element, with its lists written inline."""
+
+    # One line each; a scalar's dump trails a `...` document end marker.
+    pairs = [
+        f"{key}: {_dump(v, flow=True).splitlines()[0]}" for key, v in value.items()
+    ]
+    lines = [f"{dash_indent}- {pairs[0]}\n"]
+    lines += [f"{dash_indent}  {pair}\n" for pair in pairs[1:]]
+    return "".join(lines)
+
+
+def _append_version_column(
+    text: str, base: str, version: str, column: dict[str, Any]
+) -> str:
+    """``text`` with ``column`` appended to version ``version``'s own columns."""
+
+    root = _compose(text)
+    columns = _child(_version_item(root, base, version), "columns")
+    if columns is None or not _sequence(columns[1]):
+        return _set_key(
+            text, lambda r: _version_item(r, base, version), "columns", [column]
+        )
+    listed = columns[1]
+    if listed.flow_style:
+        raise RewriteError(f"version {version}'s `columns:` is written in flow style")
+    first = listed.value[0]
+    line_start = text.rfind("\n", 0, first.start_mark.index) + 1
+    line = text[line_start : first.start_mark.index]
+    dash_indent = line[: len(line) - len(line.lstrip(" "))]
+    end = max(_item_span(text, node)[1] for node in listed.value)
+    at = before_trailing_blanks(text, end)
+    prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"
+    return splice(text, [(at, at, prefix + _render_item(column, dash_indent))])
+
+
+def _item_span(text: str, node: Any) -> tuple[int, int]:
+    from .rewrite import _entry_span
+
+    return _entry_span(text, node)
+
+
+def _plain(node: Any) -> dict[str, Any]:
+    if node is None:
+        return {}
+    value = yaml.safe_load(yaml.serialize(node))
+    return value if isinstance(value, dict) else {}
 
 
 def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
@@ -579,15 +1233,14 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
             entry["tests"].append("not_null")
         if column.references is not None:
             parent, _, parent_column = column.references.rpartition(".")
+            parent_base, parent_version = mv.split_label(parent)
+            to = (
+                f"ref('{parent_base}', v={parent_version})"
+                if parent_version is not None
+                else f"ref('{parent}')"
+            )
             entry["tests"].append(
-                {
-                    "relationships": {
-                        "arguments": {
-                            "to": f"ref('{parent}')",
-                            "field": parent_column,
-                        }
-                    }
-                }
+                {"relationships": {"arguments": {"to": to, "field": parent_column}}}
             )
 
     grain = declaration.grain or []
@@ -612,6 +1265,10 @@ def _model_dex(declaration: Declaration) -> dict[str, Any]:
             assumption.model_dump(mode="json", exclude_none=True)
             for assumption in declaration.assumptions
         ]
+    if declaration.history is not None:
+        dex["history"] = declaration.history.model_dump(
+            mode="json", exclude_none=True, exclude_defaults=True
+        )
     return dex
 
 
@@ -636,6 +1293,26 @@ def _column_locator(model: str, column: str):
         for item in _sequence(dict(_mapping(entry)).get("columns")):
             if _scalar_value(dict(_mapping(item)).get("name")) == column:
                 return item
+        return None
+
+    return locate
+
+
+def _version_item(root: Any, base: str, version: str) -> Any:
+    entry = _model_entry(root, base)
+    for item in _sequence(dict(_mapping(entry)).get("versions")):
+        value = dict(_mapping(item)).get("v")
+        if isinstance(value, yaml.ScalarNode) and value.value == version:
+            return item
+    return None
+
+
+def _version_column_locator(base: str, version: str, column: str):
+    def locate(root: Any) -> Any:
+        item = _version_item(root, base, version)
+        for entry in _sequence(dict(_mapping(item)).get("columns")):
+            if _scalar_value(dict(_mapping(entry)).get("name")) == column:
+                return entry
         return None
 
     return locate
@@ -710,6 +1387,8 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
     plain = yaml.safe_load(yaml.serialize(node)) if node is not None else None
     existing = (entry_meta(plain) or {}).get(DEX_META_KEY)
     merged = {**existing, **dex} if isinstance(existing, dict) else dict(dex)
+    if isinstance(existing, dict):
+        merged = _merge_population(existing, merged)
 
     config = _child(node, "config")
     if config is None:
@@ -728,6 +1407,20 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         return found[1] if found else None
 
     return _set_key(text, meta_node, DEX_META_KEY, merged)
+
+
+def _merge_population(existing: Mapping[str, Any], merged: dict[str, Any]) -> dict:
+    """Keep ``population``'s own keys a later declaration leaves out (#857).
+
+    A model-level key is replaced whole, but ``population`` holds three
+    independent statements (a rule, filters, a parent), and a payload that adds
+    a parent to a model whose filters were declared earlier would otherwise
+    erase the filters. One level, the same rule one level down."""
+
+    before, after = existing.get("population"), merged.get("population")
+    if isinstance(before, dict) and isinstance(after, dict) and before is not after:
+        merged["population"] = {**before, **after}
+    return merged
 
 
 def _add_tests(text: str, locate, specs: list[Any]) -> str:
@@ -772,9 +1465,9 @@ def _add_tests(text: str, locate, specs: list[Any]) -> str:
         )
     dash_indent = line[: len(line) - len(line.lstrip(" "))]
     last_key_line = text.rfind("\n", 0, listed.value[-1].start_mark.index) + 1
-    from .rewrite import _block_end
+    from ..yaml_spans import block_end
 
-    end = _block_end(text, last_key_line, len(dash_indent))
+    end = block_end(text, last_key_line, len(dash_indent))
     at = before_trailing_blanks(text, end)
     rendered = "".join(_render_item(spec, dash_indent) for spec in todo)
     prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"
@@ -887,13 +1580,23 @@ def _flow(spec: Any) -> str:
 
 
 def _carries_declaration(files: Mapping[str, str], model: str) -> bool:
-    for entry in _entries(files, {model}):
-        if isinstance(entry_meta(entry).get(DEX_META_KEY), dict):
-            return True
-    return False
+    return any(
+        isinstance(entry_meta(entry).get(DEX_META_KEY), dict)
+        for _label, entry in _entries(files, {model})
+    )
 
 
-def _entries(files: Mapping[str, str], models: set[str]) -> Iterable[dict[str, Any]]:
+def _entries(
+    files: Mapping[str, str], models: set[str]
+) -> Iterable[tuple[str, dict[str, Any]]]:
+    """``(name, entry)`` for each model entry ``models`` names.
+
+    A version is read as dbt builds it (its effective entry, under its label),
+    so a name a version answers to (the label, the bare versioned name, or the
+    version's file stem) yields what that version declares (#895).
+    """
+
+    wanted = mv.expand(models, mv.cached_version_map(files))
     for path in sorted(files):
         if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
             continue
@@ -904,8 +1607,11 @@ def _entries(files: Mapping[str, str], models: set[str]) -> Iterable[dict[str, A
         if not isinstance(parsed, dict):
             continue
         for entry in parsed.get("models") or []:
-            if isinstance(entry, dict) and entry.get("name") in models:
-                yield entry
+            if not isinstance(entry, dict):
+                continue
+            for label, variant in mv.entry_variants(entry):
+                if label in wanted:
+                    yield label, variant
 
 
 def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str, Any]]:
@@ -916,7 +1622,7 @@ def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str,
     """
 
     out: list[dict[str, Any]] = []
-    for entry in _entries(files, set(models)):
+    for label, entry in _entries(files, set(models)):
         dex = entry_meta(entry).get(DEX_META_KEY)
         if not isinstance(dex, dict):
             continue
@@ -925,10 +1631,21 @@ def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str,
                 continue
             out.append(
                 {
-                    "model": entry["name"],
+                    "model": label,
                     "decision": assumption.get("decision"),
                     "chosen": assumption.get("chosen"),
                     "evidence": assumption.get("evidence"),
+                    **(
+                        {"column": assumption["column"]}
+                        if isinstance(assumption.get("column"), str)
+                        else {}
+                    ),
+                    **(
+                        {"detail": assumption["detail"]}
+                        if isinstance(assumption.get("detail"), str)
+                        and assumption["detail"].strip()
+                        else {}
+                    ),
                 }
             )
     return out

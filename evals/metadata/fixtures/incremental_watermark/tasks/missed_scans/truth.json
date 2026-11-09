@@ -1,0 +1,96 @@
+{
+  "models": {
+    "fct_parcel_scans": {
+      "grain": [
+        "scan_id"
+      ],
+      "columns": {
+        "scan_id": {
+          "role": "key"
+        },
+        "scanned_at": {
+          "role": [
+            "time",
+            "dimension"
+          ]
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "a full build loads every scan once",
+      "expect": 94,
+      "sql": "select count(distinct scan_id) from main.fct_parcel_scans where scan_id in (select scan_id from raw.parcel_scans)"
+    },
+    {
+      "name": "a full build loads no scan twice",
+      "expect": 0,
+      "sql": "select count(*) - count(distinct scan_id) from main.fct_parcel_scans"
+    }
+  ],
+  "replays": [
+    {
+      "name": "next_batch",
+      "select": "fct_parcel_scans",
+      "steps": [
+        [
+          "insert into raw.parcel_scans select * from raw.parcel_scans where scanned_at = (select max(scanned_at) from raw.parcel_scans) order by scan_id limit 1",
+          "insert into raw.parcel_scans select 90001 + i, 5900 + i, 'south', (select max(scanned_at) from raw.parcel_scans) from range(3) as t(i)",
+          "insert into raw.parcel_scans select 90011 + i, 5910 + i, 'west', (select max(scanned_at) from raw.parcel_scans) + interval 1 hour from range(2) as t(i)",
+          "insert into raw.parcel_scans select 90021, 5921, 'north', (select max(scanned_at) from raw.parcel_scans) - interval 2 day",
+          "insert into raw.parcel_scans values (90031, 5931, 'east', null)"
+        ],
+        []
+      ],
+      "checks": [
+        {
+          "name": "scans delivered late on the loaded watermark arrive",
+          "expect": 3,
+          "sql": "select count(distinct scan_id) from main.fct_parcel_scans where scan_id between 90001 and 90003"
+        },
+        {
+          "name": "scans after the watermark arrive",
+          "expect": 2,
+          "sql": "select count(distinct scan_id) from main.fct_parcel_scans where scan_id in (90011, 90012)"
+        },
+        {
+          "name": "no scan is loaded twice by the next runs",
+          "expect": 0,
+          "sql": "select count(*) - count(distinct scan_id) from main.fct_parcel_scans"
+        },
+        {
+          "name": "every scan from the first load is kept",
+          "expect": 94,
+          "sql": "select count(distinct scan_id) from main.fct_parcel_scans where scan_id < 90000"
+        }
+      ]
+    },
+    {
+      "name": "empty_target",
+      "select": "fct_parcel_scans",
+      "setup": [
+        "delete from raw.parcel_scans"
+      ],
+      "steps": [
+        [
+          "insert into raw.parcel_scans select 91001 + i, 6000 + i, 'north', timestamp '2026-04-01 08:00' + to_hours(i) from range(5) as t(i)"
+        ]
+      ],
+      "checks": [
+        {
+          "name": "an incremental run into an empty table loads the new scans",
+          "expect": 5,
+          "sql": "select count(*) from main.fct_parcel_scans"
+        }
+      ]
+    }
+  ],
+  "incremental_test": {
+    "model": "fct_parcel_scans"
+  },
+  "procedure": {
+    "build_after_apply": true,
+    "incremental_build_after_apply": true
+  }
+}

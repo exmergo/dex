@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.envelope import Paradigm
@@ -525,8 +526,8 @@ def test_build_ignores_a_stale_run_results_json_from_a_prior_invocation(
     build must not be reported as this invocation's node results -- verified
     against real dbt behavior (its mtime is untouched by such a failure)."""
 
-    target_dir = dbt_project_dir / "target"
-    target_dir.mkdir(exist_ok=True)
+    target_dir = dex_target(dbt_project_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / "run_results.json").write_text(
         json.dumps(
             {
@@ -656,7 +657,18 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         # The assumptions the built models declare (#491); empty here, since the
         # fixture project declares none.
         "decisions",
+        # Where dbt wrote this build's artifacts (#1014).
+        "artifact_directory",
+        # The bounded lead, ahead of every unbounded list (#855).
+        "completion",
     }
+    assert next(iter(envelope["data"])) == "completion"
+    completion = envelope["data"]["completion"]
+    assert completion["outcome"] == envelope["data"]["outcome"]
+    # No plan was named, so nothing says which nodes were the point.
+    assert completion["deliverables"]["coverage"] == "unknown"
+    # The not_null test passed, so the model's rows were checked by something.
+    assert "stg_customers" in completion["assurance"]["asserted"]["names"]
     assert envelope["data"]["decisions"] == []
     # `success` is dbt's exit code; `outcome` is whether anything was validated,
     # and this run built real nodes against current artifacts.
@@ -1005,7 +1017,7 @@ def _write_incremental_artifacts(project: Path) -> None:
         },
     }
     _write_manifest(project, nodes)
-    (project / "target" / "run_results.json").write_text(
+    (dex_target(project) / "run_results.json").write_text(
         json.dumps({"results": [{"unique_id": uid} for uid in nodes]}),
         encoding="utf-8",
     )
@@ -1224,7 +1236,7 @@ def test_clickhouse_cloud_build_uses_compute_time_and_translates_settled_seconds
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1383,7 +1395,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
         confirmed=True,
         ceiling=100_000_000,
     )
-    target_dir = bigquery_project_dir / "target"
+    target_dir = dex_target(bigquery_project_dir)
     run_results = json_mod.dumps(
         {
             "results": [
@@ -1466,6 +1478,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
         "estimate",
         "job_id",
         "statement_sha256",
+        "warehouse_claim",
     }
     assert entry["reservation_id"] == adapter.cost_gate.reservation_id
 
@@ -1507,7 +1520,7 @@ def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1572,7 +1585,7 @@ def test_a_build_whose_statements_reported_no_billing_figure_says_so(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1635,7 +1648,7 @@ def test_engine_settled_spend_reports_unknown_settlement_on_failed_build(
         monkeypatch,
         returncode=1,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1718,7 +1731,7 @@ def test_engine_settled_spend_reports_unknown_settlement_on_successful_build(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -1773,7 +1786,7 @@ def test_engine_settled_spend_reflects_build_known_spend_on_success_and_failure(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results_success,
         ),
     )
@@ -1809,7 +1822,7 @@ def test_engine_settled_spend_reflects_build_known_spend_on_success_and_failure(
         monkeypatch,
         returncode=1,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results_failure,
         ),
     )
@@ -1860,7 +1873,7 @@ def test_build_timeout_after_running_nodes_ledgers_their_seconds(
         monkeypatch,
         raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
         run_results_json=(
-            dbt_project_dir / "target" / "run_results.json",
+            dex_target(dbt_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -2449,8 +2462,8 @@ def _guard_compile_runner(monkeypatch, project, code, *, mode="ok"):
                 if mode == "failed":
                     return subprocess.CompletedProcess(argv, 1, "", "")
                 if mode != "absent":
-                    target = project / "target"
-                    target.mkdir(exist_ok=True)
+                    target = dex_target(project)
+                    target.mkdir(parents=True, exist_ok=True)
                     uid = "model.dex_test.guarded"
                     (target / "run_results.json").write_text(
                         json.dumps(
@@ -2473,7 +2486,7 @@ def _guard_compile_runner(monkeypatch, project, code, *, mode="ok"):
                     )
             else:
                 assert command == "build"
-                assert not (project / "target/run_results.json").exists()
+                assert not (dex_target(project) / "run_results.json").exists()
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         return run
@@ -2544,8 +2557,8 @@ def _compile_runner(
             assert env == expected_env
 
         def run(argv: list[str]):
-            (project / "target").mkdir(parents=True, exist_ok=True)
-            (project / "target" / "run_results.json").write_text(
+            (dex_target(project)).mkdir(parents=True, exist_ok=True)
+            (dex_target(project) / "run_results.json").write_text(
                 json.dumps(run_results), encoding="utf-8"
             )
             return subprocess.CompletedProcess(argv, returncode, "", "")
@@ -2593,8 +2606,8 @@ class _EstimatingAdapter:
 
 
 def _write_manifest(project: Path, nodes: dict) -> None:
-    (project / "target").mkdir(parents=True, exist_ok=True)
-    (project / "target" / "manifest.json").write_text(
+    (dex_target(project)).mkdir(parents=True, exist_ok=True)
+    (dex_target(project) / "manifest.json").write_text(
         json.dumps({"nodes": nodes}), encoding="utf-8"
     )
 
@@ -2737,7 +2750,7 @@ def test_dynamic_bound_nodes_finds_an_incremental_watermark_and_nothing_else(
         ),
     }
     _write_manifest(dbt_project_dir, nodes)
-    (dbt_project_dir / "target" / "run_results.json").write_text(
+    (dex_target(dbt_project_dir) / "run_results.json").write_text(
         json.dumps({"results": [{"unique_id": uid} for uid in nodes]}),
         encoding="utf-8",
     )
@@ -2846,7 +2859,7 @@ def test_a_failed_billed_build_still_reports_what_it_burned(
         returncode=1,
         stdout=json.dumps({"info": {"level": "error", "msg": msg}}),
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             run_results,
         ),
     )
@@ -3050,7 +3063,7 @@ def test_a_running_build_holds_its_headroom_and_gives_it_back(
         finally:
             concurrent.settle()
 
-    target_dir = bigquery_project_dir / "target"
+    target_dir = dex_target(bigquery_project_dir)
     run_results = json_mod.dumps(
         {
             "results": [
@@ -3127,7 +3140,7 @@ def test_a_warning_test_node_is_named_rather_than_hashed(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            dbt_project_dir / "target" / "run_results.json",
+            dex_target(dbt_project_dir) / "run_results.json",
             _node_results(
                 {
                     "unique_id": "model.dex_test.stg_customers",
@@ -3180,7 +3193,7 @@ def test_a_versioned_model_is_named_with_its_version(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            dbt_project_dir / "target" / "run_results.json",
+            dex_target(dbt_project_dir) / "run_results.json",
             _node_results(
                 *(
                     {
@@ -3232,7 +3245,7 @@ def test_a_verified_build_reports_findings_and_stays_ok(
     warnings alone still learns about them.
     """
 
-    target = dbt_project_dir / "target"
+    target = dex_target(dbt_project_dir)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -3286,7 +3299,7 @@ def test_a_failed_verified_build_names_the_failed_and_skipped_nodes(
     when "which node failed, and what did it take down with it" is worth most.
     """
 
-    target = dbt_project_dir / "target"
+    target = dex_target(dbt_project_dir)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -3362,7 +3375,7 @@ def _verifiable_manifest(project: Path, *, materialized: str) -> None:
     what scopes the sweep. A build that follows overwrites them with its own.
     """
 
-    target = project / "target"
+    target = dex_target(project)
     target.mkdir(parents=True, exist_ok=True)
     (target / "run_results.json").write_text(
         json.dumps(
@@ -3436,7 +3449,7 @@ def test_a_metered_build_does_not_verify_or_connect_unless_asked(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             _built_run_results(),
         ),
     )
@@ -3496,12 +3509,14 @@ def test_the_upfront_estimate_covers_the_build_and_its_verification(
     )
     assert rc == 0, envelope
     assert envelope["status"] == "needs_confirmation"
-    assert envelope["data"]["estimated_bytes"] == 51_000.0
+    # The build, the row counts, and the coverage probe of its one join (#857).
+    assert envelope["data"]["estimated_bytes"] == 101_000.0
     assert envelope["data"]["per_table_bytes"]["(row counts)"] == 50_000.0
+    assert envelope["data"]["per_table_bytes"]["(join overlap probes)"] == 50_000.0
     assert envelope["data"]["per_table_bytes"]["fct_orders"] == 1000.0
 
 
-def test_a_table_materialization_adds_nothing_to_the_estimate(
+def test_a_table_materialization_adds_no_row_count_to_the_estimate(
     bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
     """A warehouse keeps a row count for a table, so nothing has to be scanned
@@ -3531,8 +3546,10 @@ def test_a_table_materialization_adds_nothing_to_the_estimate(
         capsys,
     )
     assert rc == 0, envelope
-    assert envelope["data"]["estimated_bytes"] == 1000.0
+    # Only the join's coverage probe is a scan; the table's count is metadata.
+    assert envelope["data"]["estimated_bytes"] == 51_000.0
     assert "(row counts)" not in envelope["data"]["per_table_bytes"]
+    assert envelope["data"]["per_table_bytes"]["(join overlap probes)"] == 50_000.0
 
 
 def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
@@ -3565,6 +3582,7 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         query_estimate=50_000.0,
         objects=[
             _Meta("dex-test.raw.orders", 1000),
+            _Meta("dex-test.raw.events", 1000),
             _Meta("dex-test.dbt_dev.fct_orders", None),
         ],
         counts=[0],
@@ -3574,7 +3592,7 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             _built_run_results(),
         ),
     )
@@ -3595,10 +3613,13 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
     )
     assert rc == 0, envelope
     assert envelope["status"] == "ok"
-    assert len(adapter.queries) == 1, "the counts are one batched statement"
-    # 3000 from dbt, 50000 from the count statement dex issued through the gate.
-    assert envelope["data"]["spend"]["bytes_billed"] == 53_000.0
-    assert envelope["data"]["spend"]["session_spent_today"] == 53_000.0
+    # The counts are one batched statement, and the join's coverage one more.
+    assert len(adapter.queries) == 2
+    assert sum("dex_cov_rows_0" in sql for sql in adapter.queries) == 1
+    # 3000 from dbt, 50000 each from the two statements dex issued through
+    # the gate.
+    assert envelope["data"]["spend"]["bytes_billed"] == 103_000.0
+    assert envelope["data"]["spend"]["session_spent_today"] == 103_000.0
     verification = envelope["data"]["verification"]
     assert verification["ran"] is True
     assert verification["scope"] == ["fct_orders"]
@@ -3609,13 +3630,12 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         for line in (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
     ]
     settlements = [r for r in rows if r["entry"] == "settlement"]
-    assert len(settlements) == 2
+    assert len(settlements) == 3
     assert [r["reservation_id"] for r in settlements] == [
-        adapter.cost_gate.reservation_id,
-        adapter.cost_gate.reservation_id,
-    ]
+        adapter.cost_gate.reservation_id
+    ] * 3
     assert settled_ratios(rows, connector="bigquery", field="billed_bytes") == [
-        pytest.approx(53_000.0 / 51_000.0)
+        pytest.approx(103_000.0 / 101_000.0)
     ]
 
 
@@ -3642,7 +3662,7 @@ def test_a_verified_build_whose_dev_target_is_out_of_scope_says_so(
         monkeypatch,
         returncode=0,
         run_results_json=(
-            bigquery_project_dir / "target" / "run_results.json",
+            dex_target(bigquery_project_dir) / "run_results.json",
             _built_run_results(),
         ),
     )
@@ -3797,7 +3817,7 @@ def _snowflake_build(
         "  session_ceiling: 3600\n",
         encoding="utf-8",
     )
-    target = project / "target"
+    target = dex_target(project)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -3918,10 +3938,14 @@ def test_a_first_verified_snowflake_build_judges_the_schema_it_created(
         "RAW.PUBLIC",
         "DEV.DBT_DEV",
     ]
-    # The 4-second run plus the 60-second idle tail, on a warehouse it resumed.
-    assert envelope["data"]["spend"]["seconds_billed"] == pytest.approx(64.0)
-    assert _settled_seconds(run.ledger) == pytest.approx(64.0)
-    assert run.connection.data_statements == [], "the counts came from the catalog"
+    # The 4-second run plus the 60-second idle tail, on a warehouse it resumed,
+    # plus the coverage probe of the model's one join (#857).
+    assert envelope["data"]["spend"]["seconds_billed"] == pytest.approx(64.5)
+    assert _settled_seconds(run.ledger) == pytest.approx(64.5)
+    # The counts came from the catalog: the only data statement is the probe.
+    assert [
+        "DEX_COV_ROWS_0" in stmt.sql.upper() for stmt in run.connection.data_statements
+    ] == [True]
 
 
 def test_a_first_verified_snowflake_build_into_an_empty_schema_judges_it(
@@ -4052,7 +4076,10 @@ def test_a_build_that_resumed_the_warehouse_settles_its_uptime(
     assert spend["credits_billed"] == pytest.approx(64.0 / 3600, abs=1e-6)
     assert _settled_seconds(run.ledger) == pytest.approx(64.0)
     rows = [json.loads(line) for line in run.ledger.read_text().splitlines()]
-    settlements = [r for r in rows if r["entry"] == "settlement"]
+    # The claim on the resume cycle is a zero row of its own (#664).
+    settlements = [
+        r for r in rows if r["entry"] == "settlement" and not r["warehouse_claim"]
+    ]
     assert len(settlements) == 1, "the uptime joins dbt's row, keeping one ratio"
     assert settlements[0]["reservation_id"] == rows[0]["reservation_id"]
     [note] = _uptime_notes(envelope)
@@ -4272,14 +4299,26 @@ def test_cli_build_timeout_populates_envelope_spend(
     assert envelope["data"]["spend"]["unknown_settlement"] is True
 
 
+@pytest.mark.parametrize(
+    "dataset",
+    [
+        # A custom `generate_schema_name` that lands outside the dev naming.
+        pytest.param("marts", id="outside-the-dev-naming"),
+        # dbt's default naming for `+schema: marts` (#1155).
+        pytest.param("dbt_dev_marts", id="derived-from-the-dev-dataset"),
+    ],
+)
 def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
-    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch, dataset
 ):
     """BigQuery prices with a dry run that never resolves the scope, and lists
     afresh each time, so a dev dataset dbt creates reads after the build. The
     one case left is a build that writes nothing into it (every model in a
     custom schema), so it is never created. That listing once raised after the
-    build had billed; it is the out-of-scope suppression it should have been."""
+    build had billed; it is the out-of-scope suppression it should have been.
+
+    A custom schema dbt derives from the dev dataset (``dbt_dev_marts``) is this
+    target's own output, so it is read and judged instead (#1155)."""
 
     pytest.importorskip("google.cloud.bigquery")
     from fakes.bigquery import FakeBigQueryClient, FakeTable
@@ -4332,7 +4371,7 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
         "  dev_dataset: dbt_dev\n",
         encoding="utf-8",
     )
-    target = bigquery_project_dir / "target"
+    target = dex_target(bigquery_project_dir)
     target.mkdir(parents=True, exist_ok=True)
     (target / "manifest.json").write_text(
         json.dumps(
@@ -4341,7 +4380,7 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
                     "model.dex_test.fct_orders": {
                         "name": "fct_orders",
                         "resource_type": "model",
-                        "relation_name": "`dex-test`.`dbt_dev_marts`.`fct_orders`",
+                        "relation_name": f"`dex-test`.`{dataset}`.`fct_orders`",
                         "config": {"materialized": "table"},
                         "compiled_code": "select o.id from `dex-test`.`raw`.`orders` o",
                     }
@@ -4353,8 +4392,8 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
 
     def dbt_writes(argv: list[str]) -> None:
         if "build" in argv:
-            client.tables["dex-test.dbt_dev_marts.fct_orders"] = table(
-                "dbt_dev_marts", "fct_orders", 5
+            client.tables[f"dex-test.{dataset}.fct_orders"] = table(
+                dataset, "fct_orders", 5
             )
 
     _fake_runner_factory(
@@ -4378,9 +4417,15 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
     )
     assert rc == 0, envelope
     assert envelope["status"] == "ok"
-    reason = envelope["data"]["verification"]["suppressed"]["row_population"]
-    assert "outside dex's read scope" in reason
-    assert "custom schema" in reason
+    verification = envelope["data"]["verification"]
+    if dataset == "marts":
+        reason = verification["suppressed"]["row_population"]
+        assert "outside dex's read scope" in reason
+        assert "custom schema" in reason
+    else:
+        assert "row_population" not in verification["suppressed"]
+        notes = envelope["data"].get("notes") or []
+        assert any("dbt_dev_marts" in n for n in notes), notes
 
 
 # --- ShadowRun.show ------------------------------------------------------------
@@ -4489,3 +4534,38 @@ def test_show_without_a_readable_preview_returns_no_rows(
     with ShadowRun(dbt_project_dir, target="dev", runner=runner) as shadow:
         _summary, rows = shadow.show("dex_mutation_equivalence")
     assert rows is None
+
+
+def test_a_failed_build_message_never_carries_the_value_a_cast_failed_on():
+    """A model that fails on a cast fails in the warehouse's words, which quote
+    the row's value; the build keeps the words and masks the value (#1070)."""
+
+    import subprocess
+
+    from exmergo_dex_core.transform.build import _collect_messages
+
+    line = json.dumps(
+        {
+            "info": {
+                "name": "RunResultError",
+                "level": "error",
+                "msg": "Conversion Error: Could not convert string "
+                "'zq_sentinel_7' to INT32",
+            },
+            "data": {},
+        }
+    )
+    completed = subprocess.CompletedProcess(
+        ["dbt"], 1, stdout=line + "\n", stderr="Bad int64 value: zq_sentinel_7"
+    )
+    messages = _collect_messages(completed)
+    assert "zq_sentinel_7" not in json.dumps(messages)
+    assert any(
+        "Could not convert string <value withheld> to INT32" in m for m in messages
+    )
+    stderr_only = _collect_messages(
+        subprocess.CompletedProcess(
+            ["dbt"], 1, stdout="", stderr="Bad int64 value: zq_sentinel_7"
+        )
+    )
+    assert stderr_only == ["Bad int64 value: <value withheld>"]

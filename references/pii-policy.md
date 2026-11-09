@@ -35,7 +35,9 @@ confidence against the blocking threshold.
 | cluster feature selection | presence, any confidence | flagged columns are excluded; naming one is opt-in and mean only |
 | the query firewall | threshold | at or above, projection is refused; below, it runs with a warning |
 | the seed header gate | threshold | a seed column at or above the threshold is refused |
+| declaration population reporting | presence, any confidence | a flagged filter withholds its values and the entire free-text population rule |
 | the semantic request gate | presence, any confidence | a flagged dimension refuses the whole command |
+| warehouse error text | none: every column | the value a conversion failure quotes is masked (see [Warehouse error text](#warehouse-error-text)) |
 
 A weak flag therefore still suppresses min and max and still stamps `meta`,
 while allowing a query that projects the column. What a weak flag means is the
@@ -60,6 +62,19 @@ This section is the only place in the repository that states the number.
 
 ## The firewall rule
 
+Agent-authored queries must be SELECTs or supported set operations. Query
+bodies in CTEs, subqueries and set-operation branches follow the same rule.
+Nested metadata statements such as `DESCRIBE` are refused before connection
+discovery, profiling or execution, including in scalar expressions and unused
+CTEs. The typed refusal names the unsupported shape and points to
+`explore inventory` or `explore profile` for introspection. This also applies
+to compile-time queries run through `transform plan`, where the refusal of a
+`DESCRIBE`, `SUMMARIZE` or `information_schema` read names
+`adapter.get_columns_in_relation` instead. Dex refuses introspection SQL that a
+model or macro issues itself; dbt's column listing is answered by the connector's
+own metadata read (a catalog query on DuckDB, `SHOW COLUMNS` on Snowflake, the
+table API on BigQuery), which returns names and types and never a value.
+
 Output may carry values only from profiled columns whose flag is absent or below
 the threshold. Every value path from a blocking column must pass through a
 measuring aggregate (COUNT, APPROX_COUNT_DISTINCT, AVG, SUM, STDDEV, and the
@@ -76,6 +91,28 @@ warning naming the column, category, and confidence. Treat that warning as
 information for the user, not an error to fix.
 
 Unnested JSON and array outputs inherit the source column's flags.
+
+## Protected values and transformation columns
+
+A refusal to return protected values to an agent does not instruct it to remove,
+redact or replace a column in a user's transformation. When the requested or
+existing output contract includes that field, preserve its authorized pass-through
+through the normal `transform plan` and `transform apply` path where supported,
+then build on dev with verification. Validate column presence and types through
+metadata and use only permitted aggregate evidence for row checks. There is no
+need to retrieve an example of the protected value.
+
+Intentional removal or redaction requires an applicable user instruction or
+contract. Do not invent either as a workaround for an inspection restriction,
+and keep protected examples out of assumptions, tests, logs and explanations.
+Only a human may clear a PII flag.
+
+Permission belongs to the command and operation being performed. A supported
+model pass-through does not authorize exporting the field as a seed: the seed
+header gate still applies because seed values enter the repository. If a
+transformation itself is prohibited or unsupported, report that limitation
+accurately and leave the guard in place. Never bypass a privacy or dev-target
+guard or infer permission from another command's success.
 
 ## The stricter surface
 
@@ -151,6 +188,50 @@ table yet stays silent, since new entities landing later under the same scope is
 the point of the pattern form. Both `explore profile` and `explore map` emit
 this warning with the same text, so a scheduled `map` is enough to catch a
 rename that left an override pointing at nothing.
+
+## Warehouse error text
+
+A warehouse refuses a statement in its own words, and dex keeps them: the column
+it could not find, the type it expected and the object that is gone are what
+make a failure diagnosable. One family of refusals also quotes a value. A
+conversion, parse or range failure names the input it could not handle, and that
+input came from a row, possibly from a flagged column. An error is not a result
+column, so the firewall never sees it.
+
+So that value is masked and every other word is kept:
+
+| Warehouse says | The envelope says |
+|---|---|
+| `Could not convert string 'org_cedar' to INT32` | `Could not convert string <value withheld> to INT32` |
+| `Bad int64 value: org_cedar` | `Bad int64 value: <value withheld>` |
+| `invalid input syntax for type integer: "org_cedar"` | `invalid input syntax for type integer: <value withheld>` |
+| `Referenced column "nope" not found` | unchanged |
+
+The rule holds on every connector and on every surface a warehouse's words can
+reach: an error envelope (`explore query`, a profile scan), a statement in an
+`explore query` batch and the query log, the notes, warnings and `suppressed`
+reasons a check that could not run leaves behind, a record's `reason` and
+`detail` (`join_coverage`, `parent_population`, `temporal_contracts`), a
+dataset's `data_quality` in the cache, the messages and node evidence of a
+`transform build` whose model failed on a cast, and the hosted semantic layer's
+error. A plain join of a text key to an integer key is the common way to meet
+it: the warehouse casts implicitly and fails on the first key that does not
+convert, with no cast in the SQL.
+
+Where a count or a conversion probe must carry nothing row-level at all (row
+attribution, identifier conversions, a converted join key, `transform compare`),
+the message is withheld and only the exception type is reported. In values-free
+mode no warehouse words reach the caller at all: an error carries its class and
+a stable code (see [`values-free-mode.md`](values-free-mode.md)), and a refused
+join probe in `explore relationships` or `explore map` names the exception type
+only.
+
+The mask is a catalogue of the shapes each connector's conversion failures take,
+held in `exmergo_dex_core.value_mask` and tested per connector. A message that
+still reads as a conversion failure after the catalogue has every quoted segment
+masked, so an unlisted shape over-masks rather than leaks; a shape that quotes
+its value unquoted and is not listed would pass through, and finding one is a
+bug to report.
 
 ## Broader than PII: values-free mode
 

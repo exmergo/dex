@@ -1,0 +1,7 @@
+{
+  "kind": "test",
+  "models": [
+    "fct_depot_trailing"
+  ],
+  "prompt": "`fct_depot_trailing` has no unit tests yet. Add unit tests that pin its trailing seven-day parcel count, so that a change which counts the wrong days would fail them. Build on dev when you are done."
+}

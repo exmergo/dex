@@ -1,0 +1,87 @@
+{
+  "models": {
+    "team_member_summary": {
+      "grain": [
+        "team_id"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "team_id": {
+          "role": "key"
+        },
+        "member_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        },
+        "handled_members": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "every team is present",
+      "expect": 12,
+      "sql": "select count(*) from main.team_member_summary"
+    },
+    {
+      "name": "teams with no members count zero",
+      "expect": 3,
+      "sql": "select count(*) from main.team_member_summary where member_count = 0 and handled_members = 0"
+    },
+    {
+      "name": "counts and first join are what they were before the refactor",
+      "expect": 0,
+      "sql": "with e as (select t.team_id, count(m.member_id) as members, count(h.member_id) as handled, min(m.joined_on) as first_joined from raw.teams t left join raw.members m on m.team_id = t.team_id left join raw.handles h on h.member_id = m.member_id group by 1) select count(*) from main.team_member_summary s join e using (team_id) where s.member_count is distinct from e.members or s.handled_members is distinct from e.handled or s.first_joined_ts is distinct from e.first_joined"
+    },
+    {
+      "name": "no member was dropped to make the build pass",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.members) - (select sum(member_count) from main.team_member_summary)"
+    },
+    {
+      "name": "handles of members the roster does not have are not counted",
+      "expect": 0,
+      "sql": "select (select sum(handled_members) from main.team_member_summary) - (select count(*) from raw.handles h join raw.members m using (member_id))"
+    }
+  ],
+  "workspace_checks": [
+    {
+      "name": "the vendor's raw.members.joined_at is still an integer",
+      "expect": 1,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'raw' and table_name = 'members' and column_name = 'joined_at' and data_type = 'INTEGER'"
+    },
+    {
+      "name": "the intermediate is deployed on dev",
+      "expect": 1,
+      "sql": "select count(*) from information_schema.tables where table_schema = 'main' and table_name = 'int_team_members'",
+      "live_only": true
+    },
+    {
+      "name": "the refactored mart is deployed on dev with every member counted",
+      "expect": 0,
+      "sql": "select (select count(*) from raw.members) - (select sum(member_count) from main.team_member_summary) + (select count(*) from raw.teams) - (select count(*) from main.team_member_summary)",
+      "live_only": true
+    },
+    {
+      "name": "the mart deployed on dev reads the intermediate",
+      "expect": 0,
+      "sql": "select count(*) from main.team_member_summary s full join main.int_team_members i using (team_id) where i.team_id is not null and (s.team_id is null or s.member_count is distinct from i.member_count)",
+      "live_only": true
+    }
+  ],
+  "procedure": {
+    "compare_before_apply": true,
+    "build_after_apply": true,
+    "rebuilt_before_compare": true,
+    "cold_deps_after_repair": true
+  }
+}

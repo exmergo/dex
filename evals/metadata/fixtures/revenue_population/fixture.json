@@ -1,0 +1,5 @@
+{
+  "name": "revenue_population",
+  "seed": 4921,
+  "description": "A web store whose every revenue model excludes cancelled and returned orders. A new revenue mart has to follow that convention, which only the sibling models state."
+}

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import DbtProjectView, EditOp, node_files, node_name, path_family
 from ..errors import RequestError
-from ..references import KINDS, ReferenceIndex
+from ..references import KINDS, ReferenceIndex, column_parse_limit
 from ..yaml_spans import with_leading_comments
 from .plans import EditKind, PlanEdit
 from .rewrite import (
@@ -110,6 +110,8 @@ def propagate(
     new: str | None = None,
     *,
     extra_edits: list[PlanEdit] | None = None,
+    retirement: bool = False,
+    scoped: bool = False,
 ) -> Propagation:
     """Every edit a rename (``new`` given) or a removal (``new`` omitted) needs.
 
@@ -122,6 +124,11 @@ def propagate(
     caller who has already decided what each read should become passes those
     edits here and the whole change is checked as one project state. Without them
     the refusal would be unavoidable for every var a project actually reads.
+
+    ``scoped`` is a retirement whose contract says ``scope: authored`` (#1086):
+    the reasons the scan is incomplete, and dynamic var reads, are reported by
+    the caller rather than refused here. Every literal read the scan did find
+    is still refused while it survives.
     """
 
     if kind not in (RENAMEABLE if new is not None else REMOVABLE):
@@ -137,7 +144,9 @@ def propagate(
             )
         )
     index = ReferenceIndex(view)
-    _refuse_incomplete(index, kind, old)
+    verb = "rename" if new is not None else "remove"
+    if not scoped:
+        _refuse_incomplete(index, kind, old, verb=verb, retirement=retirement)
     owner, column = _resolve_target(index, kind, old)
     # Compared against the *bare* name for a column, since `old` carries the
     # model that scopes it and `new` never does: `stg_orders.order_id` renamed to
@@ -146,8 +155,10 @@ def propagate(
         raise PropagationRefusedError(f"'{new}' is already its name; nothing to do")
 
     builder = _Builder(view, project_dir, index, kind, old, new, owner, column)
-    builder.run()
+    builder.run(allow_nothing=retirement)
     edits = builder.edits() + list(extra_edits or [])
+    if retirement:
+        _refuse_local_dynamic_reads(view, old, edits, scoped=scoped)
     if new is None:
         _refuse_surviving_reads(view, kind, old, edits)
     else:
@@ -265,6 +276,45 @@ def _refuse_surviving_reads(
     )
 
 
+#: Appended to the refusals a scoped retirement reports instead (#1086).
+_SCOPED_HINT = (
+    '. If the scan cannot be finished, add `"scope": "authored"` to the '
+    "retirement contract: Dex then checks the outputs and metrics the contract "
+    "names and reports reference discovery as unchecked, never as complete"
+)
+
+
+def _refuse_local_dynamic_reads(
+    view: DbtProjectView, name: str, edits: list[PlanEdit], *, scoped: bool = False
+) -> None:
+    """Refuse a retirement while this project may still read the flag (#858).
+
+    Judged on the project *after* the plan, so the repair this names can be made
+    in the same payload. A package's dynamic read is outside the owner's scope
+    and is reported instead. A read in YAML is checked here too, since the index
+    records no var form there.
+    """
+
+    from .retirement import yaml_reads
+
+    after = _project_after_edits(view, edits)
+    index = ReferenceIndex(after, scan_packages=False)
+    dynamic = [f"{ref.path}:{ref.line}" for ref in index.indeterminate_for("var")]
+    if dynamic and not scoped:
+        raise PropagationRefusedError(
+            f"{len(dynamic)} var read(s) in this project name no literal variable, "
+            f"so any of them may read '{name}': {', '.join(sorted(dynamic))}. Dex "
+            "will not guess. In this payload, rewrite each to name its variable "
+            "directly, or remove it, and re-run" + _SCOPED_HINT
+        )
+    written = yaml_reads({p: s.content for p, s in after.files.items()}, name)
+    if written:
+        raise PropagationRefusedError(
+            f"'{name}' is still read in YAML at {', '.join(written)}. Dex will not "
+            "invent what that setting should become: edit it in this payload"
+        )
+
+
 def _refuse_surviving_python_readers(
     view: DbtProjectView, kind: str, name: str, edits: list[PlanEdit]
 ) -> None:
@@ -297,7 +347,14 @@ def _refuse_surviving_python_readers(
     )
 
 
-def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
+def _refuse_incomplete(
+    index: ReferenceIndex,
+    kind: str,
+    name: str,
+    *,
+    verb: str = "rename",
+    retirement: bool = False,
+) -> None:
     """Refuse while any reason to doubt the reference report is still standing.
 
     Each of these is a way the report can be short of complete, and acting on a
@@ -312,20 +369,32 @@ def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
             "dex cannot promise it found every use of "
             f"'{name}': YAML could not be parsed in {', '.join(unread_yaml)}. "
             "Resolve that first, because a partial rewrite can still compile"
+            + (_SCOPED_HINT if retirement else "")
         )
 
     _, query_limits = index.references_to(
         name.rpartition(".")[2] if kind == "column" else name, kind
     )
     limits = list(dict.fromkeys([*index.limits, *query_limits]))
+    if retirement and kind == "var":
+        # A var read is found by the Jinja scan, which read every one of these
+        # files; a column-parse limit bounds only the column reads the
+        # retirement checks itself, from compiled SQL, and reports as partial
+        # where it cannot (#1172). Every other limit still refuses.
+        column = {column_parse_limit(path) for path in index.column_unread}
+        limits = [limit for limit in limits if limit not in column]
     if limits:
+        action = "a removal" if verb == "remove" else "a rename"
         raise PropagationRefusedError(
             "dex cannot promise it found every use of "
-            f"'{name}': {'; '.join(limits)}. Resolve that first, because a "
-            "rename applied to most of a project still compiles"
+            f"'{name}': {'; '.join(limits)}. Resolve that first, because {action} "
+            "applied to most of a project still compiles"
+            + (_SCOPED_HINT if retirement else "")
         )
 
-    unresolved = index.indeterminate_for(kind)
+    # A retirement judges these on the post-edit tree and keeps a package's out
+    # of its scope, so a repair in the same payload can satisfy it (#858).
+    unresolved = [] if retirement else index.indeterminate_for(kind)
     if unresolved:
         where = ", ".join(f"{ref.path}:{ref.line}" for ref in unresolved)
         raise PropagationRefusedError(
@@ -339,7 +408,7 @@ def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
     definitions = index.definitions_of(name, kind)
     packaged = sorted({str(d.package) for d in definitions if d.package})
     local = [d for d in definitions if not d.package]
-    if packaged and local:
+    if packaged and local and not retirement:
         here = ", ".join(sorted({d.path for d in local}))
         raise PropagationRefusedError(
             f"'{name}' is defined both in this project ({here}) and in "
@@ -425,7 +494,7 @@ class _Builder:
 
     # --- the walk ------------------------------------------------------------
 
-    def run(self) -> None:
+    def run(self, *, allow_nothing: bool = False) -> None:
         self._refuse_macro_arguments()
         for path in sorted(self.view.files):
             content = self.view.files[path].content
@@ -437,6 +506,10 @@ class _Builder:
                 self._seed_file(path, content)
         if self.kind in _FILE_NODES:
             self._node_file()
+        if allow_nothing:
+            # A read-only `var('x', true)` has no definition to remove, and the
+            # caller's read edits are the whole change.
+            return
         if not (self._spans or self._whole or self._moves or self._deletes):
             raise PropagationRefusedError(
                 f"'{self.old}' is not used as a {self.kind} anywhere in this "

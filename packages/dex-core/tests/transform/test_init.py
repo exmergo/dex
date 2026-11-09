@@ -151,6 +151,51 @@ def test_init_writes_no_absolute_path_for_an_in_repo_warehouse(tmp_path: Path, c
     assert envelope["data"]["warehouse_path"] == "warehouse/x.duckdb"
 
 
+def test_init_preserves_comments_and_unread_keys_in_an_existing_config(
+    tmp_path: Path, capsys
+):
+    """Issue #555: ``transform init`` must not rewrite an existing config through
+    a full YAML dump. Comments, unread keys, and an explicit ``null`` seed have
+    to survive; only the keys init itself sets may change."""
+
+    dex = tmp_path / ".dex"
+    dex.mkdir()
+    (dex / "config.yml").write_text(
+        "# Settings for this repo; the comments carry the reasoning.\n"
+        "connector: duckdb\n"
+        "duckdb:\n"
+        "  path: warehouse.duckdb   # the shared dev copy\n"
+        "cluster:\n"
+        "  sample_seed: null        # a fresh draw per run, on purpose\n"
+        "unknown_future_key: keep_me\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "warehouse.duckdb").write_bytes(b"")
+
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "duckdb", "--path", "warehouse.duckdb"),
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    text = (dex / "config.yml").read_text(encoding="utf-8")
+    assert "Settings for this repo" in text
+    assert "the shared dev copy" in text
+    assert "a fresh draw per run" in text
+    assert "sample_seed: null" in text
+    assert "unknown_future_key: keep_me" in text
+    assert "cluster: {}" not in text
+
+    config = yaml.safe_load(text)
+    assert config["connector"] == "duckdb"
+    assert config["dbt_project_dir"] == "analytics"
+    assert config["dbt_target"] == "dev"
+    assert config["duckdb"]["path"] == "warehouse.duckdb"
+    assert config["cluster"]["sample_seed"] is None
+    assert config["unknown_future_key"] == "keep_me"
+    assert str(tmp_path) not in text
+
+
 def test_init_keeps_an_absolute_path_for_a_warehouse_outside_the_repo(
     tmp_path: Path, capsys
 ):
@@ -583,11 +628,31 @@ def test_init_postgres_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch)
     # ~/.pgpass and peer auth still work at dbt runtime.
     assert "hunter2" not in rendered
     assert "env_var" in output["password"] and "PGPASSWORD" in output["password"]
+    # One identity, no note.
+    assert "notes" not in envelope["data"]
     # The dev schema choice is persisted for cmd_map's replica folding.
     config = yaml.safe_load(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
     assert config["postgres"]["dev_schema"] == "dbt_dev"
+
+
+def test_init_postgres_renders_the_committed_build_identity(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """A committed postgres.user is the build identity, even where discovery
+    (DATABASE_URL) found dex a read-only role (#904)."""
+
+    pytest.importorskip("psycopg")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://dex_ro@db.example.com:5439/shop")
+    _seed_postgres_config(tmp_path, user="dbt_dev")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "postgres"), capsys)
+    assert rc == 0, envelope
+    profile = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    assert profile["analytics"]["outputs"]["dev"]["user"] == "dbt_dev"
+    assert "dex_ro" in envelope["data"]["notes"][0]
 
 
 def test_init_postgres_refuses_dev_schema_source_collision(
@@ -668,6 +733,23 @@ def test_init_redshift_bootstraps_a_password_profile(
     assert config["redshift"]["dev_schema"] == "dbt_dev"
 
 
+def test_init_redshift_renders_the_committed_build_identity(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """Same split as Postgres (#904)."""
+
+    pytest.importorskip("redshift_connector")
+    monkeypatch.setenv("REDSHIFT_HOST", "wg.example.com")
+    monkeypatch.setenv("REDSHIFT_DATABASE", "shop")
+    monkeypatch.setenv("REDSHIFT_USER", "dex_ro")
+    _seed_redshift_config(tmp_path, user="dbt_dev")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "redshift"), capsys)
+    assert rc == 0, envelope
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    assert "user: dbt_dev" in rendered
+    assert "dex_ro" in envelope["data"]["notes"][0]
+
+
 def test_init_redshift_refuses_dev_schema_source_collision(
     tmp_path: Path, capsys, monkeypatch
 ):
@@ -728,6 +810,144 @@ def test_init_bigquery_bootstraps_a_project(tmp_path: Path, capsys):
     assert config["connector"] == "bigquery"
     assert config["bigquery"]["project"] == "test-proj"
     assert config["bigquery"]["dev_dataset"] == "dbt_dev"
+
+
+def _no_ambient_bigquery(monkeypatch) -> None:
+    """Pin the project resolution chain off the developer's machine: no gcloud
+    env vars and no Application Default Credentials (#1101)."""
+
+    from exmergo_dex_core import connect
+
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GCLOUD_PROJECT", raising=False)
+
+    def no_adc():
+        raise connect.CredentialDiscoveryError("no ADC")
+
+    monkeypatch.setattr(connect, "_default_credentials", no_adc)
+
+
+def _connection_project(repo: Path) -> str | None:
+    """What a later command would attribute this repo's connection to."""
+
+    from exmergo_dex_core.engine import DexEngine
+
+    engine = DexEngine.from_repo(repo)
+    try:
+        return engine.connection_provenance().target.get("project")
+    finally:
+        engine.close()
+
+
+def test_init_bigquery_honors_an_explicit_project_on_a_fresh_root(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """A fresh root with no config and no ADC initializes when --project names
+    the target, and the profile, config and attribution all choose it."""
+
+    _no_ambient_bigquery(monkeypatch)
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "bigquery", "--project", "example-project"),
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "bigquery"
+    assert _connection_project(tmp_path) == "example-project"
+
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    dev = profiles["analytics"]["outputs"]["dev"]
+    assert dev["type"] == "bigquery"
+    assert dev["project"] == "example-project"
+    assert dev["dataset"] == "dbt_dev"
+
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["bigquery"]["project"] == "example-project"
+    assert config["bigquery"]["dev_dataset"] == "dbt_dev"
+
+
+def test_init_bigquery_explicit_project_beats_the_configured_one(
+    tmp_path: Path, capsys, monkeypatch
+):
+    _no_ambient_bigquery(monkeypatch)
+    _seed_bigquery_config(tmp_path, project="configured-project")
+    rc, envelope = _run(
+        _init_argv(
+            tmp_path, "--connector", "bigquery", "--project", "explicit-project"
+        ),
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert _connection_project(tmp_path) == "explicit-project"
+
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    assert profiles["analytics"]["outputs"]["dev"]["project"] == "explicit-project"
+
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["bigquery"]["project"] == "explicit-project"
+
+
+def test_init_refuses_an_explicit_project_on_a_non_bigquery_connector(
+    tmp_path: Path, capsys
+):
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "duckdb", "--project", "example-project"),
+        capsys,
+    )
+    assert rc == 1
+    assert "--project" in envelope["errors"][0]
+    assert "duckdb" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
+@pytest.mark.parametrize(
+    "project",
+    ["", "   ", "my project", "proj/ect", "example.com:my-project:extra"],
+)
+def test_init_refuses_a_malformed_explicit_project(tmp_path: Path, capsys, project):
+    """``--project`` is a stated value, not an absent flag: a blank or
+    malformed id must fail rather than fall back to the configured or
+    discovered project, or reach the rendered profile."""
+
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "bigquery", "--project", project),
+        capsys,
+    )
+    assert rc == 1
+    assert "--project" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
+def test_init_bigquery_accepts_a_domain_scoped_project(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """The legacy ``example.com:my-project`` form is still a valid explicit
+    project."""
+
+    _no_ambient_bigquery(monkeypatch)
+    rc, envelope = _run(
+        _init_argv(
+            tmp_path,
+            "--connector",
+            "bigquery",
+            "--project",
+            "example.com:my-project",
+        ),
+        capsys,
+    )
+    assert rc == 0, envelope
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    dev = profiles["analytics"]["outputs"]["dev"]
+    assert dev["project"] == "example.com:my-project"
 
 
 def test_init_bigquery_without_a_project_errors_actionably(

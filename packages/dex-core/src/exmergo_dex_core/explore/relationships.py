@@ -34,6 +34,9 @@ from ..cache import (
 )
 from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
+from ..envelope import failure_text
+from ..errors import WarehouseQueryError
+from ..model_versions import split_label
 from ..progress import ProgressReporter
 from ..semantic_catalog import EntityJoin
 from .profile import (
@@ -244,6 +247,43 @@ def _key_host_counts(keyed: dict[str, list[list[str]]]) -> dict[str, int]:
     return counts
 
 
+def _namespace_parts(identifier: str) -> tuple[str | None, str | None, str]:
+    """Split an identifier into (catalog, schema, table), lowercased."""
+
+    parts = identifier.rsplit(".", 2)
+    if len(parts) == 3:
+        return parts[0].casefold(), parts[1].casefold(), parts[2].casefold()
+    if len(parts) == 2:
+        return None, parts[0].casefold(), parts[1].casefold()
+    return None, None, parts[0].casefold()
+
+
+def _namespace_affinity(child_id: str, parent_id: str) -> int:
+    """Namespace proximity rank between child and parent (0 is closest, 2 is furthest).
+
+    0: same catalog and schema (or same schema when catalog is absent)
+    1: same catalog, different schema
+    2: different catalog or cross-namespace
+    """
+
+    child_cat, child_sch, _ = _namespace_parts(child_id)
+    parent_cat, parent_sch, _ = _namespace_parts(parent_id)
+
+    if child_cat is not None and parent_cat is not None:
+        if child_cat == parent_cat and child_sch == parent_sch:
+            return 0
+        if child_cat == parent_cat:
+            return 1
+        return 2
+
+    if child_sch is not None and parent_sch is not None:
+        if child_sch == parent_sch:
+            return 0
+        return 2
+
+    return 2
+
+
 def infer_relationships(
     datasets: list[Dataset],
     *,
@@ -280,6 +320,7 @@ def infer_relationships(
             stem = fk_stem(col.name)
             if stem is None:
                 continue
+            col_matches: list[tuple[Dataset, list[str], float]] = []
             for parent in datasets:
                 if parent.identifier == child.identifier:
                     continue
@@ -295,16 +336,48 @@ def infer_relationships(
                 )
                 if match is not None:
                     to_columns, confidence = match
-                    relationships.append(
-                        Relationship(
-                            from_dataset=child.identifier,
-                            from_columns=[col.name],
-                            to_dataset=parent.identifier,
-                            to_columns=to_columns,
-                            kind=RelationshipKind.INFERRED,
-                            confidence=confidence,
-                        )
+                    col_matches.append((parent, to_columns, confidence))
+
+            by_entity: dict[str, list[tuple[Dataset, list[str], float]]] = {}
+            for parent, to_columns, confidence in col_matches:
+                ent = entity_of(parent.identifier.rsplit(".", 1)[-1])
+                by_entity.setdefault(ent, []).append((parent, to_columns, confidence))
+
+            for ent_matches in by_entity.values():
+                if len(ent_matches) > 1:
+                    best_affinity = min(
+                        _namespace_affinity(child.identifier, p.identifier)
+                        for p, _, _ in ent_matches
                     )
+                    for parent, to_columns, conf in ent_matches:
+                        affinity = _namespace_affinity(
+                            child.identifier, parent.identifier
+                        )
+                        if affinity > best_affinity:
+                            penalty = 0.25 if affinity == 2 else 0.15
+                            conf = round(max(0.05, conf - penalty), 4)
+                        relationships.append(
+                            Relationship(
+                                from_dataset=child.identifier,
+                                from_columns=[col.name],
+                                to_dataset=parent.identifier,
+                                to_columns=to_columns,
+                                kind=RelationshipKind.INFERRED,
+                                confidence=conf,
+                            )
+                        )
+                else:
+                    for parent, to_columns, conf in ent_matches:
+                        relationships.append(
+                            Relationship(
+                                from_dataset=child.identifier,
+                                from_columns=[col.name],
+                                to_dataset=parent.identifier,
+                                to_columns=to_columns,
+                                kind=RelationshipKind.INFERRED,
+                                confidence=conf,
+                            )
+                        )
     return relationships
 
 
@@ -324,8 +397,18 @@ def fold_replica_relationships(
     structurally mirrors another (the same layer-stripped entity and column set
     living in a second schema). With no replica in scope nothing is folded, so a
     single-dataset map is untouched. Within each lineage signature that a replica
-    edge participates in, the canonical (source-schema) edge is kept and the
-    duplicates are dropped.
+    edge participates in, each child keeps the edges to the parents nearest it
+    (:func:`_namespace_affinity`) and the cross-schema lookalikes are dropped,
+    including every edge between two tables of one entity in different schemas,
+    which are copies of each other rather than a child and its parent.
+
+    Per child rather than one edge per signature (#892): a built model's join to
+    the built parent beside it is the one a project can declare, since a
+    ``references`` renders ``ref()`` and no ``ref()`` reaches a raw table.
+    Collapsing the signature to its source-schema edge dropped every join inside
+    the dev schema, so on a warehouse a built foreign key only ever pointed at
+    the raw table. Parents tied on affinity are all kept (``stg_customers`` and
+    ``dim_customers`` beside a mart), as they are where nothing is folded.
     """
 
     def schema_of(identifier: str) -> str:
@@ -397,21 +480,30 @@ def fold_replica_relationships(
 
     kept: list[Relationship] = []
     folded = 0
-    for members in groups.values():
+    for sig, members in groups.items():
         if len(members) == 1 or not any(replica_endpoints(r) for r in members):
             kept.extend(members)
             continue
-        best = min(
-            members,
-            key=lambda r: (
-                replica_endpoints(r),
-                -(r.confidence or 0.0),
-                r.from_dataset,
-                r.to_dataset,
-            ),
-        )
-        kept.append(best)
-        folded += len(members) - 1
+        by_child: dict[str, list[Relationship]] = {}
+        for rel in members:
+            by_child.setdefault(rel.from_dataset, []).append(rel)
+        for child, edges in by_child.items():
+            if sig[0] == sig[2]:
+                # A table of the same entity in another schema is a copy of
+                # this one (raw `customers` and `stg_customers`), not a parent.
+                local = [
+                    r for r in edges if schema_of(r.to_dataset) == schema_of(child)
+                ]
+                folded += len(edges) - len(local)
+                edges = local
+                if not edges:
+                    continue
+            best = min(_namespace_affinity(child, r.to_dataset) for r in edges)
+            for rel in edges:
+                if _namespace_affinity(child, rel.to_dataset) == best:
+                    kept.append(rel)
+                else:
+                    folded += 1
     return kept, folded, mirrored_object_count
 
 
@@ -646,7 +738,31 @@ def profile_findings(
                     )
                 )
 
+    # A key that mixes value shapes (#861) is already said in prose; it is
+    # restated here under a code a diagnostic can match, so `transform plan`
+    # can cite it beside a conversion of that column without parsing prose
+    # anywhere but here, next to the sentence's only author.
+    names = {col.name for col in dataset.columns}
+    for note in dataset.data_quality:
+        match = _MIXED_SHAPES.match(note)
+        if match is not None and match.group(1) in names:
+            findings.append(
+                ProfileFinding(
+                    column=match.group(1),
+                    code="mixed_identifier_shapes",
+                    severity="low",
+                    detail=note,
+                )
+            )
+
     return sorted(findings, key=lambda f: _FINDING_SEVERITY_RANK[f.severity])
+
+
+#: The sentences `explore.profile._heterogeneous_key_note` writes
+# (proven candidate key, or id-shaped but unproven — #1072).
+_MIXED_SHAPES = re.compile(
+    r"^(.+?) (?:is a candidate key|looks like a key) but mixes value shapes: "
+)
 
 
 def key_evidence(dataset: Dataset) -> list[KeyEvidence]:
@@ -698,9 +814,9 @@ def key_evidence(dataset: Dataset) -> list[KeyEvidence]:
 # 0.2). At or above it, the two columns are effectively disjoint: a shared
 # name with this little shared data is not a shared key, and joining on it
 # returns all-NULL parent attributes while looking like it worked (issue
-# #207). Set well above the confidence-demotion tier so this fires only for
-# the catastrophic case the issue is about, not every demoted edge.
-_ORPHAN_FINDING_THRESHOLD = 0.9
+# #207, #719). Set at 0.5 so any join with at least 50% orphans reports
+# why its confidence was demoted.
+_ORPHAN_FINDING_THRESHOLD = 0.5
 
 
 def orphan_findings(
@@ -751,6 +867,116 @@ def orphan_findings(
             text = (
                 f"{edge} shares a column name but "
                 f"{rel.orphan_fraction:.0%} of values have no match; the shared "
+                "name is not evidence of a shared key"
+            )
+        findings.append((rel, text))
+    return findings
+
+
+def adopt_profiled_spelling(
+    relationships: list[Relationship], datasets: list[Dataset]
+) -> None:
+    """Spell each join's columns the way its dataset's profile does, in place.
+
+    A declared join carries its columns as the project wrote them, and a dbt
+    project writes ``customer_id`` where Snowflake stores ``CUSTOMER_ID``. The
+    probe quotes every identifier, so a column spelled in the other case binds
+    to nothing on a warehouse that folds unquoted names, and the statement
+    fails. Where exactly one profiled column matches without regard to case,
+    the edge takes that column's own spelling; a column with no match, or with
+    more than one, is left as written for :func:`missing_column_findings` and
+    the warehouse to judge.
+    """
+
+    by_identifier = {d.identifier.lower(): d for d in datasets}
+
+    def spelled(dataset_id: str, columns: list[str]) -> list[str]:
+        dataset = by_identifier.get(dataset_id.lower())
+        if dataset is None:
+            return columns
+        names: dict[str, list[str]] = {}
+        for column in dataset.columns:
+            names.setdefault(column.name.lower(), []).append(column.name)
+        out: list[str] = []
+        for column in columns:
+            found = names.get(column.lower(), [])
+            out.append(found[0] if len(found) == 1 else column)
+        return out
+
+    for rel in relationships:
+        rel.from_columns = spelled(rel.from_dataset, rel.from_columns)
+        rel.to_columns = spelled(rel.to_dataset, rel.to_columns)
+
+
+def missing_column_findings(
+    relationships: list[Relationship],
+    datasets: list[Dataset],
+) -> list[tuple[Relationship, str]]:
+    """A join that names a column its dataset's profile does not have, paired
+    with the finding text a caller needs: the relation, named, plus the column
+    that is missing and the relation it is missing from.
+
+    A probe measures a join with real SQL, so a column that no longer exists
+    cannot be referenced: the statement fails to bind and takes the whole
+    ``--verify`` command down with it (issue #924). Checking the columns
+    against the profiled datasets up front keeps that failure off the wire --
+    the broken edge is reported as a finding instead, it is never marked
+    verified, and everything sound is still measured. Only the joins
+    :func:`probe_candidates` would select are considered, so a finding here
+    always means "this edge would have failed the probe", never "this edge
+    was not probed for another reason".
+
+    A dataset absent from ``datasets`` is skipped, not reported: an unprofiled
+    parent (out of scope this run) may still exist in the warehouse, and only
+    a profiled column set is evidence that a column is really gone.
+
+    Kind-specific wording mirrors :func:`orphan_findings`: a declared join is
+    the project asserting a foreign key the warehouse no longer has, while an
+    inferred one is dex's own name match pointing at a ghost column.
+    """
+
+    by_identifier = {d.identifier.lower(): d for d in datasets}
+    findings: list[tuple[Relationship, str]] = []
+    for rel in relationships:
+        if not rel.from_columns or len(rel.from_columns) != len(rel.to_columns):
+            continue  # never probed, so it cannot fail a probe (issue #924)
+        parts: list[str] = []
+        for dataset_id, columns in (
+            (rel.from_dataset, rel.from_columns),
+            (rel.to_dataset, rel.to_columns),
+        ):
+            dataset = by_identifier.get(dataset_id.lower())
+            if dataset is None:
+                continue
+            known = {c.name.lower() for c in dataset.columns}
+            missing = [c for c in columns if c.lower() not in known]
+            if missing:
+                quoted = ", ".join(f'"{c}"' for c in missing)
+                if len(missing) == 1:
+                    parts.append(f"column {quoted} does not exist on {dataset_id}")
+                else:
+                    parts.append(f"columns {quoted} do not exist on {dataset_id}")
+        if not parts:
+            continue
+        edge = (
+            f"{rel.from_dataset}.{rel.from_columns[0]} -> "
+            f"{rel.to_dataset}.{rel.to_columns[0]}"
+        )
+        description = " and ".join(parts)
+        if rel.kind is RelationshipKind.DECLARED:
+            text = (
+                f"{edge} is declared as a foreign key but {description}; "
+                "the project and the warehouse disagree"
+            )
+        elif rel.kind is RelationshipKind.OVERLAP_INFERRED:
+            text = (
+                f"{edge} was proposed from measured value overlap but "
+                f"{description}; the containment that proposed this edge no "
+                "longer holds"
+            )
+        else:
+            text = (
+                f"{edge} shares a column name but {description}; the shared "
                 "name is not evidence of a shared key"
             )
         findings.append((rel, text))
@@ -846,7 +1072,8 @@ def verify_relationships(
     *,
     timeout_seconds: float = 30.0,
     progress: ProgressReporter | None = None,
-) -> None:
+    withhold: bool = False,
+) -> list[tuple[Relationship, str]]:
     """Measure each join with one overlap probe and adjust in place.
 
     The probe counts non-null foreign-key values and how many have no match in
@@ -871,12 +1098,34 @@ def verify_relationships(
     An optional ``progress`` reporter emits a throttled stderr line per probed
     join, so its counts match a ``total`` taken from :func:`probe_candidates`;
     ``None`` (the default) keeps existing callers silent and unchanged.
+
+    Returns the edges that could not be probed at all, paired with the finding
+    text a caller needs: a batch the warehouse refuses is retried edge by edge
+    (issue #933), so one unprobeable edge no longer takes the whole command
+    down, and an edge that still refuses after its retries is reported here
+    instead of raising. Only a warehouse refusal
+    (:class:`~exmergo_dex_core.errors.WarehouseQueryError`) is retried this
+    way; a budget, timeout, or connection failure still raises, exactly as
+    before, so the cost gate keeps its veto over the extra retry statements.
+
+    A refused edge's text keeps the warehouse's words with any value they
+    quote masked; ``withhold`` (values-free mode) drops the words and keeps the
+    exception type (#1070).
     """
 
+    refused: list[tuple[Relationship, str]] = []
     for batch in probe_batches(probe_candidates(relationships)):
-        for rel, nonnull, orphans in _run_probe_batch(
-            adapter, batch, timeout_seconds=timeout_seconds
-        ):
+        try:
+            results = _run_probe_batch(adapter, batch, timeout_seconds=timeout_seconds)
+        except WarehouseQueryError:
+            results, batch_refused = _probe_batch_with_fallback(
+                adapter, batch, timeout_seconds=timeout_seconds, withhold=withhold
+            )
+            refused.extend(batch_refused)
+            if progress is not None:
+                for _rel, _text in batch_refused:
+                    progress.advance()
+        for rel, nonnull, orphans in results:
             rel.verified = True
             if nonnull == 0:
                 rel.orphan_fraction = None
@@ -892,6 +1141,8 @@ def verify_relationships(
                     confidence += 0.1
                 elif fraction <= 0.02:
                     confidence += 0.05
+                elif fraction >= 0.5:
+                    confidence = min(0.49, confidence * (1.0 - fraction))
                 elif fraction >= 0.2:
                     confidence -= 0.25
                 else:
@@ -901,11 +1152,18 @@ def verify_relationships(
             if progress is not None:
                 progress.advance()
 
+    return refused
+
 
 def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`verify_relationships` will run, one statement per
     batch of probed joins, in the adapter's dialect. Exists so a billed caller
-    can dry-run the probes for a cost estimate before confirming the spend."""
+    can dry-run the probes for a cost estimate before confirming the spend.
+
+    These are the planned statements: a batch the warehouse refuses is retried
+    edge by edge inside :func:`verify_relationships` (issue #933), so a refusal
+    can add retry statements this list did not price, bounded by the same cost
+    gate that priced these."""
 
     return [
         _transpile_probe(_batched_probe_sql(batch), dialect)
@@ -913,7 +1171,9 @@ def probe_statements(relationships: list[Relationship], dialect: str) -> list[st
     ]
 
 
-def _batched_probe_sql(batch: list[Relationship]) -> str:
+def _batched_probe_sql(
+    batch: list[Relationship], *, key_cast: str | None = None
+) -> str:
     """One statement measuring every edge in ``batch``, returning a single row.
 
     Aggregate-only by construction: two counts per edge, no value in the
@@ -937,7 +1197,18 @@ def _batched_probe_sql(batch: list[Relationship]) -> str:
     BigQuery lacks and sqlglot does not rewrite), and a join rather than a
     projected NOT EXISTS, which Redshift refuses outright (XX000: correlated
     subquery pattern not supported).
+
+    ``key_cast`` compares both sides of every join predicate in one type
+    instead of the raw columns: the fallback for a warehouse that refuses the
+    plain join for lack of a common key type (issue #933). The null check
+    stays on the raw child column, since a cast preserves nullness and the
+    count is about values present, not values convertible.
     """
+
+    def _cast_key(expr: str) -> str:
+        if key_cast is None:
+            return expr
+        return f"CAST({expr} AS {key_cast})"
 
     by_child: dict[str, list[tuple[int, Relationship]]] = {}
     for index, rel in enumerate(batch):
@@ -952,10 +1223,12 @@ def _batched_probe_sql(batch: list[Relationship]) -> str:
             parent = _quote_identifier(rel.to_dataset)
             nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
             parent_keys = ", ".join(
-                f"{key} AS pk{pair_index}" for pair_index, key in enumerate(keys)
+                f"{_cast_key(key)} AS pk{pair_index}"
+                for pair_index, key in enumerate(keys)
             )
             predicate = " AND ".join(
-                f"d{index}.pk{pair_index} = c.{fk}" for pair_index, fk in enumerate(fks)
+                f"d{index}.pk{pair_index} = {_cast_key(f'c.{fk}')}"
+                for pair_index, fk in enumerate(fks)
             )
             counts.append(
                 f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS nonnull_fk_{index}, "
@@ -982,6 +1255,7 @@ def _run_probe_batch(
     batch: list[Relationship],
     *,
     timeout_seconds: float,
+    key_cast: str | None = None,
 ) -> list[tuple[Relationship, int, int]]:
     """Issue one batched probe and return ``(edge, nonnull_fk, orphans)`` per
     edge, in the batch's own order.
@@ -991,7 +1265,9 @@ def _run_probe_batch(
     command's overall time bound. Reads the row by alias, never by position.
     """
 
-    sql = _transpile_probe(_batched_probe_sql(batch), adapter.dialect)
+    sql = _transpile_probe(
+        _batched_probe_sql(batch, key_cast=key_cast), adapter.dialect
+    )
     result = adapter.run_query(
         sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
     )
@@ -1006,6 +1282,94 @@ def _run_probe_batch(
     ]
 
 
+# ClickHouse refuses a join whose keys have no common supertype (code 386):
+# a signed key against an unsigned one, for example Int32 against UInt64.
+# Int128 holds every UInt64 and Int64 value, so comparing in that type
+# measures the join without changing what counts as a match (issue #933).
+_CLICKHOUSE_INT128 = "Int128"
+
+
+def _is_clickhouse_supertype_refusal(adapter: Adapter, exc: Exception) -> bool:
+    """Whether this refusal is the signed/unsigned key-type refusal a cast
+    retry can fix: ClickHouse only, and only the no-supertype message. Any
+    other refusal (a missing column, a missing table) would fail the cast
+    retry identically, so it is reported rather than retried."""
+
+    return adapter.dialect == "clickhouse" and "no supertype" in str(exc).lower()
+
+
+def _refusal_text(rel: Relationship, exc: Exception, *, withhold: bool = False) -> str:
+    """Why an edge went unmeasured. ``withhold`` drops the warehouse's words,
+    for a probe that converts a key, where a failed cast quotes the value
+    (#861), and in values-free mode. Otherwise the words are kept with any value
+    they quote masked (#1070)."""
+
+    edge = (
+        f"{rel.from_dataset}.{rel.from_columns[0]} -> "
+        f"{rel.to_dataset}.{rel.to_columns[0]}"
+    )
+    said = (
+        f"{type(exc).__name__}; the warehouse's message is withheld because it "
+        "can quote a value"
+        if withhold
+        else failure_text(exc, detail_only=True)
+    )
+    return (
+        f"{edge} could not be probed: the warehouse refused the probe "
+        f"statement ({said}); the edge stays unverified"
+    )
+
+
+def _probe_batch_with_fallback(
+    adapter: Adapter,
+    batch: list[Relationship],
+    *,
+    timeout_seconds: float,
+    withhold: bool = False,
+) -> tuple[list[tuple[Relationship, int, int]], list[tuple[Relationship, str]]]:
+    """Retry a refused batch edge by edge, keeping what measures.
+
+    A batch is one statement, so one edge the warehouse refuses refuses the
+    whole statement and, before this fallback, the whole command (issue #933:
+    a single signed/unsigned join pair took down ``--verify`` with no edge
+    measured). Each edge is therefore re-probed on its own: edges the
+    warehouse accepts are measured exactly as the batch would have measured
+    them, and an edge that still refuses is reported rather than raised. A
+    ClickHouse no-supertype refusal gets one more retry with both key sides
+    cast to Int128 before it is reported, since that refusal names a key-type
+    mismatch the cast removes rather than a broken edge.
+
+    Only warehouse refusals enter this path: the caller lets budget, timeout,
+    and connection failures raise, so a retry never spends past the confirmed
+    budget or masks an outage as an unprobeable edge.
+    """
+
+    results: list[tuple[Relationship, int, int]] = []
+    refused: list[tuple[Relationship, str]] = []
+    for rel in batch:
+        try:
+            results.extend(
+                _run_probe_batch(adapter, [rel], timeout_seconds=timeout_seconds)
+            )
+            continue
+        except WarehouseQueryError as exc:
+            if not _is_clickhouse_supertype_refusal(adapter, exc):
+                refused.append((rel, _refusal_text(rel, exc, withhold=withhold)))
+                continue
+            try:
+                results.extend(
+                    _run_probe_batch(
+                        adapter,
+                        [rel],
+                        timeout_seconds=timeout_seconds,
+                        key_cast=_CLICKHOUSE_INT128,
+                    )
+                )
+            except WarehouseQueryError as cast_exc:
+                refused.append((rel, _refusal_text(rel, cast_exc, withhold=withhold)))
+    return results, refused
+
+
 def _transpile_probe(sql: str, dialect: str) -> str:
     """Render the DuckDB-flavored probe in the active connector's dialect.
 
@@ -1018,6 +1382,13 @@ def _transpile_probe(sql: str, dialect: str) -> str:
         return sql
     import sqlglot
 
+    from .. import sql_shape
+
+    if "TRY_CAST" in sql.upper():
+        # A join's own key conversion (#861): made safe per dialect, since
+        # sqlglot renders a safe cast as a failing CAST on some of them.
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        return sql_shape.with_safe_casts(tree, dialect).sql(dialect=dialect)
     return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
 
 
@@ -1028,6 +1399,336 @@ def _quote_identifier(identifier: str) -> str:
 def _quote_part(name: str) -> str:
     escaped = name.replace('"', '""')
     return f'"{escaped}"'
+
+
+# --- issue #857: join coverage, rows and distinct keys -------------------------
+#
+# The overlap probe above answers one question with two numbers: how many of a
+# child's non-null keys have no parent. That is enough to rank an inferred join,
+# and it is what `explore relationships --verify` and drift keep using. A model's
+# own join needs more to be judged: whether anything was eligible at all (an
+# empty or all-NULL input has no coverage, which is not the same as full
+# coverage), how many rows the NULL keys took out, and whether a low match rate
+# is a few distinct keys repeated over many rows or the other way round. So the
+# coverage probe is a sibling rather than a change to the shared one, and it is
+# batched the same way, through `probe_batches`, so a child is read once per
+# statement for its row counts.
+
+
+class JoinCoverageCounts(NamedTuple):
+    """One join's coverage, as aggregate counts and nothing else.
+
+    Rows and distinct keys are counted separately because they answer different
+    questions: rows say how much of the model a join reaches, keys say how many
+    entities. ``eligible_*`` excludes rows whose key has a NULL component; the
+    caller decides whether its contract counts those as unmatched instead.
+    """
+
+    rows: int
+    null_key_rows: int
+    eligible_rows: int
+    matched_rows: int
+    eligible_keys: int
+    matched_keys: int
+    #: Non-NULL child keys the join's own conversion turns into NULL (#861):
+    #: eligible, never matched, and counted apart. None where the join
+    #: converts no child key.
+    conversion_failed_rows: int | None = None
+    conversion_failed_keys: int | None = None
+
+
+#: Per relationship (by ``id``), the conversion each side applies to each key
+#: column before comparing: a DuckDB template with ``{}`` for the column, or
+#: None for the bare column (#861).
+KeyExprs = dict[int, tuple[tuple[str | None, ...], tuple[str | None, ...]]]
+
+#: Per relationship (by ``id``), the row filter each side's relation is read
+#: through before the join, a DuckDB predicate over the relation's own columns,
+#: or None for the whole relation (#1085).
+ScopeFilters = dict[int, tuple[str | None, str | None]]
+
+
+def coverage_probe_sql(
+    batch: list[Relationship],
+    *,
+    key_cast: str | None = None,
+    key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
+) -> str:
+    """One aggregate statement measuring every edge of ``batch``'s coverage.
+
+    Per child, one read for the row counts, with a LEFT JOIN per edge against
+    that edge's DISTINCT parent keys (a hit flag rather than a parent column, so
+    a NULL key on the parent side cannot read as a miss, and a connector that
+    fills unmatched columns with a default rather than NULL still counts a miss:
+    every test is ``= 1``). Each edge then has its own distinct-key subquery:
+    ``SELECT DISTINCT`` over the key tuple and its hit flag, counted. A key's hit
+    flag depends only on the key, so the distinct set holds each key once and
+    ``COUNT(*)`` is the distinct eligible keys whatever the arity, which is what
+    keeps a composite key portable where ``COUNT(DISTINCT (a, b))`` is not.
+
+    Every subquery is an ungrouped aggregate over exactly one row, so they are
+    cross-joined into one row. No value is projected anywhere.
+
+    ``key_exprs`` applies a join's own key conversion (``TRY_CAST(k AS INT)``)
+    on the side that writes it (#861). The NULL test stays on the raw key, so
+    a key the conversion fails on is eligible and unmatched, and is counted
+    apart as a failed conversion.
+
+    ``scope_filters`` reads a side through the filter the model applies before
+    joining it (#1085): the child as ``(SELECT * FROM child WHERE f) c``, so its
+    row and key counts are the filtered population's, and the parent's distinct
+    keys from its filtered rows, so a key present only in rows the filter drops
+    is not a match. Children are grouped by relation *and* filter, since the
+    same table read through two filters is two populations.
+    """
+
+    def _cast_key(expr: str) -> str:
+        return expr if key_cast is None else f"CAST({expr} AS {key_cast})"
+
+    def _apply(template: str | None, expr: str) -> str:
+        """``expr`` wrapped in the key conversion ``template``, or unchanged where there
+        is none.
+        """
+        return expr if template is None else template.format(expr)
+
+    def _filters(rel: Relationship) -> tuple[str | None, str | None]:
+        return (scope_filters or {}).get(id(rel), (None, None))
+
+    by_child: dict[tuple[str, str | None], list[tuple[int, Relationship]]] = {}
+    for index, rel in enumerate(batch):
+        key = (rel.from_dataset, _filters(rel)[0])
+        by_child.setdefault(key, []).append((index, rel))
+
+    aggregates: list[str] = []
+    for (child, child_filter), edges in by_child.items():
+        child_sql = _quote_identifier(child)
+        if child_filter is not None:
+            child_sql = f"(SELECT * FROM {child_sql} WHERE {child_filter})"  # noqa: S608
+        counts: list[str] = []
+        joins: list[str] = []
+        for index, rel in edges:
+            fks = [_quote_part(column) for column in rel.from_columns]
+            keys = [_quote_part(column) for column in rel.to_columns]
+            from_exprs, to_exprs = (key_exprs or {}).get(id(rel), ((), ()))
+            from_exprs = tuple(from_exprs) or (None,) * len(fks)
+            to_exprs = tuple(to_exprs) or (None,) * len(keys)
+            parent = _quote_identifier(rel.to_dataset)
+            parent_filter = _filters(rel)[1]
+            parent_where = f" WHERE {parent_filter}" if parent_filter else ""
+            nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
+            parent_keys = ", ".join(
+                f"{_cast_key(_apply(to_exprs[pair], key))} AS pk{pair}"
+                for pair, key in enumerate(keys)
+            )
+            predicate = " AND ".join(
+                f"d{index}.pk{pair} = {_cast_key(_apply(from_exprs[pair], f'c.{fk}'))}"
+                for pair, fk in enumerate(fks)
+            )
+            failed = " OR ".join(
+                f"{_apply(template, f'c.{fk}')} IS NULL"
+                for fk, template in zip(fks, from_exprs, strict=False)
+                if template is not None
+            )
+            distinct_parent = (
+                f"(SELECT DISTINCT {parent_keys}, 1 AS dex_hit "  # noqa: S608
+                f"FROM {parent}{parent_where})"
+            )
+            counts.append(
+                f"COUNT(*) AS dex_cov_rows_{index}, "
+                f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS dex_cov_eligible_{index}, "
+                f"COUNT(CASE WHEN {nonnull} AND d{index}.dex_hit = 1 THEN 1 END) "
+                f"AS dex_cov_matched_{index}"
+                + (
+                    f", COUNT(CASE WHEN {nonnull} AND ({failed}) THEN 1 END) "
+                    f"AS dex_cov_failed_{index}"
+                    if failed
+                    else ""
+                )
+            )
+            joins.append(f"LEFT JOIN {distinct_parent} d{index} ON {predicate}")
+            key_columns = ", ".join(f"c.{fk} AS k{pair}" for pair, fk in enumerate(fks))
+            failed_flag = (
+                f", CASE WHEN {failed} THEN 1 ELSE 0 END AS dex_failed"
+                if failed
+                else ""
+            )
+            aggregates.append(
+                f"SELECT COUNT(*) AS dex_cov_keys_{index}, "  # noqa: S608
+                "COUNT(CASE WHEN h.dex_hit = 1 THEN 1 END) "
+                f"AS dex_cov_matched_keys_{index}"
+                + (
+                    ", COUNT(CASE WHEN h.dex_failed = 1 THEN 1 END) "
+                    f"AS dex_cov_failed_keys_{index}"
+                    if failed
+                    else ""
+                )
+                + f" FROM (SELECT DISTINCT {key_columns}, d{index}.dex_hit AS dex_hit"  # noqa: S608
+                f"{failed_flag} "
+                f"FROM {child_sql} c LEFT JOIN {distinct_parent} d{index} "
+                f"ON {predicate} WHERE {nonnull}) h"
+            )
+        aggregates.append(
+            f"SELECT {', '.join(counts)} "  # noqa: S608
+            f"FROM {child_sql} c {' '.join(joins)}"
+        )
+
+    joined = " CROSS JOIN ".join(f"({sql}) a{i}" for i, sql in enumerate(aggregates))
+    return f"SELECT * FROM {joined}"  # noqa: S608
+
+
+def coverage_statements(
+    relationships: list[Relationship],
+    dialect: str,
+    *,
+    key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
+) -> list[str]:
+    """The exact statements :func:`measure_coverage` runs, for pricing first."""
+
+    return [
+        _transpile_probe(
+            coverage_probe_sql(batch, key_exprs=key_exprs, scope_filters=scope_filters),
+            dialect,
+        )
+        for batch in probe_batches(probe_candidates(relationships))
+    ]
+
+
+def _run_coverage_batch(
+    adapter: Adapter,
+    batch: list[Relationship],
+    *,
+    timeout_seconds: float,
+    key_cast: str | None = None,
+    key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
+) -> list[tuple[Relationship, JoinCoverageCounts]]:
+    """Run one batched coverage probe and read each relationship's counts back from its
+    single aggregate row.
+    """
+    sql = _transpile_probe(
+        coverage_probe_sql(
+            batch, key_cast=key_cast, key_exprs=key_exprs, scope_filters=scope_filters
+        ),
+        adapter.dialect,
+    )
+    result = adapter.run_query(
+        sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
+    )
+    values = {
+        str(column).lower(): value
+        for column, value in zip(result.columns, result.cells[0], strict=True)
+    }
+
+    def read(name: str) -> int:
+        return int(values.get(name) or 0)
+
+    def maybe(name: str) -> int | None:
+        """The count named ``name``, or None where the probe did not select it."""
+        return int(values.get(name) or 0) if name in values else None
+
+    measured = []
+    for index, rel in enumerate(batch):
+        rows = read(f"dex_cov_rows_{index}")
+        eligible = read(f"dex_cov_eligible_{index}")
+        measured.append(
+            (
+                rel,
+                JoinCoverageCounts(
+                    rows=rows,
+                    null_key_rows=rows - eligible,
+                    eligible_rows=eligible,
+                    matched_rows=read(f"dex_cov_matched_{index}"),
+                    eligible_keys=read(f"dex_cov_keys_{index}"),
+                    matched_keys=read(f"dex_cov_matched_keys_{index}"),
+                    conversion_failed_rows=maybe(f"dex_cov_failed_{index}"),
+                    conversion_failed_keys=maybe(f"dex_cov_failed_keys_{index}"),
+                ),
+            )
+        )
+    return measured
+
+
+def measure_coverage(
+    adapter: Adapter,
+    relationships: list[Relationship],
+    *,
+    timeout_seconds: float = 30.0,
+    key_exprs: KeyExprs | None = None,
+    scope_filters: ScopeFilters | None = None,
+) -> tuple[
+    list[tuple[Relationship, JoinCoverageCounts]], list[tuple[Relationship, str]]
+]:
+    """Measure every relationship's coverage; return ``(measured, refused)``.
+
+    Refusals follow :func:`verify_relationships`: a refused batch is retried
+    edge by edge, a ClickHouse no-supertype refusal once more with both keys
+    cast, and an edge that still refuses is returned with its reason rather
+    than raised. Budget, timeout and connection failures still raise.
+    """
+
+    def _withheld(rel: Relationship) -> bool:
+        # A converted key or a carried filter can make the warehouse quote a
+        # value in its refusal, so its words are withheld (#861, #1085).
+        return id(rel) in (key_exprs or {}) or id(rel) in (scope_filters or {})
+
+    measured: list[tuple[Relationship, JoinCoverageCounts]] = []
+    refused: list[tuple[Relationship, str]] = []
+    for batch in probe_batches(probe_candidates(relationships)):
+        try:
+            measured.extend(
+                _run_coverage_batch(
+                    adapter,
+                    batch,
+                    timeout_seconds=timeout_seconds,
+                    key_exprs=key_exprs,
+                    scope_filters=scope_filters,
+                )
+            )
+            continue
+        except WarehouseQueryError:
+            pass
+        for rel in batch:
+            try:
+                measured.extend(
+                    _run_coverage_batch(
+                        adapter,
+                        [rel],
+                        timeout_seconds=timeout_seconds,
+                        key_exprs=key_exprs,
+                        scope_filters=scope_filters,
+                    )
+                )
+                continue
+            except WarehouseQueryError as exc:
+                if not _is_clickhouse_supertype_refusal(adapter, exc):
+                    refused.append(
+                        (
+                            rel,
+                            _refusal_text(rel, exc, withhold=_withheld(rel)),
+                        )
+                    )
+                    continue
+            try:
+                measured.extend(
+                    _run_coverage_batch(
+                        adapter,
+                        [rel],
+                        timeout_seconds=timeout_seconds,
+                        key_cast=_CLICKHOUSE_INT128,
+                        key_exprs=key_exprs,
+                        scope_filters=scope_filters,
+                    )
+                )
+            except WarehouseQueryError as cast_exc:
+                refused.append(
+                    (
+                        rel,
+                        _refusal_text(rel, cast_exc, withhold=_withheld(rel)),
+                    )
+                )
+    return measured, refused
 
 
 # --- issue #220: propose joins from measured value overlap -------------------
@@ -1377,6 +2078,83 @@ def declared_relationships(
                 declaration_sources=[source],
             )
         )
+    return relationships, notes
+
+
+def declaration_relationships(
+    defs: ProjectDefinitions, known_identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """Joins a model's own declaration states (#498), resolved like the rest.
+
+    A column declared with ``references: <model>.<column>`` (#491) is the
+    project saying which parent that column points at, so it arrives at the
+    declared tier beside a ``relationships`` test and a semantic entity.
+    ``declared_by`` names the declaring column, because the declaration is
+    something a reader can open and the edge does not otherwise say where it
+    came from. The parent is resolved through the relation the project
+    compiled it to where there is one, and by name otherwise, with the same
+    never-guess rule :func:`declared_relationships` applies: an endpoint
+    matching nothing or several objects yields a note instead of an edge.
+    """
+
+    relationships: list[Relationship] = []
+    notes: list[str] = []
+    seen: set[tuple] = set()
+    for model, declaration in sorted(defs.model_declarations.items()):
+        for column, meaning in sorted(declaration.columns.items()):
+            if not meaning.references:
+                continue
+            parent_model, _, parent_column = meaning.references.rpartition(".")
+            label = f"declared reference {model}.{column} -> {meaning.references}"
+            if not parent_model or not parent_column:
+                notes.append(
+                    f"{label} does not name <model>.<column>; skipped rather than "
+                    "guessed"
+                )
+                continue
+            child, child_ambiguous = resolve_declared(
+                declaration.relation, model, known_identifiers
+            )
+            # A parent is named the way `ref()` names it (#895): a version
+            # label is that version, a versioned model's bare name its default.
+            # Only a known versioned model's label is split: `raw.vendors` is a
+            # source, and its `.vendors` is not a version.
+            parent_label = defs.version_defaults.get(parent_model, parent_model)
+            base, version = split_label(parent_label)
+            if version is not None and not (
+                parent_label in defs.model_relations or base in defs.version_defaults
+            ):
+                version = None
+            parent, parent_ambiguous = resolve_declared(
+                defs.model_relations.get(parent_label)
+                or defs.source_relations.get(parent_model),
+                f"{base}_v{version}" if version is not None else parent_model,
+                known_identifiers,
+            )
+            if child is None or parent is None:
+                reason = (
+                    "matches more than one object here"
+                    if (child_ambiguous or parent_ambiguous)
+                    else "references a relation not in this connection's inventory"
+                )
+                notes.append(f"{label} {reason}; skipped rather than guessed")
+                continue
+            key = (child.lower(), column.lower(), parent.lower(), parent_column.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            relationships.append(
+                Relationship(
+                    from_dataset=child,
+                    from_columns=[column],
+                    to_dataset=parent,
+                    to_columns=[parent_column],
+                    kind=RelationshipKind.DECLARED,
+                    confidence=1.0,
+                    declared_by=f"declaration {model}.{column}",
+                    declaration_sources=["declaration"],
+                )
+            )
     return relationships, notes
 
 

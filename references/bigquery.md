@@ -212,7 +212,10 @@ The `[bigquery]` extra carries `dbt-bigquery`. Running
 `transform init --connector bigquery`
 renders a single `dev` target with `method: oauth` (ADC; no secret
 is ever written), pointed at `bigquery.dev_dataset` (default `dbt_dev`), and
-refuses a dev dataset that is also a source. When `budget.ceiling` is set, the
+refuses a dev dataset that is also a source. Passing `--project <id>` picks the
+project explicitly: it wins over a configured or discovered one, and init
+records the same value as `bigquery.project`, so a fresh repository needs no
+prior config edit and no gcloud default project. When `budget.ceiling` is set, the
 profile carries `maximum_bytes_billed` so every statement dbt runs is capped
 server-side. `transform build` surfaces an upfront byte estimate: it runs a free
 `dbt compile`, dry-runs each compiled node the same way `explore` prices a query,

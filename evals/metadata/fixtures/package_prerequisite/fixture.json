@@ -1,0 +1,5 @@
+{
+  "name": "package_prerequisite",
+  "seed": 1083,
+  "description": "A deliverable blocked by an upgraded package (tiny_tasks, served from a local git repository) whose model coalesces a timestamp with a source column that arrives all NULL and typed integer. The source is delivered by an ingestion vendor, so the project can adapt but cannot change the data. Contrasting requests: adapt the project, or modify the data (which Dex cannot do here, so that part must be reported)."
+}

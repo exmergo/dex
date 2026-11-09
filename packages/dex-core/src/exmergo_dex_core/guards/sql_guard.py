@@ -323,21 +323,48 @@ def referenced_relations(sql: str, *, dialect: str = "duckdb") -> list[str]:
     ctes = {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
     names: list[str] = []
     for table in parsed.find_all(exp.Table):
-        # A plain identifier only. A table-valued function (a set-returning
-        # function, TABLE(FLATTEN(...))) parses as a Table node whose `this` is a
-        # call, and reporting one as a relation would send a caller off to resolve
-        # or profile something that is not an object.
-        if not isinstance(table.this, exp.Identifier):
-            continue
-        parts = (table.args.get("catalog"), table.args.get("db"), table.this)
-        name = ".".join(part.name for part in parts if part)
-        if not name or not table.name:
-            continue
-        if name == table.name and name.lower() in ctes:
-            continue
-        if name not in names:
+        name = _relation_name(table, ctes)
+        if name and name not in names:
             names.append(name)
     return names
+
+
+def aliased_relations(sql: str, *, dialect: str = "duckdb") -> list[tuple[str, str]]:
+    """Each physical relation a statement reads under an alias, as
+    ``(alias, relation)`` pairs in order, with the relation as written.
+
+    The same relations as :func:`referenced_relations`, so CTEs and table-valued
+    functions are left out, and unparseable input returns an empty list.
+    """
+
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return []
+
+    ctes = {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
+    pairs: list[tuple[str, str]] = []
+    for table in parsed.find_all(exp.Table):
+        name = _relation_name(table, ctes)
+        if name and table.alias and (table.alias, name) not in pairs:
+            pairs.append((table.alias, name))
+    return pairs
+
+
+def _relation_name(table: exp.Table, ctes: set[str]) -> str | None:
+    # A plain identifier only. A table-valued function (a set-returning
+    # function, TABLE(FLATTEN(...))) parses as a Table node whose `this` is a
+    # call, and reporting one as a relation would send a caller off to resolve
+    # or profile something that is not an object.
+    if not isinstance(table.this, exp.Identifier):
+        return None
+    parts = (table.args.get("catalog"), table.args.get("db"), table.this)
+    name = ".".join(part.name for part in parts if part)
+    if not name or not table.name:
+        return None
+    if name == table.name and name.lower() in ctes:
+        return None
+    return name
 
 
 # What a line has to start with to be read as a statement of its own. Narrower

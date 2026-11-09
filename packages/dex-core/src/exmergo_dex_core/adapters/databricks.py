@@ -29,7 +29,7 @@ dex never spends on a warehouse the config does not name.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import DatabricksTarget
@@ -45,7 +45,8 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
-    distinct_combination_sql,
+    dev_target_entries,
+    distinct_combination_parts,
     is_blob_type,
     is_integer_type,
     is_string_type,
@@ -238,7 +239,7 @@ class DatabricksAdapter:
         self._clock = clock
         self._conn: Any = None
         self._visible_catalogs: set[str] | None = None
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
@@ -347,7 +348,7 @@ class DatabricksAdapter:
         # facts it learned lived on the objects dropped above.
         self._detail_attempted: set[str] = set()
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``catalog.schema``, the namespace this command's build
         writes into, or stop reading it with ``None``.
 
@@ -358,7 +359,7 @@ class DatabricksAdapter:
         changed.
         """
 
-        scope = scope.strip().lower() if scope else None
+        scope = dev_target_entries(scope, str.lower)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()
@@ -470,6 +471,17 @@ class DatabricksAdapter:
         if self._resolved_scopes is None:
             self._resolved_scopes = self._resolve_scopes()
         return self._resolved_scopes
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this Databricks scope (#984)."""
+        token = namespace.strip().lower()
+        catalog, _, schema = token.partition(".")
+        for c, s in self._scopes():
+            if c.lower() != catalog:
+                continue
+            if s is None or s.lower() == schema:
+                return True
+        return False
 
     def _resolve_scopes(self) -> list[tuple[str, str | None]]:
         if not self.target.catalogs:
@@ -1155,7 +1167,9 @@ class DatabricksAdapter:
                 "not cover the extra scan; uniqueness verdicts stay approximate",
             )
             return {}
-        select_parts = [
+        # count(*) rides along so the same scan also upgrades the metadata row
+        # figure to an exact count (grain verdicts compare against it).
+        select_parts = ["COUNT(*) AS n_total"] + [
             f"COUNT(DISTINCT {_quote_ident(name)}) AS d_{i}"
             for i, name in enumerate(columns)
         ]
@@ -1165,6 +1179,8 @@ class DatabricksAdapter:
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
+        if "n_total" in values and values["n_total"] is not None:
+            self._entry(identifier)["row_count"] = int(values["n_total"])
         return {name: int(values[f"d_{i}"]) for i, name in enumerate(columns)}
 
     def distinct_combination_counts(
@@ -1192,12 +1208,23 @@ class DatabricksAdapter:
             self._note(identifier, note)
         if not probed:
             return {}
+        # the row count rides along as one more scalar subquery in the same
+        # statement, mirroring exact_distinct_counts: the grain
+        # check reads the row count only after the scan ran, so a composite
+        # grain or join fanout check is measured against the exact total, never
+        # against a missing or stale catalog row count (#946).
+        parts = [
+            f"(SELECT COUNT(*) FROM {self._quote(identifier)}) AS n_total",  # noqa: S608
+            *distinct_combination_parts(self._quote(identifier), probed, _quote_ident),
+        ]
         sql = assert_select_only(
-            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
+            f"SELECT {', '.join(parts)}",
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
+        if "n_total" in values and values["n_total"] is not None:
+            self._entry(identifier)["row_count"] = int(values["n_total"])
         return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
@@ -1260,6 +1287,32 @@ class DatabricksAdapter:
         return result
 
     # --- execution (the single billed door) --------------------------------------
+
+    #: ``DESCRIBE QUERY`` runs on the SQL warehouse and can start a stopped one,
+    #: so a comparison prices before it reads a schema here.
+    describe_query_free = False
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from ``DESCRIBE QUERY``, which reads no
+        rows but needs the warehouse."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        cursor = self._billed_cursor()
+        started = self._clock()
+        statement = f"DESCRIBE QUERY {checked}"
+        try:
+            cursor.execute(statement)
+            rows = cursor.fetchall()
+        except Exception as exc:
+            self._record_elapsed(started, cursor, statement)
+            raise self._translate(exc, None) from exc
+        self._record_elapsed(started, cursor, statement)
+        return [
+            ColumnMeta(
+                name=str(row[0]), data_type=str(row[1]), nullable=True, ordinal=ordinal
+            )
+            for ordinal, row in enumerate(rows)
+        ]
 
     def run_query(
         self,

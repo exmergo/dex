@@ -3,6 +3,10 @@
 Thanks for contributing. This guide covers local setup and the checks every
 pull request must pass.
 
+## Contribution policy
+
+**We do not accept paid open-source contributions.**
+
 ## Support the project
 
 If dex is useful to you, star the repository. Stars are how other analytics
@@ -43,6 +47,21 @@ uv run pytest
 Everything is deterministic and free: no cloud account is needed. The live
 cloud integration tests under `tests/integration/` collect as skipped with
 the enabling variables named in the skip reason.
+
+CI runs the same suite split into parallel groups by test file, defined in
+`tests/ci_groups.py`. A new test file needs nothing: it lands in the catch-all
+group until someone moves it. To reproduce one group locally, run
+`uv run pytest --ci-group <name>`. The `tests` check stays red unless the groups,
+between them, ran every collected test exactly once
+(`scripts/check_test_groups.py`).
+
+Transform groups cover builds, dependencies, artifact edits, retirement,
+refactors, contracts (including semantic authoring) and planning. Real dbt
+mutation cases run separately for coverage, equivalence and downstream routing;
+their command doubles stay with planning.
+Explore/maintain and packaging also have their own groups. Each job uploads
+JUnit test timings alongside the coverage report; use those to rebalance files
+when a group approaches five minutes including setup.
 
 To try a change by hand rather than through the suite, generate the demo
 warehouse in a scratch directory outside the checkout and drive the CLI against
@@ -374,6 +393,23 @@ installed) with `python -m evals skills/<skill>`. If a future backend needs a
 real Python dependency, promote `evals/` to its own uv project at that point and
 not before. See `evals/README.md` for the rationale and full usage.
 
+The one exception is the metadata-quality eval in `evals/metadata/` (#492), which
+needs DuckDB, PyYAML and dbt and so runs in the engine's environment. It imports
+them only when run, so the core above stays stdlib-only:
+
+```
+uv run --python 3.13 --project packages/dex-core --extra duckdb --with pytest pytest evals/tests/test_metadata.py
+uv run --python 3.13 --project packages/dex-core --extra duckdb python -m evals metadata --reference
+```
+
+CI runs the eval tests in that environment, split into parallel groups defined in
+`evals/tests/eval_groups.py`. They are cut test by test rather than by file, since
+nearly all the time is the metadata eval's dbt builds. A new eval needs nothing:
+it lands in the catch-all group. To reproduce one group locally, add
+`--eval-group <name>` to the `pytest evals/tests` command above. The `evals` check
+stays red unless the groups ran every eval exactly once between them and skipped
+none (`scripts/check_test_groups.py verify --suite evals`).
+
 ## Writing a storage backend
 
 `.dex/` state lives behind a `Store` protocol, and the contract is public so a
@@ -563,7 +599,8 @@ callers, how a vendor and a deployment resolve, and how a backend declares the
 fields its format structurally cannot carry instead of returning them empty. The
 shipped native Ossie source binds every applicable contract in
 `packages/dex-core/tests/ossie/test_conformance.py`, which is the worked example
-to read.
+to read. `packages/dex-core/tests/cube_vendor/test_reader.py` binds them for the
+Cube source, including a Cube rendering of the reference layer.
 
 ## Linting and formatting (Ruff)
 
@@ -661,6 +698,20 @@ committed to `main` here:
   `dex --help` prints, so a flag without help text fails the build.
 - `CHANGELOG.md`: the ten most recent releases.
 
+**Reader paths.** The Documentation tab starts with the local quickstart,
+installation, and connection setup, then task guides for Explore, Transform,
+Maintain, and semantic layers. Put exact flags, connector rules, compatibility,
+and integration contracts in Reference. Keep existing routes when reorganizing
+navigation so shared links and archived versions keep working.
+
+A guide starts with the reader's outcome and prerequisites, gives the shortest
+working path, explains how to interpret the result, and links to the next task
+and the canonical reference. Use tabs for mutually exclusive setup paths and
+accordions for optional detail. Keep required steps, spending decisions, and
+correctness checks visible. Do not copy policy thresholds or full command
+contracts into guides. The generated CLI pages keep command headings linkable
+and collapse their full usage and argument tables.
+
 **Linking.** A page under `docs/` links by site route
 (`/dex/guardrails/cost-controls`), never by file, and to the rest of the site by
 its full URL. A reference links by relative path
@@ -705,19 +756,24 @@ replaces the folder.
 
 - The hosted dbt Cloud Semantic Layer is the one path outside dex's cost guard.
   Say so; never write that nothing runs without a ceiling.
-- `viz preview` is "not yet implemented", and nothing more specific.
 - No quality claims dex has not measured.
 - No connector or semantic-layer promises with dates.
 - Demo numbers come from the pinned demo output only.
 
 ## Keeping the Ruff version in sync
 
-The pinned Ruff version appears in three places that must move together when you
+The pinned Ruff version appears in four places that must move together when you
 bump it:
 
 - `.github/workflows/lint.yml` (the `uvx ruff@<version>` calls)
-- `.pre-commit-config.yaml` (the `rev:` tag)
-- `packages/dex-core/pyproject.toml` (the `ruff==<version>` pin in the `dev` extra)
+- `.pre-commit-config.yaml` (the Ruff hook's `rev:` tag, without its leading `v`)
+- `packages/dex-core/pyproject.toml` (the exact `ruff==<version>` pin in the `dev` extra)
+- `packages/dex-core/uv.lock` (the locked Ruff package version)
+
+The dev extra's exact pin is the source of truth. The consistency test at
+`packages/dex-core/tests/test_ruff_version_pins.py` reads all four surfaces
+without fetching packages or resolving dependencies. Its in-memory fixture
+checks drift reporting without modifying the checkout.
 
 ## Keeping the towncrier version in sync
 

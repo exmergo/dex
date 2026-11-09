@@ -48,6 +48,14 @@ mutant ephemeral too routes the defect through them and into their tests with
 nothing materialized. :func:`downstream_closure` decides which of them can carry
 it, and :func:`classify` keeps a catch there apart from a catch by the model's own
 tests, so the per-model score still answers for the model's own suite.
+
+An incremental model is two programs, and an ephemeral model is never
+incremental, so its compiled SQL is only the full build: the
+``{% if is_incremental() %}`` branch, where the watermark comparison lives, is
+never in it (#1132). :func:`incremental_source` rewrites the model file with the
+branch taken, the caller compiles that a second time, and
+:func:`enumerate_mutants` plants comparison and filter defects in the sites only
+that program has, under the same cap, as a batch of their own.
 """
 
 from __future__ import annotations
@@ -56,12 +64,14 @@ import json
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any, NamedTuple
 
 import sqlglot
 from sqlglot import expressions as exp
 
 from .. import sql_shape
 from ..errors import DexError
+from . import window_frames
 
 #: How many mutants one run may execute. Every mutant is a dbt invocation, so
 #: this is a bound on wall time and on spend, not a matter of taste. A caller may
@@ -94,6 +104,28 @@ EPHEMERAL_HEADER = (
 
 #: dbt's own prefix for an inlined ephemeral parent.
 DBT_CTE_PREFIX = "__dbt__cte__"
+
+#: What ``{{ this }}`` is written as before the incremental program is compiled.
+#: dbt renders ``this`` as the model's physical relation even when the model is
+#: ephemeral, and a unit test binds its ``this`` fixture only to the jinja, so it
+#: has to survive the compile as a name :func:`prepare` can turn back into
+#: ``{{ this }}``. The leading ``__dex`` keeps it apart from any project's names.
+THIS_SENTINEL = "__dex_this__"
+
+#: The defect classes planted in an incremental branch. A branch's job is to
+#: choose the rows a run loads, so a boundary and a filter are what it can get
+#: wrong; everything else it shares with the full build, where it is planted.
+INCREMENTAL_OPERATORS = ("comparison", "predicate_drop", "predicate_negate")
+
+#: Why an incremental survivor is never compared on the dev data: its program
+#: reads ``{{ this }}``, which is the model itself, so outside a unit test there
+#: is no relation to read it from without building one.
+INCREMENTAL_NOT_COMPARED = (
+    "the incremental branch reads {{ this }}, which only a unit test fixture "
+    "supplies here, so it is not compared with the model on the dev data"
+)
+
+_IS_INCREMENTAL_CALL = re.compile(r"\bis_incremental\s*\(\s*\)")
 
 #: The unmutated model, written beside the mutant under a name of its own so the
 #: equivalence check has something to compare each survivor against. Both sides
@@ -174,6 +206,24 @@ _SUGGESTED_TEST = {
     "division": "a unit test pinning a known ratio",
     "window_frame": "a unit test over several rows in one partition",
     "aggregate": "a unit test with more than one row per group",
+}
+
+# A defect in the incremental branch is only reachable by a unit test that runs
+# the branch, so each suggestion names dbt's override and the `this` fixture
+# first: without them, no assertion of any kind reaches the code.
+_SUGGESTED_INCREMENTAL = {
+    "comparison": (
+        "a unit test that overrides is_incremental to true, with a `this` "
+        "fixture and an input row exactly on the boundary the branch compares"
+    ),
+    "predicate_drop": (
+        "a unit test that overrides is_incremental to true, with a `this` "
+        "fixture and an input row the branch's filter has to exclude"
+    ),
+    "predicate_negate": (
+        "a unit test that overrides is_incremental to true, with a `this` "
+        "fixture and an input row the branch's filter has to exclude"
+    ),
 }
 
 # Once the dev data has been compared, the two kinds of survivor need different
@@ -297,9 +347,12 @@ class Mutant:
     suggested_test: str
     body: str
     compiled: str = ""
+    #: For a window-frame mutant, the bound it moved and the boundary a fixture
+    #: has to reach (see :func:`_frame_payload`); ``None`` for every other class.
+    frame: dict[str, object] | None = None
 
     def payload(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "id": self.id,
             "operator": self.operator,
             "scope": self.scope,
@@ -308,6 +361,33 @@ class Mutant:
             "after": self.after,
             "suggested_test": self.suggested_test,
         }
+        if self.frame is not None:
+            record["frame"] = self.frame
+        return record
+
+
+@dataclass
+class IncrementalBatch:
+    """The mutants planted in an incremental model's ``is_incremental()`` branch.
+
+    Kept apart from the full build's because it is a different program, run
+    against different tests: only a unit test that overrides ``is_incremental``
+    to true executes the branch. ``identity`` is the branch-taken model file,
+    with ``{{ this }}`` restored, that those tests run as their baseline.
+    ``elided`` and ``considered`` are this program's share of the run's cap.
+    """
+
+    identity: str
+    identity_compiled: str = ""
+    mutants: list[Mutant] = field(default_factory=list)
+    elided: dict[str, int] = field(default_factory=dict)
+    considered: int = 0
+
+    @property
+    def elided_total(self) -> int:
+        """How many of the branch's mutants the cap cut, across classes."""
+
+        return sum(self.elided.values())
 
 
 @dataclass
@@ -318,6 +398,10 @@ class MutantBatch:
     spread across defect classes: a caller who sees five comparison mutants and
     no join mutant has to be able to tell "this model has no joins" from "the cap
     cut the joins off".
+
+    ``mutants``, ``elided`` and ``considered`` describe the full build.
+    ``incremental`` holds the branch's own, and is ``None`` for a model with no
+    branch dex compiled; the cap binds both together.
     """
 
     identity: str
@@ -327,9 +411,16 @@ class MutantBatch:
     unparsed: int = 0
     cap: int = MAX_MUTANTS
     identity_compiled: str = ""
+    #: Window-frame bounds no mutant moves, each with a ``reason_code``. They
+    #: are not mutants, so they count toward neither ``considered`` nor the cap;
+    #: they are listed so a boundary nothing tested never reads as tested.
+    unsupported: list[dict[str, str]] = field(default_factory=list)
+    incremental: IncrementalBatch | None = None
 
     @property
     def elided_total(self) -> int:
+        """How many of the full build's mutants the cap cut, across classes."""
+
         return sum(self.elided.values())
 
 
@@ -526,6 +617,39 @@ def render(prepared: PreparedModel, tree: exp.Expression | None = None) -> str:
     return "".join(out) + "\n" + EPHEMERAL_HEADER + "\n"
 
 
+def incremental_source(source: str) -> str | None:
+    """The model file as its next incremental run reads it, or ``None``.
+
+    Every ``is_incremental()`` call in a jinja block becomes ``true``, so dbt
+    compiles the branch an ephemeral model would otherwise drop, and every
+    ``{{ this }}`` becomes :data:`THIS_SENTINEL`, so the compiled SQL names the
+    model's own relation in a way :func:`prepare` can restore. Text outside
+    jinja, and jinja that names neither, is left exactly as written; dbt still
+    does the rendering. ``None`` when no jinja calls ``is_incremental()``, since
+    then there is no second program to read.
+    """
+
+    from ..dbt_project import jinja_regions
+
+    regions, _ = jinja_regions(source)
+    out: list[str] = []
+    cursor = 0
+    taken = False
+    for region in regions:
+        out.append(source[cursor : region.start])
+        text = source[region.start : region.end]
+        word = " ".join(region.body.strip().strip("-").split())
+        if region.kind == "expression" and word == "this":
+            text = THIS_SENTINEL
+        else:
+            text, count = _IS_INCREMENTAL_CALL.subn("true", text)
+            taken = taken or count > 0
+        out.append(text)
+        cursor = region.end
+    out.append(source[cursor:])
+    return "".join(out) if taken else None
+
+
 # --- the defect library --------------------------------------------------------
 
 
@@ -686,37 +810,157 @@ def _swap_division(node: exp.Expression, dialect: str) -> Applied | None:
     )
 
 
-def _window_sites(tree: exp.Expression) -> list[exp.Expression]:
-    return [
-        spec
-        for spec in tree.find_all(exp.WindowSpec)
-        if any(
-            isinstance(spec.args.get(bound), exp.Literal)
-            and not spec.args[bound].args.get("is_string")
-            for bound in ("start", "end")
+class _FrameSite(NamedTuple):
+    """One window-frame mutation: the bound it moves and which way.
+
+    A frame is one site per mutation rather than one per frame, because an
+    interval bound carries two defects worth planting (one unit wider, one
+    unit narrower) and each must be its own mutant to be its own finding.
+    """
+
+    spec: exp.WindowSpec
+    bound: str
+    step: int
+
+
+def _window_sites(tree: exp.Expression) -> list[_FrameSite]:
+    """The frame bounds dex can shift, in the order the frames are written.
+
+    Per frame, only the first bound dex can read is moved, as it always was: a
+    bare number one step wider, an interval one unit wider and, while it is
+    above zero, one unit narrower. An interval carries both because a calendar
+    window has two boundary questions (does the day after the last eligible
+    day leak in, is the last eligible day still counted) and a fixture can
+    answer one without the other. Every other offset bound is accounted for by
+    :func:`_unmutated_frame_bounds`, never silently.
+    """
+
+    sites: list[_FrameSite] = []
+    for spec in tree.find_all(exp.WindowSpec):
+        readable = [
+            o
+            for o in window_frames.offsets(spec)
+            if isinstance(o, window_frames.FrameOffset)
+        ]
+        if not readable:
+            continue
+        first = readable[0]
+        sites.append(_FrameSite(spec, first.bound, 1))
+        if first.is_interval and first.value >= 1:
+            sites.append(_FrameSite(spec, first.bound, -1))
+    return sites
+
+
+def _unmutated_frame_bounds(tree: exp.Expression, dialect: str) -> list[dict[str, str]]:
+    """Every offset bound no mutant moves, and why, so none reads as tested.
+
+    Two kinds: a bound dex cannot read exactly (a column, a fraction, a
+    compound interval), and the second readable bound of a frame whose first
+    one is already mutated. ``UNBOUNDED`` and ``CURRENT ROW`` are not offsets
+    and are not listed: there is no boundary there to be off by one.
+    """
+
+    unmutated: list[dict[str, str]] = []
+    for spec in tree.find_all(exp.WindowSpec):
+        mutated = False
+        for offset in window_frames.offsets(spec):
+            if isinstance(offset, window_frames.FrameOffset) and not mutated:
+                mutated = True
+                continue
+            if isinstance(offset, window_frames.FrameOffset):
+                code, reason = (
+                    "other_bound_of_mutated_frame",
+                    "dex shifts one bound per frame, and this frame's other bound "
+                    "is the one it shifted",
+                )
+            else:
+                code, reason = offset.reason_code, offset.reason
+            unmutated.append(
+                {
+                    "operator": "window_frame",
+                    "scope": _scope_label(spec, tree),
+                    "bound": _clip(_text(dialect, spec.args.get(offset.bound))),
+                    "side": offset.side,
+                    "reason_code": code,
+                    "reason": reason,
+                }
+            )
+    return unmutated
+
+
+def _shift_window_frame(site: _FrameSite, dialect: str) -> Applied | None:
+    offset = window_frames.read_bound(site.spec, site.bound)
+    if not isinstance(offset, window_frames.FrameOffset):
+        return None
+    target = offset.value + site.step
+    if target < 0:
+        return None
+    before = _text(dialect, site.spec)
+    window_frames.with_value(offset, target)
+    after = _text(dialect, site.spec)
+    return before, after, _frame_defect(offset, target)
+
+
+def _frame_defect(offset: window_frames.FrameOffset, target: int) -> str:
+    """The sentence for a moved bound, in the frame's own units.
+
+    A ROWS bound counts rows and a numeric RANGE bound counts the ordering
+    value, so "one row further" is only true of the first. An interval's
+    sentence names the calendar consequence, since that is what a fixture has
+    to reach.
+    """
+
+    value = offset.value
+    if offset.is_interval:
+        unit = offset.unit
+        direction = "back" if offset.side == "preceding" else "ahead"
+        span = (
+            f"{window_frames.plural(unit, value)} became "
+            f"{window_frames.plural(unit, target)}"
         )
-    ]
-
-
-def _shift_window_frame(node: exp.Expression, dialect: str) -> Applied | None:
-    for bound in ("start", "end"):
-        literal = node.args.get(bound)
-        if not isinstance(literal, exp.Literal) or literal.args.get("is_string"):
-            continue
-        try:
-            value = int(literal.this)
-        except (TypeError, ValueError):
-            continue
-        before = _text(dialect, node)
-        node.set(bound, exp.Literal.number(value + 1))
+        if target > value:
+            return (
+                f"the window reaches one {unit} further {direction} ({span}), so "
+                f"a row on the first {unit} it should exclude is counted"
+            )
         return (
-            before,
-            _text(dialect, node),
-            f"the window frame reaches one row further than it should "
-            f"({value} became {value + 1}), so every rolling value is computed "
-            "over the wrong span",
+            f"the window stops one {unit} short ({span}), so a row on the last "
+            f"{unit} it should include is dropped"
         )
-    return None
+    if offset.kind == "range":
+        return (
+            "the window frame reaches one unit of the ordering value further than "
+            f"it should ({value} became {target}), so a row whose ordering value "
+            "sits just past the boundary is counted"
+        )
+    return (
+        f"the window frame reaches one row further than it should "
+        f"({value} became {target}), so every rolling value is computed "
+        "over the wrong span"
+    )
+
+
+def _frame_payload(site: _FrameSite) -> dict[str, object] | None:
+    """What a fixture needs to reach this boundary, in the frame's units.
+
+    ``last_included`` and ``first_excluded`` are offsets from the current row,
+    in ``unit``, on the bound's own side. A RANGE interval frame over dates
+    with ``6 day PRECEDING`` includes the row six days back and excludes the
+    one seven days back: a fixture with rows on exactly those two days, and a
+    gap in the dates so a ROWS frame cannot give the same answer, is the one
+    that tells the widened and the narrowed mutant from the model.
+    """
+
+    offset = window_frames.read_bound(site.spec, site.bound)
+    if not isinstance(offset, window_frames.FrameOffset):
+        return None
+    return {
+        **offset.payload(),
+        "from": offset.value,
+        "to": offset.value + site.step,
+        "last_included": offset.value,
+        "first_excluded": offset.value + 1,
+    }
 
 
 def _aggregate_sites(tree: exp.Expression) -> list[exp.Expression]:
@@ -744,8 +988,8 @@ def _swap_aggregate(node: exp.Expression, dialect: str) -> Applied | None:
 @dataclass(frozen=True)
 class _Operator:
     name: str
-    sites: Callable[[exp.Expression], list[exp.Expression]]
-    apply: Callable[[exp.Expression, str], Applied | None]
+    sites: Callable[[exp.Expression], list[Any]]
+    apply: Callable[[Any, str], Applied | None]
 
 
 # Ordered as the issue's defect table is, and iterated round robin, so a cap cuts
@@ -762,8 +1006,16 @@ _OPERATORS: tuple[_Operator, ...] = (
 )
 
 
+#: The two programs an incremental model is, as the round robin keys them.
+_FULL = "full"
+_INCREMENTAL = "incremental"
+
+
 def enumerate_mutants(
-    prepared: PreparedModel, *, cap: int = MAX_MUTANTS
+    prepared: PreparedModel,
+    *,
+    cap: int = MAX_MUTANTS,
+    incremental: PreparedModel | None = None,
 ) -> MutantBatch:
     """Every defect this model can carry, ordered so a cap stays representative.
 
@@ -775,68 +1027,140 @@ def enumerate_mutants(
     then all joins". A model with forty comparisons and one join would otherwise
     spend an entire capped run proving things about comparisons and never test
     whether anything catches a join defect, which is the more expensive bug.
+
+    ``incremental`` is the same model compiled with its ``is_incremental()``
+    branch taken (#1132). Its comparison and filter sites that the full build
+    does not also have are planted into ``batch.incremental``, as defect classes
+    of their own in the same round robin and under the same cap, so a capped
+    run on a model with forty comparisons still tests its watermark. Ids are
+    ``m01``... for the full build and ``i01``... for the branch. A site both
+    programs share is the full build's, and is planted once.
     """
 
     cap = max(0, min(cap, MAX_MUTANTS))
     identity = render(prepared)
 
-    planned: list[tuple[str, int]] = []
-    counts: dict[str, int] = {}
+    planned: list[tuple[str, str, int]] = []
     for operator in _OPERATORS:
         found = len(operator.sites(prepared.tree))
-        counts[operator.name] = found
-        planned.extend((operator.name, index) for index in range(found))
+        planned.extend((_FULL, operator.name, index) for index in range(found))
+    branch: IncrementalBatch | None = None
+    if incremental is not None:
+        branch = IncrementalBatch(
+            identity=render(incremental),
+            identity_compiled=incremental.compiled(),
+        )
+        for operator in _OPERATORS:
+            if operator.name in INCREMENTAL_OPERATORS:
+                planned.extend(
+                    (_INCREMENTAL, operator.name, index)
+                    for index in _branch_only_sites(operator, prepared, incremental)
+                )
 
     ordered = _round_robin(planned)
     batch = MutantBatch(
         identity=identity,
-        considered=len(ordered),
+        considered=sum(1 for program, _, _ in ordered if program == _FULL),
         cap=cap,
         identity_compiled=prepared.compiled(),
+        unsupported=[
+            {**entry, "bound": prepared.readable(entry["bound"])}
+            for entry in _unmutated_frame_bounds(prepared.tree, prepared.dialect)
+        ],
+        incremental=branch,
     )
+    if branch is not None:
+        branch.considered = len(ordered) - batch.considered
     by_name = {operator.name: operator for operator in _OPERATORS}
 
-    for operator_name, index in ordered:
-        if len(batch.mutants) >= cap:
-            batch.elided[operator_name] = batch.elided.get(operator_name, 0) + 1
+    for program, operator_name, index in ordered:
+        source = prepared
+        owner: MutantBatch | IncrementalBatch = batch
+        if program == _INCREMENTAL and branch is not None and incremental is not None:
+            source, owner = incremental, branch
+        generated = len(batch.mutants) + (len(branch.mutants) if branch else 0)
+        if generated >= cap:
+            owner.elided[operator_name] = owner.elided.get(operator_name, 0) + 1
             continue
         operator = by_name[operator_name]
-        tree = prepared.tree.copy()
+        tree = source.tree.copy()
         sites = operator.sites(tree)
         if index >= len(sites):
             continue
         node = sites[index]
-        scope = _scope_label(node, tree)
-        applied = operator.apply(node, prepared.dialect)
+        frame = _frame_payload(node) if isinstance(node, _FrameSite) else None
+        scope = _scope_label(node.spec if isinstance(node, _FrameSite) else node, tree)
+        applied = operator.apply(node, source.dialect)
         if applied is None:
             continue
-        before, after, defect = (prepared.readable(part) for part in applied)
+        before, after, defect = (source.readable(part) for part in applied)
         try:
-            body = render(prepared, tree)
+            body = render(source, tree)
             # A mutant that cannot be re-read is a mutant dex cannot stand
             # behind, so it is dropped here rather than sent to the warehouse to
             # fail there and be reported as a defect the tests "rejected".
             sqlglot.parse_one(
-                _PLACEHOLDER_RE.sub("x", tree.sql(dialect=prepared.dialect)),
-                read=prepared.dialect,
+                _PLACEHOLDER_RE.sub("x", tree.sql(dialect=source.dialect)),
+                read=source.dialect,
             )
         except Exception:
             batch.unparsed += 1
             continue
-        batch.mutants.append(
+        in_branch = owner is not batch
+        owner.mutants.append(
             Mutant(
-                id=f"m{len(batch.mutants) + 1:02d}",
+                id=f"{'i' if in_branch else 'm'}{len(owner.mutants) + 1:02d}",
                 operator=operator_name,
                 scope=scope,
-                defect=defect,
+                defect=(
+                    f"in the is_incremental() branch, {defect}" if in_branch else defect
+                ),
                 before=before,
                 after=after,
-                suggested_test=_SUGGESTED_TEST[operator_name],
+                suggested_test=(
+                    incremental_suggested_test(operator_name)
+                    if in_branch
+                    else suggested_test(operator_name, frame=frame)
+                ),
                 body=body,
-                compiled=prepared.compiled(tree),
+                compiled=source.compiled(tree),
+                frame=frame,
             )
         )
     return batch
+
+
+def _branch_only_sites(
+    operator: _Operator, full: PreparedModel, incremental: PreparedModel
+) -> list[int]:
+    """The indexes of ``operator``'s sites only the incremental program has.
+
+    A site is matched across the two programs by its scope and its text with
+    every reference spelled as its name, since the two compiles number their
+    placeholders independently. Matching is a multiset subtraction, so a
+    predicate written once outside the branch and once inside it is planted
+    once in each program.
+    """
+
+    def key(source: PreparedModel, node: exp.Expression) -> tuple[str, str]:
+        """A site's scope and readable text, comparable across the two compiles."""
+
+        return (
+            _scope_label(node, source.tree),
+            source.readable(_text(source.dialect, node)),
+        )
+
+    shared: dict[tuple[str, str], int] = {}
+    for node in operator.sites(full.tree):
+        shared[key(full, node)] = shared.get(key(full, node), 0) + 1
+    only: list[int] = []
+    for index, node in enumerate(operator.sites(incremental.tree)):
+        found = key(incremental, node)
+        if shared.get(found, 0) > 0:
+            shared[found] -= 1
+            continue
+        only.append(index)
+    return only
 
 
 # --- reading the runs ----------------------------------------------------------
@@ -980,14 +1304,27 @@ def _not_routable(node: dict, project: str | None) -> str | None:
     return None
 
 
-def suggested_test(operator: str, equivalence: str | None = None) -> str:
+def suggested_test(
+    operator: str,
+    equivalence: str | None = None,
+    *,
+    frame: dict[str, object] | None = None,
+) -> str:
     """The test that would catch this survivor, once its label is known.
 
     Without a label (the comparison did not run) the operator's general
     suggestion stands. With one, an ``equivalent`` survivor gets the fixture
     that reaches the case and a ``distinguishable`` one gets the assertion over
     data that already differs.
+
+    An interval frame gets its own sentence whatever the label, naming the two
+    days a fixture needs rows on. An assertion over the dev data rarely pins a
+    calendar boundary, and a fixture on consecutive days cannot tell a day
+    window from a row window, so the gap is part of the advice.
     """
+
+    if operator == "window_frame" and frame and frame.get("unit"):
+        return _interval_fixture_advice(frame)
 
     pair = _SUGGESTED_BY_EQUIVALENCE.get(operator)
     if pair is not None and equivalence == "equivalent":
@@ -995,6 +1332,29 @@ def suggested_test(operator: str, equivalence: str | None = None) -> str:
     if pair is not None and equivalence == "distinguishable":
         return pair[1]
     return _SUGGESTED_TEST[operator]
+
+
+def incremental_suggested_test(operator: str) -> str:
+    """The test that would catch a survivor planted in the incremental branch.
+
+    The same advice whether or not a test ran: a defect there is reachable only
+    by a unit test that overrides ``is_incremental`` to true, so that override
+    is what the suggestion has to name, ahead of the row that pins the case.
+    """
+
+    return _SUGGESTED_INCREMENTAL.get(operator, _SUGGESTED_TEST[operator])
+
+
+def _interval_fixture_advice(frame: dict[str, object]) -> str:
+    unit = str(frame["unit"])
+    side = "before" if frame.get("side") == "preceding" else "after"
+    last = window_frames.plural(unit, int(frame["last_included"]))  # type: ignore[arg-type]
+    first = window_frames.plural(unit, int(frame["first_excluded"]))  # type: ignore[arg-type]
+    return (
+        f"a unit test with one row {last} {side} the current row (the last one "
+        f"the window includes) and one {first} {side} it (the first it excludes), "
+        f"with a gap in the {unit}s so a row-count window cannot give the same answer"
+    )
 
 
 def equivalence_model(model_ref: str, dialect: str) -> str | None:
@@ -1112,14 +1472,25 @@ def inline_into_test(
 # --- helpers -------------------------------------------------------------------
 
 
-def _round_robin(planned: list[tuple[str, int]]) -> list[tuple[str, int]]:
-    by_operator: dict[str, list[tuple[str, int]]] = {}
+def _round_robin(planned: list[tuple[str, str, int]]) -> list[tuple[str, str, int]]:
+    """One site per defect class per round, in the issue's order of classes.
+
+    The incremental branch's comparisons and filters are classes of their own,
+    each right after the full build's class of the same kind, so even a cap of
+    two reaches the branch's watermark."""
+
+    by_class: dict[tuple[str, str], list[tuple[str, str, int]]] = {}
     for entry in planned:
-        by_operator.setdefault(entry[0], []).append(entry)
-    ordered: list[tuple[str, int]] = []
-    while any(by_operator.values()):
-        for operator in _OPERATORS:
-            queue = by_operator.get(operator.name)
+        by_class.setdefault((entry[0], entry[1]), []).append(entry)
+    classes: list[tuple[str, str]] = []
+    for operator in _OPERATORS:
+        classes.append((_FULL, operator.name))
+        if operator.name in INCREMENTAL_OPERATORS:
+            classes.append((_INCREMENTAL, operator.name))
+    ordered: list[tuple[str, str, int]] = []
+    while any(by_class.values()):
+        for key in classes:
+            queue = by_class.get(key)
             if queue:
                 ordered.append(queue.pop(0))
     return ordered

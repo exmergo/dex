@@ -468,6 +468,72 @@ def test_a_bare_unset_is_the_config_verb(tmp_path, capsys):
     assert (rc, envelope["status"]) == (0, "needs_confirmation")
 
 
+def test_unset_duplicated_key_removes_ignored_occurrence(tmp_path, capsys):
+    path = _repo(tmp_path, "connector: duckdb\nconnector: snowflake\n")
+    before = path.read_bytes()
+
+    rc, envelope = _run(capsys, tmp_path, "config", "unset", "connector")
+    assert (rc, envelope["status"]) == (0, "needs_confirmation")
+    assert envelope["data"]["written"] is False
+    assert envelope["data"]["changed"] is True
+    assert envelope["data"]["notes"] == [
+        "connector is set twice in .dex/config.yml; removed the ignored occurrence on "
+        "line 1 (the value on line 2 was kept)"
+    ]
+    (diff,) = envelope["diffs"]
+    assert (diff["additions"], diff["deletions"]) == (0, 1)
+    assert "-connector: duckdb" in diff["unified"]
+    assert path.read_bytes() == before
+
+    rc, envelope = _run(capsys, tmp_path, "config", "unset", "connector", "--confirm")
+    assert (rc, envelope["status"], envelope["data"]["written"]) == (0, "ok", True)
+    assert path.read_text(encoding="utf-8") == "connector: snowflake\n"
+    assert envelope["warnings"] == []
+
+    rc, envelope = _run(capsys, tmp_path, "config", "validate")
+    assert (rc, envelope["data"]["valid"]) == (0, True)
+
+    rc, envelope = _run(capsys, tmp_path, "config", "unset", "connector", "--confirm")
+    assert (rc, envelope["status"], envelope["data"]["written"]) == (0, "ok", True)
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_unset_duplicate_flag_cleans_up_all_duplicates(tmp_path, capsys):
+    text = (
+        "connector: duckdb\n"
+        "connector: snowflake\n"
+        "query:\n"
+        "  max_rows: 10\n"
+        "  max_rows: 20\n"
+    )
+    path = _repo(tmp_path, text)
+    rc, envelope = _run(capsys, tmp_path, "config", "unset", "--duplicate", "--confirm")
+    assert (rc, envelope["status"], envelope["data"]["written"]) == (0, "ok", True)
+    assert path.read_text(encoding="utf-8") == (
+        "connector: snowflake\nquery:\n  max_rows: 20\n"
+    )
+    assert len(envelope["data"]["notes"]) == 2
+
+
+def test_unset_duplicate_flag_on_non_duplicate_key(tmp_path, capsys):
+    _repo(tmp_path, "connector: duckdb\n")
+    rc, envelope = _run(capsys, tmp_path, "config", "unset", "connector", "--duplicate")
+    assert (rc, envelope["status"]) == (0, "ok")
+    assert envelope["data"]["changed"] is False
+    assert envelope["data"]["notes"] == [
+        "connector is not set twice in .dex/config.yml, so there is no duplicate "
+        "to remove"
+    ]
+
+
+def test_unset_duplicate_flag_when_no_duplicates_exist(tmp_path, capsys):
+    _repo(tmp_path, "connector: duckdb\n")
+    rc, envelope = _run(capsys, tmp_path, "config", "unset", "--duplicate")
+    assert (rc, envelope["status"]) == (0, "ok")
+    assert envelope["data"]["changed"] is False
+    assert envelope["data"]["notes"] == ["no keys are set twice in .dex/config.yml"]
+
+
 def test_a_bare_validate_is_the_config_verb(tmp_path, capsys):
     _repo(tmp_path, "connector: duckdb\n")
     rc, envelope = _run(capsys, tmp_path, "validate")

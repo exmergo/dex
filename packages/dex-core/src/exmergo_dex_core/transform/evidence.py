@@ -22,15 +22,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ..edits import EditOp
-from .plans import EditKind, PlanEdit
+from ..model_versions import expand, label_for_file, version_map
+from ..value_mask import mask_values
+from .plans import EditKind, PlanEdit, PlanError
 
 #: dbt node statuses that mean the node did not produce a good relation. `fail`
 #: is a test that returned rows; `error` and `runtime error` are a node that
@@ -42,10 +45,55 @@ FAILED_STATUSES = frozenset({"error", "runtime error", "fail", "failed"})
 #: as a pass.
 SKIPPED_STATUSES = frozenset({"skipped"})
 
+#: Statuses that mean the node ran and did what it was for. A model, seed or
+#: snapshot says `success`; a test says `pass`, or `warn` when it returned rows
+#: under `severity: warn`, which dbt counts as a passed build.
+SUCCEEDED_STATUSES = frozenset({"success", "pass", "warn"})
+
+#: The one status that means a node produced its relation in this run.
+BUILT_STATUS = "success"
+
+
+def status_kind(status: str) -> str:
+    """What one dbt node status means: ``succeeded``, ``failed``, ``skipped``
+    or ``unrecognized`` (#1105).
+
+    An allow-list, not a deny-list: a status dex does not know (``partial
+    success`` from a microbatch model with a failed batch, ``no-op``, the
+    ``unknown`` a document without a status defaults to) is never read as a
+    pass. It is not a failure either, and the outcome says ``indeterminate``.
+    """
+
+    lowered = status.lower()
+    if lowered in FAILED_STATUSES:
+        return "failed"
+    if lowered in SKIPPED_STATUSES:
+        return "skipped"
+    if lowered in SUCCEEDED_STATUSES:
+        return "succeeded"
+    return "unrecognized"
+
+
 #: Edit kinds that name a buildable node by their own path. Everything else
 #: either documents nodes (a schema.yml), points at one (a semantic YAML), or
 #: can affect any node at all (a macro, the project config).
 _NODE_KINDS = frozenset({EditKind.MODEL_SQL, EditKind.SNAPSHOT_SQL, EditKind.SEED_CSV})
+
+
+#: dbt colors a unit test's diff even in run_results.json; the escapes are noise
+#: in a JSON payload and push the diff itself past the length cap.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _node_message(message: object) -> str | None:
+    """dbt's message on one node, bounded, with its color codes removed, the
+    blank lines a unit test diff opens with trimmed (#1111), and any value a
+    warehouse conversion error quotes masked (#1070)."""
+
+    if not message:
+        return None
+    text = _ANSI_ESCAPE.sub("", str(message)).replace("\r\n", "\n").strip()
+    return mask_values(text)[:400] or None
 
 
 class BuildOutcome(str, Enum):
@@ -65,9 +113,14 @@ class BuildOutcome(str, Enum):
     FAILED = "failed"
     #: Every node was skipped, which usually means a parent failed elsewhere.
     SKIPPED = "skipped"
+    #: Nothing failed, but at least one node reported a status dex does not
+    #: recognize (``partial success``, ``no-op``, ``unknown``), so what it built
+    #: cannot be told. Never read as a pass, never reported as a failure (#1105).
+    INDETERMINATE = "indeterminate"
     #: Nodes ran, and not one of them was a node this change required.
     UNRELATED = "unrelated"
-    #: Some of the required nodes ran and some did not.
+    #: Some of the required nodes built and some did not: absent from run
+    #: results, or present without succeeding (``coverage.not_built``).
     PARTIAL = "partial"
     #: A plan was named, but no buildable requirement could be derived for its
     #: edits (a metric whose measure cannot be located, a macro, a project-config
@@ -129,7 +182,11 @@ class PlanDrift(BaseModel):
 
 
 class BuildCoverage(BaseModel):
-    """Which of the nodes this change required were actually built.
+    """Which requirements appeared in run results, and which actually built.
+
+    ``covered`` includes failed and skipped nodes for compatibility. ``built``
+    and ``not_built`` partition requirements by successful execution; ``None``
+    means an older producer did not measure that partition.
 
     ``basis`` says how the requirement was derived, because the derivation is not
     uniform: a model edit names its own node, a schema.yml names the nodes it
@@ -144,11 +201,32 @@ class BuildCoverage(BaseModel):
     required: list[str] = Field(default_factory=list)
     covered: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
+    built: list[str] | None = None
+    not_built: list[str] | None = None
     basis: list[str] = Field(default_factory=list)
     #: True when at least one edit could not derive a buildable requirement and
     #: ``required`` is therefore empty. Hosts must not read an empty required list
     #: as "nothing to check" / validated.
     undetermined: bool = False
+
+    @model_validator(mode="after")
+    def _validate_partition(self) -> BuildCoverage:
+        """Reject execution partitions that do not cover the requirements once."""
+
+        if self.built is None and self.not_built is None:
+            return self
+        if self.built is None or self.not_built is None:
+            raise ValueError("built and not_built must be supplied together")
+        built, not_built = set(self.built), set(self.not_built)
+        if (
+            len(built) != len(self.built)
+            or len(not_built) != len(self.not_built)
+            or built & not_built
+            or built | not_built != set(self.required)
+            or not built <= set(self.covered)
+        ):
+            raise ValueError("built and not_built must partition required nodes")
+        return self
 
 
 class BuildDigests(BaseModel):
@@ -160,6 +238,10 @@ class BuildDigests(BaseModel):
     plan_digest: str | None = None
 
 
+class BuildEvidenceError(PlanError, ValueError):
+    """A build evidence document was unreadable or contradicts its fields."""
+
+
 class BuildEvidence(BaseModel):
     """Everything a host needs to decide whether this build validated the change."""
 
@@ -169,6 +251,9 @@ class BuildEvidence(BaseModel):
     selection: BuildSelection = Field(default_factory=BuildSelection)
     coverage: BuildCoverage | None = None
     digests: BuildDigests = Field(default_factory=BuildDigests)
+    #: Relations of the models, seeds and snapshots that succeeded in this run.
+    #: A skipped or failed node's relation is never listed, whatever survives
+    #: of it in the target from an earlier run (#1104).
     generated: list[str] = Field(default_factory=list)
     errors: list[dict[str, str]] = Field(default_factory=list)
     #: Why the outcome is `stale`, where it is. Always present so an empty list
@@ -190,6 +275,16 @@ class BuildEvidence(BaseModel):
             return getattr(self, key)
         return default
 
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> BuildEvidence:
+        recomputed = recompute_outcome(self)
+        if self.outcome != recomputed:
+            raise BuildEvidenceError(
+                f"outcome '{self.outcome.value}' contradicts evidence fields "
+                f"(recomputes to '{recomputed.value}')"
+            )
+        return self
+
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "outcome": self.outcome.value,
@@ -208,6 +303,32 @@ class BuildEvidence(BaseModel):
         if self.coverage is not None:
             payload["coverage"] = self.coverage.model_dump(mode="json")
         return payload
+
+
+def _disabled_models(manifest: Any) -> set[str]:
+    """The models a manifest lists as disabled, by name and version label."""
+
+    names: set[str] = set()
+    if not isinstance(manifest, dict):
+        return names
+    # A bare name is exempt only when no enabled model answers to it: one
+    # disabled version does not excuse a build of the version still enabled.
+    enabled = {
+        str(node.get("name"))
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if str(uid).startswith("model.") and isinstance(node, dict)
+    }
+    for uid, entries in (manifest.get("disabled") or {}).items():
+        if not str(uid).startswith("model."):
+            continue
+        for node in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                continue
+            if node["name"] not in enabled:
+                names.add(node["name"])
+            if node.get("version") is not None:
+                names.add(f"{node['name']}.v{node['version']}")
+    return names
 
 
 def _file_digest(path: Path) -> str | None:
@@ -238,6 +359,9 @@ def required_nodes(
     # Measure -> transformation model, union of plan edits and on-disk YAML.
     measure_owners = _measure_owners(edits, project)
     metric_defs = _metric_definitions(edits, project)
+    # A version is required by its label (`dim_teams.v1`), whichever file
+    # builds it, so one version building never answers for another (#859).
+    versions = _version_map(edits, project)
 
     for edit in edits:
         if edit.op is EditOp.DELETE:
@@ -246,7 +370,7 @@ def required_nodes(
             basis.append(f"{edit.path}: a deletion requires no node")
             continue
         if edit.kind in _NODE_KINDS:
-            name = node_name(edit.path)
+            name = label_for_file(edit.path, versions) or node_name(edit.path)
             required.add(name)
             basis.append(f"{edit.path}: builds '{name}'")
             continue
@@ -256,6 +380,7 @@ def required_nodes(
                 measure_owners=measure_owners,
                 metric_defs=metric_defs,
             )
+            named = expand(named, versions)
             if named:
                 required.update(named)
                 basis.append(f"{edit.path}: {detail}")
@@ -273,6 +398,24 @@ def required_nodes(
         )
     undetermined = undetermined_edits and not required
     return sorted(required), basis, undetermined
+
+
+def _version_map(edits: list[PlanEdit], project: Path) -> dict[str, Any]:
+    """The versioned models of the project as the plan leaves it."""
+
+    from ..dbt_project import DbtProjectError, load
+
+    try:
+        view = load(project)
+    except (DbtProjectError, OSError):
+        return {}
+    files = {path: source.content for path, source in view.files.items()}
+    for edit in edits:
+        if edit.op is EditOp.DELETE:
+            files.pop(edit.path, None)
+        elif edit.new_content is not None:
+            files[edit.path] = edit.new_content
+    return version_map(files, view.model_paths)
 
 
 def _ref_model(value: Any) -> str | None:
@@ -516,16 +659,138 @@ def _outcome(
         return BuildOutcome.FAILED
     if statuses and statuses <= SKIPPED_STATUSES:
         return BuildOutcome.SKIPPED
+    if any(status_kind(status) == "unrecognized" for status in statuses):
+        return BuildOutcome.INDETERMINATE
     if coverage is not None and coverage.required:
         if not coverage.covered:
             return BuildOutcome.UNRELATED
-        if coverage.missing:
+        # A required node in run results that did not succeed (skipped beside
+        # nodes that passed, with nothing failed) did not build either, so the
+        # outcome agrees with the execution partition (#1105).
+        if coverage.missing or coverage.not_built:
             return BuildOutcome.PARTIAL
     if coverage is not None and coverage.undetermined and not coverage.required:
         return BuildOutcome.COVERAGE_UNDETERMINED
     if drift or stale:
         return BuildOutcome.STALE
     return BuildOutcome.VALIDATED
+
+
+def recompute_outcome(evidence: BuildEvidence | dict[str, Any]) -> BuildOutcome:
+    """Recompute what build outcome an evidence document actually establishes.
+
+    Uses the same precedence and rules as :func:`_outcome`, reading from the
+    carried nodes, coverage, plan drift, and artifacts freshness.
+    """
+    if isinstance(evidence, dict):
+        nodes_data = evidence.get("nodes") or []
+        nodes = [
+            BuildNode.model_validate(n) if isinstance(n, dict) else n
+            for n in nodes_data
+        ]
+        coverage_data = evidence.get("coverage")
+        coverage = (
+            BuildCoverage.model_validate(coverage_data)
+            if isinstance(coverage_data, dict)
+            else coverage_data
+        )
+        stale = evidence.get("stale_artifacts")
+        drift_data = evidence.get("plan_drift") or []
+        drift = [
+            PlanDrift.model_validate(d) if isinstance(d, dict) else d
+            for d in drift_data
+        ]
+        invocation_data = evidence.get("invocation") or {}
+        inv_id = (
+            invocation_data.get("invocation_id")
+            if isinstance(invocation_data, dict)
+            else getattr(invocation_data, "invocation_id", None)
+        )
+        elapsed = (
+            invocation_data.get("elapsed_seconds")
+            if isinstance(invocation_data, dict)
+            else getattr(invocation_data, "elapsed_seconds", None)
+        )
+        digests_data = evidence.get("digests") or {}
+        run_results_sha = (
+            digests_data.get("run_results_sha256")
+            if isinstance(digests_data, dict)
+            else getattr(digests_data, "run_results_sha256", None)
+        )
+    else:
+        nodes = evidence.nodes
+        coverage = evidence.coverage
+        stale = evidence.stale_artifacts
+        drift = evidence.plan_drift
+        inv_id = evidence.invocation.get("invocation_id")
+        elapsed = evidence.invocation.get("elapsed_seconds")
+        run_results_sha = (
+            evidence.digests.run_results_sha256
+            if evidence.digests is not None
+            else None
+        )
+
+    ran = bool(nodes) or bool(run_results_sha) or bool(inv_id) or (elapsed is not None)
+    return _outcome(ran, nodes, coverage, stale, drift)
+
+
+def verify_build_evidence(
+    document: BuildEvidence | dict[str, Any] | str | bytes,
+    *,
+    expect_outcome: BuildOutcome | str | None = None,
+) -> BuildEvidence:
+    """Verify that build evidence is internally consistent and not contradictory.
+
+    Validates that the outcome the document claims is the outcome its carried
+    nodes, coverage, drift and artifact freshness actually justify, matching
+    :func:`recompute_outcome`.
+
+    If ``expect_outcome`` is given, asserts that the verified outcome matches
+    that expected verdict.
+    """
+    if isinstance(document, (str, bytes)):
+        try:
+            parsed = json.loads(document)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BuildEvidenceError(
+                f"not a readable build-evidence document: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise BuildEvidenceError("build-evidence document must be a JSON object")
+        document = parsed
+
+    if isinstance(document, dict):
+        try:
+            evidence = BuildEvidence.model_validate(document)
+        except Exception as exc:
+            msg = str(exc)
+            if hasattr(exc, "errors") and exc.errors():
+                first = exc.errors()[0]
+                if "ctx" in first and "error" in first["ctx"]:
+                    msg = str(first["ctx"]["error"])
+            raise BuildEvidenceError(f"invalid build-evidence document: {msg}") from exc
+    elif isinstance(document, BuildEvidence):
+        evidence = document
+        recomputed = recompute_outcome(evidence)
+        if evidence.outcome != recomputed:
+            raise BuildEvidenceError(
+                f"outcome '{evidence.outcome.value}' contradicts evidence fields "
+                f"(recomputes to '{recomputed.value}')"
+            )
+    else:
+        raise BuildEvidenceError(
+            f"expected BuildEvidence, dict, str or bytes, got {type(document).__name__}"
+        )
+
+    if expect_outcome is not None:
+        expected = BuildOutcome(expect_outcome)
+        if evidence.outcome != expected:
+            raise BuildEvidenceError(
+                f"build outcome '{evidence.outcome.value}' is not the expected "
+                f"'{expected.value}'"
+            )
+
+    return evidence
 
 
 #: Selector syntax dex does not evaluate. Their presence is what makes
@@ -541,13 +806,25 @@ def build_evidence(
     edits: list[PlanEdit] | None = None,
     plan_digest: str | None = None,
     source_digest: str | None = None,
+    artifact_directory: Path | str | None = None,
+    expected_invocation_id: str | None = None,
+    full_refresh: bool = False,
 ) -> BuildEvidence:
     """Read dbt's own artifacts and say what this build established.
 
-    Reads ``target/run_results.json`` and ``target/manifest.json`` rather than
-    scraping log text, exactly as :func:`~.build._summarize` does, and reads them
-    separately from it on purpose: ``summary`` is a released payload shape and
-    nothing here may move it.
+    Reads ``run_results.json`` and ``manifest.json`` from ``artifact_directory``
+    (by default the newest on disk, see
+    :func:`~.artifact_runtime.readable_artifact_dir`) rather than scraping log
+    text, exactly as :func:`~.build._summarize` does, and reads them
+    separately from it on purpose. ``summary`` is a released payload shape
+    and nothing here may move it.
+
+    ``expected_invocation_id``, when set, refuses artifacts whose invocation id
+    is a different id. A missing file has no id to disagree with and stays
+    ``not_run`` rather than a successful completion.
+
+    ``full_refresh`` records under ``invocation`` that the build ran with
+    ``--full-refresh`` (issue #1015).
     """
 
     from ..dbt_project import load as load_project
@@ -557,10 +834,23 @@ def build_evidence(
         node_name,
         strip_relation_quoting,
     )
+    from .artifact_runtime import (
+        artifact_paths,
+        artifact_producer,
+        assert_same_invocation,
+        readable_artifact_dir,
+    )
 
     root = Path(project)
-    run_results_path = root / "target" / "run_results.json"
-    manifest_path = root / "target" / "manifest.json"
+    if artifact_directory is None:
+        chosen = readable_artifact_dir(root)
+    else:
+        chosen = Path(artifact_directory)
+        if not chosen.is_absolute():
+            chosen = root / chosen
+    paths = artifact_paths(chosen)
+    run_results_path = paths.run_results
+    manifest_path = paths.manifest
 
     results: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {}
@@ -589,6 +879,7 @@ def build_evidence(
     # every version) or by the file it is defined in (`dim_customers_v2.sql`),
     # and each of those did build this node.
     answers: set[str] = set()
+    unsuccessful_answers: set[str] = set()
     generated: list[str] = []
     errors: list[dict[str, str]] = []
     for result in results:
@@ -610,21 +901,28 @@ def build_evidence(
             # dbt's message on a failure is the actionable half; it is bounded
             # here for the same reason build messages are, since a traceback in a
             # payload is a payload nobody reads.
-            message=(
-                str(result.get("message"))[:400] if result.get("message") else None
-            ),
+            message=_node_message(result.get("message")),
         )
         nodes.append(built)
-        answers.add(built.name)
+        node_answers = {built.name}
         if isinstance(node.get("name"), str):
-            answers.add(node["name"])
+            node_answers.add(node["name"])
         if node.get("resource_type") == "model" and isinstance(
             node.get("original_file_path"), str
         ):
-            answers.add(node_name(node["original_file_path"]))
+            node_answers.add(node_name(node["original_file_path"]))
+        answers.update(node_answers)
+        if status.lower() != BUILT_STATUS:
+            unsuccessful_answers.update(node_answers)
         if status.lower() in FAILED_STATUSES:
             errors.append({"node": built.name, "message": built.message or status})
-        elif built.relation and built.resource_type in {"model", "snapshot", "seed"}:
+        # Only a node that succeeded produced its relation in this run: a
+        # skipped node's relation, where one exists, predates the run (#1104).
+        elif (
+            status.lower() == BUILT_STATUS
+            and built.relation
+            and built.resource_type in {"model", "snapshot", "seed"}
+        ):
             generated.append(built.relation)
 
     matched = [n.name for n in nodes]
@@ -641,11 +939,24 @@ def build_evidence(
     if edits is not None:
         drift = plan_drift(edits, root)
         required, basis, undetermined = required_nodes(edits, root)
+        # dbt never builds a disabled model, so a plan that edits one (to drop a
+        # flag read from it, say) does not owe a build of it (#1156).
+        disabled = _disabled_models(manifest)
+        idle = [name for name in required if name in disabled and name not in answers]
+        if idle:
+            required = [name for name in required if name not in idle]
+            basis = [
+                *basis,
+                *(f"'{name}' is disabled, so no build runs it" for name in idle),
+            ]
         covered = [name for name in required if name in answers]
+        successful = [name for name in covered if name not in unsuccessful_answers]
         coverage = BuildCoverage(
             required=required,
             covered=covered,
             missing=[name for name in required if name not in answers],
+            built=successful,
+            not_built=[name for name in required if name not in successful],
             basis=basis,
             undetermined=undetermined,
         )
@@ -655,6 +966,32 @@ def build_evidence(
         stale = manifest_freshness(load_project(root)).get("stale")
     except Exception:
         stale = None
+
+    producer = artifact_producer(
+        project_root=root,
+        target=target,
+        artifact_directory=paths.directory,
+        metadata=metadata if isinstance(metadata, dict) else {},
+        project_name=(
+            str(manifest.get("metadata", {}).get("project_name"))
+            if isinstance(manifest.get("metadata"), dict)
+            and manifest.get("metadata", {}).get("project_name")
+            else None
+        ),
+        adapter_version=(
+            str(metadata["adapter_version"])
+            if isinstance(metadata, dict) and metadata.get("adapter_version")
+            else None
+        ),
+    )
+    assert_same_invocation(
+        expected_invocation_id,
+        (
+            str(metadata["invocation_id"])
+            if isinstance(metadata, dict) and metadata.get("invocation_id")
+            else None
+        ),
+    )
 
     return BuildEvidence(
         outcome=_outcome(ran, nodes, coverage, stale, drift),
@@ -666,6 +1003,8 @@ def build_evidence(
             "command": "build",
             "target": target,
             "select": select,
+            "full_refresh": full_refresh,
+            "artifact_producer": producer.as_dict(),
             # dbt writes this at the top of run_results, not inside `metadata`.
             "elapsed_seconds": (
                 float(elapsed)
@@ -678,7 +1017,7 @@ def build_evidence(
         coverage=coverage,
         digests=BuildDigests(
             manifest_sha256=_file_digest(manifest_path),
-            run_results_sha256=_file_digest(run_results_path),
+            run_results_sha256=_file_digest(run_results_path) if ran else None,
             source_digest=source_digest,
             plan_digest=plan_digest,
         ),

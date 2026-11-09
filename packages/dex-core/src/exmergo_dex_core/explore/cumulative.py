@@ -45,6 +45,7 @@ _DECREASE_FRACTION_CEILING = 0.05
 # rows. Mirrors this codebase's other "not enough evidence, fail closed"
 # floors (e.g. the temporal-alignment and heterogeneous-key checks).
 _MIN_OBSERVATIONS = 20
+MIN_OBSERVATIONS = _MIN_OBSERVATIONS
 
 
 class CumulativeCandidate(NamedTuple):
@@ -175,8 +176,8 @@ def probe_sql(identifier: str, candidate: CumulativeCandidate) -> str:
     """Aggregate-only SQL (DuckDB-flavored; transpiled per dialect by
     :func:`probe_statements`) computing, for every measure in one pass, the
     fraction of within-entity consecutive observations where the value
-    decreased. Never projects a measure's own value: each is only compared,
-    inside a ``CASE WHEN``, to its own lag."""
+    decreased, ignoring ties. Never projects a measure's own value: each is
+    only compared, inside a ``CASE WHEN``, to its own lag."""
 
     table = _quote_identifier(identifier)
     entity = _quote_part(candidate.entity)
@@ -193,7 +194,7 @@ def probe_sql(identifier: str, candidate: CumulativeCandidate) -> str:
         )
         counts.append(
             f"COUNT(CASE WHEN {prev} IS NOT NULL AND {cur} IS NOT NULL "
-            f"THEN 1 END) AS obs_{i}, "
+            f"AND {cur} != {prev} THEN 1 END) AS obs_{i}, "
             f"COUNT(CASE WHEN {prev} IS NOT NULL AND {cur} IS NOT NULL "
             f"AND {cur} < {prev} THEN 1 END) AS dec_{i}"
         )
@@ -261,6 +262,18 @@ def cumulative_columns(data_quality: list[str]) -> set[str]:
     }
 
 
+def reads_cumulative(fraction: float, observations: int) -> bool | None:
+    """The detector's verdict on one measure's probe result: ``True`` for a
+    running total or snapshot, ``False`` for a per-row increment, and ``None``
+    when there are too few within-entity observations to say either. One
+    function so the profile note and `maintain verify`'s additivity check
+    (#496) can never disagree about what the same fractions mean."""
+
+    if observations < _MIN_OBSERVATIONS:
+        return None
+    return fraction <= _DECREASE_FRACTION_CEILING
+
+
 def cumulative_measure_notes(
     candidate: CumulativeCandidate, fractions: dict[str, tuple[float, int]]
 ) -> list[str]:
@@ -275,7 +288,7 @@ def cumulative_measure_notes(
         if result is None:
             continue
         fraction, observations = result
-        if observations < _MIN_OBSERVATIONS or fraction > _DECREASE_FRACTION_CEILING:
+        if not reads_cumulative(fraction, observations):
             continue
         notes.append(
             f"{measure}{CUMULATIVE_NOTE_MARKER} over "
@@ -296,7 +309,46 @@ def _transpile_probe(sql: str, dialect: str) -> str:
         return sql
     import sqlglot
 
-    return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
+    if dialect != "clickhouse":
+        return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
+    return (
+        sqlglot.parse_one(sql, read="duckdb")
+        .transform(_clickhouse_lag)
+        .sql(dialect="clickhouse")
+    )
+
+
+def _clickhouse_lag(node):
+    """ClickHouse has no ``LAG``; its ``lagInFrame`` reads only inside the
+    frame, and fills the first row of a partition with the type's default
+    (``0``) rather than NULL, which would count every entity's first row as an
+    observation. So the frame is spelled out, and the value made nullable with
+    an explicit NULL default, keeping the probe's ``IS NOT NULL`` test honest."""
+
+    from sqlglot import exp
+
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.Lag):
+        node.set(
+            "this",
+            exp.Anonymous(
+                this="lagInFrame",
+                expressions=[
+                    exp.Anonymous(this="toNullable", expressions=[node.this.this]),
+                    exp.Literal.number(1),
+                    exp.Null(),
+                ],
+            ),
+        )
+        node.set(
+            "spec",
+            exp.WindowSpec(
+                kind="ROWS",
+                start="UNBOUNDED",
+                start_side="PRECEDING",
+                end="CURRENT ROW",
+            ),
+        )
+    return node
 
 
 def _quote_identifier(identifier: str) -> str:

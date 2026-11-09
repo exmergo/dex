@@ -110,9 +110,12 @@ class ConfigChangeResult(Result):
     written: bool = False
 
     def data(self) -> dict[str, Any]:
+        has_diff = any(
+            bool(d.get("unified")) for d in (self.diffs or []) if isinstance(d, dict)
+        )
         return {
             "path": self.path,
-            "changed": bool(self.changes),
+            "changed": bool(self.changes or has_diff),
             "written": self.written,
             "changes": self.changes,
         }
@@ -210,6 +213,7 @@ def config_unset(
     keys: list[str],
     *,
     confirmed: bool,
+    duplicate: bool = False,
     session_cap: SessionCeilingCap | None = None,
 ) -> ConfigChangeResult:
     """Remove one or more keys, as a diff to confirm and then as a write.
@@ -220,6 +224,9 @@ def config_unset(
     last one. Several keys are one change, validated once, as with ``set``, and a
     removal that would add a problem stopping commands is refused the same way.
 
+    If a key is written more than once, removes the earlier occurrence(s) that
+    YAML ignored and keeps the winning value.
+
     A key the file does not write is a note rather than a refusal, since the file
     already says what was asked. The note names the nearest key the file does
     write, because the likeliest reason is a typo in the key being removed.
@@ -227,6 +234,18 @@ def config_unset(
     A key inside one item of a list is refused: a list changes as a whole, which
     is how ``set`` writes one too.
     """
+
+    path = _committed_config(root)
+    before = ConfigDocument.read(path)
+    if duplicate and not keys:
+        dup_problems = before.duplicate_problems()
+        if not dup_problems:
+            return ConfigChangeResult(
+                path=str(path),
+                notes=[f"no keys are set twice in {CONFIG_RELPATH}"],
+                warnings=before.warnings(),
+            )
+        keys = list(dict.fromkeys(p.key for p in dup_problems))
 
     if not keys:
         raise RequestError(
@@ -256,12 +275,35 @@ def config_unset(
             f"{', '.join(nested)} is inside another key this call removes; name only "
             "the outer one"
         )
-    path = _committed_config(root)
-    before = ConfigDocument.read(path)
     after = before
     removed: list[str] = []
     notes: list[str] = []
     for key in keys:
+        dup = after._locate_duplicate(key.split("."))
+        if dup is not None:
+            mapping, dup_indices, win_idx = dup
+            dup_lines = [mapping.value[i][0].start_mark.line + 1 for i in dup_indices]
+            win_line = mapping.value[win_idx][0].start_mark.line + 1
+            after = after.without(key, duplicate_only=True)
+            removed.append(key)
+            lines_str = (
+                f"line {dup_lines[0]}"
+                if len(dup_lines) == 1
+                else f"lines {', '.join(str(n) for n in dup_lines)}"
+            )
+            notes.append(
+                f"{key} is set twice in {CONFIG_RELPATH}; removed the ignored "
+                f"occurrence on {lines_str} (the value on line {win_line} was kept)"
+            )
+            continue
+
+        if duplicate:
+            notes.append(
+                f"{key} is not set twice in {CONFIG_RELPATH}, so there is no "
+                "duplicate to remove"
+            )
+            continue
+
         # Through `without` even for a key that may be absent, so a file the
         # editor refuses (one that does not parse, say) is refused rather than
         # answered "not there".
@@ -432,6 +474,7 @@ def cmd_config(args: argparse.Namespace) -> env.Envelope:
                     root,
                     list(getattr(args, "keys", None) or []),
                     confirmed=confirmed,
+                    duplicate=bool(getattr(args, "duplicate", False)),
                     session_cap=session_cap,
                 )
             )

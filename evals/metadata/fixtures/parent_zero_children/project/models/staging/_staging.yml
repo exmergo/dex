@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: stg_accounts
+    description: One row per customer account.
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+  - name: stg_tickets
+    description: One row per support ticket.
+    columns:
+      - name: ticket_id
+        data_tests: [unique, not_null]

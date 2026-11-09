@@ -1,0 +1,301 @@
+"""Private dbt compilation child. Database SQL is brokered by the parent engine.
+
+This module is only imported by its subprocess entrypoint: dbt and agate remain
+optional. stdout is a private JSON-lines protocol; dbt's output goes to stderr.
+There is no direct warehouse handle in this process.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import sys
+import threading
+from pathlib import Path
+
+
+def guard_unopened_connections(manager, lazy, states) -> None:
+    """Release a connection that was never opened without opening it.
+
+    Releasing such a connection is not database access. dbt-bigquery's
+    ``close()`` reads ``connection.handle`` only to close it, and reading the
+    property resolves the lazy handle, which this worker refuses. So every
+    compile on BigQuery failed in ``before_run``'s ``connection_named("master")``
+    before any model compiled (#1001, found dogfooding #1015). A connection
+    whose handle is still lazy is marked closed instead. One that was opened
+    cannot exist here, since opening is what the worker refuses.
+
+    ``manager``, ``lazy`` and ``states`` are dbt's ``BaseConnectionManager``,
+    ``LazyHandle`` and ``ConnectionState``, passed in so this module still
+    imports without dbt.
+    """
+
+    def never_opened(connection) -> bool:
+        return isinstance(getattr(connection, "_handle", None), lazy)
+
+    original_release = manager.release
+    original_cleanup = manager.cleanup_all
+
+    def release(self):
+        with self.lock:
+            connection = self.get_if_exists()
+        if connection is not None and never_opened(connection):
+            connection.state = states.CLOSED
+            return None
+        return original_release(self)
+
+    def cleanup_all(self):
+        with self.lock:
+            unopened = [c for c in self.thread_connections.values() if never_opened(c)]
+            for connection in unopened:
+                connection.state = states.CLOSED
+            if len(unopened) == len(self.thread_connections):
+                self.thread_connections.clear()
+                return None
+        return original_cleanup(self)
+
+    manager.release = release
+    manager.cleanup_all = cleanup_all
+
+
+def dbt_columns(column, answer: dict) -> list:
+    """Build the adapter's own dbt columns from the parent's answer (#1154).
+
+    ``column`` is the adapter's dbt ``Column`` class. Where the answer carries a
+    column tree and the class builds from BigQuery ``SchemaField``s, the tree is
+    used, so a nested column's ``data_type`` is ``STRUCT<...>`` as dbt-bigquery
+    renders it. Where the answer is ``described`` (types as ``DESCRIBE TABLE``
+    prints them, Snowflake's), each column is ``Column.from_description``, as
+    dbt-snowflake builds it, so ``NUMBER(10,2)`` keeps its precision and scale;
+    otherwise each column is ``Column.create(name, type)``.
+    """
+
+    if answer.get("schema") is not None and hasattr(column, "create_from_field"):
+        from google.cloud.bigquery import SchemaField
+
+        def field(spec):
+            """One ``SchemaField``, its nested fields rebuilt recursively."""
+
+            return SchemaField(
+                spec["name"],
+                spec["type"],
+                mode=spec["mode"],
+                fields=[field(sub) for sub in spec["fields"]],
+            )
+
+        return [column.create_from_field(field(spec)) for spec in answer["schema"]]
+    if answer.get("described") and hasattr(column, "from_description"):
+        return [
+            column.from_description(name, dtype) for name, dtype in answer["columns"]
+        ]
+    return [column.create(name, dtype) for name, dtype in answer["columns"]]
+
+
+def main() -> int:
+    import agate
+    from dbt.adapters.base.connections import BaseConnectionManager
+    from dbt.adapters.contracts.connection import (
+        AdapterResponse,
+        ConnectionState,
+        LazyHandle,
+    )
+    from dbt.cli.main import dbtRunner
+    from dbt.context.providers import ParseDatabaseWrapper, RuntimeDatabaseWrapper
+    from dbt_common.exceptions import CompilationError
+
+    wire = sys.stdout
+    lock = threading.Lock()
+
+    def send(value):
+        wire.write(json.dumps(value) + "\n")
+        wire.flush()
+
+    def execute(sql, auto_begin=False, fetch=False, **kwargs):
+        # A dbt compile may use worker threads; serialize the request/response
+        # pair so a result can never reach another model's macro.
+        with lock:
+            send({"type": "query", "sql": sql})
+            answer = json.loads(sys.stdin.readline())
+
+        def column_type(name):
+            name = name.upper()
+            if "BOOL" in name:
+                return agate.Boolean()
+            if any(
+                part in name
+                for part in (
+                    "INT",
+                    "DECIMAL",
+                    "NUMERIC",
+                    "FLOAT",
+                    "DOUBLE",
+                    "REAL",
+                    "NUMBER",
+                )
+            ):
+                return agate.Number()
+            if "TIMESTAMP" in name or "DATETIME" in name:
+                return agate.DateTime()
+            if name == "DATE":
+                return agate.Date()
+            return agate.Text(cast_nulls=False)
+
+        table = agate.Table(
+            answer["cells"],
+            answer["columns"],
+            column_types=[column_type(t) for t in answer["types"]],
+        )
+        return AdapterResponse("SELECT", rows_affected=len(table.rows)), table
+
+    def columns_in_relation(wrapper):
+        """Answer ``adapter.get_columns_in_relation`` from Dex's metadata (#1154).
+
+        dbt-duckdb lists columns with a ``DESCRIBE`` the query firewall refuses,
+        and dbt-bigquery with a direct API handle this process does not have.
+        Both are schema reads, not data reads, so the parent answers them from
+        the same scoped inventory ``get_relation`` uses: names and types, no row.
+        """
+
+        def columns(relation):
+            """The relation's columns, asked of the parent over the private channel."""
+
+            identifier = getattr(relation, "identifier", None)
+            if not identifier:
+                # A CTE or ephemeral relation has no warehouse object; dbt itself
+                # answers a relation it cannot find with no columns.
+                return []
+            with lock:
+                send(
+                    {
+                        "type": "columns",
+                        "database": getattr(relation, "database", None),
+                        "schema": getattr(relation, "schema", None),
+                        "identifier": identifier,
+                    }
+                )
+                answer = json.loads(sys.stdin.readline())
+            return dbt_columns(wrapper._adapter.Column, answer)
+
+        return columns
+
+    def guarded_getattr(original):
+        def get(self, name):
+            if name == "execute":
+                return execute
+            if name == "get_relation" and isinstance(self, RuntimeDatabaseWrapper):
+
+                def relation(database=None, schema=None, identifier=None):
+                    with lock:
+                        send(
+                            {
+                                "type": "relation",
+                                "database": database,
+                                "schema": schema,
+                                "identifier": identifier,
+                            }
+                        )
+                        answer = json.loads(sys.stdin.readline())
+                    if answer["relation_type"] is None:
+                        return None
+                    return self.Relation.create(
+                        database=database,
+                        schema=schema,
+                        identifier=identifier,
+                        type=answer["relation_type"],
+                    )
+
+                return relation
+            if name == "get_columns_in_relation" and isinstance(
+                self, RuntimeDatabaseWrapper
+            ):
+                return columns_in_relation(self)
+            return original(self, name)
+
+        return get
+
+    def no_handle(self, connection):
+        raise CompilationError(
+            "plan-time dbt attempted direct database access; use run_query() or "
+            "a statement block with a SELECT so Dex can govern it. Adapter "
+            "introspection requiring a direct handle is unsupported during planning"
+        )
+
+    # Both parse and execute contexts must be covered: a project can invoke
+    # adapter.execute directly without an `if execute` guard during parsing.
+    ParseDatabaseWrapper.__getattr__ = guarded_getattr(ParseDatabaseWrapper.__getattr__)
+    RuntimeDatabaseWrapper.__getattr__ = guarded_getattr(
+        RuntimeDatabaseWrapper.__getattr__
+    )
+    LazyHandle.resolve = no_handle
+
+    guard_unopened_connections(BaseConnectionManager, LazyHandle, ConnectionState)
+
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    argv = [
+        "compile",
+        "--project-dir",
+        spec["project"],
+        "--profiles-dir",
+        spec["profiles"],
+        "--target",
+        spec["target"],
+        "--target-path",
+        str(Path(spec["project"]) / "target"),
+        "--log-path",
+        str(Path(spec["project"]) / "logs"),
+        "--log-format",
+        "json",
+        "--no-populate-cache",
+        "--no-introspect",
+        "--no-partial-parse",
+        "--threads",
+        "1",
+        "--no-defer",
+        "--select",
+        *[f"path:{path}" for path in spec["paths"]],
+    ]
+    with contextlib.redirect_stdout(sys.stderr):
+        result = dbtRunner().invoke(argv)
+    nodes = {}
+    manifest = Path(spec["project"]) / "target" / "manifest.json"
+    if result.success and manifest.is_file():
+        content = json.loads(manifest.read_text(encoding="utf-8"))
+        for node in content.get("nodes", {}).values():
+            # dbt writes the path with the platform's separator (a backslash on
+            # Windows); the spec, like every plan edit, names it with slashes.
+            path = str(node.get("original_file_path") or "").replace("\\", "/")
+            if (
+                path in spec["paths"]
+                and node.get("resource_type") == "model"
+                and node.get("package_name")
+                == content.get("metadata", {}).get("project_name")
+            ):
+                nodes[path] = node.get("compiled_code")
+    # A requested model dbt left disabled has no compiled SQL; named so the
+    # caller can compile it enabled rather than read silence as a failure.
+    disabled = []
+    if result.success and manifest.is_file():
+        project_name = content.get("metadata", {}).get("project_name")
+        for entries in (content.get("disabled") or {}).values():
+            for node in entries if isinstance(entries, list) else [entries]:
+                path = str(node.get("original_file_path") or "").replace("\\", "/")
+                if (
+                    path in spec["paths"]
+                    and path not in nodes
+                    and node.get("resource_type") == "model"
+                    and node.get("package_name") == project_name
+                ):
+                    disabled.append(path)
+    send(
+        {
+            "type": "complete",
+            "success": result.success,
+            "nodes": nodes,
+            "disabled": sorted(set(disabled)),
+        }
+    )
+    return 0 if result.success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

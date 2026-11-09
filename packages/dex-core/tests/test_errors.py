@@ -75,6 +75,23 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # CacheRequiredError and NoBaselineError stayed unreachable long enough for
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
+    # Caught before a caller sees it: a retirement tree that does not compile
+    # becomes `compile_unavailable` records (#1170).
+    "CompileUnavailableError",
+    # Caught before a caller sees it: an identifier probe or a join coverage
+    # probe that needs a safe cast on Postgres becomes an `unchecked` record
+    # with `reason_code: no_safe_cast_on_connector` (#861).
+    "NoSafeCastError",
+    # Wrapped before a caller sees it: `transform build --cold-deps` turns it into
+    # BuildFailedError, with the report under cold_verification.
+    "ColdReinstallError",
+    # Wrapped before a caller sees it: the Cube layer turns each into
+    # SemanticBackendError, or SemanticQueryRefusedError for a refusal.
+    "CubeFilterError",
+    "CubeQueryError",
+    "CubeRefusalError",
+    "CubeTransportError",
+    "StaleRendererError",
     # Connector-specific connection failures. A host catches the ConnectorError
     # family instead of importing eight names, one per warehouse it does not use.
     "BigQueryConnectionError",
@@ -102,6 +119,11 @@ INTERNAL_REFUSALS = {
     # every one is caught and rendered as the `reason` on a finding that reports
     # it could not attribute a change. A consumer reads that field, not this type.
     "UnattributableError",
+    # Control flow inside multiset compare. Callers catch it and render
+    # reason_code. It is not a boundary type.
+    "_NotCheckedError",
+    # The same, one level up: `transform compare` reports it as a reason_code.
+    "_NotComparableError",
     # The transform surface. Every one of these needs a repo_root, so they sit
     # outside "reachable from the public API without a repo_root". Worth
     # revisiting as a family if a host ever drives transform programmatically.
@@ -109,6 +131,11 @@ INTERNAL_REFUSALS = {
     # driving `transform plan --scaffold` has to tell "run `explore map`" from
     # "qualify the name" from "edit the sources file", and ScaffoldError goes
     # with its two subclasses so `except ScaffoldError` works from the root too.
+    # Transform/artifact isolation control flow (hosts catch DexError or
+    # use isolate_on_collision=True). ForeignInvocationError is the same
+    # family: the artifacts belong to another invocation.
+    "ArtifactCollisionError",
+    "ForeignInvocationError",
     "BuildFailedError",
     "DbtParseError",
     "DbtProjectError",
@@ -122,6 +149,8 @@ INTERNAL_REFUSALS = {
     "PropagationRefusedError",
     "RewriteError",
     "TestScaffoldError",
+    # Never leaves select_list: it becomes SelectList.reason.
+    "_UnresolvedError",
 }
 
 

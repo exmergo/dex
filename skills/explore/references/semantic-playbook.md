@@ -23,7 +23,7 @@ Three habits, in order of how much they save:
   it is cut.
 - **Get the value domain before writing a filter.** `values <dimension>` is the
   only way to know what a `--where` may filter to, and on a hosted layer it is the
-  only dex command that can reach it at all.
+  only Dex command that can reach it at all.
 
 ## Discovery order
 
@@ -105,7 +105,7 @@ are.
 
 Read `scoped_to` on the result, because it changes what the values mean. Empty
 means these are the domain of the column behind the dimension. A metric name means
-dex had to reach the dimension through that metric, because a dimension behind a
+Dex had to reach the dimension through that metric, because a dimension behind a
 join has no other rendering: neither layer will run a distinct-values query with
 no measure to join from. Those are then the values **present for that metric**,
 which can be narrower than the column's own domain, and the note names the other
@@ -153,21 +153,70 @@ format rather than a missing feature:
   render a governed statement from. Take the physical route instead: a dimension
   names its `semantic_model`, that model names its `relation`, and `explore
   profile` then `explore query` reach the values under the firewall and the cost
-  guard. Do not present the refusal as dex being unable to reach the layer.
+  guard. Do not present the refusal as Dex being unable to reach the layer.
 - **`--for-dimension` refuses**, because Ossie states no metric-to-dimension
   relationship at all. `metrics[].dimensions` is empty and `unavailable.metrics`
   says why. An empty groupable list here is not "this metric can be grouped by
   nothing".
 - **A metric with no `semantic_models` is a metric whose lineage did not resolve**,
-  not one that reads nothing. Ossie carries no metric-to-dataset reference, so dex
+  not one that reads nothing. Ossie carries no metric-to-dataset reference, so Dex
   reports only what a qualified reference in the expression proved, and reports
-  nothing when none did.
+  nothing when none did. A metric named `dataset.metric` is dataset-scoped
+  (`datasets[].metrics`): it aggregates that one dataset's fields, and its lineage
+  is that dataset.
+
+A declared key or join names **fields**, and dex follows each field to the column
+its expression names, so `explore relationships --use-project --verify` probes
+the columns even where a field is named differently. A key or join on a field
+with no column (computed, quoted, non-SQL) is named in a note and never probed.
 
 An element with no `column` is also normal here and the notes say which of four
 reasons applies: a computed expression, a quoted identifier, a query-backed
 dataset source, or a field written only in a non-SQL dialect. In every one of them
-dex declined to guess a column rather than failed to find one, so do not go looking
+Dex declined to guess a column rather than failed to find one, so do not go looking
 for the column yourself and do not treat the absence as a data problem.
+
+## When the layer is Cube models
+
+`vendor: cube` means the layer is Cube YAML model files in the repository, read
+statically with no Cube server. `list` reads the same shape as anywhere else:
+
+- **A dimension token is `cube.member`**, and a view's member is
+  `view.member`. A view has no `relation`; each of its members carries the cube
+  member it exposes in `vendor_params.source`, and that cube's `relation` is the
+  table to profile.
+- **A measure is listed twice on purpose.** An aggregating measure (`sum`,
+  `count`, ...) is a `measure` and a `simple` metric named `cube.member`. A
+  calculated `number` measure is a `ratio` or `derived` metric only. Measure
+  names are scoped to their cube, so two cubes may each have `count`: read
+  `semantic_model` with the name.
+- **There are no entities.** `primary_key` and joins reach `explore map`,
+  `explore relationships` and `explore profile` through `--use-project`.
+- **`compiled_only` lists what Dex did not read**: a JS model, a templated
+  (Jinja) YAML file, or a cube using `extends`. Those definitions exist; do not
+  report them as missing, and do not guess at their contents.
+- **`query` and `values` need a Cube server, as a renderer.** Dex asks the
+  server at `semantic.cube.url` for the SQL and runs it itself, so
+  `CUBEJS_API_SECRET` must be exported (never put it in config), and a host
+  other than this machine must be named in `DEX_CUBE_ALLOWED_HOSTS`. No Cube
+  server running, or the wrong secret, is an error naming the fix; with none
+  available, use `explore profile` and `explore query` on the relations the
+  catalog names instead.
+- **Speak Cube's dialect.** Metrics and dimensions are `cube.member` (or
+  `view.member`). Cube has no `metric_time`: group by the time dimension with
+  its grain, `--group-by orders.ordered_at__month` (custom granularities work
+  the same way). `--where` takes Cube's JSON filter, one object, a list, or
+  `and`/`or` groups; a date range on the grouped time dimension
+  (`inDateRange`) also bounds a rolling window. `--order-by` names only the
+  query's own members, `--order-by=-orders.revenue` for descending.
+- **A stale-renderer refusal means restart Cube, not fix the query.** Cube
+  outside dev mode never reloads an edited model file, so after a
+  `semantic cube update` the server serves the old model until restarted, and
+  Dex refuses rather than run SQL from a model nobody reviewed. A refusal naming
+  a cube planned over another table than its `sql_table` is the same case: the
+  server holds another model than the repository. A refusal naming a
+  pre-aggregation means Cube would answer from a rollup table; query members it
+  does not cover.
 
 ## When the layer is SLayer models
 
@@ -185,8 +234,8 @@ read differently:
   answers within one model.
 - **There are no entities.** The joins and keys are real and reach `explore map`,
   `explore relationships` and `explore profile` through `--use-project`.
-- **`query` and `values` run, and dex executes them.** SLayer only renders the
-  SQL, as a dry run over the model files dex validated; dex runs it through the
+- **`query` and `values` run, and Dex executes them.** SLayer only renders the
+  SQL, as a dry run over the model files Dex validated; Dex runs it through the
   same PII gate, relation pre-check and cost handshake as the dbt `--local`
   backend, and `execution` is `dex`. Treat a result as cost-guarded, exactly as
   you would a local dbt one.
@@ -203,7 +252,7 @@ read differently:
   `--where "status = 'paid'"`, with columns read relative to the query's model;
   a dotted name (`customers.region = 'EU'`) walks a declared join. The gate
   screens every column a clause names, joined ones included, so a PII column
-  refuses the query wherever it appears. A clause dex cannot read, or one with
+  refuses the query wherever it appears. A clause Dex cannot read, or one with
   `{variable}` placeholders, is refused: write the value into the clause.
 - **`values` before `--where`, as anywhere.** `values orders.status` reads the
   column's domain on its own model, with the model's own filters applied, so
@@ -217,16 +266,16 @@ read differently:
   server, and Trino refuses until its rendered SQL has been reviewed. On those, take the physical route: a dimension's `semantic_model`,
   that model's `relation`, then `explore profile` and `explore query`.
 
-A model file dex refuses (a stale `version`, a duplicate name, a join to a model
+A model file Dex refuses (a stale `version`, a duplicate name, a join to a model
 that is not configured) is named in `notes` with its file and element, and the
 rest of the layer still answers. Report the refusal; do not edit the file to
 silence it unless asked.
 
 ## Cost, and which backend answered
 
-Every result names `execution`. `dex` means dex rendered the statement and ran it
+Every result names `execution`. `dex` means Dex rendered the statement and ran it
 through its own connector, so the cost handshake applied and spend was surfaced
-before it happened. `vendor` means the semantic layer ran it: dex never held a
+before it happened. `vendor` means the semantic layer ran it: Dex never held a
 statement it could price or cap, so the result carries an explicit warning that
 spend is governed there. Do not present a hosted result as cost-guarded, and do
 not treat the absence of an estimate as "it was free".

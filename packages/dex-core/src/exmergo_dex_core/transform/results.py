@@ -15,6 +15,7 @@ from pydantic import Field
 from ..attribution import COMMIT_TRAILER
 from ..results import Result
 from .classify import ArtifactClassification
+from .completion import BuildCompletion
 from .evidence import BuildEvidence
 from .grounding import Grounding
 from .portable import PortablePlan
@@ -76,11 +77,45 @@ class PlanResult(Result):
     decisions: list[dict[str, Any]] | None = None
     # Per model the plan creates, edits or declares: what dex drafted from the
     # cache and the SQL, what the post-change YAML declares, and which intent
-    # fields nobody has supplied. A draft is offered, never written. Absent when
+    # fields nobody has supplied. A plan offers a draft and never writes it
+    # (`transform declare` writes part of one, when asked). Absent when
     # the plan touches no model.
     declarations: dict[str, dict[str, Any]] | None = None
+    # The semantic model derived from each declared mart the plan touches
+    # (issue #499): added to the plan where the project has a dbt semantic
+    # layer, offered here where it does not. Absent when no declared mart was
+    # touched.
+    semantic_proposal: dict[str, Any] | None = None
+    # The free pointer to `transform compare` on a plan that rewrites a model
+    # that already exists (#856). Planning scans nothing for it. Absent when the
+    # plan rewrites none.
+    refactor_comparison_offer: dict[str, Any] | None = None
+    # Each conversion this plan adds to an identifier column (a cast, a safe
+    # cast, a lower/upper/trim), with what it does to the entities the model
+    # holds: counts with their denominator, and a status of lossless,
+    # declared, undeclared or unchecked (#861). Absent when the plan adds none.
+    identifier_conversions: list[dict[str, Any]] | None = None
+    # Per existing model the plan rewrites (#1115): whether its row population
+    # is changed, kept or unchecked, and which outputs it removes, adds,
+    # retypes, re-aggregates or re-NULLs, each judged change `declared` by an
+    # assumption naming its column or `undeclared`. Absent when the plan
+    # rewrites no existing model.
+    change_scope: dict[str, Any] | None = None
+    # Per versioned model the plan touches (#859): each version's file and
+    # relation, the default before and after, every consumer's ref and what it
+    # resolves to, relation and contract changes, and dbt's own manifest
+    # confirmation; plus `independent_models`, a `<model>_v<N>` copy the plan
+    # writes that is not a version. Absent when the plan touches neither.
+    model_versions: dict[str, Any] | None = None
+    # The toggle contract's check from compiled SQL (#1113): every model of the
+    # project on both values, the producers of the governed columns, and what
+    # could not be judged. Absent when the plan carries no toggle.
+    toggle: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
+        """The plan envelope's ``data``, carrying each optional section only where it
+        was produced.
+        """
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
             "intent": self.intent,
@@ -88,10 +123,22 @@ class PlanResult(Result):
             "paths": self.paths,
             "plan_path": self.plan_path,
         }
+        if self.toggle is not None:
+            payload["toggle"] = self.toggle
+        if self.refactor_comparison_offer is not None:
+            payload["refactor_comparison_offer"] = self.refactor_comparison_offer
+        if self.identifier_conversions is not None:
+            payload["identifier_conversions"] = self.identifier_conversions
+        if self.change_scope is not None:
+            payload["change_scope"] = self.change_scope
+        if self.model_versions is not None:
+            payload["model_versions"] = self.model_versions
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.declarations is not None:
             payload["declarations"] = self.declarations
+        if self.semantic_proposal is not None:
+            payload["semantic_proposal"] = self.semantic_proposal
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:
@@ -119,15 +166,22 @@ class PropagationResult(PlanResult):
     change: str = ""
     kind: str = ""
     sites: dict[str, int] = Field(default_factory=dict)
+    # The contract and how the proposal measured against it (#858).
+    retirement: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload = {
             "change": self.change,
             "kind": self.kind,
             "sites": self.sites,
             "site_count": sum(self.sites.values()),
+            **({"retirement": self.retirement} if self.retirement else {}),
             **super().data(),
         }
+        if not self.plan_id:
+            # Nothing to apply: an already complete retirement stores no plan.
+            payload["plan_id"] = None
+        return payload
 
 
 class PlacementResult(PlanResult):
@@ -169,6 +223,38 @@ class PlacementResult(PlanResult):
         return payload if self.explained else {**payload, **super().data()}
 
 
+class DeclareResult(PlanResult):
+    """Declarations proposed for models that already exist (#501).
+
+    Every selected model is accounted for: proposed (``proposed``, each with the
+    measured facts written and their evidence), skipped (``skipped``, each with
+    its reason), or past the cap (``elided_count``, also stated in ``notes``).
+    With nothing to propose no plan is stored, and the plan fields are omitted
+    rather than empty, so an empty ``plan_id`` never reads as a plan that failed
+    to store.
+    """
+
+    selector: list[str] = Field(default_factory=list)
+    selected_count: int = 0
+    proposed: list[dict[str, Any]] = Field(default_factory=list)
+    skipped: list[dict[str, Any]] = Field(default_factory=list)
+    elided_count: int = 0
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "selector": self.selector,
+            "selected_count": self.selected_count,
+            "proposed": self.proposed,
+            "skipped": self.skipped,
+            "elided_count": self.elided_count,
+        }
+        if not self.plan_id:
+            return {**payload, "plan_id": None}
+        return {**payload, **super().data()}
+
+
 class MacroListResult(Result):
     """The shipped macros available to scaffold."""
 
@@ -206,13 +292,33 @@ class TestScaffoldResult(PlanResult):
     scaffolding a unit test *is* planning an edit. ``inputs`` are the bare
     names of every input a ``given`` block was built for, in the order the
     model reads them.
+
+    ``window_boundaries`` names each calendar window (a ``RANGE`` frame with a
+    day or week interval bound) whose boundary rows were placed in the
+    ``given`` block: the input, the ordering column, the frame, and what each
+    placed date tests (#1112). A window it could not reach is a warning with a
+    reason code, and that input keeps its single example row.
     """
 
     model: str = ""
     inputs: list[str] = Field(default_factory=list)
+    #: ``None`` unless the model has an ``{% if is_incremental() %}`` branch;
+    #: then ``tests`` (the full-build test, then the incremental one) and
+    #: ``watermark`` (``{column, operator, input, this_column}``, or ``None``
+    #: where no single comparison with a subquery over ``{{ this }}`` was
+    #: read). Issue #1111.
+    incremental: dict[str, Any] | None = None
+    window_boundaries: list[dict[str, Any]] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
-        return {"model": self.model, "inputs": self.inputs, **super().data()}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "inputs": self.inputs,
+            "window_boundaries": self.window_boundaries,
+        }
+        if self.incremental is not None:
+            payload["incremental"] = self.incremental
+        return {**payload, **super().data()}
 
 
 class ApplyResult(Result):
@@ -228,21 +334,42 @@ class ApplyResult(Result):
     """
 
     plan_id: str = ""
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     written: list[str] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
     conflicts_overridden: list[str] = Field(default_factory=list)
     # The assumptions declared on the models this apply wrote, as the project
     # now records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
+    # Per model this plan rewrote, the refactor comparison the plan recorded,
+    # or `not_compared` (#1049). Reported, never enforced: an intentional
+    # behavior change needs no equivalence. Absent when the plan rewrote no
+    # existing model.
+    refactor_comparison: list[dict[str, Any]] | None = None
 
     def data(self) -> dict[str, Any]:
+        resolution = (
+            {"resolved_plan": self.resolved_plan}
+            if self.resolved_plan is not None
+            else {}
+        )
         if self.pending_confirmation is not None:
-            return {"plan_id": self.plan_id, "conflicts": self.conflicts}
+            return {
+                "plan_id": self.plan_id,
+                **resolution,
+                "conflicts": self.conflicts,
+            }
         payload: dict[str, Any] = {
             "plan_id": self.plan_id,
+            **resolution,
             "written": self.written,
             "conflicts_overridden": self.conflicts_overridden,
         }
+        if self.refactor_comparison is not None:
+            payload["refactor_comparison"] = self.refactor_comparison
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.commit_trailer is not None:
@@ -269,6 +396,10 @@ class PlanExportResult(Result):
     """
 
     plan_id: str = ""
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     digest: str = ""
     plan: PortablePlan = Field(
         default_factory=lambda: PortablePlan(
@@ -287,7 +418,10 @@ class PlanExportResult(Result):
             if hasattr(self.plan, "data")
             else (self.plan.model_dump(mode="json") if self.plan is not None else {})
         )
-        return {"plan_id": self.plan_id, "digest": self.digest, "plan": plan_data}
+        payload: dict[str, Any] = {"plan_id": self.plan_id}
+        if self.resolved_plan is not None:
+            payload["resolved_plan"] = self.resolved_plan
+        return {**payload, "digest": self.digest, "plan": plan_data}
 
 
 class ClassificationResult(Result):
@@ -298,6 +432,10 @@ class ClassificationResult(Result):
     """
 
     plan_id: str | None = None
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     classifications: list[ArtifactClassification] = Field(default_factory=list)
 
     always_reports_notes: ClassVar[bool] = True
@@ -313,6 +451,8 @@ class ClassificationResult(Result):
             c.data() if hasattr(c, "data") else c for c in self.classifications
         ]
         payload: dict[str, Any] = {"classifications": classifications_data}
+        if self.resolved_plan is not None:
+            payload = {"resolved_plan": self.resolved_plan, **payload}
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
         return payload
@@ -327,6 +467,10 @@ class GroundingResult(Result):
     """
 
     plan_id: str | None = None
+    # Which plan "no plan id" picked (#1103): `{plan_id, intent, created_at,
+    # resolved_from: "latest_unapplied"}`, with a `warnings` line naming it.
+    # None, and absent from the payload, when the caller passed an id.
+    resolved_plan: dict[str, Any] | None = None
     grounding: Grounding = Field(default_factory=Grounding)
 
     always_reports_notes: ClassVar[bool] = True
@@ -342,6 +486,8 @@ class GroundingResult(Result):
             else dict(self.grounding)
         )
         payload = dict(grounding_data)
+        if self.resolved_plan is not None:
+            payload = {"resolved_plan": self.resolved_plan, **payload}
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
         return payload
@@ -385,6 +531,99 @@ class DepsResult(Result):
         return {"ran": True, **self.summary}
 
 
+class RefactorComparisonResult(Result):
+    """Whether a stored plan keeps one model's results on the compared inputs.
+
+    ``status`` is ``equivalent``, ``different`` or ``not_checked``, and
+    ``reason_code`` says which of them and why. ``equivalent`` means the schema
+    and the row multiset matched on ``input_scope`` at ``compared_at``. It is not
+    a claim about a build, or about any input that was not compared. Every field
+    here is a count, a name or a type: no row comes back.
+
+    With a stated expectation (#1157) ``status`` is ``as_expected`` or
+    ``unexpected`` instead (``matches_expected_change``, ``unexpected_change``),
+    and ``expectation`` says how. Its ``unexpected_keys`` is the one place key
+    values appear: key columns only, at most five per class, through the query
+    firewall, so a PII-flagged key is withheld (``samples_withheld``).
+
+    ``keyed`` is present only when a key was given or declared, and unique on both
+    sides. ``key_source`` says which, because a key the request named and one a
+    declaration stated are different evidence.
+    """
+
+    plan_id: str = ""
+    # Which plan "no plan id" picked (#1103); None, and absent, for an explicit id.
+    resolved_plan: dict[str, Any] | None = None
+    model: str = ""
+    target: str = ""
+    status: str = "not_checked"
+    reason_code: str = ""
+    detail: str | None = None
+    compared_at: str = ""
+    baseline_compiled: str | None = None
+    proposed_compiled: str | None = None
+    input_scope: list[str] = Field(default_factory=list)
+    schema_diff: dict[str, Any] | None = None
+    multiset: dict[str, Any] | None = None
+    key_columns: list[str] | None = None
+    key_source: str | None = None
+    keyed: dict[str, Any] | None = None
+    keyed_reason: str | None = None
+    profiled_on_demand: list[str] = Field(default_factory=list)
+    # The values the baseline compiled at, where a retirement contract chose a
+    # branch (#858). Absent everywhere else.
+    baseline_vars: dict[str, Any] | None = None
+    # The values the proposal compiled at, where a toggle contract names the on
+    # value (#1113): both sides compile there. Absent everywhere else.
+    proposed_vars: dict[str, Any] | None = None
+    # The latest build of the compared model's upstream models, ordinary or
+    # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
+    # so `cold` does not mean every input was built cold. None with no build.
+    inputs_built_by: dict[str, Any] | None = None
+    # How the difference matches a stated expected change (#1157): the clauses,
+    # the counts split into matching and unexpected, the failed clauses, and up
+    # to five unexpected keys per class, firewall-cleared. Absent with no
+    # expectation.
+    expectation: dict[str, Any] | None = None
+    # A digest of the stated expectation, recorded with the verdict.
+    expectation_digest: str | None = None
+
+    def data(self) -> dict[str, Any]:
+        """The comparison as ``data``: identity, verdict, counts and any expectation."""
+
+        branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
+        if self.proposed_vars:
+            branch["proposed_vars"] = self.proposed_vars
+        resolution = (
+            {"resolved_plan": self.resolved_plan}
+            if self.resolved_plan is not None
+            else {}
+        )
+        return {
+            **branch,
+            "plan_id": self.plan_id,
+            **resolution,
+            "model": self.model,
+            "target": self.target,
+            "status": self.status,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "compared_at": self.compared_at,
+            "baseline_compiled": self.baseline_compiled,
+            "proposed_compiled": self.proposed_compiled,
+            "input_scope": self.input_scope,
+            "inputs_built_by": self.inputs_built_by,
+            "schema": self.schema_diff,
+            "multiset": self.multiset,
+            "key_columns": self.key_columns,
+            "key_source": self.key_source,
+            "keyed": self.keyed,
+            "keyed_reason": self.keyed_reason,
+            **({"expectation": self.expectation} if self.expectation else {}),
+            "profiled_on_demand": self.profiled_on_demand,
+        }
+
+
 class MutationCoverageResult(Result):
     """Which planted defects a model's tests caught, and which they missed.
 
@@ -416,6 +655,21 @@ class MutationCoverageResult(Result):
     it answers for the model's own suite and must mean what it meant before
     downstream tests ran; ``score_with_downstream`` counts it as caught, and is
     null when they did not run.
+
+    ``unsupported_sites`` lists every window-frame offset bound no mutant
+    moved, each with a ``reason_code`` (a column or expression offset, a
+    fraction, a compound interval, the second bound of a frame whose first one
+    was moved). Its boundary is untested by this run, and an empty list means
+    every offset bound was mutated (#1112).
+
+    ``incremental`` is the model's ``is_incremental()`` branch, measured as the
+    program it is (#1132): its own ``mutants``, ``counts``, ``score``,
+    ``baseline`` and share of the ``cap``, the unit tests that override
+    ``is_incremental`` to true in ``tests``, and a ``reason`` when nothing ran
+    against it. Those tests run only against the branch, and the full build's
+    tests only against the full build, so ``score`` and ``incremental.score``
+    never mix the two. Null for a model with no branch dex read. ``cap`` is the
+    whole run's, since one cap binds both.
     """
 
     model: str = ""
@@ -429,6 +683,8 @@ class MutationCoverageResult(Result):
     runs: int = 0
     equivalence: dict[str, Any] | None = None
     downstream: dict[str, Any] | None = None
+    unsupported_sites: list[dict[str, Any]] = Field(default_factory=list)
+    incremental: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         return {
@@ -440,9 +696,11 @@ class MutationCoverageResult(Result):
             "score": self.score,
             "score_with_downstream": self.score_with_downstream,
             "cap": self.cap,
+            "unsupported_sites": self.unsupported_sites,
             "runs": self.runs,
             "equivalence": self.equivalence,
             "downstream": self.downstream,
+            "incremental": self.incremental,
         }
 
 
@@ -475,6 +733,14 @@ class BuildResult(Result):
     # The assumptions declared on the models this build ran, as the project
     # records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
+    # The bounded lead (#855): what the run established about the change, held
+    # to a size that survives a truncated read, ahead of every unbounded list.
+    completion: BuildCompletion | None = None
+    # Who owns each failed node and which repairs dbt has for it (#860).
+    prerequisites: list[dict[str, Any]] | None = None
+    prerequisites_elided: int = 0
+    # What `--cold-deps` reinstalled and what the installed tree lost (#860).
+    cold_verification: dict[str, Any] | None = None
 
     def evidence_model(self) -> BuildEvidence | None:
         """The typed :class:`~exmergo_dex_core.transform.evidence.BuildEvidence`
@@ -503,4 +769,17 @@ class BuildResult(Result):
             payload["verification"] = self.verification
         if self.decisions is not None:
             payload["decisions"] = self.decisions
+        lead: dict[str, Any] = {}
+        if self.prerequisites:
+            lead["prerequisites"] = self.prerequisites
+            if self.prerequisites_elided:
+                lead["prerequisites_elided"] = self.prerequisites_elided
+        if self.cold_verification is not None:
+            lead["cold_verification"] = self.cold_verification
+        payload = {**lead, **payload}
+        if self.completion is not None:
+            # First, by construction rather than by luck: key order means
+            # nothing to a parser and everything to a reader whose harness cut
+            # the output after a few kilobytes (#855).
+            payload = {"completion": self.completion.data(), **payload}
         return payload

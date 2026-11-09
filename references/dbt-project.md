@@ -1,5 +1,8 @@
 # dbt as a first-class input (and the write target for transformations)
 
+Start with [Transform a dbt project](https://docs.exmergo.com/dex/guides/transform) for the workflow.
+This reference describes the files Dex reads and writes, and how it runs dbt.
+
 The dbt project is the source of truth for the transformation model. dex
 maintains no parallel model: it loads the project, reasons over it together with
 warehouse introspection and the `.dex/` cache, and writes changes back into the
@@ -11,6 +14,38 @@ on the semantic axis, and `semantic ossie define|update|plan` followed by
 confined to the repository and byte for byte. That surface shares this one's plan
 and apply spine and none of the path families below, which is why it is described
 in [`semantic-layer.md`](semantic-layer.md) rather than here.
+
+## Compiling authored control flow
+
+A model edit using Jinja `for` or `if` is checked against fresh dbt-compiled SQL
+in a throwaway copy containing the whole edit set. The compiled query must pass
+the SELECT-only guard; the stored edit keeps the authored Jinja. Compilation
+requires dbt and a dev profile that passes the usual build coherence and
+existence preflight, and never reuses a prior manifest as proof.
+Missing or failed compilation stores no plan.
+
+Compile-time `run_query`, statement blocks and `adapter.execute` SELECTs run
+through Dex's scoped read-only connector, query firewall, PII gate and result
+limits. `get_relation()` and `is_incremental()` use Dex's scoped, scan-free inventory.
+`adapter.get_columns_in_relation()` (what `dbt_utils.star`,
+`get_filtered_columns_in_relation` and Fivetran's `fill_staging_columns` call) is
+answered from the same inventory's column metadata: names and types, never a row,
+free on every connector. The columns are built by the adapter's own dbt column
+class, so a macro reads the `data_type` a real build would give it; on BigQuery a
+nested column keeps its `STRUCT<...>` or `ARRAY<...>` type, built from the table's
+field tree. Each listing counts toward `query.max_statements` and is
+named once in the plan's warnings, and a relation the inventory does not hold
+(outside the source scope, or not built yet) is answered with no columns, as dbt
+answers a missing relation, with a warning naming it. The SQL spellings of the
+same read stay refused: a top-level or nested `DESCRIBE`, `SUMMARIZE`, `SHOW`,
+`PRAGMA` or an `information_schema` read, including the one the dispatched
+`get_columns_in_relation` macro issues when called directly, and the refusal names
+`adapter.get_columns_in_relation` as the supported route. Direct database handles
+and other unsupported adapter introspection refuse; truncated macro results refuse
+too. The first discovered query is priced before
+spend and later queries share its command and daily ceilings. See
+[cost controls](cost-controls.md#queries-discovered-during-model-compilation).
+No model materialization runs during planning.
 
 ## What dex reads
 
@@ -26,8 +61,9 @@ in [`semantic-layer.md`](semantic-layer.md) rather than here.
   author but does not load would hash as absent, so a later edit to it would
   register as a create and the apply after it would conflict on a file nobody
   touched; the scan covers every family for that reason, not for completeness.
-- `target/manifest.json` when the project has been compiled; a fresh project
-  loads fine without one.
+- The newer available `manifest.json` from Dex's isolated artifact directory
+  or the project's own target path when the project has been compiled; a fresh
+  project loads fine without one.
 - `profiles.yml` (searched the way dbt searches: `$DBT_PROFILES_DIR`, the project
   directory, `~/.dbt`), but only to resolve a target's **name and adapter type**.
   Connection fields, credentials included, never leave the engine.
@@ -152,6 +188,14 @@ the repo, never a relation from the warehouse.
 
 ## Running dbt (build, deps, parse)
 
+By default, Dex writes artifacts under `<target-path>/dex/<dbt-version>/`, and
+`data.artifact_directory` reports the directory used. This keeps artifacts from
+different dbt runtimes apart. `transform.artifacts: shared` selects the project's
+normal target path, with compatibility checks before anything writes. The
+[command contract](command-contract.md) describes the artifact policy and the
+`transform build --full-refresh` option for rebuilding selected incremental
+models on dev.
+
 Every dbt subprocess runs with its working directory pinned to the project dir, so
 relative paths in `profiles.yml` and anywhere else resolve against the project, not
 the caller's shell cwd. Its environment is the caller's minus the credentials dbt
@@ -161,8 +205,9 @@ can read any variable through `env_var()`; warehouse credentials a profile reads
 still reach it. When the project declares packages (`packages.yml`, or a
 `dependencies.yml` with a `packages:` key) and `dbt_packages/` is missing or empty,
 `transform build` runs `dbt deps` automatically before building; `transform deps`
-is the explicit install/refresh. Package installation writes only `dbt_packages/`
-and the lockfile inside the project and spends nothing against the warehouse, so it
+is the explicit install/refresh. `transform build --cold-deps` reinstalls into an
+isolated copy instead, leaving this project's `dbt_packages/` alone. Package
+installation writes only `dbt_packages/` and the lockfile inside the project and spends nothing against the warehouse, so it
 runs without the cost gate.
 
 Semantic plans are validated up to and including dbt's own parser before they are

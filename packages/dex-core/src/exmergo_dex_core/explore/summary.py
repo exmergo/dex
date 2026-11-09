@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
-from ..cache import Dataset, DexCache, PIIFlag, Relationship, join_columns_by_dataset
+from ..cache import (
+    Dataset,
+    DatasetDeclaration,
+    DexCache,
+    PIIFlag,
+    Relationship,
+    join_columns_by_dataset,
+)
 
 # Matches `DexConfig.profile_top_n`, so a default map's payload covers exactly the
 # objects a default map profiled: the cap binds on a warehouse big enough to have
@@ -40,6 +47,9 @@ MAX_COLUMNS_PER_OBJECT = 12
 # at the same point.
 MAX_EDGES = 40
 MAX_DATA_QUALITY_PER_OBJECT = 5
+# A declaration's columns (#498) are budgeted like the profiled ones, for the
+# same reason: past a dozen, an object's declaration is its schema again.
+MAX_DECLARED_COLUMNS = MAX_COLUMNS_PER_OBJECT
 # The rank cutoff's leftovers, named rather than counted (#540). Sized like the
 # objects the map does report, so a default cutoff names as many objects as it
 # profiled; namespaces get the same budget, which a source allowlist rarely nears.
@@ -133,6 +143,10 @@ class MapObject(BaseModel):
     load-bearing" rather than only "how big is it". Empty means the layer reaches
     it through none, or that no project was read, which is the ordinary case: the
     link is folded in only under ``--use-project``.
+
+    ``declaration`` is the project's declaration of the model on this relation
+    (#498), present only under ``--use-project`` and only where one resolved;
+    the payload leaves the key out otherwise rather than reporting it null.
     """
 
     identifier: str
@@ -143,6 +157,7 @@ class MapObject(BaseModel):
     grain: list[str] | None = None
     candidate_key: list[str] | None = None
     semantic_models: list[str] = Field(default_factory=list)
+    declaration: DatasetDeclaration | None = None
     columns: list[MapColumn] = Field(default_factory=list)
     elided_column_count: int = 0
     pii_column_count: int = 0
@@ -222,6 +237,7 @@ def summarize_map(
                 grain=dataset.grain,
                 candidate_key=_best_key(dataset),
                 semantic_models=list(dataset.semantic_models),
+                declaration=capped_declaration(dataset.declaration, max_columns),
                 columns=[
                     MapColumn(
                         name=column.name,
@@ -269,6 +285,16 @@ def summarize_map(
         notes.append(
             f"{dropped_edges} relationship(s) are not listed: " + ", ".join(reasons)
         )
+    trimmed_declared = sum(
+        o.declaration.elided_column_count for o in objects if o.declaration
+    )
+    if trimmed_declared:
+        notes.append(
+            f"{trimmed_declared} declared column(s) are not listed: each "
+            f"declaration reports at most {max_columns} columns, with the rest "
+            "counted in its elided_column_count; `explore profile <object> "
+            "--use-project --columns all` lists every one"
+        )
     trimmed_findings = sum(o.elided_data_quality_count for o in objects)
     if trimmed_findings:
         notes.append(
@@ -299,3 +325,25 @@ def _best_key(dataset: Dataset) -> list[str] | None:
         if group:
             return list(group)
     return None
+
+
+def capped_declaration(
+    declaration: DatasetDeclaration | None, max_columns: int | None
+) -> DatasetDeclaration | None:
+    """``declaration`` with at most ``max_columns`` columns, the rest counted.
+
+    None lifts the cap. A copy, so the dataset keeps every column for a library
+    caller reading it directly.
+    """
+
+    if declaration is None or max_columns is None:
+        return declaration
+    cut = max(0, len(declaration.columns) - max_columns)
+    if not cut:
+        return declaration
+    return declaration.model_copy(
+        update={
+            "columns": declaration.columns[:max_columns],
+            "elided_column_count": declaration.elided_column_count + cut,
+        }
+    )

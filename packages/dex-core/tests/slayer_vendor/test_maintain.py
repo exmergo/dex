@@ -256,6 +256,21 @@ def test_a_vendor_change_compares_no_definitions(repo: Path, capsys):
 # --- grain drift ------------------------------------------------------------------
 
 
+def test_a_widened_categorical_column_is_caught(repo: Path, capsys):
+    """A SLayer model names its table, not a dbt model, and is re-counted (#912)."""
+
+    assert _cli(repo, capsys, "explore", "map")["_exit"] == 0
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "INSERT INTO customers VALUES (4, 'west')")
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    assert payload["_exit"] == 0, payload
+    finding = _finding(payload, "dimension_cardinality_changed", column="region")
+    assert finding["data"]["semantic_model"] == "customers"
+    assert finding["data"]["distinct_after"] == 4
+
+
 def test_a_declared_primary_key_that_lost_uniqueness_is_caught(repo: Path, capsys):
     _cli(repo, capsys, "maintain", "snapshot")
     _sql(repo, "INSERT INTO orders VALUES (4, 2, 1.0, 'paid', '2026-01-05')")
@@ -566,3 +581,112 @@ def test_a_join_is_matched_by_target_and_pairs():
     assert yaml.safe_load(edited) == {
         "joins": [{"target_model": "customers", "join_pairs": [["customer_id", "id"]]}]
     }
+
+
+# --- declaration drift on the native layer (#995) -----------------------------
+
+
+def _declared_orders(
+    excludes: tuple[str, ...] = ("test",), *, restated: bool = False, **overrides: Any
+) -> dict[str, Any]:
+    """The orders model declaring its population and a column's unit in
+    ``meta.dex``. ``restated`` writes the same declaration with its keys and
+    filter values reordered."""
+
+    population: dict[str, Any] = {
+        "rule": "Orders a customer placed.",
+        "filters": [{"column": "status", "excludes": list(excludes)}],
+    }
+    if restated:
+        population = {
+            "filters": [
+                {"excludes": sorted(excludes, reverse=True), "column": "status"}
+            ],
+            "rule": "Orders  a customer\nplaced.",
+        }
+    entry = _orders(meta={"dex": {"population": population}}, **overrides)
+    for column in entry["columns"]:
+        if column["name"] == "amount":
+            column["meta"] = {"dex": {"unit": "currency:USD", "additivity": "additive"}}
+    return entry
+
+
+def _declarations(payload: dict) -> list[dict]:
+    """The declaration findings of a drift payload, in ranked order."""
+
+    return [
+        f for f in payload["data"]["findings"] if f["code"].startswith("declaration_")
+    ]
+
+
+def test_a_changed_population_in_meta_dex_is_high_severity_drift(repo: Path, capsys):
+    _write_model(repo, ORDERS, _declared_orders())
+    _cli(repo, capsys, "maintain", "snapshot")
+    _write_model(repo, ORDERS, _declared_orders(("test", "open")))
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    assert payload["_exit"] == 0, payload
+    [finding] = _declarations(payload)
+    assert finding["code"] == "declaration_changed"
+    assert (finding["identifier"], finding["severity"]) == ("orders", "high")
+    assert finding["data"]["field"] == "population"
+    # Beside a dbt project, the native layer's status rides under its own key.
+    status = payload["data"]["declaration_drift"]
+    assert status["checked"] is True
+    assert status["semantic_layer"]["checked"] is True
+    assert status["semantic_layer"]["vendor"] == "slayer"
+
+
+def test_a_restated_meta_dex_block_is_not_drift(repo: Path, capsys):
+    _write_model(repo, ORDERS, _declared_orders(("test", "open")))
+    _cli(repo, capsys, "maintain", "snapshot")
+    _write_model(repo, ORDERS, _declared_orders(("test", "open"), restated=True))
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    assert payload["_exit"] == 0, payload
+    assert _declarations(payload) == []
+    assert payload["data"]["declaration_drift"]["checked"] is True
+
+
+def test_a_changed_unit_names_the_column(repo: Path, capsys):
+    _write_model(repo, ORDERS, _declared_orders())
+    _cli(repo, capsys, "maintain", "snapshot")
+    entry = _declared_orders()
+    entry["columns"][2]["meta"]["dex"]["unit"] = "currency:EUR"
+    _write_model(repo, ORDERS, entry)
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    [finding] = _declarations(payload)
+    assert finding["column"] == "amount"
+    assert (finding["data"]["field"], finding["severity"]) == ("unit", "high")
+
+
+def test_a_pre_declaration_baseline_is_unchecked_until_project_only(repo: Path, capsys):
+    """A baseline with no native declarations is unchecked, never clean, until a
+    project-only snapshot baselines them.
+    """
+
+    _write_model(repo, ORDERS, _declared_orders())
+    _cli(repo, capsys, "maintain", "snapshot")
+    path = repo / ".dex" / "snapshot.json"
+    stored = json.loads(path.read_text())
+    del stored["semantic_layer"]["declarations"]
+    path.write_text(json.dumps(stored))
+
+    payload = _cli(repo, capsys, "maintain", "semantic")
+
+    status = payload["data"]["declaration_drift"]
+    assert status["checked"] is False
+    assert status["semantic_layer"]["checked"] is False
+    assert "before the semantic layer's declarations" in status["reason"]
+    assert any(
+        w.startswith("declaration drift was not checked") for w in payload["warnings"]
+    )
+
+    assert _cli(repo, capsys, "maintain", "snapshot", "--project-only")["_exit"] == 0
+    payload = _cli(repo, capsys, "maintain", "semantic")
+    assert payload["data"]["declaration_drift"]["checked"] is True
+    assert _declarations(payload) == []

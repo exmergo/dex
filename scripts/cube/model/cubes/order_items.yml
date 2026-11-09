@@ -1,0 +1,36 @@
+cubes:
+  - name: order_items
+    sql_table: app.order_items
+    joins:
+      - name: orders
+        sql: "{CUBE}.order_id = {orders}.id"
+        relationship: many_to_one
+      - name: products
+        sql: "{CUBE}.product_id = {products}.id"
+        relationship: many_to_one
+    dimensions:
+      - name: id
+        sql: id
+        type: number
+        primary_key: true
+    measures:
+      - name: units
+        sql: quantity
+        type: sum
+      - name: line_revenue
+        sql: "{CUBE}.quantity * {CUBE}.unit_price"
+        type: sum
+
+  - name: products
+    sql_table: app.products
+    dimensions:
+      - name: id
+        sql: id
+        type: number
+        primary_key: true
+      - name: category
+        sql: category
+        type: string
+    measures:
+      - name: count
+        type: count

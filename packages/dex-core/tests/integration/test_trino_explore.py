@@ -230,7 +230,7 @@ def test_the_query_firewall_admits_trino_idioms_and_refuses_what_it_must(
         "SELECT email FROM memory.app.customers LIMIT 5": "email",
         "SELECT count(*) FROM app.customers": "fully qualified",
         "SELECT * FROM TABLE(memory.system.query(query => 'SELECT 1'))": (
-            "table function"
+            "function query is not permitted"
         ),
         'SELECT * FROM iceberg.app."orders$files"': "orders$files",
     }

@@ -1,0 +1,15 @@
+version: 2
+models:
+  - name: stg_teams
+    columns:
+      - name: team_id
+        data_tests: [unique, not_null]
+  - name: member_data
+    description: The vendor's member data, read as delivered. The tiny_roster package reads it.
+    columns:
+      - name: member_id
+        data_tests: [unique, not_null]
+  - name: stg_handles
+    columns:
+      - name: member_id
+        data_tests: [unique, not_null]

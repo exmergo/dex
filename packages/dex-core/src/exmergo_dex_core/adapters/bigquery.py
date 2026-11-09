@@ -17,7 +17,7 @@ simply calls no mutating client API, and the docs recommend read-only roles
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +36,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_parts,
     distinct_combination_sql,
     is_blob_type,
@@ -218,7 +219,7 @@ class BigQueryAdapter:
         self._client = client or bigquery.Client(
             project=project, credentials=credentials
         )
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._notes: dict[str, list[str]] = {}
         # What the last profile estimate was made of, so the handshake and the
@@ -277,7 +278,7 @@ class BigQueryAdapter:
         self._exact_rows: dict[str, int] = {}
         self._resolved_datasets: list[str] | None = None
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_dataset``, the dataset this command's build writes into,
         or stop reading it with ``None``. A bare name qualifies against
         ``self.project``, as allowlist entries do.
@@ -289,9 +290,9 @@ class BigQueryAdapter:
         changed.
         """
 
-        token = scope.strip() if scope else None
-        if token and "." not in token:
-            token = f"{self.project}.{token}"
+        token = dev_target_entries(
+            scope, lambda entry: entry if "." in entry else f"{self.project}.{entry}"
+        )
         if token != self._dev_target:
             self._dev_target = token
             self.forget_metadata()
@@ -321,6 +322,31 @@ class BigQueryAdapter:
             for index, field in enumerate(table.schema)
         ]
         return self._object_meta(table, object_type), columns
+
+    def column_schema(self, identifier: str) -> list[dict]:
+        """One table's column tree as dbt-bigquery reads it: name, type, mode and
+        nested fields, nothing else (#1154).
+
+        ``table_metadata`` renders a RECORD as a bare ``STRUCT``, which is right
+        for profiling but not for a dbt macro: dbt-bigquery builds its columns
+        from the whole ``SchemaField`` tree, so ``data_type`` reads
+        ``STRUCT<...>`` and a cast built from it is valid SQL. Planning hands this
+        tree to dbt's own ``BigQueryColumn`` so a macro sees what it would see on
+        a real build. Free metadata (the same cached ``get_table``); descriptions
+        and policy tags are left out, since a macro never needs them.
+        """
+
+        def spec(field: Any) -> dict:
+            """One field and its sub-fields, keeping only what dbt reads."""
+
+            return {
+                "name": field.name,
+                "type": field.field_type,
+                "mode": field.mode or "NULLABLE",
+                "fields": [spec(sub) for sub in (field.fields or ())],
+            }
+
+        return [spec(field) for field in self._get_table(identifier).schema]
 
     def _object_meta(self, table: Any, object_type: str) -> ObjectMeta:
         identifier = f"{table.project}.{table.dataset_id}.{table.table_id}"
@@ -401,6 +427,16 @@ class BigQueryAdapter:
         if self._resolved_datasets is None:
             self._resolved_datasets = self._resolve_datasets()
         return self._resolved_datasets
+
+    def in_scope(self, namespace: str) -> bool:
+        """Whether a dotted namespace lies inside this BigQuery scope (#984)."""
+        qualified = namespace.strip().lower()
+        if "." not in qualified:
+            qualified = f"{self.project.lower()}.{qualified}"
+        project, _, _dataset = qualified.partition(".")
+        if not self.target.datasets:
+            return project == self.project.lower()
+        return qualified in {d.lower() for d in self._dataset_ids()}
 
     def _resolve_datasets(self) -> list[str]:
         if not self.target.datasets:
@@ -1319,6 +1355,24 @@ class BigQueryAdapter:
         return max(len(tables), 1)
 
     # --- execution (the single billed door) -----------------------------------
+
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, from the free dry run's own schema."""
+
+        checked = assert_select_only(sql, dialect=self.dialect)
+        job_config = self._bq.QueryJobConfig(dry_run=True, use_query_cache=False)
+        job = self._client.query(
+            checked, job_config=job_config, location=self.target.location
+        )
+        return [
+            ColumnMeta(
+                name=field.name,
+                data_type=self._render_type(field),
+                nullable=(field.mode or "NULLABLE") != "REQUIRED",
+                ordinal=ordinal,
+            )
+            for ordinal, field in enumerate(job.schema or [])
+        ]
 
     def run_query(
         self,

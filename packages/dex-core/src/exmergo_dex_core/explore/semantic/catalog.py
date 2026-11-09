@@ -265,6 +265,10 @@ class SemanticCatalog:
                 "notes": self.notes,
             }
         )
+        if self.view.compiled_only:
+            payload["compiled_only"] = [
+                _element_data(item) for item in self.view.compiled_only
+            ]
         return payload
 
     def capped(

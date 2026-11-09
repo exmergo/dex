@@ -56,8 +56,8 @@ with DexEngine.from_repo(repo) as engine:
     result = engine.plan("define a revenue metric", edits=edits)
     exported = engine.export_plan(result.plan_id)
 
-document = exported.plan     # send this wherever
-digest = exported.digest     # send this through a channel you trust
+document = exported.plan  # send this wherever
+digest = exported.digest  # send this through a channel you trust
 ```
 
 The document carries every edit's operation, kind, preimage hash, content hash,
@@ -269,9 +269,10 @@ change never touched. `evidence.outcome` is what tells them apart.
 | `validated` | everything required ran and passed, against current artifacts |
 | `empty_selection` | the selection matched nothing |
 | `unrelated` | nodes ran, and none of them was required by this change |
-| `partial` | some required nodes ran and some did not |
+| `partial` | some required nodes built and some did not (absent from run results, or present without succeeding) |
 | `failed` | a node errored, or a test returned rows |
 | `skipped` | every node was skipped, usually behind a failed parent |
+| `indeterminate` | nothing failed, and a node reported a status dex does not recognize |
 | `stale` | it passed, and the tree it validated is not the one the plan describes |
 | `not_run` | dbt never reached node execution |
 
@@ -281,9 +282,54 @@ semantic YAML requires the dbt model its semantic model sits on. It is absent
 rather than empty when no plan was named, because an empty coverage block reads
 as "nothing required was built", which is the opposite of "nobody asked".
 
+Node statuses are read against an allow-list. `success` (a model, seed or
+snapshot) and `pass` or `warn` (a test) succeeded; `error`, `runtime error`,
+`fail` and `failed` failed; `skipped` was not attempted. Any other status
+(`partial success` from a microbatch model with a failed batch, `no-op`, or the
+`unknown` a node without a status defaults to) is unrecognized: it never counts
+as built, never lets a run read `validated`, and is not reported as a failure.
+The outcome is `indeterminate`, and `data.completion.deliverables.unrecognized`
+names such a deliverable. A document that claims `validated` over one is refused
+by `verify_build_evidence`.
+
+`generated` lists the relations of the models, seeds and snapshots that
+succeeded in this run. A skipped or failed node's relation is never listed,
+whatever an earlier run left of it in the target.
+
+`coverage.covered` records presence in run results, including failed and skipped
+nodes. Use `coverage.built` and `coverage.not_built` for successful execution:
+they partition `required`, and missing nodes belong to `not_built`. A requirement
+matching multiple versions is built only if every matched version succeeded.
+Legacy documents omit this partition and deserialize it as `null`; outcome
+recomputation and the artifact digests are unchanged.
+
+With verification enabled, `verification.scope` lists successful models only;
+`scope_not_built` names the other reported models. A model may be in scope even
+when a test failed. Scope describes execution; `suppressed` still names checks
+that could not run.
+
+`result.prerequisites[].previous_run` adds the previous status and invocation
+context, or `available: false` with a reason code. Completion blockers include
+`previous_status` when known. Dex preserves this context before pricing compiles,
+including across confirmation retries, without running a baseline build. It is
+the last available build artifact for that target/runtime, with separate cold
+history, and may describe a different selection or source tree. It never changes
+`plan_relation` or establishes that the plan caused a failure.
+
 `selection.complete` is `null` for a selector using dbt's graph operators or
 method selectors. dex does not evaluate dbt's selector language, and a second
 implementation of it would disagree with dbt's.
+
+`result.completion` is the same answer in a bounded, typed form
+(`host.BuildCompletion`, at most `host.COMPLETION_BUDGET_BYTES` serialized): the
+required deliverables built, failed, skipped, missing and stale, what blocked
+each one, which of them anything checked, what verification ran and suppressed,
+and the declared obligations by status. It leads the CLI payload as
+`data.completion`, ahead of the node lists, for a reader that may only see the
+first few kilobytes. A host holding evidence from another process can rebuild it
+with `host.summarize_completion(evidence, verification_payload)`; pass the
+manifest's dependency edges as `graph` to name a skip's cause and a test's model.
+It reports and never decides: `outcome` above is still the verdict.
 
 `stale` deserves a note. The obvious reading is "the compiled artifacts predate
 the sources", and that is reported as `stale_artifacts`, but it is close to
@@ -319,7 +365,21 @@ A declaration dex cannot check by name (a git URL names a repository, and dbt
 installs under the package's own name) is reported separately rather than named
 on a guess. `REFUSE` checks every declaration even when `dbt_packages/` is
 non-empty, and stops on missing or unverifiable packages. This checks presence;
-it does not verify lockfile versions or installed package contents.
+it does not verify lockfile versions or installed package contents. To verify
+contents, `transform build --cold-deps` reinstalls into an isolated copy, builds from
+it, and reports `data.cold_verification.installed_edits`; it may reach the network,
+so a host selects it explicitly, and it is refused together with `--no-install-deps`.
+
+`transform plan` never installs either. Where the plan needs dbt's parse or a
+control-flow compile, it runs the same presence check against the tree as the
+plan leaves it, and refuses with `MissingPackagesError` (lead: "a plan installs
+nothing"). A package the plan's own `packages_yml` edit declares is refused as
+its subclass `PlanDeclaresMissingPackagesError`, whose `declared_by_plan` names
+them and whose message gives the route: the `packages_yml` edit as a plan of its
+own (it needs no parse), applied, `transform deps`, then the rest (#1166). Both
+are `PrerequisiteError`s, but only the parent clears with `transform deps` and a
+retry: the subclass needs the `packages_yml` plan applied first, which is why it
+is a type of its own.
 
 ```bash
 dex transform preflight
@@ -454,16 +514,19 @@ then, because there is no figure to append.
 from exmergo_dex_core.host import conformance_vectors
 
 for vector in conformance_vectors():
-    vector["contract"]     # portable-plan | classification | grounding | build-evidence
-    vector["payload"]      # what a host will be handed
-    vector["expect"]       # the verdict it should reach
+    vector["contract"]  # portable-plan | classification | grounding | build-evidence
+    vector["payload"]  # what a host will be handed
+    vector["expect"]  # the verdict it should reach
 ```
 
-Twenty-three fixtures ship in the wheel beside the reader: a valid plan and the
-same plan exported from a second checkout, tampered content, a repinned digest, a
-future schema version, a delete; a declarative, executable, authority-bearing,
-unknown, and filtered-metric classification; a complete, unresolved, ambiguous,
-and missing grounding; and one per build outcome. A grounding vector carries the
+The fixtures ship in the wheel beside the reader: a valid plan and the same plan
+exported from a second checkout, tampered content, a repinned digest, a future
+schema version, a delete; a declarative, executable, authority-bearing, unknown,
+and filtered-metric classification; a complete, unresolved, ambiguous, and missing
+grounding; one per build outcome; and a forged build document claiming
+`validated` over a node whose status dex does not recognize. A vector a reader
+must refuse says `"verifies": false` under `expect`, with the outcome its fields
+actually support and the error a refusal carries. A grounding vector carries the
 project it was grounded against in `payload.project`, as relative paths and their
 content.
 

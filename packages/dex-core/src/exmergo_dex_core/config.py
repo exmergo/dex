@@ -9,8 +9,9 @@ Secrets (passwords, keys, tokens) are read at runtime from their own stores by
 from __future__ import annotations
 
 import fnmatch
+import re
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -91,6 +92,12 @@ class SnowflakeTarget(BaseModel):
     (SAMPLE SYSTEM) instead of a full scan. ``credit_price_usd`` is the
     contract-specific dollar price of one credit; set it to see dollar figures
     next to the credit translation (no API exposes it, so dex never guesses).
+    ``suspend_after_command`` (off by default) suspends the pinned warehouse at
+    the end of a command that woke it and left it idle, so the command bills
+    its statements plus Snowflake's 60-second resume minimum rather than the
+    whole AUTO_SUSPEND tail. It needs OPERATE on the warehouse, and it never
+    touches a warehouse that was already running or that other queries are
+    using (issue #664).
     """
 
     account: str | None = None
@@ -101,6 +108,7 @@ class SnowflakeTarget(BaseModel):
     dev_schema: str | None = None
     max_full_profile_bytes: int | None = None
     credit_price_usd: float | None = None
+    suspend_after_command: bool = False
 
 
 class DatabricksTarget(BaseModel):
@@ -568,6 +576,44 @@ class ConventionWarnings(BaseModel):
     resolved_keys: bool = True
 
 
+class TransformConfig(BaseModel):
+    """Where the project's layers live, for what ``transform plan`` derives.
+
+    ``marts_paths``: the folders, relative to the dbt project directory, whose
+    models are marts. A declared mart is the one model a semantic model is
+    derived from (issue #499): a staging model's declaration describes a source,
+    and a semantic model on it would put an unconformed relation in front of
+    every metric. The default is the folder ``transform init`` scaffolds, so a
+    project dex created needs nothing here; a house that keeps marts elsewhere
+    names its own. A folder covers everything beneath it.
+
+    ``artifacts``: where the dbt invocations Dex runs on the project write
+    their artifacts (issue #1014). ``isolated``, the default, is a directory of
+    Dex's own per dbt runtime, ``<target-path>/dex/<runtime>``, so a project or
+    CI runtime of another dbt version never trips on what Dex's left behind.
+    ``shared`` writes the project's own target path for a caller whose other
+    tooling reads it there, and refuses one another runtime left incompatible
+    rather than writing over it.
+    """
+
+    marts_paths: list[str] = Field(default_factory=lambda: ["models/marts"])
+    artifacts: Literal["isolated", "shared"] = "isolated"
+
+    @model_validator(mode="after")
+    def _check_marts_paths(self) -> TransformConfig:
+        normalized: list[str] = []
+        for name in self.marts_paths:
+            path = PurePosixPath(name.strip())
+            if not name.strip() or path.is_absolute() or ".." in path.parts:
+                raise ValueError(
+                    f"transform.marts_paths: '{name}' has to name a folder inside "
+                    "the dbt project, written relative to it"
+                )
+            normalized.append(str(path))
+        self.marts_paths = normalized
+        return self
+
+
 # Which deployments each semantic-layer vendor ships, and the spellings that name
 # them. The table exists because `backend:` collapsed vendor and deployment into
 # one enum, which only extends while there is exactly one vendor, and there is
@@ -586,6 +632,11 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # repository, and a server is a second copy of them that nobody reviews in a
     # pull request. `local` is those files and nothing else.
     "slayer": ("local",),
+    # Cube's YAML model files committed here, rendered for a governed query by
+    # the Cube server at `semantic.cube.url` (a Cube Core on this machine by
+    # default) and executed by dex. Cube Cloud is a deployment of the same files
+    # (#914), not read yet.
+    "cube": ("local",),
 }
 
 #: The factory that builds a vendor's own semantic source, for the vendors whose
@@ -609,6 +660,7 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
 SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
     "ossie": "exmergo_dex_core.ossie.project:build_semantic_layer",
     "slayer": "exmergo_dex_core.slayer.project:build_semantic_layer",
+    "cube": "exmergo_dex_core.cube.project:build_semantic_layer",
 }
 
 #: The vendors whose native documents `semantic <vendor> define|update|plan`
@@ -619,7 +671,7 @@ SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
 #: before the layer implements it would exist only to refuse. The route takes
 #: no vendor name of its own; it reads the vendor off the subcommand, and refuses
 #: one that is not the configured `semantic.vendor`.
-SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = ("ossie", "slayer")
+SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = ("ossie", "slayer", "cube")
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",
@@ -797,12 +849,125 @@ class SlayerSemanticConfig(BaseModel):
         return self
 
 
+#: Cube files that configure a deployment rather than declare a model. Named so a
+#: listing that points at one is refused with the reason: `globals.py` feeds the
+#: Jinja renderer and `cube.py`/`cube.js` configure the server, and neither is a
+#: cube or a view dex can read.
+_CUBE_NEVER_READ = frozenset({"globals.py", "cube.py", "cube.js"})
+
+#: The model files Cube compiles. YAML is read statically; a JS model is listed
+#: so the layer's extent is declared, and is named compiled-only rather than read.
+CUBE_MODEL_SUFFIXES = (".yml", ".yaml", ".js")
+
+_IDENTIFIER_SHAPE = re.compile(r"[_a-zA-Z][_a-zA-Z0-9]*")
+
+
+class CubeSemanticConfig(BaseModel):
+    """The repository-confined Cube model files behind ``vendor: cube``.
+
+    ``files`` is an exact allowlist with the rules ``semantic.ossie.files``
+    follows: no globs, no absolute paths, no ``..``, no duplicates, each written
+    relative to the repository root. A ``.yml``/``.yaml`` file is read
+    statically. A ``.js`` file, and a YAML file carrying Jinja, are listed so the
+    layer's whole extent is declared: Cube compiles them, dex names them as
+    compiled-only and translates nothing out of them. ``globals.py`` and
+    ``cube.py``/``cube.js`` are deployment configuration, not models, and are
+    refused by name.
+
+    ``url`` is the non-secret base of a Cube REST API, read by ``explore
+    semantic query|values``, which ask a Cube server to render SQL and execute
+    it themselves (``http://localhost:4000/cubejs-api`` when unset). It may name
+    no credential: a token in a committed URL is a token in git, and the secret a
+    Cube server needs is read from the environment. ``data_source`` is the Cube
+    data source dex treats as the warehouse it is connected to (Cube's own
+    default is ``default``); a cube on another one is named in the catalog.
+
+    Validated where it is written, so a bad path is refused at its line. The
+    reader checks again for callers that build it directly.
+    """
+
+    LISTING: ClassVar[str] = "files"
+    LISTING_MEANS: ClassVar[str] = (
+        "the Cube model files to read, named relative to the repository root"
+    )
+
+    files: list[str] = Field(default_factory=list)
+    url: str | None = None
+    data_source: str = "default"
+
+    @model_validator(mode="after")
+    def _check(self) -> CubeSemanticConfig:
+        listed = ", ".join(CUBE_MODEL_SUFFIXES)
+        for name in self.files:
+            path = _repository_relative("semantic.cube.files", name)
+            if path.name in _CUBE_NEVER_READ:
+                raise ValueError(
+                    f"semantic.cube.files: '{name}' configures a Cube deployment "
+                    "rather than declaring a model, so dex neither reads nor "
+                    "writes it; list the cube and view files instead"
+                )
+            if not name.endswith(CUBE_MODEL_SUFFIXES):
+                raise ValueError(
+                    f"semantic.cube.files: '{name}' is not a Cube model file; "
+                    f"they are named {listed}"
+                )
+        if duplicated := sorted({n for n in self.files if self.files.count(n) > 1}):
+            raise ValueError(
+                "semantic.cube.files names the same file twice: "
+                f"{', '.join(duplicated)}"
+            )
+        if self.url is not None:
+            _check_cube_url(self.url)
+        if not _IDENTIFIER_SHAPE.fullmatch(self.data_source or ""):
+            raise ValueError(
+                f"semantic.cube.data_source: '{self.data_source}' is not a Cube "
+                "data source name, which is an identifier such as `default`"
+            )
+        return self
+
+
+def _check_cube_url(url: str) -> None:
+    """Refuse a ``semantic.cube.url`` that is not a plain API base.
+
+    A scheme and a host, optionally a port and a path, and nothing that carries
+    a secret or changes per request: no user or password, no query string, no
+    fragment. Which hosts dex will actually send a token to is not decided here,
+    because this file may be one an agent wrote; the commands that call a Cube
+    server bind hosts from the environment.
+    """
+
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        parts.port  # noqa: B018  (raises on a malformed port)
+    except ValueError as exc:
+        raise ValueError(f"semantic.cube.url: '{url}' is not a URL: {exc}") from exc
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError(
+            f"semantic.cube.url: '{url}' has to be an http or https URL naming a "
+            "host, such as https://cube.example.com/cubejs-api"
+        )
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(
+            "semantic.cube.url carries a user or password, and this file is "
+            "committed. A Cube server's secret is read from the environment, never "
+            "from configuration; write the URL without it"
+        )
+    if parts.query or parts.fragment:
+        raise ValueError(
+            f"semantic.cube.url: '{url}' carries a query string or fragment; write "
+            "only the API base"
+        )
+
+
 class SemanticConfig(BaseModel):
     """How ``explore semantic`` reaches the semantic layer, on two axes.
 
     ``vendor`` is which semantic-layer format answers: ``dbt``/MetricFlow,
-    ``ossie`` for native Apache Ossie documents in the repository, or ``slayer``
-    for SLayer model files in the repository. It is
+    ``ossie`` for native Apache Ossie documents in the repository, ``slayer``
+    for SLayer model files in the repository, or ``cube`` for Cube YAML model
+    files in the repository. It is
     ambient per repo, chosen once, the same rule ``connector:`` follows: a repo
     has one semantic layer, so there is no more reason to retype the vendor per
     command than to retype the warehouse.
@@ -829,6 +994,10 @@ class SemanticConfig(BaseModel):
     SLayer files are the repository's one semantic layer: a dbt project beside
     them keeps the transformation tiers, and its MetricFlow semantic models are
     not read.
+
+    ``cube.files`` is Cube's equivalent, with the same rules (see
+    :class:`CubeSemanticConfig`): a dbt project beside them keeps the
+    transformation tiers, and Cube is the repository's one semantic layer.
 
     A third property, **who executes**, is derived from those two and never
     configured, because it is what decides whether the cost guard can apply at
@@ -857,6 +1026,7 @@ class SemanticConfig(BaseModel):
     environment_id: str | None = None
     ossie: OssieSemanticConfig = Field(default_factory=OssieSemanticConfig)
     slayer: SlayerSemanticConfig = Field(default_factory=SlayerSemanticConfig)
+    cube: CubeSemanticConfig = Field(default_factory=CubeSemanticConfig)
 
     @model_validator(mode="after")
     def _check_axes(self) -> SemanticConfig:
@@ -1184,6 +1354,9 @@ class DexConfig(BaseModel):
     # on by default: each stays silent unless the project's own models agree
     # unanimously, so a repo with no convention never hears from them.
     conventions: ConventionWarnings = Field(default_factory=ConventionWarnings)
+    # Where the project's marts live, which is where `transform plan` derives a
+    # semantic model from a declaration (issue #499).
+    transform: TransformConfig = Field(default_factory=TransformConfig)
     query: QueryLimits = Field(default_factory=QueryLimits)
     # Opt-in tightening for a guarded build in a sandbox. Off by default, so an
     # interactive build behaves exactly as it did before this existed.

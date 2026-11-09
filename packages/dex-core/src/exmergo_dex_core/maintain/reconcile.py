@@ -22,6 +22,7 @@ writes to the project and human edits stay authoritative at apply time.
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +36,7 @@ from ..transform.plans import EditKind, PlanEdit
 from ..transform.rewrite import (
     RewriteError,
     column_tests,
+    output_columns,
     project_column_in_sql,
     unproject_column_in_sql,
 )
@@ -71,6 +73,20 @@ _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_c
 _MECHANICAL = {"column_added", "column_dropped", "nullability_changed"}
 
 
+def _semantic_update_command(vendor: str | None) -> str:
+    """Authoring command for the configured semantic vendor (#974).
+
+    MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer and Cube each have
+    their own ``semantic <vendor> update`` route; naming the dbt command under
+    those vendors sends the operator to the wrong place.
+    """
+
+    name = (vendor or "dbt").lower()
+    if name == "dbt":
+        return "semantic update"
+    return f"semantic {name} update"
+
+
 def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
     """Where an edit of ``kind`` for ``table`` goes, asking the format first.
 
@@ -86,7 +102,8 @@ def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str
         # callers holding no format, so answering a path where it answers `None`
         # would make the shim and the format disagree about the same input.
         suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
-        return None if suffix is None else f"models/staging/stg_{table}.{suffix}"
+        model = table if table.startswith("stg_") else f"stg_{table}"
+        return None if suffix is None else f"models/staging/{model}.{suffix}"
     return placement.edit_path(kind, table)
 
 
@@ -94,7 +111,7 @@ def build(
     findings: list[DriftFinding],
     snap: Snapshot,
     cache: DexCache | None,
-    view: DbtProjectView | None,
+    view: Any | None,
     *,
     pii_overrides: PIIOverrideMatcher | None = None,
     placement: PlacingProject | None = None,
@@ -128,23 +145,33 @@ def build(
     edits: list[PlanEdit] = []
     warnings: list[str] = []
 
+    semantic_vendor = (
+        snap.semantic_layer.vendor
+        if snap.semantic_layer is not None and snap.semantic_layer.vendor
+        else "dbt"
+    )
+
     schema_patches: dict[str, list[DriftFinding]] = {}
     definition_churn = False
     orphan_identifiers: list[str] = []
     for finding in findings:
-        if finding.axis == "schema" and finding.code in _PATCHABLE:
+        if (
+            finding.axis == "schema"
+            and finding.code in _PATCHABLE
+            and finding.identifier is not None
+        ):
             schema_patches.setdefault(finding.identifier, []).append(finding)
         elif finding.code.startswith("definition_") or finding.code.startswith(
             "model_"
         ):
             # A model added, removed, or content-changed is the project's own
             # edit, the same as a semantic definition changing: there is no
-            # warehouse-side fix to propose, only a baseline to catch up.
+            # warehouse-side fix to propose.
             definition_churn = True
         else:
-            if finding.code == "orphan_relation":
+            if finding.code == "orphan_relation" and finding.identifier is not None:
                 orphan_identifiers.append(finding.identifier)
-            proposals.append(_advisory(finding))
+            proposals.append(_advisory(finding, semantic_vendor=semantic_vendor))
 
     declarations = DeclarationEdits(view, placement)
     for identifier, table_findings in sorted(schema_patches.items()):
@@ -153,7 +180,7 @@ def build(
         # rebuild anything: nothing dex writes carries a type, so a plan built for
         # one would propose the file it already has.
         proposals.extend(
-            _retype_advisory(finding)
+            _retype_advisory(finding, semantic_vendor=semantic_vendor)
             for finding in table_findings
             if finding.code not in _MECHANICAL
         )
@@ -183,7 +210,7 @@ def build(
                     for finding in written
                 )
             continue
-        if view is None or model_path not in view.files:
+        if view is None or model_path is None or model_path not in view.files:
             reason = (
                 "this project format cannot receive edits"
                 if view is None
@@ -247,11 +274,7 @@ def build(
     _drop_empty_proposals(proposals, {edit.path for edit in edits})
 
     if definition_churn:
-        warnings.append(
-            "definition or model changes since the baseline are recorded but "
-            "not reconciled: if the current project state is intended, "
-            "re-run `maintain snapshot` to accept it as the new baseline"
-        )
+        warnings.append(_definition_churn_warning(findings))
     if len(orphan_identifiers) > 1:
         warnings.append(
             f"{len(orphan_identifiers)} orphan relations found this run; once "
@@ -265,6 +288,34 @@ def build(
 # --- helpers -------------------------------------------------------------------
 
 
+def _definition_churn_warning(findings: list[DriftFinding]) -> str:
+    """Both ways forward for definition or model churn.
+
+    A high-severity grain finding in the same check is a regression. The
+    repair command comes first there, so a reader does not snapshot it.
+    """
+
+    recorded = (
+        "definition or model changes since the baseline are recorded but not reconciled"
+    )
+    accept = (
+        "run `explore map` then `maintain snapshot` to accept it as the new baseline"
+    )
+    repair = "repair the project through `transform plan`"
+    if any(
+        finding.axis == "grain" and finding.severity == "high" for finding in findings
+    ):
+        return (
+            f"{recorded}: {repair} before accepting a baseline, because a "
+            "high-severity grain finding is in this check; once the repair "
+            f"holds and the project state is intended, {accept}"
+        )
+    return (
+        f"{recorded}: if the current project state is intended, {accept}; "
+        f"otherwise {repair}"
+    )
+
+
 def _run_operation_args(identifiers: list[str]) -> str:
     """The ``--args`` payload for ``dbt run-operation drop_orphan_relations``."""
 
@@ -272,8 +323,15 @@ def _run_operation_args(identifiers: list[str]) -> str:
     return f"{{relations: [{relations}], dry_run: false}}"
 
 
-def _advisory(finding: DriftFinding) -> Proposal:
+def _advisory(
+    finding: DriftFinding,
+    *,
+    semantic_vendor: str | None = None,
+) -> Proposal:
     if finding.code == "orphan_relation":
+        operation_args = _run_operation_args(
+            [finding.identifier] if finding.identifier else []
+        )
         return Proposal(
             axis=finding.axis,
             kind="advisory",
@@ -286,9 +344,31 @@ def _advisory(finding: DriftFinding) -> Proposal:
                 "governed macro (dex never executes this itself): scaffold "
                 "it with `transform macro drop_orphan_relations` if the "
                 "project does not have it yet, then run dbt run-operation "
-                "drop_orphan_relations --args "
-                f"'{_run_operation_args([finding.identifier])}'"
+                f"drop_orphan_relations --args '{operation_args}'"
             ),
+        )
+    if finding.code == "dimension_cardinality_changed":
+        before = finding.data.get("distinct_before")
+        after = finding.data.get("distinct_after")
+        investigation = "check whether the dimension's population changed"
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            if after < before:
+                investigation = "check for missing categories or upstream filters"
+            elif after > before:
+                investigation = (
+                    "check for additional categories or upstream population changes"
+                )
+        if not finding.exact:
+            investigation += (
+                "; the distinct counts are approximate, not proof of changed values"
+            )
+        return Proposal(
+            axis=finding.axis,
+            kind="advisory",
+            finding_code=finding.code,
+            identifier=finding.identifier,
+            column=finding.column,
+            action=investigation,
         )
     actions = {
         "table_added": (
@@ -330,19 +410,43 @@ def _advisory(finding: DriftFinding) -> Proposal:
             "investigate the upstream load; a dbt `relationships` test would "
             "make the orphaned keys visible in builds"
         ),
-        "dimension_cardinality_changed": (
-            "decide whether the new categorical value belongs in the impacted "
-            "metric definitions; a firewalled `explore query` can name it"
+        "declared_join_orphans": (
+            "the project declares a join the data does not meet, and no "
+            "baseline measurement shows it ever held, so this is not drift: repoint "
+            "the declaration at the parent that holds these keys, load the "
+            "missing parents, or drop the claim. Once the join is right, re-pin "
+            "with `explore map --verify --use-project` (the map reads no "
+            "declared join without it) and `maintain snapshot` so later runs "
+            "judge it against a before"
         ),
         "dangling_reference": (
-            "update the semantic definition with `semantic update`, or restore "
-            "the model/column it references"
+            "update the semantic definition with `"
+            + _semantic_update_command(semantic_vendor)
+            + "`, or restore the model/column it references"
         ),
         "join_cardinality_exceeded": (
             "the semantic layer declares an arity this join does not have, so "
             "measures aggregated across it are inflated: dedup the side that "
             "should be unique, or declare the cardinality the data has. dex "
             "proposes no edit, because which of the two is right is a decision"
+        ),
+        # A declaration is the project's own record of a decision, so there is
+        # nothing to rewrite here: the change is either the decision someone
+        # meant to make or one to revert by hand, and only a human knows which.
+        "declaration_changed": (
+            "a declared rule changed since the baseline: confirm the model's SQL "
+            "and the metrics on it agree with the new declaration, or revert the "
+            "YAML; once it is intended, re-run `maintain snapshot --project-only` "
+            "to accept it"
+        ),
+        "declaration_added": (
+            "the model records new intent: confirm it describes what the SQL "
+            "does, then re-run `maintain snapshot --project-only` to accept it"
+        ),
+        "declaration_removed": (
+            "the record of these decisions is gone: restore the declaration, or "
+            "if dropping it is intended, re-run `maintain snapshot "
+            "--project-only` to accept it"
         ),
         "semantic_vendor_changed": (
             "the semantic layer moved to another vendor since the baseline; "
@@ -353,6 +457,11 @@ def _advisory(finding: DriftFinding) -> Proposal:
             "the semantic layer was read under another release or model format "
             "than the baseline, so its definitions could not be compared; "
             "re-run `maintain snapshot` to baseline the upgraded format"
+        ),
+        "compiled_only_changed": (
+            "a definition only the vendor's compiler can read changed since the "
+            "baseline, and dex cannot say how: review the change by hand, then "
+            "re-run `maintain snapshot --project-only` to accept it"
         ),
     }
     return Proposal(
@@ -380,7 +489,11 @@ def _schema_advisory(identifier: str, finding: DriftFinding, reason: str) -> Pro
     )
 
 
-def _retype_advisory(finding: DriftFinding) -> Proposal:
+def _retype_advisory(
+    finding: DriftFinding,
+    *,
+    semantic_vendor: str | None = None,
+) -> Proposal:
     """A type change, surfaced rather than written.
 
     Nothing dex authors carries a type, and there is no type it could carry: the
@@ -391,7 +504,7 @@ def _retype_advisory(finding: DriftFinding) -> Proposal:
     """
 
     if finding.code != "column_retyped":
-        return _advisory(finding)
+        return _advisory(finding, semantic_vendor=semantic_vendor)
     before = finding.data.get("type_before", "?")
     after = finding.data.get("type_after", "?")
     return Proposal(
@@ -531,6 +644,7 @@ def _splice_model(
     model = PurePosixPath(model_path).stem
     settled: list[DriftFinding] = []
     in_sql: list[DriftFinding] = []
+    already_reflected: list[DriftFinding] = []
     for finding in written:
         if finding.code == "nullability_changed":
             settled.append(finding)
@@ -561,7 +675,25 @@ def _splice_model(
         if result.changed:
             declarations.stage_sql(model_path, result.content)
             in_sql.append(finding)
-        settled.append(finding)
+            # Stage YAML only when the model's output actually changes (#983).
+            settled.append(finding)
+        else:
+            # SQL splice was a no-op. For a drop, only treat it as covered when
+            # the model still *outputs* that column (alias absorption, #983).
+            # A star over a dropped source column, or SQL already edited by
+            # hand, leaves the column absent from the declared output and still
+            # needs the YAML half cleaned up (CodeRabbit on #1117). Added
+            # columns keep the prior covered path: a no-op add is either a star
+            # that already carries the column or a rename the model already
+            # reads under another alias.
+            if finding.code == "column_dropped":
+                outs = output_columns(content, model_path, through_ctes=True)
+                if outs is not None and column.lower() in outs:
+                    already_reflected.append(finding)
+                else:
+                    settled.append(finding)
+            else:
+                already_reflected.append(finding)
 
     placed = declarations.resolve(table)
     in_yaml: list[DriftFinding] = []
@@ -585,14 +717,18 @@ def _splice_model(
             )
         else:
             proposals.append(_schema_advisory(identifier, finding, reason))
+    # Warn only for drops that actually change staging output. An absorbed
+    # alias (#983) keeps the contract name, so downstream readers still work.
     warnings.extend(_downstream_readers(view, model, settled))
 
     if not changed:
         declined = [finding for finding, _reason in unstaged]
-        already = [f for f in settled if f not in declined]
+        already = already_reflected + [f for f in settled if f not in declined]
         if already:
             proposals.append(_covered_advisory(identifier, already))
         return
+    if already_reflected:
+        proposals.append(_covered_advisory(identifier, already_reflected))
     paths = ([model_path] if in_sql else []) + (
         [placed.path] if isinstance(placed, Placed) and in_yaml else []
     )

@@ -257,6 +257,41 @@ def test_the_slayer_extra_follows_the_configured_vendor(
     assert wrapper._feature_extras(argv, vendor) == expected
 
 
+# Cube follows the same config read for the same commands (#910): its extra is
+# light, but it is named so a Cube layer's commands resolve what the layer needs,
+# and a Cube `query` or `values` never takes MetricFlow.
+@pytest.mark.parametrize(
+    ("argv", "vendor", "expected"),
+    [
+        (["maintain", "check"], "cube", ["ossie", "cube"]),
+        (["maintain", "grain"], "cube", ["cube"]),
+        (["explore", "semantic"], "cube", ["ossie", "cube", "semantic-api"]),
+        (
+            ["explore", "semantic", "query", "orders.revenue"],
+            "cube",
+            ["ossie", "cube", "semantic-api"],
+        ),
+        (
+            ["explore", "semantic", "values", "orders.status"],
+            "cube",
+            ["ossie", "cube", "semantic-api"],
+        ),
+        (["explore", "map", "--use-project"], "cube", ["cube"]),
+        (["explore", "relationships", "--use-project"], "cube", ["cube"]),
+        (["transform", "apply"], "cube", ["cube"]),
+        # Authoring always takes it, as `semantic slayer` takes its own (#911).
+        (["semantic", "cube", "plan"], "cube", ["cube"]),
+        (["semantic", "cube", "define"], None, ["cube"]),
+        # Not on another vendor, and not for a command that reads no layer.
+        (["explore", "map", "--use-project"], "slayer", ["slayer"]),
+        (["explore", "inventory"], "cube", []),
+        (["explore", "map"], "cube", []),
+    ],
+)
+def test_the_cube_extra_follows_the_configured_vendor(wrapper, argv, vendor, expected):
+    assert wrapper._feature_extras(argv, vendor) == expected
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

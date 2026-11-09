@@ -152,7 +152,7 @@ def test_values_free_profile_and_query_withhold_values_but_keep_counts(
     assert "cells" not in grouped["data"]
 
 
-def test_a_postgres_cast_error_quotes_its_input_only_outside_the_mode(
+def test_a_postgres_cast_error_keeps_its_words_and_never_its_input(
     tmp_path: Path, capsys
 ):
     seed_repo(tmp_path, schemas=["app"], budget=120)
@@ -167,9 +167,12 @@ def test_a_postgres_cast_error_quotes_its_input_only_outside_the_mode(
         capsys,
     )
 
-    # The control: Postgres really does quote the value it failed on.
+    # Outside the mode the warehouse's words survive, but the value Postgres
+    # quotes is masked (#1070): the error names the failure, never the row.
     assert full["reason"] == "execution_failure"
-    assert "@" in full["errors"][0]
+    assert "invalid input syntax for type integer" in full["errors"][0]
+    assert "<value withheld>" in full["errors"][0]
+    assert "@" not in json.dumps(full)
     assert moded["reason"] == "execution_failure"
     assert moded["data"]["code"] == "warehouse_refused"
     assert "@" not in json.dumps(moded)

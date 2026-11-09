@@ -29,7 +29,7 @@ import os
 import re
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -714,6 +714,40 @@ def scope_origin(connector: str, flag: str | None) -> str:
     return flag or f"{connector}.{_SCOPE_FIELDS[connector]} in .dex/config.yml"
 
 
+def dev_namespace_outside_allowlist(
+    connector: str, target, scopes: list[str] | None = None
+) -> str | None:
+    """The dev namespace when the source scope does not reach it, else None.
+
+    Where it does not, a model whose only build is the dev one is invisible to
+    every read but the commands that take ``--target dev`` (#893), so a hint
+    naming a plain read of it would name a command that cannot find it. An
+    empty allowlist reads everything visible, the dev namespace included, and
+    DuckDB has no namespace to be outside of. ``scopes`` is a ``--scope`` that
+    narrowed the committed allowlist for this command, and replaces it when
+    given, since a narrowed read can miss a namespace the allowlist reaches.
+    """
+
+    dev = dev_target_scope(connector, target)
+    if dev is None or connector not in _SCOPE_FIELDS:
+        return None
+    committed = source_scope(connector, target, scopes)
+    if not committed or scope_within(dev, committed):
+        return None
+    return dev
+
+
+def source_scope(connector: str, target, scopes: list[str] | None = None) -> list[str]:
+    """The source allowlist one command reads: ``--scope`` where it narrowed the
+    committed entries, else the committed entries. Empty reads everything."""
+
+    if scopes:
+        return [str(entry) for entry in scopes]
+    if target is None or connector not in _SCOPE_FIELDS:
+        return []
+    return [str(entry) for entry in getattr(target, _SCOPE_FIELDS[connector])]
+
+
 def dev_target_scope(connector: str, target) -> str | None:
     """The namespace dbt dev builds write into, spelled as a scope entry of
     ``connector``, or ``None`` when the config names none.
@@ -747,6 +781,74 @@ def dev_target_scope(connector: str, target) -> str | None:
             return f"{target.dev_catalog}.{target.dev_schema}"
         return None
     return None
+
+
+def derived_dev_scopes(
+    dev_scope: str | None, relations: Iterable[str], *, container: str | None = None
+) -> list[str]:
+    """The namespaces dbt derives from the dev namespace for ``relations``.
+
+    dbt's default ``generate_schema_name`` builds a model with ``+schema: inbox``
+    into ``<target schema>_inbox``, which is how most packages (Fivetran's among
+    them) keep their staging models apart. Those relations are this target's own
+    output, so a command that reads the dev namespace to judge a build reads them
+    too (#1155). Only a namespace whose last part extends the dev namespace's
+    with ``_``, in the same container, counts: a relation in any other namespace
+    is not something the dev target derived, and stays out of reach.
+
+    ``relations`` are the manifest's relation names, compiled for the dev target.
+    Each is spelled as the dev scope is (a bare dataset or schema, or
+    ``container.schema``), so an adapter qualifies it the way it qualifies the
+    dev scope itself. ``container`` is what a bare dev scope is qualified with
+    (BigQuery's project): a relation in another one is left out, since its bare
+    name would be read in the adapter's own container instead.
+    """
+
+    if not dev_scope:
+        return []
+    from .dbt_project import strip_relation_quoting
+
+    wanted = [part.lower() for part in dev_scope.split(".")]
+    found: dict[str, None] = {}
+    for relation in relations:
+        parts = strip_relation_quoting(relation).split(".")[:-1]
+        if len(parts) < len(wanted):
+            continue
+        candidate = parts[len(parts) - len(wanted) :]
+        lowered = [part.lower() for part in candidate]
+        if lowered[:-1] != wanted[:-1]:
+            continue
+        if not lowered[-1].startswith(wanted[-1] + "_"):
+            continue
+        if container is not None and len(wanted) == 1:
+            above = parts[len(parts) - len(wanted) - 1 : len(parts) - len(wanted)]
+            if above and above[0].lower() != container.lower():
+                continue
+        found.setdefault(".".join(candidate), None)
+    return sorted(found)
+
+
+def widen_dev_reads(
+    adapter: Any, config: DexConfig, relations: Iterable[str]
+) -> list[str]:
+    """Have ``adapter`` read the dev namespace and the namespaces dbt derived from
+    it for ``relations`` (:func:`derived_dev_scopes`), for this command only.
+
+    Returns the derived namespaces it added. A connector with no namespace to
+    read (DuckDB reads its whole file) is left alone.
+    """
+
+    read_dev_target = getattr(adapter, "read_dev_target", None)
+    if read_dev_target is None:
+        return []
+    dev_scope = dev_target_scope(adapter.name, getattr(config, adapter.name, None))
+    project = getattr(adapter, "project", None)
+    bigquery = adapter.name == "bigquery" and isinstance(project, str)
+    container = project if bigquery else None
+    derived = derived_dev_scopes(dev_scope, relations, container=container)
+    if derived:
+        read_dev_target([dev_scope, *derived])
+    return derived
 
 
 def _open_bigquery(

@@ -7,15 +7,17 @@ core never depends on any model. A non-Claude agent (Codex, Gemini) becomes a
 second backend implementing the same two protocols, with no change to the core,
 which is what backs the cross-agent portability claim.
 
-Requires the ``claude`` CLI on PATH and a configured workspace where the dex
-plugin is installed. The exact knobs for enabling/disabling the skill per arm and
-for detecting that the skill fired are environment-specific; they are isolated
-here behind small, overridable hooks so calibrating them never touches the core.
+Requires the ``claude`` CLI on PATH. The CLI passes the plugin under test in
+with ``--plugin-dir`` (see ``evals/__main__.py``). The exact knobs for
+enabling/disabling the skill per arm and for detecting that the skill fired are
+environment-specific; they are isolated here behind small, overridable hooks so
+calibrating them never touches the core.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -37,6 +39,23 @@ def _require_claude(binary: str) -> str:
     return resolved
 
 
+# Login and provider settings a child still needs; every other CLAUDE* variable
+# is dropped, since run from inside a Claude Code session they describe that
+# session and a child that inherits them can answer as part of it (#791).
+_KEEP_ENV = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN")
+_KEEP_ENV_PREFIXES = ("CLAUDE_CODE_USE_", "CLAUDE_CODE_SKIP_")
+
+
+def _child_env() -> dict[str, str]:
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("CLAUDE")
+        or k in _KEEP_ENV
+        or k.startswith(_KEEP_ENV_PREFIXES)
+    }
+
+
 def _invoke(binary: str, args: list[str], prompt: str, timeout: int) -> str:
     """Run ``claude -p`` and return its textual result, or raise on failure."""
 
@@ -45,6 +64,7 @@ def _invoke(binary: str, args: list[str], prompt: str, timeout: int) -> str:
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_child_env(),
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"claude exited {proc.returncode}")

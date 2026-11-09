@@ -569,6 +569,32 @@ class MaintainStoreContract(ExploreStoreContract):
             "Check that make_store(key) actually keys storage"
         )
 
+    def test_an_interrupted_save_leaves_the_previous_snapshot_readable(
+        self, store, monkeypatch
+    ):
+        initial = a_snapshot()
+        store.save_snapshot(initial)
+        assert store.load_snapshot() is not None
+
+        if hasattr(store, "_write_document"):
+            from pathlib import Path
+
+            def failing_replace(self_path, target):
+                raise OSError("simulated interruption during atomic replace")
+
+            monkeypatch.setattr(Path, "replace", failing_replace)
+            with pytest.raises(OSError, match="simulated interruption"):
+                store.save_snapshot(
+                    initial.model_copy(update={"warehouse_from": "interrupted"})
+                )
+
+        loaded = store.load_snapshot()
+        assert loaded is not None, (
+            "an interrupted save must leave the previous snapshot readable"
+        )
+        assert loaded.created_at == initial.created_at
+        assert loaded.warehouse_from == initial.warehouse_from
+
 
 class StoreContract(MaintainStoreContract):
     """The full contract: everything above, plus the transform plan store."""
@@ -658,6 +684,31 @@ class StoreContract(MaintainStoreContract):
         assert store.load_plan("pabc").applied_at == "2026-07-03T10:30:00+00:00", (
             "the update did not persist: this is how apply marks a plan applied, "
             "so losing it re-applies work already written to the dbt project"
+        )
+
+    def test_a_recorded_comparison_round_trips(self, store):
+        # How `transform compare` records its verdict (#1049): same id, the
+        # plan's bookkeeping updated, the edits untouched.
+        plan = a_plan("pabc", "2026-07-03T10:00:00+00:00")
+        plan.refactor_models = {"stg_orders": "unattributed"}
+        store.save_plan(plan)
+        plan.comparisons = {
+            "stg_orders": {
+                "status": "equivalent",
+                "reason_code": "equivalent_on_compared_inputs",
+                "compared_at": "2026-07-03T10:15:00+00:00",
+                "input_scope": ["dev.main.orders"],
+            }
+        }
+        store.save_plan(plan)
+        loaded = store.load_plan("pabc")
+        assert loaded.refactor_models == {"stg_orders": "unattributed"}, (
+            "a plan's rewritten models must round-trip: apply and a --for-plan "
+            f"build read them; got {loaded.refactor_models!r}"
+        )
+        assert loaded.comparisons["stg_orders"]["status"] == "equivalent", (
+            "a recorded comparison must round-trip, or apply reports a compared "
+            f"rewrite as not compared; got {loaded.comparisons!r}"
         )
 
     def test_plan_locators_are_per_plan(self, store):

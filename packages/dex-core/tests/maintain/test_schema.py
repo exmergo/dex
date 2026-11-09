@@ -494,3 +494,41 @@ def test_relations_the_project_builds_are_not_reported_as_source_drift(maintain_
         "1 relation(s) built by this project were not reported as source drift "
         "(table_added)"
     ]
+
+
+def test_possible_rename_ranks_multiple_same_type_candidates():
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.maintain.drift import schema_drift
+    from exmergo_dex_core.maintain.snapshot import (
+        Snapshot,
+        TransformLayer,
+        WarehouseBaseline,
+    )
+
+    old_ds = Dataset(
+        identifier="raw.seeds",
+        columns=[ColumnProfile(name="path_prefix", data_type="VARCHAR")],
+    )
+    new_ds = Dataset(
+        identifier="raw.seeds",
+        columns=[
+            ColumnProfile(name="host", data_type="VARCHAR"),
+            ColumnProfile(name="path", data_type="VARCHAR"),
+            ColumnProfile(name="match_type", data_type="VARCHAR"),
+        ],
+    )
+    snap = Snapshot(
+        created_at="2026-01-01T00:00:00+00:00",
+        warehouse=WarehouseBaseline(datasets=[old_ds]),
+        transform_layer=TransformLayer(),
+    )
+    findings = schema_drift([new_ds], snap, None, None)
+    renames = [f for f in findings if f.code == "possible_rename"]
+
+    assert len(renames) == 1
+    rename = renames[0]
+    assert rename.column == "path"
+    assert rename.data["renamed_to"] == "path"
+    assert rename.data["renamed_from"] == "path_prefix"
+    assert rename.data["candidates"] == ["path", "match_type", "host"]
+    assert "path_prefix -> path, match_type, host" in rename.detail
