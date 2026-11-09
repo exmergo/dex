@@ -1101,6 +1101,13 @@ def column_contract_warnings(
         declared_lower = {c.lower(): None for c in declared}
 
         compiled = (compiled_models or {}).get(edit.path)
+        if compiled is None and lists_columns(edit.new_content):
+            warnings.append(
+                f"{edit.path}: schema.yml declares column(s) for {model}, but "
+                "the SELECT list could not be resolved statically "
+                "(compilation was not possible); the contract comparison was skipped"
+            )
+            continue
         sql_to_resolve = compiled.sql if compiled is not None else edit.new_content
         resolved = resolve_select_list(
             sql_to_resolve,
@@ -1109,14 +1116,9 @@ def column_contract_warnings(
         )
         produced = resolved.columns
         if produced is None:
-            reason = (
-                "compilation was not possible"
-                if compiled is None and lists_columns(edit.new_content)
-                else resolved.reason
-            )
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) for {model}, but "
-                f"the SELECT list could not be resolved statically ({reason}"
+                f"the SELECT list could not be resolved statically ({resolved.reason}"
                 "); the contract comparison was skipped"
             )
             continue
@@ -1186,9 +1188,13 @@ class _ProjectCatalog:
         }
 
     def reader(self, stack: frozenset[str]) -> Callable[[Any], Any]:
+        """Build a column reader for the given recursion stack."""
+
         return lambda relation: self._columns(relation, stack)
 
     def _columns(self, relation: Any, stack: frozenset[str]) -> Any:
+        """Resolve columns for a relation, using compiled model SQL if available."""
+
         from .declarations import model_sql_path
         from .select_list import RelationColumns, resolve_select_list
 
@@ -1200,17 +1206,22 @@ class _ProjectCatalog:
             path = model_sql_path(self.files, self.model_paths, relation.label)
             if path is not None:
                 compiled = (self.compiled_models or {}).get(path)
-                sql = compiled.sql if compiled is not None else self.files[path]
-                resolved = resolve_select_list(
-                    sql,
-                    dialect=self.dialect,
-                    relation_columns=self.reader(stack | {model}),
-                )
-                if resolved.columns is not None:
-                    return RelationColumns(
-                        sorted(resolved.columns), read_from=resolved.read_from
+                from .validate import lists_columns
+
+                if compiled is None and lists_columns(self.files[path]):
+                    inner = "compilation was not possible"
+                else:
+                    sql = compiled.sql if compiled is not None else self.files[path]
+                    resolved = resolve_select_list(
+                        sql,
+                        dialect=self.dialect,
+                        relation_columns=self.reader(stack | {model}),
                     )
-                inner = resolved.reason
+                    if resolved.columns is not None:
+                        return RelationColumns(
+                            sorted(resolved.columns), read_from=resolved.read_from
+                        )
+                    inner = resolved.reason
             if model in self.changed:
                 return RelationColumns(
                     reason=(

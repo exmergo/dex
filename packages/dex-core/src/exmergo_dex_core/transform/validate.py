@@ -144,10 +144,10 @@ _PLACEHOLDER = "__dex_jinja__"
 _CONTROL_FLOW_STMT = re.compile(r"\{%\s*-?\s*(?:for|if)\b")
 _COLUMN_LISTING = re.compile(
     r"\b(?:"
-    r"adapter\."
-    r"|(?:[A-Za-z0-9_]+\.)?star\s*\("
+    r"(?:[A-Za-z0-9_]+\.)?star\s*\("
     r"|(?:[A-Za-z0-9_]+\.)?get_filtered_columns_in_relation\s*\("
     r"|(?:[A-Za-z0-9_]+\.)?get_columns_in_relation\s*\("
+    r"|(?:[A-Za-z0-9_]+\.)?get_relation_columns\s*\("
     r"|(?:[A-Za-z0-9_]+\.)?fill_staging_columns\s*\("
     r")"
 )

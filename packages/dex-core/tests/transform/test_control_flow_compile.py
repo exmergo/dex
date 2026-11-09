@@ -512,6 +512,7 @@ def test_jinja_comments_do_not_require_compilation():
         "select {{ star(ref('orders')) }}",
         "select {{ dbt_utils.get_filtered_columns_in_relation(ref('orders')) }}",
         "select {{ adapter.get_columns_in_relation(ref('orders')) }}",
+        "select {{ adapter.get_relation_columns(ref('orders')) }}",
         "select {{ fivetran_utils.fill_staging_columns(source_columns=[]) }}",
         "{% set cols = adapter.get_columns_in_relation(ref('orders')) %}",
     ],
@@ -527,6 +528,8 @@ def test_plain_sql_does_not_require_compilation():
 
     assert not needs_compilation("select 1 as id from {{ ref('orders') }}")
     assert not needs_compilation("select 1 as id from adapter.orders")
+    assert not needs_compilation("select {{ adapter.quote('col') }} from tbl")
+    assert not needs_compilation("select {{ adapter.dispatch('m', 'p')() }} from tbl")
     assert not needs_compilation("{# {{ dbt_utils.star(ref('x')) }} #} select 1")
 
 
@@ -564,10 +567,69 @@ def test_column_contract_warnings_when_compilation_not_possible():
             path="models/loop.sql",
             kind=EditKind.MODEL_SQL,
             new_content=(
-                "select {{ dbt_utils.star(ref('stg_orders')) }} "
+                "select {{ dbt_utils.star(ref('stg_orders')) }} as aliased_col "
                 "from {{ ref('stg_orders') }}"
             ),
         )
+    ]
+    warnings = column_contract_warnings(edits, view, compiled_models=None)
+    assert any(
+        "compilation was not possible" in w and "contract comparison was skipped" in w
+        for w in warnings
+    ), warnings
+
+
+def test_column_contract_warnings_upstream_uncompiled_skips_downstream():
+    """#1200: Downstream select-star skips contract when upstream uncompiled."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.transform.plans import column_contract_warnings
+
+    view = DbtProjectView(
+        root=".",
+        project_name="test",
+        profile_name="test",
+        files={
+            "models/schema.yml": SourceFile(
+                path="models/schema.yml",
+                content=yaml.safe_dump(
+                    {
+                        "version": 2,
+                        "models": [
+                            {
+                                "name": "downstream",
+                                "columns": [{"name": "id"}, {"name": "email"}],
+                            }
+                        ],
+                    }
+                ),
+                sha256="h",
+            ),
+            "models/upstream.sql": SourceFile(
+                path="models/upstream.sql",
+                content=(
+                    "select {{ dbt_utils.star(ref('raw')) }} as aliased_col "
+                    "from {{ ref('raw') }}"
+                ),
+                sha256="h2",
+            ),
+        },
+        model_paths=["models"],
+    )
+    edits = [
+        PlanEdit(
+            path="models/upstream.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content=(
+                "select {{ dbt_utils.star(ref('raw')) }} as aliased_col "
+                "from {{ ref('raw') }}"
+            ),
+        ),
+        PlanEdit(
+            path="models/downstream.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content="select * from {{ ref('upstream') }}",
+        ),
     ]
     warnings = column_contract_warnings(edits, view, compiled_models=None)
     assert any(
