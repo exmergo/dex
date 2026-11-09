@@ -1,0 +1,77 @@
+version: 2
+models:
+  - name: daily_tickets
+    description: Support tickets opened per day.
+    config:
+      meta:
+        dex:
+          grain: [ticket_date]
+          population:
+            rule: "Days with at least one ticket."
+          assumptions:
+            - decision: Which days have a row
+              chosen: days with a ticket
+              evidence: data
+              column: ticket_date
+              detail: the model groups the tickets it has
+    columns:
+      - name: ticket_date
+        data_type: date
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key, null_rule: never}}}
+      - name: tickets
+        data_type: bigint
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count}}}
+  - name: workspace_memberships
+    description: Workspace memberships.
+    config:
+      meta:
+        dex:
+          grain: [membership_id]
+          population:
+            rule: "Every membership."
+          assumptions:
+            - decision: Which memberships are in
+              chosen: every membership
+              evidence: default
+              column: workspace_id
+              detail: no filter was asked for
+    columns:
+      - name: membership_id
+        data_type: integer
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key, null_rule: never}}}
+      - name: workspace_id
+        data_type: integer
+        config: {meta: {dex: {role: foreign_key}}}
+      - name: user_id
+        data_type: integer
+        config: {meta: {dex: {role: foreign_key}}}
+  - name: shipments_loaded
+    description: Shipments with how long each took to load.
+    config:
+      meta:
+        dex:
+          grain: [shipment_id]
+          population:
+            rule: "Every shipment, however late it was loaded."
+          assumptions:
+            - decision: Which shipments are in
+              chosen: every shipment
+              evidence: request
+              column: days_to_load
+              detail: the request asks for the late shipments
+    columns:
+      - name: shipment_id
+        data_type: integer
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key, null_rule: never}}}
+      - name: shipped_on
+        data_type: date
+        config: {meta: {dex: {role: time}}}
+      - name: region
+        data_type: varchar
+        config: {meta: {dex: {role: dimension}}}
+      - name: days_to_load
+        data_type: bigint
+        config: {meta: {dex: {role: measure, aggregation: max, additivity: non_additive, unit: days}}}

@@ -576,6 +576,8 @@ ranks what matters, profiles it, and infers how the tables join.
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """The argparse tree for every group and subcommand."""
+
     parser = argparse.ArgumentParser(
         prog="dex",
         description=(
@@ -1375,6 +1377,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=None,
                         metavar="COLUMN",
                         help="baseline column whose type may change in its family",
+                    )
+                    expect = sp.add_mutually_exclusive_group()
+                    expect.add_argument(
+                        "--expect",
+                        default=None,
+                        metavar="JSON",
+                        help="JSON: the rows the plan may add, remove and change",
+                    )
+                    expect.add_argument(
+                        "--expect-file",
+                        default=None,
+                        metavar="PATH",
+                        help='read --expect\'s JSON from a file ("-" reads stdin)',
                     )
                     sp.add_argument(
                         "--target",

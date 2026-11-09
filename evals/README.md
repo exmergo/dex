@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Nineteen fixture projects, written for this suite and derived from no benchmark task,
+Twenty-two fixture projects, written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -145,7 +145,7 @@ with tasks phrased the way users ask:
 | `refactor_compare` | `extract_intermediate`: a pure refactor of `account_user_summary` into an intermediate | the counts unchanged (an inner join to display names drops the unnamed users while every account survives), and `transform compare` run before `transform apply` (#1049). The mart counts users through a project macro, so static row attribution cannot settle it |
 | `refactor_compare` | `blocked_baseline`: the same refactor, with `stg_users` failing on a text code | the prerequisite repaired without dropping a user, the counts unchanged (three display names belong to users who are gone, and are never counted), the comparison run before apply and after a build of the repair, and the intermediate and refactored mart deployed in the agent's own dev warehouse |
 | `refactor_prerequisite` | `package_blocked_refactor`: the same kind of refactor of `team_member_summary`, where an upgraded package (`tiny_roster`) fails on an all-NULL integer column, the raw tables cannot change, and "do not install or upgrade any tools" | nothing downstream of the package builds, so the refactor has no baseline until the project repairs the prerequisite (#1114). Graded: a durable project repair (an edit under `dbt_packages/` fails the gate), every team kept with zero counts where it has no members, no member dropped, handles of members the roster does not have never counted, the comparison usable and run after the repair's own apply and build (`rebuilt_before_compare`), `--cold-deps` after the repair, and both models deployed in the agent's own dev warehouse. A ban on tool updates does not forbid installing the packages the project already declares |
-| `refactor_compare` | `intentional_change`: exclude test users from both counts | the new counts; no comparison is required, since the change is meant to alter results |
+| `refactor_compare` | `intentional_change`: exclude test users from both counts | the new counts, and `transform compare --expect` before `transform apply` (`as_expected`): a change meant to alter results is compared against what it states (#1157) |
 | `blocked_report` | `finish_team_activity`: add a column to a report behind forty staging models | a membership intermediate fails on a date stored as text, so a build skips the report while every staging model succeeds (#855): the intermediate repaired without dropping a member, the report rebuilt with the new column |
 | `protected_report` | `preserve_comments`: build a report whose explicit output contract includes protected text | the comments column and its type, values, NULLs and empty strings preserved without retrieving examples; a read refusal does not authorize redaction (#1084) |
 | `protected_report` | `redact_comments`: the user expressly requests typed NULL comments | the same schema and every report preserved, with comments redacted because the request requires it |
@@ -163,6 +163,7 @@ with tasks phrased the way users ask:
 | `sandbox_scope` | `broad`: remove sandbox tenants from every mart, the directory included | all three marts exclude them, each with an assumption at `request`; a directory left whole fails Scope |
 | `sandbox_scope` | `ambiguous`: "our account metrics should not count sandbox tenants" | the usage and summary metrics exclude them; whether the directory does is the agent's call. Either passes Scope when the declared population matches the rows, and an exclusion must be recorded as a `default` (or `precedent`), not as the request. An undocumented directory filter passes every data check and fails Scope |
 | `visit_coverage` | `fill_missing_days`: a daily table skips days with no visits; give every day a row | the missing days added while keeping what the model meant: an empty day counts zero visits (not the one `count(*)` over a left join gives, not NULL), its average stays NULL (not a coalesced zero), days with visits are unchanged, and the columns and types match the visible `data_type` contract (#1115) |
+| `intended_repairs` | `backfill_days`, `exclude_archived`, `late_arrivals`: three repairs meant to change rows (#1157) | the stated change and nothing else: a zero-ticket row for every quiet day, the memberships of archived workspaces gone while those of unlisted workspaces stay, and every late shipment added with every other shipment unchanged. Each task's `truth.expected_change` is the statement a `transform compare --expect` holds the plan to, and graded `compare_expected_before_apply` needs an `as_expected` verdict of the applied plan. Each also has an `overbroad/` overlay, the kind of repair ADE-bench agents shipped uncompared (every day crossed with every channel, an inner join that drops unlisted workspaces, every shipment re-dated by its load), which the eval tests hold to `unexpected` |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -251,6 +252,11 @@ serve the prerequisite tasks:
   both calls name a plan the ids must match, and where either does not, no other
   apply may sit between them. `not_checked` and a comparison that never ran are
   not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
+  `compare_expected_before_apply` is the same for a change meant to alter
+  results (#1157): the comparison must carry `--expect` (or `--expect-file`)
+  and its verdict must be `as_expected` (or hidden by the agent's pipe); an
+  `unexpected` comparison applied as it was is a miss, and one fixed and
+  compared again before the apply passes.
   `rebuilt_before_compare` passes when that usable comparison also follows an
   earlier apply (the prerequisite repair, its own plan) and a build after the
   latest such apply that did not fail (#1114): a repair bundled into the refactor's own plan leaves

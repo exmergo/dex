@@ -199,7 +199,7 @@ def test_the_inner_join_extraction_is_different_and_recorded(accounts):
     # The fixture's own build made the inputs the comparison read (#1114).
     assert recorded["inputs_built_by"]["cold"] is False
     assert recorded["inputs_built_by"]["invocation_id"]
-    assert any("did not establish equivalence" in n for n in applied.notes)
+    assert any("did not establish the results were kept" in n for n in applied.notes)
     assert not any("comparison" in w for w in applied.warnings)
 
 
