@@ -1085,6 +1085,76 @@ def test_the_downstream_flag_pair_reaches_the_engine_as_one_tri_state(
         )
 
 
+def test_transform_build_select_accepts_several_values_or_quoted(monkeypatch):
+    """`transform build --select` accepts multiple space-separated selectors or a
+    quoted list, joining them as dbt reads them (#1061)."""
+
+    from exmergo_dex_core.cli import _build_parser
+    from exmergo_dex_core.transform import commands
+
+    parser = _build_parser()
+
+    # Multiple space-separated values
+    args = parser.parse_args(
+        [
+            "transform",
+            "build",
+            "--select",
+            "stg_accounts",
+            "stg_users",
+            "stg_display_names",
+        ]
+    )
+    assert args.select == ["stg_accounts", "stg_users", "stg_display_names"]
+
+    # Quoted string value
+    args_quoted = parser.parse_args(
+        ["transform", "build", "--select", "stg_accounts stg_users"]
+    )
+    assert args_quoted.select == ["stg_accounts stg_users"]
+
+    # Single value
+    args_single = parser.parse_args(["transform", "build", "--select", "stg_accounts"])
+    assert args_single.select == ["stg_accounts"]
+
+    # Dispatch to build joins multiple values into space-separated string
+    seen: dict = {}
+
+    def capture(engine, **kwargs):
+        seen.update(kwargs)
+        raise ValueError("captured")
+
+    monkeypatch.setattr(commands, "build", capture)
+
+    with pytest.raises(ValueError, match="captured"):
+        commands.cmd_build(args, engine=None)
+    assert seen["select"] == "stg_accounts stg_users stg_display_names"
+
+    seen.clear()
+    with pytest.raises(ValueError, match="captured"):
+        commands.cmd_build(args_quoted, engine=None)
+    assert seen["select"] == "stg_accounts stg_users"
+
+    monkeypatch.undo()
+
+    # Direct library call with a sequence joins values as well
+    seen.clear()
+
+    def capture_project(engine, **kwargs):
+        seen.update(kwargs)
+        raise ValueError("captured_project")
+
+    monkeypatch.setattr(commands, "_build_project", capture_project)
+    with pytest.raises(ValueError, match="captured_project"):
+        commands.build(None, select=["stg_accounts", "stg_users"])
+    assert seen["select"] == "stg_accounts stg_users"
+
+    seen.clear()
+    with pytest.raises(ValueError, match="captured_project"):
+        commands.build(None, select=("stg_accounts", "stg_users"))
+    assert seen["select"] == "stg_accounts stg_users"
+
+
 # --- the config file, as every command reads it -----------------------------------
 
 

@@ -4745,7 +4745,7 @@ def build(
     engine: DexEngine,
     *,
     target: str | None = None,
-    select: str | None = None,
+    select: str | Sequence[str] | None = None,
     verify: bool = False,
     for_plan: str | None = None,
     for_plan_document: Any = None,
@@ -4779,6 +4779,8 @@ def build(
         "pass the plan id the build is for, or omit the flag to build with no "
         "plan coverage",
     )
+    if select is not None and not isinstance(select, str):
+        select = " ".join(select)
     kwargs: dict[str, Any] = {
         "target": target,
         "select": select,
@@ -5380,12 +5382,15 @@ def _for_plan_document(args: argparse.Namespace) -> Any:
 
 
 def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    select = getattr(args, "select", None)
+    if select is not None and not isinstance(select, str):
+        select = " ".join(select)
     try:
         return to_envelope(
             build(
                 engine,
                 target=getattr(args, "target", None),
-                select=getattr(args, "select", None),
+                select=select,
                 verify=getattr(args, "verify", False),
                 for_plan=getattr(args, "for_plan", None),
                 for_plan_document=_for_plan_document(args),
