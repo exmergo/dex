@@ -667,9 +667,8 @@ def _column_contract(
             "an earlier run's output rather than this build's"
         )
 
-    declared, _undeclared, plan_notes = verify_mod.column_contract_plan(
-        project_dir, scope=scope
-    )
+    plan = verify_mod.column_contract_plan(project_dir, scope=scope)
+    declared, _undeclared, plan_notes = plan
     if plan_notes:
         result.warnings.extend(plan_notes)
         return plan_notes[0]
@@ -702,7 +701,12 @@ def _column_contract(
     relations = verify_mod.built_model_relations(project_dir, scope)
     # The no-columns count is reported by name in the record above.
     check = verify_mod.column_contract_check(
-        adapter, declared, relations, [meta.identifier for meta in live], 0
+        adapter,
+        declared,
+        relations,
+        [meta.identifier for meta in live],
+        0,
+        package_entries=getattr(plan, "package_entries", None),
     )
     result.findings.extend(check.findings)
     result.warnings.extend(check.notes)
