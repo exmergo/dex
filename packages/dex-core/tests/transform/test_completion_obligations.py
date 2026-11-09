@@ -424,3 +424,54 @@ def test_a_plain_build_with_no_incremental_test_names_that(
     assert completion["obligations"]["incremental_replay"][0]["reason_code"] == (
         "no_incremental_test"
     )
+
+
+# --- population_delta (#1228) --------------------------------------------------------
+
+
+def _delta(status: str, **extra) -> dict:
+    return {
+        "ran": True,
+        "findings": [],
+        "suppressed": {},
+        "population_delta": [{"model": FCT, "status": status, **extra}],
+    }
+
+
+def test_a_population_that_asks_is_listed_as_needing_a_decision():
+    completion = summarize_completion(
+        _evidence(_nodes(), required=[FCT]),
+        _delta("needs_decision", finding="population_delta"),
+    )
+    obligations = completion.data()["obligations"]
+    [entry] = obligations["needs_decision"]
+    assert entry == {
+        "model": FCT,
+        "kind": "population_delta",
+        "status": "needs_decision",
+        "finding": "population_delta",
+    }
+    assert obligations["by_status"] == {"needs_decision": 1}
+    # A question is not a failed check, and not an assertion that rows held.
+    assert completion.assurance.failed_checks.count == 0
+    assert FCT not in completion.assurance.asserted.names
+
+
+@pytest.mark.parametrize("status", ["satisfied", "settled", "not_applicable"])
+def test_a_population_that_does_not_ask_lists_nothing(status):
+    obligations = summarize_completion(
+        _evidence(_nodes(), required=[FCT]), _delta(status)
+    ).data()["obligations"]
+    assert "needs_decision" not in obligations
+
+
+def test_a_drafted_parent_that_was_not_measured_is_unchecked():
+    obligations = summarize_completion(
+        _evidence(_nodes(), required=[FCT]),
+        _delta("unchecked", reason_code="no_parent_drafted"),
+    ).data()["obligations"]
+    [entry] = obligations["unchecked"]
+    assert (entry["kind"], entry["reason_code"]) == (
+        "population_delta",
+        "no_parent_drafted",
+    )
