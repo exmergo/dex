@@ -919,7 +919,8 @@ def test_the_local_catalog_omits_the_population_sentence_a_build_compiles(
 
 
 def test_a_mart_named_with_double_underscore_derives_single_underscore_name():
-    """Fivetran convention `intercom__threads` derives `intercom_threads` with model ref intact (#1207)."""
+    """Fivetran convention `intercom__threads` derives `intercom_threads`
+    with model ref intact (#1207)."""
     found = sd.derive(
         "intercom__threads",
         _declared(
@@ -932,14 +933,17 @@ def test_a_mart_named_with_double_underscore_derives_single_underscore_name():
     assert found.status == "proposed"
     assert found.body["name"] == "intercom_threads"
     assert found.body["model"] == "ref('intercom__threads')"
-    assert any("intercom_threads" in n and "intercom__threads" in n for n in found.notes)
+    assert any(
+        "intercom_threads" in n and "intercom__threads" in n for n in found.notes
+    )
     assert any("MetricFlow does not allow '__'" in n for n in found.notes)
 
 
 def test_a_double_underscore_mart_gets_proposal_passing_metricflow_validation(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
-    """End-to-end plan with a double-underscore mart proposes valid MetricFlow YAML (#1207)."""
+    """End-to-end plan with a double-underscore mart proposes valid MetricFlow
+    YAML (#1207)."""
     fivetran_mart = {
         "model": "intercom__threads",
         "description": "One row per conversation thread.",
