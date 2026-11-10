@@ -1227,6 +1227,11 @@ def verify(
             )
             proven_grains: dict[str, dict] = {}
             grain_coverage = []
+            spine_or_generated = (
+                verify_mod.spine_or_generated_models(project_dir, adapter.dialect)
+                if project_dir is not None
+                else set()
+            )
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1236,6 +1241,7 @@ def verify(
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
                 records=grain_coverage,
+                spine_or_generated=spine_or_generated,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1409,6 +1415,7 @@ def _grain_contract(
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
     records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1448,6 +1455,7 @@ def _grain_contract(
         scoped_models,
         proven=proven,
         records=records,
+        spine_or_generated=spine_or_generated,
     )
     return findings, notes, None
 
