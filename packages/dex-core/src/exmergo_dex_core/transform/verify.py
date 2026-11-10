@@ -806,7 +806,8 @@ def _row_population(
             f"(dex sees {len(identifiers)} object(s), none of them the "
             "relations this build produced); --verify reads the configured dev "
             "namespace, so a relation built anywhere else, such as a custom "
-            "schema, is not judged"
+            "schema or generate_schema_name that lands outside the dev "
+            "namespace's naming, is not judged"
         )
 
     wanted = sorted({relation for check in checks for relation in check.relations})

@@ -875,6 +875,7 @@ def _package_lookup(
         else (current.content if current is not None else None)
     )
     seen: dict[str, str | None] = {}
+    targets: dict[str, Any] = {}
 
     def lookup(name: str) -> str | None:
         """The package that builds ``name``, or ``None``; remembered per name."""
@@ -882,9 +883,16 @@ def _package_lookup(
             found = find_package_target(
                 view.root, name, project_yml=text, manifest=view.manifest
             )
-            seen[name] = found.package if found is not None and found.enabled else None
+            targets[name] = found if found is not None and found.enabled else None
+            seen[name] = targets[name].package if targets[name] is not None else None
         return seen[name]
 
+    def get_target(name: str) -> Any:
+        """the target node of an installed package called ``name``."""
+        lookup(name)
+        return targets.get(name)
+
+    lookup.target = get_target  # type: ignore[attr-defined]
     return lookup
 
 

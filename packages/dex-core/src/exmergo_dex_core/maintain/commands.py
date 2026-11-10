@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
-from .. import command_args
+from .. import command_args, model_scope
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
@@ -1082,15 +1082,11 @@ def verify(
         if build_notes:
             suppressed["build_status"] = build_notes[0]
 
+    # A scope may be spelled as separate arguments, comma-separated, or as one
+    # quoted argument with the names separated by spaces: `a b`, `"a b"` and
+    # `a,b` all name the same models (#1243).
     wanted = (
-        {
-            name.strip().lower()
-            for raw in objects
-            for name in raw.split(",")
-            if name.strip()
-        }
-        if objects
-        else None
+        {name.lower() for name in model_scope.model_names(objects)} if objects else None
     )
     cost = None
     adapter = None
@@ -1227,6 +1223,11 @@ def verify(
             )
             proven_grains: dict[str, dict] = {}
             grain_coverage = []
+            spine_or_generated = (
+                verify_mod.spine_or_generated_models(project_dir, adapter.dialect)
+                if project_dir is not None
+                else set()
+            )
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1236,6 +1237,7 @@ def verify(
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
                 records=grain_coverage,
+                spine_or_generated=spine_or_generated,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1409,6 +1411,7 @@ def _grain_contract(
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
     records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1448,6 +1451,7 @@ def _grain_contract(
         scoped_models,
         proven=proven,
         records=records,
+        spine_or_generated=spine_or_generated,
     )
     return findings, notes, None
 

@@ -889,6 +889,225 @@ def test_an_ambiguous_input_names_no_command_and_says_why():
     assert "no profile run can settle" in warning
 
 
+def test_a_package_input_names_derived_dev_namespace_on_warehouse():
+    """#1199: a package model with custom schema derives the namespace."""
+
+    from types import SimpleNamespace
+
+    target = SimpleNamespace(schema="inbox", package="tiny_inbox")
+    drafts, warnings = draft(
+        ["fct"],
+        {"models/marts/fct.sql": "select id from {{ ref('stg_inbox') }}\n"},
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        package_target=lambda name: target if name == "stg_inbox" else None,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input == {
+        "relation": "stg_inbox",
+        "profiled": False,
+        "reason": (
+            "the cache has not profiled it, and its dev build in "
+            "SHOP.DBT_DEV_inbox is outside the source allowlist"
+        ),
+        "command": "explore profile SHOP.DBT_DEV_inbox.stg_inbox --target dev",
+    }
+    assert any(
+        "`explore profile SHOP.DBT_DEV_inbox.stg_inbox --target dev`" in w
+        for w in warnings
+    )
+
+
+def test_a_package_input_without_custom_schema_names_dev_namespace():
+    """#1199: a package model without custom schema uses the dev namespace."""
+
+    drafts, warnings = draft(
+        ["fct"],
+        {"models/marts/fct.sql": "select id from {{ ref('stg_inbox') }}\n"},
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        packaged=lambda name: "tiny_inbox" if name == "stg_inbox" else None,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input["command"] == (
+        "explore profile SHOP.DBT_DEV.stg_inbox --target dev"
+    )
+    assert any(
+        "`explore profile SHOP.DBT_DEV.stg_inbox --target dev`" in w for w in warnings
+    )
+
+
+def test_a_package_input_with_custom_schema_withholds_command_when_macro_overridden():
+    """#1199: an override of generate_schema_name withholds the profile hint."""
+
+    from types import SimpleNamespace
+
+    target = SimpleNamespace(schema="inbox", package="tiny_inbox")
+    drafts, warnings = draft(
+        ["fct"],
+        {
+            "models/marts/fct.sql": "select id from {{ ref('stg_inbox') }}\n",
+            "macros/generate_schema_name.sql": (
+                "{% macro generate_schema_name(custom_schema_name, node) %}"
+                "{{ custom_schema_name }}_{{ target.name }}{% endmacro %}\n"
+            ),
+        },
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        package_target=lambda name: target if name == "stg_inbox" else None,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert "project overrides generate_schema_name" in missing_input["reason"]
+    assert any("generate_schema_name" in w for w in warnings)
+
+
+def test_commands_draft_package_model_with_custom_schema(tmp_path, monkeypatch):
+    """#1199: commands._draft resolves package schema through lookup target."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.dbt_project import load as load_project
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage.memory import MemoryStore
+    from exmergo_dex_core.transform import commands
+    from exmergo_dex_core.transform.plans import EditKind, EditOp, PlanEdit
+
+    pkg_dbt = (
+        "name: tiny_inbox\nversion: '1.0'\nconfig-version: 2\n"
+        "model-paths: [models]\nmodels:\n  tiny_inbox:\n    +schema: inbox\n"
+    )
+    pkg_model = "select 1 as id\n"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").write_text(
+        "name: p\nversion: '1.0'\nconfig-version: 2\nmodel-paths: [models]\n"
+    )
+    (project_dir / "models").mkdir()
+    pkg_dir = project_dir / "dbt_packages" / "tiny_inbox"
+    (pkg_dir / "models").mkdir(parents=True)
+    (pkg_dir / "dbt_project.yml").write_text(pkg_dbt)
+    (pkg_dir / "models" / "stg_inbox.sql").write_text(pkg_model)
+
+    view = load_project(project_dir)
+    engine = DexEngine(
+        config=DexConfig(connector="snowflake"),
+        store=MemoryStore(),
+        repo_root=str(tmp_path),
+    )
+    monkeypatch.setattr(commands, "_dev_namespace", lambda _eng: "SHOP.DBT_DEV")
+
+    edits = [
+        PlanEdit(
+            path="models/fct.sql",
+            kind=EditKind.MODEL_SQL,
+            op=EditOp.UPSERT,
+            new_content="select id from {{ ref('stg_inbox') }}\n",
+        )
+    ]
+    drafts, warnings = commands._draft(engine, view, edits, ["fct"])
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input["command"] == (
+        "explore profile SHOP.DBT_DEV_inbox.stg_inbox --target dev"
+    )
+    assert any("SHOP.DBT_DEV_inbox" in w for w in warnings)
+
+
+def test_an_input_created_by_plan_names_post_build_command_and_has_no_command():
+    """#1199: an input created by the plan carries no command and names post-build."""
+
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('time_spine') }}\n",
+        "models/staging/time_spine.sql": "select 1 as id\n",
+    }
+    prior = {"models/marts/fct.sql": "select 1 as id\n"}
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        prior=prior,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["profiled"] is False
+    assert missing_input["reason"] == (
+        "it is built by this plan; run `transform build --target dev`, then "
+        "`explore profile SHOP.DBT_DEV.time_spine --target dev`"
+    )
+    [warning] = [w for w in warnings if "time_spine" in w and "profiled" in w]
+    assert "it is built by this plan" in warning
+    assert (
+        "run `transform build --target dev`, then "
+        "`explore profile SHOP.DBT_DEV.time_spine --target dev`"
+    ) in warning
+
+
+def test_an_input_created_by_plan_on_duckdb_names_plain_post_build_command():
+    """#1199: on duckdb an input created by the plan names post-build without dev."""
+
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('time_spine') }}\n",
+        "models/staging/time_spine.sql": "select 1 as id\n",
+    }
+    prior = {}
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="duckdb",
+        prior=prior,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["profiled"] is False
+    assert missing_input["reason"] == (
+        "it is built by this plan; run `transform build`, then "
+        "`explore profile time_spine`"
+    )
+    [warning] = [w for w in warnings if "time_spine" in w and "profiled" in w]
+    assert "it is built by this plan" in warning
+    assert "run `transform build`, then `explore profile time_spine`" in warning
+
+
+def test_an_input_created_by_plan_with_alias_names_alias_in_post_build_command():
+    """#1199: an input created by the plan with an alias uses the alias."""
+
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('time_spine') }}\n",
+        "models/staging/time_spine.sql": (
+            "{{ config(alias='dim_time') }}\nselect 1 as id\n"
+        ),
+    }
+    prior = {}
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        prior=prior,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["reason"] == (
+        "it is built by this plan; run `transform build --target dev`, then "
+        "`explore profile SHOP.DBT_DEV.dim_time --target dev`"
+    )
+    [warning] = [w for w in warnings if "time_spine" in w and "profiled" in w]
+    assert "it is built by this plan" in warning
+    assert "dim_time" in warning
+
+
 def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
     """#832: MetricFlow's time spine is ``select ... from range(...)``. sqlglot
     reads that table function as a table with no name, and the draft must not

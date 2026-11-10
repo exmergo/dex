@@ -164,6 +164,7 @@ def draft(
     prior: Mapping[str, str] | None = None,
     package_documented: Mapping[str, Mapping[str, str]] | None = None,
     packaged: Callable[[str], str | None] | None = None,
+    package_target: Callable[[str], Any] | None = None,
     key_facts: Callable[[], KeyFacts | None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
@@ -194,6 +195,9 @@ def draft(
     out: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     built: list[ReferenceIndex] = []
+
+    if package_target is None:
+        package_target = getattr(packaged, "target", None)
 
     def reference_index() -> ReferenceIndex | None:
         if index is None:
@@ -235,6 +239,8 @@ def draft(
             cache_note=cache_note,
             dev_namespace=dev_namespace,
             packaged=packaged,
+            package_target=package_target,
+            prior=prior,
         )
         if reading.usages and (found := reference_index()) is not None:
             precedent = _precedent(
@@ -1618,6 +1624,38 @@ def _column(dataset: Dataset | None, name: str) -> ColumnProfile | None:
     return next((c for c in dataset.columns if c.name.lower() == name.lower()), None)
 
 
+def _is_plan_created_or_edited(
+    files: Mapping[str, str],
+    prior: Mapping[str, str] | None,
+    model_paths: list[str],
+    relation: str,
+) -> bool:
+    """whether ``relation`` is created or edited by the current plan."""
+
+    if prior is None:
+        return False
+    current_path = model_sql_path(files, model_paths, relation)
+    if current_path is None:
+        return False
+    prior_path = model_sql_path(prior, model_paths, relation)
+    if prior_path is None:
+        return True
+    return prior.get(prior_path) != files.get(current_path)
+
+
+_MACRO_GENERATE_SCHEMA_NAME = re.compile(r"\{%-?\s*macro\s+generate_schema_name\b")
+
+
+def _has_custom_generate_schema_name(files: Mapping[str, str]) -> bool:
+    """whether the project overrides dbt's default ``generate_schema_name``."""
+
+    return any(
+        bool(_MACRO_GENERATE_SCHEMA_NAME.search(content))
+        for path, content in files.items()
+        if path.endswith(".sql")
+    )
+
+
 # --- assembling the draft -------------------------------------------------------------
 
 
@@ -1633,6 +1671,8 @@ def _drafted(
     model: str | None = None,
     dev_namespace: str | None = None,
     packaged: Callable[[str], str | None] | None = None,
+    package_target: Callable[[str], Any] | None = None,
+    prior: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1691,6 +1731,17 @@ def _drafted(
                     f"({', '.join(ambiguous)}), and a ref() is read by name, so "
                     "no profile run can settle which one it means"
                 )
+            elif _is_plan_created_or_edited(files, prior, model_paths, relation):
+                built = _alias_of_model(files, model_paths, relation) or relation
+                if dev_namespace is not None:
+                    build_cmd = "transform build --target dev"
+                    target_cmd = f"explore profile {dev_namespace}.{built} --target dev"
+                else:
+                    build_cmd = "transform build"
+                    target_cmd = f"explore profile {built}"
+                entry["reason"] = (
+                    f"it is built by this plan; run `{build_cmd}`, then `{target_cmd}`"
+                )
             elif (
                 dev_namespace is not None
                 and model_sql_path(files, model_paths, relation) is not None
@@ -1706,6 +1757,45 @@ def _drafted(
                 entry["command"] = (
                     f"explore profile {dev_namespace}.{built} --target dev"
                 )
+            elif dev_namespace is not None and (
+                (packaged is not None and packaged(relation) is not None)
+                or (package_target is not None and package_target(relation) is not None)
+            ):
+                # an installed package model or seed. under dbt's default
+                # generate_schema_name, a custom schema is appended to the dev
+                # target's schema (<target.schema>_<custom>). when the project
+                # overrides generate_schema_name, the effective dev namespace
+                # cannot be safely determined, so withhold the command.
+                target = (
+                    package_target(relation) if package_target is not None else None
+                )
+                custom = getattr(target, "schema", None) if target is not None else None
+                if custom:
+                    if _has_custom_generate_schema_name(files):
+                        entry["reason"] = cache_note or (
+                            "the cache has not profiled it, and the project overrides "
+                            "generate_schema_name so its dev namespace cannot be "
+                            "determined"
+                        )
+                    else:
+                        parts = dev_namespace.split(".")
+                        derived = ".".join([*parts[:-1], f"{parts[-1]}_{custom}"])
+                        entry["reason"] = cache_note or (
+                            "the cache has not profiled it, and its dev build in "
+                            f"{derived} is outside the source allowlist"
+                        )
+                        entry["command"] = (
+                            f"explore profile {derived}.{relation} --target dev"
+                        )
+                else:
+                    derived = dev_namespace
+                    entry["reason"] = cache_note or (
+                        "the cache has not profiled it, and its dev build in "
+                        f"{derived} is outside the source allowlist"
+                    )
+                    entry["command"] = (
+                        f"explore profile {derived}.{relation} --target dev"
+                    )
             else:
                 entry["reason"] = cache_note or "the cache has not profiled it"
                 entry["command"] = f"explore profile {relation}"
