@@ -972,6 +972,13 @@ def _grain_broken_finding(
 ) -> DriftFinding:
     duplicates = row_count - distinct_count
     severity, extra_data, note_suffix = _grain_severity(row_count, min_rows)
+    if source == "heuristic" and severity == "high":
+        severity = "medium"
+        extra_data = {**extra_data, "severity_cap_applied": "heuristic_grain"}
+        note_suffix = (
+            " (severity capped at medium: guessed from column name; "
+            "not a declared grain)"
+        )
     approx = "" if exact else "approximately "
     columns_text = " and ".join(columns) if len(columns) < 3 else ", ".join(columns)
     unique_word = "unique" if len(columns) == 1 else "jointly unique"
@@ -1290,6 +1297,7 @@ def grain_findings(
     min_rows: int = 100,
     proven: dict[str, dict] | None = None,
     records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """A built relation's grain against what the project declares (or, absent
     any declaration, a free naming guess), for every selected model (#229).
@@ -1313,9 +1321,11 @@ def grain_findings(
     ``declared_composite_checks`` already rests on. Only a model with no
     declaration at all falls to the heuristic, which is free-first and
     escalates to exact only when already close (see
-    :func:`_heuristic_candidate`) -- so a ``grain_broken`` finding's ``exact``
-    flag is always True except in exactly that one approximate-verdict case,
-    honestly naming the one place this check ever reports from a guess.
+    :func:`_heuristic_candidate`), unless the model is a time spine,
+    generated in SQL, or driven off one (#1202). A ``grain_broken`` finding's
+    ``exact`` flag is always True except in exactly that one
+    approximate-verdict case, honestly naming the one place this check ever
+    reports from a guess.
 
     An unknown grain and a broken one are reported through different
     channels on purpose (the issue's own framing): a broken grain is a
@@ -1385,6 +1395,12 @@ def grain_findings(
                     no_count.append(model)
                 if missing:
                     unresolved[model] = missing
+                continue
+
+            if spine_or_generated and (
+                model in spine_or_generated
+                or model.lower() in {m.lower() for m in spine_or_generated}
+            ):
                 continue
 
             finding, reason = _heuristic_candidate(adapter, model, identifier, min_rows)
@@ -1823,6 +1839,130 @@ def _driving_parent(tree, sql_shape):
                 )
             continue
         return relation, reducers, found_joins, multiplies, None, cte_scopes
+
+
+def spine_or_generated_models(
+    project_dir: Path | str | None,
+    dialect: str = "duckdb",
+    nodes: dict[str, dict] | None = None,
+) -> set[str]:
+    """Models that are a time spine, generated in SQL, or driven off one (#1202).
+
+    Such models supply anchors or cross products rather than preserving a
+    parent's population or holding a natural single-column primary key. Absent
+    a declared grain, the naming heuristic is skipped on them so a cross
+    product (like a calendar crossed with customers) is not flagged as a
+    broken grain.
+    """
+
+    if nodes is None:
+        if project_dir is None:
+            return set()
+        project_path = (
+            Path(project_dir) if isinstance(project_dir, str) else project_dir
+        )
+        nodes = _manifest_nodes(project_path) or {}
+    if not nodes:
+        return set()
+
+    import sqlglot
+
+    from .. import sql_shape
+
+    relations: dict[str, str] = {}
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        if isinstance(relation, str) and relation and isinstance(node.get("name"), str):
+            relations[strip_relation_quoting(relation)] = manifest_node_label(uid, node)
+
+    known = sorted(relations)
+
+    def name_of(relation: str) -> tuple[str, str]:
+        matched = match_identifier(relation, known)
+        resolved = matched[0] if len(matched) == 1 else relation
+        return resolved, relations.get(resolved, resolved)
+
+    non_population: dict[str, str] = {}
+    model_by_relation: dict[str, dict] = {}
+    result: set[str] = set()
+
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        if not (isinstance(relation, str) and relation):
+            continue
+        label = manifest_node_label(uid, node)
+        stripped = strip_relation_quoting(relation)
+        model_by_relation[stripped] = node
+        if node.get("time_spine") or str(node.get("name", "")).lower() == (
+            _LEGACY_TIME_SPINE
+        ):
+            non_population[stripped] = _TIME_SPINE
+            result.add(label)
+
+    checks: list[tuple[str, str, list[str]]] = []
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        code = node.get("compiled_code")
+        if not (isinstance(node.get("name"), str) and node["name"]):
+            continue
+        name = manifest_node_label(uid, node)
+        if not (isinstance(relation, str) and relation):
+            continue
+        stripped = strip_relation_quoting(relation)
+        if not (isinstance(code, str) and code.strip()):
+            continue
+        try:
+            tree = sqlglot.parse_one(code, read=dialect)
+        except Exception:
+            tree = None
+        if tree is None:
+            continue
+        table, _, found_joins, _, reason, cte_scopes = _driving_parent(tree, sql_shape)
+        model_by_relation.pop(stripped, None)
+        if table is None:
+            if reason == _GENERATED_SQL:
+                result.add(name)
+                non_population.setdefault(stripped, _GENERATED_PARENT)
+            continue
+        parent_relation, _ = name_of(_table_name(table))
+        join_rels: list[str] = []
+        for join in found_joins:
+            resolved = _through_ctes(join.relation, cte_scopes, sql_shape)
+            if resolved is not None:
+                join_rels.append(name_of(_table_name(resolved))[0])
+        checks.append((name, parent_relation, join_rels))
+
+    for _name, parent_relation, _ in checks:
+        parent_node = model_by_relation.get(parent_relation)
+        if parent_relation in non_population or parent_node is None:
+            continue
+        parent_code = parent_node.get("compiled_code")
+        if not (isinstance(parent_code, str) and parent_code.strip()):
+            continue
+        try:
+            parent_tree = sqlglot.parse_one(parent_code, read=dialect)
+        except Exception:
+            parent_tree = None
+        if parent_tree is not None and (
+            _driving_parent(parent_tree, sql_shape)[4] == _GENERATED_SQL
+        ):
+            non_population[parent_relation] = _GENERATED_PARENT
+        else:
+            model_by_relation.pop(parent_relation, None)
+
+    for name, parent_relation, join_rels in checks:
+        if parent_relation in non_population or any(
+            j in non_population for j in join_rels
+        ):
+            result.add(name)
+
+    return result
 
 
 def row_population_plan(

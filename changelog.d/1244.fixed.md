@@ -1,0 +1,2 @@
+**`maintain verify` skips naming-guess grain checks on spine-driven and generated models.**
+When a model declares no grain, `maintain verify` skips falling back to an id-shaped naming guess if the model is a time spine, generated in SQL, or driven off one (such as a calendar crossed with customers), aligning with `transform build --verify`. In addition, naming-guess grain findings on other models are capped at medium severity.
