@@ -1112,8 +1112,8 @@ the safety contract:
    resolves it to. `explore profile` flags a list from its element's type, so
    `email VARCHAR[]` and BigQuery's repeated `ARRAY<STRING>` are flagged as a
    string column of that name would be. A saved measure that answers with a column's
-   values rather than a number about it (`min`, `max`, `first`, `last`, `collect`,
-   or the model's own custom aggregation) has the columns it aggregates screened
+   values rather than a number about it (`min`, `max`, `first`, `last`, `median`,
+   `percentile`, `collect`, or the model's own custom aggregation) has the columns it aggregates screened
    as grouped columns, so `collect(email.value)` is refused where grouping by
    `email.value` would be; a formula dex cannot read refuses the query.
 2. **The grain check**, then **translation** into a SLayer query, which refuses

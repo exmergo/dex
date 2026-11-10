@@ -150,12 +150,13 @@ class LoadedModel:
         return None if refs is None else [ref.measure_name for ref in refs]
 
 
-#: SLayer's built-in aggregations whose result is one of their input's values
-#: (`min`, `max`, `first`, `last`) or all of them (`collect`, a list). A model's
-#: own custom aggregation is read as one too, since dex cannot say what its SQL
-#: returns.
+#: SLayer's built-in aggregations whose result can be one of their input's values
+#: (`min`, `max`, `first`, `last`; `median` over an odd count, and `percentile`,
+#: which at 0 or 1 is the minimum or maximum) or all of them (`collect`, a list).
+#: A model's own custom aggregation is read as one too, since dex cannot say what
+#: its SQL returns.
 VALUE_AGGREGATIONS: frozenset[str] = frozenset(
-    {"min", "max", "first", "last", "collect"}
+    {"min", "max", "first", "last", "median", "percentile", "collect"}
 )
 
 

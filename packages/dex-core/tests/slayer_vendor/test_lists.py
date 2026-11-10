@@ -83,6 +83,7 @@ POSTS = {
         {"name": "tag_list", "formula": "tags.value:collect"},
         {"name": "addresses", "formula": "email.value:collect"},
         {"name": "last_address", "formula": "email.value:max"},
+        {"name": "median_score", "formula": "score:median"},
     ],
 }
 
@@ -231,6 +232,7 @@ def test_for_dimension_answers_for_an_element_token(repo, capsys):
         "posts.tag_list",
         "posts.addresses",
         "posts.last_address",
+        "posts.median_score",
     }
 
 
@@ -459,6 +461,12 @@ def test_a_measure_returning_a_pii_column_s_values_is_refused(
     assert rc != 0
     assert "would surface PII" in _errors(envelope)
     assert "posts.email.value" in _errors(envelope)
+
+
+def test_a_value_returning_measure_over_a_non_pii_column_runs(repo, capsys):
+    rc, envelope = _query(capsys, repo, "posts.median_score")
+
+    assert rc == 0, envelope["errors"]
 
 
 def test_the_gate_runs_before_anything_renders(repo, monkeypatch):
