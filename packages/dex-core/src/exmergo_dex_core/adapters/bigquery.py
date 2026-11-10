@@ -861,10 +861,15 @@ class BigQueryAdapter:
     def exact_distinct_counts(
         self, identifier: str, columns: list[str]
     ) -> dict[str, int]:
-        """Exact COUNT(DISTINCT) for near-unique columns, spent only within the
+        """Exact count(distinct) for near-unique columns, spent only within the
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let uniqueness verdicts stay
         approximate. A metered adapter never self-escalates past its ceiling.
+
+        Columns BigQuery cannot count distinctly (nested and complex types:
+        record/struct, json, geography, range, interval, array) are skipped:
+        maintain verify and maintain drift send key columns here directly,
+        and one BigQuery cannot group would fail the whole statement.
 
         Charged at the floored bytes, not the raw dry-run number: this is one
         billed query like any other, so it bills (and must be budgeted
@@ -873,9 +878,18 @@ class BigQueryAdapter:
 
         if self._unqueryable(identifier) or not columns:
             return {}
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        countable = [
+            name
+            for name in columns
+            if name not in types or not self._is_nested(types[name])
+        ]
+        if not countable:
+            return {}
         select_parts = [
             f"COUNT(DISTINCT {_quote_ident(name)}) AS d_{i}"
-            for i, name in enumerate(columns)
+            for i, name in enumerate(countable)
         ]
         sql = assert_select_only(
             f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}",  # noqa: S608
@@ -891,7 +905,7 @@ class BigQueryAdapter:
             return {}
         _job, iterator = self._run(sql, floored)
         rows = list(iterator)
-        return {name: int(rows[0][f"d_{i}"]) for i, name in enumerate(columns)}
+        return {name: int(rows[0][f"d_{i}"]) for i, name in enumerate(countable)}
 
     def distinct_combination_counts(
         self, identifier: str, combinations: list[list[str]]
@@ -903,6 +917,10 @@ class BigQueryAdapter:
         up the grain wholesale. A metered adapter never self-escalates past its
         ceiling.
 
+        Combinations containing columns BigQuery cannot group or distinct
+        (nested and complex types: record/struct, json, geography, range,
+        interval, array) are skipped before pricing.
+
         Charged at the floored bytes, not the raw dry-run number: this is one
         billed query like any other, so it bills (and must be budgeted
         against) at least the per-query minimum (issue #107). That floor is
@@ -911,6 +929,17 @@ class BigQueryAdapter:
         so only a probe that would genuinely cost less gets re-priced."""
 
         if self._unqueryable(identifier) or not combinations:
+            return {}
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        valid_combos = [
+            combo
+            for combo in combinations
+            if not any(
+                types.get(name) and self._is_nested(types[name]) for name in combo
+            )
+        ]
+        if not valid_combos:
             return {}
         priced: dict[int, tuple[str, float]] = {}
 
@@ -924,7 +953,7 @@ class BigQueryAdapter:
             return floored
 
         probed, note = affordable_combinations(
-            combinations,
+            valid_combos,
             price,
             self.cost_gate.try_charge,
             floor=float(_MIN_BILLED_BYTES),
@@ -958,8 +987,24 @@ class BigQueryAdapter:
             return None
         if null_columns and self._sampled_percent(identifier) is not None:
             return None
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        filtered_distinct = [
+            name
+            for name in distinct
+            if name not in types or not self._is_nested(types[name])
+        ]
+        filtered_combos = [
+            combo
+            for combo in combinations
+            if not any(
+                types.get(name) and self._is_nested(types[name]) for name in combo
+            )
+        ]
+        if not (filtered_distinct or filtered_combos or null_columns):
+            return None
         sql, _plan = self._table_probe_statement(
-            identifier, distinct, combinations, null_columns
+            identifier, filtered_distinct, filtered_combos, null_columns
         )
         return sql
 
@@ -992,18 +1037,32 @@ class BigQueryAdapter:
         reads there must be what it read when the probes were separate.
         """
 
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        filtered_distinct = [
+            name
+            for name in distinct
+            if name not in types or not self._is_nested(types[name])
+        ]
+        filtered_combos = [
+            combo
+            for combo in combinations
+            if not any(
+                types.get(name) and self._is_nested(types[name]) for name in combo
+            )
+        ]
         if (
             self.table_probe_sql(
                 identifier,
-                distinct=distinct,
-                combinations=combinations,
+                distinct=filtered_distinct,
+                combinations=filtered_combos,
                 null_columns=null_columns,
             )
             is None
         ):
             return None
         sql, plan = self._table_probe_statement(
-            identifier, distinct, combinations, null_columns
+            identifier, filtered_distinct, filtered_combos, null_columns
         )
         try:
             floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
@@ -1015,10 +1074,12 @@ class BigQueryAdapter:
         rows = list(iterator)
         row = rows[0]
         return TableProbe(
-            distinct={name: int(row[f"kd_{i}"]) for i, name in enumerate(distinct)},
+            distinct={
+                name: int(row[f"kd_{i}"]) for i, name in enumerate(filtered_distinct)
+            },
             combinations={
                 tuple(combo): int(row[f"cd_{i}"])
-                for i, combo in enumerate(combinations)
+                for i, combo in enumerate(filtered_combos)
             },
             aggregates=(
                 self._read_aggregates(row, plan, sampled=False)
@@ -1069,15 +1130,27 @@ class BigQueryAdapter:
         the extra scan, return nothing and report no value domain. A metered
         adapter never self-escalates past its ceiling.
 
+        Columns BigQuery cannot group or distinct (nested and complex types:
+        record/struct, json, geography, range, interval, array) are skipped.
+
         Charged at the floored bytes, not the raw dry-run number: this is one
         billed query like any other, so it bills (and must be budgeted
         against) at least the per-query minimum (issue #107)."""
 
         if self._unqueryable(identifier) or not columns:
             return {}
+        _meta, table_columns = self.table_metadata(identifier)
+        types = {col.name: col.data_type for col in table_columns}
+        countable = [
+            name
+            for name in columns
+            if name not in types or not self._is_nested(types[name])
+        ]
+        if not countable:
+            return {}
         table = self._quote(identifier)
         parts = []
-        for i, name in enumerate(columns):
+        for i, name in enumerate(countable):
             qcol = _quote_ident(name)
             parts.append(
                 "(SELECT ARRAY_AGG(STRUCT(v AS v, c AS c) ORDER BY c DESC, v "  # noqa: S608
@@ -1104,7 +1177,7 @@ class BigQueryAdapter:
                 values=[(entry["v"], entry["c"]) for entry in rows[0][f"d_{i}"]],
                 total_distinct=int(rows[0][f"n_{i}"]),
             )
-            for i, name in enumerate(columns)
+            for i, name in enumerate(countable)
         }
 
     # --- estimation (free dry-runs; feeds the confirm handshake) --------------
