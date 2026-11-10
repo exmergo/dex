@@ -104,6 +104,13 @@ def test_the_selector_reads_names_the_way_maintain_verify_does():
     assert selection.models == ["stg_orders", "fct_orders"]
 
 
+def test_a_quoted_list_selects_every_model_it_names():
+    """One quoted argument, names separated by spaces, names the same models."""
+    selection = declare_mod.select_models(_view(_shop()), ["stg_orders fct_orders"])
+    assert selection.models == ["stg_orders", "fct_orders"]
+    assert selection.skipped == []
+
+
 def test_a_name_that_matches_no_model_is_named_rather_than_dropped():
     selection = declare_mod.select_models(_view(_shop()), ["fct_ordrs"])
     assert selection.models == []
