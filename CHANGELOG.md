@@ -14,6 +14,79 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.6] - 2026-11-10
+
+### Added
+
+- **The toggle check names the tests and semantic definitions that break with
+  the flag off.** `data.toggle` judged models only, so a `not_null` on a governed
+  column failed the off build with no warning at plan time, and a dimension or
+  measure over one stopped resolving with nothing said. It now reports
+  `governed_column_tested_when_off` for each test the off branch still runs over
+  a producer's governed column (a test disabled at the off value, such as
+  `enabled: "{{ var('enable_fees') }}"`, is not reported), and
+  `governed_column_in_semantic_layer` for each dimension, measure or entity over
+  one, with the metrics drawing on a measure. Each names its file and line and
+  contradicts the verdict like a model finding. A computed semantic `expr` the
+  reference index cannot resolve is listed in `data.toggle.limits`. ([#1195](https://github.com/exmergo/dex/pull/1195))
+- **`dex transform build --select` accepts several values.** Passing multiple space-separated selectors or model names is joined as dbt reads them, matching dbt CLI syntax while preserving quoted lists. ([#1227](https://github.com/exmergo/dex/pull/1227))
+- **A model with no declared `population.parent` is measured against a drafted one.** `transform plan` drafts the entity each model is about (`data.declarations.<model>.drafted.population_parent`): the model, seed or snapshot whose tested, declared or profiled unique key is the model's grain, else the parent a `relationships` test, `references` or clean verified join names, else the "one row per" noun of its description, else its driving relation. It is labelled `drafted` with its evidence, never written, and a declared parent always wins. `transform build --verify` measures the built model against it on the relation dbt wrote, so an aggregate CTE joined to its parent is no longer a blind spot: `data.verification.population_delta` counts orphan keys, missing parents and rows whose child columns are all NULL or zero (a signal of parents kept with no children, not proof: children can sum to zero), and a non-trivial count is `needs_decision`, a `population_delta` finding and an entry under `data.completion.obligations.needs_decision`, settled by declaring the parent or by an assumption naming the key at `request`, `contract` or `precedent` tier. Counts and key column names only. In `data.change_scope`, re-driving a model (a new driving relation, or a declared parent removed or replaced, against the applied model or an earlier unapplied plan) is a `redriven` change that only a `request` or `contract` assumption settles, and the procedure now routes NULL or zero aggregates on a parent-driven model to the join key rather than to a new driving relation (#1228). ([#1228](https://github.com/exmergo/dex/pull/1228))
+- **`dex transform repair <node>` drafts the override that repairs a failing package model.** It restates the package's SQL as a project model (package macros qualified, `var()` reads given the package's values, a relation var inlined so a project var cannot cycle, the package's materialization restated), disables the package's node in `dbt_project.yml` in place, and converts only the columns the warehouse error names, where the cached profile settles what they hold: all NULL is a cast through text, epoch seconds or milliseconds are read as such and flagged as meaning-changing, ISO text is parsed, and anything else is left `unresolved`. The draft is compiled and bound on dev reading no row before it is stored as an unapplied plan. A failed build's `completion.blockers[]` and `data.prerequisites[]` now carry a `next` line naming the repair, the refactor offer names the command instead of a key plans never emit, a `--for-plan` build of the repair carries `obligations.repair`, and the procedure treats repairing a blocker of the request's own deliverables as in scope. ([#1241](https://github.com/exmergo/dex/pull/1241))
+- **SLayer list columns (`type: ARRAY` with `element_type`) work end to end.** `explore semantic list` lists a list column with `groupable: false` and its `element_type`, and lists its elements as the groupable dimension `model.column.value`, typed from `element_type`, so `--for-dimension posts.tags.value` answers. `explore semantic query --group-by posts.tags.value` and `values posts.tags.value` run through the full spine. A grouping by elements is sent with SLayer's `to_many_handling: associate`, so each element row counts the parents holding that element; SLayer's default repeated the metric's whole total on every element row. A note says the rows overlap. Grouping by, or reading the values of, the whole list is refused before anything renders, naming the `.value` token. `contains_any` and `contains_all` filters are now read and screened like `contains`. On Redshift, which has no native lists, a list column is refused by name. `maintain schema` reports a column that became a list as `declared_type_conflict` with `remedy_kind: reingest` and the warehouse's `element_type`, and `maintain reconcile` states it as the `type: ARRAY` declaration to make through `semantic slayer update`.
+
+### Changed
+
+- **The `[slayer]` extra now pins SLayer 1.8.2 (was 1.2.0).** The model format is still version 15, so existing SLayer model files read unchanged. Results can change, and the new ones are correct: a query that filters through a join now applies the joined model's own filters, which SLayer 1.2.0 silently dropped. A query that groups and names no order is now sorted by its grouped columns, distinct values included. A metric query renders the model's filters in a subquery under the query's filter, which changes the statement's shape and not its rows. Also, a declared column whose warehouse type moved to another bucket (`declared_type_conflict` from `maintain schema`) is now reported with SLayer's remedy (`remedy_kind`, `remedy`) instead of a removal, so `maintain reconcile` proposes changing the declared type as advisory rather than cutting the column and the measures on it. Because that remedy alone can leave a measure summing a TEXT column, the finding lists the measures it would break under `breaks_measures`, `semantic slayer define|update|plan` now refuses a saved measure whose aggregation SLayer does not allow on its column's type (it would validate and fail every query), and the catalog names such a measure in a file dex did not author. Installing the extra now resolves SQLAlchemy below 2.1, which SLayer 1.8 requires.
+
+### Fixed
+
+- maintain verify and transform build: report column_undeclared on an
+  override of a package-documented model against the package's yaml entry,
+  explaining that the project cannot declare the override (#1205). ([#1233](https://github.com/exmergo/dex/pull/1233))
+- **`transform plan` compiles models using column-listing macros to verify their
+  SELECT list against `schema.yml`.** A model using column-introspection macros
+  (`dbt_utils.star`, `dbt_utils.get_filtered_columns_in_relation`,
+  `adapter.get_columns_in_relation`, or `fill_staging_columns`) is now compiled
+  alongside control-flow models so its expanded SELECT list is checked against
+  declared column contracts. Where compilation is not possible, the plan reports
+  that the SELECT list could not be checked statically. ([#1234](https://github.com/exmergo/dex/pull/1234))
+- **drafting hints name derived dev namespaces for package models and post-build guidance for created inputs.** when a model reads an unprofiled package model or seed on a warehouse connector, drafting now derives the package model's dev-qualified relation with its custom schema and appends `--target dev`. when an input is created or edited by the plan itself, drafting omits an unexecutable exploration command and instead names the post-build sequence to profile it after `transform build`. ([#1236](https://github.com/exmergo/dex/pull/1236))
+- **`--verify` reads layer schemas scaffolded by `transform init --layered-schemas`.**
+  the verification sweep and dev-target reads derive `<layer>_<target name>`
+  schemas alongside `<dev schema>_<name>`, so warehouse models built across
+  staging, intermediate and mart schemas are judged instead of suppressed. ([#1238](https://github.com/exmergo/dex/pull/1238))
+- **bigquery non-groupable types are skipped from distinct queries and single-object
+  profile failures are noted instead of failing explore runs (#925).** nested and
+  non-groupable column types like geography, json, and struct are excluded from
+  distinct count and combination queries in bigquery, and explore map and explore
+  relationships turn per-object profile failures into notes while reporting the
+  remaining objects. ([#1239](https://github.com/exmergo/dex/pull/1239))
+- transform: allow group by on attributes of declared grain when cache proves
+  dependence, and name the upstream profile that would confirm it when unprofiled (#1204). ([#1240](https://github.com/exmergo/dex/pull/1240))
+- **`dex maintain verify` reads a quoted list of model names.** A scope spelled
+  as one quoted argument separated by spaces names the same models as the same
+  names given as separate arguments or comma-separated, so a quoted list no
+  longer narrows the verification to a model nobody has (#1243). ([#1243](https://github.com/exmergo/dex/pull/1243))
+- **`maintain verify` skips naming-guess grain checks on spine-driven and generated models.**
+  When a model declares no grain, `maintain verify` skips falling back to an id-shaped naming guess if the model is a time spine, generated in SQL, or driven off one (such as a calendar crossed with customers), aligning with `transform build --verify`. In addition, naming-guess grain findings on other models are capped at medium severity. ([#1244](https://github.com/exmergo/dex/pull/1244))
+- **A flow-style `config`, `meta` or entry no longer blocks a declaration.**
+  `transform plan` and `transform declare` refused to write a declaration whose
+  entry, `config` or `config.meta` mapping was written in flow style
+  (`config: {meta: {dex: {grain: [event_id]}}}`), quoting the style instead of
+  recording the decision; in live agent runs, three of three agents stopped
+  there and the assumption went unrecorded. Dex now converts just that mapping
+  to block style in the same `schema.yml` edit, keeping its keys and values and
+  every byte outside it, so the plan writes the declaration and the diff shows
+  the restyle. A mapping that an alias references (used more than once) still
+  refuses with the reason named, and an entry nested in a flow-style `models:`
+  list still does, because a block entry cannot sit inside one.
+- **A list of personal data is screened as personal data.** `explore profile` now reads a list column's element type for its PII type gates, so `email VARCHAR[]` or a repeated BigQuery `ARRAY<STRING>` named like an email, name or phone column is flagged as a string column of that name is. Before, it was never flagged, so once profiled it read as cleared. On a SLayer layer, `<column>.value` was screened against an internal placeholder with the name heuristic instead of the list column's profile; it is now screened as the list column, so its profiled flag, confidence and any `pii_overrides` entry apply, and a refusal names `model.column.value`. A SLayer saved measure that answers with a column's values (`min`, `max`, `first`, `last`, `median`, `percentile`, SLayer 1.8's `collect`, or a model's custom aggregation) now has the columns it aggregates screened like grouped columns, so `collect(email.value)` is refused where grouping by `email.value` is. Mart derivation under `semantic.vendor: slayer` no longer declares a list as a scalar (`VARCHAR[]` as `TEXT`, `BIGINT[]` as `INT`): it writes `type: ARRAY` with the `element_type` the warehouse names.
+- **Postgres refactor comparison supports `citext` columns.** Postgres extension
+  types that psycopg reports only by OID are now named in comparison schemas and
+  diagnostics. `citext` is compared as case-sensitive text, while extension types
+  without a safe grouping operator class remain refused with their readable name.
+
+
 ## [1.17.5] - 2026-11-09
 
 ### Added
