@@ -32,6 +32,7 @@ from ..dbt_project import (
     REF_PATTERN,
     SOURCE_PATTERN,
     DbtProjectView,
+    declared_source_relations,
     jinja_regions,
     manifest_node_label,
     model_file,
@@ -144,7 +145,7 @@ def unit_test_scaffold(
             "to scaffold a fixture from"
         )
     cache = _pinned_to_sources(cache, view, sql)
-    declared = _declared_source_relations(view)
+    declared = declared_source_relations(view)
     known = [d.identifier for d in cache.datasets] if cache is not None else []
     inputs = [
         i._replace(lookup=_cached_relation(declared.get(_source_key(i), ""), known))
@@ -720,7 +721,7 @@ def _pinned_to_sources(
 
     if cache is None:
         return None
-    declared = _declared_source_relations(view)
+    declared = declared_source_relations(view)
     known = {d.identifier.lower() for d in cache.datasets}
     pinned: dict[str, str] = {}
     for match in SOURCE_PATTERN.finditer(sql):
@@ -750,37 +751,6 @@ def _source_key(model_input: ModelInput) -> tuple[str, str]:
 
     match = SOURCE_PATTERN.search("{{ " + model_input.literal + " }}")
     return (match.group(1), match.group(2)) if match else ("", model_input.name)
-
-
-def _declared_source_relations(view: DbtProjectView) -> dict[tuple[str, str], str]:
-    """``(source, table)`` -> the dotted relation it declares, for every source
-    the project's YAML declares. dbt's own defaults apply: ``schema`` is the
-    source's name when unset, and a table's ``identifier`` overrides its name.
-    A file that does not parse declares nothing here."""
-
-    relations: dict[tuple[str, str], str] = {}
-    for path, file in view.files.items():
-        if not path.endswith((".yml", ".yaml")) or "sources:" not in file.content:
-            continue
-        try:
-            doc = yaml.safe_load(file.content) or {}
-        except yaml.YAMLError:
-            continue
-        for source in doc.get("sources") or [] if isinstance(doc, dict) else []:
-            if not isinstance(source, dict) or not source.get("name"):
-                continue
-            name = str(source["name"])
-            schema = str(source.get("schema") or name)
-            database = source.get("database")
-            for table in source.get("tables") or []:
-                if not isinstance(table, dict) or not table.get("name"):
-                    continue
-                identifier = str(table.get("identifier") or table["name"])
-                parts = [str(database)] if database else []
-                relations[(name, str(table["name"]))] = ".".join(
-                    [*parts, schema, identifier]
-                )
-    return relations
 
 
 def _find_inputs(sql: str) -> list[ModelInput]:

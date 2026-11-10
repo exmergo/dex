@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -372,6 +372,131 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
         manifest=manifest,
         vars=_project_vars(raw, str(project_name)),
     )
+
+
+def _source_declarations(
+    view: DbtProjectView,
+) -> Iterator[tuple[str, str, Any, Any, Any]]:
+    """Yield ``(source, table, schema, database, identifier)`` for every source
+    table the project's YAML declares, dbt defaults not applied. A file that
+    does not parse, or a ``sources:``/``tables:`` value that is not a list,
+    yields nothing: a scalar where a list belongs is a broken declaration, not
+    a crash in the middle of row attribution."""
+
+    for path, file in view.files.items():
+        if not path.endswith((".yml", ".yaml")) or "sources:" not in file.content:
+            continue
+        try:
+            doc = yaml.safe_load(file.content) or {}
+        except yaml.YAMLError:
+            continue
+        sources = doc.get("sources") if isinstance(doc, dict) else None
+        for source in sources if isinstance(sources, list) else []:
+            if not isinstance(source, dict) or not source.get("name"):
+                continue
+            tables = source.get("tables")
+            for table in tables if isinstance(tables, list) else []:
+                if not isinstance(table, dict) or not table.get("name"):
+                    continue
+                yield (
+                    str(source["name"]),
+                    str(table["name"]),
+                    source.get("schema"),
+                    source.get("database"),
+                    table.get("identifier"),
+                )
+
+
+def _is_templated(value: Any) -> bool:
+    """Whether a source property's raw value carries jinja dex cannot render.
+
+    Attribution runs without dbt, so ``{{ var('env') }}.raw_events`` cannot be
+    turned into the relation the warehouse holds; the honest answer is that the
+    declared schema is unknown, not that it is the literal text."""
+
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def declared_source_relations(view: DbtProjectView) -> dict[tuple[str, str], str]:
+    """``(source, table)`` -> the dotted relation it declares, for every source
+    the project's YAML declares. dbt's own defaults apply: ``schema`` is the
+    source's name when unset, and a table's ``identifier`` overrides its name.
+    A file that does not parse declares nothing here.
+
+    A declaration whose ``schema``, ``database`` or ``identifier`` carries
+    jinja is omitted rather than emitted with the unrendered template text in
+    the relation: a relation dex cannot resolve must not sit in this map
+    pretending to be one (:func:`unresolvable_source_relations` reports those
+    pairs, so attribution can refuse them instead of bare-name matching a
+    cached table the declaration never pointed at).
+
+    The manifest's own ``relation_name`` map is exact and wins when one is
+    available (``ProjectDefinitions.source_relations``); this is the same mapping
+    derived from the authored files, for the paths that run without a compiled
+    artifact -- which is every path that counts rows, since `explore map` needs
+    no manifest."""
+
+    relations: dict[tuple[str, str], str] = {}
+    for name, table, schema, database, identifier in _source_declarations(view):
+        if (
+            _is_templated(schema)
+            or _is_templated(database)
+            or _is_templated(identifier)
+        ):
+            continue
+        schema_name = str(schema or name)
+        parts = [str(database)] if database else []
+        relations[(name, table)] = ".".join(
+            [*parts, schema_name, str(identifier or table)]
+        )
+    return relations
+
+
+def unresolvable_source_relations(view: DbtProjectView) -> set[tuple[str, str]]:
+    """Declared ``(source, table)`` pairs whose ``schema``, ``database`` or
+    ``identifier`` property carries jinja. Rendering those needs dbt's context
+    (project vars, ``env_var``, macros), which attribution deliberately does
+    not run, so the caller refuses them outright rather than letting the
+    bare-name fallback attribute their rows to whichever cached table happens
+    to share the logical name."""
+
+    return {
+        (name, table)
+        for name, table, schema, database, identifier in _source_declarations(view)
+        if _is_templated(schema) or _is_templated(database) or _is_templated(identifier)
+    }
+
+
+def authored_source_qualifications(view: DbtProjectView) -> dict[str, str]:
+    """Declared relation -> the qualification its declaration actually authors.
+
+    The value is the authored ``database``/``schema`` parts joined with dots,
+    or ``''`` when dbt's defaults supply every part (``schema`` defaulting to
+    the source's name). Only authored parts may override a cache match: the
+    default is dbt's guess, and a project that never declares a schema still
+    resolves its sources through the bare identifier -- that resolution is
+    what the identifier feature is built on."""
+
+    out: dict[str, str] = {}
+    for name, table, schema, database, identifier in _source_declarations(view):
+        if (
+            _is_templated(schema)
+            or _is_templated(database)
+            or _is_templated(identifier)
+        ):
+            continue
+        parts = [str(database)] if database else []
+        if schema:
+            parts.append(str(schema))
+        relation = ".".join(
+            [
+                *([str(database)] if database else []),
+                str(schema or name),
+                str(identifier or table),
+            ]
+        )
+        out[relation] = ".".join(parts)
+    return out
 
 
 def _project_vars(raw: dict[str, Any], project_name: str) -> dict[str, Any]:
