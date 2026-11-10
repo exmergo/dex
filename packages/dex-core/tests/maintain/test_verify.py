@@ -1600,6 +1600,64 @@ def test_verify_scopes_to_the_named_object(maintain_repo, _assume_the_project_co
     assert [f["identifier"] for f in payload["data"]["findings"]] == ["a"]
 
 
+def _two_failing_models(maintain_repo) -> None:
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.a": {"name": "a", "resource_type": "model"},
+            "model.maintain_test.b": {"name": "b", "resource_type": "model"},
+            "model.maintain_test.c": {"name": "c", "resource_type": "model"},
+        },
+        results=[
+            {"unique_id": "model.maintain_test.a", "status": "error"},
+            {"unique_id": "model.maintain_test.b", "status": "error"},
+            {"unique_id": "model.maintain_test.c", "status": "error"},
+        ],
+    )
+
+
+def _verified(maintain_repo, *scope: str) -> list[str]:
+    rc, payload = maintain_repo.dex("maintain", "verify", *scope)
+    assert rc == 0 and payload["status"] == "ok", payload
+    return [f["identifier"] for f in payload["data"]["findings"]]
+
+
+def test_verify_scopes_to_a_quoted_list_of_models(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`maintain verify "a b"` names two models, not one named "a b" (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a b") == ["a", "b"]
+
+
+def test_verify_scopes_to_a_quoted_list_mixed_with_another_argument(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A quoted list and a separate argument name the same models (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a b", "c") == ["a", "b", "c"]
+
+
+def test_verify_scopes_to_a_comma_separated_list(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The comma-separated spelling still names both models (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a,b") == ["a", "b"]
+
+
+def test_verify_scopes_to_a_list_in_any_case(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A model name is matched case-insensitively, however it is spelled (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "A B") == ["a", "b"]
+
+
 # --- row population: a model against the relation it is built from (#226) ------
 #
 # Pure, like the build-status half above: a manifest on disk in, findings out,
