@@ -617,8 +617,10 @@ dex maintain reconcile [<class>]  -> propose the edits that reconcile detected d
                                      semantic_plan_id;
                                      cardinality advisories distinguish expansion from contraction
                                      using available counts, and flag approximate counts as uncertain
-dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
-                                     required (unlike every subcommand above). Build status:
+dex maintain verify [<models>]    -> is the project correct right now, no .dex/snapshot.json baseline
+                                     required (unlike every subcommand above). The scope is model
+                                     names: repeatable, comma-separated, or in one quoted argument
+                                     separated by spaces ("a b"), none = every model. Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
                                      through transitively skipped parents), nodes that warned rather
                                      than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against

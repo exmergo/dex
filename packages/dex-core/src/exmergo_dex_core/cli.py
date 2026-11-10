@@ -1334,8 +1334,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="a failing package model (`model` or `pkg.model`)",
                     )
                 if group == "transform" and name == "declare":
-                    # The selector `maintain verify` takes: model names, repeated
-                    # or comma-separated; none selects every model.
+                    # The selector `maintain verify` takes: model names, repeated,
+                    # comma-separated, or in one quoted argument separated by
+                    # spaces; none selects every model.
                     sp.add_argument(
                         "objects",
                         nargs="*",
@@ -1557,7 +1558,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         nargs="*",
                         metavar="object",
                         help=(
-                            "dbt selector to verify (default: the whole project)"
+                            "model names: repeated, comma-separated or "
+                            "space-separated (default: all)"
                             if name == "verify"
                             else "object to check (default: the whole project)"
                         ),
