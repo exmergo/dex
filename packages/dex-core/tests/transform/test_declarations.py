@@ -295,10 +295,7 @@ def test_a_flow_style_config_is_restyled_and_the_rest_of_the_file_kept():
 def test_a_flow_style_meta_mapping_is_restyled():
     [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
     content = (
-        "models:\n"
-        "  - name: fct_orders\n"
-        "    config:\n"
-        "      meta: {team: analytics}\n"
+        "models:\n  - name: fct_orders\n    config:\n      meta: {team: analytics}\n"
     )
 
     out = render(content, declaration)
@@ -335,6 +332,30 @@ def test_an_empty_flow_config_is_dropped_and_written_fresh():
     entry = _entry(out)
     assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
     assert "config: {}" not in out
+
+
+def test_an_empty_flow_meta_leaves_a_config_that_is_written_fresh():
+    """`config: {meta: {}}`: the restyle drops the only `meta` pair, so the
+    `config` it leaves behind is null, and the declaration writes `config`
+    afresh instead of refusing (#1203)."""
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    content = "models:\n  - name: fct_orders\n    config: {meta: {}}\n"
+
+    out = render(content, declaration)
+
+    entry = _entry(out)
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+
+
+def test_an_empty_flow_pair_on_a_bullet_line_still_refuses():
+    """Dropping an empty flow pair that shares its line with the entry's
+    bullet would swallow the bullet and the keys after it (#1203)."""
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    from exmergo_dex_core.transform.rewrite import RewriteError
+
+    content = "models:\n  - config: {}\n    name: fct_orders\n"
+    with pytest.raises(RewriteError, match="shares its line"):
+        render(content, declaration)
 
 
 def test_a_flow_style_entry_that_uses_an_alias_still_refuses():

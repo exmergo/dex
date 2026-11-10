@@ -1329,13 +1329,14 @@ def _compose(text: str) -> Any:
 
 
 def _carries_anchor(root: Any, node: Any) -> bool:
-    """True when the subtree defines or uses a YAML anchor or alias.
+    """True when the subtree is aliased: used more than once.
 
     PyYAML resolves an alias to the anchored node object itself, so a node
     that appears more than once in the document is an aliased one: a restyle
-    re-renders the subtree from its parsed value, which would rename the
+    re-renders the subtree from its parsed value, which would drop the
     anchor and break a reference written elsewhere (#1203). Such a mapping
-    keeps refusing, with the reason named.
+    keeps refusing, with the reason named; an anchor that nothing aliases
+    does not, because no reference can break.
     """
 
     counts: dict[int, int] = {}
@@ -1362,7 +1363,7 @@ def _carries_anchor(root: Any, node: Any) -> bool:
         if id(current) in seen:
             return False
         seen.add(id(current))
-        if getattr(current, "anchor", None) or counts.get(id(current), 0) > 1:
+        if counts.get(id(current), 0) > 1:
             return True
         if isinstance(current, yaml.MappingNode):
             return any(carries(k, seen) or carries(v, seen) for k, v in current.value)
@@ -1395,8 +1396,8 @@ def _restyle_flow_entry(text: str, locate) -> str:
         return text
     if _carries_anchor(root, node):
         raise RewriteError(
-            "the entry is a flow-style mapping that defines or uses a YAML "
-            "anchor; rewrite it in block style"
+            "the entry is a flow-style mapping that is aliased; a restyle "
+            "would break its YAML anchor, rewrite it in block style"
         )
     start, end = _span(node)
     line_start = text.rfind("\n", 0, start) + 1
@@ -1427,10 +1428,13 @@ def _restyle_flow_value(text: str, root: Any, parent: Any, key: str) -> str:
         return text
     if _carries_anchor(root, v):
         raise RewriteError(
-            f"'{key}' is a flow-style mapping that defines or uses a YAML "
-            "anchor; rewrite it in block style"
+            f"'{key}' is a flow-style mapping that is aliased; a restyle "
+            "would break its YAML anchor, rewrite it in block style"
         )
     if not v.value:
+        line_start = text.rfind("\n", 0, k.start_mark.index) + 1
+        if text[line_start : k.start_mark.index].strip():
+            raise RewriteError(f"'{key}' shares its line with the entry's bullet")
         start, end = _pair_span(text, _span(k), v)
         return splice(text, [(start, end, "")])
     body = _dump(yaml.safe_load(yaml.serialize(v))).strip("\n")
@@ -1505,7 +1509,11 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         merged = _merge_population(existing, merged)
 
     config = _child(node, "config")
-    if config is not None and isinstance(config[1], yaml.MappingNode) and config[1].flow_style:
+    if (
+        config is not None
+        and isinstance(config[1], yaml.MappingNode)
+        and config[1].flow_style
+    ):
         # `config: {...}` written in flow style: the mapping is restyled to
         # block style in the same edit, so the steps below write into a
         # block mapping instead of refusing (#1203). An empty `{}` holds
@@ -1522,13 +1530,24 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         return found[1] if found else None
 
     meta = _child(config[1], "meta")
-    if meta is not None and isinstance(meta[1], yaml.MappingNode) and meta[1].flow_style:
+    if (
+        meta is not None
+        and isinstance(meta[1], yaml.MappingNode)
+        and meta[1].flow_style
+    ):
         # `config.meta` in flow style: same restyle, one level down.
         text = _restyle_flow_value(text, root, config[1], "meta")
         root = _compose(text)
         node = locate(root)
         config = _child(node, "config")
         meta = _child(config[1], "meta") if config is not None else None
+    if config is not None and not (
+        isinstance(config[1], yaml.MappingNode) and config[1].value
+    ):
+        # `config` is null or empty after the restyles (an only `meta: {}`
+        # pair is dropped): writing it fresh keeps nothing that was there,
+        # and `_set_key` could not write into a null anyway.
+        return _set_key(text, locate, "config", {"meta": {DEX_META_KEY: merged}})
     if meta is None:
         return _set_key(text, config_node, "meta", {DEX_META_KEY: merged})
 
