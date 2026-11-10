@@ -347,9 +347,30 @@ def test_a_retyped_column_conflicts_with_its_declared_type(repo: Path, capsys):
     conflict = _finding(payload, "declared_type_conflict", column="amount")
     assert conflict["data"]["declared_type"] == "DOUBLE"
     assert conflict["data"]["warehouse_type"] == "VARCHAR"
-    # SLayer's own cascade: the measure aggregating the column goes with it.
-    assert conflict["data"]["removal"]["columns"] == ["amount"]
-    assert conflict["data"]["removal"]["measures"] == ["revenue"]
+    # SLayer reports a retype and removes nothing: its remedy is the type.
+    assert "removal" not in conflict["data"]
+    assert conflict["data"]["remedy_kind"] == "set_type"
+    assert conflict["data"]["remedy"] == "set the column's type to TEXT"
+
+
+def test_reconcile_proposes_a_retype_as_advisory_and_cuts_nothing(repo: Path, capsys):
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders ALTER amount TYPE VARCHAR")
+    _cli(repo, capsys, "maintain", "schema")
+    before = (repo / BASE / ORDERS).read_text()
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload["errors"]
+    proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_type_conflict"
+    ]
+    assert proposals and all(p["kind"] == "advisory" for p in proposals)
+    assert "set the column's type to TEXT" in proposals[0]["action"]
+    assert "semantic_plan_id" not in payload["data"]
+    assert (repo / BASE / ORDERS).read_text() == before
 
 
 def test_a_dropped_source_column_still_declared_is_caught(repo: Path, capsys):
@@ -470,7 +491,7 @@ def test_no_maintain_path_opens_a_slayer_datasource_or_storage(
     for name in (
         "validate_datasource",
         "_live_schema_for_datasource",
-        "_probe_connect",
+        "_live_schema_refs",
     ):
         monkeypatch.setattr(schema_drift, name, refuse)
 

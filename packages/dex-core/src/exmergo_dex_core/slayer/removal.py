@@ -65,6 +65,23 @@ def proposals_and_edits(
 
     by_file: dict[str, list[DriftFinding]] = {}
     for finding in findings:
+        if finding.code == "declared_type_conflict":
+            # SLayer removes nothing for a retype; its remedy is the declared
+            # type, which only the author can confirm is the one they mean.
+            proposals.append(
+                _proposal(
+                    finding,
+                    "advisory",
+                    f"{finding.data.get('remedy') or 'change the declared type'} "
+                    f"on column '{finding.data.get('declared_column')}' of SLayer "
+                    f"model '{finding.data.get('semantic_model')}' "
+                    f"({finding.data.get('model_file')}) with `semantic slayer "
+                    "update`, or restore the warehouse type if the change was "
+                    "not intended",
+                    paths=[str(finding.data.get("model_file"))],
+                )
+            )
+            continue
         by_file.setdefault(str(finding.data.get("model_file")), []).append(finding)
 
     for path, group in sorted(by_file.items()):
@@ -118,14 +135,7 @@ def proposals_and_edits(
                 "mechanical",
                 f"remove {described} from SLayer model '{model}', the minimal "
                 "removal SLayer's own validate-models rules compute for this "
-                "schema; review the diff before applying it"
-                + (
-                    ". If the warehouse type is the intended one, discard this "
-                    "plan and change the column's declared type with `semantic "
-                    "slayer update` instead"
-                    if finding.code == "declared_type_conflict"
-                    else ""
-                ),
+                "schema; review the diff before applying it",
                 paths=[path],
             )
             for finding in group

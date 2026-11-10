@@ -90,9 +90,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM shop.main.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM shop.main.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -107,9 +113,15 @@ SELECT
   DATE_TRUNC(orders.ordered_at, MONTH) AS `orders___ordered_at`,
   CAST(SUM(orders.amount) AS FLOAT64) AS `orders___revenue`,
   COUNT(*) AS `orders___order_count`
-FROM `dex-ci-project`.shop.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM `dex-ci-project`.shop.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   `orders___status`,
   `orders___ordered_at`
@@ -122,9 +134,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -137,9 +155,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE PRECISION) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -152,9 +176,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE PRECISION) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM dev.public.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM dev.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -281,11 +311,17 @@ SNOWFLAKE_WEEKS = {
 SELECT
   DATEADD(DAY, 1 - DAYOFWEEKISO(orders.ordered_at), DATE_TRUNC('DAY', orders.ordered_at)) AS "orders.ordered_at",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
-WHERE
-  orders.status <> 'test'
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 GROUP BY
-  DATEADD(DAY, 1 - DAYOFWEEKISO(orders.ordered_at), DATE_TRUNC('DAY', orders.ordered_at))""",  # noqa: E501
+  DATEADD(DAY, 1 - DAYOFWEEKISO(orders.ordered_at), DATE_TRUNC('DAY', orders.ordered_at))
+ORDER BY
+  "orders.ordered_at" ASC""",  # noqa: E501
     # The Monday week of the next day, moved back one: Sunday, once the Monday
     # it is built from no longer depends on the account.
     "week_sunday": """\
@@ -300,9 +336,13 @@ SELECT
     )
   ) AS "orders.ordered_at",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
-WHERE
-  orders.status <> 'test'
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 GROUP BY
   DATEADD(
     DAY,
@@ -312,7 +352,9 @@ GROUP BY
       1 - DAYOFWEEKISO(CAST(DATEADD(DAY, 1, orders.ordered_at) AS TIMESTAMP)),
       DATE_TRUNC('DAY', CAST(DATEADD(DAY, 1, orders.ordered_at) AS TIMESTAMP))
     )
-  )""",
+  )
+ORDER BY
+  "orders.ordered_at" ASC""",
 }
 
 

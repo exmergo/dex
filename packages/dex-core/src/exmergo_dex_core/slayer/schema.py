@@ -2,10 +2,10 @@
 
 SLayer's ``validate-models`` compares each model against the live schema and
 names the minimal removals that would make the set consistent again: a column
-the table no longer has, a column whose type moved to another bucket, and
-everything that leaned on either (a measure, a join, a filter, a whole model).
-It does that through SLayer's own datasource connection, which carries
-credentials dex does not read, so under dex it never runs.
+the table no longer has, and everything that leaned on it (a measure, a join, a
+filter, a whole model). It does that through SLayer's own datasource
+connection, which carries credentials dex does not read, so under dex it never
+runs.
 
 Its rules run here instead, on metadata dex captured through its own
 connection. ``diff_sql_table_model`` and ``compute_datasource_drops`` are
@@ -27,11 +27,15 @@ SQLAlchemy and dex's datasets do not:
   case would otherwise report every column as missing.
 
 **Which findings come out.** One per declared column SLayer would drop
-(``declared_column_missing`` or ``declared_type_conflict``), one per model whose
-table has gone since the baseline (``declared_relation_missing``), and one per
-model that only loses something because another drop cascaded into it
-(``declared_dependency_dropped``). Each carries the model's whole removal as
-SLayer computed it, which is what ``maintain reconcile`` turns into a plan.
+(``declared_column_missing``), one per model whose table has gone since the
+baseline (``declared_relation_missing``), and one per model that only loses
+something because another drop cascaded into it
+(``declared_dependency_dropped``); each carries the model's whole removal as
+SLayer computed it, which is what ``maintain reconcile`` turns into a plan. A
+declared column whose type moved to another bucket is ``declared_type_conflict``,
+which SLayer (since 1.6) reports through ``retype_findings`` and never removes:
+it carries SLayer's remedy instead of a removal, and reconcile proposes that
+remedy as advisory.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ from slayer.engine.schema_drift import (
     compute_datasource_drops,
     data_type_bucket,
     diff_sql_table_model,
+    retype_findings,
 )
 
 from ..cache import match_identifier
@@ -168,7 +173,12 @@ def declared_schema_drift(
                 diffs[model.name] = diff_sql_table_model(
                     model=model, live_table=live, available_models_in_ds=names
                 )
+                retypes = retype_findings(model=model, live_table=live)
             located[model.name] = (dataset.identifier, spelled)
+            findings.extend(
+                _retype_finding(model, retype, dataset.identifier, spelled, entry.file)
+                for retype in retypes
+            )
 
         if not diffs:
             continue
@@ -196,7 +206,7 @@ def declared_schema_drift(
                 findings.append(_relation_missing(models[name], identifier, context))
             else:
                 findings.extend(
-                    _column_findings(models[name], base, identifier, spelled, context)
+                    _column_findings(models[name], base, identifier, context)
                 )
     return findings, [note for note in notes if note]
 
@@ -267,63 +277,82 @@ def _column_findings(
     model: Any,
     base: EditModelDelete,
     identifier: str | None,
-    spelled: dict[str, str] | None,
     context: dict[str, Any],
 ) -> list[DriftFinding]:
-    findings: list[DriftFinding] = []
+    """One ``declared_column_missing`` per base column SLayer would drop.
+
+    Since SLayer 1.6 a drop is only ever a column the table no longer has: a
+    column whose type moved is a report-only retype, read by
+    :func:`_retype_finding`, and never removed.
+    """
+
     consequence = _consequence(context["removal"])
+    findings: list[DriftFinding] = []
     for name in base.remove.columns:
         col = model.get_column(name)
         physical = physical_column_sql(sql=col.sql, name=col.name) if col else name
-        declared = str(getattr(col.type, "value", col.type)) if col else None
-        live_type = (spelled or {}).get(physical)
-        if live_type is None:
-            findings.append(
-                DriftFinding(
-                    axis="schema",
-                    code="declared_column_missing",
-                    identifier=identifier,
-                    column=physical,
-                    severity="high",
-                    detail=(
-                        f"SLayer model '{model.name}' declares column '{name}' on "
-                        f"{identifier}, which no longer has a column '{physical}'"
-                        f"{consequence}"
-                    ),
-                    data={**context, "declared_column": name},
-                )
-            )
-            continue
-        live = data_type(live_type)
         findings.append(
             DriftFinding(
                 axis="schema",
-                code="declared_type_conflict",
+                code="declared_column_missing",
                 identifier=identifier,
                 column=physical,
                 severity="high",
                 detail=(
-                    f"SLayer model '{model.name}' declares column '{name}' as "
-                    f"{declared}, and {identifier}.{physical} is {live_type}, "
-                    "which SLayer reads as another kind of value "
-                    f"({data_type_bucket(col.type)} against "
-                    f"{data_type_bucket(live) if live else 'unknown'})"
+                    f"SLayer model '{model.name}' declares column '{name}' on "
+                    f"{identifier}, which no longer has a column '{physical}'"
                     f"{consequence}"
                 ),
-                data={
-                    **context,
-                    "declared_column": name,
-                    "declared_type": declared,
-                    "warehouse_type": live_type,
-                },
+                data={**context, "declared_column": name},
             )
         )
-    if not findings and base.remove.join_edges:
-        # A join dropped with no column of its own model dropped: SLayer found
-        # its target missing from the set, which the loader already refuses, so
-        # this is reached only if the two rules ever part.
-        findings.append(_cascaded(base, identifier, context))
     return findings
+
+
+def _retype_finding(
+    model: Any,
+    retype: Any,
+    identifier: str,
+    spelled: dict[str, str],
+    model_file: str,
+) -> DriftFinding:
+    """A declared column whose warehouse type is in another of SLayer's buckets.
+
+    SLayer reports this and removes nothing: its remedy is to change the
+    declared type (or, for a column that became a list, to re-ingest). So the
+    finding carries that remedy rather than a removal, and reconcile proposes it
+    as advisory rather than cutting the column and every measure on it.
+    """
+
+    col = model.get_column(retype.column)
+    physical = physical_column_sql(sql=col.sql, name=col.name) if col else retype.column
+    declared = str(getattr(retype.stored_type, "value", retype.stored_type))
+    live_type = spelled.get(physical, str(retype.live_type.value))
+    return DriftFinding(
+        axis="schema",
+        code="declared_type_conflict",
+        identifier=identifier,
+        column=physical,
+        severity="high",
+        detail=(
+            f"SLayer model '{model.name}' declares column '{retype.column}' as "
+            f"{declared}, and {identifier}.{physical} is {live_type}, which "
+            "SLayer reads as another kind of value "
+            f"({data_type_bucket(retype.stored_type)} against "
+            f"{data_type_bucket(retype.live_type)}); SLayer's remedy: "
+            f"{retype.remedy}"
+        ),
+        data={
+            "semantic_model": model.name,
+            "model_file": model_file,
+            "declared_column": retype.column,
+            "declared_type": declared,
+            "warehouse_type": live_type,
+            "slayer_type": str(retype.live_type.value),
+            "remedy_kind": retype.remedy_kind,
+            "remedy": retype.remedy,
+        },
+    )
 
 
 def _relation_missing(

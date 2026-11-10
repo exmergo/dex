@@ -959,7 +959,7 @@ semantic:
       - models/warehouse/customers.yaml
 ```
 
-The `[slayer]` extra pins one exact SLayer release (`motley-slayer==1.2.0`), and
+The `[slayer]` extra pins one exact SLayer release (`motley-slayer==1.8.2`), and
 selecting the vendor without it refuses by name with `reason: prerequisite`.
 
 ### What a model file is checked against
@@ -970,7 +970,7 @@ that, and before any of it reaches a catalog:
 
 - **the format version.** `SlayerModel` migrates an older `version` while parsing
   and reads a newer one best-effort. dex checks first and refuses anything but the
-  pinned release's current format (15 at 1.2.0), naming both numbers. A file with
+  pinned release's current format (15 at 1.8.2), naming both numbers. A file with
   no `version` is stale, because SLayer's storage reads it as version 1.
 - **the path.** A file has to sit where SLayer keeps it,
   `models/<data_source>/<name>.yaml`, with its `name` and `data_source` agreeing.
@@ -1215,8 +1215,11 @@ reads the model files and the metadata dex captured through its own connection.
   warehouse's is `declared_type_conflict`; a model whose table was in the
   baseline and is gone is `declared_relation_missing`; and a model that loses a
   join, measure or filter only because another drop cascaded into it is
-  `declared_dependency_dropped`. Each finding carries the model's whole removal
-  as SLayer computes it. A warehouse type dex cannot place in a bucket is never
+  `declared_dependency_dropped`. Each of those carries the model's whole removal
+  as SLayer computes it, except `declared_type_conflict`: SLayer reports a retype
+  through `retype_findings` and removes nothing, so that finding carries SLayer's
+  remedy (`remedy_kind` and `remedy`, such as "set the column's type to TEXT")
+  and reconcile proposes it as advisory rather than cutting the column. A warehouse type dex cannot place in a bucket is never
   reported as a conflict, a column matches case-insensitively when exactly one
   does, and a model backed by `sql` or `source_queries` is named as not compared,
   because SLayer checks those by running the query.
@@ -1228,9 +1231,9 @@ reads the model files and the metadata dex captured through its own connection.
   that cannot be cut that way (a flow-style list) leaves the proposal advisory
   rather than reformatting the file. A model whose table is gone is never
   removed: deleting the file is advisory, because a vanished table is as often a
-  rename as a retirement. A type conflict is proposed as SLayer's removal, with
-  the alternative named: if the warehouse type is intended, change the declared
-  type instead.
+  rename as a retirement. A type conflict is advisory and cuts nothing: it names
+  SLayer's remedy (change the declared type with `semantic slayer update`), or
+  restoring the warehouse type if the change was not intended.
 
 ### Authoring SLayer models
 
