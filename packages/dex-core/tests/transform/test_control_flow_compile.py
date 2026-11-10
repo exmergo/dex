@@ -340,6 +340,50 @@ def test_a_dbt_utils_star_model_plans(project, tmp_path, capsys):
     assert stored["edits"][0]["new_content"] == sql
 
 
+def test_column_listing_macro_compiles_and_checks_select_list(
+    project, tmp_path, capsys
+):
+    """#1200: A model listing columns without control flow is compiled and checked."""
+
+    macro = {"path": "macros/star.sql", "kind": "macro_sql", "content": STAR_MACROS}
+    # No control flow: just a column-listing macro.
+    sql = (
+        "select {{ star(source('raw', 'customers'), except=['email']) }}"
+        " from {{ source('raw', 'customers') }}"
+    )
+    sources = {
+        "path": "models/sources.yml",
+        "kind": "schema_yml",
+        "content": yaml.safe_dump(
+            {
+                "version": 2,
+                "sources": [
+                    {
+                        "name": "raw",
+                        "database": "warehouse",
+                        "schema": "main",
+                        "tables": [{"name": "customers"}],
+                    }
+                ],
+                "models": [
+                    {
+                        "name": "loop",
+                        "columns": [{"name": "id"}, {"name": "email"}],
+                    }
+                ],
+            }
+        ),
+    }
+
+    rc, out = _plan(tmp_path, capsys, sql, extra=[macro, sources])
+    assert rc == 0, out
+    expected = (
+        "models/loop.sql: schema.yml declares column(s) email for loop "
+        "that the SELECT list does not produce"
+    )
+    assert any(expected in w for w in out["warnings"]), out["warnings"]
+
+
 def test_columns_of_a_relation_outside_the_inventory_are_none_and_named(
     project, tmp_path
 ):
@@ -456,7 +500,229 @@ def test_low_level_validation_requires_current_compilation():
 
 
 def test_jinja_comments_do_not_require_compilation():
+    """Jinja comments are stripped and do not trigger compilation."""
+
     assert not needs_compilation("{# {% if true %} ignored {% endif %} #} select 1")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select {{ dbt_utils.star(ref('orders')) }}",
+        "select {{ star(ref('orders')) }}",
+        "select {{ dbt_utils.get_filtered_columns_in_relation(ref('orders')) }}",
+        "select {{ adapter.get_columns_in_relation(ref('orders')) }}",
+        "select {{ adapter.get_relation_columns(ref('orders')) }}",
+        "select {{ fivetran_utils.fill_staging_columns(source_columns=[]) }}",
+        "{% set cols = adapter.get_columns_in_relation(ref('orders')) %}",
+    ],
+)
+def test_column_listing_macros_require_compilation(sql):
+    """#1200: Known column listing macros and adapter calls require compilation."""
+
+    assert needs_compilation(sql)
+
+
+def test_plain_sql_does_not_require_compilation():
+    """#1200: Models without control flow or column listing do not compile."""
+
+    assert not needs_compilation("select 1 as id from {{ ref('orders') }}")
+    assert not needs_compilation("select 1 as id from adapter.orders")
+    assert not needs_compilation("select {{ adapter.quote('col') }} from tbl")
+    assert not needs_compilation("select {{ adapter.dispatch('m', 'p')() }} from tbl")
+    assert not needs_compilation("select {{ custom.star(ref('tbl')) }} from tbl")
+    assert not needs_compilation(
+        "select {{ custom.get_relation_columns('tbl') }} from tbl"
+    )
+    assert not needs_compilation("select {{ get_relation_columns('tbl') }} from tbl")
+    assert not needs_compilation("{# {{ dbt_utils.star(ref('x')) }} #} select 1")
+
+
+def test_column_contract_warnings_when_compilation_not_possible():
+    """#1200: When compilation is not possible, warnings say comparison was skipped."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.transform.plans import column_contract_warnings
+
+    view = DbtProjectView(
+        root=".",
+        project_name="test",
+        profile_name="test",
+        files={
+            "models/schema.yml": SourceFile(
+                path="models/schema.yml",
+                content=yaml.safe_dump(
+                    {
+                        "version": 2,
+                        "models": [
+                            {
+                                "name": "loop",
+                                "columns": [{"name": "id"}, {"name": "email"}],
+                            }
+                        ],
+                    }
+                ),
+                sha256="h",
+            )
+        },
+        model_paths=["models"],
+    )
+    edits = [
+        PlanEdit(
+            path="models/loop.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content=(
+                "select {{ dbt_utils.star(ref('stg_orders')) }} as aliased_col "
+                "from {{ ref('stg_orders') }}"
+            ),
+        )
+    ]
+    warnings = column_contract_warnings(edits, view, compiled_models=None)
+    assert any(
+        "compilation was not possible" in w and "contract comparison was skipped" in w
+        for w in warnings
+    ), warnings
+
+
+def test_column_contract_warnings_upstream_uncompiled_skips_downstream():
+    """#1200: Downstream select-star skips contract when upstream uncompiled."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.transform.plans import column_contract_warnings
+
+    view = DbtProjectView(
+        root=".",
+        project_name="test",
+        profile_name="test",
+        files={
+            "models/schema.yml": SourceFile(
+                path="models/schema.yml",
+                content=yaml.safe_dump(
+                    {
+                        "version": 2,
+                        "models": [
+                            {
+                                "name": "downstream",
+                                "columns": [{"name": "id"}, {"name": "email"}],
+                            }
+                        ],
+                    }
+                ),
+                sha256="h",
+            ),
+            "models/upstream.sql": SourceFile(
+                path="models/upstream.sql",
+                content=(
+                    "select {{ dbt_utils.star(ref('raw')) }} as aliased_col "
+                    "from {{ ref('raw') }}"
+                ),
+                sha256="h2",
+            ),
+        },
+        model_paths=["models"],
+    )
+    edits = [
+        PlanEdit(
+            path="models/upstream.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content=(
+                "select {{ dbt_utils.star(ref('raw')) }} as aliased_col "
+                "from {{ ref('raw') }}"
+            ),
+        ),
+        PlanEdit(
+            path="models/downstream.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content="select * from {{ ref('upstream') }}",
+        ),
+    ]
+    warnings = column_contract_warnings(edits, view, compiled_models=None)
+    assert any(
+        "compilation was not possible" in w and "contract comparison was skipped" in w
+        for w in warnings
+    ), warnings
+
+
+def test_column_contract_warnings_qualified_own_project_ref():
+    """#1200: Two-part refs to own project route through project-model path."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.transform.plans import column_contract_warnings
+
+    view = DbtProjectView(
+        root=".",
+        project_name="my_proj",
+        profile_name="test",
+        files={
+            "models/schema.yml": SourceFile(
+                path="models/schema.yml",
+                content=yaml.safe_dump(
+                    {
+                        "version": 2,
+                        "models": [
+                            {
+                                "name": "downstream",
+                                "columns": [{"name": "id"}],
+                            }
+                        ],
+                    }
+                ),
+                sha256="h",
+            ),
+            "models/upstream.sql": SourceFile(
+                path="models/upstream.sql",
+                content="select 1 as id, 2 as extra",
+                sha256="h2",
+            ),
+        },
+        model_paths=["models"],
+    )
+    edits = [
+        PlanEdit(
+            path="models/downstream.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content="select * from {{ ref('my_proj', 'upstream') }}",
+        ),
+    ]
+    warnings = column_contract_warnings(edits, view, compiled_models=None)
+    assert any("not declared in schema.yml" in w for w in warnings), warnings
+
+
+def test_compile_models_missing_profile_allows_column_listing_models(tmp_path):
+    """#1200: Missing profile returns empty compilation for column-listing models."""
+
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.transform.compile import compile_models
+
+    dbt_dir = tmp_path / "dbt_proj"
+    dbt_dir.mkdir()
+    (dbt_dir / "dbt_project.yml").write_text("name: test\nprofile: test\n")
+    engine = SimpleNamespace(
+        project_dir=lambda: dbt_dir,
+        config=SimpleNamespace(dbt_target="dev", connector="duckdb"),
+        connector="duckdb",
+        path=None,
+    )
+    edits = [
+        PlanEdit(
+            path="models/loop.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content="select {{ dbt_utils.star(ref('stg')) }} from {{ ref('stg') }}",
+        )
+    ]
+    compiled, _broker = compile_models(engine, edits)
+    assert compiled == {}
+
+    control_flow_edits = [
+        PlanEdit(
+            path="models/cf.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content="{% for x in [1, 2] %}select {{ x }}{% endfor %}",
+        )
+    ]
+    with pytest.raises(EditValidationError):
+        compile_models(engine, control_flow_edits)
 
 
 def test_compiled_file_reads_keep_the_existing_warning():

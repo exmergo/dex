@@ -39,10 +39,12 @@ bounded metadata) alone.
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
@@ -392,9 +394,38 @@ def missing_relation_findings(
 # --- column contract: a built relation against its declared schema.yml ---------
 
 
+class ColumnContractPlan(tuple[dict[str, dict[str, str | None]], int, list[str]]):
+    """The plan for checking column contracts against the compiled manifest.
+
+    A 3-tuple of ``(declared_by_model, undeclared, notes)`` for backwards
+    compatibility with callers that unpack it, plus ``package_entries`` naming
+    the package YAML that documents any project override among them (#1205).
+    """
+
+    declared_by_model: dict[str, dict[str, str | None]]
+    undeclared: int
+    notes: list[str]
+    package_entries: dict[str, str]
+
+    def __new__(
+        cls,
+        declared_by_model: dict[str, dict[str, str | None]],
+        undeclared: int,
+        notes: list[str],
+        package_entries: dict[str, str] | None = None,
+    ) -> ColumnContractPlan:
+        """Create a new column contract plan."""
+        obj = super().__new__(cls, (declared_by_model, undeclared, notes))
+        obj.declared_by_model = declared_by_model
+        obj.undeclared = undeclared
+        obj.notes = notes
+        obj.package_entries = package_entries or {}
+        return obj
+
+
 def column_contract_plan(
     project_dir: Path, *, scope: set[str] | None = None
-) -> tuple[dict[str, dict[str, str | None]], int, list[str]]:
+) -> ColumnContractPlan:
     """Every selected model's declared column contract, from the compiled
     manifest, plus how many considered models declare none at all (#230).
 
@@ -411,27 +442,38 @@ def column_contract_plan(
     has: a model name is conventionally lowercase already, so this never narrows
     past what an exact-case match would.
 
-    Returns ``(declared_by_model, undeclared_count, notes)``. A model with no
-    ``columns:`` entry contributes to the count and nothing to the mapping:
-    it has no contract to compare, which is a fact about the project rather
-    than a finding about any one model, so it is named once at the summary
-    level (#230's acceptance) rather than repeated per model. ``notes`` names
-    the one condition that stops this from running at all, the same way
-    :func:`row_population_plan` does for its own manifest read.
+    Returns a :class:`ColumnContractPlan` unpacking as ``(declared_by_model,
+    undeclared_count, notes)``. A model with no ``columns:`` entry contributes to
+    the count and nothing to the mapping: it has no contract to compare, which is a
+    fact about the project rather than a finding about any one model, so it is named
+    once at the summary level (#230's acceptance) rather than repeated per model.
+    ``notes`` names the one condition that stops this from running at all, the same
+    way :func:`row_population_plan` does for its own manifest read.
     """
 
     nodes = _manifest_nodes(project_dir)
     if nodes is None:
-        return (
+        return ColumnContractPlan(
             {},
             0,
             [
                 "no compiled manifest found; run `dbt compile` or `dbt build` "
                 "for column-contract findings"
             ],
+            {},
         )
 
+    from ..transform.build import packages_dir
+
+    try:
+        install_dir = (
+            packages_dir(project_dir).relative_to(Path(project_dir)).as_posix()
+        )
+    except Exception:
+        install_dir = "dbt_packages"
+
     declared_by_model: dict[str, dict[str, str | None]] = {}
+    package_entries: dict[str, str] = {}
     undeclared = 0
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
@@ -454,7 +496,25 @@ def column_contract_plan(
             for column_name, column in columns.items()
             if isinstance(column_name, str)
         }
-    return declared_by_model, undeclared, []
+        patch = node.get("patch_path")
+        if isinstance(patch, str) and "://" in patch:
+            pkg, path = patch.split("://", 1)
+            if pkg and path and pkg != node.get("package_name"):
+                package_entries[name] = f"{install_dir.rstrip('/')}/{pkg}/{path}"
+
+    with contextlib.suppress(Exception):
+        from ..transform.package_overrides import documented_overrides
+
+        project_file = Path(project_dir) / "dbt_project.yml"
+        if project_file.is_file():
+            project_yml = project_file.read_text(encoding="utf-8")
+            overrides = documented_overrides(
+                project_dir, declared_by_model.keys(), project_yml
+            )
+            for model_name, override in overrides.items():
+                package_entries[model_name] = override.package_entry
+
+    return ColumnContractPlan(declared_by_model, undeclared, [], package_entries)
 
 
 @dataclass
@@ -495,11 +555,18 @@ def column_contract_findings(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     undeclared: int,
+    *,
+    package_entries: Mapping[str, str] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """:func:`column_contract_check`, as findings and notes alone."""
 
     check = column_contract_check(
-        adapter, declared_by_model, model_relations, live_identifiers, undeclared
+        adapter,
+        declared_by_model,
+        model_relations,
+        live_identifiers,
+        undeclared,
+        package_entries=package_entries,
     )
     return check.findings, check.notes
 
@@ -510,6 +577,8 @@ def column_contract_check(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     undeclared: int,
+    *,
+    package_entries: Mapping[str, str] | None = None,
 ) -> ColumnContractCheck:
     """A built relation's actual columns against what its schema.yml declares,
     in both directions, plus a type check where a type is declared (#230).
@@ -536,6 +605,10 @@ def column_contract_check(
     A relation whose metadata cannot be read is named and the rest still
     compared. A cost-guard refusal is re-raised: it is the caller's own limit
     rather than a gap in this check.
+
+    An override of a package model documented by the package names the package's
+    YAML entry in its findings (``package_entries``) and explains that the project
+    cannot declare the override (#1205).
     """
 
     from ..dbt_project import column_contract_divergence
@@ -580,6 +653,9 @@ def column_contract_check(
             declared_lower, actual_lower, connector=connector
         )
 
+        package_entry = (package_entries or {}).get(model)
+        source = f"`{package_entry}`" if package_entry else "schema.yml"
+
         if missing:
             findings.append(
                 DriftFinding(
@@ -589,23 +665,34 @@ def column_contract_check(
                     severity="high",
                     detail=(
                         f"'{model}' declares column(s) {', '.join(missing)} in "
-                        "schema.yml that the built relation does not have"
+                        f"{source} that the built relation does not have"
                     ),
                     data={"model": model, "columns": missing},
                 )
             )
         if extra:
+            if package_entry:
+                detail = (
+                    f"'{model}' builds column(s) {', '.join(extra)} that "
+                    f"`{package_entry}` does not declare; the project cannot "
+                    "declare the override"
+                )
+            else:
+                detail = (
+                    f"'{model}' builds column(s) {', '.join(extra)} that "
+                    "schema.yml does not declare"
+                )
+            extra_data: dict[str, Any] = {"model": model, "columns": extra}
+            if package_entry:
+                extra_data["package_entry"] = package_entry
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="column_undeclared",
                     identifier=model,
                     severity="low",
-                    detail=(
-                        f"'{model}' builds column(s) {', '.join(extra)} that "
-                        "schema.yml does not declare"
-                    ),
-                    data={"model": model, "columns": extra},
+                    detail=detail,
+                    data=extra_data,
                 )
             )
         if mismatched:
@@ -621,7 +708,7 @@ def column_contract_check(
                             f"{name} as {declared_type}"
                             for name, declared_type, _ in mismatched
                         )
-                        + " in schema.yml, but the built relation has "
+                        + f" in {source}, but the built relation has "
                         + ", ".join(
                             f"{name} as {actual_type}"
                             for name, _, actual_type in mismatched

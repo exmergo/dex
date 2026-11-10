@@ -19,7 +19,17 @@ no query and no connection, and says two things:
 Each change that alters a row population, removes an output, or changes a type,
 an aggregate or a NULL treatment is held to the model's existing assumptions,
 the way identifier conversions are (#861): ``declared`` when an assumption's
-``column`` names a column it governs, ``undeclared`` otherwise. Nothing here
+``column`` names a column it governs, ``undeclared`` otherwise.
+
+Re-driving a model (#1228) is the one population change held to more: the
+relations its rows come from changed, or its declared ``population.parent`` was
+removed or replaced. That changes which entity the model is about, which only
+the request or a contract can decide, so it is ``declared`` only by an
+assumption at ``request`` or ``contract`` tier. Observed counts never settle
+it: an agent that sees NULL aggregates and re-drives the model from the child
+table has answered a join-key question with a new population. The baseline is
+the applied model, or, for a model only an earlier unapplied plan wrote, that
+plan. Nothing here
 refuses a plan. An undeclared change is either one the request asked for, which
 an assumption should record with the evidence that settles it, or one nobody
 decided, which should be undone.
@@ -77,6 +87,9 @@ class ScopeChange(BaseModel):
     columns: list[str] | None = None
     prior: str | None = None
     authored: str | None = None
+    #: ``redriven`` for a change of the relations driving the model or of its
+    #: declared parent (#1228), whose settling needs ``request`` or ``contract``.
+    reason: str | None = None
     #: ``declared`` or ``undeclared`` for a judged change; absent for one that
     #: is only listed (a column added, a rewritten expression).
     status: str | None = None
@@ -99,6 +112,9 @@ class ModelScope(BaseModel):
     #: ``changed`` without making the removals readable.
     outputs_unread: bool | None = None
     elided: int = 0
+    #: What the model was compared with: ``applied`` (the file on disk) or
+    #: ``earlier_plan`` (a model only an earlier unapplied plan wrote, #1228).
+    against: str | None = None
 
 
 def analyze(
@@ -106,11 +122,16 @@ def analyze(
     assumptions: Iterable[Mapping[str, Any]],
     dialect: str,
     vars: Mapping[str, Any] | None = None,
+    *,
+    parents: Mapping[str, tuple[str | None, str | None]] | None = None,
+    against: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """``data.change_scope`` for ``(path, prior_sql, authored_sql)`` triples.
 
     ``assumptions`` are ``data.decisions`` entries (``model``, ``column``, ...).
-    ``None`` when no edit rewrites an existing model.
+    ``None`` when no edit rewrites an existing model. ``parents`` maps a path
+    to its declared ``population.parent`` before and after, and ``against`` a
+    path to what its prior SQL is (``applied`` unless stated), for #1228.
     """
 
     by_model: dict[str, list[Mapping[str, Any]]] = {}
@@ -121,19 +142,22 @@ def analyze(
 
     models: list[ModelScope] = []
     for path, prior_sql, authored_sql in edits:
-        if prior_sql.strip() == authored_sql.strip():
+        if prior_sql.strip() == authored_sql.strip() and not _parent_moved(
+            (parents or {}).get(path)
+        ):
             continue
         model = PurePosixPath(path).stem
-        models.append(
-            scope_for(
-                path,
-                prior_sql,
-                authored_sql,
-                dialect,
-                by_model.get(model.lower(), []),
-                vars,
-            )
+        found = scope_for(
+            path,
+            prior_sql,
+            authored_sql,
+            dialect,
+            by_model.get(model.lower(), []),
+            vars,
+            parents=(parents or {}).get(path),
         )
+        found.against = (against or {}).get(path, "applied")
+        models.append(found)
     if not models:
         return None
     models.sort(key=lambda m: (-m.undeclared, m.model))
@@ -160,6 +184,8 @@ def scope_for(
     dialect: str,
     assumptions: list[Mapping[str, Any]],
     vars: Mapping[str, Any] | None = None,
+    *,
+    parents: tuple[str | None, str | None] | None = None,
 ) -> ModelScope:
     """One model's change scope; never raises."""
 
@@ -207,13 +233,26 @@ def scope_for(
             population = "unchecked"
     outputs, outputs_reason = _outputs(prior_tree, authored_tree, changes)
     unread = outputs_reason is not None
+    redriven = _redriven(prior_sql, authored_sql, dialect, vars, parents)
+    if redriven:
+        changes.extend(redriven)
+        population = "changed"
 
     for change in changes:
         _settle(change, assumptions)
     # Undeclared first, so a cap never hides the change that needs a decision.
+    # A redrive leads its status (#1228): it changes which entity the model is
+    # about, so no per-model or completion cap may cut it before a formula.
     order = {"undeclared": 0, "declared": 1, None: 2}
     changes.sort(
-        key=lambda c: (order[c.status], c.axis, c.scope, c.kind, c.column or "")
+        key=lambda c: (
+            order[c.status],
+            c.reason != "redriven",
+            c.axis,
+            c.scope,
+            c.kind,
+            c.column or "",
+        )
     )
     undeclared = sum(1 for c in changes if c.status == "undeclared")
     elided = max(0, len(changes) - MAX_CHANGES_PER_MODEL)
@@ -267,6 +306,79 @@ def _population(
     if unresolved:
         return "unchecked", "; ".join(sorted({u.detail for u in unresolved}))
     return "kept", None
+
+
+def _parent_moved(parents: tuple[str | None, str | None] | None) -> bool:
+    if parents is None:
+        return False
+    before, after = parents
+    return before is not None and (after or "").lower() != before.lower()
+
+
+def _redriven(
+    prior_sql: str,
+    authored_sql: str,
+    dialect: str,
+    vars: Mapping[str, Any] | None,
+    parents: tuple[str | None, str | None] | None,
+) -> list[ScopeChange]:
+    """The re-driving changes between two versions of a model (#1228): the set
+    of relations its rows come from, read as drafting reads it (the FROM chain
+    through CTEs, plus what a RIGHT, FULL or CROSS join keeps), and a declared
+    parent removed or replaced. A version whose drivers cannot be read reports
+    nothing here; row attribution names what it could not isolate."""
+
+    from .drafting import read
+
+    out: list[ScopeChange] = []
+    try:
+        before = read(prior_sql, None, dialect=dialect, vars=vars)
+        after = read(authored_sql, None, dialect=dialect, vars=vars)
+    except Exception:
+        before = after = None
+    if (
+        before is not None
+        and after is not None
+        and before.driving
+        and after.driving
+        and before.driving_unread is None
+        and after.driving_unread is None
+        and {d.lower() for d in before.driving} != {d.lower() for d in after.driving}
+    ):
+        prior = ", ".join(before.driving)
+        authored = ", ".join(after.driving)
+        out.append(
+            ScopeChange(
+                axis="population",
+                kind="redriven",
+                scope="model",
+                detail=(
+                    f"the relations the model's rows come from changed from "
+                    f"`{prior}` to `{authored}`, which changes which entity it "
+                    "is about"
+                ),
+                prior=prior,
+                authored=authored,
+                reason="redriven",
+            )
+        )
+    if parents is not None and _parent_moved(parents):
+        was, now = parents
+        out.append(
+            ScopeChange(
+                axis="population",
+                kind="redriven",
+                scope="model",
+                detail=(
+                    f"the declared population.parent `{was}` was "
+                    + (f"replaced by `{now}`" if now else "removed")
+                ),
+                prior=was,
+                authored=now,
+                reason="redriven",
+            )
+        )
+    return out
 
 
 def _columns_of(prior: str | None, authored: str | None, dialect: str) -> list[str]:
@@ -502,6 +614,9 @@ def _settle(change: ScopeChange, assumptions: list[Mapping[str, Any]]) -> None:
 
     if change.axis == "output" and change.kind not in JUDGED:
         return
+    if change.reason == "redriven":
+        _settle_redriven(change, assumptions)
+        return
     if change.axis == "population":
         names = set(change.columns or [])
     else:
@@ -528,6 +643,46 @@ def _settle(change: ScopeChange, assumptions: list[Mapping[str, Any]]) -> None:
             )
         return
     change.status = "undeclared"
+
+
+#: The tiers that settle re-driving a model: which entity a model is about is the
+#: request's or a contract's to say, never the data's (#1228).
+REDRIVE_TIERS = ("request", "contract")
+
+
+def _settle_redriven(change: ScopeChange, assumptions: list[Mapping[str, Any]]) -> None:
+    """``declared`` by the first assumption on the model at ``request`` or
+    ``contract`` tier, whatever column it names, since a swapped driver names
+    none; otherwise ``undeclared``, saying what a lower tier cannot settle."""
+
+    for assumption in assumptions:
+        if assumption.get("evidence") in REDRIVE_TIERS:
+            change.status = "declared"
+            change.assumption = {
+                k: assumption.get(k)
+                for k in ("decision", "chosen", "evidence", "column")
+                if assumption.get(k) is not None
+            }
+            return
+    change.status = "undeclared"
+    lower = sorted(
+        {
+            str(a.get("evidence"))
+            for a in assumptions
+            if a.get("evidence") and a.get("evidence") not in REDRIVE_TIERS
+        }
+    )
+    change.note = (
+        "re-driving a model is settled only by an assumption at request or "
+        "contract tier; observed counts never settle it, and NULL or zero "
+        "aggregates on a parent-driven model point at the join key, not at a new "
+        "driving relation"
+        + (
+            f" (this model's assumptions are at {', '.join(lower)} tier)"
+            if lower
+            else ""
+        )
+    )
 
 
 # --- envelope helpers ----------------------------------------------------------
@@ -569,6 +724,7 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
                     ("kind", c.get("kind")),
                     ("column", c.get("column")),
                     ("status", c.get("status")),
+                    ("reason", c.get("reason")),
                 )
                 if v is not None
             }

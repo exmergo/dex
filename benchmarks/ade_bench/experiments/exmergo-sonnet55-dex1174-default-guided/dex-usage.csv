@@ -1,0 +1,76 @@
+task_id,attempt,is_latest_attempt,condition,status,is_resolved,reported_cost_usd,runtime_ms,skill_calls,skills_by_name,execution_telemetry_available,cli_operations,wrapper_operations,uv_module_operations,operations_started,operations_succeeded,operations_errored,operations_incomplete,help_or_version_calls
+airbnb001.base,1,True,dex-guided-v1,pass,True,0.11102619999999999,35250,1,"{""dex:transform"": 1}",True,0,4,0,4,4,0,0,0
+airbnb002.base,1,True,dex-guided-v1,pass,True,0.11450890000000001,39808,1,"{""dex:transform"": 1}",True,0,5,0,5,4,1,0,0
+airbnb003.base,1,True,dex-guided-v1,pass,True,0.129903,33305,1,"{""dex:transform"": 1}",True,5,0,0,5,3,2,0,0
+airbnb004.base,1,True,dex-guided-v1,pass,True,0.1379271,48398,1,"{""dex:transform"": 1}",True,0,7,0,7,6,1,0,0
+airbnb005.base,1,True,dex-guided-v1,fail,False,0.1832813,45309,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,6,0,6,5,1,0,0
+airbnb006.base,1,True,dex-guided-v1,pass,True,0.11625590000000002,42290,1,"{""dex:transform"": 1}",True,0,6,0,6,5,1,0,0
+airbnb007.base,1,True,dex-guided-v1,pass,True,0.1608188,57121,1,"{""dex:transform"": 1}",True,0,8,0,8,7,1,0,0
+airbnb008.base,1,True,dex-guided-v1,pass,True,0.0964387,36585,1,"{""dex:maintain"": 1}",True,0,5,0,5,5,0,0,0
+airbnb009.base,1,True,dex-guided-v1,fail,False,0.1713313,66592,1,"{""dex:maintain"": 1}",True,0,13,0,13,10,3,0,2
+airbnb010.base,1,True,dex-guided-v1,pass,True,0.1382947,48636,1,"{""dex:transform"": 1}",True,0,6,0,6,5,1,0,0
+airbnb011.base,1,True,dex-guided-v1,pass,True,0.20639459999999998,56231,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,7,0,7,6,1,0,0
+airbnb011.hint,1,True,dex-guided-v1,pass,True,0.22471729999999995,62192,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,8,0,8,6,2,0,0
+airbnb012.base,1,True,dex-guided-v1,pass,True,0.16655160000000002,63460,1,"{""dex:transform"": 1}",True,0,11,0,11,7,4,0,0
+airbnb013.base,1,True,dex-guided-v1,pass,True,0.124121,55261,1,"{""dex:maintain"": 1}",True,0,8,0,8,8,0,0,0
+analytics_engineering001.base,1,True,dex-guided-v1,pass,True,0.019655,7127,0,{},True,0,0,0,0,0,0,0,0
+analytics_engineering002.base,1,True,dex-guided-v1,pass,True,0.0938029,21939,1,"{""dex:transform"": 1}",True,4,0,0,4,3,1,0,0
+analytics_engineering002.medium,1,True,dex-guided-v1,pass,True,0.1530898,50599,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,7,0,7,6,1,0,0
+analytics_engineering003.base,1,True,dex-guided-v1,pass,True,0.1097072,27447,1,"{""dex:transform"": 1}",True,6,0,0,6,5,1,0,0
+analytics_engineering004.base,1,True,dex-guided-v1,fail,False,0.18849250000000004,55718,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,11,0,11,9,2,0,0
+analytics_engineering005.base,1,True,dex-guided-v1,pass,True,0.1670365,79193,1,"{""dex:maintain"": 1}",True,0,16,0,16,10,6,0,1
+analytics_engineering006.base,1,True,dex-guided-v1,fail,False,0.2117233,64041,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,11,0,11,5,6,0,0
+analytics_engineering007.base,1,True,dex-guided-v1,pass,True,0.15483130000000003,64014,1,"{""dex:transform"": 1}",True,0,9,0,9,4,5,0,0
+analytics_engineering007.medium,1,True,dex-guided-v1,pass,True,0.240875,69013,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,10,0,10,8,2,0,0
+analytics_engineering008.base,1,True,dex-guided-v1,pass,True,0.12116270000000001,30439,1,"{""dex:transform"": 1}",True,0,5,0,5,5,0,0,0
+asana001.base,1,True,dex-guided-v1,pass,True,0.223986,116381,1,"{""dex:maintain"": 1}",True,0,12,0,12,6,6,0,1
+asana002.base,1,True,dex-guided-v1,fail,False,0.18977950000000002,47331,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,1,0,1,1,0,0,0
+asana003.base,1,True,dex-guided-v1,pass,True,0.1499161,35761,1,"{""dex:transform"": 1}",True,0,1,0,1,1,0,0,0
+asana004.base,1,True,dex-guided-v1,fail,False,0.11647960000000002,37371,1,"{""dex:transform"": 1}",True,0,5,0,5,4,1,0,0
+asana005.base,1,True,dex-guided-v1,fail,False,0.39254789999999995,148169,1,"{""dex:transform"": 1}",True,23,0,0,23,15,8,0,2
+asana005.hard,1,True,dex-guided-v1,fail,False,0.1077181,39589,1,"{""dex:transform"": 1}",True,0,4,0,4,2,2,0,0
+f1001.base,1,True,dex-guided-v1,pass,True,0.15887500000000002,52296,1,"{""dex:transform"": 1}",True,7,0,0,7,5,2,0,1
+f1002.base,1,True,dex-guided-v1,fail,False,0.12623790000000001,33454,1,"{""dex:transform"": 1}",True,0,4,0,4,4,0,0,0
+f1003.base,1,True,dex-guided-v1,pass,True,0.2349005,71637,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,12,0,12,8,4,0,0
+f1003.hard,1,True,dex-guided-v1,pass,True,0.1217713,42800,1,"{""dex:explore"": 1}",True,0,4,0,4,3,1,0,0
+f1004.base,1,True,dex-guided-v1,pass,True,0.17600299999999997,55936,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,11,1,0,12,9,3,0,0
+f1005.base,1,True,dex-guided-v1,pass,True,0.1075192,34311,1,"{""dex:maintain"": 1}",True,0,7,0,7,6,1,0,0
+f1005.medium,1,True,dex-guided-v1,pass,True,0.16263899999999998,37618,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,7,0,7,5,2,0,0
+f1006.base,1,True,dex-guided-v1,pass,True,0.1218293,41359,1,"{""dex:maintain"": 1}",True,0,9,0,9,6,3,0,0
+f1006.hard,1,True,dex-guided-v1,pass,True,0.12610290000000002,44543,1,"{""dex:maintain"": 1}",True,0,8,0,8,6,2,0,0
+f1007.base,1,True,dex-guided-v1,pass,True,0.11624010000000001,38796,1,"{""dex:maintain"": 1}",True,0,9,0,9,9,0,0,0
+f1007.medium,1,True,dex-guided-v1,pass,True,0.1725296,46328,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,18,0,18,18,0,0,0
+f1007.hard,1,True,dex-guided-v1,pass,True,0.1606891,36255,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,6,0,6,6,0,0,0
+f1009.base,1,True,dex-guided-v1,pass,True,0.1424489,36089,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,5,0,5,5,0,0,0
+f1010.base,1,True,dex-guided-v1,pass,True,0.0932261,34372,1,"{""dex:explore"": 1}",True,0,4,0,4,4,0,0,0
+f1010.medium,1,True,dex-guided-v1,pass,True,0.11065439999999997,39891,1,"{""dex:explore"": 1}",True,0,5,0,5,4,1,0,0
+f1011.base,1,True,dex-guided-v1,fail,False,0.14174989999999998,42539,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,6,0,6,5,1,0,0
+helixops_saas001.base,1,True,dex-guided-v1,pass,True,0.1082684,31127,1,"{""dex:transform"": 1}",True,0,4,0,4,4,0,0,0
+helixops_saas002.base,1,True,dex-guided-v1,pass,True,0.1419882,27637,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,5,0,5,5,0,0,0
+helixops_saas003.base,1,True,dex-guided-v1,pass,True,0.1492799,38842,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,6,0,0,6,6,0,0,0
+helixops_saas004.base,1,True,dex-guided-v1,pass,True,0.13463170000000002,20639,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,4,0,0,4,4,0,0,0
+helixops_saas004.no_hint,1,True,dex-guided-v1,pass,True,0.13270959999999998,27162,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,4,0,4,4,0,0,0
+helixops_saas005.base,1,True,dex-guided-v1,pass,True,0.1366328,34137,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,5,0,5,5,0,0,0
+helixops_saas006.base,1,True,dex-guided-v1,pass,True,0.11288060000000001,45601,1,"{""dex:explore"": 1}",True,0,5,0,5,5,0,0,0
+helixops_saas007.base,1,True,dex-guided-v1,pass,True,0.1312182,37848,1,"{""dex:transform"": 1}",True,0,6,0,6,4,2,0,0
+helixops_saas007.no_location_hint,1,True,dex-guided-v1,fail,False,0.1374117,30850,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,5,0,5,4,1,0,0
+helixops_saas008.base,1,True,dex-guided-v1,pass,True,0.1283524,31775,1,"{""dex:transform"": 1}",True,0,5,0,5,4,1,0,1
+helixops_saas009.base,1,True,dex-guided-v1,pass,True,0.1188982,31253,1,"{""dex:transform"": 1}",True,0,4,0,4,3,1,0,0
+helixops_saas010.base,1,True,dex-guided-v1,fail,False,0.1320883,38008,1,"{""dex:transform"": 1}",True,5,0,0,5,5,0,0,0
+helixops_saas011.base,1,True,dex-guided-v1,pass,True,0.1736944,51924,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,10,0,10,8,2,0,0
+helixops_saas011.hard,1,True,dex-guided-v1,pass,True,0.3240997,101723,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,36,0,36,32,4,0,0
+helixops_saas012.base,1,True,dex-guided-v1,pass,True,0.109066,31628,1,"{""dex:transform"": 1}",True,5,0,0,5,5,0,0,0
+helixops_saas012.hard,1,True,dex-guided-v1,pass,True,0.1202187,36348,1,"{""dex:transform"": 1}",True,6,0,0,6,6,0,0,0
+helixops_saas013.base,1,True,dex-guided-v1,pass,True,0.1428782,37651,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,6,0,6,4,2,0,0
+helixops_saas015.base,1,True,dex-guided-v1,pass,True,0.1560279,45096,1,"{""dex:transform"": 1}",True,0,5,0,5,4,1,0,1
+helixops_saas015.low,1,True,dex-guided-v1,pass,True,0.1614532,51227,1,"{""dex:transform"": 1}",True,0,7,0,7,6,1,0,1
+helixops_saas016.base,1,True,dex-guided-v1,pass,True,0.1929729,36564,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,8,0,0,8,7,1,0,1
+helixops_saas017.base,1,True,dex-guided-v1,pass,True,0.09919990000000001,28679,1,"{""dex:explore"": 1}",True,0,4,0,4,2,2,0,1
+helixops_saas018.base,1,True,dex-guided-v1,pass,True,0.15121620000000002,35173,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,5,0,5,4,1,0,0
+intercom001.base,1,True,dex-guided-v1,pass,True,0.17018509999999998,49693,1,"{""dex:explore"": 1}",True,12,0,0,12,8,4,0,0
+intercom002.base,1,True,dex-guided-v1,fail,False,0.2032883,56455,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,9,0,0,9,6,3,0,0
+intercom003.base,1,True,dex-guided-v1,fail,False,0.2156482,55323,2,"{""dex:explore"": 1, ""dex:transform"": 1}",True,0,9,0,9,6,3,0,0
+quickbooks001.base,1,True,dex-guided-v1,pass,True,0.3608592,145188,2,"{""dex:maintain"": 1, ""dex:transform"": 1}",True,0,23,0,23,16,7,0,0
+quickbooks002.base,1,True,dex-guided-v1,pass,True,0.21210179999999998,83806,1,"{""dex:transform"": 1}",True,0,7,0,7,5,2,0,0
+quickbooks003.base,1,True,dex-guided-v1,fail,False,0.21464450000000002,107098,1,"{""dex:transform"": 1}",True,0,6,0,6,4,2,0,0
+quickbooks004.base,1,True,dex-guided-v1,pass,True,0.34530770000000005,141164,1,"{""dex:transform"": 1}",True,9,0,0,9,6,3,0,0

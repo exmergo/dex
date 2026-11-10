@@ -752,3 +752,106 @@ def test_a_new_model_has_no_change_scope(accounts_project, capsys):
         capsys,
     )
     assert "change_scope" not in envelope["data"]
+
+
+# --- re-driving (#1228) ------------------------------------------------------------
+
+REDRIVE_FROM_PARENT = (
+    "with parts as (\n"
+    "  select conversation_id, count(*) as part_count\n"
+    "  from {{ ref('stg_parts') }} group by conversation_id\n"
+    ")\n"
+    "select c.conversation_id, coalesce(p.part_count, 0) as part_count\n"
+    "from {{ ref('stg_conversations') }} as c\n"
+    "left join parts as p on p.conversation_id = c.conversation_id\n"
+)
+REDRIVE_FROM_PARTS = (
+    "select conversation_id, count(*) as part_count\n"
+    "from {{ ref('stg_parts') }} group by conversation_id\n"
+)
+REDRIVE_PATH = "models/marts/conversation_summary.sql"
+
+
+def _redrive(prior, authored, assumptions=None, parents=None):
+    return cs.scope_for(
+        REDRIVE_PATH, prior, authored, "duckdb", assumptions or [], parents=parents
+    )
+
+
+def test_a_new_driving_relation_is_redriven_and_undeclared():
+    scope = _redrive(REDRIVE_FROM_PARENT, REDRIVE_FROM_PARTS)
+    [change] = [c for c in scope.changes if c.kind == "redriven"]
+    assert scope.population == "changed"
+    assert change.reason == "redriven"
+    assert change.prior == "stg_conversations"
+    assert change.authored == "stg_parts"
+    assert change.status == "undeclared"
+    assert "join key" in change.note
+
+
+@pytest.mark.parametrize(
+    ("evidence", "status"),
+    [
+        ("request", "declared"),
+        ("contract", "declared"),
+        ("precedent", "undeclared"),
+        ("data", "undeclared"),
+        ("default", "undeclared"),
+    ],
+)
+def test_only_request_or_contract_settles_a_redrive(evidence, status):
+    assumption = {
+        "model": "conversation_summary",
+        "decision": "which conversations belong",
+        "chosen": "only conversations with parts",
+        "evidence": evidence,
+    }
+    scope = _redrive(REDRIVE_FROM_PARENT, REDRIVE_FROM_PARTS, [assumption])
+    [change] = [c for c in scope.changes if c.kind == "redriven"]
+    assert change.status == status
+    if status == "undeclared":
+        assert f"at {evidence} tier" in change.note
+
+
+def test_a_removed_parent_is_redriven_even_with_the_sql_unchanged():
+    report = cs.analyze(
+        [(REDRIVE_PATH, REDRIVE_FROM_PARENT, REDRIVE_FROM_PARENT)],
+        [],
+        "duckdb",
+        parents={REDRIVE_PATH: ("stg_conversations", None)},
+    )
+    [entry] = report["models"]
+    assert entry["population"] == "changed"
+    [change] = entry["changes"]
+    assert change["kind"] == "redriven"
+    assert "was removed" in change["detail"]
+    assert cs.stored_form(report)["conversation_summary"] == [
+        {"kind": "redriven", "status": "undeclared", "reason": "redriven"}
+    ]
+
+
+def test_an_unchanged_driver_and_parent_are_not_redriven():
+    scope = _redrive(
+        REDRIVE_FROM_PARENT,
+        REDRIVE_FROM_PARENT.replace("coalesce(p.part_count, 0)", "p.part_count"),
+        parents=("stg_conversations", "stg_conversations"),
+    )
+    assert not [c for c in scope.changes if c.kind == "redriven"]
+
+
+def test_an_earlier_plan_is_named_as_what_was_compared():
+    report = cs.analyze(
+        [(REDRIVE_PATH, REDRIVE_FROM_PARENT, REDRIVE_FROM_PARTS)],
+        [],
+        "duckdb",
+        against={REDRIVE_PATH: "earlier_plan"},
+    )
+    assert report["models"][0]["against"] == "earlier_plan"
+
+
+def test_a_redrive_leads_so_no_cap_cuts_it():
+    # Four output changes beside the redrive: a completion list capped at five
+    # still has the redrive, because it sorts first among the undeclared.
+    scope = _redrive(REDRIVE_FROM_PARTS, REDRIVE_FROM_PARENT)
+    assert len([c for c in scope.changes if c.status == "undeclared"]) > 1
+    assert scope.changes[0].kind == "redriven"

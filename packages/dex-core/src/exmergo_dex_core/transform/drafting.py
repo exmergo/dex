@@ -48,6 +48,7 @@ from .declarations import DEX_META_KEY, model_sql_path, snapshot_defined
 
 if TYPE_CHECKING:
     from ..references import ReferenceIndex
+    from .population_inference import Draft, KeyFacts
 
 #: The model-level intent fields every declaration is expected to state, in the
 #: order a reader would ask about them.
@@ -139,6 +140,12 @@ class _Reading:
     incomplete: list[str] = field(default_factory=list)
     #: Placeholder identifier -> the dbt relation name it stands for.
     tokens: dict[str, str] = field(default_factory=dict)
+    #: Output columns an aggregate produces, followed through CTEs: the columns
+    #: that read NULL or zero on a parent with no children (#1228).
+    aggregated: list[str] = field(default_factory=list)
+    #: Output columns carried from the outer side of a join, which read NULL
+    #: where the join found no match (#1228).
+    outer_joined: list[str] = field(default_factory=list)
 
 
 def draft(
@@ -158,6 +165,7 @@ def draft(
     package_documented: Mapping[str, Mapping[str, str]] | None = None,
     packaged: Callable[[str], str | None] | None = None,
     package_target: Callable[[str], Any] | None = None,
+    key_facts: Callable[[], KeyFacts | None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
 
@@ -177,6 +185,9 @@ def draft(
     the package documents (``package`` and ``package_entry``): dbt gives such an
     override the package's YAML entry and allows it none of its own, so it owes
     no intent and its entry says where its documentation lives (#1161).
+    ``key_facts`` builds the keys and joins the project states (see
+    :mod:`.population_inference`), called at most once; with it, a model that
+    declares no ``population.parent`` gets a drafted one (#1228).
     """
 
     model_paths = list(model_paths)
@@ -194,6 +205,15 @@ def draft(
         if not built:
             built.append(index())
         return built[0]
+
+    facts_read: list[KeyFacts | None] = []
+
+    def facts() -> KeyFacts | None:
+        if key_facts is None:
+            return None
+        if not facts_read:
+            facts_read.append(key_facts())
+        return facts_read[0]
 
     for model in sorted(set(models)):
         sql_path = model_sql_path(files, model_paths, model)
@@ -229,6 +249,24 @@ def draft(
             if precedent:
                 drafted["precedent"] = precedent
         documented = (package_documented or {}).get(model)
+        parent_draft = None
+        if not documented and (stated := facts()) is not None:
+            parent_draft = _draft_parent(
+                model,
+                reading,
+                declared,
+                files,
+                model_paths,
+                cache,
+                stated,
+                reference_index,
+                packaged,
+                dialect,
+                vars,
+                warnings,
+            )
+            if parent_draft is not None:
+                drafted["population_parent"] = parent_draft.as_dict()
         missing = [] if documented else _missing(declared, reading)
         found = _contradictions(
             model,
@@ -253,6 +291,8 @@ def draft(
             grain_judged=any(c["check"] == "grain" for c in found or []),
         )
         model_warnings.extend(_literal_warnings(model, reading, cache))
+        if parent_draft is not None and parent_draft.model is not None:
+            model_warnings.append(_parent_draft_warning(model, parent_draft))
         if (
             not documented
             and not declared.get("history")
@@ -278,6 +318,80 @@ def draft(
             out[model]["contradictions"] = found
         warnings.extend(_untoken(model_warnings, reading.tokens))
     return out, warnings
+
+
+def _draft_parent(
+    model: str,
+    reading: _Reading,
+    declared: dict[str, Any],
+    files: Mapping[str, str],
+    model_paths: list[str],
+    cache: DexCache | None,
+    stated: KeyFacts,
+    index: Callable[[], ReferenceIndex | None],
+    packaged: Callable[[str], str | None] | None,
+    dialect: str,
+    vars: Mapping[str, Any] | None,
+    warnings: list[str],
+) -> Draft | None:
+    """The parent drafted for a model that declares none (#1228); commentary,
+    so a defect is a warning naming the exception and never a missing draft."""
+
+    from .population_inference import draft_parent
+
+    try:
+        if not reading.grain and stated.unique:
+            path = model_sql_path(files, model_paths, model)
+            if path is not None:
+                reading = read(
+                    files[path],
+                    cache,
+                    dialect=dialect,
+                    vars=vars,
+                    files=files,
+                    model_paths=model_paths,
+                    known_keys=stated.known_keys(),
+                )
+        return draft_parent(
+            model,
+            reading,
+            declared=declared,
+            files=files,
+            model_paths=model_paths,
+            cache=cache,
+            facts=stated,
+            index=index(),
+            packaged=packaged,
+            dialect=dialect,
+            vars=vars,
+        )
+    except Exception as exc:
+        warnings.append(
+            f"could not draft the parent of '{model}' ({type(exc).__name__}: "
+            f"{exc}); the plan itself is unaffected"
+        )
+        return None
+
+
+def _parent_draft_warning(model: str, draft: Draft) -> str:
+    """One sentence naming the drafted parent, what it rests on, and what the
+    build will do with it."""
+
+    key = ", ".join(f"{o} -> {draft.model}.{p}" for o, p in draft.key.items())
+    sentence = (
+        f"'{model}' declares no population.parent; dex drafts {draft.model} "
+        f"({key}) from {draft.evidence} evidence. `transform build --verify` "
+        "measures the model against it (orphan keys, missing parents, parents "
+        "with no children); declare the parent, or record the population you "
+        "intend as an assumption"
+    )
+    if draft.drives_from_parent is False:
+        sentence += (
+            f". Its rows are driven from {', '.join(draft.driving)}, outside "
+            f"{draft.model}'s lineage, so its keys are whatever that relation "
+            "holds"
+        )
+    return sentence
 
 
 def _contradictions(
@@ -452,12 +566,15 @@ def read(
     vars: Mapping[str, Any] | None,
     files: Mapping[str, str] | None = None,
     model_paths: list[str] | None = None,
+    known_keys: Mapping[str, list[list[str]]] | None = None,
 ) -> _Reading:
     """Read one model's SQL statically.
 
     ``files`` and ``model_paths`` let profile lookups resolve a relation to the
     model's configured alias; readers without them still read everything that
-    needs no alias.
+    needs no alias. ``known_keys`` maps a lowered relation name to keys the
+    project tests or declares unique on it, which stand in where the cache has
+    proved none (the parent draft passes them, #1228).
     """
     reading = _Reading()
     try:
@@ -502,7 +619,13 @@ def read(
         return reading
 
     _Lineage(
-        tree, relations, cache, reading, files=files, model_paths=model_paths
+        tree,
+        relations,
+        cache,
+        reading,
+        files=files,
+        model_paths=model_paths,
+        known_keys=known_keys,
     ).run()
     return reading
 
@@ -527,8 +650,11 @@ class _Lineage:
         reading: _Reading,
         files: Mapping[str, str] | None = None,
         model_paths: list[str] | None = None,
+        known_keys: Mapping[str, list[list[str]]] | None = None,
     ) -> None:
         from .. import sql_shape
+
+        self.known_keys = known_keys or {}
 
         self.shape = sql_shape
         self.tree = tree
@@ -575,6 +701,7 @@ class _Lineage:
                 origin = self.origin(self.tree, expression)
                 if origin is not None:
                     self.reading.origins[name] = origin
+            self._read_children(outputs)
 
         keys, evidence = self.keys(self.tree)
         if keys:
@@ -660,6 +787,64 @@ class _Lineage:
                         "its driving relation is generated in SQL or is not a "
                         "table or subquery dex can follow"
                     )
+
+    def _read_children(self, outputs: dict[str, Any]) -> None:
+        """Which output columns describe a child rather than the row's entity:
+        those an aggregate produces, and those carried from the outer side of a
+        join. A parent kept with no children reads NULL or zero in all of them,
+        which is what verification counts (#1228). Commentary only: a column
+        whose lineage cannot be followed is simply not listed, and nothing it
+        tried is recorded as incomplete."""
+
+        noted = len(self.reading.incomplete)
+        for name, expression in outputs.items():
+            found = self._child_kind(self.tree, expression, 0)
+            if found == "aggregate":
+                self.reading.aggregated.append(name)
+            elif found == "outer":
+                self.reading.outer_joined.append(name)
+        del self.reading.incomplete[noted:]
+
+    def _child_kind(self, select: Any, expression: Any, depth: int) -> str | None:
+        """``aggregate`` where ``expression`` is computed by an aggregate,
+        through any CTE or subquery, ``outer`` where it reads a column from the
+        outer side of a join, otherwise ``None``."""
+
+        from sqlglot import expressions as exp
+
+        if depth > 32 or expression is None:
+            return None
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            return None
+        if any(
+            node.find_ancestor(exp.Select) in (None, select)
+            for node in expression.find_all(exp.AggFunc)
+        ):
+            return "aggregate"
+        outer = False
+        for column in expression.find_all(exp.Column):
+            if isinstance(column.this, exp.Star):
+                continue
+            found = self.source_of(select, column)
+            if found is None:
+                continue
+            _alias, relation, join = found
+            if self.outer_join(select, join) is not None and join is not None:
+                outer = True
+            kind, target = self.target(relation)
+            if kind != "scope":
+                continue
+            inner_outputs = self.outputs(target)
+            inner = (
+                None
+                if inner_outputs is None
+                else inner_outputs.get(column.name.lower())
+            )
+            deeper = self._child_kind(target, inner, depth + 1)
+            if deeper == "aggregate":
+                return "aggregate"
+            outer = outer or deeper == "outer"
+        return "outer" if outer else None
 
     @staticmethod
     def _output_order(outputs: dict[str, Any] | None):
@@ -1056,6 +1241,14 @@ class _Lineage:
         if kind != "physical":
             return [], "its driving relation is not one dex can follow"
         dataset = dataset_for(self.cache, target)
+        stated = self.known_keys.get(target.rsplit(".", 1)[-1].lower())
+        if (dataset is None or not dataset.columns or not proven_keys(dataset)) and (
+            stated
+        ):
+            shown = " + ".join(", ".join(key) for key in stated)
+            return [frozenset(c.lower() for c in key) for key in stated], (
+                f"{shown} is tested unique on {target}"
+            )
         if dataset is None or not dataset.columns:
             return [], f"{target} is not profiled, so no key of it is proven"
         proven = proven_keys(dataset)

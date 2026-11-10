@@ -256,7 +256,10 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      re-aggregated or re-NULLed, every judged change declared
                                      (an assumption names its column) or undeclared (a warning),
                                      carried to a --for-plan build's
-                                     completion.obligations.change_scope;
+                                     completion.obligations.change_scope; a changed driving relation
+                                     or a declared population.parent removed or replaced is kind
+                                     redriven (reason redriven, against applied or earlier_plan),
+                                     declared only by an assumption at request or contract tier (#1228);
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref
@@ -353,6 +356,25 @@ dex transform place <column>      -> where a derived column shared by several mo
                                      `per_target` and the reason is stated rather than the worse thing
                                      being done quietly. --explain returns the reasoning and stores no
                                      plan. Repo-only and free
+dex transform repair <node>...    -> the project override that repairs each package model whose
+                                     latest build attempt failed, drafted as one stored, unapplied
+                                     plan (#1229; every failed model in one call, since each disables
+                                     its node in the same dbt_project.yml): the package's SQL restated as
+                                     <model path>/overrides/<node>.sql (package macros qualified,
+                                     each var() given what the package node saw, a relation var
+                                     inlined so a project var cannot cycle, materialized/schema/alias
+                                     restated) and +enabled: false for the node in dbt_project.yml,
+                                     written in place. Inside the calls the error names, and only
+                                     there, each column of the offending type is converted where the
+                                     input's cached profile settles it (all NULL: a cast through text;
+                                     epoch seconds/ms: the epoch reader, meaning_changing: true; ISO
+                                     text: a parse), else left as written, unresolved with a
+                                     reason_code. Compiled, then bound on dev reading no row (DuckDB
+                                     limit 0, BigQuery dry run), each further type error converted
+                                     the same way. data.repair leads the payload (status, plan_id,
+                                     compiled, next, nodes[]). A --for-plan build of it carries
+                                     data.completion.obligations.repair, one `repair: satisfied` entry
+                                     per override whose every check held
 dex transform declare [<model>]   -> declarations for models that already exist, opt-in. One stored
   [--edits-file <f>] [--limit N]     plan proposing, per selected model, only the measured facts its
   [--intent "<text>"]                YAML does not state: the grain, a key or foreign_key role, a
@@ -637,6 +659,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      entity counts, one data.temporal_contracts record per contract;
                                      unchecked with snapshot_not_ancestor or lineage_unavailable where
                                      the manifest does not show the model descending from it),
+                                     population_delta (a built model declaring no parent, against the
+                                     parent dex drafts for it: orphan_keys, missing_parents, empty_rows,
+                                     one data.population_delta record per model, needs_decision listed
+                                     under completion.obligations.needs_decision; build only, #1228),
                                      each class
                                      priced into the same single offer on a metered connector. Join
                                      contract: every equality join's coverage, rows and distinct keys
@@ -689,7 +715,12 @@ supplied, each also a warning). For measures, warnings name only the missing
 `aggregation`, `additivity`, or `unit` fields and group columns with the same
 missing fields; the `missing` list keeps its per-column paths unchanged.
 `drafted.precedent` says what the project's other models do with each column
-that the model filters, branches on or aggregates, and a
+that the model filters, branches on or aggregates; `drafted.population_parent`
+is the parent dex drafts for a model that declares none (a unique key equal to
+the grain, a `relationships` edge, the description's "one row per" noun, the
+driving relation, strongest first), labelled `drafted` with its evidence and
+never written, with `transform build --verify` measuring the model against it
+(#1228); and a
 literal compared to a column whose complete cached domain does not hold it is a
 warning. On a model that already exists, `contradictions` lists each declared rule
 (population filter, grain, declared column, an upstream column's additivity) that
@@ -1535,9 +1566,15 @@ default, or a filter or operator after it is refused. A key naming a location
   checked twice. A declared `population.parent` is held to the parent's keys
   (`parent_population_missing`, `parent_population_unexpected`, #857), and a
   declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
-  per contract under `data.verification.temporal_contracts`). Every class that
+  per contract under `data.verification.temporal_contracts`). A built model that
+  declares no parent is measured against the parent dex drafts for it (#1228):
+  orphan keys, missing parents and rows with no child, one record per model under
+  `data.verification.population_delta`, a `population_delta` finding and
+  `completion.obligations.needs_decision` where the counts ask which rows belong.
+  Only the plan's models with `--for-plan`, at most 25 without. Every class that
   did not run is named in `suppressed` (`grain`, `unit`, `additivity`,
-  `population`, `parent_population`, `temporal`).
+  `population`, `parent_population`, `temporal`); `population_delta` never is,
+  since each model it considered has its own record.
 
   **Join coverage.** Every equality join the built models write is measured as
   `maintain verify` measures it (#857), with one record per join under

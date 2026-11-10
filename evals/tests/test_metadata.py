@@ -80,6 +80,7 @@ DIGESTS = {
     "trial_events": "74e1c40cadf83d6cdfb83caef52b94855393764cf05c340d2806bd69cb662d6a",
     "adjusted_price": "a5f757536249ad0a1a9d3834b8e2005838de6588726b3e1ce9be2cebe15282d3",
     "intended_repairs": "f85cf9bda1ccac17b11c024cbee3e351047b425a5f60dfc178f3fce4e3133b8a",
+    "reviewed_listings": "77e9d59322d5207ce8a7bc5954156cefe28b27afe51b37f97d03403e2f21892b",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -3794,3 +3795,164 @@ def test_compare_expect_passes_the_repair_and_flags_its_over_broad_variant(
     assert verdicts["reference"]["status"] == "as_expected", verdicts["reference"]
     assert verdicts["overbroad"]["status"] == "unexpected", verdicts["overbroad"]
     assert verdicts["overbroad"]["expectation"]["findings"]
+
+
+# --- #1228: a population no declaration states, measured anyway --------------------
+
+_THREE_CASES = {
+    # Orphan child keys: the setup of the "fix" task, driven from the tickets.
+    "orphans": (
+        "parent_zero_children/build_account_summary",
+        "models/marts/account_ticket_summary.sql",
+        "select t.account_id, a.account_name, count(*) as ticket_count,\n"
+        "    max(t.opened_on) as last_ticket_opened_on\n"
+        "from {{ ref('stg_tickets') }} as t\n"
+        "left join {{ ref('stg_accounts') }} as a using (account_id)\n"
+        "group by 1, 2\n",
+    ),
+    # Parents kept with no children, where the request keeps only reviewed ones.
+    "zero_children": (
+        "reviewed_listings/build_listing_reviews",
+        "models/marts/listing_review_summary.sql",
+        "with reviews as (\n"
+        "    select listing_id, count(*) as review_count, avg(rating) as avg_rating\n"
+        "    from {{ ref('stg_reviews') }} group by listing_id\n"
+        ")\n"
+        "select l.listing_id, l.listing_name, r.review_count, r.avg_rating\n"
+        "from {{ ref('stg_listings') }} as l\n"
+        "left join reviews as r on r.listing_id = l.listing_id\n",
+    ),
+    # An extraction refactor whose intermediate drops the accounts with no users.
+    "extraction": (
+        "refactor_compare/extract_intermediate",
+        "models/intermediate/int_account_users.sql",
+        "select a.account_id, count(us.user_id) as user_count,\n"
+        "    count(d.user_id) as named_users\n"
+        "from {{ ref('stg_accounts') }} as a\n"
+        "inner join {{ ref('stg_users') }} as us on us.account_id = a.account_id\n"
+        "left join {{ ref('stg_display_names') }} as d on d.user_id = us.user_id\n"
+        "group by a.account_id\n",
+    ),
+}
+
+
+def _dex(capsys, *argv: str) -> dict:
+    from exmergo_dex_core.cli import main
+
+    main(list(argv))
+    return json.loads(capsys.readouterr().out)
+
+
+def _measure(workspace: Path, edits: list[tuple[str, str]], capsys) -> dict:
+    """Plan ``edits`` with no declaration, apply and build them with --verify."""
+
+    payload = workspace / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {"path": path, "kind": "model_sql", "content": sql}
+                    for path, sql in edits
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    planned = _dex(capsys, "transform", "plan", "eval", "--edits-file", str(payload))
+    assert planned["status"] == "ok", planned["errors"]
+    plan_id = planned["data"]["plan_id"]
+    assert _dex(capsys, "transform", "apply", plan_id)["status"] == "ok"
+    built = _dex(
+        capsys,
+        "transform",
+        "build",
+        "--target",
+        "dev",
+        "--verify",
+        "--for-plan",
+        plan_id,
+    )
+    assert built["status"] == "ok", built["errors"]
+    return built
+
+
+def _delta(built: dict, model: str) -> dict:
+    [record] = [
+        r
+        for r in built["data"]["verification"].get("population_delta") or []
+        if r["model"] == model
+    ]
+    return record
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("case", "model", "asks", "severity"),
+    [
+        (
+            "orphans",
+            "account_ticket_summary",
+            ["orphan_keys", "missing_parents"],
+            "high",
+        ),
+        ("zero_children", "listing_review_summary", ["empty_rows"], "low"),
+        ("extraction", "int_account_users", ["missing_parents"], "medium"),
+    ],
+)
+def test_dex_flags_each_population_no_declaration_states(
+    case, model, asks, severity, tmp_path, monkeypatch, capsys
+):
+    """The issue's three cases on the fixtures' own data, with nothing declared:
+    Dex drafts the parent and the --verify build asks which rows belong."""
+
+    key, path, sql = _THREE_CASES[case]
+    task = _task(key)
+    workspace = materialize(task, fixture_of(task, FIXTURES), tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
+    built = _measure(workspace, [(path, sql)], capsys)
+    record = _delta(built, model)
+    assert record["status"] == "needs_decision", record
+    assert record["asks"] == asks
+    severities = {
+        f["identifier"]: f["severity"]
+        for f in built["data"]["verification"]["findings"]
+        if f["code"] == "population_delta"
+    }
+    assert severities[model] == severity
+    assert model in {
+        o["model"] for o in built["data"]["completion"]["obligations"]["needs_decision"]
+    }
+
+
+@needs_dbt
+def test_the_reviewed_listings_answer_is_settled_by_its_request(
+    tmp_path, monkeypatch, capsys
+):
+    """The reference drops the unreviewed listings on the request's word, which
+    its assumption records, so the counts that would ask are settled."""
+
+    task = _task("reviewed_listings/build_listing_reviews")
+    workspace = materialize(task, fixture_of(task, FIXTURES), tmp_path / "ws")
+    reference = task.directory / "reference" / "models" / "marts"
+    shutil.copy(
+        reference / "listing_review_summary.yml",
+        workspace / "models" / "marts" / "listing_review_summary.yml",
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
+    built = _measure(
+        workspace,
+        [
+            (
+                "models/marts/listing_review_summary.sql",
+                (reference / "listing_review_summary.sql").read_text(encoding="utf-8"),
+            )
+        ],
+        capsys,
+    )
+    record = _delta(built, "listing_review_summary")
+    assert record["status"] == "settled"
+    assert record["asks"] == ["missing_parents"]
+    assert record["measured"]["orphan_keys"] == 0
+    assert record["settled_by"]["evidence"] == "request"
