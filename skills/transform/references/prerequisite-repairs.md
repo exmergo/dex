@@ -157,8 +157,9 @@ dex transform build --target dev --verify --for-plan <plan-id> --cold-deps
 ```
 
 `data.completion.obligations.repair` holds the build to `repair_built`,
-`repair_tests` (the package's own tests, run on the override), `repair_cold_deps`
-and `repair_row_count`. The draft never adds a filter, so the package's own
+`repair_tests` (the package's own tests, run on the override), `repair_cold_deps`,
+`repair_row_count`, and `repair_conversion` while a conversion stays unresolved
+or an `unbound` draft has not built. The draft never adds a filter, so the package's own
 filters stand and the override holds the rows the package would have: a Fivetran
 staging model still drops `_fivetran_deleted` rows, which can leave fewer rows
 than the raw source. A draft left `unresolved` is still a plan: edit the
@@ -258,10 +259,13 @@ whatever an earlier build left, so the comparison is `not_checked`
    says `baseline_ready: false` and lists each blocked input under
    `per_model[].blocked_inputs` with its `owner` (and `package`). Do not apply
    this plan: applying it discards the baseline (`plan_applied`).
-2. **Repair the prerequisite in a plan of its own**: for a package model, the
-   `repair` each `blocked_inputs[]` entry names (`dex transform repair <model>`,
-   section 2a); otherwise a supported route from a build's `data.prerequisites`.
-   Apply it.
+2. **Repair the prerequisite in a plan of its own**: for a failed package
+   model, the `repair` its `blocked_inputs[]` entry names (`dex transform repair
+   <model>`, section 2a), every failed one in one call. A `skipped` input names
+   no repair: it was skipped because something upstream failed, so find that
+   failed node in the build's `data.prerequisites` and repair it, and the skipped
+   input rebuilds with it. Otherwise use a supported route from
+   `data.prerequisites`. Apply it.
 3. **Build the repair.** Where a package owns the node, build it cold:
 
    ```bash
@@ -293,8 +297,10 @@ failed build for the baseline, so it can never be usable: the plan carries
 
 A blocker of the request's own deliverables is in scope, so stop only when the
 repair cannot be made: `transform repair` refuses the node (the override route is
-refused, or the draft does not compile), or a conversion stays `unresolved` with
-no profile or request that settles it. Then report the deliverable as incomplete
+refused, or the draft does not compile) and no other route the build's
+`data.prerequisites` marks `supported` (`macro_dispatch`, `pinned_dependency`)
+resolves it, or a conversion stays `unresolved` with no profile or request that
+settles it. Then report the deliverable as incomplete
 and name the exact prerequisite (`node`, `owner`, `message`) and the remedy you
 tried. Writing the requested SQL file does not complete
 it. A refactor left blocked has no comparison: say so, rather than citing a

@@ -351,10 +351,15 @@ Needs no baseline. The classes of finding:
     low for parents kept with no children), on `transform build --verify`
     only, for a built model that declares no `population.parent` (#1228): the
     same counts against the parent dex drafts for it, plus the rows whose child
-    columns are all NULL or zero. It asks which rows the model is for rather
-    than calling any of them wrong; each such model has a record under
-    `data.population_delta` (`satisfied`, `needs_decision`, `settled`,
-    `not_applicable`, `unchecked`), and it is never named in `suppressed`.
+    columns are all NULL or zero (a sign of parents kept with no children, not
+    proof: children whose amounts sum to zero read the same). It asks which rows the model is for rather
+    than calling any of them wrong. Its records are under
+    `data.verification.population_delta` (`satisfied`, `needs_decision`,
+    `settled`, `not_applicable`, `unchecked`), and it is never named in
+    `suppressed`. Not every such model gets one: with `--for-plan` only the
+    plan's models are drafted (one the draft cannot reach is `unchecked`),
+    without it at most 25, and a model nothing could be drafted for is named in
+    `notes`, so an absent record does not mean the model was checked.
     `maintain verify` measures declared parents only.
   - `temporal_transition_count_mismatch`, `temporal_latest_transition_mismatch`
     and `temporal_first_attainment_mismatch` (high), `temporal_population_missing`
