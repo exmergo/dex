@@ -280,6 +280,8 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
 
 
 def plan_hint(result: PlanResult) -> dict[str, str]:
+    """The plan envelope's `next`: what to compare, repair or apply, in order."""
+
     companion = (getattr(result, "semantic_proposal", None) or {}).get("plan_id")
     if companion:
         # Named both explicitly: a bare `transform apply` takes the latest

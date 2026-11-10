@@ -72,6 +72,8 @@ from exmergo_dex_core.transform.refactor_compare import BlockedInput, repair_fir
     ],
 )
 def test_the_typing_errors_dex_reads(message, function, offending, target):
+    """Each DuckDB and BigQuery typing error names its function and types."""
+
     failure = repair.parse_type_failure(message)
     assert failure is not None
     assert (failure.function, failure.offending, failure.target) == (
@@ -92,10 +94,14 @@ def test_the_typing_errors_dex_reads(message, function, offending, target):
     ],
 )
 def test_anything_else_is_not_read(message):
+    """A message that is not a typing error Dex converts reads as nothing."""
+
     assert repair.parse_type_failure(message) is None
 
 
 def test_a_coalesce_of_two_non_temporal_types_has_no_target():
+    """A coalesce of two non-temporal types has no target to convert to."""
+
     failure = repair.parse_type_failure(
         "Cannot mix values of type INTEGER and VARCHAR in COALESCE"
     )
@@ -120,6 +126,8 @@ def test_a_coalesce_of_two_non_temporal_types_has_no_target():
     ],
 )
 def test_type_families(data_type, expected):
+    """Warehouse types fold into the families conversions are chosen by."""
+
     assert repair.family(data_type) == expected
 
 
@@ -127,6 +135,8 @@ def test_type_families(data_type, expected):
 
 
 def test_each_connector_spells_its_conversions_without_a_quote():
+    """Every spelling can sit inside a quoted macro argument."""
+
     for connector in ("duckdb", "bigquery", "snowflake"):
         for kind in ("null_cast", "epoch_seconds", "epoch_millis", "iso_parse"):
             for target in ("timestamp", "date"):
@@ -141,12 +151,16 @@ def test_each_connector_spells_its_conversions_without_a_quote():
 
 
 def _profile(name="legacy_ts", data_type="INTEGER", null_fraction=1.0, pii=None):
+    """A cached column profile with only the fields settling reads."""
+
     return SimpleNamespace(
         name=name, data_type=data_type, null_fraction=null_fraction, pii=pii
     )
 
 
 def _dataset(columns, notes=(), rows=3):
+    """A cached dataset holding ``columns`` and the profile's ``notes``."""
+
     return SimpleNamespace(
         identifier="dev.main.raw_task",
         row_count=rows,
@@ -157,12 +171,16 @@ def _dataset(columns, notes=(), rows=3):
 
 
 def _coalesce():
+    """The failure DuckDB reports for a TIMESTAMP coalesced with an INTEGER."""
+
     return repair.TypeFailure(
         "coalesce", ("TIMESTAMP", "INTEGER"), "integer", "timestamp"
     )
 
 
 def test_an_all_null_column_is_a_plain_cast_that_changes_no_value():
+    """All NULL settles a cast through text, which changes no value."""
+
     conversion = repair.Conversion(column="legacy_ts")
     profile = _profile()
     repair.settle(conversion, profile, _dataset([profile]), _coalesce(), "duckdb")
@@ -174,6 +192,8 @@ def test_an_all_null_column_is_a_plain_cast_that_changes_no_value():
 
 
 def test_epoch_seconds_are_read_as_such_and_flagged_as_meaning_changing():
+    """Epoch seconds are read as such, and flagged as changing the value's meaning."""
+
     profile = _profile(name="due_epoch", null_fraction=0.0)
     note = (
         "due_epoch is declared INTEGER but 100% of values fall in the plausible "
@@ -189,6 +209,8 @@ def test_epoch_seconds_are_read_as_such_and_flagged_as_meaning_changing():
 
 
 def test_iso_text_is_parsed_when_the_error_names_a_string():
+    """ISO text is parsed when the error names a string column."""
+
     profile = _profile(name="due_on", data_type="VARCHAR", null_fraction=0.1)
     note = (
         "due_on is declared VARCHAR but 99% of values match the %Y-%m-%d date "
@@ -221,6 +243,8 @@ def test_iso_text_is_parsed_when_the_error_names_a_string():
     ],
 )
 def test_what_the_evidence_does_not_settle_stays_unresolved(profile, notes, reason):
+    """Evidence that settles nothing leaves the column unresolved, never guessed."""
+
     conversion = repair.Conversion(column="legacy_ts")
     repair.settle(
         conversion, profile, _dataset([profile], notes), _coalesce(), "duckdb"
@@ -231,6 +255,8 @@ def test_what_the_evidence_does_not_settle_stays_unresolved(profile, notes, reas
 
 
 def test_an_unreviewed_connector_is_unresolved_rather_than_guessed():
+    """A connector with no reviewed spelling is unresolved."""
+
     conversion = repair.Conversion(column="legacy_ts")
     profile = _profile()
     repair.settle(conversion, profile, _dataset([profile]), _coalesce(), "databricks")
@@ -274,11 +300,15 @@ from base
 
 
 def test_call_sites_include_macro_arguments_and_skip_comments():
+    """Call sites include macro arguments and skip comments."""
+
     assert repair.columns_in_sites(SQL, "coalesce") == ["created_at", "legacy_ts"]
     assert "due_epoch" in repair.columns_in_sites(SQL, "date_trunc")
 
 
 def test_conversions_land_only_inside_the_failing_calls():
+    """A conversion is written only inside the calls the error names."""
+
     legacy = repair.Conversion(
         column="legacy_ts", status="resolved", expression="cast({c} as timestamp)"
     )
@@ -298,12 +328,16 @@ def test_conversions_land_only_inside_the_failing_calls():
 
 
 def test_a_conversion_no_site_reads_is_unresolved():
+    """A conversion no call site reads becomes unresolved and changes nothing."""
+
     missing = repair.Conversion(column="nowhere", status="resolved", expression="{c}")
     assert repair.apply_conversions(SQL, "coalesce", [missing]) == SQL
     assert (missing.status, missing.reason_code) == ("unresolved", "site_not_found")
 
 
 def test_only_the_packages_own_unqualified_macros_are_qualified():
+    """Only the package's own macros, called unqualified, are qualified."""
+
     sql = (
         "select {{ task_columns() }}, {{ tiny_pkg.other() }}, "
         "{{ fivetran_utils.fill() }}, {{ dbt.type_string() }} from x"
@@ -316,6 +350,8 @@ def test_only_the_packages_own_unqualified_macros_are_qualified():
 
 
 def _scope(root=None, package_vars=None):
+    """The vars each side sees, for a package ``pkg`` in a project ``proj``."""
+
     return repair.VarScope(
         root_project="proj",
         package="pkg",
@@ -326,6 +362,8 @@ def _scope(root=None, package_vars=None):
 
 
 def test_a_relation_var_that_would_cycle_is_inlined():
+    """A relation var the project points at the overridden model is inlined."""
+
     scope = _scope(
         root={"proj": {"task": "{{ ref('stg_task') }}"}},
         package_vars={"pkg": {"task": "{{ source('raw', 'task') }}"}},
@@ -339,6 +377,8 @@ def test_a_relation_var_that_would_cycle_is_inlined():
 
 
 def test_a_value_the_project_lacks_becomes_the_reads_default():
+    """A value only the package defines becomes the read's default."""
+
     scope = _scope(package_vars={"using_x": True, "pkg": {"cols": ["a"]}})
     out, changed, _defaults, _warnings = repair.resolve_vars(
         "{{ config(enabled=var('using_x')) }} {% for c in var('cols') %}{% endfor %}",
@@ -350,6 +390,8 @@ def test_a_value_the_project_lacks_becomes_the_reads_default():
 
 
 def test_a_value_the_project_sets_differently_becomes_the_packages_literal():
+    """A value the project sets differently is written as the package's literal."""
+
     scope = _scope(root={"limit_n": 5, "pkg": {"limit_n": 10}})
     out, changed, _d, _w = repair.resolve_vars("select {{ var('limit_n') }}", scope)
     # Only the package's scoped value differs from what the project sees.
@@ -358,12 +400,16 @@ def test_a_value_the_project_sets_differently_becomes_the_packages_literal():
 
 
 def test_a_var_seen_the_same_way_on_both_sides_is_left_alone():
+    """A var both sides read the same way is left alone."""
+
     scope = _scope(root={"shared": 1})
     sql = "select {{ var('shared') }}"
     assert repair.resolve_vars(sql, scope)[0] == sql
 
 
 def test_a_var_a_macro_reads_by_name_is_set_for_the_project():
+    """A var a macro reads by name is set under the project's vars."""
+
     scope = _scope(package_vars={"pkg": {"task_pass_through_columns": []}})
     out, changed, defaults, _w = repair.resolve_vars(
         "select {{ fivetran_utils.fill_pass_through_columns("
@@ -378,6 +424,8 @@ def test_a_var_a_macro_reads_by_name_is_set_for_the_project():
 
 
 def test_the_packages_resolved_config_is_restated_unless_the_sql_sets_it():
+    """The package's resolved config is restated unless its SQL sets it."""
+
     sql, keys = repair.restate_config(
         "select 1", {"materialized": "table", "schema": "stg", "alias": None}
     )
@@ -408,6 +456,8 @@ seeds:
 
 
 def test_set_nested_inserts_under_the_existing_block_and_keeps_comments():
+    """A nested key joins its existing block, and comments survive."""
+
     out = repair.set_nested(PROJECT, ["models", "pkg", "stg", "+enabled"], False)
     assert "# packages we override" in out and "name: proj  # the project" in out
     loaded = yaml.safe_load(out)
@@ -420,6 +470,8 @@ def test_set_nested_inserts_under_the_existing_block_and_keeps_comments():
 
 
 def test_set_nested_adds_a_missing_top_level_block_and_fills_an_empty_one():
+    """A missing block is added, and an empty one is filled."""
+
     out = repair.set_nested("name: proj\n", ["vars", "proj", "cols"], [])
     assert yaml.safe_load(out) == {"name": "proj", "vars": {"proj": {"cols": []}}}
     out = repair.set_nested(
@@ -429,6 +481,8 @@ def test_set_nested_adds_a_missing_top_level_block_and_fills_an_empty_one():
 
 
 def test_set_nested_replaces_a_scalar_leaf():
+    """An existing scalar is replaced in place, its comment kept."""
+
     out = repair.set_nested(
         "models:\n  pkg:\n    stg:\n      +enabled: true  # on\n",
         ["models", "pkg", "stg", "+enabled"],
@@ -438,6 +492,8 @@ def test_set_nested_replaces_a_scalar_leaf():
 
 
 def test_set_nested_refuses_a_flow_mapping_it_would_reformat():
+    """A flow mapping on the path is refused rather than reformatted."""
+
     with pytest.raises(repair.RepairRefusedError, match="flow mapping"):
         repair.set_nested("models: {pkg: {}}\n", ["models", "pkg", "+enabled"], False)
 
@@ -447,15 +503,21 @@ def test_set_nested_refuses_a_flow_mapping_it_would_reformat():
 
 class _Adapter:
     def __init__(self, error=None):
+        """A fake adapter raising ``error`` from every statement, if one is given."""
+
         self.error = error
         self.sql: list[str] = []
 
     def run_query(self, sql, *, max_rows, timeout_seconds):
+        """Record the statement and raise the configured error."""
+
         self.sql.append(sql)
         if self.error:
             raise RuntimeError(self.error)
 
     def query_estimate(self, sql):
+        """Record the statement, raise any configured error, and price it at zero."""
+
         self.sql.append(sql)
         if self.error:
             raise RuntimeError(self.error)
@@ -463,12 +525,16 @@ class _Adapter:
 
 
 def test_duckdb_binds_the_draft_returning_no_row():
+    """DuckDB binds the draft with ``limit 0``."""
+
     adapter = _Adapter()
     assert repair.bind_check(adapter, "duckdb", "select 1;") == ("bound", None, None)
     assert adapter.sql[0].endswith("as dex_bind_check limit 0")
 
 
 def test_bigquery_dry_runs_the_draft_and_a_failure_is_masked():
+    """BigQuery dry-runs the draft, and a refusal's values are masked."""
+
     adapter = _Adapter(error="Could not cast literal 'secret-value' to type DATE")
     status, detail, text = repair.bind_check(adapter, "bigquery", "select 1")
     assert status == "failed"
@@ -477,6 +543,8 @@ def test_bigquery_dry_runs_the_draft_and_a_failure_is_masked():
 
 
 def test_elsewhere_no_bind_check_runs():
+    """A connector with no free, row-free check runs none."""
+
     adapter = _Adapter()
     status, reason, _text = repair.bind_check(adapter, "postgres", "select 1")
     assert status == "not_checked" and "postgres" in reason
@@ -487,6 +555,8 @@ def test_elsewhere_no_bind_check_runs():
 
 
 def _manifest(**config):
+    """A manifest with one package model and the project model reading it."""
+
     return {
         "metadata": {"project_name": "proj"},
         "nodes": {
@@ -510,6 +580,8 @@ def _manifest(**config):
 
 
 def test_a_package_failure_names_the_repair_command():
+    """A failed package model names `dex transform repair` in `next`."""
+
     [entry] = diagnose([("model.pkg.stg_task", "error", "boom")], _manifest())
     assert entry["next"] == "repair: dex transform repair stg_task"
     [override] = [o for o in entry["options"] if o["kind"] == "project_override"]
@@ -517,6 +589,8 @@ def test_a_package_failure_names_the_repair_command():
 
 
 def test_a_package_model_that_cannot_be_overridden_names_no_repair():
+    """A package model whose override route is refused names no repair."""
+
     [entry] = diagnose(
         [("model.pkg.stg_task", "error", "boom")], _manifest(language="python")
     )
@@ -524,11 +598,15 @@ def test_a_package_model_that_cannot_be_overridden_names_no_repair():
 
 
 def test_a_project_failure_names_its_file():
+    """A failed project model points at `transform plan` on its file."""
+
     [entry] = diagnose([("model.proj.mine", "error", "boom")], _manifest())
     assert entry["next"] == "repair: transform plan on models/mine.sql"
 
 
 def test_the_refactor_offer_names_the_repair_command_not_a_key_plans_lack():
+    """The refactor offer names the command, not a key plans never emit."""
+
     text = repair_first(
         [
             BlockedInput("stg_task", "error", "pkg"),
@@ -551,6 +629,8 @@ def test_the_refactor_offer_names_the_repair_command_not_a_key_plans_lack():
 
 
 def _evidence(statuses: dict[str, str]) -> BuildEvidence:
+    """Build evidence holding one node per ``statuses`` entry."""
+
     return BuildEvidence.model_construct(
         nodes=[
             BuildNode(unique_id=uid, name=uid.split(".")[-1], status=status)
@@ -569,10 +649,14 @@ GRAPH = {"test.proj.unique_stg_task_id.abc": ["model.proj.stg_task"]}
 
 
 def _kinds(obligations):
+    """Each obligation's kind, mapped to its status and reason or finding."""
+
     return {o.kind: (o.status, o.reason_code or o.finding) for o in obligations}
 
 
 def test_a_cold_verified_repair_satisfies_every_obligation():
+    """A cold build that built and tested the override satisfies every check."""
+
     evidence = _evidence(
         {"model.proj.stg_task": "success", "test.proj.unique_stg_task_id.abc": "pass"}
     )
@@ -589,6 +673,8 @@ def test_a_cold_verified_repair_satisfies_every_obligation():
 
 
 def test_a_failed_test_a_lost_edit_and_a_row_finding_contradict_it():
+    """A failed test, a lost installed edit and a row finding each contradict it."""
+
     evidence = _evidence(
         {"model.proj.stg_task": "success", "test.proj.unique_stg_task_id.abc": "fail"}
     )
@@ -604,6 +690,8 @@ def test_a_failed_test_a_lost_edit_and_a_row_finding_contradict_it():
 
 
 def test_an_unbuilt_unresolved_repair_stays_open():
+    """An unbuilt, unresolved repair leaves every check open."""
+
     evidence = _evidence({"model.pkg.stg_task": "error"})
     out = _repair_obligations(
         {**RECORD, "status": "unresolved"}, evidence, GRAPH, None, None
@@ -618,10 +706,14 @@ def test_an_unbuilt_unresolved_repair_stays_open():
 
 
 def test_no_repair_record_adds_no_obligation():
+    """A plan with no repair record adds no repair obligation."""
+
     assert _repair_obligations(None, _evidence({}), {}, None, None) == []
 
 
 def test_a_var_read_twice_is_reported_once():
+    """A var read twice is reported once."""
+
     scope = _scope(package_vars={"pkg": {"cols": []}})
     _out, changed, _d, _w = repair.resolve_vars(
         "{% if var('cols') %}{{ var('cols') | join(', ') }}{% endif %}", scope
@@ -630,6 +722,8 @@ def test_a_var_read_twice_is_reported_once():
 
 
 def test_the_plan_hint_names_the_command_that_drafts_a_blocked_repair():
+    """The plan hint names one repair call covering every failed package model."""
+
     from exmergo_dex_core.transform.native_semantic import plan_hint
     from exmergo_dex_core.transform.results import PlanResult
 
@@ -693,6 +787,8 @@ def test_a_column_list_macro_inside_a_cte_passes_the_static_check():
 
 
 def test_a_plan_repairing_several_models_holds_each_to_its_obligations():
+    """Several overrides in one plan are each held to their checks."""
+
     evidence = _evidence(
         {"model.proj.stg_task": "success", "model.proj.stg_note": "error"}
     )
@@ -723,6 +819,8 @@ def test_a_one_line_refusal_is_read_through_its_cause():
 
     class _Refusing(_Adapter):
         def query_estimate(self, sql):
+            """Refuse with a one-line error whose cause carries the argument types."""
+
             try:
                 raise RuntimeError(
                     "No matching signature for function TIMESTAMP_TRUNC\n"
@@ -791,6 +889,8 @@ def test_a_later_pass_never_reads_a_written_conversion_as_a_new_site():
 
 
 def _converted_draft(bind: dict) -> repair.Draft:
+    """A draft whose one failure was converted, with ``bind`` as its bind check."""
+
     drafted = repair.Draft(
         name="stg",
         package="pkg",
@@ -819,10 +919,14 @@ def _converted_draft(bind: dict) -> repair.Draft:
     ],
 )
 def test_a_node_is_resolved_only_when_its_draft_binds(bind, status):
+    """A node is resolved only when its draft binds on dev."""
+
     assert repair.finish(_converted_draft(bind))["status"] == status
 
 
 def test_an_unbound_draft_is_checked_by_the_build_that_builds_it():
+    """An unbound draft's conversion stays open until the override builds."""
+
     record = {**RECORD, "status": "unbound"}
     built = _evidence({"model.proj.stg_task": "success"})
     failed = _evidence({"model.proj.stg_task": "error"})

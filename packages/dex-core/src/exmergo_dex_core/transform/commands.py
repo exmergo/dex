@@ -2070,6 +2070,8 @@ def repair(engine: DexEngine, names: str | Sequence[str] | None) -> RepairResult
         manifests[unique_id] = manifest
 
     def drafted_edits() -> list[PlanEdit]:
+        """The plan's edits as the drafts stand: the overrides, then the project."""
+
         return [
             *(
                 PlanEdit(
@@ -2206,6 +2208,8 @@ def repair(engine: DexEngine, names: str | Sequence[str] | None) -> RepairResult
 
 
 def cmd_repair(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """CLI shim for `transform repair`: draft the overrides and wrap the result."""
+
     try:
         result = repair(engine, getattr(args, "nodes", None))
     except DbtParseError as exc:

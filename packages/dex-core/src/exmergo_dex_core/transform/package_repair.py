@@ -116,6 +116,9 @@ _FUNCTION_NAMES = {
 
 
 def _failure(function: str, types: list[str]) -> TypeFailure | None:
+    """The failure ``function`` over ``types`` names, or ``None`` where Dex
+    drafts no conversion for that function."""
+
     name = _FUNCTION_NAMES.get(function.lower())
     if name is None:
         return None
@@ -344,6 +347,8 @@ def _masked(sql: str) -> str:
 
 
 def _closing(text: str, open_paren: int) -> int | None:
+    """Where the paren opened at ``open_paren`` closes; ``None`` if never."""
+
     depth = 0
     for index in range(open_paren, len(text)):
         if text[index] == "(":
@@ -522,6 +527,8 @@ class VarScope:
     scopes: set[str]
 
     def _global(self, mapping: Mapping[str, Any]) -> dict[str, Any]:
+        """A ``vars:`` mapping's entries not scoped to a project or package."""
+
         return {
             str(k): v
             for k, v in mapping.items()
@@ -529,6 +536,8 @@ class VarScope:
         }
 
     def _scoped(self, mapping: Mapping[str, Any], name: str) -> dict[str, Any]:
+        """The entries of a ``vars:`` mapping scoped to ``name``."""
+
         scoped = mapping.get(name)
         return dict(scoped) if isinstance(scoped, Mapping) else {}
 
@@ -688,10 +697,14 @@ def restate_config(sql: str, config: Mapping[str, Any]) -> tuple[str, list[str]]
 
 
 def _line_start(text: str, index: int) -> int:
+    """The index where the line holding ``index`` starts."""
+
     return text.rfind("\n", 0, index) + 1
 
 
 def _block(parts: list[str], value: Any, column: int) -> str:
+    """``parts`` as nested YAML keys at ``column``, the last one set to ``value``."""
+
     lines = []
     for depth, part in enumerate(parts):
         pad = " " * (column + 2 * depth)
@@ -715,6 +728,8 @@ def set_nested(text: str, path: list[str], value: Any) -> str:
         raise RepairRefusedError(f"dbt_project.yml does not parse: {exc}") from exc
 
     def insert(at: int, block: str) -> str:
+        """``text`` with ``block`` inserted at ``at``, on a line of its own."""
+
         prefix = text[:at]
         if prefix and not prefix.endswith("\n"):
             prefix += "\n"
@@ -823,6 +838,8 @@ class Draft:
 
 
 def _relation(manifest: Mapping[str, Any], unique_id: str) -> str | None:
+    """The unquoted relation a manifest node or source names, if any."""
+
     from ..dbt_project import strip_relation_quoting
 
     for section in ("nodes", "sources", "seeds", "snapshots"):
@@ -864,6 +881,9 @@ def upstream_relations(
 
 
 def _cached(cache: Any, relation: str) -> Any:
+    """The cached profile of ``relation``, matched as `explore query` matches
+    names, or ``None``."""
+
     from ..cache import match_identifier
 
     if cache is None:
@@ -880,6 +900,9 @@ def _cached(cache: Any, relation: str) -> Any:
 
 
 def _profile_command(manifest: Mapping[str, Any], unique_id: str, relation: str) -> str:
+    """The `explore profile` command that reaches ``relation``, with
+    ``--target dev`` for a project node."""
+
     dev = unique_id.split(".", 1)[0] in ("model", "seed", "snapshot")
     return f"dex explore profile {relation}" + (" --target dev" if dev else "")
 

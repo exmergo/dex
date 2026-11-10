@@ -65,6 +65,8 @@ def _git(cwd: Path, *argv: str) -> str:
 
 
 def _make_project(tmp_path: Path) -> Path:
+    """A DuckDB project reading a local git package whose model fails twice over."""
+
     package = tmp_path / "tiny_pkg"
     (package / "models").mkdir(parents=True)
     (package / "macros").mkdir()
@@ -139,6 +141,8 @@ def _make_project(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
+    """The project, as the working directory."""
+
     root = _make_project(tmp_path)
     monkeypatch.chdir(root)
     monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
@@ -146,11 +150,15 @@ def project(tmp_path, monkeypatch):
 
 
 def _dex(capsys, *argv: str) -> dict:
+    """Run the CLI and return its envelope."""
+
     main(list(argv))
     return json.loads(capsys.readouterr().out)
 
 
 def _failed_build(capsys) -> dict:
+    """Install the package and run the build that fails on it."""
+
     assert _dex(capsys, "transform", "deps")["status"] == "ok"
     failed = _dex(capsys, "transform", "build", "--target", "dev")
     assert failed["status"] == "error"

@@ -1656,6 +1656,8 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # First, and without `ensure_dialect_available`: demo authors no SQL a guard
     # has to clear, and it must stay reachable on the lightest install that can
     # run it, which is the one a first-time user has.
+    """Dispatch one parsed command to its handler and return its envelope."""
+
     if args.group == "demo":
         from .demo.commands import cmd_demo
 

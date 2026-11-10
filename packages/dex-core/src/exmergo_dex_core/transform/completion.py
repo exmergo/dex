@@ -1055,6 +1055,8 @@ def _repair_obligations(
     )
 
     def obligation(kind: str, status: str, **extra: Any) -> Obligation:
+        """One repair obligation on this override."""
+
         return Obligation(model=name, kind=kind, status=status, **extra)
 
     out: list[Obligation] = []
