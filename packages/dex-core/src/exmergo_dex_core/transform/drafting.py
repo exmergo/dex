@@ -43,6 +43,7 @@ from ..cache import (
     Relationship,
     match_identifier,
 )
+from ..dbt_project import strip_relation_quoting
 from ..guards.pii_meta import entry_meta
 from .declarations import DEX_META_KEY, model_sql_path, snapshot_defined
 
@@ -157,6 +158,8 @@ def draft(
     prior: Mapping[str, str] | None = None,
     package_documented: Mapping[str, Mapping[str, str]] | None = None,
     packaged: Callable[[str], str | None] | None = None,
+    manifest: Mapping[str, Any] | None = None,
+    manifest_stale: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
 
@@ -176,6 +179,8 @@ def draft(
     the package documents (``package`` and ``package_entry``): dbt gives such an
     override the package's YAML entry and allows it none of its own, so it owes
     no intent and its entry says where its documentation lives (#1161).
+    ``manifest`` is the compiled dbt manifest, used to resolve ambiguous
+    ``ref()`` inputs when not stale (#989).
     """
 
     model_paths = list(model_paths)
@@ -183,6 +188,11 @@ def draft(
     out: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     built: list[ReferenceIndex] = []
+    effective_manifest = (
+        None
+        if (manifest_stale or (manifest and manifest.get("stale") is True))
+        else manifest
+    )
 
     def reference_index() -> ReferenceIndex | None:
         if index is None:
@@ -203,6 +213,7 @@ def draft(
             vars=vars,
             files=files,
             model_paths=model_paths,
+            manifest=effective_manifest,
         )
         drafted = _drafted(
             reading,
@@ -215,6 +226,7 @@ def draft(
             cache_note=cache_note,
             dev_namespace=dev_namespace,
             packaged=packaged,
+            manifest=effective_manifest,
         )
         if reading.usages and (found := reference_index()) is not None:
             precedent = _precedent(
@@ -246,7 +258,9 @@ def draft(
             missing,
             grain_judged=any(c["check"] == "grain" for c in found or []),
         )
-        model_warnings.extend(_literal_warnings(model, reading, cache))
+        model_warnings.extend(
+            _literal_warnings(model, reading, cache, manifest=effective_manifest)
+        )
         if (
             not documented
             and not declared.get("history")
@@ -446,6 +460,7 @@ def read(
     vars: Mapping[str, Any] | None,
     files: Mapping[str, str] | None = None,
     model_paths: list[str] | None = None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> _Reading:
     """Read one model's SQL statically.
 
@@ -496,7 +511,13 @@ def read(
         return reading
 
     _Lineage(
-        tree, relations, cache, reading, files=files, model_paths=model_paths
+        tree,
+        relations,
+        cache,
+        reading,
+        files=files,
+        model_paths=model_paths,
+        manifest=manifest,
     ).run()
     return reading
 
@@ -521,6 +542,7 @@ class _Lineage:
         reading: _Reading,
         files: Mapping[str, str] | None = None,
         model_paths: list[str] | None = None,
+        manifest: Mapping[str, Any] | None = None,
     ) -> None:
         from .. import sql_shape
 
@@ -531,6 +553,7 @@ class _Lineage:
         self.reading = reading
         self.files = files or {}
         self.model_paths = list(model_paths or [])
+        self.manifest = manifest
         self.ctes = {
             name: scope
             for name, scope in sql_shape.scopes(tree).items()
@@ -726,7 +749,7 @@ class _Lineage:
             outputs = self.outputs(target)
             return None if outputs is None else list(outputs)
         if kind == "physical":
-            dataset = dataset_for(self.cache, target)
+            dataset = dataset_for(self.cache, target, manifest=self.manifest)
             if dataset is not None and dataset.columns:
                 return [column.name for column in dataset.columns]
         return None
@@ -1032,7 +1055,11 @@ class _Lineage:
             if origin is None:
                 continue
             dataset = _dataset_for_model(
-                self.cache, origin.relation, self.files, self.model_paths
+                self.cache,
+                origin.relation,
+                self.files,
+                self.model_paths,
+                manifest=self.manifest,
             )
             profile = _column(dataset, origin.column)
             if profile is not None and profile.pii is not None:
@@ -1049,7 +1076,7 @@ class _Lineage:
             return [], "it is generated in SQL, so no key of it is proven"
         if kind != "physical":
             return [], "its driving relation is not one dex can follow"
-        dataset = dataset_for(self.cache, target)
+        dataset = dataset_for(self.cache, target, manifest=self.manifest)
         if dataset is None or not dataset.columns:
             return [], f"{target} is not profiled, so no key of it is proven"
         proven = proven_keys(dataset)
@@ -1376,32 +1403,82 @@ def _alias_of_model(
     return None
 
 
+def _matches_manifest_relation(candidate: str, relation: str) -> bool:
+    """Whether a cached dataset identifier matches a manifest relation name.
+
+    Handles exact match or matching schema.table suffix / prefix when catalog
+    qualification differs.
+    """
+    c = candidate.lower()
+    r = relation.lower()
+    return c == r or c.endswith(f".{r}") or r.endswith(f".{c}")
+
+
+def _manifest_model_relations(
+    manifest: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Map lowercased model, seed, or snapshot names and aliases to their
+    stripped relation_name from the compiled manifest (#989)."""
+    if not manifest or not isinstance(manifest, Mapping):
+        return {}
+    nodes = manifest.get("nodes")
+    if not isinstance(nodes, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for node in nodes.values():
+        if not isinstance(node, Mapping):
+            continue
+        rel = node.get("relation_name")
+        if not isinstance(rel, str) or not rel:
+            continue
+        stripped = strip_relation_quoting(rel)
+        name = node.get("name")
+        if isinstance(name, str) and name:
+            out.setdefault(name.lower(), stripped)
+        alias = node.get("alias")
+        if isinstance(alias, str) and alias:
+            out.setdefault(alias.lower(), stripped)
+    return out
+
+
 def _dataset_for_model(
     cache: DexCache | None,
     name: str,
     files: Mapping[str, str],
     model_paths: list[str],
+    manifest: Mapping[str, Any] | None = None,
 ) -> Dataset | None:
     """Cache dataset for a model name, falling back to its literal alias."""
 
-    found = dataset_for(cache, name)
+    found = dataset_for(cache, name, manifest=manifest)
     if found is not None:
         return found
     alias = _alias_of_model(files, model_paths, name)
     if alias is None:
         return None
-    return dataset_for(cache, alias)
+    return dataset_for(cache, alias, manifest=manifest)
 
 
-def dataset_for(cache: DexCache | None, name: str) -> Dataset | None:
+def dataset_for(
+    cache: DexCache | None,
+    name: str,
+    manifest: Mapping[str, Any] | None = None,
+) -> Dataset | None:
     """The cache's one dataset ``name`` resolves to, or None (absent or ambiguous)."""
 
     if cache is None:
         return None
     matches = match_identifier(name, [d.identifier for d in cache.datasets])
-    if len(matches) != 1:
-        return None
-    return next(d for d in cache.datasets if d.identifier == matches[0])
+    if len(matches) == 1:
+        return next(d for d in cache.datasets if d.identifier == matches[0])
+    if len(matches) > 1 and manifest:
+        relations = _manifest_model_relations(manifest)
+        target_rel = relations.get(name.lower())
+        if target_rel:
+            matched = [m for m in matches if _matches_manifest_relation(m, target_rel)]
+            if len(matched) == 1:
+                return next(d for d in cache.datasets if d.identifier == matched[0])
+    return None
 
 
 def proven_keys(dataset: Dataset) -> list[list[str]]:
@@ -1440,6 +1517,7 @@ def _drafted(
     model: str | None = None,
     dev_namespace: str | None = None,
     packaged: Callable[[str], str | None] | None = None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1462,6 +1540,7 @@ def _drafted(
             cumulative=cumulative,
             model=model,
             packaged=packaged,
+            manifest=manifest,
         )
         if facts:
             columns[name] = facts
@@ -1470,7 +1549,7 @@ def _drafted(
 
     domains = []
     for (relation, column), clauses in sorted(reading.used.items()):
-        entry = _domain(relation, column, clauses, cache, domain_cap)
+        entry = _domain(relation, column, clauses, cache, domain_cap, manifest=manifest)
         if entry is not None:
             domains.append(entry)
     if domains:
@@ -1478,11 +1557,27 @@ def _drafted(
 
     inputs = []
     for relation in reading.relations:
-        dataset = _dataset_for_model(cache, relation, files, model_paths)
+        dataset = _dataset_for_model(
+            cache, relation, files, model_paths, manifest=manifest
+        )
         entry: dict[str, Any] = {"relation": relation}
         if dataset is not None and dataset.columns:
             entry["profiled"] = True
             entry["identifier"] = dataset.identifier
+            if cache is not None and manifest:
+                ambiguous = match_identifier(
+                    relation, [d.identifier for d in cache.datasets]
+                )
+                if len(ambiguous) > 1:
+                    target_name = (
+                        (manifest.get("metadata") or {}).get("target_name")
+                        if isinstance(manifest, Mapping)
+                        else None
+                    ) or "dev"
+                    entry["evidence"] = (
+                        f"resolved through the compiled manifest's relation for "
+                        f"target `{target_name}`"
+                    )
         else:
             entry["profiled"] = False
             ambiguous = (
@@ -1535,10 +1630,13 @@ def _column_facts(
     cumulative: Mapping[str, set[str]],
     model: str | None = None,
     packaged: Callable[[str], str | None] | None = None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if origin is not None:
-        dataset = _dataset_for_model(cache, origin.relation, files, model_paths)
+        dataset = _dataset_for_model(
+            cache, origin.relation, files, model_paths, manifest=manifest
+        )
         profile = _column(dataset, origin.column)
         source: str | None = f"{origin.relation}.{origin.column}"
         facts["from"] = source
@@ -1568,7 +1666,9 @@ def _column_facts(
             # A staging model's column comes from a raw table, whose joins on a
             # warehouse reach only other raw tables (#892). Once the model is
             # built, its own relation's joins reach the models beside it.
-            built = _dataset_for_model(cache, model, files, model_paths)
+            built = _dataset_for_model(
+                cache, model, files, model_paths, manifest=manifest
+            )
             if built is not None and built is not dataset:
                 own = _verified_reference(
                     cache,
@@ -1944,8 +2044,9 @@ def _domain(
     clauses: set[str],
     cache: DexCache | None,
     cap: int,
+    manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    dataset = dataset_for(cache, relation)
+    dataset = dataset_for(cache, relation, manifest=manifest)
     profile = _column(dataset, column)
     if profile is None:
         return None
@@ -2018,7 +2119,10 @@ def _precedent(
 
 
 def _literal_warnings(
-    model: str, reading: _Reading, cache: DexCache | None
+    model: str,
+    reading: _Reading,
+    cache: DexCache | None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """A compared literal the column's complete, exact domain never holds.
 
@@ -2035,7 +2139,9 @@ def _literal_warnings(
     for usage in reading.usages:
         if not usage.literals:
             continue
-        profile = _column(dataset_for(cache, usage.relation), usage.column)
+        profile = _column(
+            dataset_for(cache, usage.relation, manifest=manifest), usage.column
+        )
         if profile is None or profile.pii is not None:
             continue
         domain = profile.value_domain

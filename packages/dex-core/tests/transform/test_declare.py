@@ -771,3 +771,84 @@ def test_a_build_in_its_own_schema_gets_references_to_the_built_parent(
     assert customer["role"]["value"] == "foreign_key"
     assert customer["references"]["value"] == "stg_customers.customer_id"
     assert "dbt_dev.stg_customers" in customer["references"]["evidence"]
+
+
+def test_ambiguous_ref_resolves_through_compiled_manifest(shop: Path, capsys):
+    """#989: with legacy.stg_orders and staging_dev.stg_orders both profiled,
+    fct_orders is skipped as ambiguous with no manifest. With a fresh manifest
+    compiled for target dev pointing to staging_dev.stg_orders, it resolves and
+    is proposed."""
+
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(str(shop / "shop.duckdb"))
+    conn.execute("create schema legacy")
+    conn.execute("create schema staging_dev")
+    conn.execute(
+        "create table legacy.stg_orders as select order_id, customer_id, status, "
+        "amount from main.raw_orders"
+    )
+    conn.execute(
+        "create table staging_dev.stg_orders as select order_id, customer_id, status, "
+        "amount from main.raw_orders"
+    )
+    conn.close()
+    for argv in (
+        ["explore", "map", "--full"],
+        ["explore", "relationships", "--verify"],
+    ):
+        assert main([*argv, "--repo-root", str(shop)]) == 0, argv
+        capsys.readouterr()
+
+    # 1. With no manifest, fct_orders is skipped as ambiguous with no command
+    envelope = _dex(shop, ["transform", "declare", "fct_orders"], capsys)
+    assert envelope["status"] == "ok", envelope
+    assert envelope["data"]["proposed"] == []
+    (skipped,) = envelope["data"]["skipped"]
+    assert skipped["model"] == "fct_orders"
+    assert skipped["reason"] == "unprofiled_inputs"
+    assert skipped["commands"] == []
+    assert "it matches 2 relations in the cache" in skipped["detail"]
+    assert "no profile run can settle which one it means" in skipped["detail"]
+
+    # 2. With a fresh manifest compiled for target dev, fct_orders resolves through it
+    manifest = {
+        "metadata": {
+            "project_name": "shop",
+            "target_name": "dev",
+            "generated_at": "2099-01-01T00:00:00Z",
+        },
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"staging_dev"."stg_orders"',
+            }
+        },
+    }
+    target = shop / "analytics" / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    envelope = _dex(shop, ["transform", "declare", "fct_orders"], capsys)
+    assert envelope["status"] == "ok", envelope
+    assert envelope["data"]["skipped"] == []
+    (proposed,) = envelope["data"]["proposed"]
+    assert proposed["model"] == "fct_orders"
+    assert proposed["fields"]["grain"]["value"] == ["order_id"]
+
+    # 3. With a stale manifest, fct_orders is skipped as ambiguous again
+    stale_manifest = {
+        **manifest,
+        "metadata": {
+            **manifest["metadata"],
+            "generated_at": "2000-01-01T00:00:00Z",
+        },
+    }
+    (target / "manifest.json").write_text(json.dumps(stale_manifest), encoding="utf-8")
+    envelope = _dex(shop, ["transform", "declare", "fct_orders"], capsys)
+    assert envelope["status"] == "ok", envelope
+    assert envelope["data"]["proposed"] == []
+    (skipped,) = envelope["data"]["skipped"]
+    assert skipped["model"] == "fct_orders"
+    assert skipped["reason"] == "unprofiled_inputs"
+    assert "no profile run can settle which one it means" in skipped["detail"]

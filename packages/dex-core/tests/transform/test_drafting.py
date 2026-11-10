@@ -10,7 +10,9 @@ from is the one `explore` writes.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -148,7 +150,14 @@ DIM_USERS = Dataset(
 )
 
 
-def _draft(sql: str, *, yml: str | None = None, cache: DexCache | None = CACHE):
+def _draft(
+    sql: str,
+    *,
+    yml: str | None = None,
+    cache: DexCache | None = CACHE,
+    manifest: Mapping[str, Any] | None = None,
+    manifest_stale: bool = False,
+):
     files = {"models/marts/fct.sql": sql}
     if yml is not None:
         files["models/marts/_marts.yml"] = yml
@@ -163,6 +172,8 @@ def _draft(sql: str, *, yml: str | None = None, cache: DexCache | None = CACHE):
             for d in (cache.datasets if cache else [])
         },
         domain_cap=25,
+        manifest=manifest,
+        manifest_stale=manifest_stale,
     )
     return drafts["fct"], warnings
 
@@ -887,6 +898,90 @@ def test_an_ambiguous_input_names_no_command_and_says_why():
     [warning] = [w for w in warnings if "stg_orders" in w and "profiled" in w]
     assert "explore profile" not in warning
     assert "no profile run can settle" in warning
+
+
+def test_an_ambiguous_input_resolves_through_compiled_manifest():
+    """#989: when the input matches several profiled relations, resolve it through
+    the compiled manifest's relation_name for the compiled target."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [input_entry] = entry["drafted"]["inputs"]
+    assert input_entry["profiled"] is True
+    assert input_entry["identifier"] == "warehouse.dbt_dev.stg_orders"
+    assert input_entry["evidence"] == (
+        "resolved through the compiled manifest's relation for target `dev`"
+    )
+    assert entry["drafted"]["grain"]["value"] == ["order_id"]
+    assert not any("profile run can settle" in w for w in warnings)
+
+
+def test_an_ambiguous_input_with_stale_manifest_keeps_unprofiled_reason():
+    """#989: when the manifest is stale, keep the unprofiled reason."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+        manifest_stale=True,
+    )
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["profiled"] is False
+    assert "command" not in missing_input
+    assert "no profile run can settle which one it means" in missing_input["reason"]
+
+
+def test_an_ambiguous_input_with_manifest_matching_no_candidate_keeps_unprofiled():
+    """#989: when the manifest relation matches no candidate, keep unprofiled."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."other_schema"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["profiled"] is False
+    assert "command" not in missing_input
+    assert "no profile run can settle which one it means" in missing_input["reason"]
 
 
 def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
