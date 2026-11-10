@@ -211,6 +211,11 @@ class Blocker(BaseModel):
     plan_relation: str | None = None
     previous_status: str | None = None
     message: str | None = None
+    #: The one command that repairs it, kept ahead of the cut a truncating
+    #: reader makes (#1229): `repair: dex transform repair <node>` for a
+    #: package model the project can override, `repair: transform plan on
+    #: <path>` for the project's own.
+    next: str | None = None
 
 
 class FindingRef(BaseModel):
@@ -291,6 +296,13 @@ class Obligations(BaseModel):
     #: stored plan records verdicts, so a ``--for-plan-file`` build carries no
     #: such key (#1157).
     comparison: list[Obligation] | None = None
+    #: A package override `transform repair` drafted, held to what a repair has
+    #: to show (#1229): `repair_built`, `repair_tests` (the package's own tests,
+    #: run on the override), `repair_cold_deps` (only a `--cold-deps` build that
+    #: lost no installed edit satisfies it), `repair_row_count` (no row
+    #: finding on the override, whose draft moves no rows), and
+    #: `repair_conversion` while a conversion stayed unresolved.
+    repair: list[Obligation] | None = None
 
 
 class ColdSummary(BaseModel):
@@ -580,6 +592,7 @@ def _blockers(
                 diagnosed.get(n.unique_id, {}).get("previous_run", {}).get("status")
             ),
             message=(n.message[:_MESSAGE] if n.message else None),
+            next=diagnosed.get(n.unique_id, {}).get("next"),
         )
         for n in failed
     ]
@@ -737,6 +750,7 @@ def summarize_completion(
     identifier_conversions: Mapping[str, list[Mapping[str, Any]]] | None = None,
     change_scope: Mapping[str, list[Mapping[str, Any]]] | None = None,
     incremental_replay: Mapping[str, Mapping[str, Any]] | None = None,
+    repair: Mapping[str, Any] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -804,6 +818,9 @@ def summarize_completion(
     )
     completion.obligations.comparison = (
         _comparison_obligations(comparisons, evidence) or None
+    )
+    completion.obligations.repair = (
+        _repair_obligations(repair, evidence, graph, verification, cold) or None
     )
     if prerequisites:
         completion.details = ["data.prerequisites", *completion.details]
@@ -997,6 +1014,155 @@ def _comparison_obligations(
     return out
 
 
+_ROW_FINDINGS = frozenset({"row_loss", "row_fanout"})
+
+
+def _repair_obligations(
+    repair: Mapping[str, Any] | None,
+    evidence: BuildEvidence,
+    graph: Mapping[str, list[str]] | None,
+    verification: Mapping[str, Any] | None,
+    cold: Mapping[str, Any] | None,
+) -> list[Obligation]:
+    """What the build shows about a drafted package override (#1229).
+
+    The override is the project's model of the package model's name; the
+    package's tests attach to it, since dbt gives it the package's YAML entry.
+    """
+
+    if not repair:
+        return []
+    # One plan can repair several package models; each is held on its own.
+    # A model whose every check holds is one `repair: satisfied` entry, and an
+    # open one lists only what is open, so the bounded block keeps every model.
+    if repair.get("nodes"):
+        out: list[Obligation] = []
+        for record in repair["nodes"]:
+            if not isinstance(record, Mapping):
+                continue
+            held = _repair_obligations(record, evidence, graph, verification, cold)
+            if held and all(o.status == "satisfied" for o in held):
+                out.append(
+                    Obligation(model=held[0].model, kind="repair", status="satisfied")
+                )
+            else:
+                out.extend(o for o in held if o.status != "satisfied")
+        return out
+    if not repair.get("node"):
+        return []
+    name = str(repair["node"])
+    package = str(repair.get("package") or "")
+    node = next(
+        (
+            n
+            for n in evidence.nodes
+            if n.unique_id.startswith("model.")
+            and n.name == name
+            and n.unique_id.split(".")[1] != package
+        ),
+        None,
+    )
+
+    def obligation(kind: str, status: str, **extra: Any) -> Obligation:
+        """One repair obligation on this override."""
+
+        return Obligation(model=name, kind=kind, status=status, **extra)
+
+    out: list[Obligation] = []
+    status = node.status.lower() if node is not None else None
+    if status is None:
+        out.append(obligation("repair_built", "unchecked", reason_code="not_built"))
+    elif status in _PASSED:
+        out.append(obligation("repair_built", "satisfied"))
+    elif status in _FAILED:
+        out.append(
+            obligation("repair_built", "contradicted", finding="override_failed")
+        )
+    else:
+        out.append(obligation("repair_built", "unchecked", reason_code=status))
+
+    statuses = {n.unique_id: n.status.lower() for n in evidence.nodes}
+    tests = [
+        uid
+        for uid, parents in (graph or {}).items()
+        if uid.startswith(("test.", "unit_test."))
+        and node is not None
+        and node.unique_id in parents
+        and uid in statuses
+    ]
+    ran = [statuses[uid] for uid in tests]
+    if any(s in _FAILED for s in ran):
+        out.append(
+            obligation("repair_tests", "contradicted", finding="package_test_failed")
+        )
+    elif any(s in _PASSED for s in ran):
+        out.append(obligation("repair_tests", "satisfied"))
+    else:
+        out.append(obligation("repair_tests", "unchecked", reason_code="no_tests"))
+
+    if cold is None:
+        out.append(obligation("repair_cold_deps", "unchecked", reason_code="not_cold"))
+    elif not cold.get("reinstalled"):
+        out.append(
+            obligation("repair_cold_deps", "unchecked", reason_code="not_reinstalled")
+        )
+    else:
+        edits = cold.get("installed_edits") or {}
+        lost = sum(
+            int((edits.get(part) or {}).get("count") or 0)
+            for part in ("changed", "added", "removed")
+        )
+        out.append(
+            obligation("repair_cold_deps", "contradicted", finding="installed_edits")
+            if lost
+            else obligation("repair_cold_deps", "satisfied")
+        )
+
+    findings = (verification or {}).get("findings") or []
+    row = next(
+        (
+            f
+            for f in findings
+            if isinstance(f, Mapping)
+            and f.get("code") in _ROW_FINDINGS
+            and f.get("identifier") == name
+        ),
+        None,
+    )
+    if row is not None:
+        out.append(
+            obligation("repair_row_count", "contradicted", finding=str(row["code"]))
+        )
+    elif not (verification or {}).get("ran"):
+        out.append(
+            obligation(
+                "repair_row_count", "unchecked", reason_code="verification_not_run"
+            )
+        )
+    elif status not in _PASSED:
+        out.append(obligation("repair_row_count", "unchecked", reason_code="not_built"))
+    elif repair.get("population") != "kept":
+        out.append(
+            obligation(
+                "repair_row_count", "unchecked", reason_code="population_unchecked"
+            )
+        )
+    else:
+        out.append(obligation("repair_row_count", "satisfied"))
+
+    # An `unbound` draft is checked by the build itself: once the override
+    # builds, its types bound; until then the conversion stays open.
+    if repair.get("status") == "unresolved" or (
+        repair.get("status") == "unbound" and status not in _PASSED
+    ):
+        out.append(
+            obligation(
+                "repair_conversion", "unchecked", reason_code=str(repair["status"])
+            )
+        )
+    return out
+
+
 def _one_per_model_first(
     names: list[str], failures: Mapping[str, list[FailedCheck]]
 ) -> list[FailedCheck]:
@@ -1049,7 +1215,7 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         _NAMES,
         "obligations.identifier_conversions",
     )
-    for listed in ("change_scope", "incremental_replay", "comparison"):
+    for listed in ("change_scope", "incremental_replay", "comparison", "repair"):
         cap_list(completion.obligations, listed, _NAMES, f"obligations.{listed}")
     if completion.refactor_comparison is not None:
         cap_list(completion, "refactor_comparison", _NAMES, "refactor_comparison")
@@ -1089,7 +1255,7 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             max(keep, 1),
             "obligations.identifier_conversions",
         )
-        for listed in ("change_scope", "incremental_replay", "comparison"):
+        for listed in ("change_scope", "incremental_replay", "comparison", "repair"):
             cap_list(
                 completion.obligations, listed, max(keep, 1), f"obligations.{listed}"
             )
@@ -1142,6 +1308,7 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         "change_scope",
         "incremental_replay",
         "comparison",
+        "repair",
     ):
         cap_list(completion.obligations, listed, 0, f"obligations.{listed}")
         completion.elided = dict(elided)

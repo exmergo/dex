@@ -281,18 +281,24 @@ _FORCE_ENABLED = "{{ config(enabled=true) }}"
 
 
 def compile_models(
-    engine, edits: list[PlanEdit]
+    engine, edits: list[PlanEdit], *, force: set[str] | None = None
 ) -> tuple[dict[str, CompiledModel], CompileQueries]:
-    """Compile the complete proposed project, admitting SQL through the engine."""
+    """Compile the complete proposed project, admitting SQL through the engine.
+
+    ``force`` names model paths compiled even with no control flow: a drafted
+    package override (#1229) is checked by dbt's compile, macros and governed
+    introspection included, before it is stored.
+    """
 
     from . import dev_target
 
+    forced = force or set()
     wanted = {
         edit.path: edit
         for edit in edits
         if edit.kind is EditKind.MODEL_SQL
         and edit.new_content is not None
-        and needs_compilation(edit.new_content)
+        and (edit.path in forced or needs_compilation(edit.new_content))
     }
     broker = CompileQueries(engine)
     if not wanted:

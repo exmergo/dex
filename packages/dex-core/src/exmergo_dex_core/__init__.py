@@ -97,6 +97,7 @@ _EXPORTS = {
     "MermaidDiagram": "explore.diagram",
     "MissingPackagesError": "transform.build",
     "PlanDeclaresMissingPackagesError": "transform.build",
+    "RepairRefusedError": "transform.package_repair",
     "ModelVersionError": "transform.model_versions",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
@@ -228,6 +229,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .transform.evidence import BuildEvidenceError
     from .transform.expected_change import ExpectationError
     from .transform.model_versions import ModelVersionError
+    from .transform.package_repair import RepairRefusedError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -306,6 +308,7 @@ __all__ = [
     "ProjectError",
     "QueryRefusedError",
     "Relationship",
+    "RepairRefusedError",
     "RepoRootRequiredError",
     "RequestError",
     "Result",

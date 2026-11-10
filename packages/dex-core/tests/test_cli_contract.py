@@ -769,6 +769,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "intent": "intent",
         },
     },
+    ("transform", "repair"): {"method": "repair", "args": {"nodes": "nodes"}},
     ("transform", "test"): {
         "reason": (
             "two modes on one verb: --mutate is DexEngine.test_mutations (with "

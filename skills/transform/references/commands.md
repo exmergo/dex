@@ -261,8 +261,14 @@ See the cost-controls reference for the shared budget mechanism.
 
   The checks are `governed_column_present_when_off`,
   `governed_column_read_when_off`, `governed_column_lost_when_on`,
-  `ungoverned_column_lost`, `ungoverned_columns_differ` and
-  `branch_compile_failed`, each also a warning. A plan whose tree never reads the
+  `ungoverned_column_lost`, `ungoverned_columns_differ`,
+  `branch_compile_failed`, `governed_column_tested_when_off` (a test on a
+  producer's governed column that still runs with the flag off) and
+  `governed_column_in_semantic_layer` (a dimension, measure or entity over one;
+  `metrics` names the metrics on a measure, directly or through other metrics,
+  and is empty for a dimension or entity, even one a metric filters on), each
+  also a warning. The last two carry the `path` and `line` they name; a semantic
+  `expr` the index cannot resolve is a limit. A plan whose tree never reads the
   variable is refused. Recipe: [feature-toggles.md](feature-toggles.md).
 
 ## `transform apply [plan-id]` and `transform plans`
@@ -409,6 +415,83 @@ model is selected by version (`dim_teams.v2`, or every version with
 `dim_teams`) and proposed into that version's `versions:` item. Fields, skip
 reasons and the cap: `declarations.md`, "Declaring models that already exist".
 
+## `transform repair <node> [<node>...]`
+
+Drafts the project override that repairs each package model whose latest build
+attempt failed, and stores them as one ordinary plan (#1229). Nothing is applied.
+Name every failed package model in one call: each override disables its node in
+the same `dbt_project.yml`, so separate plans would conflict when applied.
+Run it when a blocker's `next` (in `data.completion.blockers[]` or
+`data.prerequisites[]`) names it, after `explore profile` on the input it reads.
+
+The draft restates the package's SQL (`raw_code` from the latest manifest) as
+`<model path>/overrides/<node>.sql` and adds `+enabled: false` at the node's
+path under `models:` in `dbt_project.yml`, written in place. On the way it:
+
+- qualifies each unqualified call to a macro the package defines
+  (`get_task_columns()` becomes `asana_source.get_task_columns()`);
+- resolves each `var()` the SQL reads to what the package node saw: a
+  relation-valued `{{ var('task') }}` is inlined (which removes the cycle when the
+  project's own `task` reads the overridden model), any other value becomes the
+  read's default, and a var a package macro reads by a name the SQL passes as a
+  string (`fill_pass_through_columns('task_pass_through_columns')`) is added
+  under `vars.<project>`;
+- restates the package node's resolved `materialized`, `schema` and `alias`;
+- converts, inside the calls the error names and nowhere else, each column of
+  the offending type, where the input's cached profile settles what it holds.
+
+It then compiles the draft and binds it on dev reading no row (DuckDB
+`limit 0`, BigQuery's free dry run). A bind that reveals another typing error is
+one more failure to convert, up to four, as successive builds would reveal them.
+
+`data.repair` leads the payload after the plan id: `status` (`unresolved` if any
+node is, else `unbound` if any node is, else `resolved`), `plan_id`, `compiled` (whether dbt compiled the drafts),
+`next`, and `nodes[]`, one record per model:
+
+| `nodes[]` field | What it says |
+|---|---|
+| `node`, `package`, `unique_id` | the package model the override replaces |
+| `status` | `resolved` when every failure read was converted and the draft binds on dev; `unbound` when every failure was converted but nothing could bind it (dbt absent, no connection, or a connector with no free, row-free check: `bind_check.reason` says which), so the build is the first check of its types; otherwise `unresolved` |
+| `errors[]` | each failure read: `source` (`build` or `bind_check`), `function`, `types`, `offending_type`, `target_type`, or `recognized: false` |
+| `conversions[]` | per column: `call`, `relation`, `from_type`, `to_type`, `kind`, `expression`, `meaning_changing`, `evidence` (`data`), `detail`, `sites`; or `status: unresolved` with `reason_code` and, where a profile would settle it, `next` |
+| `bind_check` | `bound`, `failed` (with the masked `detail`), or `not_checked` with the `reason` |
+| `restated` | `macros_qualified`, `vars` (`inlined`, `defaulted`, `literal`, `project_default`), `config` |
+| `override` | the override's `path` and the setting it `disables` |
+| `population` | `kept`: the draft rewrites expressions, macro names, var reads and config, never a filter, join or grouping. The package's own filters stand, so the override holds the rows the package would have, which can be fewer than the raw source (a Fivetran model drops `_fivetran_deleted` rows) |
+
+Conversions, by what the profile shows:
+
+| Evidence | `kind` | `meaning_changing` |
+|---|---|---|
+| every value NULL (or no rows) | `null_cast`: through text, `cast(cast(c as varchar) as timestamp)` | false |
+| the epoch-seconds note | `epoch_seconds`: DuckDB `epoch_ms(cast(c as bigint) * 1000)`, BigQuery `timestamp_seconds(...)` | true |
+| the epoch-milliseconds note | `epoch_millis` | true |
+| the ISO date or datetime note on text | `iso_parse`: `cast(c as timestamp)` | false |
+
+Anything else stays as the package wrote it, `unresolved`: `unprofiled_input`
+(with the `explore profile` command), `stale_profile`, `ambiguous_content`,
+`pii_flagged`, `site_not_found`, `unsupported_on_connector`. A failure Dex does
+not recognise as a type error is restated with no conversion. The error texts
+read are DuckDB's and BigQuery's.
+
+Refused (`reason: request`): no build has run; the node's latest attempt did not
+fail; the project owns the node (fix it with `transform plan`); the override
+route is refused (`ref('pkg', 'model')` readers, a versioned or Python model, a
+node that is not a model); the project already has a file of that name; the
+draft does not compile.
+
+After `transform apply`, build it with
+`transform build --target dev --verify --for-plan <id> --cold-deps`.
+`data.completion.obligations.repair` holds each override to `repair_built`,
+`repair_tests` (the package's own tests, which dbt runs on the override),
+`repair_cold_deps` (only a `--cold-deps` build that lost no installed edit
+satisfies it), `repair_row_count` (no `row_loss` or `row_fanout` on the
+override, whose draft moves no rows) and `repair_conversion` while a conversion
+is unresolved, or while an `unbound` draft has not built. A model whose every check holds is one
+`{"kind": "repair", "status": "satisfied"}` entry; an open one lists only the
+checks that are open, so the bounded block names every repaired model.
+Recipe: `prerequisite-repairs.md`.
+
 ## `transform build --target dev [--select <s>] [--full-refresh] [--verify] [--for-plan <id>] [--no-install-deps]`
 
 Runs `dbt build` against a dev target, with a cost preflight first.
@@ -472,13 +555,14 @@ failed-build envelope carries it too, and Python callers get the same typed
 | `process` | dbt's own `success`, `returncode` and `node_counts` by status. A process result, not a check |
 | `change` | the `plan_id` and `source` (`for_plan`, `for_plan_file`) the build was asked to validate, and the `selector` (cut at 200 characters; the whole one is in `data.evidence.selection`) |
 | `deliverables` | `coverage`: `known`, `unknown` (no plan named, so nothing says what the build was for) or `undetermined` (the plan's edits name no buildable node). Then `required`, and `built`, `failed`, `skipped`, `missing` and `stale` as `{count, names, elided}`. `blocked` names each required deliverable that did not build and the node that `cause`d it, walked back through skipped parents, a failing data test on a parent included. A skipped or failed deliverable is never counted as built: whatever relation it has in dev predates this run, and `note` says so |
-| `blockers` | the failed nodes, with the ones that stopped a deliverable first, and dbt's message cut to 160 characters (the whole message is in `data.evidence.nodes`) |
+| `blockers` | the failed nodes, with the ones that stopped a deliverable first, and dbt's message cut to 160 characters (the whole message is in `data.evidence.nodes`). `next` is the one command that repairs it: `repair: dex transform repair <node>` for a package model the project can override, `repair: transform plan on <path>` for the project's own (#1229) |
 | `assurance` | over the required deliverables, or over every built model with no plan: `asserted` (a passing data test reads it, or a verification record judged it `satisfied`), `failed_checks` (a data test on it failed or warned, or a record was `contradicted`; `checks` lists each failure with its `kind`, `data_test` with the test's `name` or the record list such as `join_coverage` with its `finding` and `join`, so a join measured against a default threshold is not read as a failed test, #1162) and `build_only` (it built and nothing checked its rows; a unit test reads fixtures, so it does not count) |
 | `verification` | `ran` (and `reason` when it did not), `finding_count` including the ones past the 50-finding cap (`findings_dropped`), `by_severity`, the `top` five as `{code, identifier, severity}`, the `suppressed` class names, and `offered` when the sweep's scan was offered rather than run |
 | `obligations` | the declared contracts the sweep held the build to (`join_coverage`, `parent_population`, `temporal_contracts`, `population_delta`, and the column contract's unchecked models), counted `by_status`, with the `contradicted` ones named with their `finding`, the `unchecked` ones with their `reason_code`, and a drafted population that asks which rows belong under `needs_decision` (#1228), and the models that declare no columns under `no_declared_columns`. `checked: false` when the sweep did not run. An empty `by_status` from a sweep that ran means nothing declared a contract it could hold the build to, which is not the same as every contract holding |
 | `obligations.identifier_conversions`, `obligations.change_scope` | the plan's identifier conversions and change-scope entries that are not settled, on the required models (#861, #1115) |
 | `obligations.incremental_replay` | each required incremental model the plan edited: `satisfied` when a unit test overriding `is_incremental` to true passed in this build, `contradicted` (`incremental_test_failed`) when one failed, otherwise `unchecked` with `full_refresh_only` (the build only full-refreshed it, which never runs the next incremental run) or `no_incremental_test`. Absent when the plan edits no incremental model (#1130) |
 | `obligations.comparison` | with `--for-plan`, each required model the plan rewrote, held to its recorded `transform compare` verdict: `equivalent` or `as_expected` is `satisfied`, `different` or `unexpected` is `contradicted`, and no verdict is `unchecked` with `not_compared` (or `compared_elsewhere` where another rewrite in the plan was compared), as is a `not_checked` verdict with its own code. A `--for-plan-file` build carries none, since verdicts are recorded on the stored plan (#1157) |
+| `obligations.repair` | with `--for-plan` on a plan `transform repair` drafted, per override: one `repair: satisfied` entry when every check holds, otherwise each open one of `repair_built`, `repair_tests`, `repair_cold_deps`, `repair_row_count` and `repair_conversion`, `contradicted` (with its `finding`) or `unchecked` (with its `reason_code`) (#1229) |
 | `refactor_comparison` | with `--for-plan`, each model the plan rewrote and any model compared on it (a downstream mart included), with its recorded `transform compare` verdict, or `not_compared` |
 | `details` | where the full evidence is, in reading order |
 | `elided` | every cut the budget forced, counted. Counts are never cut, and each unfinished list keeps at least one name |

@@ -356,6 +356,25 @@ dex transform place <column>      -> where a derived column shared by several mo
                                      `per_target` and the reason is stated rather than the worse thing
                                      being done quietly. --explain returns the reasoning and stores no
                                      plan. Repo-only and free
+dex transform repair <node>...    -> the project override that repairs each package model whose
+                                     latest build attempt failed, drafted as one stored, unapplied
+                                     plan (#1229; every failed model in one call, since each disables
+                                     its node in the same dbt_project.yml): the package's SQL restated as
+                                     <model path>/overrides/<node>.sql (package macros qualified,
+                                     each var() given what the package node saw, a relation var
+                                     inlined so a project var cannot cycle, materialized/schema/alias
+                                     restated) and +enabled: false for the node in dbt_project.yml,
+                                     written in place. Inside the calls the error names, and only
+                                     there, each column of the offending type is converted where the
+                                     input's cached profile settles it (all NULL: a cast through text;
+                                     epoch seconds/ms: the epoch reader, meaning_changing: true; ISO
+                                     text: a parse), else left as written, unresolved with a
+                                     reason_code. Compiled, then bound on dev reading no row (DuckDB
+                                     limit 0, BigQuery dry run), each further type error converted
+                                     the same way. data.repair leads the payload (status, plan_id,
+                                     compiled, next, nodes[]). A --for-plan build of it carries
+                                     data.completion.obligations.repair, one `repair: satisfied` entry
+                                     per override whose every check held
 dex transform declare [<model>]   -> declarations for models that already exist, opt-in. One stored
   [--edits-file <f>] [--limit N]     plan proposing, per selected model, only the measured facts its
   [--intent "<text>"]                YAML does not state: the grain, a key or foreign_key role, a

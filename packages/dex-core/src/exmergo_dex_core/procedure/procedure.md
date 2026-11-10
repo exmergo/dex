@@ -287,11 +287,18 @@ the checkable form where the model carries the column, and read
   `--cold-deps` proves a project repair survives a reinstall, not that the data
   changed.
 - Never edit installed packages (`dbt_packages/`) and never repair only in the
-  warehouse: a reinstall or a reload undoes both. When a prerequisite blocks a
-  deliverable, read `data.prerequisites` for its owner, its `plan_relation` and
-  the repairs dbt supports, make a supported one through a plan (an explicit
-  cast, never dropped rows), and prove it with `--cold-deps` on the build. With no
-  repair in scope the deliverable is incomplete: report the prerequisite and the
+  warehouse: a reinstall or a reload undoes both. A prerequisite that blocks the
+  request's own deliverables is part of the request, not scope creep: a
+  durable project-side repair is how the request completes. Each
+  `completion.blockers[]` entry's `next` names it. For a package model, run
+  `dex transform repair <node>...` (after `explore profile` on the input it
+  names; every failed package model in one call): it drafts the overrides as a
+  plan of their own, with the conversion read from
+  the error and the data, or left `unresolved` where they do not settle it.
+  Review it, relay each `meaning_changing` conversion as a decision, apply it and
+  build it with `--cold-deps`; never fold it into the deliverable's plan. Stop
+  only when the draft is refused or stays `unresolved` with nothing that settles
+  it: then the deliverable is incomplete, so report the prerequisite and the
   remedy tried. An override of a model its package documents takes the
   package's YAML entry, and dbt allows it no second one, so it carries no
   declaration: declare the models that read it. `dex transform deps` and the

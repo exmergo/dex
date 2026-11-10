@@ -328,14 +328,32 @@ def strip_jinja(sql: str) -> str:
     depth = 0
     for line_number, line in enumerate(text.splitlines(), start=1):
         if line.strip() == _PLACEHOLDER:
-            if depth > 0:
+            if depth > 0 and _opens_a_query("\n".join(lines)):
                 lines.append(line.replace(_PLACEHOLDER, f"select {_PLACEHOLDER}"))
+            elif depth > 0:
+                # A macro rendering part of a select list inside a CTE (a
+                # Fivetran staging model's `fill_staging_columns`), so it stays
+                # an expression (#1229).
+                lines.append(line)
             elif query_start_line is not None and line_number >= query_start_line:
                 lines.append(line)
             continue
         depth += line.count("(") - line.count(")")
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_QUERY_OPENERS = re.compile(
+    r"(\(|\bunion(\s+all|\s+distinct)?|\bintersect|\bexcept)\s*$", re.IGNORECASE
+)
+
+
+def _opens_a_query(before: str) -> bool:
+    """Whether SQL ending in ``before`` expects a whole query next: right after
+    an open paren or a set operator, as opposed to inside a select list."""
+
+    return bool(_QUERY_OPENERS.search(_SQL_COMMENT.sub("", before).rstrip()))
 
 
 # A seed is data entering git, and it stays there. dbt itself warns against

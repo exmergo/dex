@@ -925,15 +925,22 @@ def repair_first(blocked: Sequence[BlockedInput]) -> str:
     packages = sorted({b.package for b in blocked if b.package})
     build = f"`transform build --target dev --select {' '.join(names)}`"
     if packages:
-        owned = [b.model for b in blocked if b.package]
+        owned = sorted({b.model for b in blocked if b.package})
+        failed = sorted(
+            {b.model for b in blocked if b.package and b.status != "skipped"}
+        )
+        # One call names every failed package model: the overrides share
+        # dbt_project.yml, so separate plans would conflict on apply (#1229).
+        drafts = f"`dex transform repair {' '.join(failed)}`" if failed else ""
         build = (
             "`transform build --target dev --cold-deps --for-plan <repair plan>`, "
-            + ", ".join(sorted(owned))
+            + ", ".join(owned)
             + (" belongs" if len(owned) == 1 else " belong")
             + " to "
             + ", ".join(packages)
-            + ", so the repair is a project change from `data.prerequisites` "
-            "(never an edit under `dbt_packages/`) and `--cold-deps` shows it "
+            + ", so the repair is a project override"
+            + (f" that {drafts} drafts as its own plan" if drafts else "")
+            + " (never an edit under `dbt_packages/`) and `--cold-deps` shows it "
             "survives a reinstall"
         )
     return (
