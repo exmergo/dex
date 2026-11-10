@@ -585,6 +585,50 @@ def test_the_aggregation_check_agrees_with_slayer_s_own_binding_gate(column, for
     assert bool(found) == (refused is not None), (found, refused)
 
 
+@pytest.mark.parametrize(
+    ("column", "expected_refused"),
+    [
+        # A custom aggregation skips the type defaults: TEXT allows no `spread`.
+        ({"name": "status", "type": "TEXT"}, False),
+        # It does not skip a primary key's or a column's own whitelist.
+        ({"name": "order_id", "type": "INT", "primary_key": True}, True),
+        (
+            {"name": "amount", "type": "DOUBLE", "allowed_aggregations": ["sum"]},
+            True,
+        ),
+    ],
+)
+def test_a_custom_aggregation_agrees_with_slayer_s_own_binding_gate(
+    column, expected_refused
+):
+    from slayer.core.models import SlayerModel
+    from slayer.engine.binding import _column_agg_refusal
+
+    from exmergo_dex_core.slayer.loader import LoadedModel, unaggregatable_measures
+
+    columns = [column]
+    if column["name"] != "order_id":
+        columns.insert(0, {"name": "order_id", "type": "INT", "primary_key": True})
+    slayer_model = SlayerModel(
+        **model(
+            "orders",
+            columns=columns,
+            aggregations=[{"name": "spread", "formula": "max({value}) - min({value})"}],
+            measures=[{"name": "m", "formula": f"{column['name']}:spread"}],
+        )
+    )
+    found = unaggregatable_measures(LoadedModel(file=ORDERS, model=slayer_model))
+    refused = _column_agg_refusal(
+        col=slayer_model.get_column(column["name"]),
+        columns=slayer_model.columns,
+        agg="spread",
+        custom=True,
+    )
+
+    assert (refused is not None) == expected_refused
+    assert bool(found) == expected_refused, found
+
+
 def test_metricflow_habits_are_refused_with_what_slayer_uses_instead(tmp_path, capsys):
     """The reproduction in #620: the keys an agent brings from MetricFlow."""
 

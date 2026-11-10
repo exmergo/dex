@@ -837,8 +837,6 @@ def unaggregatable_measures(
                 continue
             written = ref.aggregation_name
             agg = written if written in custom else normalize_aggregation_name(written)
-            if agg in custom:
-                continue
             col_type = (retyped or {}).get(col.name, col.type)
             if is_identifier(column=col, columns=model.columns):
                 if agg in PRIMARY_KEY_AGGREGATIONS:
@@ -856,7 +854,10 @@ def unaggregatable_measures(
                 )
             else:
                 allowed = DEFAULT_AGGREGATIONS_BY_TYPE.get(col_type, frozenset())
-                if agg in allowed:
+                # A model's custom aggregation is exempt from the type defaults
+                # only: SLayer still holds it to a primary key's and a column's
+                # `allowed_aggregations` (`binding._column_agg_refusal`).
+                if agg in custom or agg in allowed:
                     continue
                 spelled = getattr(col_type, "value", col_type)
                 reason = (
