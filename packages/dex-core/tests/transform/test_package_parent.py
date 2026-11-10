@@ -569,6 +569,19 @@ def test_derived_dev_scopes_with_explicit_target_name():
     ]
 
 
+def test_derived_dev_scopes_excludes_dev_suffix_with_explicit_target_name():
+    """a schema ending in _dev is excluded when an explicit target name is set."""
+    from exmergo_dex_core.connect import derived_dev_scopes
+
+    relations = [
+        "`acme-dw`.`finance_dev`.`fct_revenue`",
+        "`acme-dw`.`staging_local`.`stg_orders`",
+    ]
+    assert derived_dev_scopes("dbt_local", relations, target_name="local") == [
+        "staging_local",
+    ]
+
+
 def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
     """Both are read; nothing changes when nothing derives."""
     from exmergo_dex_core.config import BigQueryTarget, DexConfig

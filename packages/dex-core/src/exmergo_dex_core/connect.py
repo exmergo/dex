@@ -822,9 +822,8 @@ def derived_dev_scopes(
         dict.fromkeys(
             t
             for t in (
-                target_name.lower() if target_name else None,
+                target_name.lower() if target_name else "dev",
                 wanted[-1],
-                "dev",
             )
             if t
         )
