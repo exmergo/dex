@@ -44,7 +44,15 @@ from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import jinja_regions
 from .declarations import model_sql_path
-from .drafting import Usage, _Reading, _untoken, dataset_for, read_declared
+from .drafting import (
+    Usage,
+    _dataset_for_model,
+    _Reading,
+    _untoken,
+    dataset_for,
+    proven_keys,
+    read_declared,
+)
 
 if TYPE_CHECKING:
     from ..cache import DexCache
@@ -168,7 +176,7 @@ def check(
     found: list[Contradiction] = []
     found.extend(_population(model, before, after))
     found.extend(_parent(model, before, after, model_paths, index))
-    grain = _grain(model, before, after)
+    grain = _grain(model, before, after, cache, model_paths)
     found.extend(grain)
     dropped = {c.column for c in grain if c.column}
     found.extend(_columns(model, before, after, skip=dropped))
@@ -688,19 +696,29 @@ def _polarity(expression: str) -> bool | None:
 # --- grain ------------------------------------------------------------------------
 
 
-def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
+def _grain(
+    model: str,
+    before: _Side,
+    after: _Side,
+    cache: DexCache | None = None,
+    model_paths: list[str] | None = None,
+) -> list[Contradiction]:
     declared = after.declared.get("grain")
     if not isinstance(declared, list) or not declared:
         return []
     grain = [str(g).lower() for g in declared]
     prior = before.declared.get("grain")
     prior_grain = [str(g).lower() for g in prior] if isinstance(prior, list) else None
-    after_verdict = _grain_verdict(after.reading, grain)
+    after_verdict = _grain_verdict(
+        after.reading, grain, cache, after.files, model_paths
+    )
     found = _judge(
         model,
         "grain",
         f"grain [{', '.join(declared)}]",
-        _grain_verdict(before.reading, prior_grain or grain),
+        _grain_verdict(
+            before.reading, prior_grain or grain, cache, before.files, model_paths
+        ),
         after_verdict,
         rule_changed=prior_grain is None or set(prior_grain) != set(grain),
     )
@@ -714,7 +732,13 @@ def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
     return [found]
 
 
-def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
+def _grain_verdict(
+    reading: _Reading,
+    grain: list[str],
+    cache: DexCache | None = None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
+) -> _Verdict:
     produced = reading.produced
     dropped = [g for g in grain if produced is not None and g not in produced]
     # The declared grain is matched against every proven key, not only the one
@@ -740,6 +764,46 @@ def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
         said = f"[{', '.join(reading.grain)}]"
         if any(set(key) == set(grain) for key in proven):
             return _Verdict("holds", said=said, signature=signature)
+        if set(grain) < set(reading.grain):
+            # The GROUP BY only adds columns to the declared grain. The grain
+            # still holds when every added column is functionally dependent
+            # on it: grouping by an attribute of the key changes no row
+            # (#1204). The cache is the evidence: an added column whose
+            # origin relation carries a proven key the declared grain covers
+            # has one value per grain key.
+            outcomes, profiles = _grain_dependence(
+                reading, grain, cache, files, model_paths
+            )
+            extended = (*signature, tuple(sorted(outcomes.items())))
+            if all(outcome == "dependent" for outcome in outcomes.values()):
+                return _Verdict(
+                    "holds",
+                    said=(
+                        f"{said} (each added column has one value per "
+                        f"{', '.join(grain)})"
+                    ),
+                    signature=extended,
+                )
+            unknown = [
+                extra for extra, outcome in outcomes.items() if outcome == "unknown"
+            ]
+            if unknown and not any(
+                outcome == "not-dependent" for outcome in outcomes.values()
+            ):
+                extra = unknown[0]
+                profile = profiles[extra]
+                if profile is not None:
+                    reason = (
+                        "the grain could not be confirmed: no profile of "
+                        f"'{profile}' shows whether {extra} has one value per "
+                        f"{', '.join(grain)}"
+                    )
+                else:
+                    reason = (
+                        "the grain could not be confirmed: no profile shows "
+                        f"whether {extra} has one value per {', '.join(grain)}"
+                    )
+                return _Verdict("unknown", reason=reason, signature=extended)
         return _Verdict(
             "contradicted",
             said=f"{said} ({reading.grain_evidence})",
@@ -749,6 +813,49 @@ def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
         reading.incomplete[0] if reading.incomplete else "the grain could not be read"
     )
     return _Verdict("unknown", reason=reason, signature=signature)
+
+
+def _grain_dependence(
+    reading: _Reading,
+    grain: list[str],
+    cache: DexCache | None,
+    files: Mapping[str, str] | None,
+    model_paths: list[str] | None,
+) -> tuple[dict[str, str], dict[str, str | None]]:
+    """One outcome per GROUP BY column beyond the declared grain.
+
+    ``dependent``: the column's origin relation carries a proven key the
+    declared grain covers, so the column has one value per grain key.
+    ``not-dependent``: the origin is profiled, and no proven key there is
+    covered by the declared grain. ``unknown``: the cache cannot judge the
+    column, either because its origin has no profile or because the column
+    could not be traced to an origin at all. The second return maps each
+    unknown column to the relation to profile to settle it, or None where
+    the origin could not be traced.
+    """
+
+    grain_set = set(grain)
+    outcomes: dict[str, str] = {}
+    profiles: dict[str, str | None] = {}
+    for extra in [c for c in (reading.grain or []) if c not in grain_set]:
+        origin = reading.origins.get(extra)
+        if origin is None:
+            outcomes[extra] = "unknown"
+            profiles[extra] = None
+            continue
+        dataset = _dataset_for_model(
+            cache, origin.relation, files or {}, model_paths or []
+        )
+        if dataset is None:
+            outcomes[extra] = "unknown"
+            profiles[extra] = origin.relation
+            continue
+        profiles[extra] = origin.relation
+        if any(set(key) <= grain_set for key in proven_keys(dataset)):
+            outcomes[extra] = "dependent"
+        else:
+            outcomes[extra] = "not-dependent"
+    return outcomes, profiles
 
 
 # --- columns ----------------------------------------------------------------------
