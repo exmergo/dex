@@ -1045,3 +1045,27 @@ def test_a_model_symlinked_to_a_datasource_file_is_not_read(tmp_path):
     (diagnostic,) = loaded.diagnostics
     assert diagnostic.rule == "confinement"
     assert "hunter2" not in diagnostic.render()
+
+
+def test_a_measure_its_column_type_cannot_aggregate_is_noted_on_the_catalog(
+    tmp_path,
+):
+    """A hand-edited file dex did not author still reads, and the catalog says
+    that querying the measure fails rather than listing it as if it were sound."""
+
+    text_sum = model(
+        "orders",
+        columns=[
+            {"name": "order_id", "type": "INT", "primary_key": True},
+            {"name": "amount", "type": "TEXT"},
+        ],
+        measures=[{"name": "revenue", "formula": "amount:sum"}],
+    )
+    catalog = source(tmp_path, text_sum).semantic_catalog()
+
+    assert [m.name for m in catalog.metrics] == ["orders.revenue"]
+    assert any(
+        "measures['revenue'].formula: [aggregation_not_applicable]" in note
+        and "every query of it fails" in note
+        for note in catalog.notes
+    ), catalog.notes

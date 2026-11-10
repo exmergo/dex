@@ -1219,7 +1219,12 @@ reads the model files and the metadata dex captured through its own connection.
   as SLayer computes it, except `declared_type_conflict`: SLayer reports a retype
   through `retype_findings` and removes nothing, so that finding carries SLayer's
   remedy (`remedy_kind` and `remedy`, such as "set the column's type to TEXT")
-  and reconcile proposes it as advisory rather than cutting the column. A warehouse type dex cannot place in a bucket is never
+  and reconcile proposes it as advisory rather than cutting the column. The
+  remedy alone can leave a broken metric (a measure summing a column that is
+  now TEXT), so the finding also lists `breaks_measures`, each saved measure the
+  proposed type cannot aggregate, and the remedy says they have to go or change;
+  `semantic slayer update` refuses the type change while one remains. A
+  warehouse type dex cannot place in a bucket is never
   reported as a conflict, a column matches case-insensitively when exactly one
   does, and a model backed by `sql` or `source_queries` is named as not compared,
   because SLayer checks those by running the query.
@@ -1278,7 +1283,16 @@ opening SLayer's storage:
 - an edited model's saved measures parse with SLayer's own formula parser, with
   sibling measures available by bare name. SLayer checks scalar calls inside a
   formula with sqlglot, so without the `[sql]` extra this check is skipped and a
-  note says so.
+  note says so;
+- an edited model's saved measures aggregate each column with an aggregation
+  SLayer allows on it: a sole primary key only counts, takes `min`/`max` or
+  collects; a column's `allowed_aggregations` is a whitelist; otherwise the
+  column's type decides (TEXT, DATE and TIMESTAMP have no `sum` or `avg`). SLayer
+  applies this rule only when it binds a query, so without the check
+  `amount:sum` over a TEXT column would validate, be listed and fail every query.
+  A model's own custom aggregation is exempt, as it is in SLayer. A file dex did
+  not author still reads, and the catalog's notes name the measure
+  (`aggregation_not_applicable`).
 
 Every refusal names the file and the element. `define` refuses a model that
 exists, `update` one that does not, and `plan` reports both under `defined` and

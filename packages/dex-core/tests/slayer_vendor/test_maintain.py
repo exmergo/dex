@@ -350,7 +350,13 @@ def test_a_retyped_column_conflicts_with_its_declared_type(repo: Path, capsys):
     # SLayer reports a retype and removes nothing: its remedy is the type.
     assert "removal" not in conflict["data"]
     assert conflict["data"]["remedy_kind"] == "set_type"
-    assert conflict["data"]["remedy"] == "set the column's type to TEXT"
+    # Setting the type alone would leave `revenue` summing a TEXT column, which
+    # validates and fails every query, so the remedy names it.
+    assert conflict["data"]["breaks_measures"] == [
+        {"measure": "revenue", "aggregation": "sum"}
+    ]
+    assert conflict["data"]["remedy"].startswith("set the column's type to TEXT")
+    assert "revenue (sum)" in conflict["data"]["remedy"]
 
 
 def test_reconcile_proposes_a_retype_as_advisory_and_cuts_nothing(repo: Path, capsys):
@@ -369,6 +375,7 @@ def test_reconcile_proposes_a_retype_as_advisory_and_cuts_nothing(repo: Path, ca
     ]
     assert proposals and all(p["kind"] == "advisory" for p in proposals)
     assert "set the column's type to TEXT" in proposals[0]["action"]
+    assert "revenue (sum)" in proposals[0]["action"]
     assert "semantic_plan_id" not in payload["data"]
     assert (repo / BASE / ORDERS).read_text() == before
 

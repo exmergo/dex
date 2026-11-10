@@ -176,7 +176,7 @@ def declared_schema_drift(
                 retypes = retype_findings(model=model, live_table=live)
             located[model.name] = (dataset.identifier, spelled)
             findings.extend(
-                _retype_finding(model, retype, dataset.identifier, spelled, entry.file)
+                _retype_finding(entry, retype, dataset.identifier, spelled)
                 for retype in retypes
             )
 
@@ -310,11 +310,10 @@ def _column_findings(
 
 
 def _retype_finding(
-    model: Any,
+    entry: LoadedModel,
     retype: Any,
     identifier: str,
     spelled: dict[str, str],
-    model_file: str,
 ) -> DriftFinding:
     """A declared column whose warehouse type is in another of SLayer's buckets.
 
@@ -322,12 +321,60 @@ def _retype_finding(
     declared type (or, for a column that became a list, to re-ingest). So the
     finding carries that remedy rather than a removal, and reconcile proposes it
     as advisory rather than cutting the column and every measure on it.
+
+    The remedy alone is not safe to follow. A saved measure that sums the column
+    still validates once the type is TEXT, is still listed, and fails every
+    query, because SLayer only checks an aggregation against its column's type
+    when it binds a query. So the finding also names each measure the remedy
+    would break (``breaks_measures``), and says they have to go or change.
     """
 
+    from .loader import unaggregatable_measures
+
+    model = entry.model
     col = model.get_column(retype.column)
     physical = physical_column_sql(sql=col.sql, name=col.name) if col else retype.column
     declared = str(getattr(retype.stored_type, "value", retype.stored_type))
     live_type = spelled.get(physical, str(retype.live_type.value))
+    with slayer_keywords():
+        before = unaggregatable_measures(entry)
+        after = unaggregatable_measures(
+            entry, retyped={retype.column: retype.live_type}
+        )
+    broken: list[dict[str, str]] | None
+    if after is None or before is None:
+        broken = None
+    else:
+        already = {(p.measure, p.column) for p in before}
+        broken = [
+            {"measure": p.measure, "aggregation": p.aggregation}
+            for p in after
+            if p.column == retype.column and (p.measure, p.column) not in already
+        ]
+    remedy = retype.remedy
+    if broken:
+        named = ", ".join(f"{b['measure']} ({b['aggregation']})" for b in broken)
+        remedy = (
+            f"{remedy}, and remove or rewrite the measure(s) that cannot "
+            f"aggregate a {retype.live_type.value} column: {named}"
+        )
+    elif broken is None:
+        remedy = (
+            f"{remedy}; dex could not read the model's measure formulas (the "
+            "[sql] extra is absent), so check that no measure aggregates the "
+            "column in a way the new type refuses"
+        )
+    data: dict[str, Any] = {
+        "semantic_model": model.name,
+        "model_file": entry.file,
+        "declared_column": retype.column,
+        "declared_type": declared,
+        "warehouse_type": live_type,
+        "slayer_type": str(retype.live_type.value),
+        "remedy_kind": retype.remedy_kind,
+        "remedy": remedy,
+        "breaks_measures": broken,
+    }
     return DriftFinding(
         axis="schema",
         code="declared_type_conflict",
@@ -339,19 +386,9 @@ def _retype_finding(
             f"{declared}, and {identifier}.{physical} is {live_type}, which "
             "SLayer reads as another kind of value "
             f"({data_type_bucket(retype.stored_type)} against "
-            f"{data_type_bucket(retype.live_type)}); SLayer's remedy: "
-            f"{retype.remedy}"
+            f"{data_type_bucket(retype.live_type)}); remedy: {remedy}"
         ),
-        data={
-            "semantic_model": model.name,
-            "model_file": model_file,
-            "declared_column": retype.column,
-            "declared_type": declared,
-            "warehouse_type": live_type,
-            "slayer_type": str(retype.live_type.value),
-            "remedy_kind": retype.remedy_kind,
-            "remedy": retype.remedy,
-        },
+        data=data,
     )
 
 

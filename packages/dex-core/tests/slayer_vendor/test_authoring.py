@@ -494,6 +494,97 @@ def test_a_key_slayer_does_not_declare_is_refused_at_any_level(
     assert not list((root / ".dex").glob("plans/*"))
 
 
+def _text_amount() -> dict[str, Any]:
+    """orders with `amount` declared TEXT, which its `revenue` measure sums."""
+
+    authored = orders()
+    for column in authored["columns"]:
+        if column["name"] == "amount":
+            column["type"] = "TEXT"
+    return authored
+
+
+def test_a_measure_its_column_type_cannot_aggregate_is_refused(tmp_path, capsys):
+    """SLayer checks an aggregation against its column's type only when it binds
+    a query, so `sum` over a TEXT column would validate, be listed, and fail on
+    every query. Authoring refuses it by file and element instead."""
+
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS],
+        **{ORDERS: dump(orders()), CUSTOMERS: dump(customers())},
+    )
+
+    rc, refused = plan(capsys, root, "update", {ORDERS: dump(_text_amount())})
+
+    assert rc != 0
+    message = errors(refused)
+    assert "no plan was stored" in message
+    assert (
+        f"{ORDERS}: measures['revenue'].formula: [aggregation_not_applicable]"
+        in message
+    ), message
+    assert "'sum' is not applicable to a TEXT column" in message
+    assert not list((root / ".dex").glob("plans/*"))
+
+
+def test_a_count_over_a_text_column_is_not_refused(tmp_path, capsys):
+    authored = _text_amount()
+    authored["measures"] = [{"name": "amounts", "formula": "amount:count"}]
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS],
+        **{ORDERS: dump(orders()), CUSTOMERS: dump(customers())},
+    )
+
+    rc, planned = plan(capsys, root, "update", {ORDERS: dump(authored)})
+
+    assert rc == 0, planned["errors"]
+
+
+@pytest.mark.parametrize(
+    ("column", "formula"),
+    [
+        ({"name": "amount", "type": "TEXT"}, "amount:sum"),
+        ({"name": "amount", "type": "TEXT"}, "amount:count_distinct"),
+        ({"name": "amount", "type": "DOUBLE"}, "amount:avg"),
+        ({"name": "amount", "type": "DATE"}, "amount:max"),
+        ({"name": "amount", "type": "DATE"}, "amount:avg"),
+        ({"name": "amount", "type": "BOOLEAN"}, "amount:sum"),
+        (
+            {"name": "amount", "type": "DOUBLE", "allowed_aggregations": ["sum"]},
+            "amount:avg",
+        ),
+        ({"name": "order_id", "type": "INT", "primary_key": True}, "order_id:sum"),
+        ({"name": "order_id", "type": "INT", "primary_key": True}, "order_id:count"),
+    ],
+)
+def test_the_aggregation_check_agrees_with_slayer_s_own_binding_gate(column, formula):
+    """dex restates SLayer's query-time gate from its public pieces; this holds
+    the two equal, so a release that moves the rule fails here first."""
+
+    from slayer.core.enums import normalize_aggregation_name
+    from slayer.core.models import SlayerModel
+    from slayer.engine.binding import _column_agg_refusal
+
+    from exmergo_dex_core.slayer.loader import LoadedModel, unaggregatable_measures
+
+    columns = [column]
+    if column["name"] != "order_id":
+        columns.insert(0, {"name": "order_id", "type": "INT", "primary_key": True})
+    slayer_model = SlayerModel(
+        **model("orders", columns=columns, measures=[{"name": "m", "formula": formula}])
+    )
+    found = unaggregatable_measures(LoadedModel(file=ORDERS, model=slayer_model))
+    target = slayer_model.get_column(column["name"])
+    agg = normalize_aggregation_name(formula.split(":")[1])
+    refused = _column_agg_refusal(
+        col=target, columns=slayer_model.columns, agg=agg, custom=False
+    )
+
+    assert bool(found) == (refused is not None), (found, refused)
+
+
 def test_metricflow_habits_are_refused_with_what_slayer_uses_instead(tmp_path, capsys):
     """The reproduction in #620: the keys an agent brings from MetricFlow."""
 

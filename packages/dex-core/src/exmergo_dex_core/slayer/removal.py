@@ -72,12 +72,13 @@ def proposals_and_edits(
                 _proposal(
                     finding,
                     "advisory",
-                    f"{finding.data.get('remedy') or 'change the declared type'} "
-                    f"on column '{finding.data.get('declared_column')}' of SLayer "
-                    f"model '{finding.data.get('semantic_model')}' "
-                    f"({finding.data.get('model_file')}) with `semantic slayer "
-                    "update`, or restore the warehouse type if the change was "
-                    "not intended",
+                    f"SLayer model '{finding.data.get('semantic_model')}' "
+                    f"({finding.data.get('model_file')}), column "
+                    f"'{finding.data.get('declared_column')}': "
+                    f"{finding.data.get('remedy') or 'change the declared type'}. "
+                    "Make that edit with `semantic slayer update`, which refuses "
+                    "a measure the new type cannot aggregate; or restore the "
+                    "warehouse type if the change was not intended",
                     paths=[str(finding.data.get("model_file"))],
                 )
             )
