@@ -1768,12 +1768,13 @@ def spine_or_generated_models(
     broken grain.
     """
 
-    if project_dir is None and nodes is None:
-        return set()
     if nodes is None:
-        if isinstance(project_dir, str):
-            project_dir = Path(project_dir)
-        nodes = _manifest_nodes(project_dir) or {}
+        if project_dir is None:
+            return set()
+        project_path = (
+            Path(project_dir) if isinstance(project_dir, str) else project_dir
+        )
+        nodes = _manifest_nodes(project_path) or {}
     if not nodes:
         return set()
 
