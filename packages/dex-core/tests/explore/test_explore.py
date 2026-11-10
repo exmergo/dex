@@ -850,10 +850,11 @@ def test_map_one_object_profile_failure_turns_into_note_and_reports_rest(
         if o["identifier"].endswith("broken")
     )
     assert not broken_obj["columns"]
-    assert any(
-        "not profiled" in q and "type geography" in q
-        for q in broken_obj["data_quality"]
-    )
+    not_profiled_notes = [
+        q for q in broken_obj["data_quality"] if q.startswith("not profiled: ")
+    ]
+    assert len(not_profiled_notes) == 1
+    assert "type geography" in not_profiled_notes[0]
 
 
 def test_relationships_one_object_profile_failure_turns_into_note_and_reports_rest(
@@ -912,6 +913,75 @@ def test_relationships_one_object_profile_failure_turns_into_note_and_reports_re
     rel = rels[0]
     assert rel["from_dataset"].endswith("child")
     assert rel["to_dataset"].endswith("parent")
+
+
+def test_profile_failure_withholds_warehouse_error_in_values_free_mode(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """values-free mode withholds warehouse error text in notes and cache."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "failing_vf.duckdb"
+    con = duckdb.connect(str(warehouse))
+    con.execute("create table broken (id integer, geom varchar)")
+    con.execute("insert into broken values (1, 'point(0 0)')")
+    con.execute("create table healthy (id integer)")
+    con.execute("insert into healthy values (1)")
+    con.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    original_aggs = DuckDBAdapter.column_aggregates
+
+    def failing_aggs(self, identifier, columns, **kwargs):
+        if "broken" in identifier:
+            raise WarehouseQueryError("sensitive warehouse detail for geography")
+        return original_aggs(self, identifier, columns, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "column_aggregates", failing_aggs)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    map_payload = _run(
+        [
+            "explore",
+            "map",
+            "--detail",
+            "--values-free",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert map_payload["status"] == "ok"
+    map_notes = map_payload["data"]["notes"]
+    assert any("broken" in n and "warehouse_refused" in n for n in map_notes)
+    assert not any("sensitive warehouse detail" in n for n in map_notes)
+    broken_obj = next(
+        o for o in map_payload["data"]["objects"] if o["identifier"].endswith("broken")
+    )
+    assert broken_obj["data_quality"] == ["not profiled: warehouse_refused"]
+
+    rel_payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--values-free",
+            "--path",
+            str(warehouse),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert rel_payload["status"] == "ok"
+    rel_notes = rel_payload["data"]["notes"]
+    assert any("broken" in n and "warehouse_refused" in n for n in rel_notes)
+    assert not any("sensitive warehouse detail" in n for n in rel_notes)
 
 
 def test_map_data_quality_notes_omit_flag_encodings(tmp_path: Path):

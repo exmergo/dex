@@ -1423,7 +1423,7 @@ def relationships(
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
     notes.extend(defs.notes)
     for ident, err in profile_errors:
-        reason = err.detail or str(err)
+        reason = "warehouse_refused" if values_free else (err.detail or str(err))
         notes.append(f"{ident} not profiled: {reason}")
     if confirmed:
         notes.append(
@@ -3003,8 +3003,14 @@ def map(
         reusable,
         observed_namespaces=observed_namespaces,
     )
-    failed_reasons = {ident: (err.detail or str(err)) for ident, err in profile_errors}
+    failed_reasons = {
+        ident: "warehouse_refused" if values_free else (err.detail or str(err))
+        for ident, err in profile_errors
+    }
     for ds in datasets:
+        ds.data_quality = [
+            n for n in ds.data_quality if not n.startswith("not profiled: ")
+        ]
         if ds.identifier in failed_reasons:
             ds.data_quality.append(f"not profiled: {failed_reasons[ds.identifier]}")
 
@@ -3076,7 +3082,7 @@ def map(
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
     for ident, err in profile_errors:
-        reason = err.detail or str(err)
+        reason = "warehouse_refused" if values_free else (err.detail or str(err))
         notes.append(f"{ident} not profiled: {reason}")
     if semantic_exposed:
         notes.append(
