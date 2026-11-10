@@ -34,6 +34,11 @@ column called ``revenue``: SLayer renders the measure's formula in its place
 reported as the columns its formula reads, read the same way and relative to the
 measure's own model, rather than as a token no profile could adjudicate.
 
+**A list element is its parent column's.** ``tags.value`` (and
+``contains_any(tags, ['a', 'b'])``, whose list literal is walked like any other
+node) is reported as ``model.tags.value``, never as the element-child model SLayer
+mints to resolve it, so the gate screens it against ``tags``'s own profile.
+
 **Every reference counts, aggregation arguments included.** SLayer's
 ``walk_parsed_refs`` treats an aggregation's and a transform's arguments as
 opaque by design, which is right for drift tagging and wrong for screening:
@@ -65,6 +70,7 @@ from slayer.core.query import has_variable_syntax
 from slayer.engine.syntax import (
     AggCall,
     Arith,
+    ArrayLit,
     BoolOp,
     Cmp,
     DottedRef,
@@ -87,6 +93,7 @@ __all__ = ["filter_refs"]
 _KNOWN_NODES = (
     AggCall,
     Arith,
+    ArrayLit,
     BoolOp,
     Cmp,
     DottedRef,
@@ -188,6 +195,15 @@ def _tokens(
         )
         if target is None:
             raise ValueError(".".join(node.parts))
+    # A list column's elements (``tags.value``) resolve to an element child SLayer
+    # mints for the walk, named by a reserved placeholder no profile knows. The
+    # element is read from the parent's column, so it is reported against that
+    # column (``posts.tags.value``): the gate then screens it with the parent
+    # column's profiled flag and any override, and a refusal never names the
+    # placeholder. A child holds only its element column and no measures.
+    if target.list_of is not None:
+        parent, column = target.list_of
+        return [f"{parent}.{column}.{leaf}"]
     token = f"{target.name}.{leaf}"
     measure = next((m for m in target.measures if m.name == leaf), None)
     if measure is None:

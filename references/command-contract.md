@@ -1570,7 +1570,8 @@ default, or a filter or operator after it is refused. A key naming a location
   declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
   per contract under `data.verification.temporal_contracts`). A built model that
   declares no parent is measured against the parent dex drafts for it (#1228):
-  orphan keys, missing parents and rows with no child, one record per model under
+  orphan keys, missing parents and rows whose child columns are all NULL or zero
+  (a sign of no child, not proof), one record per drafted model under
   `data.verification.population_delta`, a `population_delta` finding and
   `completion.obligations.needs_decision` where the counts ask which rows belong.
   Only the plan's models with `--for-plan`, at most 25 without. Every class that

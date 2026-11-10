@@ -122,7 +122,8 @@ the project edits, migrations and dev builds described below.
    A model that declares no parent is measured against the one Dex drafts for
    it (`data.declarations.<model>.drafted.population_parent` on the plan): each
    `population_delta` record counts its orphan keys, missing parents and rows
-   with no child. `needs_decision` (listed under
+   whose child columns are all NULL or zero (a sign of a parent with no child,
+   not proof). `needs_decision` (listed under
    `data.completion.obligations.needs_decision`) asks which rows the model is
    for: declare `population.parent`, or record the population as an assumption
    naming the key `column` at `request`, `contract` or `precedent` tier.
@@ -309,8 +310,9 @@ the checkable form where the model carries the column, and read
   names; every failed package model in one call): it drafts the overrides as a
   plan of their own, with the conversion read from
   the error and the data, or left `unresolved` where they do not settle it.
-  Review it, relay each `meaning_changing` conversion as a decision, apply it and
-  build it with `--cold-deps`; never fold it into the deliverable's plan. Stop
+  Review it, relay each `meaning_changing` conversion as a decision, settle any
+  `unresolved` conversion (profile its input, draft again) before applying, then
+  apply it and build it with `--cold-deps`; never fold it into the deliverable's plan. Stop
   only when the draft is refused or stays `unresolved` with nothing that settles
   it: then the deliverable is incomplete, so report the prerequisite and the
   remedy tried. An override of a model its package documents takes the
@@ -524,8 +526,9 @@ a field, flag, or macro you need is not described here.
 - `transform repair <node>`: when a build's blocker `next` names it. Profile the
   input it reads first, then read `data.repair`: `status`, each conversion's
   `kind` and `meaning_changing` (relay that as a decision), anything `unresolved`.
-  Apply it and build it `--cold-deps` as its own plan, never inside the
-  deliverable's.
+  While `data.repair.status` is `unresolved`, settle the conversion first
+  (profile the input it names) and draft again rather than applying. Then apply
+  it and build it `--cold-deps` as its own plan, never inside the deliverable's.
 - Use a shipped macro (`transform macro <name>`) rather than hand-rolling or
   inlining a copy of it, and do not hand-write `generate_schema_name`. When a
   plan warns that a called macro is missing, scaffold it. Do not "fix" the

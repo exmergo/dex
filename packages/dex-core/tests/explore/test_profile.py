@@ -110,6 +110,31 @@ def test_detect_pii_does_not_flag(column: str, data_type: str):
     assert detect_pii(column, data_type) is None, column
 
 
+@pytest.mark.parametrize(
+    "data_type",
+    [
+        "VARCHAR[]",  # DuckDB
+        "text[]",  # Postgres
+        "ARRAY<STRING>",  # BigQuery, a REPEATED STRING field
+        "ARRAY",  # Snowflake, semi-structured: elements of unknown type
+        "STRUCT(a INTEGER)[]",  # elements no type gate can read, so text
+    ],
+)
+def test_a_list_is_screened_by_its_element_type(data_type: str):
+    """A list of addresses is as personal as one address (#1246): the type gates
+    read the element's type, failing closed to text where it cannot be read."""
+
+    flag = detect_pii("email", data_type)
+
+    assert flag is not None and flag.category is PIICategory.EMAIL
+    assert detect_pii("reviewer_name", data_type) is not None
+
+
+def test_a_list_of_numbers_keeps_the_numeric_type_gates():
+    assert detect_pii("email", "BIGINT[]") is None
+    assert detect_pii("user_email_count", "ARRAY<INT64>") is None
+
+
 def test_generic_name_is_weaker_than_exact_person_tokens():
     exact = detect_pii("last_name", "VARCHAR")
     generic = detect_pii("reviewer_name", "VARCHAR")

@@ -233,8 +233,8 @@ semantic-api = ["httpx>=0.27"]
 # its validator, so dex validates against what upstream validates against.
 ossie = ["jsonschema>=4.26"]
 # SLayer semantic models (`semantic.vendor: slayer`). Pinned to ONE exact release,
-# never a range: SLayer is beta (six releases between Sep 27 and Oct 12, 2026) and
-# its stored model format is versioned (15 at 1.2.0), so a range would let the
+# never a range: SLayer moves fast (eleven releases between Oct 12 and Nov 9, 2026) and
+# its stored model format is versioned (15 at 1.8.2), so a range would let the
 # format dex reads and writes move under it on an ordinary reinstall. Moving the
 # pin is a deliberate act, and `exmergo_dex_core.slayer.dependency.SLAYER_VERSION`
 # has to move with it (a test holds the two equal).
@@ -254,7 +254,7 @@ ossie = ["jsonschema>=4.26"]
 # FastAPI, uvicorn, mcp, duckdb, jafgen and tantivy. Nothing outside
 # `exmergo_dex_core.slayer` may import `slayer`, and that module imports it only
 # behind `ensure_available`; a packaging test holds both true.
-slayer = ["motley-slayer==1.2.0", "exmergo-dex-core[sql]"]
+slayer = ["motley-slayer==1.8.2", "exmergo-dex-core[sql]"]
 # Cube YAML model files (`semantic.vendor: cube`). Read statically, validated by
 # dex's own port of Cube's model rules, so there is no Cube package to install:
 # no Node, no Cube server, no `cube_dbt`. The one thing the reader needs is the
@@ -373,7 +373,7 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # This package lives in a subdirectory; the repository .git is two levels up.
 root = "../.."
-fallback_version = "1.17.5"
+fallback_version = "1.17.6"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

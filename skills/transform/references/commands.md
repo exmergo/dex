@@ -708,8 +708,9 @@ test over the smaller result.
   declarations.md, "Checked against the built relation".
 - A built model that declares no parent is measured against the one dex drafts
   for it (#1228): `data.verification.population_delta` holds one record per
-  model with `orphan_keys`, `missing_parents` and `empty_rows` (parents kept
-  with no children), and a `status` of `satisfied`, `needs_decision` (a
+  model with `orphan_keys`, `missing_parents` and `empty_rows` (rows whose
+  child columns are all NULL, or zero where numeric: a sign of parents kept with
+  no children, not proof, since children can sum to zero), and a `status` of `satisfied`, `needs_decision` (a
   `population_delta` finding, and `obligations.needs_decision`), `settled` (an
   assumption naming the key at `request`, `contract` or `precedent` tier),
   `not_applicable` or `unchecked`. With `--for-plan` only the plan's models are

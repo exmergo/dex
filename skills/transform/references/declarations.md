@@ -755,7 +755,7 @@ One model file per mart, `models/<data_source>/<mart>.yaml` under
 | Declaration | SLayer model |
 | --- | --- |
 | `grain` | `primary_key: true` on each grain column, a composite grain included |
-| any role | a column, typed from the SQL's casts or the cache's profile (`INT`, `DOUBLE`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `TEXT`); a summed measure of unknown type is `DOUBLE`, with a note |
+| any role | a column, typed from the SQL's casts or the cache's profile (`INT`, `DOUBLE`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `TEXT`); a summed measure of unknown type is `DOUBLE`, with a note. A list type (`VARCHAR[]`, `text[]`, `ARRAY<STRING>`, Snowflake `ARRAY`) is `type: ARRAY` with the `element_type` its element names, `UNKNOWN` for a list of lists or structs or a semi-structured `ARRAY` |
 | the first `time` column | `default_time_dimension` (only where its type is known to be a date or a timestamp) |
 | `foreign_key` with `references` | a `many_to_one` join to the SLayer model already sitting on the parent's table; where none does, no join and a note |
 | `measure` with `aggregation` | a saved measure named `<column>_<agg>`, formula `<column>:<agg>`: `sum`, `avg` (`average`, `mean`), `min`, `max`, `count`, `count_distinct`, `median`. SLayer keeps columns and measures in one namespace, so a name a column already holds fails the derivation rather than being renamed |
