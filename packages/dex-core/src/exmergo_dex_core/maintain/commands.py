@@ -1378,9 +1378,8 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
     running and then being discarded by that later filter.
     """
 
-    declared_by_model, undeclared, plan_notes = verify_mod.column_contract_plan(
-        project_dir, scope=scope
-    )
+    plan = verify_mod.column_contract_plan(project_dir, scope=scope)
+    declared_by_model, undeclared, plan_notes = plan
     if not declared_by_model and not undeclared:
         reason = (
             plan_notes[0]
@@ -1395,6 +1394,7 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
         model_relations,
         [o.identifier for o in live],
         undeclared,
+        package_entries=getattr(plan, "package_entries", None),
     )
     return findings, plan_notes + finding_notes, None
 
