@@ -660,6 +660,37 @@ def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | No
     )
 
 
+#: The content shapes :func:`content_shape` reads back out of a cached
+#: profile's notes, keyed by the phrase the writers above put in them.
+_SHAPE_PHRASES = (
+    ("epoch_seconds", "of values fall in the plausible unix-epoch-seconds range"),
+    ("epoch_millis", "of values fall in the plausible unix-epoch-milliseconds range"),
+    ("iso_datetime", "of values match the %Y-%m-%d %H:%M:%S date format"),
+    ("iso_date", "of values match the %Y-%m-%d date format"),
+)
+
+
+def content_shape(notes: list[str], column: str) -> str | None:
+    """The temporal shape a cached profile's notes report for ``column`` (#1229).
+
+    One of ``epoch_seconds``, ``epoch_millis``, ``iso_datetime`` and
+    ``iso_date``, or ``None`` where no note on that column reports one. A note
+    is written only at :data:`_TYPE_CONTRADICTION_MATCH_THRESHOLD`, so a shape
+    read here holds for nearly every non-null value. Read beside the writers
+    (:func:`_epoch_note`, :func:`_temporal_note`) so the two cannot drift apart.
+    """
+
+    prefix = f"{column} is declared ".lower()
+    for note in notes:
+        lowered = note.lower()
+        if not lowered.startswith(prefix):
+            continue
+        for shape, phrase in _SHAPE_PHRASES:
+            if phrase.lower() in lowered:
+                return shape
+    return None
+
+
 # Below this, a second shape reads as a handful of typos/outliers, not a
 # second real population; the issue's own worked example floors here at 10%,
 # so 5% catches a genuine minority scheme with margin to spare while staying

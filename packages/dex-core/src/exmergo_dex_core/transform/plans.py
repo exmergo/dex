@@ -126,6 +126,10 @@ class TransformPlan(BaseModel):
     # `undeclared`, plus `unchecked` where the edit could not be read.
     # Bookkeeping outside the digest, read by a `--for-plan` build.
     change_scope: dict[str, list[dict[str, Any]]] | None = None
+    # A package override `transform repair` drafted (#1229): the node, the
+    # conversions and what they rest on, read by a `--for-plan` build to hold the
+    # repair to its obligations. Bookkeeping outside the digest, like the two above.
+    repair: dict[str, Any] | None = None
     # The retirement contract (#858): which flag value's behavior survives and
     # what each output must hold. Intent rather than bookkeeping, so unlike the
     # two above it travels in the plan document and, where present, its digest.

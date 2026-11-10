@@ -71,6 +71,7 @@ from .results import (
     PlanResult,
     PreflightResult,
     PropagationResult,
+    RepairResult,
     TestScaffoldResult,
 )
 
@@ -1007,6 +1008,13 @@ def _offer_refactor_comparison(
                         "status": b.status,
                         "owner": "package" if b.package else "project",
                         **({"package": b.package} if b.package else {}),
+                        # The command that drafts the repair, so the offer
+                        # names one rather than a key a plan never emits (#1229).
+                        **(
+                            {"repair": f"dex transform repair {b.model}"}
+                            if b.package and b.status != "skipped"
+                            else {}
+                        ),
                     }
                     for b in blocked
                 ]
@@ -1899,6 +1907,301 @@ def cmd_declare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
         return env.error_for(exc)
+
+
+def _failed_package_node(
+    project: Path, name: str
+) -> tuple[str, dict[str, Any], dict[str, Any], Any]:
+    """The failed package node named ``name``: its unique id, manifest node,
+    the manifest, and its latest attempt. Refuses whatever is not one."""
+
+    from .artifact_runtime import latest_node_runs
+    from .evidence import FAILED_STATUSES
+    from .package_repair import RepairRefusedError
+
+    runs = latest_node_runs(project)
+    if runs.manifest is None:
+        raise RepairRefusedError(
+            f"no build has run here, so there is no failure of {name} to repair: "
+            "run `dex transform build --target dev` first"
+        )
+    manifest = json.loads(runs.manifest.read_text(encoding="utf-8"))
+    root = (manifest.get("metadata") or {}).get("project_name")
+    wanted = name.split(".")[-1].lower()
+    candidates = [
+        (uid, node)
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if isinstance(node, dict)
+        and str(node.get("name") or "").lower() == wanted
+        and (len(name.split(".")) == 1 or uid.split(".")[1] == name.split(".")[0])
+    ]
+    if not candidates:
+        disabled = [
+            uid
+            for uid, entries in (manifest.get("disabled") or {}).items()
+            if uid.split(".")[-1].lower() == wanted
+        ]
+        if disabled:
+            raise RepairRefusedError(
+                f"{name} is disabled in the project already, so an override is in "
+                "place: the project owns the model now, so fix it with "
+                "`dex transform plan`"
+            )
+        raise RepairRefusedError(
+            f"no node named {name} is in the latest build's manifest"
+        )
+    failed = [
+        (uid, node)
+        for uid, node in candidates
+        if (run := runs.nodes.get(uid)) is not None and run.status in FAILED_STATUSES
+    ]
+    if not failed:
+        statuses = sorted(
+            {runs.nodes[uid].status for uid, _ in candidates if uid in runs.nodes}
+        )
+        raise RepairRefusedError(
+            f"the latest build attempt of {name} did not fail"
+            + (f" ({', '.join(statuses)})" if statuses else " (never attempted)")
+            + ": `transform repair` drafts a fix for a failed package model; "
+            "build it first to see whether it fails"
+        )
+    unique_id, node = failed[0]
+    if node.get("package_name") == root:
+        path = node.get("original_file_path") or name
+        raise RepairRefusedError(
+            f"the project owns {name} ({path}), so it is repaired with an ordinary "
+            "`dex transform plan` on that file, not an override"
+        )
+    return unique_id, node, manifest, runs.nodes[unique_id]
+
+
+def repair(engine: DexEngine, names: str | Sequence[str] | None) -> RepairResult:
+    """Draft the project overrides that repair failing package models (#1229).
+
+    Every node named goes into one plan: each override disables its package node
+    in the same ``dbt_project.yml``, so separate plans would conflict on apply.
+    Reads the latest build attempt and its manifest, the project and the
+    exploration cache. dbt's compile of the drafts answers column listings from
+    metadata, and the bind check reads no row. The drafts are an ordinary plan:
+    every gate ``transform plan`` runs, runs on them.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import package_repair as repair_mod
+    from .prerequisites import _override_option
+    from .validate import EditValidationError
+
+    wanted = list(
+        dict.fromkeys(
+            name.strip()
+            for name in ([names] if isinstance(names, str) else list(names or []))
+            for name in name.split(",")
+            if name.strip()
+        )
+    )
+    if not wanted:
+        raise repair_mod.RepairRefusedError(
+            "transform repair needs the failing node: `transform repair <model>`"
+        )
+    project = Path(engine.project_dir())
+    view = load_project(project)
+    project_file = project / "dbt_project.yml"
+    project_text = (
+        project_file.read_text(encoding="utf-8") if project_file.is_file() else ""
+    )
+    raw_project = yaml.safe_load(project_text or "") or {}
+    root_vars = raw_project.get("vars") if isinstance(raw_project, dict) else None
+    try:
+        cache = readable_cache(engine.store)
+    except Exception:
+        cache = None
+    connector = str(engine.connector or engine.config.connector or "")
+    installed = repair_mod.installed_names(project)
+
+    drafts: list[repair_mod.Draft] = []
+    manifests: dict[str, dict[str, Any]] = {}
+    for name in wanted:
+        unique_id, node, manifest, run = _failed_package_node(project, name)
+        if any(d.unique_id == unique_id for d in drafts):
+            continue
+        nodes = {
+            **(manifest.get("nodes") or {}),
+            **(manifest.get("unit_tests") or {}),
+        }
+        option = _override_option(unique_id, node, nodes, _install_dir(project))
+        if not option.get("supported"):
+            raise repair_mod.RepairRefusedError(
+                f"{node.get('package_name')}.{node.get('name')} cannot be "
+                f"overridden: {option.get('reason')}"
+            )
+        target = repair_mod.override_path(view.model_paths, str(node["name"]))
+        clash = next(
+            (
+                path
+                for path in view.files
+                if path.endswith(".sql")
+                and Path(path).stem.lower() == str(node["name"]).lower()
+                and path != target
+            ),
+            None,
+        )
+        if clash is not None:
+            raise repair_mod.RepairRefusedError(
+                f"the project already has a file named {Path(clash).name} "
+                f"({clash}); an override would be a second model of that name"
+            )
+        package = str(node.get("package_name"))
+        drafted = repair_mod.draft(
+            node=node,
+            unique_id=unique_id,
+            manifest=manifest,
+            message=run.message,
+            # Each draft writes into the project file the previous one left.
+            project_yml=drafts[-1].project_yml if drafts else project_text,
+            root_project=view.project_name,
+            root_vars=root_vars if isinstance(root_vars, dict) else {},
+            package_vars=repair_mod.package_vars(project, package),
+            installed=installed,
+            model_paths=view.model_paths,
+            cache=cache,
+            connector=connector,
+        )
+        drafts.append(drafted)
+        manifests[unique_id] = manifest
+
+    def drafted_edits() -> list[PlanEdit]:
+        return [
+            *(
+                PlanEdit(
+                    path=d.override_path,
+                    kind=EditKind.MODEL_SQL,
+                    new_content=d.override_sql,
+                )
+                for d in drafts
+            ),
+            PlanEdit(
+                path="dbt_project.yml",
+                kind=EditKind.PROJECT_YML,
+                new_content=drafts[-1].project_yml,
+            ),
+        ]
+
+    compile_notes: list[str] = []
+    compiled_ok: bool | None = None
+    adapter = None
+    # Compile the drafts, then bind each on dev reading no row; each typing
+    # error a bind reveals is one more failure to convert, as successive builds
+    # would reveal them one rebuild at a time.
+    for _pass in range(repair_mod.MAX_PASSES):
+        edits = drafted_edits()
+        try:
+            from .compile import compile_models
+
+            compiled, broker = compile_models(
+                engine, edits, force={d.override_path for d in drafts}
+            )
+            broker.settle()
+            compile_notes.extend(broker.warnings)
+            compiled_ok = True
+        except EditValidationError as exc:
+            if "require dbt" in str(exc):
+                compiled_ok = False
+                compile_notes.append(
+                    "dbt is not installed, so the drafts were neither compiled nor "
+                    "bound before they were stored; `transform build` compiles them"
+                )
+                for d in drafts:
+                    d.bind_check = {
+                        "status": "not_checked",
+                        "reason": "dbt is not installed",
+                    }
+                break
+            raise repair_mod.RepairRefusedError(
+                "the drafted override of "
+                + ", ".join(f"{d.package}.{d.name}" for d in drafts)
+                + f" does not compile, so no plan was stored: {exc}"
+            ) from exc
+        progressed = False
+        for d in drafts:
+            if d.bind_check.get("status") == "bound":
+                continue
+            try:
+                if adapter is None:
+                    adapter = engine._adapter("transform repair", reads_dev_target=True)
+                outcome, detail, text = repair_mod.bind_check(
+                    adapter, connector, compiled[d.override_path].sql
+                )
+            except Exception as exc:
+                outcome, text = "not_checked", None
+                detail = f"no connection to bind the draft on ({type(exc).__name__})"
+            d.bind_check = {"status": outcome}
+            if detail:
+                d.bind_check["detail" if outcome == "failed" else "reason"] = detail
+            if outcome == "failed" and repair_mod.add_failure(
+                d,
+                text or detail,
+                source="bind_check",
+                manifest=manifests[d.unique_id],
+                cache=cache,
+                connector=connector,
+            ):
+                progressed = True
+        if not progressed:
+            break
+    edits = drafted_edits()
+    records = [repair_mod.finish(d) for d in drafts]
+    conversions = ", ".join(
+        f"{record['node']}.{c['column']} {c['kind']}"
+        for record in records
+        for c in record["conversions"]
+        if c.get("status") == "resolved"
+    )
+    intent = (
+        "repair "
+        + ", ".join(f"{d.package}.{d.name}" for d in drafts)
+        + " with a project override"
+        + (f" ({conversions})" if conversions else "")
+    )
+    planned = plan(engine, intent, edits=edits)
+    settled = all(record["status"] == "resolved" for record in records)
+    summary: dict[str, Any] = {
+        "status": "resolved" if settled else "unresolved",
+        "plan_id": planned.plan_id,
+        "compiled": compiled_ok,
+        "nodes": records,
+        "next": (
+            f"review the diff, then `dex transform apply {planned.plan_id}` and "
+            f"`dex transform build --target dev --verify --for-plan "
+            f"{planned.plan_id} --cold-deps`"
+            if settled
+            else "edit each unresolved conversion in the draft (or profile the "
+            "input it names and repair again) before applying it"
+        ),
+    }
+    result = RepairResult(**planned.model_dump(), repair=summary)
+    # The compile and the parse run dbt twice over one tree, so its own
+    # warnings arrive twice; each is said once.
+    result.warnings = list(
+        dict.fromkeys(
+            [*(w for d in drafts for w in d.warnings), *compile_notes, *result.warnings]
+        )
+    )
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("recording a repair")
+        stored = store.load_plan(planned.plan_id)
+        stored.repair = summary
+        store.save_plan(stored)
+    return result
+
+
+def cmd_repair(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        result = repair(engine, getattr(args, "nodes", None))
+    except DbtParseError as exc:
+        return env.error_for(exc, warnings=exc.warnings)
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result, hints={"next": result.repair.get("next", "")})
 
 
 def _split_targets(raw: list[str] | None) -> list[str]:
@@ -6539,6 +6842,7 @@ def _attach_completion(
             identifier_conversions=inputs.get("identifier_conversions"),
             change_scope=inputs.get("change_scope"),
             incremental_replay=_incremental_replay_inputs(result, inputs),
+            repair=inputs.get("repair"),
         )
     except Exception as exc:
         result.notes.append(
@@ -6625,6 +6929,7 @@ def _completion_inputs(
                 getattr(stored, "identifier_conversions", None) or {}
             )
             inputs["change_scope"] = getattr(stored, "change_scope", None) or {}
+            inputs["repair"] = getattr(stored, "repair", None)
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):

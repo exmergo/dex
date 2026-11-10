@@ -83,6 +83,8 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # Declarations for models that already exist (#501): opt-in, one capped
         # plan per call, repo-and-cache only.
         "declare",
+        # A failing package model's project override, drafted as a plan (#1229).
+        "repair",
         "test",
         # Whether a stored plan keeps a model's results (#856).
         "compare",
@@ -405,6 +407,14 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "running totals) each selected model does not yet declare, plus any "
         "intent the --edits-file declarations supply. Capped at 25 models; "
         "every skipped model is named. Repo-only and free.",
+    ),
+    ("transform", "repair"): (
+        "draft an override that repairs a failing package model",
+        "Read the latest build's failure of a package model, restate its SQL as "
+        "a project override (package macros qualified, vars resolved, the "
+        "package node disabled), convert the columns the error names where the "
+        "cached profile settles what they hold, compile it, and store it as a "
+        "plan. Nothing is applied.",
     ),
     ("transform", "test"): (
         "scaffold a unit test, or mutation-test existing tests",
@@ -1316,6 +1326,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="return the reasoning without storing a plan",
                     )
+                if group == "transform" and name == "repair":
+                    sp.add_argument(
+                        "nodes",
+                        nargs="*",
+                        metavar="model",
+                        help="a failing package model (`model` or `pkg.model`)",
+                    )
                 if group == "transform" and name == "declare":
                     # The selector `maintain verify` takes: model names, repeated
                     # or comma-separated; none selects every model.
@@ -1715,6 +1732,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
         ("transform", "declare"): "cmd_declare",
+        ("transform", "repair"): "cmd_repair",
         ("transform", "test"): "cmd_test",
         ("transform", "compare"): "cmd_compare",
         ("transform", "export"): "cmd_export",
