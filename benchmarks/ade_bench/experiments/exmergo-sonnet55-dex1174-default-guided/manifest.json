@@ -1,0 +1,364 @@
+{
+  "schema": 2,
+  "created_at": "2026-11-05T21:51:22.729221+00:00",
+  "organization": "Exmergo",
+  "token": "e14ea827f4681848ed73fb66",
+  "pins": {
+    "model": "claude-sonnet-5-5",
+    "dex_version": "1.17.4",
+    "dex_commit": "abf76a721b6db710637bdfedac036da51dc87cde",
+    "claude_code_version": "2.1.310",
+    "uv_version": "0.13.4",
+    "image": "exmergo/ade-bench-dex:1.17.4-sonnet-5-5-default",
+    "databases": {
+      "airbnb": "29b83129330bedb5d81a0de76868615f96b90e6373ebc68bfba6d3202ed174ab",
+      "analytics_engineering": "2d14bd7097fab0ac3f0ca8ff8d4d4e1ec869f9eda65b77b72cb60ccfdfcc32f9",
+      "asana": "738ce7433e0f10af3328f4d711c4aa4fcc46d3865695ac45e7cc3e7a2faa7eb1",
+      "f1": "4b233007359d18e69ef18119bdc40806abc158d6a053c0ef9b56c55061b0a731",
+      "helixops_saas": "911dc733f778bd3bf832a069369852b91eb5a4bcf2c2df17335714e73adfc24c",
+      "intercom": "0cce2124b0373621bb52f7171141742ee8bd1133922e26d8141f79146404da65",
+      "quickbooks": "2496b56984721d76d57c522e47bdbce8189a48edf783e441814e821d7c3e2a40",
+      "simple": "b08bcb86bf6b28c9f6a1c6eee11d498ec641cb93ff6ea4908a0a8cff7922224f"
+    },
+    "reasoning_effort": null,
+    "dex_archive_sha256": "1049cf95612d80e8494c377a87ae1fa58c5515c43e51a8881a9d990eafccffa8"
+  },
+  "benchmark_condition": "dex-guided-v1",
+  "prompt_suffix": "You are completing an unattended Exmergo Dex-guided benchmark on a synthetic local\nDuckDB copy. Solve the user's task completely using Dex 1.17.4 where it supports\nthe work. Work in /app; .dex/config.yml connects to the task database. Existing projects\nand profiles are there; project-creation tasks intentionally start without them.\n\nBefore changing project files, use the Skill tool to load the relevant Dex skill:\n- dex:explore: inspect unfamiliar source columns, types, grain, joins or values.\n  Prefer targeted profiles or queries when the relevant tables are known.\n- dex:transform: author, fix, rename or refactor dbt models, macros or configuration.\n- dex:maintain: diagnose an existing project's correctness or warehouse drift when\n  that diagnosis is needed to determine the fix.\nChoose the skills the task needs. Do not run all three as a ritual. Load another\nskill if the work reaches its scope. Skills are available through the native Dex\nplugin. Run their engine commands with the documented absolute run.py wrapper;\nthe dex CLI is also installed and available on PATH.\n\nPerform at least one task-relevant Dex operation before editing the project.\nReading help or checking a version does not satisfy this. Follow the skill's\nworkflow: verify unfamiliar schema before writing SQL, inspect a plan before\napplying it, and build/verify the affected models on dev. Make the smallest\ncomplete fix requested. Do not add unrelated tests, documentation or refactors.\nDo not stop after planning or explaining: apply the fix and verify the result.\n\nIf a command fails, read its error or focused help and correct the invocation.\nIf Dex cannot represent the required change or has a blocking implementation\nfailure, report that limitation and finish the task with the available local\ntools. Do not bypass Dex's privacy, cost or dev-target safeguards. Do not make\nmeaningless Dex calls simply to increase invocation counts.\n\nYou are authorized to inspect this synthetic data, edit this disposable project,\napply the needed changes, and build/verify on its dev target without follow-up\nquestions. uv, Dex and dbt are installed. Do not install or update tools. Do not\ncreate git commits or push anything.\n",
+  "prompt_sha256": "4aeed68b9bbe213fd0affedf36ac27b5383af2e29acd0d378a80fbfce71b4fd6",
+  "agent_config_dir": null,
+  "agent_config_sha256": null,
+  "image_id": "sha256:cd45552728d1540dbdb2c54d8a7752f430cf3b887d92b0bd6dd22dd5d2eca8a0",
+  "platform": "linux/arm64",
+  "docker_host": "unix:///Users/marcociavarella/.docker/run/docker.sock",
+  "runtime": {
+    "setup_tools": [
+      "patch",
+      "git",
+      "tmux",
+      "curl",
+      "node",
+      "dbt",
+      "uv",
+      "yq"
+    ],
+    "plugin": "1.17.4",
+    "claude_code": "2.1.310 (Claude Code)",
+    "dex_cli": "1.17.4",
+    "dbt_core": "1.10.11",
+    "dbt_duckdb": "1.9.3",
+    "duckdb": "1.3.0",
+    "uv": "uv 0.13.4 (aarch64-unknown-linux-gnu)"
+  },
+  "source_sha256": "8570dd6ddac312f07eff40d777de9ca06de00d44d426def05af55c099a64990e",
+  "image_ref": "exmergo/ade-bench-dex:sha-cd45552728d1540dbdb2",
+  "tasks": [
+    {
+      "id": "airbnb001.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb002.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb003.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb004.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb005.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb006.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb007.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb008.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb009.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb010.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb011.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb011.hint",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb012.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "airbnb013.base",
+      "database": "airbnb"
+    },
+    {
+      "id": "analytics_engineering001.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering002.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering002.medium",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering003.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering004.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering005.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering006.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering007.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering007.medium",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "analytics_engineering008.base",
+      "database": "analytics_engineering"
+    },
+    {
+      "id": "asana001.base",
+      "database": "asana"
+    },
+    {
+      "id": "asana002.base",
+      "database": "asana"
+    },
+    {
+      "id": "asana003.base",
+      "database": "asana"
+    },
+    {
+      "id": "asana004.base",
+      "database": "asana"
+    },
+    {
+      "id": "asana005.base",
+      "database": "asana"
+    },
+    {
+      "id": "asana005.hard",
+      "database": "asana"
+    },
+    {
+      "id": "f1001.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1002.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1003.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1003.hard",
+      "database": "f1"
+    },
+    {
+      "id": "f1004.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1005.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1005.medium",
+      "database": "f1"
+    },
+    {
+      "id": "f1006.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1006.hard",
+      "database": "f1"
+    },
+    {
+      "id": "f1007.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1007.medium",
+      "database": "f1"
+    },
+    {
+      "id": "f1007.hard",
+      "database": "f1"
+    },
+    {
+      "id": "f1009.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1010.base",
+      "database": "f1"
+    },
+    {
+      "id": "f1010.medium",
+      "database": "f1"
+    },
+    {
+      "id": "f1011.base",
+      "database": "f1"
+    },
+    {
+      "id": "helixops_saas001.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas002.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas003.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas004.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas004.no_hint",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas005.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas006.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas007.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas007.no_location_hint",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas008.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas009.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas010.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas011.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas011.hard",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas012.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas012.hard",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas013.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas015.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas015.low",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas016.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas017.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "helixops_saas018.base",
+      "database": "helixops_saas"
+    },
+    {
+      "id": "intercom001.base",
+      "database": "intercom"
+    },
+    {
+      "id": "intercom002.base",
+      "database": "intercom"
+    },
+    {
+      "id": "intercom003.base",
+      "database": "intercom"
+    },
+    {
+      "id": "quickbooks001.base",
+      "database": "quickbooks"
+    },
+    {
+      "id": "quickbooks002.base",
+      "database": "quickbooks"
+    },
+    {
+      "id": "quickbooks003.base",
+      "database": "quickbooks"
+    },
+    {
+      "id": "quickbooks004.base",
+      "database": "quickbooks"
+    }
+  ],
+  "jobs": 2,
+  "retries": 2,
+  "retry_delay": 30,
+  "max_turns": 50,
+  "agent_timeout": 1800,
+  "task_timeout": 3600,
+  "retry_policy": "Retry execution errors only; never retry a completed wrong answer. Provider billing errors stop the batch and do not consume retry budgets."
+}

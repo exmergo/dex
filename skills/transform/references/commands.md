@@ -111,7 +111,12 @@ See the cost-controls reference for the shared budget mechanism.
   (`outputs_unread: true` marks a star whose removals were not read even where
   `outputs` is `changed`), and an `elided` entry (`unchecked`) for a model whose
   changes the cap cut or that `beyond_cap` names, so a capped report never reads
-  as complete.
+  as complete. A change of the relations driving a model, or a declared
+  `population.parent` removed or replaced, is `kind: redriven` (`reason:
+  redriven`, #1228), judged against the applied model or, for a model only an
+  earlier unapplied plan wrote, that plan (the entry's `against` says which). It
+  is `declared` only by an assumption at `request` or `contract` tier; any
+  other leaves it `undeclared` with a `note`.
   Advisory: nothing here refuses a plan.
 - `data.identifier_conversions` (#861): each conversion the plan adds to an
   identifier column, on a new model or an edited one. A conversion is a `cast`, a
@@ -185,7 +190,10 @@ See the cost-controls reference for the shared budget mechanism.
   the `.dex/` cache and the repository and opens no connection. Shape in
   `declarations.md`. Absent when the plan touches no model. `drafted.precedent`
   says what the project's other models do with each column this one filters,
-  branches on or aggregates, grouped and counted.
+  branches on or aggregates, grouped and counted. `drafted.population_parent`
+  is the entity dex drafts a model with no declared `population.parent` is
+  about, with its evidence and whether the SQL is driven from it (#1228), and a
+  warning names it; see declarations.md, "A drafted parent".
 - Contradiction warnings: on a model that already exists, a declared rule the
   edit breaks, also listed under `data.declarations.<model>.contradictions`
   (`check`, `status`, `rule`, `stale`, `prior`, `authored`, `preexisting`,
@@ -550,7 +558,7 @@ failed-build envelope carries it too, and Python callers get the same typed
 | `blockers` | the failed nodes, with the ones that stopped a deliverable first, and dbt's message cut to 160 characters (the whole message is in `data.evidence.nodes`). `next` is the one command that repairs it: `repair: dex transform repair <node>` for a package model the project can override, `repair: transform plan on <path>` for the project's own (#1229) |
 | `assurance` | over the required deliverables, or over every built model with no plan: `asserted` (a passing data test reads it, or a verification record judged it `satisfied`), `failed_checks` (a data test on it failed or warned, or a record was `contradicted`; `checks` lists each failure with its `kind`, `data_test` with the test's `name` or the record list such as `join_coverage` with its `finding` and `join`, so a join measured against a default threshold is not read as a failed test, #1162) and `build_only` (it built and nothing checked its rows; a unit test reads fixtures, so it does not count) |
 | `verification` | `ran` (and `reason` when it did not), `finding_count` including the ones past the 50-finding cap (`findings_dropped`), `by_severity`, the `top` five as `{code, identifier, severity}`, the `suppressed` class names, and `offered` when the sweep's scan was offered rather than run |
-| `obligations` | the declared contracts the sweep held the build to (`join_coverage`, `parent_population`, `temporal_contracts`, and the column contract's unchecked models), counted `by_status`, with the `contradicted` ones named with their `finding` and the `unchecked` ones with their `reason_code`, and the models that declare no columns under `no_declared_columns`. `checked: false` when the sweep did not run. An empty `by_status` from a sweep that ran means nothing declared a contract it could hold the build to, which is not the same as every contract holding |
+| `obligations` | the declared contracts the sweep held the build to (`join_coverage`, `parent_population`, `temporal_contracts`, `population_delta`, and the column contract's unchecked models), counted `by_status`, with the `contradicted` ones named with their `finding`, the `unchecked` ones with their `reason_code`, and a drafted population that asks which rows belong under `needs_decision` (#1228), and the models that declare no columns under `no_declared_columns`. `checked: false` when the sweep did not run. An empty `by_status` from a sweep that ran means nothing declared a contract it could hold the build to, which is not the same as every contract holding |
 | `obligations.identifier_conversions`, `obligations.change_scope` | the plan's identifier conversions and change-scope entries that are not settled, on the required models (#861, #1115) |
 | `obligations.incremental_replay` | each required incremental model the plan edited: `satisfied` when a unit test overriding `is_incremental` to true passed in this build, `contradicted` (`incremental_test_failed`) when one failed, otherwise `unchecked` with `full_refresh_only` (the build only full-refreshed it, which never runs the next incremental run) or `no_incremental_test`. Absent when the plan edits no incremental model (#1130) |
 | `obligations.comparison` | with `--for-plan`, each required model the plan rewrote, held to its recorded `transform compare` verdict: `equivalent` or `as_expected` is `satisfied`, `different` or `unexpected` is `contradicted`, and no verdict is `unchecked` with `not_compared` (or `compared_elsewhere` where another rewrite in the plan was compared), as is a `not_checked` verdict with its own code. A `--for-plan-file` build carries none, since verdicts are recorded on the stored plan (#1157) |
@@ -698,6 +706,15 @@ test over the smaller result.
   `data.verification.temporal_contracts`), and a declared grain no `unique` test
   in the build covers (`grain_broken`, `source: declaration`). See
   declarations.md, "Checked against the built relation".
+- A built model that declares no parent is measured against the one dex drafts
+  for it (#1228): `data.verification.population_delta` holds one record per
+  model with `orphan_keys`, `missing_parents` and `empty_rows` (parents kept
+  with no children), and a `status` of `satisfied`, `needs_decision` (a
+  `population_delta` finding, and `obligations.needs_decision`), `settled` (an
+  assumption naming the key at `request`, `contract` or `precedent` tier),
+  `not_applicable` or `unchecked`. With `--for-plan` only the plan's models are
+  drafted; without, up to 25. The statements are priced with the declared facts.
+  See declarations.md, "Measured against a drafted parent".
 - It reads the dev namespace, and the namespaces dbt derived from it for this
   build's manifest (`<dev schema>_<name>`, where a package or a folder sets
   `+schema`), so a package parent or a joined package model built there is

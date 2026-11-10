@@ -808,6 +808,7 @@ def _draft(
                 "packaged": _package_lookup(view, files.get("dbt_project.yml")),
             },
             index=lambda: _post_change_index(view, edits),
+            key_facts=lambda: _post_change_key_facts(view, edits),
             prior={path: source.content for path, source in view.files.items()},
             package_documented={
                 name: {"package": o.package, "package_entry": o.package_entry}
@@ -913,6 +914,17 @@ def _post_change_index(view: Any, edits: list[PlanEdit]) -> Any:
     from .propagate import _project_after_edits
 
     return ReferenceIndex(_project_after_edits(view, edits))
+
+
+def _post_change_key_facts(view: Any, edits: list[PlanEdit]) -> Any:
+    """The keys and joins the project states once ``edits`` land: its YAML as
+    the plan leaves it, and the compiled manifest for an installed package's
+    tests (#1228)."""
+
+    from .population_inference import facts_for
+    from .propagate import _project_after_edits
+
+    return facts_for(_project_after_edits(view, edits), view.manifest)
 
 
 def _plan_decisions(
@@ -1325,6 +1337,8 @@ def _report_change_scope(
             and edit.new_content is not None
             and edit.path in view.files
         ]
+        earlier, against, parents = _redrive_baselines(engine, view, edits, result)
+        rewrites.extend(earlier)
         if not rewrites:
             return
         report = change_scope.analyze(
@@ -1332,6 +1346,8 @@ def _report_change_scope(
             result.decisions or [],
             get_dialect(engine.connector or engine.config.connector),
             view.vars,
+            parents=parents,
+            against=against,
         )
     except Exception as exc:
         result.warnings.append(
@@ -1351,6 +1367,114 @@ def _report_change_scope(
         stored = store.load_plan(result.plan_id)
         stored.change_scope = per_model
         store.save_plan(stored)
+
+
+def _redrive_baselines(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], result: PlanResult
+) -> tuple[list[tuple[str, str, str]], dict[str, str], dict[str, Any]]:
+    """What re-driving is judged against (#1228): for a model only an earlier
+    unapplied plan wrote, that plan's SQL as the prior version; and for every
+    model this plan writes, its declared ``population.parent`` before (on disk,
+    or in that earlier plan) and after. Never raises."""
+
+    from . import declarations as declarations_mod
+    from .contradictions import _declared_parent
+    from .drafting import read_declared
+
+    earlier: list[tuple[str, str, str]] = []
+    against: dict[str, str] = {}
+    parents: dict[str, Any] = {}
+    written = [
+        edit
+        for edit in edits
+        if edit.kind is EditKind.MODEL_SQL
+        and edit.op is EditOp.UPSERT
+        and edit.new_content is not None
+        and edit.path.endswith(".sql")
+    ]
+    before_files = {path: source.content for path, source in view.files.items()}
+    after_files = declarations_mod.post_change_files(view, edits)
+    # A declaration-only edit can remove or replace a parent with the SQL left
+    # as it is; that model is judged on its unchanged SQL and its parents.
+    sql_written = {edit.path for edit in written}
+    for name in _yaml_models(edits):
+        path = declarations_mod.model_sql_path(before_files, view.model_paths, name)
+        if path is None or path in sql_written:
+            continue
+        moved = (
+            _declared_parent(read_declared(before_files, name)),
+            _declared_parent(read_declared(after_files, name)),
+        )
+        if moved[0] is not None and (moved[1] or "").lower() != moved[0].lower():
+            earlier.append((path, before_files[path], before_files[path]))
+            parents[path] = moved
+    if not written:
+        return earlier, against, parents
+    previous = _earlier_plans(engine, result.plan_id)
+    for edit in written:
+        model = Path(edit.path).stem
+        baseline_files = before_files
+        if edit.path not in view.files:
+            plan = next(
+                (
+                    p
+                    for p in previous
+                    if any(
+                        e.path == edit.path
+                        and e.op is EditOp.UPSERT
+                        and e.new_content is not None
+                        for e in p.edits
+                    )
+                ),
+                None,
+            )
+            if plan is None:
+                continue
+            prior_sql = next(
+                e.new_content
+                for e in plan.edits
+                if e.path == edit.path and e.new_content is not None
+            )
+            earlier.append((edit.path, prior_sql, edit.new_content or ""))
+            against[edit.path] = "earlier_plan"
+            baseline_files = declarations_mod.post_change_files(view, list(plan.edits))
+        parents[edit.path] = (
+            _declared_parent(read_declared(baseline_files, model)),
+            _declared_parent(read_declared(after_files, model)),
+        )
+    return earlier, against, parents
+
+
+def _yaml_models(edits: list[PlanEdit]) -> set[str]:
+    """The model names the plan's YAML edits carry an entry for."""
+
+    import yaml
+
+    names: set[str] = set()
+    for edit in edits:
+        if edit.kind is not EditKind.SCHEMA_YML or edit.new_content is None:
+            continue
+        with contextlib.suppress(yaml.YAMLError):
+            parsed = yaml.safe_load(edit.new_content)
+            if not isinstance(parsed, dict):
+                continue
+            for entry in parsed.get("models") or []:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    names.add(entry["name"])
+    return names
+
+
+def _earlier_plans(engine: DexEngine, plan_id: str | None) -> list[Any]:
+    """The stored unapplied plans other than ``plan_id``, newest first."""
+
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("reading earlier plans")
+        return [
+            plan
+            for plan in store.list_plans()
+            if plan.plan_id != plan_id and plan.applied_at is None
+        ]
+    return []
 
 
 def _contradiction_warnings(result: PlanResult) -> None:
@@ -5414,6 +5538,8 @@ def _build_project(
     if dependencies is DependencyPolicy.REFUSE:
         assert_packages_installed(project)
 
+    from .verify import plan_models
+
     estimate, per_node, price_notes, upper_bounds, adapter = _price_build(
         engine,
         checkout,
@@ -5422,6 +5548,11 @@ def _build_project(
         verify=verify,
         artifact_directory=artifacts_dir,
         full_refresh=full_refresh,
+        focus=(
+            plan_models(_plan_edits(engine, for_plan, for_plan_document))
+            if verify
+            else None
+        ),
     )
     if estimate is not None:
         command_args.billed_handshake(
@@ -6297,6 +6428,7 @@ def _price_build(
     verify: bool = False,
     artifact_directory: Path | None = None,
     full_refresh: bool = False,
+    focus: set[str] | None = None,
 ):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
@@ -6409,7 +6541,7 @@ def _price_build(
                     adapter, Path(project), scope=scope, recomputed=recomputed
                 )
                 facts, facts_notes = price_declared_facts(
-                    adapter, Path(project), scope=scope
+                    adapter, Path(project), scope=scope, engine=engine, focus=focus
                 )
                 joins, join_notes = price_join_contract(
                     adapter, Path(project), scope=scope

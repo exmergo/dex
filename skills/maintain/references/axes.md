@@ -345,6 +345,15 @@ Needs no baseline. The classes of finding:
     relation the manifest names for it; with `--target dev` (and on a build's
     `--verify`) a package that sets `+schema` is read in the
     `<dev schema>_<name>` namespace dbt built it into.
+  - `population_delta` (high with orphan keys, medium with missing parents,
+    low for parents kept with no children), on `transform build --verify`
+    only, for a built model that declares no `population.parent` (#1228): the
+    same counts against the parent dex drafts for it, plus the rows whose child
+    columns are all NULL or zero. It asks which rows the model is for rather
+    than calling any of them wrong; each such model has a record under
+    `data.population_delta` (`satisfied`, `needs_decision`, `settled`,
+    `not_applicable`, `unchecked`), and it is never named in `suppressed`.
+    `maintain verify` measures declared parents only.
   - `temporal_transition_count_mismatch`, `temporal_latest_transition_mismatch`
     and `temporal_first_attainment_mismatch` (high), `temporal_population_missing`
     and `temporal_population_unexpected` (high), and
