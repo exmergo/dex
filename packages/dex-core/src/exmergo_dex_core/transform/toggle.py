@@ -29,6 +29,7 @@ an incomplete reading of the project is never reported as ``satisfied``.
 # ruff: noqa: PERF401
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -39,6 +40,7 @@ from ..dbt_project import DbtProjectView, jinja_calls
 from ..references import column_parse_limit
 from ..semantic_declarations import Assumption, _Strict
 from .compiled_tree import (
+    _QUOTES,
     Branch,
     Catalog,
     compile_branch,
@@ -283,12 +285,13 @@ def _record(model: str) -> dict[str, Any]:
     return {"model": model, "status": "satisfied", "checks": []}
 
 
-def _contradict(record: dict[str, Any], check: str, detail: str) -> None:
-    """Mark ``record`` contradicted by ``check``, keeping every check's detail."""
+def _contradict(record: dict[str, Any], check: str, detail: str, **where: Any) -> None:
+    """Mark ``record`` contradicted by ``check``, keeping every check's detail
+    and, where a check names a site (a file and line), that site."""
 
     record["status"] = "contradicted"
     record["finding"] = record.get("finding") or check
-    record["checks"].append({"check": check, "detail": detail})
+    record["checks"].append({"check": check, "detail": detail, **where})
 
 
 def _uncheck(record: dict[str, Any], code: str, reason: str | None = None) -> None:
@@ -450,6 +453,30 @@ def analyze(
             "compiled, so the toggle is unchecked for them only: "
             + ", ".join(e["model"] for e in not_compiled[:10])
         )
+
+    # What else reads a governed column with the flag off: a test that still
+    # runs, and a semantic definition that stops resolving (#1169).
+    by_label = {record["model"]: record for record in records}
+    sites, reader_limits = governed_readers(
+        index,
+        after,
+        off,
+        {
+            label: cols
+            for label, cols in producers.items()
+            if label.lower() not in exempt
+        },
+        name=project_name,
+        variable=variable,
+        on_value=contract.on_value,
+        off_value=contract.off_value,
+    )
+    limits.extend(reader_limits)
+    for label, found in sites.items():
+        for site in found:
+            check = site.pop("check")
+            detail = site.pop("detail")
+            _contradict(by_label[label], check, detail, **site)
 
     judged = [r for r in records if r["status"] != "satisfied" or r.get("produces")]
     report = _report(
@@ -690,6 +717,446 @@ def _judge_model(
                 + (f"; only off: {', '.join(only_off)}" if only_off else "")
                 + ". Add them to `columns` if the feature governs them",
             )
+
+
+# --- what else reads a governed column (#1169) ---------------------------------
+
+#: The test arguments that name a column of the model the test is attached to.
+#: ``field`` is apart: a ``relationships`` test names a column of its ``to``.
+_TEST_COLUMN_KEYS = ("column_name", "combination_of_columns", "compare_columns")
+
+
+def _names(value: Any) -> set[str]:
+    """Lowercased column names from one test argument, quoting removed."""
+
+    values = value if isinstance(value, list) else [value]
+    return {
+        _QUOTES.sub("", item).strip().lower()
+        for item in values
+        if isinstance(item, str)
+    }
+
+
+def _test_columns(node: Mapping[str, Any], uid: str) -> set[str]:
+    """The columns of model ``uid`` a compiled test node reads."""
+
+    from ..references import _relation_from
+
+    kwargs = (node.get("test_metadata") or {}).get("kwargs") or {}
+    names: set[str] = set()
+    if node.get("attached_node") == uid:
+        names |= _names(node.get("column_name"))
+        for key in _TEST_COLUMN_KEYS:
+            names |= _names(kwargs.get(key))
+    parts = uid.split(".")
+    if (
+        len(parts) > 2
+        and uid in ((node.get("depends_on") or {}).get("nodes") or [])
+        and _relation_from(kwargs.get("to")) == parts[2]
+    ):
+        names |= _names(kwargs.get("field"))
+    return names
+
+
+def _argument_columns(node: Mapping[str, Any]) -> set[str]:
+    """The columns a test names in its arguments, beyond the column it sits on.
+
+    The index records these as ``yaml_test_column``; a column test's own
+    ``column_name`` is the column entry it is written under instead.
+    """
+
+    kwargs = (node.get("test_metadata") or {}).get("kwargs") or {}
+    names: set[str] = set()
+    for key in ("combination_of_columns", "compare_columns", "field"):
+        names |= _names(kwargs.get(key))
+    if not node.get("column_name"):
+        names |= _names(kwargs.get("column_name"))
+    return names
+
+
+def _project_tests(
+    manifest: Mapping[str, Any], project: str
+) -> tuple[list[tuple[str, Mapping[str, Any]]], list[tuple[str, Mapping[str, Any]]]]:
+    """This project's test nodes in one compiled branch: enabled, then disabled."""
+
+    enabled = [
+        (uid, node)
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if uid.startswith(f"test.{project}.")
+    ]
+    disabled = []
+    for uid, entries in (manifest.get("disabled") or {}).items():
+        if uid.startswith(f"test.{project}."):
+            for node in entries if isinstance(entries, list) else [entries]:
+                disabled.append((uid, node))
+    return enabled, disabled
+
+
+def _indent(text: str) -> int:
+    """The column a YAML line's content starts at."""
+
+    return len(text) - len(text.lstrip(" -"))
+
+
+def _test_line(content: str, column_line: int, test: str) -> int | None:
+    """The line under a column's YAML entry that invokes ``test``, if any.
+
+    The index places the column's entry, and its tests sit inside it: the first
+    line naming the test before the entry ends is the one dbt reads.
+    """
+
+    lines = content.splitlines()
+    if not 0 < column_line <= len(lines):
+        return None
+    depth = _indent(lines[column_line - 1])
+    pattern = re.compile(rf"(?<!\w){re.escape(test)}(?!\w)")
+    for number in range(column_line - 1, len(lines)):
+        text = lines[number]
+        stripped = text.lstrip()
+        if number >= column_line and stripped and not stripped.startswith("#"):
+            # The next column, or the end of the entry this column sits in.
+            indent = _indent(text)
+            if indent < depth or (indent == depth and stripped.startswith("- ")):
+                return None
+        if pattern.search(text.split("#", 1)[0]):
+            return number + 1
+    return None
+
+
+def governed_readers(
+    index: Any,
+    view: DbtProjectView,
+    off: Branch,
+    producers: Mapping[str, list[str]],
+    *,
+    name: str,
+    variable: str,
+    on_value: Any,
+    off_value: Any,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """The tests and semantic definitions over a producer's governed column.
+
+    ``producers`` are the models that output a governed column with the flag
+    on, exempt ones left out (they keep the column off). The sites come from
+    :meth:`ReferenceIndex.references_to` on ``model.column``, as retirement's
+    ``removed_column_still_read`` does, and each carries its file and line:
+
+    - ``governed_column_tested_when_off``: a test that dbt still runs with the
+      flag off, read from the off branch's manifest, so a test disabled at the
+      off value (``enabled: "{{ var('flag') }}"``) is not reported;
+    - ``governed_column_in_semantic_layer``: a dimension, measure or entity
+      whose column is gone with the flag off, with the metrics drawing on it.
+
+    A reference the index cannot resolve, and a test it names that the manifest
+    holds no node for, are returned as limits rather than dropped.
+    """
+
+    sites: dict[str, list[dict[str, Any]]] = {}
+    limits: list[str] = []
+    if not producers:
+        return sites, limits
+    hits_of: dict[tuple[str, str], list[Any]] = {}
+    for label, columns in sorted(producers.items()):
+        base = label.split(".")[0]
+        for column in sorted(set(columns)):
+            hits, query_limits = index.references_to(f"{base}.{column}", "column")
+            limits.extend(query_limits)
+            hits_of[(label, column)] = [hit for hit in hits if not hit.package]
+
+    if off.failure is None:
+        advice = _enabled_expression(variable, on_value, off_value)
+        _tested_when_off(view, off, hits_of, sites, limits, name, advice, off_value)
+    elif any(
+        hit.form in ("yaml_column", "yaml_test_column")
+        for hits in hits_of.values()
+        for hit in hits
+    ):
+        limits.append(
+            "the tests over governed columns were not judged: the project does "
+            "not compile with the flag off"
+        )
+    _in_semantic_layer(index, view, off, producers, hits_of, sites, limits, name)
+    return sites, limits
+
+
+def _tested_when_off(
+    view: DbtProjectView,
+    off: Branch,
+    hits_of: Mapping[tuple[str, str], list[Any]],
+    sites: dict[str, list[dict[str, Any]]],
+    limits: list[str],
+    project: str,
+    advice: str,
+    off_value: Any,
+) -> None:
+    """Each test still enabled with the flag off over a producer's governed column."""
+
+    enabled, disabled = _project_tests(off.manifest, project)
+    seen: set[str] = set()
+    taken: set[tuple[str, int]] = set()
+    for (label, column), hits in sorted(hits_of.items()):
+        uid = f"model.{project}.{label}"
+        base = label.split(".")[0]
+        reading = [
+            (test_id, node)
+            for test_id, node in enabled
+            if column in _test_columns(node, uid)
+        ]
+        compiled = [
+            node
+            for _test_id, node in (*enabled, *disabled)
+            if column in _test_columns(node, uid)
+        ]
+        for test_id, node in reading:
+            if test_id in seen:
+                continue
+            path = str(node.get("original_file_path") or "")
+            test = str(
+                (node.get("test_metadata") or {}).get("name") or node.get("name")
+            )
+            line = _locate_test(view, hits, path, base, column, node, test, taken)
+            seen.add(test_id)
+            where = f"{path}:{line}" if line else path
+            sites.setdefault(label, []).append(
+                {
+                    "check": "governed_column_tested_when_off",
+                    "detail": (
+                        f"the {test} test at {where} reads '{label}.{column}' and "
+                        f"still runs with the flag off ({off_value!r}), where the "
+                        "column is gone, so the off build fails it. Disable it at "
+                        f'the off value (`enabled: "{advice}"` in its config) or '
+                        "remove it"
+                    ),
+                    "path": path,
+                    "line": line,
+                    "column": column,
+                    "test": test,
+                }
+            )
+        # A test the index places on this column that dbt compiled into no node,
+        # enabled or not, is one this check could not judge. Each site is held
+        # to the nodes of its own file and kind, so one compiled test on the
+        # column does not stand for another written elsewhere.
+        for hit in hits:
+            if hit.owner != base or hit.form not in ("yaml_test_column", "yaml_column"):
+                continue
+            in_file = [
+                node
+                for node in compiled
+                if node.get("original_file_path") == hit.path
+                and (
+                    column in _argument_columns(node)
+                    if hit.form == "yaml_test_column"
+                    else str(node.get("column_name") or "").lower() == column
+                )
+            ]
+            if in_file or (
+                hit.form == "yaml_column"
+                and not _declares_tests(view, hit.path, base, column)
+            ):
+                continue
+            limits.append(
+                f"{hit.path}:{hit.line} names '{label}.{column}' in a test "
+                "that matched no compiled test node, so whether it runs with "
+                "the flag off is unknown"
+            )
+
+
+def _enabled_expression(variable: str, on_value: Any, off_value: Any) -> str:
+    """A test ``enabled`` config that is true at ``on_value`` and false at
+    ``off_value``.
+
+    A bare ``var()`` only works for a boolean flag that is on when true: a
+    ``disable_x`` flag turns the feature on with ``false``, and a string or
+    integer flag renders a value dbt does not read as a boolean. A contract may
+    pair values Jinja holds equal across types (``0`` and ``false``), so the
+    test then also checks the type, never truthiness alone.
+    """
+
+    read = f"var('{variable}')"
+    if isinstance(on_value, bool) and isinstance(off_value, bool):
+        expression = read if on_value else f"not {read}"
+    elif isinstance(on_value, bool):
+        expression = f"{read} is sameas {'true' if on_value else 'false'}"
+    elif isinstance(off_value, bool) and on_value == off_value:
+        expression = f"({read} == {on_value!r} and {read} is not boolean)"
+    else:
+        expression = f"{read} == {on_value!r}"
+    return "{{ " + expression + " }}"
+
+
+def _declares_tests(view: DbtProjectView, path: str, model: str, column: str) -> bool:
+    """Whether the YAML at ``path`` declares a test under ``model.column``."""
+
+    from ..dbt_project import yaml_documents
+    from ..references import _tests_of
+
+    for parsed, where in yaml_documents(view):
+        if where != path:
+            continue
+        for entry in parsed.get("models") or []:
+            if not isinstance(entry, dict) or entry.get("name") != model:
+                continue
+            for item in entry.get("columns") or []:
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("name") or "").lower() == column
+                    and _tests_of(item)
+                ):
+                    return True
+    return False
+
+
+def _locate_test(
+    view: DbtProjectView,
+    hits: list[Any],
+    path: str,
+    base: str,
+    column: str,
+    node: Mapping[str, Any],
+    test: str,
+    taken: set[tuple[str, int]],
+) -> int | None:
+    """The line of one compiled test in its YAML file, from the index's sites."""
+
+    in_file = [hit for hit in hits if hit.path == path]
+    source = view.files.get(path)
+    if str(node.get("column_name") or "").lower() == column and source is not None:
+        for hit in in_file:
+            if hit.form == "yaml_column" and hit.owner == base:
+                line = _test_line(source.content, hit.line, test)
+                if line:
+                    return line
+    # A test naming the column in its arguments: the argument's own line, on
+    # the model the test is declared under (a relationships test sits on the
+    # model that points at this one).
+    attached = str(node.get("attached_node") or "").split(".")
+    owner = attached[2] if len(attached) > 2 else None
+    for hit in in_file:
+        if (
+            hit.form == "yaml_test_column"
+            and hit.owner == owner
+            and (path, hit.line) not in taken
+        ):
+            taken.add((path, hit.line))
+            return int(hit.line)
+    for hit in in_file:
+        if hit.form == "yaml_column" and hit.owner == base:
+            return int(hit.line)
+    return None
+
+
+def _in_semantic_layer(
+    index: Any,
+    view: DbtProjectView,
+    off: Branch,
+    producers: Mapping[str, list[str]],
+    hits_of: Mapping[tuple[str, str], list[Any]],
+    sites: dict[str, list[dict[str, Any]]],
+    limits: list[str],
+    project: str,
+) -> None:
+    """Each semantic definition over a producer's governed column, and the
+    metrics drawing on it; an unresolved semantic expression is a limit."""
+
+    from ..dbt_project import metric_inputs, physical_column, semantic_yaml_entries
+    from ..references import _relation_from
+
+    entries = semantic_yaml_entries(view)
+    feeds: dict[str, set[str]] = {}
+    for kind, entry, _path in entries:
+        if kind == "metric":
+            measures, metrics = metric_inputs(entry)
+            for name in (*measures, *metrics):
+                feeds.setdefault(name, set()).add(str(entry["name"]))
+
+    def metrics_on(measure: str) -> list[str]:
+        """Every metric drawing on ``measure``, through other metrics too."""
+
+        found: set[str] = set()
+        pending = [measure]
+        while pending:
+            for metric in feeds.get(pending.pop(), set()):
+                if metric not in found:
+                    found.add(metric)
+                    pending.append(metric)
+        return sorted(found)
+
+    disabled_off = (
+        set(off.manifest.get("disabled") or {})
+        - set(off.manifest.get("semantic_models") or {})
+        if off.failure is None
+        else set()
+    )
+    roles = (
+        ("dimensions", "dimension"),
+        ("measures", "measure"),
+        ("entities", "entity"),
+    )
+    for label, columns in sorted(producers.items()):
+        base = label.split(".")[0]
+        governed = {c.lower() for c in columns}
+        paths = {
+            hit.path
+            for column in governed
+            for hit in hits_of.get((label, column), [])
+            if hit.form == "semantic_expr" and hit.owner == base
+        }
+        for kind, entry, path in entries:
+            if kind != "semantic_model" or path not in paths:
+                continue
+            if _relation_from(entry.get("model")) != base:
+                continue
+            if f"semantic_model.{project}.{entry['name']}" in disabled_off:
+                continue
+            for role, item_kind in roles:
+                for item in entry.get(role) or []:
+                    column = physical_column(item)
+                    if not column or column.lower() not in governed:
+                        continue
+                    item_name = str(item.get("name"))
+                    line = next(
+                        (
+                            int(hit.line)
+                            for hit in index.references_to(item_name, item_kind)[0]
+                            if hit.path == path
+                            and hit.form
+                            in ("semantic_definition", "semantic_entity_ref")
+                        ),
+                        None,
+                    )
+                    metrics = metrics_on(item_name) if item_kind == "measure" else []
+                    where = f"{path}:{line}" if line else path
+                    sites.setdefault(label, []).append(
+                        {
+                            "check": "governed_column_in_semantic_layer",
+                            "detail": (
+                                f"the {item_kind} '{item_name}' of semantic model "
+                                f"'{entry['name']}' at {where} is defined over "
+                                f"'{label}.{column.lower()}', which is gone with the "
+                                "flag off, so it stops resolving"
+                                + (
+                                    f", and with it the metric(s) {', '.join(metrics)}"
+                                    if metrics
+                                    else ""
+                                )
+                            ),
+                            "path": path,
+                            "line": line,
+                            "column": column.lower(),
+                            "kind": item_kind,
+                            "definition": item_name,
+                            "semantic_model": str(entry["name"]),
+                            "metrics": metrics,
+                        }
+                    )
+        for hit in index.indeterminate_for("column"):
+            if hit.form == "semantic_expr" and hit.owner == base and not hit.package:
+                limits.append(
+                    f"{hit.path}:{hit.line}: the {hit.note or 'expression'} over "
+                    f"'{label}' could not be resolved to a column, so whether it "
+                    "reads a governed column is unknown"
+                )
 
 
 def _report(
