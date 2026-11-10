@@ -67,7 +67,9 @@ Under `semantic.vendor: slayer` the SLayer models are also held to the warehouse
 by SLayer's own `validate-models` rules, run on the metadata Dex captured and
 never through a SLayer datasource: `declared_column_missing`,
 `declared_type_conflict` (SLayer's type buckets: number, string, boolean,
-temporal), `declared_relation_missing` (a table gone since the baseline), and
+temporal, and a list; a column that became a list is `remedy_kind: reingest`
+with the warehouse's `element_type`, and reconcile states it as a `type: ARRAY`
+declaration rather than `slayer ingest`), `declared_relation_missing` (a table gone since the baseline), and
 `declared_dependency_dropped` (a join, measure or filter lost to another drop).
 Each carries the model's whole removal under `data.removal`, which is what
 `maintain reconcile` plans.

@@ -54,6 +54,7 @@ from ..semantic_declarations import (
     sibling_prefix,
     with_population,
 )
+from ..semantic_types import list_element
 
 if TYPE_CHECKING:
     from ..semantic_source import (
@@ -227,6 +228,12 @@ def _build(
         slayer_type, type_note = _column_type(name, fields, declaration)
         if slayer_type:
             column["type"] = slayer_type
+        element_type = _element_type(name, declaration)
+        if element_type:
+            # SLayer requires a list's element type on a table-backed model, and
+            # groups the list by its elements (`name.value`) typed from it.
+            column["type"] = "ARRAY"
+            column["element_type"] = element_type
         if type_note:
             notes.append(type_note)
         if name in grain:
@@ -410,7 +417,24 @@ def _column_type(
     return None, None
 
 
+def _element_type(name: str, declaration: SemanticDeclaration) -> str | None:
+    """A list column's SLayer ``element_type``, or ``None`` for a scalar.
+
+    ``UNKNOWN`` where the element is not a scalar SLayer can type (a list of
+    lists or structs, a Snowflake semi-structured ``ARRAY``): SLayer keeps such
+    a list, but has no element to group by.
+    """
+
+    element = list_element(declaration.data_types.get(name))
+    if element is None:
+        return None
+    return (_slayer_type(element) if element else None) or "UNKNOWN"
+
+
 def _slayer_type(raw: str) -> str | None:
+    if list_element(raw) is not None:
+        return "ARRAY"
+
     lowered = raw.strip().lower()
     if "timestamp" in lowered or "datetime" in lowered:
         return "TIMESTAMP"

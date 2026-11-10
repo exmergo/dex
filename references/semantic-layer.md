@@ -999,6 +999,7 @@ dex's catalog is shaped by MetricFlow, and SLayer is shaped differently:
 |---|---|
 | `SlayerModel` | a semantic model, on the relation `sql_table` names. A model backed by `sql` or `source_queries`, or a `sql_table` that is not fully qualified for the connector, carries no relation and a note says why |
 | `Column` | a dimension, keyed `model.column`, the reference a SLayer query uses. `time` for `DATE` and `TIMESTAMP`, `categorical` otherwise. The `column` is the physical one behind it, and `None` for an expression or a quoted identifier |
+| `Column` of `type: ARRAY` | a list column (SLayer 1.8). Listed, keyed `model.column`, with `data_type: ARRAY`, its `element_type` and `groupable: false` under `vendor_params`, and in no metric's groupable tokens: SLayer refuses to group on a whole list. Its elements are a second dimension, `model.column.value`, typed from `element_type` (`time` for a `DATE` or `TIMESTAMP` element), groupable by every metric of the model, with the same physical `column`. A list whose `element_type` is `UNKNOWN` (a list of lists or structs) has no `.value` row, since SLayer has no element to reach |
 | saved `ModelMeasure` | a metric of type `formula`, named `model.measure`, with the formula under `composition.expr`, the model's filters under `filter`, and every column of its own model as a groupable token |
 | `Column.filter` | part of a metric's `filter` where every aggregation in its formula reads a column carrying that one filter, since a filtered column is where SLayer puts a predicate meant for one metric. A formula that aggregates filtered and unfiltered columns (a ratio over a filtered side) is narrowed in part only, so the column filter is not the metric's. A formula SLayer's parser could not read reports only the model's filters, with a note |
 | `default_time_dimension` | the model's `agg_time_dimension` and each of its metrics' `time_axis`, resolved the way SLayer resolves it (the declared column, else the model's only date or timestamp column) |
@@ -1038,7 +1039,12 @@ the same per-vendor hook that derives a MetricFlow semantic model under
 - a `foreign_key` with `references` is a `many_to_one` join to the SLayer model
   already sitting on the parent's table, and where none does, no join is invented;
 - every declared column is a column, typed from the SQL's casts or the profiled
-  cache, and the first `time` column is the `default_time_dimension`;
+  cache, and the first `time` column is the `default_time_dimension`. A list
+  type (DuckDB and Postgres `VARCHAR[]` and `text[]`, BigQuery `ARRAY<STRING>`,
+  Snowflake `ARRAY` or `ARRAY(VARCHAR)`) is `type: ARRAY` with the
+  `element_type` its element names, `UNKNOWN` where the element is not a scalar
+  (a list of lists or structs, a semi-structured Snowflake `ARRAY`). Redshift's
+  `SUPER` is a document, not a list, and is not typed;
 - a declared aggregation is a saved measure `<column>_<agg>` (formula
   `<column>:<agg>`); a `semi_additive` measure is left to the author, since SLayer's
   `last` is not a total across entities on the last period;
@@ -1099,6 +1105,17 @@ the safety contract:
    defined by `sql` through every column that expression reads, with the name
    heuristic as the floor. A result names each column that only the heuristic
    screened. A clause dex cannot read is refused rather than screened by half.
+   A list column's elements (`tags.value`, grouped or filtered) are screened as
+   the list column they read: the profile's flag on it, its confidence and any
+   `pii_overrides` entry decide, the heuristic floor reads the list column's
+   name, and a refusal names `model.tags.value`, never the element model SLayer
+   resolves it to. `explore profile` flags a list from its element's type, so
+   `email VARCHAR[]` and BigQuery's repeated `ARRAY<STRING>` are flagged as a
+   string column of that name would be. A saved measure that answers with a column's
+   values rather than a number about it (`min`, `max`, `first`, `last`, `collect`,
+   or the model's own custom aggregation) has the columns it aggregates screened
+   as grouped columns, so `collect(email.value)` is refused where grouping by
+   `email.value` would be; a formula dex cannot read refuses the query.
 2. **The grain check**, then **translation** into a SLayer query, which refuses
    whatever this release does not map (below).
 3. **A dry-run render**, in the dialect of dex's own connector. A SLayer resolution
@@ -1119,6 +1136,16 @@ What a query can say, in this release:
 - **`--group-by` takes the root model's own columns**, `model.column`, which is what
   the catalog reports as groupable (`dimension_scope: declarations`). A column on a
   joined model is refused by name, even where the layer declares the join.
+- **A list column groups by its elements**, `model.column.value` (SLayer 1.8's
+  `type: ARRAY`): one row per element, NULL elements left out. dex sends the
+  query with SLayer's `to_many_handling: associate`, so each element row counts
+  the parents holding that element once, and a result note says the rows overlap
+  and do not sum to the metric's total. SLayer's default, `broadcast`, would
+  repeat the metric's whole total on every element row. A parent with an empty
+  or NULL list is in no row. Grouping by the whole list (`model.column`), or
+  reading its values, is refused before anything renders, naming the `.value`
+  token. Redshift has no native lists, so there a list column in a grouping, a
+  filter or `values` is refused by name.
 - **`--grain` buckets the model's `default_time_dimension`** at one of SLayer's
   built-in granularities: `second`, `minute`, `hour`, `day`, `week`,
   `week_sunday`, `month`, `quarter`, `year`. A datasource's custom grain is not
@@ -1127,7 +1154,10 @@ What a query can say, in this release:
 - **`--where` is SLayer's filter syntax**, passed to SLayer verbatim once the gate
   has read it. A clause carrying `{variable}` syntax is refused, because SLayer
   fills a placeholder from the model's declared defaults after the gate has
-  screened the clause; write the value in.
+  screened the clause; write the value in. List membership reads like any
+  other clause: `contains(tags, 'dbt')`, `contains_any(tags, ['dbt', 'sql'])`,
+  `contains_all(tags, ['dbt', 'sql'])` and `tags.value = 'dbt'` are screened as
+  the `tags` column and run.
 - **`--order-by`** (`-token` for descending) names one of the query's own metrics or
   grouped columns. Anything else would reach a column the gate never screened.
 - **Result columns are named `model.column`** on every connector. BigQuery rejects
@@ -1151,7 +1181,9 @@ model, so `scoped_to` is empty and the model's own filters still apply: the doma
 is the column's values among the rows the model keeps. `--metric` roots it at that
 metric's model instead, the dimension must be one the metric groups by, and
 `scoped_to` names the metric. A grain suffix (`orders.ordered_at__month`) buckets a
-time dimension and is refused on a categorical one. There is no escalation to a
+time dimension and is refused on a categorical one. A list's elements are a
+dimension of their own (`posts.tags.value`, `posts.posted_on.value__month`), and
+the whole list is refused, naming that token. There is no escalation to a
 metric: a SLayer dimension is a column of its own model, so the unscoped form
 always answers. SLayer's own value profiling (`update_column_sampled`, the samples
 it caches in a model file) is never reached.
@@ -1211,8 +1243,8 @@ reads the model files and the metadata dex captured through its own connection.
   SLayer's pure entry points (`diff_sql_table_model`, `compute_datasource_drops`),
   on the columns and types dex's own metadata reports. A declared column the
   table no longer has is `declared_column_missing`; one whose declared type is in
-  another of SLayer's buckets (number, string, boolean, temporal) than the
-  warehouse's is `declared_type_conflict`; a model whose table was in the
+  another of SLayer's buckets (number, string, boolean, temporal, and a list,
+  `ARRAY`) than the warehouse's is `declared_type_conflict`; a model whose table was in the
   baseline and is gone is `declared_relation_missing`; and a model that loses a
   join, measure or filter only because another drop cascaded into it is
   `declared_dependency_dropped`. Each of those carries the model's whole removal
@@ -1224,7 +1256,13 @@ reads the model files and the metadata dex captured through its own connection.
   now TEXT), so the finding also lists `breaks_measures`, each saved measure the
   proposed type cannot aggregate, and the remedy says they have to go or change;
   `semantic slayer update` refuses the type change while one remains. A
-  warehouse type dex cannot place in a bucket is never
+  column the warehouse now holds as a list (`VARCHAR[]`, `ARRAY<STRING>`, a
+  Snowflake `ARRAY`) is SLayer's re-ingest case, `remedy_kind: reingest`, and the
+  finding also carries the `element_type` the warehouse names; a list counts
+  only, so a measure summing or distinct-counting it is in `breaks_measures`. The
+  element type itself is not compared: a list of text that became a list of
+  integers is not a finding, as it is not in SLayer. A warehouse type dex cannot
+  place in a bucket is never
   reported as a conflict, a column matches case-insensitively when exactly one
   does, and a model backed by `sql` or `source_queries` is named as not compared,
   because SLayer checks those by running the query.
@@ -1238,7 +1276,11 @@ reads the model files and the metadata dex captured through its own connection.
   removed: deleting the file is advisory, because a vanished table is as often a
   rename as a retirement. A type conflict is advisory and cuts nothing: it names
   SLayer's remedy (change the declared type with `semantic slayer update`), or
-  restoring the warehouse type if the change was not intended.
+  restoring the warehouse type if the change was not intended. For a column that
+  became a list, SLayer's remedy is `slayer ingest`, which would rewrite a file
+  dex owns, so the proposal states the declaration it leads to instead
+  (`type: ARRAY` with its `element_type`, grouped by `column.value`) and names
+  the measures to remove.
 
 ### Authoring SLayer models
 

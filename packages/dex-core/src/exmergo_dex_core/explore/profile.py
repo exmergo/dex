@@ -38,6 +38,7 @@ from ..cache import (
 from ..config import PIIOverrideMatcher
 from ..errors import WarehouseQueryError
 from ..progress import ProgressReporter
+from ..semantic_types import list_element
 
 # approx_count_distinct error observed in practice reaches ~14% in both
 # directions at tens of thousands of rows (27,044 approx on 26,599 unique;
@@ -490,6 +491,15 @@ def classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool
     """
 
     name = _normalize(column_name)
+    # A list holds values of its element type, and each element is as personal
+    # as a scalar of that type: `email VARCHAR[]` and BigQuery's repeated
+    # `ARRAY<STRING>` are lists of addresses. So the type gates below read the
+    # element's type. A list whose element cannot be typed (a bare Snowflake
+    # `ARRAY`, a list of structs) is read as text, failing closed: its elements
+    # can hold a string.
+    element = list_element(data_type)
+    if element is not None:
+        data_type = element or "VARCHAR"
     for pattern, category, confidence in _PII_PATTERNS:
         if pattern.search(name):
             # A type-forbidden or derived-statistic match continues past this

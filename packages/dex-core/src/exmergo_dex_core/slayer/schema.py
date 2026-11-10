@@ -63,7 +63,7 @@ from slayer.engine.schema_drift import (
 
 from ..cache import match_identifier
 from ..maintain.drift import DriftFinding
-from ..semantic_types import NUMERIC, TEXT, UNPLACEABLE
+from ..semantic_types import NUMERIC, TEXT, UNPLACEABLE, list_element
 from ..semantic_types import spelled as spelled_type
 from . import catalog as catalog_mod
 
@@ -78,11 +78,17 @@ def data_type(raw: str | None) -> DataType | None:
     """SLayer's type for a connector's spelling of one, or ``None``.
 
     Only where the spelling says it plainly, matching what SLayer's own
-    introspection maps it to. ``None`` is "cannot tell", never "opaque": an
-    opaque live type conflicts with any operable declared one under SLayer's
-    rule, and a guess would turn every unfamiliar spelling into a finding.
+    introspection maps it to: a list spelling (``VARCHAR[]``, ``ARRAY<STRING>``,
+    a bare Snowflake ``ARRAY``) is ``ARRAY``. ``None`` is "cannot tell", never
+    "opaque": an opaque live type conflicts with any operable declared one under
+    SLayer's rule, and a guess would turn every unfamiliar spelling into a finding.
     """
 
+    # A list of anything is SLayer's ARRAY (1.8+), whatever its element: SLayer
+    # buckets ARRAY apart from every scalar, so a column that became a list is a
+    # re-type it re-ingests, and the element type is not part of that rule.
+    if list_element(raw) is not None:
+        return DataType.ARRAY
     spelled = spelled_type(raw)
     if not spelled or spelled.endswith("[]") or spelled.startswith(UNPLACEABLE):
         return None
@@ -356,7 +362,8 @@ def _retype_finding(
         named = ", ".join(f"{b['measure']} ({b['aggregation']})" for b in broken)
         remedy = (
             f"{remedy}, and remove or rewrite the measure(s) that cannot "
-            f"aggregate a {retype.live_type.value} column: {named}"
+            f"aggregate {'an' if retype.live_type.value[0] in 'AEIOU' else 'a'} "
+            f"{retype.live_type.value} column: {named}"
         )
     elif broken is None:
         remedy = (
@@ -375,6 +382,13 @@ def _retype_finding(
         "remedy": remedy,
         "breaks_measures": broken,
     }
+    if retype.live_type is DataType.ARRAY:
+        # The element type the warehouse names, which the declaration needs
+        # beside `type: ARRAY` on a table-backed model (UNKNOWN where it is not
+        # a scalar SLayer can type).
+        element = list_element(live_type)
+        typed = data_type(element) if element else None
+        data["element_type"] = typed.value if typed is not None else "UNKNOWN"
     return DriftFinding(
         axis="schema",
         code="declared_type_conflict",

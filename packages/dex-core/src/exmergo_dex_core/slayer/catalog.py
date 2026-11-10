@@ -74,9 +74,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DECLARATION_SOURCE",
+    "LIST_TYPE",
     "METRIC_TYPE",
     "definitions",
     "dimension_token",
+    "list_column_of",
+    "list_element_token",
     "semantic_catalog",
 ]
 
@@ -93,6 +96,36 @@ _TEMPORAL = frozenset({"DATE", "TIMESTAMP"})
 
 # One unquoted identifier part, the shape `parse_relation` accepts.
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+
+#: SLayer's list type (1.8+): a column whose cells are lists of `element_type`.
+LIST_TYPE = "ARRAY"
+
+#: The element of a list column, as SLayer spells it: `tags.value`.
+LIST_ELEMENT = "value"
+
+# Element types SLayer cannot reach as a child (`DataType.is_opaque`): a list of
+# these has no `.value` to group by.
+_OPAQUE_ELEMENTS = frozenset({"UNKNOWN"})
+
+
+def list_element_token(token: str) -> str:
+    """The token a list column's elements group by: ``posts.tags.value``."""
+
+    return f"{token}.{LIST_ELEMENT}"
+
+
+def list_column_of(token: str) -> str | None:
+    """The list column token behind an element token, or ``None``.
+
+    ``posts.tags.value`` is ``posts.tags``; anything not ending in ``.value`` is
+    not an element token.
+    """
+
+    suffix = f".{LIST_ELEMENT}"
+    if token.endswith(suffix) and token.count(".") >= 2:
+        return token[: -len(suffix)]
+    return None
 
 
 def dimension_token(model: str, column: str) -> str:
@@ -147,7 +180,12 @@ def semantic_catalog(
             if gate_relation and gate_column is None:
                 computed.append(col.name)
             token = dimension_token(model.name, col.name)
-            tokens.append(token)
+            is_list = _type(col) == LIST_TYPE
+            if not is_list:
+                # A list column is listed but groups nothing: SLayer refuses to
+                # group on a whole list, and its elements are what a query
+                # groups by, through the `.value` row added below.
+                tokens.append(token)
             is_time = _type(col) in _TEMPORAL
             dimensions.append(
                 DimensionInfo(
@@ -165,12 +203,25 @@ def semantic_catalog(
                     vendor_params=_column_params(col),
                 )
             )
-            if gate_column and gate_relation:
-                physical[token] = (gate_relation, gate_column)
-            elif gate_relation and isinstance(col.sql, str) and col.sql.strip():
-                # Not a column to name, but an expression the gate can read: it
-                # screens every column the expression reads instead of the name.
-                computed_columns[token] = (gate_relation, col.sql)
+            element = (
+                list_element_token(token)
+                if is_list and _element_type(col) not in _OPAQUE_ELEMENTS
+                else None
+            )
+            if is_list and element is not None:
+                dimensions.append(_element_dimension(model.name, col, element, column))
+                tokens.append(element)
+            # The element token reads the list column's values, so it is
+            # screened as that column: its profiled flag, confidence and any
+            # override apply, never a name heuristic on the token.
+            gated = (token, element) if element else (token,)
+            for key in gated:
+                if gate_column and gate_relation:
+                    physical[key] = (gate_relation, gate_column)
+                elif gate_relation and isinstance(col.sql, str) and col.sql.strip():
+                    # Not a column to name, but an expression the gate can read:
+                    # it screens every column the expression reads instead.
+                    computed_columns[key] = (gate_relation, col.sql)
         if computed:
             one = len(computed) == 1
             found.append(
@@ -237,6 +288,35 @@ def _metric(
         time_axis=[time_dimension] if time_dimension else None,
         vendor_params=_measure_params(measure),
     )
+
+
+def _element_dimension(
+    model: str, col: Any, element: str, column: str | None
+) -> DimensionInfo:
+    """The groupable row for a list column's elements, typed from ``element_type``.
+
+    One row per element, NULL elements excluded (SLayer's element child), so a
+    query grouped by it counts a parent once under each element it holds.
+    """
+
+    element_type = _element_type(col)
+    is_time = element_type in _TEMPORAL
+    return DimensionInfo(
+        name=element,
+        type="time" if is_time else "categorical",
+        label=col.label,
+        description=col.description,
+        definition=f"{col.name}.{LIST_ELEMENT}",
+        semantic_model=model,
+        queryable_granularities=None if is_time else [],
+        column=column,
+        vendor_params={"data_type": element_type, "element_of": col.name},
+    )
+
+
+def _element_type(col: Any) -> str:
+    element = getattr(col, "element_type", None)
+    return str(getattr(element, "value", element)) if element is not None else "UNKNOWN"
 
 
 def physical_column(col: Any, connector: str | None = None) -> str | None:
@@ -388,6 +468,13 @@ def _column_params(col: Any) -> dict[str, Any] | None:
     """
 
     params: dict[str, Any] = {"data_type": _type(col)}
+    if _type(col) == LIST_TYPE:
+        params["element_type"] = _element_type(col)
+        # Listed so a reader sees the column, never groupable: SLayer groups a
+        # list by its elements, the `.value` token, and refuses the whole list.
+        params["groupable"] = False
+        if _element_type(col) not in _OPAQUE_ELEMENTS:
+            params["group_by"] = f"{col.name}.{LIST_ELEMENT}"
     if col.sql is not None:
         params["sql"] = col.sql
     if col.db_type:

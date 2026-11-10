@@ -150,6 +150,55 @@ class LoadedModel:
         return None if refs is None else [ref.measure_name for ref in refs]
 
 
+#: SLayer's built-in aggregations whose result is one of their input's values
+#: (`min`, `max`, `first`, `last`) or all of them (`collect`, a list). A model's
+#: own custom aggregation is read as one too, since dex cannot say what its SQL
+#: returns.
+VALUE_AGGREGATIONS: frozenset[str] = frozenset(
+    {"min", "max", "first", "last", "collect"}
+)
+
+
+def value_aggregated_columns(loaded: LoadedModel, measure: Any) -> list[str] | None:
+    """The column references a saved measure returns values of, as written.
+
+    A count or a sum answers a number about a column; ``max(email)`` or
+    ``collect(email.value)`` answers with the column's own values, which is
+    what the PII gate screens. So the references aggregated by a value-returning
+    aggregation are returned, for the caller to resolve and screen as it would a
+    grouped column (``email``, ``tags.value``, ``customers.email``). ``*`` reads
+    no column. ``None`` means the formula was not read, which is unscreened
+    rather than clean.
+    """
+
+    if find_spec("sqlglot") is None:
+        return None
+    from slayer.core.enums import normalize_aggregation_name
+    from slayer.core.formula import parse_formula
+
+    model = loaded.model
+    custom = frozenset(a.name for a in model.aggregations)
+    named = {
+        m.name: m.formula for m in model.measures if m.name and m.name != measure.name
+    }
+    try:
+        spec = parse_formula(
+            measure.formula, extra_agg_names=custom, named_measures=named
+        )
+    except (ValueError, RecursionError):
+        return None
+    refs = _aggregated_refs(spec)
+    if refs is None:
+        return None
+    found: list[str] = []
+    for ref in refs:
+        written = ref.aggregation_name
+        agg = written if written in custom else normalize_aggregation_name(written)
+        if (agg in VALUE_AGGREGATIONS or agg in custom) and ref.measure_name != "*":
+            found.append(ref.measure_name)
+    return found
+
+
 def _aggregated_refs(spec: Any) -> list[Any] | None:
     """Every aggregated reference in a parsed formula, or ``None`` for a shape
     this release does not know, which is unread rather than empty."""
