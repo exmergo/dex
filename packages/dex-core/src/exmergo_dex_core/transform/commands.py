@@ -839,14 +839,14 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
     if cache is not None:
         cache = mask_overridden(cache, pii_override_paths(engine.config.pii_overrides))
     manifest = getattr(view, "manifest", None)
-    manifest_stale = False
+    manifest_stale = True
     if manifest is not None:
         try:
             from ..dbt_project import manifest_freshness
 
-            manifest_stale = manifest_freshness(view).get("stale") is True
+            manifest_stale = manifest_freshness(view).get("stale") is not False
         except Exception:
-            manifest_stale = False
+            manifest_stale = True
     return {
         "cache": cache,
         "dialect": get_dialect(engine.connector or engine.config.connector),
