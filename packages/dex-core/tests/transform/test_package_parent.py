@@ -299,6 +299,46 @@ def test_a_custom_packages_install_path_is_followed(tmp_path):
     assert found.path.startswith("vendor_packages/tiny_inbox/")
 
 
+def test_package_target_reads_schema_from_package_or_project(tmp_path):
+    """#1199: find_package_target reads the custom schema for package models."""
+
+    pkg_dbt = (
+        "name: tiny_inbox\nversion: '1.0'\nconfig-version: 2\n"
+        "model-paths: [models]\nmodels:\n  tiny_inbox:\n    +schema: inbox\n"
+    )
+    root = _project(
+        tmp_path / "p",
+        extra={"dbt_packages/tiny_inbox/dbt_project.yml": pkg_dbt},
+    )
+    found = find_package_target(
+        root,
+        "stg_inbox__conversations",
+        project_yml=(root / "dbt_project.yml").read_text(),
+    )
+    assert found is not None
+    assert found.schema == "inbox"
+
+    override_yml = (
+        root / "dbt_project.yml"
+    ).read_text() + "models:\n  tiny_inbox:\n    +schema: custom_inbox\n"
+    overridden = find_package_target(
+        root,
+        "stg_inbox__conversations",
+        project_yml=override_yml,
+    )
+    assert overridden is not None
+    assert overridden.schema == "custom_inbox"
+
+
+def test_sql_schema_does_not_match_other_config_keys_ending_in_schema():
+    """#1199: _sql_schema requires a word boundary before schema."""
+
+    from exmergo_dex_core.transform.package_targets import _sql_schema
+
+    assert _sql_schema("{{ config(some_schema='ignored', schema='real') }}") == "real"
+    assert _sql_schema("{{ config(some_schema='ignored') }}") is None
+
+
 def test_a_source_is_still_refused_and_says_so(tmp_path):
     """A source table is not a parent."""
     root = _project(tmp_path / "p")
