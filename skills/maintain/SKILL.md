@@ -120,10 +120,23 @@ the project edits, migrations and dev builds described below.
    `equivalent` verdict) and an `incremental_replay` entry that is not
    `satisfied` (no passing unit test ran the `is_incremental()` branch) are
    unfinished work, not a passing build.
+   A model that declares no parent is measured against the one Dex drafts for
+   it (`data.declarations.<model>.drafted.population_parent` on the plan): each
+   `population_delta` record counts its orphan keys, missing parents and rows
+   with no child. `needs_decision` (listed under
+   `data.completion.obligations.needs_decision`) asks which rows the model is
+   for: declare `population.parent`, or record the population as an assumption
+   naming the key `column` at `request`, `contract` or `precedent` tier.
    Output keys the parent lacks are never the population: drive the model from
    the parent instead. Check the rows the request is about with an aggregate
    over the built model, `dex explore query --target dev "<SELECT ...>"`, which
-   reads the dev namespace for that one command.
+   reads the dev namespace for that one command. Observed counts describe the
+   data; they do not establish the intended population or NULL policy. NULL or
+   zero aggregates on a model driven from its parent point at the join key (its
+   type, its spelling, the relation it reads): investigate the join, and do not
+   re-drive the model from the child table. A change of driving relation or
+   parent is `redriven` in `data.change_scope`, settled only at `request` or
+   `contract` tier.
 6. **Maintain.** `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
@@ -142,8 +155,8 @@ implementation detail. Weigh evidence in this order, and never present a
    settle.
 3. `precedent`: how sibling models decide the same thing
    (`dex transform references <model.column> --usage`).
-4. `data`: what profiling showed about the data. Observed counts describe the
-   data; they do not establish the intended population or NULL policy.
+4. `data`: what profiling showed about the data (see step 5: counts never
+   establish the intended population).
 5. `default`: the conventional analytics-engineering choice.
 
 Name `request` or `contract` only when that source actually settles the choice;

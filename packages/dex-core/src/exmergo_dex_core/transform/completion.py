@@ -90,6 +90,7 @@ _RECORD_KINDS = (
     "join_coverage",
     "parent_population",
     "temporal_contracts",
+    "population_delta",
     "retirement",
     "toggle",
     "model_versions",
@@ -264,6 +265,10 @@ class Obligations(BaseModel):
     by_status: dict[str, int] = Field(default_factory=dict)
     contradicted: list[Obligation] = Field(default_factory=list)
     unchecked: list[Obligation] = Field(default_factory=list)
+    #: Populations measured against a drafted parent whose counts ask which
+    #: rows the model is for, with no assumption recording the answer (#1228):
+    #: orphan keys, missing parents, or parents kept with no children.
+    needs_decision: list[Obligation] | None = None
     no_declared_columns: NameList = Field(default_factory=NameList)
     #: Required models whose declared population is a sentence: nothing can run
     #: it, as distinct from a parent or filter a record above measured (#1029).
@@ -690,6 +695,7 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
     by_status: Counter[str] = Counter()
     contradicted: list[Obligation] = []
     unchecked: list[Obligation] = []
+    needs_decision: list[Obligation] = []
     for kind in _RECORD_KINDS:
         for record in verification.get(kind) or []:
             status = str(record.get("status") or "unknown")
@@ -703,6 +709,8 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
             )
             if status == "contradicted":
                 contradicted.append(entry)
+            elif status == "needs_decision":
+                needs_decision.append(entry)
             elif status == "unchecked":
                 unchecked.append(entry)
     contract = verification.get("column_contract") or {}
@@ -721,6 +729,7 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
         by_status=dict(sorted(by_status.items())),
         contradicted=contradicted,
         unchecked=unchecked,
+        needs_decision=needs_decision or None,
         no_declared_columns=_names(contract.get("no_declared_columns") or []),
     )
 
@@ -1198,6 +1207,9 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     cap_list(completion.obligations, "contradicted", _NAMES, "obligations.contradicted")
     cap_list(completion.obligations, "unchecked", _NAMES, "obligations.unchecked")
     cap_list(
+        completion.obligations, "needs_decision", _NAMES, "obligations.needs_decision"
+    )
+    cap_list(
         completion.obligations,
         "identifier_conversions",
         _NAMES,
@@ -1231,6 +1243,12 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             completion.obligations, "contradicted", keep, "obligations.contradicted"
         )
         cap_list(completion.obligations, "unchecked", keep, "obligations.unchecked")
+        cap_list(
+            completion.obligations,
+            "needs_decision",
+            max(keep, 1),
+            "obligations.needs_decision",
+        )
         cap_list(
             completion.obligations,
             "identifier_conversions",
@@ -1285,6 +1303,7 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     # count kept under `elided`, since a block over budget is cut by the reader
     # where nothing counts it.
     for listed in (
+        "needs_decision",
         "identifier_conversions",
         "change_scope",
         "incremental_replay",

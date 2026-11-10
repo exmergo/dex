@@ -622,6 +622,19 @@ class ReferenceIndex:
             for reference in self._declared.get((kind, name), ())
         )
 
+    def defined_nodes(self) -> list[str]:
+        """Every model, seed and snapshot name the project or an installed
+        package defines, sorted. A package node the project shadows is one
+        name, as it is one node dbt builds."""
+
+        names = set(self._node_kinds)
+        for kind, name in list(self._by_name) + list(self._declared):
+            if kind in ("model", "seed", "snapshot") and self.declarations_of(
+                name, (kind,)
+            ):
+                names.add(name)
+        return sorted(names)
+
     def package_node_kind(self, node: str) -> tuple[str, str] | None:
         """``(kind, package)`` for a node only an installed package defines.
 

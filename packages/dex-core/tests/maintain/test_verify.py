@@ -325,6 +325,22 @@ def test_a_column_with_no_declared_type_maps_to_none(tmp_path: Path):
     assert declared["a"] == {"id": None}
 
 
+def test_package_entry_is_identified_for_override_node(tmp_path: Path):
+    """A manifest node patched by a package YAML records package_entries (#1205)."""
+    node = _node_with_columns("pkg_task", {"id": "INTEGER"})
+    node["package_name"] = "p"
+    node["patch_path"] = "tiny_pkg://models/pkg_task.yml"
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.pkg_task": node},
+        results=[],
+    )
+    plan = column_contract_plan(tmp_path)
+    assert plan.package_entries == {
+        "pkg_task": "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    }
+
+
 def test_a_missing_declared_column_is_reported_high_severity():
     findings, notes = column_contract_findings(
         _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
@@ -356,6 +372,36 @@ def test_an_undeclared_column_is_reported_low_severity():
     assert finding.code == "column_undeclared"
     assert finding.severity == "low"
     assert "extra" in finding.detail
+    assert "schema.yml" in finding.detail
+    assert "the project cannot declare the override" not in finding.detail
+    assert finding.data == {"model": "a", "columns": ["extra"]}
+
+
+def test_an_undeclared_column_on_package_override_names_entry_and_refuses():
+    """An override of a package-documented model names the package's YAML entry
+    and states that the project cannot declare the override (#1205)."""
+    pkg_entry = "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER"), ("extra", "VARCHAR")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+        package_entries={"a": pkg_entry},
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_undeclared"
+    assert finding.severity == "low"
+    assert "extra" in finding.detail
+    assert pkg_entry in finding.detail
+    assert "the project cannot declare the override" in finding.detail
+    assert "schema.yml" not in finding.detail
+    assert finding.data == {
+        "model": "a",
+        "columns": ["extra"],
+        "package_entry": pkg_entry,
+    }
 
 
 def test_a_declared_type_that_disagrees_is_a_medium_severity_mismatch():
