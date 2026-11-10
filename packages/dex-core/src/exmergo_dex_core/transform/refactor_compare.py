@@ -929,7 +929,9 @@ def repair_first(blocked: Sequence[BlockedInput]) -> str:
         failed = sorted(
             {b.model for b in blocked if b.package and b.status != "skipped"}
         )
-        drafts = " and ".join(f"`dex transform repair {m}`" for m in failed)
+        # One call names every failed package model: the overrides share
+        # dbt_project.yml, so separate plans would conflict on apply (#1229).
+        drafts = f"`dex transform repair {' '.join(failed)}`" if failed else ""
         build = (
             "`transform build --target dev --cold-deps --for-plan <repair plan>`, "
             + ", ".join(owned)

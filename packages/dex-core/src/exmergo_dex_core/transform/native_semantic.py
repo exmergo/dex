@@ -309,9 +309,9 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
                 for b in m.get("blocked_inputs") or []
             }
         )
-        drafts = sorted(
+        failed_packages = sorted(
             {
-                b["repair"]
+                b["model"]
                 for m in offer["per_model"]
                 for b in m.get("blocked_inputs") or []
                 if b.get("repair")
@@ -319,10 +319,11 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
         )
         if blocked and not offer.get("mixed_with_repair"):
             # The comparison cannot run until its baseline builds (#1114); a
-            # failed package model's repair is drafted by a command (#1229).
+            # failed package model's repair is drafted by one command naming
+            # every such model, since the overrides share dbt_project.yml (#1229).
             how = (
-                " (" + " and ".join(f"`{d}`" for d in drafts) + " drafts it)"
-                if drafts
+                f" (`dex transform repair {' '.join(failed_packages)}` drafts it)"
+                if failed_packages
                 else ""
             )
             step = (

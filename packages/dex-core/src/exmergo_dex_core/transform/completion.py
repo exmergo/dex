@@ -1139,9 +1139,15 @@ def _repair_obligations(
     else:
         out.append(obligation("repair_row_count", "satisfied"))
 
-    if repair.get("status") != "resolved":
+    # An `unbound` draft is checked by the build itself: once the override
+    # builds, its types bound; until then the conversion stays open.
+    if repair.get("status") == "unresolved" or (
+        repair.get("status") == "unbound" and status not in _PASSED
+    ):
         out.append(
-            obligation("repair_conversion", "unchecked", reason_code="unresolved")
+            obligation(
+                "repair_conversion", "unchecked", reason_code=str(repair["status"])
+            )
         )
     return out
 

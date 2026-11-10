@@ -1123,17 +1123,23 @@ def finish(drafted: Draft) -> dict[str, Any]:
             f"the drafted {drafted.name} still does not bind on the dev target: "
             + str(drafted.bind_check.get("detail") or "")
         )
-    settled = (
-        bool(resolved)
-        and not unresolved
-        and not unrecognized
-        and drafted.bind_check.get("status") != "failed"
+    converted = bool(resolved) and not unresolved and not unrecognized
+    bound = drafted.bind_check.get("status")
+    # `resolved` is converted *and* bound on dev. Converted with no bind (dbt
+    # absent, no connection, or a connector with no free, row-free check) is
+    # `unbound`: nothing has checked the draft's types.
+    status = (
+        "resolved"
+        if converted and bound == "bound"
+        else "unbound"
+        if converted and bound != "failed"
+        else "unresolved"
     )
     drafted.record = {
         "node": drafted.name,
         "package": drafted.package,
         "unique_id": drafted.unique_id,
-        "status": "resolved" if settled else "unresolved",
+        "status": status,
         "override": {"path": drafted.override_path, "disables": drafted.disabled_at},
         "errors": drafted.errors,
         "conversions": [c.record() for c in drafted.conversions],

@@ -430,14 +430,14 @@ It then compiles the draft and binds it on dev reading no row (DuckDB
 `limit 0`, BigQuery's free dry run). A bind that reveals another typing error is
 one more failure to convert, up to four, as successive builds would reveal them.
 
-`data.repair` leads the payload after the plan id: `status` (`resolved` only
-when every node is), `plan_id`, `compiled` (whether dbt compiled the drafts),
+`data.repair` leads the payload after the plan id: `status` (`unresolved` if any
+node is, else `unbound` if any node is, else `resolved`), `plan_id`, `compiled` (whether dbt compiled the drafts),
 `next`, and `nodes[]`, one record per model:
 
 | `nodes[]` field | What it says |
 |---|---|
 | `node`, `package`, `unique_id` | the package model the override replaces |
-| `status` | `resolved` when every failure read was converted and the draft binds; otherwise `unresolved` |
+| `status` | `resolved` when every failure read was converted and the draft binds on dev; `unbound` when every failure was converted but nothing could bind it (dbt absent, no connection, or a connector with no free, row-free check: `bind_check.reason` says which), so the build is the first check of its types; otherwise `unresolved` |
 | `errors[]` | each failure read: `source` (`build` or `bind_check`), `function`, `types`, `offending_type`, `target_type`, or `recognized: false` |
 | `conversions[]` | per column: `call`, `relation`, `from_type`, `to_type`, `kind`, `expression`, `meaning_changing`, `evidence` (`data`), `detail`, `sites`; or `status: unresolved` with `reason_code` and, where a profile would settle it, `next` |
 | `bind_check` | `bound`, `failed` (with the masked `detail`), or `not_checked` with the `reason` |
@@ -472,8 +472,8 @@ After `transform apply`, build it with
 `repair_tests` (the package's own tests, which dbt runs on the override),
 `repair_cold_deps` (only a `--cold-deps` build that lost no installed edit
 satisfies it), `repair_row_count` (no `row_loss` or `row_fanout` on the
-override, whose draft moves no rows) and, while a conversion is unresolved,
-`repair_conversion`. A model whose every check holds is one
+override, whose draft moves no rows) and `repair_conversion` while a conversion
+is unresolved, or while an `unbound` draft has not built. A model whose every check holds is one
 `{"kind": "repair", "status": "satisfied"}` entry; an open one lists only the
 checks that are open, so the bounded block names every repaired model.
 Recipe: `prerequisite-repairs.md`.

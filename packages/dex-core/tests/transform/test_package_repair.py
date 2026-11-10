@@ -537,6 +537,13 @@ def test_the_refactor_offer_names_the_repair_command_not_a_key_plans_lack():
     )
     assert "`dex transform repair stg_task`" in text
     assert "dex transform repair int_x" not in text
+    text = repair_first(
+        [
+            BlockedInput("stg_task", "error", "pkg"),
+            BlockedInput("stg_note", "error", "pkg"),
+        ]
+    )
+    assert "`dex transform repair stg_note stg_task` drafts" in text
     assert "data.prerequisites" not in text
 
 
@@ -647,6 +654,20 @@ def test_the_plan_hint_names_the_command_that_drafts_a_blocked_repair():
     step = plan_hint(result)["next"]
     assert "(`dex transform repair stg_task` drafts it)" in step
     assert step.startswith("the baseline does not build (int_x, stg_task)")
+
+    # Two failed package models: one call, since the overrides share
+    # dbt_project.yml and separate plans would conflict on apply.
+    result.refactor_comparison_offer["per_model"][0]["blocked_inputs"].append(
+        {
+            "model": "stg_note",
+            "status": "error",
+            "owner": "package",
+            "package": "pkg",
+            "repair": "dex transform repair stg_note",
+        }
+    )
+    step = plan_hint(result)["next"]
+    assert "(`dex transform repair stg_note stg_task` drafts it)" in step
 
 
 def test_a_column_list_macro_inside_a_cte_passes_the_static_check():
@@ -767,3 +788,44 @@ def test_a_later_pass_never_reads_a_written_conversion_as_a_new_site():
     assert drafted.body.count("legacy_ts") == 1
     assert "cast(cast(legacy_ts as string) as timestamp)" in drafted.body
     assert "timestamp_seconds(cast(due_epoch as int64))" in drafted.body
+
+
+def _converted_draft(bind: dict) -> repair.Draft:
+    drafted = repair.Draft(
+        name="stg",
+        package="pkg",
+        unique_id="model.pkg.stg",
+        override_path="models/overrides/stg.sql",
+        body="select 1",
+        project_yml="",
+        disabled_at="models.pkg.stg.+enabled",
+        restated={},
+        errors=[{"recognized": True, "source": "build"}],
+        conversions=[
+            repair.Conversion(column="c", status="resolved", kind="null_cast")
+        ],
+    )
+    drafted.bind_check = bind
+    return drafted
+
+
+@pytest.mark.parametrize(
+    ("bind", "status"),
+    [
+        ({"status": "bound"}, "resolved"),
+        ({"status": "not_checked", "reason": "dbt is not installed"}, "unbound"),
+        ({"status": "not_run"}, "unbound"),
+        ({"status": "failed", "detail": "x"}, "unresolved"),
+    ],
+)
+def test_a_node_is_resolved_only_when_its_draft_binds(bind, status):
+    assert repair.finish(_converted_draft(bind))["status"] == status
+
+
+def test_an_unbound_draft_is_checked_by_the_build_that_builds_it():
+    record = {**RECORD, "status": "unbound"}
+    built = _evidence({"model.proj.stg_task": "success"})
+    failed = _evidence({"model.proj.stg_task": "error"})
+    kinds = lambda e: _kinds(_repair_obligations(record, e, {}, None, None))  # noqa: E731
+    assert "repair_conversion" not in kinds(built)
+    assert kinds(failed)["repair_conversion"] == ("unchecked", "unbound")

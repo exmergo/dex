@@ -145,7 +145,9 @@ where the cached profile settles what they hold:
 The draft is compiled and bound on dev before it is stored (DuckDB `limit 0`,
 BigQuery's free dry run), and a further typing error that binding reveals is
 converted the same way. `data.repair` says what was read and done; its `status`
-is `resolved` only when every failure was converted and the draft binds.
+is `resolved` only when every failure was converted and the draft binds; a
+draft converted but never bound (no dbt, no connection, or a warehouse with no
+free check) is `unbound`, and the build is the first check of its types.
 
 Read the diff, then apply and build it as its own plan:
 

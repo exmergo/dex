@@ -2163,20 +2163,31 @@ def repair(engine: DexEngine, names: str | Sequence[str] | None) -> RepairResult
         + (f" ({conversions})" if conversions else "")
     )
     planned = plan(engine, intent, edits=edits)
-    settled = all(record["status"] == "resolved" for record in records)
+    statuses = {record["status"] for record in records}
+    overall = (
+        "unresolved"
+        if "unresolved" in statuses
+        else "unbound"
+        if "unbound" in statuses
+        else "resolved"
+    )
+    build_step = (
+        f"`dex transform apply {planned.plan_id}` and `dex transform build "
+        f"--target dev --verify --for-plan {planned.plan_id} --cold-deps`"
+    )
     summary: dict[str, Any] = {
-        "status": "resolved" if settled else "unresolved",
+        "status": overall,
         "plan_id": planned.plan_id,
         "compiled": compiled_ok,
         "nodes": records,
-        "next": (
-            f"review the diff, then `dex transform apply {planned.plan_id}` and "
-            f"`dex transform build --target dev --verify --for-plan "
-            f"{planned.plan_id} --cold-deps`"
-            if settled
-            else "edit each unresolved conversion in the draft (or profile the "
-            "input it names and repair again) before applying it"
-        ),
+        "next": {
+            "resolved": f"review the diff, then {build_step}",
+            "unbound": "every failure was converted, but nothing checked the "
+            "draft's types on dev (see each node's `bind_check.reason`): review "
+            f"the diff with that in mind, then {build_step}, which is the check",
+            "unresolved": "edit each unresolved conversion in the draft (or "
+            "profile the input it names and repair again) before applying it",
+        }[overall],
     }
     result = RepairResult(**planned.model_dump(), repair=summary)
     # The compile and the parse run dbt twice over one tree, so its own
