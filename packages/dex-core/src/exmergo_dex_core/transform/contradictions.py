@@ -43,11 +43,9 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import jinja_regions
-from ..explore.relationships import candidate_keys
 from .declarations import model_sql_path
 from .drafting import (
     Usage,
-    _column,
     _dataset_for_model,
     _Reading,
     _untoken,
@@ -721,22 +719,9 @@ def _polarity(expression: str) -> bool | None:
 
 
 def _is_unique_key_in_dataset(dataset: Dataset, key_columns: list[str]) -> bool:
-    """whether key_columns forms a unique key of the profiled dataset."""
+    """whether key_columns matches a proven key of the profiled dataset."""
     key_set = {c.lower() for c in key_columns}
-    for key in proven_keys(dataset):
-        if {c.lower() for c in key} == key_set:
-            return True
-    for key in candidate_keys(dataset):
-        if {c.lower() for c in key} == key_set:
-            return True
-    for key in dataset.composite_keys:
-        if {c.lower() for c in key} == key_set:
-            return True
-    if len(key_columns) == 1:
-        col = _column(dataset, key_columns[0])
-        if col is not None and col.is_unique and col.null_fraction in (0.0, None):
-            return True
-    return False
+    return any({c.lower() for c in key} == key_set for key in proven_keys(dataset))
 
 
 def _check_grain_dependence(
@@ -761,14 +746,6 @@ def _check_grain_dependence(
 
     files_map = files or {}
     paths = model_paths or []
-    if model and cache is not None:
-        model_ds = _dataset_for_model(cache, model, files_map, paths)
-        if (
-            model_ds is not None
-            and model_ds.columns
-            and _is_unique_key_in_dataset(model_ds, grain)
-        ):
-            return ("holds", None)
 
     grain_origins = [reading.origins.get(g.lower()) for g in grain]
     extra_origins = [reading.origins.get(e.lower()) for e in extra]

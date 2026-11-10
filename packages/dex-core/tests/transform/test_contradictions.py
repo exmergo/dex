@@ -558,6 +558,81 @@ def test_group_by_extra_column_with_no_profile_warns_unconfirmed_and_names_profi
     assert "`explore profile stg_conversations` would settle it" in warning
 
 
+def test_group_by_non_dependent_column_still_warns_when_own_model_cached():
+    """a cached unique key on fct itself does not hide a non-dependent sql edit."""
+    fct_cached = Dataset(
+        identifier="warehouse.main.fct",
+        columns=[
+            ColumnProfile(
+                name="conversation_id",
+                data_type="varchar",
+                null_fraction=0.0,
+                is_unique=True,
+                distinct_count_exact=True,
+            ),
+        ],
+    )
+    non_dep_sql = (
+        "select conversation_id, message_id, count(*) as cnt\n"
+        "from {{ ref('stg_conversations') }}\n"
+        "group by conversation_id, message_id\n"
+    )
+    [found], [warning] = _found(
+        CONVERSATIONS_SQL,
+        non_dep_sql,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": STG_CONVERSATIONS},
+        cache=DexCache(datasets=[fct_cached, CONVERSATIONS_NOT_KEYED]),
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "sql",
+    )
+    assert "the SQL looks stale" in warning
+
+
+def test_group_by_approximate_uniqueness_does_not_suppress_stale_grain_warning():
+    """approximate uniqueness without exact count is a signal, not key proof."""
+    approx_keyed = Dataset(
+        identifier="warehouse.main.stg_conversations",
+        columns=[
+            ColumnProfile(
+                name="conversation_id",
+                data_type="varchar",
+                null_fraction=0.0,
+                is_unique=True,
+                distinct_count_exact=False,
+            ),
+            ColumnProfile(
+                name="state",
+                data_type="varchar",
+                null_fraction=0.0,
+                is_unique=False,
+                distinct_count_exact=True,
+            ),
+        ],
+    )
+    prior_sql = (
+        "select conversation_id, count(*) as cnt\n"
+        "from {{ ref('stg_conversations') }}\n"
+        "group by conversation_id\n"
+    )
+    [found], [warning] = _found(
+        prior_sql,
+        CONVERSATIONS_SQL,
+        prior_yml=_yml(grain=["conversation_id"]),
+        others={"models/stg_conversations.sql": STG_CONVERSATIONS},
+        cache=DexCache(datasets=[approx_keyed]),
+    )
+    assert (found["check"], found["status"], found["stale"]) == (
+        "grain",
+        "contradicted",
+        "sql",
+    )
+    assert "the SQL looks stale" in warning
+
+
 # --- additivity -------------------------------------------------------------------
 
 
