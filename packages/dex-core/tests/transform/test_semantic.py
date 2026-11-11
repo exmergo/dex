@@ -1372,12 +1372,16 @@ def test_definition_edit_still_refuses_a_real_anchor(
     ],
 )
 def test_unspannable_check_ignores_emphasis(text: str):
+    """The issue's repros, and their quoted and bulleted cousins, pass the check."""
+
     from exmergo_dex_core.transform.semantic import _reject_unspannable
 
     _reject_unspannable("m.yml", text)
 
 
 def test_unspannable_check_names_a_file_that_does_not_parse():
+    """A broken file is refused for what it is, with the line, not blamed on anchors."""
+
     from exmergo_dex_core.transform.semantic import _reject_unspannable
 
     with pytest.raises(EditValidationError, match="does not parse as YAML at line"):

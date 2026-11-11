@@ -713,6 +713,8 @@ def test_emphasis_in_a_declarations_file_is_not_read_as_an_alias(sidecar_repo):
 
 
 def test_a_declarations_file_with_a_real_alias_stays_advisory(sidecar_repo):
+    """A real alias still declines the splice: the check narrowed, not the rule."""
+
     (sidecar_repo.root / _SIDECAR).write_text(
         "version: 2\n"
         "_desc: &desc One row per order.\n"

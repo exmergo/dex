@@ -21,6 +21,8 @@ from exmergo_dex_core.yaml_spans import uses_anchors_or_aliases
     ids=["comment", "plain_scalar", "quoted", "operators", "comment_tokens", "empty"],
 )
 def test_text_that_only_looks_like_an_alias_is_not_one(text: str):
+    """Emphasis, operators and comment tokens are text; only the parser says alias."""
+
     assert uses_anchors_or_aliases(text) is False
 
 
@@ -35,9 +37,13 @@ def test_text_that_only_looks_like_an_alias_is_not_one(text: str):
     ids=["alias", "merge_key", "anchor_only", "anchored_item"],
 )
 def test_a_real_anchor_or_alias_is_found(text: str):
+    """Every anchor and alias form counts, a merge key and an unused anchor included."""
+
     assert uses_anchors_or_aliases(text) is True
 
 
 def test_a_document_that_does_not_parse_is_the_callers_to_name():
+    """A parse error propagates, so each caller words its own refusal."""
+
     with pytest.raises(yaml.YAMLError):
         uses_anchors_or_aliases("a: [1\n")
