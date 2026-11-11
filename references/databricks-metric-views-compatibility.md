@@ -279,10 +279,48 @@ The layer-neutral axes then read the fingerprint:
   removed or changed. It also reports a column a field reads that the warehouse
   no longer has.
 - `maintain grain` measures each `rely` key (`declared_grain_not_unique`) and
-  each join's declared arity.
+  each join's declared arity. A contradicted `rely` key is worded as the view's
+  claim (`rely.at_most_one_match` on a join to the table), not as the project's
+  grain: Databricks trusts the flag and returns wrong numbers when it is false.
+- `maintain semantic` reports a view re-saved in a spec version Dex does not read
+  as `semantic_format_changed` for that file, naming it and both versions: the
+  fingerprint records each file's declared `version` under `definition_versions`,
+  so the other views are still compared by content.
 
-Holding the views' expressions to the warehouse snapshot by type, and reconciling
-through `semantic databricks update`, is #1259. The Ossie bridge is #1260.
+`maintain schema` holds each view to the warehouse metadata Dex captured (#1259),
+with no workspace connection. Each finding names the view, the element and the
+column:
+
+| Code | When |
+|---|---|
+| `declared_column_missing` | a field, measure, `filter`, join `on`/`using` or query `source` reads a column its table no longer has |
+| `declared_relation_missing` | the view's `source` (the whole view) or a join's `source` is gone since the baseline |
+| `declared_type_conflict` | a `date`/`date_time` format on a column that is not temporal, a number, currency, percentage or byte format on text, or `SUM`/`AVG` over text |
+| `declared_dependency_dropped` | a field, measure (through `MEASURE()` too), window, or nested join loses an input to another removal |
+
+A relation neither the connection nor the baseline lists, and an expression Dex
+cannot read, are named in `warnings` as unchecked rather than passed.
+
+`maintain reconcile` cuts each removal out of the view file and stores it as a
+`semantic databricks update` plan (`data.semantic_plan_id`), validated by the
+reader before it is stored, so a reconciled view reads back. A removed field,
+measure or join is cut by the span it occupies (a nested join goes with its
+parent), a contradicted `format` is cut from its member, and every other byte is
+kept. These stay advisory and are never written:
+
+- a view or a join whose `source` is gone: a vanished table is as often a rename;
+- a `filter` reading a dropped column: the filter is the view's population;
+- a query `source` reading a dropped column: no member removal repairs it;
+- a removal a `materialization` lists, or one that would leave the view no field
+  and no measure;
+- a file already holding a key Databricks refuses.
+
+A Metric View already deployed in the connector's source scope is not a
+relation Dex reads: Databricks refuses a plain `SELECT` of its measure columns,
+so the Databricks connector leaves Unity Catalog objects of type `METRIC_VIEW`
+out of its inventory. The view's YAML in the repository is what Dex reads.
+
+The Ossie bridge is #1260.
 
 ## Authoring
 

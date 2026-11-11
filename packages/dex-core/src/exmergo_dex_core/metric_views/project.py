@@ -15,8 +15,10 @@ declared keys and joins to exploration. It is also a
 :class:`~..edits.SemanticEditTarget`, which `semantic databricks
 define|update|plan` authors through (:mod:`.authoring`, #1258), and a
 :class:`~..semantic_source.SemanticDerivationSource`, which turns a declared dbt
-mart into a Metric View and annotates an existing one (:mod:`.derivation`). The
-vendor schema axis (#1259) is a later release.
+mart into a Metric View and annotates an existing one (:mod:`.derivation`), and a
+:class:`~..semantic_source.SemanticSchemaSource`, which holds the views to the
+warehouse schema dex captured (:mod:`.schema`) and proposes the removals as a
+`semantic databricks update` plan (:mod:`.removal`, #1259).
 
 **Static, and never deploying.** dex reads and writes the Metric View YAML bodies
 committed here. Nothing in this module opens a Databricks connection, reads what
@@ -36,11 +38,15 @@ from ..errors import ConfigurationError, ProjectError, RepoRootRequiredError
 from .dependency import MetricViewDependencyError, ensure_available
 
 if TYPE_CHECKING:
+    from ..cache import Dataset
     from ..edits import ApplyResult, SemanticDocumentView, SemanticEditValidation
+    from ..maintain.drift import DriftFinding
+    from ..maintain.reconcile import Proposal
     from ..maintain.snapshot import SemanticLayerSnapshot
     from ..project_definitions import ProjectDefinitions
     from ..semantic_catalog import SemanticCatalogView
     from ..semantic_source import SemanticSourceContext
+    from ..transform.plans import PlanEdit
     from .catalog import Resolution
     from .loader import LoadResult
 
@@ -188,6 +194,67 @@ class MetricViewSemanticLayer:
                 notes=[f"Metric View files could not be read: {exc}"]
             )
         return snapshot_mod.semantic_layer(loaded, resolved)
+
+    # --- the schema channel (#1259) ----------------------------------------------
+
+    def declared_schema_drift(
+        self, current: list[Dataset], baseline: list[Dataset]
+    ) -> tuple[list[DriftFinding], list[str]]:
+        """The views held to dex's warehouse metadata; see :mod:`.schema`.
+
+        Degrades the way :meth:`semantic_layer` does: a set that cannot be read
+        compares nothing and says why.
+        """
+
+        try:
+            loaded, resolved = self._load(), self._resolution()
+            from .schema import declared_schema_drift
+        except MetricViewDependencyError as exc:
+            return [], [str(exc)]
+        except (ImportError, OSError, ValueError) as exc:
+            return [], [f"Metric View files were not compared to the warehouse: {exc}"]
+        findings, notes = declared_schema_drift(
+            loaded, resolved, current, baseline, connector=self.connector
+        )
+        # A file the reader refused compared nothing, which reads the same as a
+        # clean one unless it is said.
+        refused = [
+            f"{d.render()} (not compared to the warehouse)" for d in loaded.errors
+        ]
+        return findings, [*refused, *notes]
+
+    def handles_finding(self, finding: DriftFinding) -> bool:
+        """Whether ``finding`` is one this layer's schema channel produced."""
+
+        from .removal import CODES
+
+        return finding.code in CODES and finding.data.get("model_file") is not None
+
+    def schema_reconcile(
+        self, findings: list[DriftFinding]
+    ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
+        """Each removal the schema axis recorded, as an edit of its view file."""
+
+        from .authoring import STRICT_RULES
+        from .removal import proposals_and_edits
+
+        own = [finding for finding in findings if self.handles_finding(finding)]
+        if not own:
+            return [], [], []
+        contents = {
+            name: source.content
+            for name, source in self.semantic_edit_view().files.items()
+        }
+        strict: dict[str, list[str]] = {}
+        for diagnostic in self._load().diagnostics:
+            if diagnostic.rule in STRICT_RULES:
+                strict.setdefault(diagnostic.file, []).append(
+                    f"{diagnostic.rule} at {diagnostic.element}"
+                )
+        from .schema import view_digest
+
+        digests = {view.file: view_digest(view) for view in self._load().views}
+        return proposals_and_edits(own, contents, strict, digests)
 
     # --- native semantic-document authoring (#1258) ----------------------------
 

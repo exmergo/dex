@@ -481,6 +481,44 @@ def _advisory(
             "re-run `maintain snapshot --project-only` to accept it"
         ),
     }
+    if finding.code == "semantic_format_changed" and finding.data.get("path"):
+        actions["semantic_format_changed"] = (
+            f"{finding.data['path']} moved from format version "
+            f"{finding.data.get('format_version_before')} to "
+            f"{finding.data.get('format_version_after')}. If dex does not read "
+            "the new version, restore the old one or upgrade dex before "
+            "re-running `maintain snapshot`, since a baseline taken now accepts "
+            "a definition nothing checks"
+        )
+    if finding.code == "declared_grain_not_unique" and (
+        finding.data.get("claim") == "primary"
+    ):
+        source = finding.data.get("declared_by") or "semantic"
+        actions["declared_grain_not_unique"] = (
+            f"the {source} semantic layer declares these columns its primary key "
+            "and the data says otherwise: dedup the table, or change the primary "
+            f"key with `semantic {source} update`. dex proposes no edit, because "
+            "which side is wrong is a decision"
+        )
+    if finding.code == "declared_grain_not_unique" and (
+        finding.data.get("claim") == "unique"
+    ):
+        # A semantic layer's uniqueness claim is not the grain (#1259): a Metric
+        # View's `rely.at_most_one_match` asserts the join matches at most one
+        # row, and Databricks trusts it.
+        actions["declared_grain_not_unique"] = (
+            f"the {finding.data.get('declared_by') or 'semantic'} layer asserts "
+            "these columns are unique and the data says otherwise: dedup the "
+            "table, or drop the claim"
+            + (
+                " (`rely.at_most_one_match` on the join, with `semantic "
+                "databricks update`), since Databricks trusts the flag and can "
+                "count a row more than once while it is false"
+                if finding.data.get("declared_by") == "databricks"
+                else ""
+            )
+            + ". dex proposes no edit, because which side is wrong is a decision"
+        )
     return Proposal(
         axis=finding.axis,
         kind="advisory",

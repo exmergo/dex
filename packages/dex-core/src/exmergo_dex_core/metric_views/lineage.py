@@ -36,10 +36,12 @@ __all__ = [
     "SourceRelation",
     "aggregate",
     "column_refs",
+    "is_query",
     "join_pairs",
     "measure_refs",
     "over_own_columns",
     "plain_column",
+    "query_columns",
     "ratio_sides",
     "source_relation",
 ]
@@ -224,6 +226,53 @@ def aggregate(sql: str) -> Aggregate | None:
     parts = _parts(argument) if argument is not None else None
     column = ColumnRef(tuple(parts[:-1]), parts[-1]) if parts else None
     return Aggregate(agg=agg, column=column, filter=predicate)
+
+
+def is_query(source: str) -> bool:
+    """Whether a ``source`` is a query rather than a table name."""
+
+    return bool(_QUERY.match(source))
+
+
+def query_columns(source: str) -> tuple[list[str], list[str]] | None:
+    """The physical columns a query ``source`` reads, and the names whose
+    reading is ambiguous, or None where it does not parse.
+
+    A column in the select list or ``WHERE`` is a read of the table even when an
+    alias shares its name (``old AS old``). An unqualified name in ``ORDER BY``
+    that the select list names as an alias is that alias. In ``GROUP BY`` and
+    ``HAVING`` Databricks resolves a table column before an alias, so a name
+    that is both is a read only while the table has it: such a name is returned
+    as ambiguous, for the caller to name as unchecked when it is missing rather
+    than to call it dropped.
+    """
+
+    tree = _parse(source)
+    if tree is None:
+        return None
+    select = tree
+    while isinstance(select, exp.Subquery):
+        select = select.this
+    aliases = (
+        {
+            p.alias.lower()
+            for p in select.expressions
+            if isinstance(p, exp.Alias) and p.alias
+        }
+        if isinstance(select, exp.Select)
+        else set()
+    )
+    found: list[str] = []
+    ambiguous: list[str] = []
+    for node in tree.find_all(exp.Column):
+        name = node.name
+        if node.table or name.lower() not in aliases:
+            found.append(name)
+        elif node.find_ancestor(exp.Group, exp.Having) is not None:
+            ambiguous.append(name)
+        elif node.find_ancestor(exp.Order) is None:
+            found.append(name)
+    return found, ambiguous
 
 
 def source_relation(source: str) -> SourceRelation:

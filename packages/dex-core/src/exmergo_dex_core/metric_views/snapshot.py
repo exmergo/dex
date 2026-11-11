@@ -22,8 +22,11 @@ a physical column is decided once, whichever channel asks.
 **Provenance.** ``vendor: databricks``, the Metric View YAML version as the
 ``format_version`` and the ported converter commit as the ``vendor_release``, so
 a baseline from another reader or another spec version is reported as that
-rather than as every view changed. The content hash covers the definition as
-parsed, keys sorted.
+rather than as every view changed. Each file's own declared ``version`` is
+recorded apart, under ``definition_versions``, so a view re-saved in another
+version is reported as ``semantic_format_changed`` for that file while every
+other view is still compared by content. The content hash covers the definition
+as parsed, keys sorted.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ def semantic_layer(
         "vendor": "databricks",
         "vendor_release": CONVERTER_COMMIT,
         "format_version": METRIC_VIEW_SPEC_VERSION,
+        "definition_versions": dict(sorted(loaded.declared_versions.items())),
     }
     if loaded.empty:
         return SemanticLayerSnapshot(**provenance, declarations={}, notes=notes)
