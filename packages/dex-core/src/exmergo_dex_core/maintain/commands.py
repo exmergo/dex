@@ -2015,10 +2015,10 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # A repository whose only layer is a semantic one (#912) still has
             # that layer's own findings to reconcile, through its own route;
             # only the project's half has nowhere to land.
-            if not any(
-                semantic_source is not None and semantic_source.handles_finding(f)
-                for f in findings
-            ):
+            # A semantic vendor with no project beside it is that repository's
+            # one layer: its findings on the other axes (a contradicted key on
+            # grain, say) are advisory there too, never a refusal (#1259).
+            if semantic_source is None:
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(
                 f"no transformation project to edit ({exc}), so every proposal "
@@ -2142,7 +2142,13 @@ def _reconcile_semantic(
                     proposal.paths = []
         else:
             result.diffs = [*result.diffs, *planned.diffs]
-            result.warnings.extend([*planned.warnings, *planned.notes])
+            # The plan re-reads the layer, so its notes repeat what the report
+            # already carried; each is said once.
+            result.warnings.extend(
+                w
+                for w in dict.fromkeys([*planned.warnings, *planned.notes])
+                if w not in result.warnings
+            )
             result.semantic_plan_id = planned.plan_id
     result.proposals = _mechanical_first([*result.proposals, *proposals])
 

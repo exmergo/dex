@@ -36,6 +36,7 @@ __all__ = [
     "SourceRelation",
     "aggregate",
     "column_refs",
+    "is_query",
     "join_pairs",
     "measure_refs",
     "over_own_columns",
@@ -224,6 +225,12 @@ def aggregate(sql: str) -> Aggregate | None:
     parts = _parts(argument) if argument is not None else None
     column = ColumnRef(tuple(parts[:-1]), parts[-1]) if parts else None
     return Aggregate(agg=agg, column=column, filter=predicate)
+
+
+def is_query(source: str) -> bool:
+    """Whether a ``source`` is a query rather than a table name."""
+
+    return bool(_QUERY.match(source))
 
 
 def source_relation(source: str) -> SourceRelation:

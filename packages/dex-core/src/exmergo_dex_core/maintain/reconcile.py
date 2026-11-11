@@ -481,6 +481,25 @@ def _advisory(
             "re-run `maintain snapshot --project-only` to accept it"
         ),
     }
+    if finding.code == "declared_grain_not_unique" and (
+        finding.data.get("claim") == "unique"
+    ):
+        # A semantic layer's uniqueness claim is not the grain (#1259): a Metric
+        # View's `rely.at_most_one_match` asserts the join matches at most one
+        # row, and Databricks trusts it.
+        actions["declared_grain_not_unique"] = (
+            f"the {finding.data.get('declared_by') or 'semantic'} layer asserts "
+            "these columns are unique and the data says otherwise: dedup the "
+            "table, or drop the claim"
+            + (
+                " (`rely.at_most_one_match` on the join, with `semantic "
+                "databricks update`), since Databricks trusts the flag and "
+                "returns wrong numbers while it is false"
+                if finding.data.get("declared_by") == "databricks"
+                else ""
+            )
+            + ". dex proposes no edit, because which side is wrong is a decision"
+        )
     return Proposal(
         axis=finding.axis,
         kind="advisory",

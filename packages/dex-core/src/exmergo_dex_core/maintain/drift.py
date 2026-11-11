@@ -1060,6 +1060,12 @@ class GrainPlan(NamedTuple):
     # against the data today, under its own code. Probed in the same batches
     # as the fanout pairs. Defaulted for the same reason as above.
     declared_join_checks: list[DeclaredJoinCheck] | None = None
+    # Who declared each declared combination, keyed by identifier and the
+    # combination's lower-cased columns: ``(source, claim)``, so a finding says
+    # whether it is the project's grain or a semantic layer's uniqueness claim
+    # (a Metric View's ``rely.at_most_one_match`` is the second, #1259).
+    # Defaulted for the same reason as above.
+    declared_origins: dict[tuple[str, frozenset[str]], tuple[str, str]] | None = None
 
     def scans(self) -> bool:
         """Whether the plan holds any statement that scans, and so is priced.
@@ -1171,10 +1177,13 @@ def grain_plan(
             described[identifier] = ({c.name for c in columns}, meta.row_count)
         return described[identifier]
 
+    origins: dict[tuple[str, frozenset[str]], tuple[str, str]] = {}
     declared_by_identifier, notes = _declared_composites(
-        definitions, sorted(current), scope
+        definitions, sorted(current), scope, origins
     )
-    _fold_semantic_keys(declared_by_identifier, notes, semantic, sorted(current), scope)
+    _fold_semantic_keys(
+        declared_by_identifier, notes, semantic, sorted(current), scope, origins
+    )
     # A count of None is unknown (no free row count on this connector), not
     # zero: the check is planned, and the scan that runs it supplies the count.
     key_checks: list[tuple[Dataset, list[str], int | None]] = []
@@ -1372,6 +1381,7 @@ def grain_plan(
         joins,
         widening_checks,
         declared_join_checks,
+        origins,
     )
 
 
@@ -1437,6 +1447,7 @@ def _fold_semantic_keys(
     semantic: SemanticLayer | None,
     known: list[str],
     scope: set[str] | None,
+    origins: dict[tuple[str, frozenset[str]], tuple[str, str]] | None = None,
 ) -> None:
     """Add the keys a semantic layer declares to the declared-grain survey.
 
@@ -1471,6 +1482,14 @@ def _fold_semantic_keys(
         for combo in sm.keys:
             if not any(_same_combo(combo, seen) for seen in bucket):
                 bucket.append(list(combo))
+                if origins is not None:
+                    # A Metric View fingerprints only `rely` keys; every other
+                    # native layer's keys are its primary keys.
+                    claim = "unique" if semantic.vendor == "databricks" else "primary"
+                    origins.setdefault(
+                        (identifier, frozenset(c.lower() for c in combo)),
+                        (semantic.vendor or "semantic", claim),
+                    )
 
 
 def _join_cardinality_checks(
@@ -1745,6 +1764,7 @@ def _declared_composites(
     definitions: ProjectDefinitions | None,
     known: list[str],
     scope: set[str] | None,
+    origins: dict[tuple[str, frozenset[str]], tuple[str, str]] | None = None,
 ) -> tuple[dict[str, list[list[str]]], list[str]]:
     """Declared composite grains keyed by warehouse identifier, and what could
     not be resolved.
@@ -1782,7 +1802,56 @@ def _declared_composites(
         bucket = by_identifier.setdefault(identifier, [])
         if not any(_same_combo(composite.columns, seen) for seen in bucket):
             bucket.append(list(composite.columns))
+            if origins is not None:
+                origins.setdefault(
+                    (identifier, frozenset(c.lower() for c in composite.columns)),
+                    (composite.source, composite.claim),
+                )
     return by_identifier, notes
+
+
+def _declared_claim(
+    origin: tuple[str, str] | None, members: str, identifier: str
+) -> str:
+    """Who asserts the combination, and what they assert (#1259).
+
+    The project's grain, a native layer's primary key, and a uniqueness claim
+    that is not a grain at all (an Ossie ``unique_keys`` entry, a Metric View's
+    ``rely.at_most_one_match`` on a join to the table) are different statements,
+    and the finding says which one the data contradicts.
+    """
+
+    source, claim = origin or ("", "combination")
+    if source == "databricks" and claim == "unique":
+        return (
+            f"a Metric View join to {identifier} declares "
+            f"`rely.at_most_one_match` on ({members}), asserting each row "
+            "matches at most one of its rows"
+        )
+    if claim == "unique":
+        return (
+            f"the {source} semantic layer declares ({members}) unique on {identifier}"
+        )
+    if claim == "primary" and source:
+        return (
+            f"the {source} semantic layer declares ({members}) as the primary key "
+            f"of {identifier}"
+        )
+    return f"the project declares ({members}) as the grain of {identifier}"
+
+
+def _declared_consequence(origin: tuple[str, str] | None) -> str:
+    """What a contradicted claim breaks, by who made it."""
+
+    source, claim = origin or ("", "combination")
+    if source == "databricks" and claim == "unique":
+        return (
+            "Databricks trusts the flag without checking it, so a query through "
+            "the join returns wrong numbers"
+        )
+    if claim == "unique" or (claim == "primary" and source):
+        return "Queries relying on the claim count rows more than once"
+    return "Builds asserting this grain will fail"
 
 
 class ProbeNeeds(NamedTuple):
@@ -2324,6 +2393,9 @@ def grain_drift(
             members = ", ".join(combo)
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             joins = _joins_on(plan, dataset.identifier, combo)
+            origin = (plan.declared_origins or {}).get(
+                (dataset.identifier, frozenset(c.lower() for c in combo))
+            )
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -2332,11 +2404,11 @@ def grain_drift(
                     column=members,
                     severity=severity,
                     detail=(
-                        f"the project declares ({members}) as the grain of "
-                        f"{dataset.identifier}, and the combination is not "
+                        _declared_claim(origin, members, dataset.identifier)
+                        + f", and the combination is not "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows). "
-                        "Builds asserting this grain will fail"
+                        + _declared_consequence(origin)
                         + (" and " if joins else ", and ")
                         + _fanout_clause(joins)
                         + floor_note
@@ -2346,6 +2418,11 @@ def grain_drift(
                         "distinct_count": count,
                         "row_count": row_count,
                         "declared": True,
+                        **(
+                            {"declared_by": origin[0], "claim": origin[1]}
+                            if origin
+                            else {}
+                        ),
                         **floor_data,
                         **({"joins": joins} if joins else {}),
                     },

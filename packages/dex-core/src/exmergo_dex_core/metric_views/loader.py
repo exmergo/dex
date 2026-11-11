@@ -81,6 +81,11 @@ class LoadResult:
 
     views: list[MetricView] = field(default_factory=list)
     diagnostics: list[Diagnostic] = field(default_factory=list)
+    #: The ``version`` each file declares, as text, keyed as configured: read
+    #: for every file that parses as a mapping, a refused one included, so the
+    #: fingerprint can say a view moved to a spec version dex does not read
+    #: rather than only that the view disappeared (#1259).
+    declared_versions: dict[str, str] = field(default_factory=dict)
 
     @property
     def errors(self) -> list[Diagnostic]:
@@ -288,6 +293,8 @@ def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
             )
         )
         return None
+    if isinstance(raw, Mapping) and raw.get("version") is not None:
+        result.declared_versions[name] = str(raw.get("version")).strip()
     stem = PurePosixPath(name).stem
     try:
         view, findings = validator.check_view(raw, name, stem)

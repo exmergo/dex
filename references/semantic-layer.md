@@ -1472,9 +1472,14 @@ semantic:
   named rather than invented.
 - **`query` and `values` are not available yet** (#964). `values` runs the PII
   gate before it refuses.
-- **`maintain` reads the fingerprint**: definition drift on `maintain semantic`, and
-  each `rely` key and join arity measured by `maintain grain`. The vendor schema
-  axis (#1259) and the Ossie bridge (#1260) follow.
+- **`maintain` reads the fingerprint**: definition drift on `maintain semantic`
+  (a view re-saved in another spec version is `semantic_format_changed`), and
+  each `rely` key and join arity measured by `maintain grain`. `maintain schema`
+  holds each view's fields, measures, `filter`, joins and query sources to the
+  warehouse metadata (the four `declared_*` codes, naming the view, the element
+  and the column), and `maintain reconcile` cuts the removals out of the view
+  files through `semantic databricks update` (#1259). The Ossie bridge (#1260)
+  follows.
 - **Authoring is `semantic databricks define|update|plan`** (#1258): whole files
   on `semantic.databricks.files`, validated by the same port with an unknown key
   and `fields` beside `dimensions` refused on write, stored as a plan and written

@@ -22,8 +22,10 @@ a physical column is decided once, whichever channel asks.
 **Provenance.** ``vendor: databricks``, the Metric View YAML version as the
 ``format_version`` and the ported converter commit as the ``vendor_release``, so
 a baseline from another reader or another spec version is reported as that
-rather than as every view changed. The content hash covers the definition as
-parsed, keys sorted.
+rather than as every view changed. A file declaring a version dex does not read
+is named in the ``format_version`` (:func:`format_version`), so a view re-saved
+in another version is reported as ``semantic_format_changed`` too. The content
+hash covers the definition as parsed, keys sorted.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from .dependency import CONVERTER_COMMIT, METRIC_VIEW_SPEC_VERSION
 if TYPE_CHECKING:
     from .loader import LoadResult
 
-__all__ = ["semantic_layer"]
+__all__ = ["format_version", "semantic_layer"]
 
 
 def semantic_layer(
@@ -56,7 +58,7 @@ def semantic_layer(
     provenance = {
         "vendor": "databricks",
         "vendor_release": CONVERTER_COMMIT,
-        "format_version": METRIC_VIEW_SPEC_VERSION,
+        "format_version": format_version(loaded),
     }
     if loaded.empty:
         return SemanticLayerSnapshot(**provenance, declarations={}, notes=notes)
@@ -197,6 +199,27 @@ def semantic_layer(
         declarations={},
         notes=notes,
     )
+
+
+def format_version(loaded: LoadResult) -> str:
+    """The spec version the fingerprint records: the one dex reads, followed by
+    every file that declares another (#1259).
+
+    dex reads one version and refuses a file in any other, so a view re-saved
+    in another version drops out of the read set. Recording the version here
+    makes ``maintain semantic`` report that as ``semantic_format_changed``,
+    naming the file and both versions, rather than only as a removed view.
+    A move of dex's own pinned version is reported the same way.
+    """
+
+    others = sorted(
+        f"{name}: {version}"
+        for name, version in loaded.declared_versions.items()
+        if version != METRIC_VIEW_SPEC_VERSION
+    )
+    if not others:
+        return METRIC_VIEW_SPEC_VERSION
+    return f"{METRIC_VIEW_SPEC_VERSION} ({'; '.join(others)})"
 
 
 def _hash(definition: Any) -> str:
