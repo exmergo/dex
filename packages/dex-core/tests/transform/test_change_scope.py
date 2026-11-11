@@ -53,6 +53,92 @@ def test_count_star_to_count_column_in_a_cte_is_an_aggregate_change():
     assert scope.outputs == "changed"
 
 
+EXTRACT_PRIOR = (
+    "select conversation_id, count(*) as part_count, "
+    "max(created_at) as last_part_at from stg_parts group by conversation_id\n"
+)
+EXTRACT_AUTHORED = (
+    "with p as (\n"
+    "  select conversation_id, count(*) as part_count, "
+    "max(created_at) as last_part_at from stg_parts group by conversation_id\n"
+    ")\n"
+    "select conversation_id, p.part_count, p.last_part_at from p\n"
+)
+
+
+def test_extracting_unchanged_aggregates_into_a_cte_is_silent():
+    """Moving a calculation into a CTE is a move, not a change (#1253)."""
+
+    scope = _scope(EXTRACT_AUTHORED, prior=EXTRACT_PRIOR)
+    assert scope.outputs == "kept"
+    assert "aggregate_changed" not in {c.kind for c in scope.changes}
+
+
+def test_extracting_aggregates_through_two_ctes_is_silent():
+    """Supported aliases are followed through more than one CTE (#1253)."""
+
+    authored = (
+        "with a as (\n"
+        "  select conversation_id, count(*) as n, max(created_at) as m "
+        "from stg_parts group by conversation_id\n"
+        "), b as (\n"
+        "  select conversation_id, a.n as part_count, a.m as last_part_at from a\n"
+        ")\n"
+        "select conversation_id, part_count, last_part_at from b\n"
+    )
+    scope = _scope(authored, prior=EXTRACT_PRIOR)
+    assert scope.outputs == "kept"
+    assert "aggregate_changed" not in {c.kind for c in scope.changes}
+
+
+def test_inlining_an_unchanged_aggregate_from_a_cte_is_silent():
+    scope = _scope(EXTRACT_PRIOR, prior=EXTRACT_AUTHORED)
+    assert scope.outputs == "kept"
+    assert "aggregate_changed" not in {c.kind for c in scope.changes}
+
+
+def test_extracting_a_changed_aggregate_into_a_cte_is_still_an_aggregate_change():
+    authored = EXTRACT_AUTHORED.replace("count(*)", "count(child_id)")
+    scope = _scope(authored, prior=EXTRACT_PRIOR)
+    assert scope.outputs == "changed"
+    (change,) = [c for c in scope.changes if c.kind == "aggregate_changed"]
+    assert change.column == "part_count"
+    assert "count(child_id)" in change.detail and "count(*)" in change.detail
+
+
+def test_extracting_a_distinct_aggregate_into_a_cte_is_still_an_aggregate_change():
+    authored = EXTRACT_AUTHORED.replace("count(*)", "count(distinct child_id)")
+    scope = _scope(authored, prior=EXTRACT_PRIOR)
+    assert scope.outputs == "changed"
+    (change,) = [c for c in scope.changes if c.kind == "aggregate_changed"]
+    assert change.column == "part_count"
+    assert "count(distinct child_id)" in change.detail
+
+
+def test_a_coalesce_around_an_extracted_aggregate_is_only_a_null_handling_change():
+    authored = EXTRACT_AUTHORED.replace(
+        "p.part_count", "coalesce(p.part_count, 0) as part_count"
+    )
+    scope = _scope(authored, prior=EXTRACT_PRIOR)
+    assert "aggregate_changed" not in {c.kind for c in scope.changes}
+    assert ("null_handling_changed", "part_count", "undeclared") in _kinds(scope)
+
+
+def test_an_unresolvable_cte_reference_is_not_proven_equivalent():
+    """A CTE that projects a star leaves its outputs unreadable (#1253)."""
+
+    authored = (
+        "with p as (select * from stg_parts)\n"
+        "select conversation_id, p.part_count, p.last_part_at from p\n"
+    )
+    scope = _scope(authored, prior=EXTRACT_PRIOR)
+    assert scope.outputs == "changed"
+    assert {
+        ("aggregate_changed", "part_count", "undeclared"),
+        ("aggregate_changed", "last_part_at", "undeclared"),
+    } <= set(_kinds(scope))
+
+
 def test_a_coalesce_removed_is_a_null_handling_change():
     prior = PRIOR.replace(
         "avg(duration) as avg_duration", "coalesce(avg(duration), 0) as avg_duration"
@@ -752,6 +838,32 @@ def test_a_new_model_has_no_change_scope(accounts_project, capsys):
         capsys,
     )
     assert "change_scope" not in envelope["data"]
+
+
+def test_plan_extracting_an_aggregate_into_a_cte_reports_no_aggregate_change(
+    accounts_project, capsys
+):
+    """A normal plan whose only output move is a CTE extraction (#1253)."""
+
+    repo, warehouse = accounts_project
+    extracted = (
+        "with counted as (\n"
+        "  select region, count(*) as accounts\n"
+        "  from {{ source('raw', 'accounts') }}\n"
+        "  group by region\n"
+        ")\n"
+        "select region, accounts from counted\n"
+    )
+    envelope = _plan(
+        repo,
+        warehouse,
+        {"edits": [_edit("region_summary", extracted)]},
+        capsys,
+    )
+    (model,) = envelope["data"]["change_scope"]["models"]
+    assert model["model"] == "region_summary"
+    assert model["outputs"] == "kept"
+    assert "aggregate_changed" not in {c["kind"] for c in model["changes"]}
 
 
 # --- re-driving (#1228) ------------------------------------------------------------

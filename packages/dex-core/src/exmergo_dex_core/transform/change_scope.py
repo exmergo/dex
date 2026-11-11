@@ -438,6 +438,120 @@ def _projections(select: exp.Expression) -> tuple[dict[str, exp.Expression], boo
     return found, star
 
 
+def _cte_output_map(
+    scopes: Mapping[str, exp.Expression], exclude: set[str]
+) -> dict[str, tuple[dict[str, exp.Expression], bool]]:
+    """Mappable outputs of the CTEs in ``scopes`` that ``exclude`` does not name.
+
+    Only CTEs outside ``exclude`` are followed: a CTE both versions share has
+    its own comparison in the scope loop, and resolving through it here would
+    report the same change twice. A CTE body that is not a plain SELECT (a set
+    operation) maps to no outputs and a star, so a reference to it is left as
+    written rather than guessed at.
+    """
+
+    found: dict[str, tuple[dict[str, exp.Expression], bool]] = {}
+    for name, body in scopes.items():
+        if name == sql_shape.MAIN_SCOPE or name in exclude:
+            continue
+        found[name] = _projections(body)
+    return found
+
+
+def _cte_qualifiers(select: exp.Expression, cte_names: set[str]) -> dict[str, str]:
+    """The qualifier a select uses for each CTE it reads, to the CTE it names.
+
+    ``from p as q`` reads the CTE ``p`` under the qualifier ``q``; ``from p``
+    reads it under ``p``. Only relations that are CTEs of this query are
+    mapped, so a qualifier that names a real table never resolves here.
+    """
+
+    mapping: dict[str, str] = {}
+    if not isinstance(select, exp.Select):
+        return mapping
+    relations: list[exp.Expression] = []
+    driving = sql_shape.from_relation(select)
+    if driving is not None:
+        relations.append(driving)
+    relations.extend(join.relation for join in sql_shape.joins(select))
+    for relation in relations:
+        if not isinstance(relation, exp.Table):
+            continue
+        underlying = relation.name.lower()
+        if underlying not in cte_names:
+            continue
+        mapping[(relation.alias or underlying).lower()] = underlying
+    return mapping
+
+
+def _resolve_cte_references(
+    expression: exp.Expression,
+    cte_outputs: Mapping[str, tuple[dict[str, exp.Expression], bool]],
+    qualifiers: Mapping[str, str],
+    scopes: Mapping[str, exp.Expression],
+    cte_names: set[str],
+    seen: frozenset[str] = frozenset(),
+) -> exp.Expression:
+    """``expression`` with its references to CTE outputs replaced by the
+    expressions those outputs compute, following chains of CTEs.
+
+    Only references to CTEs in ``cte_outputs`` are followed. A reference is
+    read in the context of the select that wrote it: a column of the final
+    select under ``qualifiers``, and a column of a CTE's own output under that
+    CTE's qualifiers, so a chain through more than one CTE resolves each step
+    where it is defined. A column inside a nested select belongs to that
+    select, not to this one, so it is never substituted. A reference that
+    cannot be resolved, a bare name two CTEs produce, or a chain that revisits
+    a CTE returns the expression as written: an unresolved expression is never
+    presented as proven equivalent (#1253).
+    """
+
+    resolved = expression.copy()
+    for column in list(resolved.find_all(exp.Column)):
+        if column.find_ancestor(exp.Select, exp.Subquery) is not None:
+            continue
+        qualifier = column.table.lower()
+        name = column.name.lower()
+        if qualifier:
+            cte = qualifiers.get(qualifier)
+            if cte is None or cte not in cte_outputs:
+                continue
+            outputs, star = cte_outputs[cte]
+            if name not in outputs:
+                if star:
+                    continue
+                return expression
+        else:
+            candidates = [
+                cte
+                for cte in dict.fromkeys(qualifiers.values())
+                if cte in cte_outputs and name in cte_outputs[cte][0]
+            ]
+            if not candidates:
+                continue
+            if len(candidates) > 1:
+                return expression
+            cte = candidates[0]
+            outputs = cte_outputs[cte][0]
+        if cte in seen:
+            return expression
+        replacement = _resolve_cte_references(
+            outputs[name],
+            cte_outputs,
+            _cte_qualifiers(scopes[cte], cte_names),
+            scopes,
+            cte_names,
+            seen | {cte},
+        )
+        if replacement is outputs[name]:
+            return expression
+        if column is resolved:
+            resolved = replacement
+        else:
+            column.replace(replacement)
+    return resolved
+
+
 def _outputs(
     prior: exp.Expression, authored: exp.Expression, out: list[ScopeChange]
 ) -> tuple[str, str | None]:
@@ -489,11 +603,32 @@ def _outputs(
                 )
             )
 
+    shared_ctes = (set(before_scopes) & set(after_scopes)) - {sql_shape.MAIN_SCOPE}
+    prior_ctes = _cte_output_map(before_scopes, shared_ctes)
+    authored_ctes = _cte_output_map(after_scopes, shared_ctes)
+    prior_names = set(before_scopes) - {sql_shape.MAIN_SCOPE}
+    authored_names = set(after_scopes) - {sql_shape.MAIN_SCOPE}
+
     for scope in sorted(before_scopes.keys() & after_scopes.keys()):
         left, _ = _projections(before_scopes[scope])
         right, _ = _projections(after_scopes[scope])
+        prior_qualifiers = _cte_qualifiers(before_scopes[scope], prior_names)
+        authored_qualifiers = _cte_qualifiers(after_scopes[scope], authored_names)
         for name in sorted(left.keys() & right.keys()):
-            for change in _expression_changes(scope, name, left[name], right[name]):
+            # Follow an output alias through a CTE that only one version has
+            # before comparing what it aggregates, so moving a calculation
+            # reads as a move and changing it still reads as a change (#1253).
+            prior_expr = _resolve_cte_references(
+                left[name], prior_ctes, prior_qualifiers, before_scopes, prior_names
+            )
+            authored_expr = _resolve_cte_references(
+                right[name],
+                authored_ctes,
+                authored_qualifiers,
+                after_scopes,
+                authored_names,
+            )
+            for change in _expression_changes(scope, name, prior_expr, authored_expr):
                 changed = True
                 out.append(change)
 
