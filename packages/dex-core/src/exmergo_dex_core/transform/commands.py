@@ -1954,10 +1954,15 @@ def declare(
     files = {path: source.content for path, source in view.files.items()}
     inputs = _drafting_inputs(engine, view)
 
+    from .population_inference import facts_for
+
+    def facts_fn():
+        return facts_for(view, getattr(view, "manifest", None))
+
     def draft_one(model: str) -> tuple[dict[str, Any] | None, list[str]]:
         try:
             drafts, warnings = drafting.draft(
-                [model], files, view.model_paths, **inputs
+                [model], files, view.model_paths, **inputs, key_facts=facts_fn
             )
         except Exception as exc:
             return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
