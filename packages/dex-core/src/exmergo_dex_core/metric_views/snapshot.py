@@ -10,7 +10,9 @@ a physical column is decided once, whichever channel asks.
 - Each joined table that is not another view's source is one semantic model of
   its own (``view.join.path``), with the fields that read it mapped to its
   columns and its ``rely.at_most_one_match`` key, so a column dropped from a
-  joined table is reported against the table that lost it.
+  joined table is reported against the table that lost it. A joined table that
+  is another view's source is that view's model, which also carries the columns
+  the reading view's fields take from it, keyed ``reading_view.field``.
 - Each measure is one metric named the way the catalog names it
   (``view.measure``), so a removed or rewritten one is its own finding.
 - Each join with key pairs is one relationship with every ordered pair, oriented
@@ -59,7 +61,7 @@ def semantic_layer(
         return SemanticLayerSnapshot(**provenance, declarations={}, notes=notes)
 
     joins = catalog_mod.declared_relationships(loaded, resolved)
-    views = {view.name for view in loaded.views}
+    views = [view.name for view in loaded.views]
     keys: dict[str, list[list[str]]] = {}
     for declared in joins:
         if declared.join.at_most_one_match and declared.key_columns:
@@ -69,6 +71,10 @@ def semantic_layer(
 
     models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
+    #: Columns a view's fields read from a table another view sits on, keyed by
+    #: that view, so the table's own model carries them (qualified by the reading
+    #: view, so they cannot collide with its own fields).
+    borrowed: dict[str, dict[str, str | None]] = {}
     for view in loaded.views:
         dimensions: dict[str, str | None] = {}
         categorical: dict[str, str] = {}
@@ -113,7 +119,16 @@ def semantic_layer(
                 None,
             )
             if other is not None:
-                continue  # that view's own model fingerprints the table
+                # That view's model fingerprints the table and its keys; it also
+                # carries the columns this view's fields read from it, so a
+                # column dropped there is still reported.
+                borrowed.setdefault(other, {}).update(
+                    {
+                        catalog_mod.member_token(view.name, field): column
+                        for field, column in joined.get(join.path, {}).items()
+                    }
+                )
+                continue
             models.append(
                 SemanticModelDef(
                     name=name,
@@ -132,6 +147,11 @@ def semantic_layer(
             )
             for member in view.measures
         )
+
+    by_name = {model.name: model for model in models}
+    for target, columns in borrowed.items():
+        model = by_name[target]
+        model.dimensions = {**model.dimensions, **columns}
 
     relationships = [
         RelationshipDef(
@@ -158,5 +178,6 @@ def semantic_layer(
 
 
 def _hash(definition: Any) -> str:
+    """A content hash of one definition as parsed, keys sorted."""
     text = json.dumps(definition, sort_keys=True, default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

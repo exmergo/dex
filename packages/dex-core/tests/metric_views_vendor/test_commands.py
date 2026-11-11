@@ -25,6 +25,7 @@ from .conftest import ORDERS, repo, view
 
 
 def _run(capsys, root: Path, *argv: str) -> tuple[int, dict]:
+    """Run the CLI against ``root`` and return its exit code and envelope."""
     rc = main(["--repo-root", str(root), *argv])
     return rc, json.loads(capsys.readouterr().out)
 
@@ -34,6 +35,7 @@ def no_network(monkeypatch):
     """Any socket a command opens fails the test: the catalog needs no workspace."""
 
     def refuse(*_args, **_kwargs):
+        """Any socket connect fails the test."""
         raise AssertionError("a Metric View catalog read opened a network connection")
 
     monkeypatch.setattr(socket.socket, "connect", refuse)
@@ -49,6 +51,7 @@ PEOPLE = view(
 
 @pytest.fixture
 def layer(tmp_path: Path) -> Path:
+    """`ORDERS` beside a `people` view with a personal field."""
     return repo(tmp_path, orders=ORDERS, people=PEOPLE)
 
 
@@ -56,6 +59,7 @@ def layer(tmp_path: Path) -> Path:
 
 
 def test_semantic_list_reads_the_layer_with_no_network(layer, capsys, no_network):
+    """With its provenance and declared gaps."""
     rc, envelope = _run(capsys, layer, "explore", "semantic", "list")
 
     assert rc == 0, envelope["errors"]
@@ -71,6 +75,7 @@ def test_semantic_list_reads_the_layer_with_no_network(layer, capsys, no_network
 
 
 def test_the_narrowing_flags_answer(layer, capsys, no_network):
+    """`--metric`, `--for-dimension` and `--search`."""
     rc, by_metric = _run(
         capsys, layer, "explore", "semantic", "list", "--metric", "orders.revenue"
     )
@@ -97,6 +102,7 @@ def test_the_narrowing_flags_answer(layer, capsys, no_network):
 
 
 def test_a_query_is_refused_by_name(layer, capsys, no_network):
+    """Naming #964."""
     rc, envelope = _run(capsys, layer, "explore", "semantic", "query", "orders.revenue")
 
     assert rc != 0
@@ -105,6 +111,7 @@ def test_a_query_is_refused_by_name(layer, capsys, no_network):
 
 
 def test_values_of_a_personal_field_are_refused_as_pii_first(layer, capsys, no_network):
+    """The PII gate speaks before the missing runtime does."""
     rc, envelope = _run(capsys, layer, "explore", "semantic", "values", "people.email")
 
     assert rc != 0
@@ -115,6 +122,7 @@ def test_values_of_a_personal_field_are_refused_as_pii_first(layer, capsys, no_n
 def test_values_of_any_other_field_are_refused_for_want_of_a_runtime(
     layer, capsys, no_network
 ):
+    """Naming #964."""
     rc, envelope = _run(capsys, layer, "explore", "semantic", "values", "people.tier")
 
     assert rc != 0
@@ -122,6 +130,7 @@ def test_values_of_any_other_field_are_refused_for_want_of_a_runtime(
 
 
 def test_an_unreadable_layer_says_which_file(tmp_path, capsys, no_network):
+    """A layer of one refused view names it."""
     root = repo(
         tmp_path, orders=view(fields=[{"name": "x", "expr": "x"}]) | {"version": 0.1}
     )
@@ -137,6 +146,7 @@ def test_an_unreadable_layer_says_which_file(tmp_path, capsys, no_network):
 
 @pytest.fixture
 def warehouse(tmp_path: Path) -> Path:
+    """A DuckDB warehouse with orders and customers, and a view joining them."""
     duckdb = pytest.importorskip("duckdb")
     conn = duckdb.connect(str(tmp_path / "demo.duckdb"))
     conn.execute(
@@ -169,6 +179,7 @@ def warehouse(tmp_path: Path) -> Path:
 
 
 def test_relationships_carry_each_join_at_full_confidence(warehouse, capsys):
+    """Verified, with no orphans."""
     rc, envelope = _run(
         capsys, warehouse, "explore", "relationships", "--use-project", "--verify"
     )
@@ -189,6 +200,7 @@ def test_relationships_carry_each_join_at_full_confidence(warehouse, capsys):
 
 
 def test_map_carries_the_join_and_the_semantic_model(warehouse, capsys):
+    """And the `rely` key as the joined table's grain."""
     rc, envelope = _run(capsys, warehouse, "explore", "map", "--use-project")
 
     assert rc == 0, envelope["errors"]
@@ -202,6 +214,7 @@ def test_map_carries_the_join_and_the_semantic_model(warehouse, capsys):
 
 
 def test_maintain_snapshot_fingerprints_the_layer(warehouse, capsys):
+    """Vendor, spec version, joined tables, keys and arity."""
     rc, envelope = _run(capsys, warehouse, "maintain", "snapshot")
 
     assert rc == 0, envelope["errors"]
@@ -218,6 +231,7 @@ def test_maintain_snapshot_fingerprints_the_layer(warehouse, capsys):
 
 
 def test_a_removed_measure_is_reported_as_definition_drift(warehouse, capsys):
+    """Against the snapshot."""
     assert _run(capsys, warehouse, "maintain", "snapshot")[0] == 0
     path = warehouse / "views" / "orders.yaml"
     body = yaml.safe_load(path.read_text())
@@ -330,3 +344,41 @@ def test_search_finds_a_field_and_a_measure_by_their_synonyms(
     )
     assert rc == 0, by_measure["errors"]
     assert [m["name"] for m in by_measure["data"]["metrics"]] == ["orders.revenue"]
+
+
+def test_a_column_a_view_reads_from_another_views_table_is_reported_when_dropped(
+    warehouse, capsys
+):
+    """`orders.region` reads `customers.region` through a join to a table the
+    `customers` view sits on; dropping the column is still a dangling reference."""
+
+    duckdb = pytest.importorskip("duckdb")
+    customers = view(
+        "demo.main.customers", fields=[{"name": "key", "expr": "customer_key"}]
+    )
+    (warehouse / "views" / "customers.yaml").write_text(
+        yaml.safe_dump(customers), encoding="utf-8"
+    )
+    config = warehouse / ".dex" / "config.yml"
+    config.write_text(
+        config.read_text().replace(
+            "      - views/orders.yaml\n",
+            "      - views/orders.yaml\n      - views/customers.yaml\n",
+        ),
+        encoding="utf-8",
+    )
+    assert _run(capsys, warehouse, "explore", "map")[0] == 0
+    assert _run(capsys, warehouse, "maintain", "snapshot")[0] == 0
+    conn = duckdb.connect(str(warehouse / "demo.duckdb"))
+    conn.execute("ALTER TABLE customers DROP COLUMN region")
+    conn.close()
+    assert _run(capsys, warehouse, "explore", "map", "--refresh")[0] == 0
+
+    rc, envelope = _run(capsys, warehouse, "maintain", "semantic")
+
+    assert rc == 0, envelope["errors"]
+    dangling = [
+        f for f in envelope["data"]["findings"] if f["code"] == "dangling_reference"
+    ]
+    assert dangling, envelope["data"]["findings"]
+    assert "region" in json.dumps(dangling)

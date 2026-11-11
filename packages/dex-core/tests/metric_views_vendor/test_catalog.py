@@ -15,14 +15,17 @@ from .conftest import ORDERS, source, view
 
 @pytest.fixture
 def orders(tmp_path: Path):
+    """The `ORDERS` star as a source."""
     return source(tmp_path, orders=ORDERS)
 
 
 def _by(items, key="name"):
+    """``items`` keyed by one attribute."""
     return {getattr(item, key): item for item in items}
 
 
 def test_a_view_is_one_semantic_model_on_its_source(orders):
+    """The model, its relation and description, and the naming note."""
     catalog = orders.semantic_catalog()
 
     (model,) = catalog.semantic_models
@@ -33,6 +36,7 @@ def test_a_view_is_one_semantic_model_on_its_source(orders):
 
 
 def test_each_field_names_the_column_behind_it_only_on_the_views_relation(orders):
+    """Joined and computed fields claim no column; the PII gate still reaches theirs."""
     catalog = orders.semantic_catalog()
     rows = _by(catalog.dimensions, "definition")
 
@@ -55,6 +59,7 @@ def test_each_field_names_the_column_behind_it_only_on_the_views_relation(orders
 
 
 def test_the_metadata_a_field_carries(orders):
+    """Label, description, synonyms, the join it reads, and `time` from `format`."""
     rows = _by(orders.semantic_catalog().dimensions, "definition")
 
     status = rows["status"]
@@ -69,6 +74,7 @@ def test_the_metadata_a_field_carries(orders):
 
 
 def test_measures_and_metrics_by_shape(orders):
+    """Aggregates are measures and simple metrics; compositions are ratio or derived."""
     catalog = orders.semantic_catalog()
     measures = _by(catalog.measures)
     metrics = _by(catalog.metrics)
@@ -100,6 +106,7 @@ def test_measures_and_metrics_by_shape(orders):
 
 
 def test_the_view_filter_rides_on_every_metric_and_a_measure_filter_beside_it(orders):
+    """A view `filter` is on each metric, ANDed with a measure's own `FILTER`."""
     metrics = _by(orders.semantic_catalog().metrics)
 
     assert metrics["orders.revenue"].filter == "status != 'cancelled'"
@@ -107,6 +114,7 @@ def test_the_view_filter_rides_on_every_metric_and_a_measure_filter_beside_it(or
 
 
 def test_a_metric_groups_by_its_views_fields(orders):
+    """Groupable tokens are the view's own fields, in order."""
     metrics = _by(orders.semantic_catalog().metrics)
 
     assert metrics["orders.revenue"].dimensions == [
@@ -120,6 +128,7 @@ def test_a_metric_groups_by_its_views_fields(orders):
 
 
 def test_each_join_is_a_declared_relationship_child_to_parent(orders):
+    """Including a nested join, and a `one_to_many` join turned round."""
     declared = orders.declared_definitions()
     rows = {r.name: r for r in declared.declared_relationships}
 
@@ -143,6 +152,7 @@ def test_each_join_is_a_declared_relationship_child_to_parent(orders):
 
 
 def test_rely_is_a_declared_key_on_the_joined_side_and_nothing_else(orders):
+    """A unique key, never primary, and only where `rely` says so."""
     declared = orders.declared_definitions()
 
     assert [
@@ -153,6 +163,7 @@ def test_rely_is_a_declared_key_on_the_joined_side_and_nothing_else(orders):
 
 
 def test_a_join_to_another_views_source_is_that_view(tmp_path: Path):
+    """The join's far side, its key and its read columns land on that view."""
     customers = view("demo.main.customers", fields=[{"name": "id", "expr": "id"}])
     layer = source(tmp_path, orders=ORDERS, customers=customers)
 
@@ -163,11 +174,18 @@ def test_a_join_to_another_views_source_is_that_view(tmp_path: Path):
     fingerprint = {m.name: m for m in layer.semantic_layer().semantic_models}
     assert fingerprint["customers"].keys == [["id"]]
     assert "orders.customer" not in fingerprint
+    # The column `orders.customer_name` reads from that table is fingerprinted
+    # on the table's own model, so dropping it is still reported.
+    assert fingerprint["customers"].dimensions == {
+        "id": "id",
+        "orders.customer_name": "name",
+    }
 
 
 def test_a_join_condition_that_is_not_key_pairs_declares_no_relationship(
     tmp_path: Path,
 ):
+    """A range join is named in a note, not guessed into pairs."""
     body = view(
         joins=[
             {
@@ -187,6 +205,7 @@ def test_a_join_condition_that_is_not_key_pairs_declares_no_relationship(
 def test_a_projection_query_source_is_its_table_and_a_filtered_one_is_not(
     tmp_path: Path,
 ):
+    """Projection, filtered and joined query sources."""
     projected = view(
         "SELECT order_id, amount_usd AS amount FROM demo.main.orders",
         fields=[{"name": "order_id", "expr": "order_id"}],
@@ -218,6 +237,7 @@ def test_a_projection_query_source_is_its_table_and_a_filtered_one_is_not(
 
 
 def test_a_field_reading_an_earlier_field_resolves_through_it(tmp_path: Path):
+    """A bare name matching an earlier field is that field."""
     body = view(
         fields=[
             {"name": "buyer", "expr": "customer_id"},
@@ -243,6 +263,7 @@ def test_a_field_reading_an_earlier_field_resolves_through_it(tmp_path: Path):
 def test_names_are_folded_the_way_the_connector_folds_them(
     tmp_path: Path, connector, relation, column
 ):
+    """Snowflake upper-cases, Databricks lower-cases, BigQuery keeps case."""
     body = view("demo.MAIN.Orders", fields=[{"name": "status", "expr": "Status"}])
     catalog = source(tmp_path, connector=connector, orders=body).semantic_catalog()
 
@@ -251,6 +272,7 @@ def test_names_are_folded_the_way_the_connector_folds_them(
 
 
 def test_a_partial_source_name_claims_no_relation_and_says_why(tmp_path: Path):
+    """The PII gate still matches it by suffix."""
     body = view("orders", fields=[{"name": "x", "expr": "x"}])
     catalog = source(tmp_path, orders=body).semantic_catalog()
 
@@ -262,6 +284,7 @@ def test_a_partial_source_name_claims_no_relation_and_says_why(tmp_path: Path):
 def test_parameters_materialization_and_partition_are_named_not_modelled(
     tmp_path: Path,
 ):
+    """Each is carried, noted, and never a measure."""
     body = view(
         parameters=[{"name": "region", "data_type": "string", "default": "'EU'"}],
         materialization={
@@ -293,6 +316,7 @@ def test_parameters_materialization_and_partition_are_named_not_modelled(
 
 
 def test_the_fingerprint_keeps_each_joined_tables_columns_and_key(orders):
+    """Joined tables are their own models; joins are many_to_one."""
     layer = orders.semantic_layer()
     models = {m.name: m for m in layer.semantic_models}
 
@@ -318,6 +342,7 @@ def test_the_fingerprint_keeps_each_joined_tables_columns_and_key(orders):
 
 
 def test_a_changed_measure_changes_its_hash_and_nothing_else(tmp_path: Path):
+    """One measure edited, one metric hash moved."""
     first = {
         m.name: m.content_sha256
         for m in source(tmp_path, orders=ORDERS).semantic_layer().metrics
@@ -343,11 +368,13 @@ def test_a_changed_measure_changes_its_hash_and_nothing_else(tmp_path: Path):
     ],
 )
 def test_join_conditions_read_as_ordered_pairs(on, pairs):
+    """Either side order; anything but key equalities names no pairs."""
     found, _ = lineage.join_pairs(on, None, "c", ("c",), (("source",),))
     assert found == pairs
 
 
 def test_a_nested_join_names_its_parent_by_name_or_path():
+    """`customer.c_nationkey = nation.n_nationkey` under `customer`."""
     found, _ = lineage.join_pairs(
         "customer.c_nationkey = nation.n_nationkey",
         None,
