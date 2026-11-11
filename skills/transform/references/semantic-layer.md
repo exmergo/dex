@@ -165,6 +165,15 @@ after their column from declared aggregations, population and units in
 `declarations`, which annotate a cube the payload or the layer defines, rewriting
 only that cube's entry. See [declarations.md](declarations.md#cube-semanticvendor-cube).
 
+## Databricks Metric Views: not authored yet
+
+Under `semantic.vendor: databricks`, Dex reads the configured Metric View YAML files
+and does not author them yet (#1258): there is no `semantic databricks` subcommand,
+and `transform plan` derives no Metric View from a declared mart. An edit to a view
+is a direct edit to its file; read it back with `explore semantic list`, which
+validates it with the same port of the YAML 1.1 rules, and never deploy it from
+here (`CREATE VIEW ... WITH METRICS` is outside Dex).
+
 ## SLayer models: `semantic slayer define|update|plan`
 
 Under `semantic.vendor: slayer`, the configured SLayer model files are the

@@ -293,6 +293,39 @@ def test_the_cube_extra_follows_the_configured_vendor(wrapper, argv, vendor, exp
 
 
 @pytest.mark.parametrize(
+    ("argv", "vendor", "expected"),
+    [
+        (
+            ["explore", "semantic", "list"],
+            "databricks",
+            ["ossie", "metric-views", "semantic-api"],
+        ),
+        # A Metric View query is SQL over the view: MetricFlow is never installed.
+        (
+            ["explore", "semantic", "query", "orders.revenue"],
+            "databricks",
+            ["ossie", "metric-views", "semantic-api"],
+        ),
+        (["maintain", "grain"], "databricks", ["metric-views"]),
+        (
+            ["explore", "profile", "a.b.c", "--use-project"],
+            "databricks",
+            ["metric-views"],
+        ),
+        (["transform", "apply"], "databricks", ["metric-views"]),
+        # Not for a command that reads no layer, and never from the connector name.
+        (["explore", "inventory"], "databricks", []),
+        (["explore", "map"], "databricks", []),
+        (["maintain", "grain"], "dbt", []),
+    ],
+)
+def test_the_metric_views_extra_follows_the_configured_vendor(
+    wrapper, argv, vendor, expected
+):
+    assert wrapper._feature_extras(argv, vendor) == expected
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("semantic:\n  vendor: slayer\n", "slayer"),

@@ -437,6 +437,24 @@ A measure whose `filters` read a dropped column goes with the column rather than
 losing its filter, because a filter removed quietly changes what the number
 counts.
 
+## Databricks Metric View layers (`semantic.vendor: databricks`)
+
+Every layer-neutral axis runs on a Metric View layer, beside a dbt project or with
+none, without a workspace connection to read it: each reads the configured files
+and the metadata Dex captured through its own connection. The wrapper installs the
+`[metric-views]` extra for every `maintain` command where the vendor is
+`databricks`.
+
+| Axis | On Metric Views |
+|---|---|
+| `snapshot` | fingerprints each view, each joined table that is not another view's source (`view.join.path`, with the fields that read it and its `rely` key), each measure (as `view.measure`), and each join with its ordered pairs, oriented child to parent; records `vendor: databricks`, `format_version: 1.1` and the ported converter commit |
+| `schema` | unchanged: no vendor schema axis yet (#1259) |
+| `volume` | unchanged: it reads the warehouse, not the layer |
+| `grain` | measures each `rely.at_most_one_match` key (`declared_grain_not_unique`) and each join's declared arity (`join_cardinality_exceeded`, a `many_to_one` join whose joined side is not unique, `rely` or not) |
+| `semantic` | definition drift free as everywhere: a view, measure or join added, removed or changed, and a field reading a column the warehouse no longer has |
+| `reconcile` | advisory only: there is no `semantic databricks update` route yet (#1258) |
+| `verify` | checks the dbt project only |
+
 ## SLayer layers (`semantic.vendor: slayer`)
 
 Every axis runs on a SLayer layer, and none opens a SLayer datasource or SLayer

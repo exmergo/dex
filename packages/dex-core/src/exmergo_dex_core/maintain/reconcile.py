@@ -73,18 +73,36 @@ _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_c
 _MECHANICAL = {"column_added", "column_dropped", "nullability_changed"}
 
 
-def _semantic_update_command(vendor: str | None) -> str:
+def _semantic_update_command(vendor: str | None) -> str | None:
     """Authoring command for the configured semantic vendor (#974).
 
     MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer and Cube each have
     their own ``semantic <vendor> update`` route; naming the dbt command under
-    those vendors sends the operator to the wrong place.
+    those vendors sends the operator to the wrong place. ``None`` for a vendor
+    dex reads but does not author yet (Databricks Metric Views, #1258): there is
+    no route to name.
     """
+
+    from ..config import SEMANTIC_DOCUMENT_AUTHORING
 
     name = (vendor or "dbt").lower()
     if name == "dbt":
         return "semantic update"
+    if name not in SEMANTIC_DOCUMENT_AUTHORING:
+        return None
     return f"semantic {name} update"
+
+
+def _semantic_update_hint(vendor: str | None) -> str:
+    """How to update a semantic definition, for an advisory proposal."""
+
+    command = _semantic_update_command(vendor)
+    if command is None:
+        return (
+            "edit the semantic definition in its file (dex does not author the "
+            f"{(vendor or '').lower()} layer yet)"
+        )
+    return f"update the semantic definition with `{command}`"
 
 
 def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
@@ -420,9 +438,8 @@ def _advisory(
             "judge it against a before"
         ),
         "dangling_reference": (
-            "update the semantic definition with `"
-            + _semantic_update_command(semantic_vendor)
-            + "`, or restore the model/column it references"
+            _semantic_update_hint(semantic_vendor)
+            + ", or restore the model/column it references"
         ),
         "join_cardinality_exceeded": (
             "the semantic layer declares an arity this join does not have, so "

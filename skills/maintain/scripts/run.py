@@ -318,8 +318,16 @@ _SLAYER_VENDOR = "slayer"
 _CUBE_COMMANDS = (("semantic", "cube"),)
 _CUBE_VENDOR = "cube"
 
+# Databricks Metric Views follow the same config read for the same commands, for
+# Cube's reason: `metric-views` is the dialect engine and nothing heavier, named
+# so the commands that read a Metric View layer keep resolving what it needs as
+# the extra grows. A Metric View query is SQL over the view, so MetricFlow is
+# never installed for one. (`databricks` is also a connector name; the
+# connector's extra is resolved from `connector:`, never from this.)
+_METRIC_VIEWS_VENDOR = "databricks"
+
 # The vendors that render a metric query without MetricFlow.
-_RENDERS_WITHOUT_METRICFLOW = (_SLAYER_VENDOR, _CUBE_VENDOR)
+_RENDERS_WITHOUT_METRICFLOW = (_SLAYER_VENDOR, _CUBE_VENDOR, _METRIC_VIEWS_VENDOR)
 
 
 def _positionals(argv: list[str]) -> list[str]:
@@ -372,7 +380,8 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     `_SLAYER_COMMANDS`). The same read keeps MetricFlow out of a SLayer `query` or
     `values`: SLayer renders those itself, so `semantic` would be installed for
     nothing. `cube` follows the same read for the same commands (see
-    `_CUBE_VENDOR`), and keeps MetricFlow out the same way.
+    `_CUBE_VENDOR`), and keeps MetricFlow out the same way, and so does
+    `metric-views` (see `_METRIC_VIEWS_VENDOR`).
     """
 
     positionals = _positionals(argv)
@@ -390,6 +399,8 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
         extras.append("slayer")
     if command in _CUBE_COMMANDS or (vendor == _CUBE_VENDOR and reads_layer):
         extras.append("cube")
+    if vendor == _METRIC_VIEWS_VENDOR and reads_layer:
+        extras.append("metric-views")
     if command in _SEMANTIC_AUTHORING_COMMANDS:
         extras.append("semantic")
     if command != ("explore", "semantic"):
