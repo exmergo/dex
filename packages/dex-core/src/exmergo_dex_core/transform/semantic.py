@@ -41,6 +41,7 @@ from ..dbt_project import (
     content_hash,
     metric_inputs,
 )
+from ..yaml_spans import uses_anchors_or_aliases
 from .validate import EditValidationError
 
 
@@ -907,7 +908,19 @@ def _reject_unspannable(path: str, text: str) -> None:
             f"{path}: the file holds more than one YAML document; a definition "
             "edit cannot tell which one to write into, use --edits-file"
         )
-    if re.search(r"(^|[\s:\[{,])[&*][A-Za-z0-9_][^\s]*", text):
+    # From the parse, not the text: `*active*` in a comment or a description is
+    # emphasis, and refusing on it sent every such file to a whole-file edit.
+    try:
+        aliased = uses_anchors_or_aliases(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = f" at line {mark.line + 1}" if mark is not None else ""
+        raise EditValidationError(
+            f"{path}: the file does not parse as YAML{where}, so the definition "
+            "editor cannot tell where one definition ends; fix it, or use "
+            "--edits-file"
+        ) from None
+    if aliased:
         raise EditValidationError(
             f"{path}: the file uses YAML anchors or aliases, whose expansion the "
             "definition editor does not track; use --edits-file"

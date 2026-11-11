@@ -1661,7 +1661,9 @@ default, or a filter or operator after it is refused. A key naming a location
   re-parses the result and compares it against what was sent. A file whose
   layout it cannot span safely (a flow-style sequence, anchors or aliases,
   multiple documents, tab indentation) is refused with `--edits-file` named as
-  the way to edit it. Classification is scoped to the definitions named, so a
+  the way to edit it. Anchors and aliases are read from the YAML parse, so
+  `*emphasis*` in a comment or a description does not count as one, and a file
+  that does not parse is refused saying so. Classification is scoped to the definitions named, so a
   spliced file's other definitions are reported in no class at all. Names
   implicitly created by `create_metric: true` measures count as existing metrics
   everywhere. Beyond MetricFlow's schemas, the engine

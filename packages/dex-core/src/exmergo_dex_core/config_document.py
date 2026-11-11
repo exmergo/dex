@@ -38,7 +38,12 @@ from .envelope import redact, secret_like
 from .errors import ConfigurationError, RequestError
 from .storage import DEX_DIR
 from .values_free import caller_only_message
-from .yaml_spans import before_trailing_blanks, block_end, indent_of
+from .yaml_spans import (
+    before_trailing_blanks,
+    block_end,
+    indent_of,
+    uses_anchors_or_aliases,
+)
 
 CONFIG_RELPATH = f"{DEX_DIR}/{CONFIG_FILE}"
 
@@ -846,12 +851,11 @@ class ConfigDocument:
             raise ConfigEditError(
                 f"{CONFIG_RELPATH} holds no mapping of settings to edit; fix it by hand"
             )
-        for event in yaml.parse(self.text, Loader=yaml.SafeLoader):
-            if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None):
-                raise ConfigEditError(
-                    f"{CONFIG_RELPATH} uses a YAML anchor or alias, so one edit "
-                    "could change a value in two places; edit it by hand"
-                )
+        if uses_anchors_or_aliases(self.text):
+            raise ConfigEditError(
+                f"{CONFIG_RELPATH} uses a YAML anchor or alias, so one edit "
+                "could change a value in two places; edit it by hand"
+            )
         for line in self.text.splitlines():
             if "\t" in line[: len(line) - len(line.lstrip(" \t"))]:
                 raise ConfigEditError(

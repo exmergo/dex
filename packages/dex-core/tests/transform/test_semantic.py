@@ -1246,6 +1246,144 @@ def test_definition_edit_refuses_a_file_it_cannot_span(
     assert "--edits-file" in envelope["errors"][0]
 
 
+_EMPHASIS_YAML = """\
+# see the *column* descriptions before editing
+semantic_models:
+  - name: customers
+    description: Customer grain, *active* and churned alike.
+    model: ref('stg_customers')
+    defaults:
+      agg_time_dimension: signup_date
+    entities:
+      - name: customer
+        type: primary
+        expr: id
+    dimensions:
+      - name: signup_date
+        type: time
+        expr: cast('2020-01-01' as date)
+        type_params:
+          time_granularity: day
+    measures:
+      - name: customer_count
+        agg: count
+        expr: id
+
+metrics:
+  - name: customer_count
+    label: Customer count
+    description: counts *active* users & churned ones
+    type: simple
+    type_params:
+      measure: customer_count
+"""
+
+
+def test_definition_edit_reads_emphasis_as_text_not_as_an_alias(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#1255: `*word*` in a comment or a description is Markdown, not YAML.
+
+    Read as text it looked like an alias, so every hand-written file that
+    emphasised a word was refused and the caller rewrote the whole file to
+    change one definition. The parse knows the difference.
+    """
+
+    _land_baseline(tmp_path, capsys, _EMPHASIS_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [
+            {
+                "kind": "metric",
+                "content": (
+                    "name: customer_count\n"
+                    "label: Count of customers\n"
+                    "description: counts *active* users & churned ones\n"
+                    "type: simple\n"
+                    "type_params:\n"
+                    "  measure: customer_count\n"
+                ),
+            }
+        ],
+        "emphasis.json",
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["updated"] == ["customer_count"]
+    changed = [
+        line
+        for line in envelope["diffs"][0]["unified"].splitlines()
+        if line[:1] in {"+", "-"} and not line.startswith(("+++", "---"))
+    ]
+    assert changed == ["-    label: Customer count", "+    label: Count of customers"]
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "version: 2\n\n_measure: &measure customer_count\nmetrics:\n"
+        "  - name: aliased_metric\n    type: simple\n    type_params:\n"
+        "      measure: *measure\n",
+        "version: 2\n\n_base: &base {type: simple}\nmetrics:\n"
+        "  - name: aliased_metric\n    <<: *base\n    type_params:\n"
+        "      measure: customer_count\n",
+    ],
+    ids=["alias", "merge_key"],
+)
+def test_definition_edit_still_refuses_a_real_anchor(
+    dbt_project_dir: Path, tmp_path: Path, capsys, layout: str
+):
+    """The fix narrows what counts as an alias; it does not stop refusing one."""
+
+    _land_baseline(tmp_path, capsys)
+    (dbt_project_dir / "models" / "semantic" / "aliased.yml").write_text(
+        layout, encoding="utf-8"
+    )
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [
+            {
+                "kind": "metric",
+                "content": (
+                    "name: aliased_metric\n"
+                    "label: Renamed\n"
+                    "type: simple\n"
+                    "type_params:\n"
+                    "  measure: customer_count\n"
+                ),
+                "path": "models/semantic/aliased.yml",
+            }
+        ],
+        "aliased.json",
+    )
+    assert rc == 1
+    assert "anchors or aliases" in envelope["errors"][0]
+    assert "--edits-file" in envelope["errors"][0]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# see the *column* descriptions\nsemantic_models: []\n",
+        "metrics:\n  - name: m\n    description: counts *active* users\n",
+        "metrics:\n  - name: m\n    description: '*quoted* & kept'\n",
+        "# * a bullet, & an ampersand\nmetrics: []\n",
+    ],
+)
+def test_unspannable_check_ignores_emphasis(text: str):
+    from exmergo_dex_core.transform.semantic import _reject_unspannable
+
+    _reject_unspannable("m.yml", text)
+
+
+def test_unspannable_check_names_a_file_that_does_not_parse():
+    from exmergo_dex_core.transform.semantic import _reject_unspannable
+
+    with pytest.raises(EditValidationError, match="does not parse as YAML at line"):
+        _reject_unspannable("m.yml", "metrics: [\n  - name: m\n")
+
+
 def test_definition_payload_reads_the_name_from_the_content(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

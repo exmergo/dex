@@ -683,6 +683,59 @@ def test_a_declarations_file_dex_cannot_span_stays_advisory(sidecar_repo):
     assert not payload.get("diffs")
 
 
+def test_emphasis_in_a_declarations_file_is_not_read_as_an_alias(sidecar_repo):
+    """#1255: `*active*` in a description is Markdown, and the edit stays mechanical.
+
+    The text scan that looked for aliases matched emphasis too, so a sidecar
+    whose description stressed a word had every edit downgraded to advice.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(
+        "version: 2\n"
+        "# see the *column* notes\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    description: One row per *placed* order.\n"
+        "    columns:\n"
+        "      - name: order_id\n",
+        encoding="utf-8",
+    )
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0 and payload["status"] == "ok", payload.get("errors")
+    mechanical = [p for p in payload["data"]["proposals"] if p["kind"] == "mechanical"]
+    assert mechanical, payload["data"]["proposals"]
+    assert mechanical[0]["paths"] == [_SIDECAR]
+    diff = next(d for d in payload.get("diffs") or [] if d["path"] == _SIDECAR)
+    assert "discount" in diff["unified"]
+
+
+def test_a_declarations_file_with_a_real_alias_stays_advisory(sidecar_repo):
+    (sidecar_repo.root / _SIDECAR).write_text(
+        "version: 2\n"
+        "_desc: &desc One row per order.\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    description: *desc\n"
+        "    columns:\n"
+        "      - name: order_id\n",
+        encoding="utf-8",
+    )
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    added = next(
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "column_added"
+    )
+    assert added["kind"] == "advisory"
+    assert "anchors or aliases" in added["action"]
+    assert not payload.get("diffs")
+
+
 def test_a_column_dropped_by_drift_gets_no_unique_test_proposed_on_it(sidecar_repo):
     """The two axes disagree about a column, and the removal wins.
 

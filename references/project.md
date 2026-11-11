@@ -427,7 +427,8 @@ A blank line between two entries stays wherever the edit happens beside it. A te
 is counted and never rewritten, so a configured `accepted_values` survives an edit to
 the plain names beside it. A file dex cannot span safely, one indented with tabs, one
 holding several YAML documents, or one using anchors and aliases, is declined by name
-rather than spliced at an offset nobody chose. Every result is re-parsed and compared
+rather than spliced at an offset nobody chose. Anchors and aliases are read from the
+YAML parse, so `*emphasis*` in a comment or a description is not one. Every result is re-parsed and compared
 against what the edit intended before it can reach the plan store.
 
 **A table that drifted on two axes arrives as one edit.** Schema drift and a lost
