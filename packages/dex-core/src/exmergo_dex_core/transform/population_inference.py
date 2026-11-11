@@ -137,12 +137,13 @@ class KeyFacts:
         if all(existing != key for existing, _ in entries):
             entries.append((key, source))
 
-    def known_keys(self) -> dict[str, list[list[str]]]:
-        """Each node's stated unique keys, in the shape :func:`.drafting.read`
-        takes, so a grain carried from a tested key is read without a cache."""
+    def known_keys(self) -> dict[str, list[tuple[list[str], str]]]:
+        """Each node's stated unique keys with their sources, in the shape
+        :func:`.drafting.read` takes, so a grain carried from a tested or
+        declared key is read without a cache."""
 
         return {
-            name: [sorted(key) for key, _source in keys]
+            name: [(sorted(key), source) for key, source in keys]
             for name, keys in self.unique.items()
         }
 
@@ -163,16 +164,24 @@ def key_facts(*definitions: ProjectDefinitions | None) -> KeyFacts:
     for defs in definitions:
         if defs is None:
             continue
-        for key in defs.declared_keys:
-            if key.unique or key.primary:
-                facts.add_unique(_base(key.model), [key.column], "a unique test")
+        for model, grain in defs.declared_grains.items():
+            facts.add_unique(_base(model), grain, "its declared grain")
         for composite in defs.declared_composite_keys:
             if composite.claim in ("primary", "combination"):
                 facts.add_unique(
-                    _base(composite.model), composite.columns, "a combination test"
+                    _base(composite.model),
+                    composite.columns,
+                    "a unique_combination_of_columns test"
+                    if composite.claim == "combination"
+                    else "a primary key",
                 )
-        for model, grain in defs.declared_grains.items():
-            facts.add_unique(_base(model), grain, "its declared grain")
+        for key in defs.declared_keys:
+            if key.unique or key.primary:
+                facts.add_unique(
+                    _base(key.model),
+                    [key.column],
+                    "a primary key" if key.primary else "a unique test",
+                )
         for model, column in defs.primary_entities.items():
             facts.add_unique(_base(model), [column], "its primary entity")
         for fk in defs.foreign_keys:
