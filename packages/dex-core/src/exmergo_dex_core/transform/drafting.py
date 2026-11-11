@@ -752,7 +752,7 @@ class _Lineage:
             if kind == "generated":
                 parentless = True
                 continue
-            if kind == "physical" and target and target not in named:
+            if kind in {"physical", "ref"} and target and target not in named:
                 named.append(target)
         if any(True for _ in self.tree.find_all(exp.Values)):
             parentless = True
@@ -795,10 +795,10 @@ class _Lineage:
                 kind, target = self.target(relation)
                 if kind == "scope":
                     pending.append(target)
-                elif kind == "physical":
+                elif kind in {"physical", "ref"}:
                     if target not in reading.driving:
                         reading.driving.append(target)
-                    literal = relation.name not in self.relations
+                    literal = kind == "physical"
                     if literal and target not in reading.driving_literal:
                         reading.driving_literal.append(target)
                 elif relation is driving:
@@ -922,7 +922,7 @@ class _Lineage:
             if not name and not relation.db and not relation.catalog:
                 return "generated", None
             if not relation.db and name in self.relations:
-                return "physical", self.relations[name]
+                return "ref", self.relations[name]
             if not relation.db and name.lower() in self.ctes:
                 return "scope", self.ctes[name.lower()]
             return "physical", ".".join(
@@ -935,8 +935,9 @@ class _Lineage:
         if kind == "scope":
             outputs = self.outputs(target)
             return None if outputs is None else list(outputs)
-        if kind == "physical":
-            dataset = dataset_for(self.cache, target, manifest=self.manifest)
+        if kind in {"physical", "ref"}:
+            manifest = self.manifest if kind == "ref" else None
+            dataset = dataset_for(self.cache, target, manifest=manifest)
             if dataset is not None and dataset.columns:
                 return [column.name for column in dataset.columns]
         return None
@@ -1056,7 +1057,7 @@ class _Lineage:
         _alias, relation, join = found
         outer = self.outer_join(select, join)
         kind, target = self.target(relation)
-        if kind == "physical":
+        if kind in {"physical", "ref"}:
             return _Origin(target, node.name, outer)
         if kind != "scope":
             return None
@@ -1261,9 +1262,10 @@ class _Lineage:
             return self.keys(target, depth + 1)
         if kind == "generated":
             return [], "it is generated in SQL, so no key of it is proven"
-        if kind != "physical":
+        if kind not in {"physical", "ref"}:
             return [], "its driving relation is not one dex can follow"
-        dataset = dataset_for(self.cache, target, manifest=self.manifest)
+        manifest = self.manifest if kind == "ref" else None
+        dataset = dataset_for(self.cache, target, manifest=manifest)
         stated = self.known_keys.get(target.rsplit(".", 1)[-1].lower())
         if (dataset is None or not dataset.columns or not proven_keys(dataset)) and (
             stated
@@ -1360,7 +1362,7 @@ class _Lineage:
 
     def _display(self, relation: Any) -> str:
         kind, target = self.target(relation)
-        if kind == "physical":
+        if kind in {"physical", "ref"}:
             return target
         return relation.alias_or_name or "a subquery"
 
@@ -1613,13 +1615,18 @@ def _manifest_model_relations(
     manifest: Mapping[str, Any] | None,
 ) -> dict[str, str]:
     """Map lowercased model, seed, or snapshot names and aliases to their
-    stripped relation_name from the compiled manifest (#989)."""
+    stripped relation_name from the compiled manifest (#989).
+
+    Model names take precedence over physical aliases, and colliding entries
+    for the same name or alias across multiple nodes are omitted as ambiguous.
+    """
     if not manifest or not isinstance(manifest, Mapping):
         return {}
     nodes = manifest.get("nodes")
     if not isinstance(nodes, Mapping):
         return {}
-    out: dict[str, str] = {}
+    name_to_rels: dict[str, set[str]] = {}
+    alias_to_rels: dict[str, set[str]] = {}
     for node in nodes.values():
         if not isinstance(node, Mapping):
             continue
@@ -1629,10 +1636,18 @@ def _manifest_model_relations(
         stripped = strip_relation_quoting(rel)
         name = node.get("name")
         if isinstance(name, str) and name:
-            out.setdefault(name.lower(), stripped)
+            name_to_rels.setdefault(name.lower(), set()).add(stripped)
         alias = node.get("alias")
         if isinstance(alias, str) and alias:
-            out.setdefault(alias.lower(), stripped)
+            alias_to_rels.setdefault(alias.lower(), set()).add(stripped)
+
+    out: dict[str, str] = {}
+    for name, rels in name_to_rels.items():
+        if len(rels) == 1:
+            out[name] = next(iter(rels))
+    for alias, rels in alias_to_rels.items():
+        if alias not in out and alias not in name_to_rels and len(rels) == 1:
+            out[alias] = next(iter(rels))
     return out
 
 
@@ -1776,9 +1791,19 @@ def _drafted(
     if columns:
         drafted["columns"] = columns
 
+    ref_models = set(reading.tokens.values())
+
     domains = []
     for (relation, column), clauses in sorted(reading.used.items()):
-        entry = _domain(relation, column, clauses, cache, domain_cap, manifest=manifest)
+        is_ref = relation in ref_models
+        entry = _domain(
+            relation,
+            column,
+            clauses,
+            cache,
+            domain_cap,
+            manifest=manifest if is_ref else None,
+        )
         if entry is not None:
             domains.append(entry)
     if domains:
@@ -1786,14 +1811,19 @@ def _drafted(
 
     inputs = []
     for relation in reading.relations:
+        is_ref = relation in ref_models
         dataset = _dataset_for_model(
-            cache, relation, files, model_paths, manifest=manifest
+            cache,
+            relation,
+            files,
+            model_paths,
+            manifest=manifest if is_ref else None,
         )
         entry: dict[str, Any] = {"relation": relation}
         if dataset is not None and dataset.columns:
             entry["profiled"] = True
             entry["identifier"] = dataset.identifier
-            if cache is not None and manifest:
+            if is_ref and cache is not None and manifest:
                 ambiguous = match_identifier(
                     relation, [d.identifier for d in cache.datasets]
                 )
@@ -1913,8 +1943,13 @@ def _column_facts(
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if origin is not None:
+        is_ref = origin.relation in reading.tokens.values()
         dataset = _dataset_for_model(
-            cache, origin.relation, files, model_paths, manifest=manifest
+            cache,
+            origin.relation,
+            files,
+            model_paths,
+            manifest=manifest if is_ref else None,
         )
         profile = _column(dataset, origin.column)
         source: str | None = f"{origin.relation}.{origin.column}"
@@ -2415,11 +2450,14 @@ def _literal_warnings(
 
     out: list[str] = []
     seen: set[tuple[str, str, str]] = set()
+    ref_models = set(reading.tokens.values())
     for usage in reading.usages:
         if not usage.literals:
             continue
+        is_ref = usage.relation in ref_models
         profile = _column(
-            dataset_for(cache, usage.relation, manifest=manifest), usage.column
+            dataset_for(cache, usage.relation, manifest=manifest if is_ref else None),
+            usage.column,
         )
         if profile is None or profile.pii is not None:
             continue

@@ -984,6 +984,67 @@ def test_an_ambiguous_input_with_manifest_matching_no_candidate_keeps_unprofiled
     assert "no profile run can settle which one it means" in missing_input["reason"]
 
 
+def test_literal_table_does_not_inherit_manifest_relation():
+    """#989: literal table name does not resolve through compiled manifest."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from stg_orders\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [input_entry] = entry["drafted"]["inputs"]
+    assert input_entry["profiled"] is False
+    assert "resolved through the compiled manifest" not in input_entry.get(
+        "evidence", ""
+    )
+    assert "no profile run can settle which one it means" in input_entry["reason"]
+
+
+def test_model_names_resolve_before_aliases_and_collisions_remain_ambiguous():
+    """#989: model names take precedence over aliases and collisions stay ambiguous."""
+
+    legacy = ORDERS.model_copy(update={"identifier": "warehouse.legacy.stg_orders"})
+    dev = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = DexCache(datasets=[legacy, dev])
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.old_orders": {
+                "name": "old_orders",
+                "alias": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."legacy"."stg_orders"',
+            },
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            },
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [input_entry] = entry["drafted"]["inputs"]
+    assert input_entry["profiled"] is True
+    assert input_entry["identifier"] == "warehouse.dbt_dev.stg_orders"
+    assert "resolved through the compiled manifest" in input_entry["evidence"]
+
+
 def test_a_package_input_names_derived_dev_namespace_on_warehouse():
     """#1199: a package model with custom schema derives the namespace."""
 
