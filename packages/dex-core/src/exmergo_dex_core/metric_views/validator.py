@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..errors import DexError
 from .dependency import METRIC_VIEW_SPEC_VERSION
 from .model import FIELD, MEASURE, Join, Member, MetricView, Wildcard
 
@@ -177,8 +178,12 @@ class Finding:
         return RULES[self.rule]
 
 
-class _Refused(Exception):  # noqa: N818 - a control-flow signal, not an error
-    """The element being read is refused; the finding already says why."""
+class _RefusedError(DexError):
+    """The element being read is refused; the finding already says why.
+
+    A control-flow signal inside this module, caught before anything returns:
+    a caller sees the finding, never this.
+    """
 
 
 def derived_name(expr: str) -> str:
@@ -230,7 +235,7 @@ def check_view(
         filter_ = _optional_text(raw, "filter", "(root)", find)
         parameters = _parameters(raw.get("parameters"), find)
         materialization = _materialization(raw.get("materialization"), find)
-    except _Refused:
+    except _RefusedError:
         return None, findings
 
     has_fields = bool(raw.get("fields"))
@@ -295,7 +300,7 @@ def _version(value: Any, find: Any) -> str:
             f"`version` is required; dex reads Metric View YAML "
             f"{METRIC_VIEW_SPEC_VERSION}",
         )
-        raise _Refused
+        raise _RefusedError
     text = str(value).strip()
     if text != METRIC_VIEW_SPEC_VERSION:
         find(
@@ -306,7 +311,7 @@ def _version(value: Any, find: Any) -> str:
             f"`version: {METRIC_VIEW_SPEC_VERSION}` (Databricks' `ALTER VIEW ... AS "
             "$$...$$`), copying any Unity Catalog comments into `comment` first",
         )
-        raise _Refused
+        raise _RefusedError
     return text
 
 
@@ -316,7 +321,7 @@ def _required_text(
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
         find(element, rule, f"`{key}` is required and has to be non-empty text")
-        raise _Refused
+        raise _RefusedError
     return value.strip()
 
 
@@ -328,7 +333,7 @@ def _optional_text(
         return None
     if not isinstance(value, str):
         find(element, "type", f"`{key}` has to be text, got {type(value).__name__}")
-        raise _Refused
+        raise _RefusedError
     return value
 
 
@@ -337,14 +342,14 @@ def _parameters(value: Any, find: Any) -> list[dict[str, Any]]:
         return []
     if not isinstance(value, list):
         find("parameters", "parameters", "`parameters` has to be a list")
-        raise _Refused
+        raise _RefusedError
     found: list[dict[str, Any]] = []
     defaulted: str | None = None
     for index, entry in enumerate(value):
         where = f"parameters[{index}]"
         if not isinstance(entry, Mapping):
             find(where, "parameters", "a parameter is a mapping")
-            raise _Refused
+            raise _RefusedError
         for key in entry:
             if key not in ("name", "data_type", "default"):
                 find(where, "unknown_key", f"`{key}` is not a parameter key")
@@ -353,7 +358,7 @@ def _parameters(value: Any, find: Any) -> list[dict[str, Any]]:
             find(
                 where, "parameters", "a parameter needs a `name` that is an identifier"
             )
-            raise _Refused
+            raise _RefusedError
         if (
             not isinstance(entry.get("data_type"), str)
             or not entry["data_type"].strip()
@@ -363,7 +368,7 @@ def _parameters(value: Any, find: Any) -> list[dict[str, Any]]:
                 "parameters",
                 "a parameter needs a `data_type` (a SQL type such as `double`)",
             )
-            raise _Refused
+            raise _RefusedError
         if "default" in entry:
             defaulted = defaulted or name
         elif defaulted:
@@ -373,7 +378,7 @@ def _parameters(value: Any, find: Any) -> list[dict[str, Any]]:
                 f"follows `{defaulted}`, which has a default, and has none: once "
                 "one parameter has a default, every later one needs one",
             )
-            raise _Refused
+            raise _RefusedError
         found.append(dict(entry))
     return found
 
@@ -384,23 +389,23 @@ def _materialization(value: Any, find: Any) -> dict[str, Any] | None:
     where = "materialization"
     if not isinstance(value, Mapping):
         find(where, "materialization", "`materialization` has to be a mapping")
-        raise _Refused
+        raise _RefusedError
     for key in value:
         if key not in ("schedule", "mode", "materialized_views"):
             find(where, "unknown_key", f"`{key}` is not a materialization key")
     if value.get("mode") != "relaxed":
         find(where, "materialization", "`mode` is required and has to be `relaxed`")
-        raise _Refused
+        raise _RefusedError
     views = value.get("materialized_views")
     if not isinstance(views, list) or not views:
         find(where, "materialization", "`materialized_views` is a non-empty list")
-        raise _Refused
+        raise _RefusedError
     unaggregated = 0
     for index, entry in enumerate(views):
         here = f"{where}.materialized_views[{index}]"
         if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
             find(here, "materialization", "each materialized view needs a `name`")
-            raise _Refused
+            raise _RefusedError
         kind = entry.get("type")
         if kind not in ("aggregated", "unaggregated"):
             find(
@@ -408,7 +413,7 @@ def _materialization(value: Any, find: Any) -> dict[str, Any] | None:
                 "materialization",
                 "`type` is `aggregated` or `unaggregated`",
             )
-            raise _Refused
+            raise _RefusedError
         if kind == "unaggregated":
             unaggregated += 1
             if entry.get("dimensions") or entry.get("measures"):
@@ -417,21 +422,21 @@ def _materialization(value: Any, find: Any) -> dict[str, Any] | None:
                     "materialization",
                     "an unaggregated materialized view takes no dimensions or measures",
                 )
-                raise _Refused
+                raise _RefusedError
         elif not entry.get("dimensions") and not entry.get("measures"):
             find(
                 here,
                 "materialization",
                 "an aggregated materialized view needs `dimensions` or `measures`",
             )
-            raise _Refused
+            raise _RefusedError
     if unaggregated > 1:
         find(
             where,
             "materialization",
             "at most one materialized view may be `unaggregated`",
         )
-        raise _Refused
+        raise _RefusedError
     return dict(value)
 
 
@@ -450,7 +455,7 @@ def _members(
     for index, entry in enumerate(value):
         try:
             member = _member(entry, key, index, kind, wildcards, find)
-        except _Refused:
+        except _RefusedError:
             continue
         if member is not None:
             found.append(member)
@@ -468,11 +473,11 @@ def _member(
     where = f"{key}[{index}]"
     if not isinstance(entry, Mapping):
         find(where, "member", "each entry is a mapping with at least an `expr`")
-        raise _Refused
+        raise _RefusedError
     expr = entry.get("expr")
     if not isinstance(expr, str) or not expr.strip():
         find(where, "member", "`expr` is required and has to be non-empty text")
-        raise _Refused
+        raise _RefusedError
     if _WILDCARD.search(expr):
         if any(k != "expr" for k in entry):
             find(
@@ -481,7 +486,7 @@ def _member(
                 f"`{expr.strip()}` is a wildcard, which takes no `name` or other "
                 "metadata",
             )
-            raise _Refused
+            raise _RefusedError
         find(
             where,
             "wildcard",
@@ -515,14 +520,14 @@ def _member(
         raw_name = entry.get("name")
         if not isinstance(raw_name, str) or not raw_name.strip():
             find(where, "empty_name", "an explicit `name` cannot be empty")
-            raise _Refused
+            raise _RefusedError
         name = raw_name.strip()
     where = f"{key}['{name}']"
 
     comment = entry.get("comment")
     if comment is not None and not isinstance(comment, str):
         find(where, "type", "`comment` has to be text")
-        raise _Refused
+        raise _RefusedError
     display_name = entry.get("display_name")
     if display_name is not None and (
         not isinstance(display_name, str) or len(display_name) > _NAME_LIMIT
@@ -532,7 +537,7 @@ def _member(
             "display_name",
             f"`display_name` is text of at most {_NAME_LIMIT} characters",
         )
-        raise _Refused
+        raise _RefusedError
     synonyms = _synonyms(entry.get("synonyms"), where, find)
     format_ = _format(entry.get("format"), where, find)
 
@@ -545,7 +550,7 @@ def _member(
                 "window_and_partition",
                 "a measure has a `window` or a `partition`, never both",
             )
-            raise _Refused
+            raise _RefusedError
         window = _window(entry.get("window"), where, find)
         partition = _partition(entry.get("partition"), where, find)
 
@@ -569,7 +574,7 @@ def _synonyms(value: Any, where: str, find: Any) -> tuple[str, ...]:
         return ()
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         find(where, "synonyms", "`synonyms` is a list of text")
-        raise _Refused
+        raise _RefusedError
     if len(value) > _SYNONYM_LIMIT or any(len(v) > _NAME_LIMIT for v in value):
         find(
             where,
@@ -577,7 +582,7 @@ def _synonyms(value: Any, where: str, find: Any) -> tuple[str, ...]:
             f"`synonyms` holds at most {_SYNONYM_LIMIT} entries of at most "
             f"{_NAME_LIMIT} characters each, and this holds {len(value)}",
         )
-        raise _Refused
+        raise _RefusedError
     return tuple(value)
 
 
@@ -587,7 +592,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
     here = f"{where}.format"
     if not isinstance(value, Mapping):
         find(here, "format", "`format` is a mapping with a `type`")
-        raise _Refused
+        raise _RefusedError
     kind = value.get("type")
     if kind not in _FORMAT_KEYS:
         find(
@@ -595,7 +600,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
             "format",
             f"`type` is one of {', '.join(_FORMAT_KEYS)}, got {kind!r}",
         )
-        raise _Refused
+        raise _RefusedError
     for key in value:
         if key != "type" and key not in _FORMAT_KEYS[kind]:
             find(here, "unknown_key", f"`{key}` is not a key of a `{kind}` format")
@@ -607,7 +612,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
                 "format",
                 "a currency format needs `currency_code`, an ISO-4217 code (USD)",
             )
-            raise _Refused
+            raise _RefusedError
     places = value.get("decimal_places")
     if places is not None:
         if not isinstance(places, Mapping) or places.get("type") not in _DECIMAL_TYPES:
@@ -616,7 +621,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
                 "format",
                 "`decimal_places` is a mapping whose `type` is max, exact or all",
             )
-            raise _Refused
+            raise _RefusedError
         count = places.get("places")
         if places["type"] != "all" and (
             not isinstance(count, int)
@@ -628,31 +633,31 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
                 "format",
                 f"`decimal_places` of type {places['type']} needs `places`, 0 to 10",
             )
-            raise _Refused
+            raise _RefusedError
     for key in ("hide_group_separator", "leading_zeros"):
         if key in value and not isinstance(value[key], bool):
             find(here, "format", f"`{key}` is true or false")
-            raise _Refused
+            raise _RefusedError
     if "abbreviation" in value and value["abbreviation"] not in _ABBREVIATIONS:
         find(
             here,
             "format",
             f"`abbreviation` is one of {', '.join(_ABBREVIATIONS)}",
         )
-        raise _Refused
+        raise _RefusedError
     date_format = value.get("date_format")
     time_format = value.get("time_format")
     if date_format is not None:
         allowed = (*_DATE_FORMATS, "no_date") if kind == "date_time" else _DATE_FORMATS
         if date_format not in allowed:
             find(here, "format", f"`date_format` is one of {', '.join(allowed)}")
-            raise _Refused
+            raise _RefusedError
     if time_format is not None and time_format not in _TIME_FORMATS:
         find(here, "format", f"`time_format` is one of {', '.join(_TIME_FORMATS)}")
-        raise _Refused
+        raise _RefusedError
     if date_format == "no_date" and time_format == "no_time":
         find(here, "format", "`date_format` and `time_format` cannot both be none")
-        raise _Refused
+        raise _RefusedError
     return dict(value)
 
 
@@ -661,18 +666,18 @@ def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
         return ()
     if not isinstance(value, list) or not value:
         find(where, "window", "`window` is a non-empty list of window specs")
-        raise _Refused
+        raise _RefusedError
     for index, spec in enumerate(value):
         here = f"{where}.window[{index}]"
         if not isinstance(spec, Mapping):
             find(here, "window", "a window spec is a mapping")
-            raise _Refused
+            raise _RefusedError
         for key in spec:
             if key not in ("order", "range", "semiadditive", "offset"):
                 find(here, "unknown_key", f"`{key}` is not a window key")
         if not isinstance(spec.get("order"), str) or not spec["order"].strip():
             find(here, "window", "`order` is required: the field the window orders by")
-            raise _Refused
+            raise _RefusedError
         if not _range_ok(spec.get("range")):
             find(
                 here,
@@ -680,10 +685,10 @@ def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
                 "`range` is current, cumulative, all, or trailing|leading <n> "
                 f"[<unit>] [inclusive|exclusive]; got {spec.get('range')!r}",
             )
-            raise _Refused
+            raise _RefusedError
         if spec.get("semiadditive") not in (None, "first", "last"):
             find(here, "window", "`semiadditive` is first or last")
-            raise _Refused
+            raise _RefusedError
         offset = spec.get("offset")
         if offset is not None and not (
             (isinstance(offset, int) and not isinstance(offset, bool))
@@ -694,7 +699,7 @@ def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
                 "window",
                 "`offset` is a signed integer or `<n> day|month|year[s]`",
             )
-            raise _Refused
+            raise _RefusedError
     return tuple(dict(spec) for spec in value)
 
 
@@ -722,14 +727,14 @@ def _partition(value: Any, where: str, find: Any) -> dict[str, Any] | None:
         find(
             here, "partition", "`partition` is a mapping of include and outer_aggregate"
         )
-        raise _Refused
+        raise _RefusedError
     for key in value:
         if key not in ("include", "outer_aggregate"):
             find(here, "unknown_key", f"`{key}` is not a partition key")
     include = value.get("include")
     if not isinstance(include, list) or not all(isinstance(i, str) for i in include):
         find(here, "partition", "`include` is a list of field names")
-        raise _Refused
+        raise _RefusedError
     outer = value.get("outer_aggregate")
     if not isinstance(outer, str) or outer.lower() not in _OUTER_AGGREGATES:
         find(
@@ -738,7 +743,7 @@ def _partition(value: Any, where: str, find: Any) -> dict[str, Any] | None:
             "`outer_aggregate` is one of "
             f"{', '.join(a.upper() for a in _OUTER_AGGREGATES)}",
         )
-        raise _Refused
+        raise _RefusedError
     return dict(value)
 
 
@@ -783,7 +788,7 @@ def _joins(
     for index, entry in enumerate(value):
         try:
             join = _join(entry, parent, index, inherited, find)
-        except _Refused:
+        except _RefusedError:
             continue
         if join.name.lower() in names:
             find(
@@ -810,11 +815,11 @@ def _join(
     )
     if not isinstance(entry, Mapping):
         find(where, "join", "a join is a mapping with a `name` and a `source`")
-        raise _Refused
+        raise _RefusedError
     name = entry.get("name")
     if not isinstance(name, str) or not _IDENTIFIER.match(name):
         find(where, "join", "a join needs a `name` that is an identifier")
-        raise _Refused
+        raise _RefusedError
     if name.lower() == "source":
         find(
             where,
@@ -822,7 +827,7 @@ def _join(
             "`source` names the view's own source in every expression, so no join "
             "can be called that",
         )
-        raise _Refused
+        raise _RefusedError
     path = (*parent, name)
     where = f"joins['{'.'.join(path)}']"
     for key in entry:
@@ -831,23 +836,23 @@ def _join(
     source = entry.get("source")
     if not isinstance(source, str) or not source.strip():
         find(where, "join", "`source` is required: a table name or a query")
-        raise _Refused
+        raise _RefusedError
 
     on = entry.get("on")
     using = entry.get("using")
     if on is not None and not (isinstance(on, str) and on.strip()):
         find(where, "join_condition", "`on` has to be a boolean SQL expression")
-        raise _Refused
+        raise _RefusedError
     if using is not None and (
         not isinstance(using, list)
         or not using
         or not all(isinstance(u, str) and u.strip() for u in using)
     ):
         find(where, "join_condition", "`using` is a non-empty list of column names")
-        raise _Refused
+        raise _RefusedError
     if on is None and using is None:
         find(where, "join_condition", "a join needs `on` or `using`")
-        raise _Refused
+        raise _RefusedError
     if on is not None and using is not None:
         find(
             where,
@@ -864,7 +869,7 @@ def _join(
             f"`cardinality` is many_to_one (the default) or one_to_many, got "
             f"{cardinality!r}",
         )
-        raise _Refused
+        raise _RefusedError
     if inherited is not None and cardinality != inherited:
         find(
             where,
@@ -872,21 +877,21 @@ def _join(
             f"is {cardinality} under a {inherited} join; every join below a join "
             "keeps that join's cardinality",
         )
-        raise _Refused
+        raise _RefusedError
 
     rely = entry.get("rely")
     at_most_one: bool | None = None
     if rely is not None:
         if not isinstance(rely, Mapping):
             find(where, "rely", "`rely` is a mapping")
-            raise _Refused
+            raise _RefusedError
         for key in rely:
             if key != "at_most_one_match":
                 find(where, "unknown_key", f"`rely.{key}` is not a rely key")
         if "at_most_one_match" in rely:
             if not isinstance(rely["at_most_one_match"], bool):
                 find(where, "rely", "`rely.at_most_one_match` is true or false")
-                raise _Refused
+                raise _RefusedError
             at_most_one = rely["at_most_one_match"]
 
     children = _joins(entry.get("joins"), path, cardinality, find)
