@@ -1,0 +1,11 @@
+name: stays
+version: "1.0.0"
+profile: stays
+model-paths: ["models"]
+
+models:
+  stays:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

@@ -117,6 +117,7 @@ if TYPE_CHECKING:
         PreflightResult,
         PropagationResult,
         RefactorComparisonResult,
+        RepairResult,
     )
     from .transform.semantic import DefinitionEdit
 
@@ -1620,6 +1621,14 @@ class DexEngine:
         return transform.declare(
             self, models, declarations=declarations, limit=limit, intent=intent
         )
+
+    def repair(self, nodes: str | Sequence[str]) -> RepairResult:
+        """Draft the project overrides that repair failing package models
+        (#1229), stored as one plan and never applied."""
+
+        from .transform import commands as transform
+
+        return transform.repair(self, nodes)
 
     def build(
         self,

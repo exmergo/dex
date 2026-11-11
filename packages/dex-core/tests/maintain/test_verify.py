@@ -325,6 +325,22 @@ def test_a_column_with_no_declared_type_maps_to_none(tmp_path: Path):
     assert declared["a"] == {"id": None}
 
 
+def test_package_entry_is_identified_for_override_node(tmp_path: Path):
+    """A manifest node patched by a package YAML records package_entries (#1205)."""
+    node = _node_with_columns("pkg_task", {"id": "INTEGER"})
+    node["package_name"] = "p"
+    node["patch_path"] = "tiny_pkg://models/pkg_task.yml"
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.pkg_task": node},
+        results=[],
+    )
+    plan = column_contract_plan(tmp_path)
+    assert plan.package_entries == {
+        "pkg_task": "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    }
+
+
 def test_a_missing_declared_column_is_reported_high_severity():
     findings, notes = column_contract_findings(
         _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
@@ -356,6 +372,36 @@ def test_an_undeclared_column_is_reported_low_severity():
     assert finding.code == "column_undeclared"
     assert finding.severity == "low"
     assert "extra" in finding.detail
+    assert "schema.yml" in finding.detail
+    assert "the project cannot declare the override" not in finding.detail
+    assert finding.data == {"model": "a", "columns": ["extra"]}
+
+
+def test_an_undeclared_column_on_package_override_names_entry_and_refuses():
+    """An override of a package-documented model names the package's YAML entry
+    and states that the project cannot declare the override (#1205)."""
+    pkg_entry = "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER"), ("extra", "VARCHAR")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+        package_entries={"a": pkg_entry},
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_undeclared"
+    assert finding.severity == "low"
+    assert "extra" in finding.detail
+    assert pkg_entry in finding.detail
+    assert "the project cannot declare the override" in finding.detail
+    assert "schema.yml" not in finding.detail
+    assert finding.data == {
+        "model": "a",
+        "columns": ["extra"],
+        "package_entry": pkg_entry,
+    }
 
 
 def test_a_declared_type_that_disagrees_is_a_medium_severity_mismatch():
@@ -1554,6 +1600,64 @@ def test_verify_scopes_to_the_named_object(maintain_repo, _assume_the_project_co
     assert [f["identifier"] for f in payload["data"]["findings"]] == ["a"]
 
 
+def _two_failing_models(maintain_repo) -> None:
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.a": {"name": "a", "resource_type": "model"},
+            "model.maintain_test.b": {"name": "b", "resource_type": "model"},
+            "model.maintain_test.c": {"name": "c", "resource_type": "model"},
+        },
+        results=[
+            {"unique_id": "model.maintain_test.a", "status": "error"},
+            {"unique_id": "model.maintain_test.b", "status": "error"},
+            {"unique_id": "model.maintain_test.c", "status": "error"},
+        ],
+    )
+
+
+def _verified(maintain_repo, *scope: str) -> list[str]:
+    rc, payload = maintain_repo.dex("maintain", "verify", *scope)
+    assert rc == 0 and payload["status"] == "ok", payload
+    return [f["identifier"] for f in payload["data"]["findings"]]
+
+
+def test_verify_scopes_to_a_quoted_list_of_models(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`maintain verify "a b"` names two models, not one named "a b" (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a b") == ["a", "b"]
+
+
+def test_verify_scopes_to_a_quoted_list_mixed_with_another_argument(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A quoted list and a separate argument name the same models (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a b", "c") == ["a", "b", "c"]
+
+
+def test_verify_scopes_to_a_comma_separated_list(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The comma-separated spelling still names both models (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a,b") == ["a", "b"]
+
+
+def test_verify_scopes_to_a_list_in_any_case(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A model name is matched case-insensitively, however it is spelled (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "A B") == ["a", "b"]
+
+
 # --- row population: a model against the relation it is built from (#226) ------
 #
 # Pure, like the build-status half above: a manifest on disk in, findings out,
@@ -2028,6 +2132,101 @@ def test_an_unnest_of_a_column_is_not_generated_sql():
         read="duckdb",
     )
     assert verify_mod._driving_parent(tree, sql_shape)[4] != verify_mod._GENERATED_SQL
+
+
+def test_spine_or_generated_models_identifies_spines_and_driven_models(tmp_path: Path):
+    nodes = {
+        "m.spine": _spine_node("metricflow_time_spine"),
+        "m.configured": _model(
+            "configured_spine",
+            "select date_day from raw_dates",
+            time_spine={"standard_granularity_column": "date_day"},
+        ),
+        "m.generated": _model(
+            "generated_dates",
+            "select cast(range as date) as date_day from "
+            "range(date '2024-01-01', date '2024-04-10', interval 1 day)",
+        ),
+        "m.driven": _model(
+            "fct_calendar_coverage",
+            _SPINE_ANCHORED.format(spine="metricflow_time_spine"),
+        ),
+        "m.driven_gen": _model(
+            "fct_generated_coverage",
+            _SPINE_ANCHORED.format(spine="generated_dates"),
+        ),
+        "m.ordinary": _model(
+            "dim_customers",
+            'select c.customer_id from "wh"."main"."stg_customers" c',
+        ),
+    }
+    models = verify_mod.spine_or_generated_models(tmp_path, "duckdb", nodes=nodes)
+    assert "metricflow_time_spine" in models
+    assert "configured_spine" in models
+    assert "generated_dates" in models
+    assert "fct_calendar_coverage" in models
+    assert "fct_generated_coverage" in models
+    assert "dim_customers" not in models
+
+
+def test_grain_findings_skips_naming_guess_on_spine_driven_model():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.fct_coverage": 100},
+        columns={"db.main.fct_coverage": ["customer_id", "date_day"]},
+        approx={"db.main.fct_coverage": {"customer_id": (40, 0.0)}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {},
+        {"fct_coverage": "db.main.fct_coverage"},
+        ["db.main.fct_coverage"],
+        {"fct_coverage"},
+        spine_or_generated={"fct_coverage"},
+    )
+    assert findings == []
+    assert notes == []
+
+
+def test_grain_findings_checks_declared_grain_on_spine_driven_model_at_full_severity():
+    candidate = verify_mod.GrainCandidate(
+        columns=("customer_id",), source="declaration"
+    )
+    adapter = _GrainAdapter(
+        row_counts={"db.main.fct_coverage": 100},
+        columns={"db.main.fct_coverage": ["customer_id", "date_day"]},
+        exact={"db.main.fct_coverage": {"customer_id": 40}},
+    )
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {"fct_coverage": [candidate]},
+        {"fct_coverage": "db.main.fct_coverage"},
+        ["db.main.fct_coverage"],
+        {"fct_coverage"},
+        spine_or_generated={"fct_coverage"},
+    )
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert findings[0].data["source"] == "declaration"
+
+
+def test_grain_findings_caps_heuristic_guess_at_medium_severity():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.orders": 100},
+        columns={"db.main.orders": ["order_id"]},
+        approx={"db.main.orders": {"order_id": (40, 0.0)}},
+    )
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {},
+        {"orders": "db.main.orders"},
+        ["db.main.orders"],
+        {"orders"},
+    )
+    assert len(findings) == 1
+    assert findings[0].severity == "medium"
+    assert findings[0].data["source"] == "heuristic"
+    assert findings[0].data["severity_cap_applied"] == "heuristic_grain"
+    assert "severity capped at medium" in findings[0].detail
 
 
 def test_a_union_reading_a_table_is_still_a_set_operation(tmp_path: Path):
@@ -2707,6 +2906,109 @@ def test_verify_leaves_a_fanout_undamped_when_its_grain_broke(
     assert by_code["grain_broken"]["data"]["duplicate_count"] == 5
     assert by_code["row_fanout"]["severity"] == "medium"
     assert "grain_proven" not in by_code["row_fanout"]["data"]
+
+
+def test_verify_skips_naming_guess_on_spine_driven_model_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#1202 end to end: a spine-driven cross-product model with no declared
+    grain produces no grain_broken finding from a naming guess."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 10) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_calendar_coverage AS "
+        "SELECT o.customer_id, s.date_day FROM metricflow_time_spine s "
+        "CROSS JOIN orders o"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day from "
+                    "range(date '2024-01-01', date '2024-01-10', interval 1 day)"
+                ),
+            },
+            "model.maintain_test.fct_calendar_coverage": {
+                "name": "fct_calendar_coverage",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_calendar_coverage"',
+                "compiled_code": (
+                    "select o.customer_id, s.date_day from "
+                    '"warehouse"."main"."metricflow_time_spine" s '
+                    'cross join "warehouse"."main"."orders" o'
+                ),
+            },
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    grain_findings = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_calendar_coverage"
+    ]
+    assert grain_findings == []
+
+
+def test_verify_checks_declared_grain_on_spine_driven_model_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#1202 end to end: a spine-driven model that declares a broken grain
+    is still checked and reported at full severity."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 10) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_calendar_coverage AS "
+        "SELECT o.customer_id, s.date_day FROM metricflow_time_spine s "
+        "CROSS JOIN orders o"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day from "
+                    "range(date '2024-01-01', date '2024-01-10', interval 1 day)"
+                ),
+            },
+            "model.maintain_test.fct_calendar_coverage": {
+                "name": "fct_calendar_coverage",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_calendar_coverage"',
+                "compiled_code": (
+                    "select o.customer_id, s.date_day from "
+                    '"warehouse"."main"."metricflow_time_spine" s '
+                    'cross join "warehouse"."main"."orders" o'
+                ),
+                "config": {"meta": {"dex": {"grain": ["customer_id"]}}},
+            },
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    grain_findings = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_calendar_coverage"
+    ]
+    assert len(grain_findings) == 1
+    assert grain_findings[0]["severity"] == "high"
+    assert grain_findings[0]["data"]["source"] == "declaration"
 
 
 def test_verify_names_generated_sql_in_notes(

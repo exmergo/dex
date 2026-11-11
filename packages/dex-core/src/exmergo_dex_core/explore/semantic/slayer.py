@@ -197,7 +197,12 @@ class LocalSlayerLayer:
 
     def query(self, q: SemanticQuery) -> SemanticQueryResult:
         from ...slayer.render import slayer_type
-        from ...slayer.translate import source_model, to_slayer_query
+        from ...slayer.translate import (
+            element_note,
+            element_tokens,
+            source_model,
+            to_slayer_query,
+        )
 
         if not q.metrics:
             raise SemanticBackendError("a metric query needs at least one --metric")
@@ -227,12 +232,19 @@ class LocalSlayerLayer:
         )
         if q.grain and root is not None:
             refs = list(dict.fromkeys([*refs, *(self.time_axis_refs(q.metrics) or [])]))
+        # A metric that returns a column's values (`max(email)`, SLayer 1.8's
+        # `collect(tags.value)`) projects that column as surely as a grouping
+        # does, so its inputs are screened as grouped columns.
+        refs = list(dict.fromkeys([*refs, *self._value_refs(q.metrics, view)]))
         lookup = governed.pii_lookup(cache)
-        blocked = screen_dimension_refs(refs, meta_lookup=lookup)
+        blocked = screen_dimension_refs(
+            refs, meta_lookup=lookup, aliases=_element_aliases(refs, view)
+        )
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
             raise SemanticQueryRefusedError(
-                f"refused: grouping or filtering by {named} would surface PII. "
+                f"refused: grouping, filtering or returning the values of {named} "
+                "would surface PII. "
                 "PII is flagged, never surfaced; query a non-PII dimension instead."
             )
 
@@ -241,7 +253,9 @@ class LocalSlayerLayer:
         # can be bucketed at is the translation's check: its default time
         # dimension, at one of SLayer's built-in granularities.
         q = replace(q, grain=validate_grain(q.grain, available=None))
+        self._refuse_lists_without_native_support(refs, view)
         rendered = self._render(to_slayer_query(q, view), "the metric query")
+        elements = element_tokens(q.group_by, view)
 
         return governed.run(
             rendered.sql,
@@ -252,9 +266,51 @@ class LocalSlayerLayer:
             extra_notes=[
                 *name_only_note(unadjudicated_refs(refs, meta_lookup=lookup)),
                 *sub_threshold_note(refs, meta_lookup=lookup),
+                *([element_note(elements)] if elements else []),
             ],
             column_names=rendered.result_keys,
         )
+
+    def _value_refs(self, metrics: list[str], view: Any) -> list[str]:
+        """The ``model.column`` tokens these metrics return values of.
+
+        Read from each saved measure's formula with SLayer's own parser, and
+        resolved the way a filter's references are, so ``collect(tags.value)``
+        is ``posts.tags.value`` and a joined column is its own model's token. A
+        formula or reference that cannot be read refuses the query: the columns
+        it would return could not be screened.
+        """
+
+        from ...slayer.loader import value_aggregated_columns
+        from ...slayer.translate import source_model
+
+        root = source_model(metrics, view)
+        entries = {
+            loaded.model.name: loaded for loaded in self._source.validated_models()
+        }
+        entry = entries.get(root.name)
+        if entry is None:
+            return []
+        measures = {m.name: m for m in entry.model.measures}
+        found: list[str] = []
+        for metric in dict.fromkeys(metrics):
+            measure = measures.get(metric.split(".", 1)[-1])
+            if measure is None:
+                continue  # translation refuses it by name, before anything renders
+            columns = value_aggregated_columns(entry, measure)
+            tokens = (
+                self.filter_refs(columns, source_model=root.name)
+                if columns
+                else ([] if columns is not None else None)
+            )
+            if tokens is None:
+                raise SemanticQueryRefusedError(
+                    f"refused: dex could not read which columns metric {metric} "
+                    "returns the values of, so the PII gate cannot screen them. "
+                    "Query a metric whose formula SLayer's parser reads"
+                )
+            found.extend(tokens)
+        return found
 
     def time_axis_refs(self, metrics: list[str]) -> list[str] | None:
         """The ``model.column`` a ``--grain`` on these metrics buckets.
@@ -296,10 +352,13 @@ class LocalSlayerLayer:
         )
         cache = governed.load_cache()
         notes = screen_values_request(
-            request.name, meta_lookup=governed.pii_lookup(cache)
+            request.name,
+            meta_lookup=governed.pii_lookup(cache),
+            aliases=_element_aliases([request.name], view),
         )
 
         slayer_query = to_slayer_values_query(request, view)
+        self._refuse_lists_without_native_support([request.name], view)
         rendered = self._render(slayer_query, f"the values of {request.token}")
 
         return governed.run(
@@ -313,6 +372,28 @@ class LocalSlayerLayer:
             dimension=request.token,
             scoped_to=request.metrics,
         )
+
+    def _refuse_lists_without_native_support(self, refs: list[str], view: Any) -> None:
+        """Refuse a list column on a warehouse with no native lists, by name.
+
+        Redshift has no list type SLayer can unnest or test membership in, so
+        SLayer refuses `.value`, `contains` and the rest only once it renders, as
+        an error dex would redact to "could not resolve". Said here instead.
+        """
+
+        from ...slayer.render import slayer_type
+        from ...slayer.translate import list_tokens
+
+        if slayer_type(self._connector()) != "redshift":
+            return
+        lists = list_tokens(refs, view)
+        if lists:
+            raise SemanticBackendError(
+                f"cannot read list column {', '.join(lists)} on Redshift: it has no "
+                "native lists, so SLayer cannot group by a list's elements or test "
+                "membership in one there. Query the list column on a connector "
+                "with native lists (DuckDB, BigQuery, Snowflake, Postgres)"
+            )
 
     def _render(self, slayer_query: Any, what: str) -> Any:
         """The ``RenderedQuery`` SLayer makes of ``slayer_query``, as a dry run."""
@@ -377,3 +458,23 @@ class LocalSlayerLayer:
             return dict(self._catalog_view().computed_columns)
         except SemanticBackendError:
             return {}
+
+
+def _element_aliases(refs: list[str], view: Any) -> dict[str, list[str]]:
+    """Each list-element token, screened as itself and as its list column.
+
+    ``posts.email.value`` reads the ``email`` column, and the catalog maps both
+    tokens to it, so a profiled flag or an override speaks for either. Where
+    nothing profiled the column, the name heuristic reads ``posts.email``: the
+    element token ends in ``value``, a word no heuristic flags. The refusal
+    still names the token the caller wrote.
+    """
+
+    from ...slayer.catalog import list_column_of
+    from ...slayer.translate import element_tokens
+
+    return {
+        token: [token, column]
+        for token in element_tokens(refs, view)
+        if (column := list_column_of(token)) is not None
+    }

@@ -538,6 +538,11 @@ class NodeRun:
     #: True when that run was a ``--cold-deps`` build, whose artifacts live in
     #: ``cold/`` beside the ordinary build's.
     cold: bool
+    #: dbt's own message for the attempt and the SQL it compiled, where the run
+    #: recorded them: what ``transform repair`` reads a failure's types from
+    #: (#1229). Warehouse text, so never put into an envelope unbounded.
+    message: str | None = None
+    compiled_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -605,6 +610,14 @@ def latest_node_runs(project_root: Path | str) -> LatestRuns:
                 invocation_id=meta.get("invocation_id"),
                 generated_at=stamp or None,
                 cold=cold,
+                message=(
+                    str(row["message"]) if isinstance(row.get("message"), str) else None
+                ),
+                compiled_code=(
+                    str(row["compiled_code"])
+                    if isinstance(row.get("compiled_code"), str)
+                    else None
+                ),
             )
     manifest = None
     for _, _, directory, _, _ in reversed(found):

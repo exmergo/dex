@@ -67,6 +67,7 @@ from .sqlglot_keywords import slayer_keywords
 
 # isort: split
 
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -308,7 +309,11 @@ class SlayerRenderer:
         """The SQL SLayer would run for ``query``, rendered without executing it."""
 
         ds_type = self.storage.datasource_type
-        with slayer_keywords():
+        # SLayer also raises its grain advisories as Python warnings (an
+        # associated grouping, a broadcast); dex states what they mean in the
+        # result's notes, and nothing but the envelope may reach the output.
+        with slayer_keywords(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             response = self._engine.execute_sync(query, dry_run=True)
             dialect = dialect_for_ds_type(ds_type)
             emitted = {dialect.emit_alias(key): key for key in response.columns}

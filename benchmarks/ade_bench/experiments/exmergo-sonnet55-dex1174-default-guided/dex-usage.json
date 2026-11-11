@@ -1,0 +1,3574 @@
+{
+  "tasks": [
+    {
+      "task_id": "airbnb001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.11102619999999999,
+          "runtime_ms": 35250,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 4,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "transform references": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01QFXMBt5fc4mYP48L64nZnd",
+            "toolu_01H2Vsr5CYFKLwTojWgJpyLa",
+            "toolu_01WU2E6R4Qwn36msdkvqKLiH"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.11450890000000001,
+          "runtime_ms": 39808,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "transform references": 1,
+              "": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_014rF3djt61ftn5xjUMkCCUD",
+            "toolu_01ApLAXLKMMerigDAMFko93B",
+            "toolu_01963fco9ad3MkB57X7NVeZP",
+            "toolu_01J4NXepExKpVCNApDCcUsDJ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.129903,
+          "runtime_ms": 33305,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 3,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 5
+            },
+            "by_command": {
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 2
+            },
+            "by_envelope_status": {
+              "ok": 3,
+              "no_envelope": 1,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01ERVRr3z2o7gwKS4ArNmffp",
+            "toolu_01M1fvnakQjaBqGkqwFk7NXa",
+            "toolu_01SLX8o3FDSePyvfJcA9NeHF",
+            "toolu_01LxHrecRyx3ipxHYbfHYmQk"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb004.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1379271,
+          "runtime_ms": 48398,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 6,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "explore profile": 1,
+              "explore query": 2,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01AgZNthfo13FDiwwQJZn1ew",
+            "toolu_015tvXbjWHqHEjSeDsozL3zH",
+            "toolu_01CwnThXUsDcAMkD5XTnq872",
+            "toolu_015HdB8TW2ap2vx4xkzdc4cJ",
+            "toolu_018Sp9WHbTc5KVghkWWNTUQP",
+            "toolu_01UwuR6xJJaYaxMExjXycBcc"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb005.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.1832813,
+          "runtime_ms": 45309,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 5,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 2
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01M3MvS6DiEx6EywVwJe2aEv",
+            "toolu_01NFX9G1Djd2Fza57aHka2X9",
+            "toolu_01V1r6uGsr7hc4LpfrcnxVmr",
+            "toolu_01UqRTEHetSMFn3Zag81EsDc",
+            "toolu_01X2wEHkRDVdRRRoufiGrkWR"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb006.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.11625590000000002,
+          "runtime_ms": 42290,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 5,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "": 1,
+              "transform plan": 1,
+              "transform compare": 2,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "no_envelope": 1,
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01Go6Jbwp1ixC7RYqSh3vma5",
+            "toolu_01WZEy2YTqTRUYuCNR154Rf3",
+            "toolu_01JM6xhAhueJzfauyy8dwnrC"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb007.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1608188,
+          "runtime_ms": 57121,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 8,
+            "operations_finished": 8,
+            "operations_succeeded": 7,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 8
+            },
+            "by_command": {
+              "explore profile": 2,
+              "explore query": 3,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 1,
+              "ok": 7
+            }
+          },
+          "command_text_candidates": [
+            "toolu_011tyseGcKW1SissUQaYt5KL",
+            "toolu_01Eo8c761kF5xvPzgZ9W57fT",
+            "toolu_01Ks9fD2v4enZkn2k8e6tcK6",
+            "toolu_01DjzzBWzuq2nZB8oK1nYQ7M",
+            "toolu_01DkkbTC9FK1FK98MmFDyz5e"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb008.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.0964387,
+          "runtime_ms": 36585,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "maintain verify": 3,
+              "transform deps": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01GY17vBdxe4A7PLd9EoLJ77",
+            "toolu_01B3wUjeUxdvjMh9oZkoAEd8",
+            "toolu_01NfLgxCVTeSf4gVnEtU8Td9",
+            "toolu_01PGyiA23viB3b6wqV7Eyq2i"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb009.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.1713313,
+          "runtime_ms": 66592,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 13,
+            "operations_finished": 13,
+            "operations_succeeded": 10,
+            "operations_errored": 3,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 2,
+            "by_entrypoint": {
+              "skill_wrapper": 13
+            },
+            "by_command": {
+              "explore profile": 2,
+              "explore query": 5,
+              "transform plan": 2,
+              "transform apply": 2,
+              "transform build": 2
+            },
+            "by_envelope_status": {
+              "ok": 10,
+              "error": 2,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01JXwwXjTSfDq5Ri8LtkDiun",
+            "toolu_01L8aWz9QeS262hA3Y8tybRM",
+            "toolu_0147YBNK8YBCALrJZcY2n3uN",
+            "toolu_01Rg6QqppsJW5RszqAyaUUnK",
+            "toolu_01QMbp5dRLypJzZz6rvBLiZo",
+            "toolu_016VrTp15jN5yMNjTX5W4kaQ",
+            "toolu_01F274v7yUBUBpsAVLzcZCwZ",
+            "toolu_01HUGSCCv7xWS4bC9e4tfNSh"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb010.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1382947,
+          "runtime_ms": 48636,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 5,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 2
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01WxDimxQP38gGWLdeMgyd9t",
+            "toolu_01FbfmzP7JVSKGYgy186jP6T",
+            "toolu_01X8rvKAFK6mAy7sH5Ekzdaa",
+            "toolu_01211JM6aFN9VdMWFWhH3E87",
+            "toolu_01VBuxsSW2yZ6LPVVm2aqJue"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb011.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.20639459999999998,
+          "runtime_ms": 56231,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 6,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "explore profile": 2,
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 1,
+              "ok": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01EyswhwiUSeVJ46vvGETVo9",
+            "toolu_01Vi1utjVmPyGo9fpH4dqheJ",
+            "toolu_01EkhMSfdSdzFwzGWpsPEzRG",
+            "toolu_01EJuHJTaEfu6EpiekgPwJ42",
+            "toolu_01RX6BfGyA9RoZUBwY7fmBCX"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb011.hint",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.22471729999999995,
+          "runtime_ms": 62192,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 8,
+            "operations_finished": 8,
+            "operations_succeeded": 6,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 8
+            },
+            "by_command": {
+              "explore profile": 2,
+              "explore query": 3,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 1,
+              "ok": 6,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01ExaoRtfztSoKrbNwi4ZS9Y",
+            "toolu_01KxRaWy9Scr4GKs68BQGRUB",
+            "toolu_01TdSa2bMapPU3Q3j6uz7yxr",
+            "toolu_01Up2SUJPYHadiwFnpifd1an",
+            "toolu_01Vyq9GnnopFZC3odNAsEqfm",
+            "toolu_01CpxKEynAw3chZeUUWPkgBQ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb012.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.16655160000000002,
+          "runtime_ms": 63460,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 11,
+            "operations_finished": 11,
+            "operations_succeeded": 7,
+            "operations_errored": 4,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 11
+            },
+            "by_command": {
+              "": 1,
+              "transform test": 2,
+              "explore profile": 1,
+              "transform plan": 3,
+              "transform apply": 2,
+              "transform build": 2
+            },
+            "by_envelope_status": {
+              "no_envelope": 1,
+              "error": 3,
+              "ok": 7
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01S6KHDrETrm2GADUB4gyPn7",
+            "toolu_012aEo7FogHFuB8FyVm7TH1A",
+            "toolu_01BTEPZzpy5YgmouWfKb6j6W",
+            "toolu_01FDVocQmsTnMnDyjhLm3xbW",
+            "toolu_01VVy3GTGKLTvXa4NQGpjGR4",
+            "toolu_01TzNdojyon8fXrMP2WX6F51",
+            "toolu_01KhYudBw3ig9i1PBDFVCRLD",
+            "toolu_01P74Nr1DD6cHMy86SbUVsDd",
+            "toolu_01CZt849EXnpGWTLT6EWksCe"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "airbnb013.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.124121,
+          "runtime_ms": 55261,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 8,
+            "operations_finished": 8,
+            "operations_succeeded": 8,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 8
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore query": 4,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 8
+            }
+          },
+          "command_text_candidates": [
+            "toolu_011UXWiBAFJZtKhTJA51xmPn",
+            "toolu_01Vg9YKpmd6U3972j2SAB1bS",
+            "toolu_018b354zmHXMh7K2ysDRYiNW",
+            "toolu_01DbLAt2FCNr8Fn3sLdaTh7k",
+            "toolu_01F2tS6RBDEhve3vGbMLFAaC",
+            "toolu_01X8zPMR6tsXkxBDZBYgWKJp",
+            "toolu_01JAUS7edcq6Yc1M9K2r8H8Z"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.019655,
+          "runtime_ms": 7127,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [],
+          "execution": {
+            "schema": 2,
+            "operations_started": 0,
+            "operations_finished": 0,
+            "operations_succeeded": 0,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {},
+            "by_command": {},
+            "by_envelope_status": {}
+          },
+          "command_text_candidates": []
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.0938029,
+          "runtime_ms": 21939,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 3,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 4
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 3,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01U9q8Hcxg5R3N2uQ2F8XmWU",
+            "toolu_01HtNsKRc8PcEELFmtTnmCuH"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering002.medium",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1530898,
+          "runtime_ms": 50599,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 6,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "transform plan": 2,
+              "transform apply": 2,
+              "transform build": 2
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_016pCSBjVV7gfQaLJ7wV9jPS",
+            "toolu_014sSNEPM2zAjan4f2CrmSin",
+            "toolu_01TTdJKinQiACQqeVduZMsQ8",
+            "toolu_01KmpPDErMgtE5Eo6twGw5xJ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1097072,
+          "runtime_ms": 27447,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 5,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 6
+            },
+            "by_command": {
+              "explore profile": 1,
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01UWdeXujec2RwfXRBgmh8jf",
+            "toolu_01VgkUgX4Uk3LTM89vUvkmMW",
+            "toolu_01AVdDucwSWV9jCiT16JGFaN",
+            "toolu_01HAwVFx2JvxUmiHTQUBJYP5",
+            "toolu_013Stc6sASHCfN3GWCRjyPPu"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering004.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.18849250000000004,
+          "runtime_ms": 55718,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 11,
+            "operations_finished": 11,
+            "operations_succeeded": 9,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 11
+            },
+            "by_command": {
+              "explore map": 1,
+              "explore profile": 2,
+              "explore relationships": 1,
+              "transform plan": 2,
+              "transform apply": 2,
+              "transform build": 3
+            },
+            "by_envelope_status": {
+              "ok": 9,
+              "error": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01H3LFRbAw54smJvdEyAXs1Z",
+            "toolu_018StqWLu7N6XGZtN8Cth7U5",
+            "toolu_01PoQmL6DbaHeiu8RuMPpAMw",
+            "toolu_017V9zcjHZtZEK1icTcw4f7J",
+            "toolu_01HSgenYBREmtexsiR7NgKPx",
+            "toolu_01HyKTqYWRadtFF5SWESr6xX",
+            "toolu_01LQkimDqH55BbJVvfctrpS6"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering005.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1670365,
+          "runtime_ms": 79193,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 16,
+            "operations_finished": 16,
+            "operations_succeeded": 10,
+            "operations_errored": 6,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "skill_wrapper": 16
+            },
+            "by_command": {
+              "explore query": 7,
+              "": 1,
+              "transform plan": 3,
+              "transform apply": 2,
+              "transform build": 2,
+              "explore map": 1
+            },
+            "by_envelope_status": {
+              "ok": 10,
+              "no_envelope": 4,
+              "error": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01BcgjUKbKo7UGRgngmgSfvT",
+            "toolu_01CR27UeZBTPrayuBFynoC1S",
+            "toolu_01ENh8spHHzxfHyMS7jE3YVK",
+            "toolu_01DZejsViho4MeKCXH1VJr1Z",
+            "toolu_01K63UkGbJaYutPkReesqNfZ",
+            "toolu_01GwsiBz4PGu1aMfTpEHZWUB",
+            "toolu_01CSteYULV3PfFcgVyaD5wqQ",
+            "toolu_016SiZHVMXXzCqzGb8VSGhzZ",
+            "toolu_015u4ZiUk2yhXumaXgksBqFi",
+            "toolu_01N6zG6NSYpNYBuyJDx4tTLM",
+            "toolu_01PxqyVywJCgPtvByu9XFLXz",
+            "toolu_01CM1AXjfVBj8ksNKBjR3gcw",
+            "toolu_0117A8iNMs8xudVTC8dwhxk8"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering006.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.2117233,
+          "runtime_ms": 64041,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 11,
+            "operations_finished": 11,
+            "operations_succeeded": 5,
+            "operations_errored": 6,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 11
+            },
+            "by_command": {
+              "explore map": 1,
+              "explore profile": 1,
+              "explore query": 6,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "error": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01GUpVrXmZWL6QpbvFCcgatq",
+            "toolu_0132UPVVDs5TnhYjuRE6T1wc",
+            "toolu_01XW1crdt5UnRjBFSa4DMRwa",
+            "toolu_019CqGPWtb7xkC8Qvjo5Rrc7",
+            "toolu_015k7rkKr1zPchJGBQfsqpHb",
+            "toolu_0122e93dZkzMQWoMNDCPTSmb",
+            "toolu_0199dV6mERm9geAMfkr1mpWP",
+            "toolu_01Jk9dHQh3nY8j8rYu5q6XJ7",
+            "toolu_01KduVkw4DoVzBu1t1dQJvBx",
+            "toolu_01VjxJiEcQGWNHBPFabhPs6W"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering007.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.15483130000000003,
+          "runtime_ms": 64014,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 9,
+            "operations_finished": 9,
+            "operations_succeeded": 4,
+            "operations_errored": 5,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 9
+            },
+            "by_command": {
+              "explore profile": 2,
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 3
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "error": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01DqDq8aYsZTGr13r5uCPS36",
+            "toolu_01VqKHEzCi8sn48p4yWae4cN",
+            "toolu_012efb8TphkVuKtkLKxv4VK8",
+            "toolu_01X4ZWPSGc1i79jH6NbAEsQ2",
+            "toolu_01MsTvWKhgGkCdrKPFCTdyk1",
+            "toolu_01Vnq9rtbKUfsrBQiqZmCCBc",
+            "toolu_01698cXHbP4wau2uohp1nu5f"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering007.medium",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.240875,
+          "runtime_ms": 69013,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 10,
+            "operations_finished": 10,
+            "operations_succeeded": 8,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 10
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore query": 2,
+              "explore profile": 1,
+              "transform plan": 2,
+              "transform apply": 2,
+              "transform build": 2
+            },
+            "by_envelope_status": {
+              "ok": 8,
+              "error": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01NFWwti65nCUVDVdUtXpFbw",
+            "toolu_01Afdh4AHqdyyXiKiFZMQhLJ",
+            "toolu_01U8e86TSUQuVkaac9k85k6a",
+            "toolu_01B2NpxNoVyvuanLKA3aSYDC",
+            "toolu_01K8PVmtZiPfJuxxk3qH3f9M",
+            "toolu_01N9Z6mSr8YvzQEcdWGphxL5",
+            "toolu_01E45XzKW39g1h37V25Ntgrf"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "analytics_engineering008.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.12116270000000001,
+          "runtime_ms": 30439,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform init": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01EMPLJSpdXeWo9sjRGaNDzY",
+            "toolu_012NVZENR1sMp8FPEXBic7Gq",
+            "toolu_01HgMJEi9bazC21FhuPEpXzs",
+            "toolu_01TbTSsG7FT2uQo33XcQy4Vz"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "asana001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.223986,
+          "runtime_ms": 116381,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 12,
+            "operations_finished": 12,
+            "operations_succeeded": 6,
+            "operations_errored": 6,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "skill_wrapper": 12
+            },
+            "by_command": {
+              "maintain verify": 2,
+              "explore profile": 1,
+              "explore query": 1,
+              "transform plan": 3,
+              "explore map": 1,
+              "transform build": 4
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "error": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01HmwYWvRkjmUr8ZBHm3EJjA",
+            "toolu_01DRqFWNEUz2ParpwmXrR6y6",
+            "toolu_01S87WFqYJJUeM19mV9d4SJv",
+            "toolu_016o1ynRmGtJm5PKFZVd9wFA",
+            "toolu_01EyKf8dcDUMAgkmRXiKHUwP",
+            "toolu_01MKFRkLsphd6DCL4ew5nkh5",
+            "toolu_015dY68NxfU1bLZ2DjAyn9QD",
+            "toolu_01E5RGrvZSgzq6hVQjPaqvfP",
+            "toolu_01DAcx4VWxwTruyUVcd9rZt1",
+            "toolu_012dUstqCNpXYPYtbNp5hmda",
+            "toolu_01MUQWd8Gb7Dh8Vah3gbZzQm",
+            "toolu_01USUMGG1ZAGnTNKHpz7mGzn"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "asana002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.18977950000000002,
+          "runtime_ms": 47331,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 1,
+            "operations_finished": 1,
+            "operations_succeeded": 1,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 1
+            },
+            "by_command": {
+              "explore profile": 1
+            },
+            "by_envelope_status": {
+              "ok": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_017Zi2tP2gbjVVnBLncMsErt"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "asana003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1499161,
+          "runtime_ms": 35761,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 1,
+            "operations_finished": 1,
+            "operations_succeeded": 1,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 1
+            },
+            "by_command": {
+              "explore map": 1
+            },
+            "by_envelope_status": {
+              "ok": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01VvczzzLGdsHD2XTa92LQbH"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "asana004.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.11647960000000002,
+          "runtime_ms": 37371,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "": 1,
+              "transform plan": 1,
+              "transform compare": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "no_envelope": 1,
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01Mjm4QgD48YC62pNz7zze1m",
+            "toolu_01CPxQLwujvk2bCEgzoX4UFs",
+            "toolu_01C5GfM1uuEfa4GksQSkPiHo"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "asana005.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.39254789999999995,
+          "runtime_ms": 148169,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 23,
+            "operations_finished": 23,
+            "operations_succeeded": 15,
+            "operations_errored": 8,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 2,
+            "by_entrypoint": {
+              "cli": 23
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore profile": 1,
+              "explore query": 6,
+              "transform build": 5,
+              "transform plan": 6,
+              "transform compare": 3,
+              "transform apply": 1
+            },
+            "by_envelope_status": {
+              "ok": 15,
+              "error": 8
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01Rfe4Za3NJXvNEHG1wCeijP",
+            "toolu_01FBdHK951HRqoNqB59MBckA",
+            "toolu_01PA2eYJob6jspYHcAp6o5Nf",
+            "toolu_01Gc6oQvX3vVSybTsbfiZUU2",
+            "toolu_018rjxeJW1JJgb3mfnQioGxm",
+            "toolu_01Y7g5W3cXkX4hoxvTEKFHAb",
+            "toolu_01CBG7UWHzKi3WLQy7ZyVKiY",
+            "toolu_01CSjbfrr8w5xrKEsMk71buL",
+            "toolu_01QpetjTeMz7ZQtvUJ6ERcRF",
+            "toolu_018samYfDCt6yKGoskHa61V5",
+            "toolu_01GCMJKpmEqCHd42URNDKFFa",
+            "toolu_01BUwTpfWgGNFpX9A7ttiLVF",
+            "toolu_01R8gUDXRASrimT52AUbPLWY",
+            "toolu_01GfNLTEKHSY2ab7rRPDpxJo",
+            "toolu_013ckdCfiBVZzwbErfd7QjxP",
+            "toolu_017okT1gPYDjuyA44Vp5Hc8L",
+            "toolu_017hxrodaj6fKkjtMSsWHprH",
+            "toolu_01Lj1ec4qatyEr2F3Ki6nG4H",
+            "toolu_01VPBZkE4guawM6Y1J9agoML",
+            "toolu_01VixXULBuhRNaHARtGfWhTG"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "asana005.hard",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.1077181,
+          "runtime_ms": 39589,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 2,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "no_envelope": 1,
+              "ok": 2,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01EHQFQknok6qATstNXYbJTF",
+            "toolu_012W547JhrgAgHMErHNTrkfS",
+            "toolu_01U29TwinDnsB2LDt1taNQwj"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.15887500000000002,
+          "runtime_ms": 52296,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 5,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "cli": 7
+            },
+            "by_command": {
+              "explore map": 1,
+              "explore query": 1,
+              "transform plan": 2,
+              "transform deps": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "error": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01FNRapySuCsMRcfA3eK7Epa",
+            "toolu_01RjcHBCEDfAppHDPb8PR8zu",
+            "toolu_01T9AJuJqGTv7X9ptSsjCtea",
+            "toolu_01KWkvNwB621SVwN6bSeW9ho",
+            "toolu_019yu1a7qFFodSLtvxd2Yq5V"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.12623790000000001,
+          "runtime_ms": 33454,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 4,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_018NddtcmeWXXi3vWtpbY4oe",
+            "toolu_015byZZhGpc7dhDMbGTeA6Yw",
+            "toolu_01E8PErYiBHMHNSrXNiU9W9t"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.2349005,
+          "runtime_ms": 71637,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 12,
+            "operations_finished": 12,
+            "operations_succeeded": 8,
+            "operations_errored": 4,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 12
+            },
+            "by_command": {
+              "explore inventory": 1,
+              "explore query": 7,
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 8,
+              "error": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_015PLvw62uZvr1QEARMf8LKG",
+            "toolu_01Ge77dxJm9psMgAzCRtDeWD",
+            "toolu_01KgoCEJxdcMveJLCtPiuuVF",
+            "toolu_01DNoWwKVAvrtdV3rLUWtcYP",
+            "toolu_0131DSs114ckR4dpRsPTvWyH",
+            "toolu_01JEW9hwkWRVs7X1JjV2Ucne",
+            "toolu_019diTvWR7ZvacHV48vuHgmY",
+            "toolu_01UESNy3Fpxu3YK1E8nGjKNi",
+            "toolu_01QjaVKN9iLD26dCWsf6EevT",
+            "toolu_01XkDDNcHQqxZfNjFnxCL6Qq"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1003.hard",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1217713,
+          "runtime_ms": 42800,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 3,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "explore inventory": 2,
+              "explore query": 2
+            },
+            "by_envelope_status": {
+              "ok": 3,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_018KuSF9EPhcffUxUxLkbCpu",
+            "toolu_017q4Gr3AF8LvLqKYp5mUJoc",
+            "toolu_0119HQD2bkFLS28Qz22HWPHE",
+            "toolu_016XT6uHHkaftqTu1pHT2m6C"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1004.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.17600299999999997,
+          "runtime_ms": 55936,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 12,
+            "operations_finished": 12,
+            "operations_succeeded": 9,
+            "operations_errored": 3,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 1,
+              "cli": 11
+            },
+            "by_command": {
+              "explore query": 6,
+              "explore map": 1,
+              "transform plan": 3,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 3,
+              "ok": 9
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01Q5R8mAXEmxDZfMEFZxGmvL",
+            "toolu_015KuU2UmqHq3Cp4w3zP2eWt",
+            "toolu_015eyxaXwi9g9YS9UTcfvgus",
+            "toolu_01BvUYYYRsuBs4cPHHTqJwiX",
+            "toolu_01APE5bJBrQDE9ANN3YudvwF",
+            "toolu_01SCj9atHhv2ZmvbQcVMHfce",
+            "toolu_01L5XKQKRNREVibm72EKX6GZ",
+            "toolu_01PzAe5aiPVuMrrUAY8dTcqZ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1005.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1075192,
+          "runtime_ms": 34311,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 6,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "explore profile": 1,
+              "explore query": 3,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01JFZWhjHGjmpsEE3krt8zrx",
+            "toolu_018HvBu3WB7vvKx7UYfAc89B",
+            "toolu_013nrk2HTY82m1xhkvxnKDju",
+            "toolu_01WJ2XgEy46awPHJtQvysZtX",
+            "toolu_01QXoMUDqvmUXiAHioierdov"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1005.medium",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.16263899999999998,
+          "runtime_ms": 37618,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 5,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "explore profile": 1,
+              "": 1,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 1
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "no_envelope": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01P2wxQemGhJAqUCyhuhkDLK",
+            "toolu_01BMsJzuRAAvJWxGjvaEu5A7",
+            "toolu_014GbtN5kXB2Vh4nepSYnGr1",
+            "toolu_01XGTqfHTFV7nDDdszEx1jyR",
+            "toolu_01TtJZjFYFRR7KaiABG8e4Pt",
+            "toolu_012crRL5jCzkWD49aiA3Wwyp"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1006.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1218293,
+          "runtime_ms": 41359,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 9,
+            "operations_finished": 9,
+            "operations_succeeded": 6,
+            "operations_errored": 3,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 9
+            },
+            "by_command": {
+              "explore query": 4,
+              "": 1,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "no_envelope": 2,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_017mdfyTHzVYrW7w9Yj9L7Hw",
+            "toolu_01QRhp51HpuLHxPKdFh6Mbfz",
+            "toolu_01HizkB618WMXsLrbjuJox8C",
+            "toolu_01J7EoNVmcVvGjdzCjXCD6kj",
+            "toolu_01HxEZZQ6pqFRjqDtkefWJKa",
+            "toolu_0152ysVUiLpnyY1r3VcF9qGV",
+            "toolu_019JcEn9KY5aGHnRRc1XXZKn"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1006.hard",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.12610290000000002,
+          "runtime_ms": 44543,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 8,
+            "operations_finished": 8,
+            "operations_succeeded": 6,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 8
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 3
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "no_envelope": 1,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01XJiXNenvJ8u8JhBVhHsySk",
+            "toolu_01XbdhKA5B6PWbJwpzk6SrsR",
+            "toolu_01UuzHsB3AnD6dj8a3VzjQqG",
+            "toolu_01YYaMMBEpGySWRazavBQVjy",
+            "toolu_013yFxiE8UDbigKrFeVBmu4V",
+            "toolu_01RFWx7gXgQqLi6PgaCTz5jq",
+            "toolu_01VviBMHKREFWqCK7Aw9abU2"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1007.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.11624010000000001,
+          "runtime_ms": 38796,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 9,
+            "operations_finished": 9,
+            "operations_succeeded": 9,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 9
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore query": 5,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 9
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01Svoz5sEi3NJVGb5AnzxSU1",
+            "toolu_015P6LRoTxPVZLty4CE12hid",
+            "toolu_01CQsdD7ZXZEzf4y8psTXkFk",
+            "toolu_01Qsmdg7AACsvwoKPckkR5y8",
+            "toolu_01JbLvZUj3BSL47ZJNEz3417",
+            "toolu_014RuLnJaigkgLVgCSmkJUbL"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1007.medium",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1725296,
+          "runtime_ms": 46328,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 18,
+            "operations_finished": 18,
+            "operations_succeeded": 18,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 18
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore query": 14,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 18
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01PopGm1PrQEdUQB5v87W4o6",
+            "toolu_01FVnV97Tc7pjQukDiWj2sK5",
+            "toolu_0175pWftinhsRUv6Z48Tyd7u",
+            "toolu_016pmgtZrpZucTZQhkQtFGBj",
+            "toolu_01UeceVzS5UGmRXx1Wh9AEYZ",
+            "toolu_01FYVDQ2DJz57j41gAY36NPD",
+            "toolu_01KmFhavvjUgNYWqADzzmLPp",
+            "toolu_014vDHCResXPkiew2jbbtdNc"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1007.hard",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1606891,
+          "runtime_ms": 36255,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 6,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01JSkQbiZZLi82ZAk3KLEaUx",
+            "toolu_01NeVXbfikbcB7FJGGFAT6AB",
+            "toolu_018CU9YBCSjqibvztE1it3Rp",
+            "toolu_01FYBxauWsTy5QeG8BNrUdrQ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1009.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1424489,
+          "runtime_ms": 36089,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore map": 1,
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01FnPmQRMJpv2mBVqrJTz3RQ",
+            "toolu_01KzpDsy8YF2S54WS2YfoP2t",
+            "toolu_018Vs8GNpjmqePrwsXxYM8hU",
+            "toolu_019YW9JZLZ78tgkJyatrqoFX"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1010.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.0932261,
+          "runtime_ms": 34372,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 4,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "explore map": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_015K9DFEVtUMjWFH3bFTxJ7v",
+            "toolu_01Wja2pMUU2sGsnnSpFWLHRq",
+            "toolu_01Stnr4Rv62ANged4syQSSTw"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1010.medium",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.11065439999999997,
+          "runtime_ms": 39891,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore map": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_0117AjHw3v2PmsoG7ueckUA1",
+            "toolu_01G7Ajg445QU7HnDf55BiQ27",
+            "toolu_01T8dvX5gzXegNUej8f3vG7t",
+            "toolu_01GxVYu4L1QZg2bz9QsChuLa"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "f1011.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.14174989999999998,
+          "runtime_ms": 42539,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 5,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "explore query": 1,
+              "transform plan": 2,
+              "transform deps": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01R811saCt6Aaoi6bU81Ziam",
+            "toolu_01T2QUpnhYrHqmJKVYBMSnfP",
+            "toolu_019s8jkA3PfKHgvZHsNcEZxG",
+            "toolu_01FRPXjie2GkM8etGox6BHX5"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1082684,
+          "runtime_ms": 31127,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 4,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01J42SvgUXNQgkuTGwHmgcsg",
+            "toolu_01GnXGx3YwLuiTYSAAbdETAR",
+            "toolu_012bCEU3NUmqERkEQax6D9HP"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1419882,
+          "runtime_ms": 27637,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore profile": 1,
+              "explore query": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_017xFK8VERGN5QR1RXwKU5K8",
+            "toolu_01KMvu3HewscJJSU5EwXa5KJ",
+            "toolu_012GLMcrX9hJLGgKnBEHiCmw"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1492799,
+          "runtime_ms": 38842,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 6,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 6
+            },
+            "by_command": {
+              "explore query": 2,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01P8ntmUpD4T8wypKspQjTmT",
+            "toolu_01U9MSRSJ2wrko6c6QpwhX53",
+            "toolu_01NEZ4c16YkgwTjz1BKfLrb7",
+            "toolu_016yCSeCNT6cfnnqttsUxrcJ",
+            "toolu_014UGZSWZDLiudC6tE5MjLF7"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas004.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.13463170000000002,
+          "runtime_ms": 20639,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 4,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 4
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_013d1YjK1NeVXv8Wjyx9QqSi",
+            "toolu_01LzvNEXgQF1fDWRR7AfAQjk",
+            "toolu_011D3EAvpGN4F3my3FSpwaYU"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas004.no_hint",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.13270959999999998,
+          "runtime_ms": 27162,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 4,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01VRUCnLUxVxQZyyVDnU1yAr",
+            "toolu_018NqSYQgPSatjs4QYqijkGc",
+            "toolu_01EqTJBEjPbitiETZ1LPsQNv"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas005.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1366328,
+          "runtime_ms": 34137,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_012k1D74MDADYe2JmSKARJ7J",
+            "toolu_01Kkez5dfj6RrJgBSAWSS3gF",
+            "toolu_01QV51Y9VSj1SBuiG4FJPYaX",
+            "toolu_01LJtGxKwqFg8daDtf8gTYF6"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas006.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.11288060000000001,
+          "runtime_ms": 45601,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore map": 1,
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01R3nLfTtdpohmdwzPwW2bzA",
+            "toolu_01BB1L8QDcdtDB8CoWfMiX8n",
+            "toolu_01SHjKrewVLbs9ErpurKKjta",
+            "toolu_015posukTvoGQWGq8pHiYMtU"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas007.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1312182,
+          "runtime_ms": 37848,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 4,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "explore profile": 1,
+              "": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "no_envelope": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01GtdhbZZ1hDLP79h2C7YdS9",
+            "toolu_01P2CbShkg1YzB59S6NYy58T",
+            "toolu_01UhRD4QGAaF2MStdzi4ATHk",
+            "toolu_018iHCwR9wymw29hcUTeeqQw",
+            "toolu_01Gsm3T3TNSmupS1hL4YsWKR"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas007.no_location_hint",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.1374117,
+          "runtime_ms": 30850,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01GBqZatu1TaKQubwvmNBveT",
+            "toolu_01Tsdfwaa3BTnYaP7enEbKcL",
+            "toolu_01S2GxwtZk7mmzV35kwyB1Lj"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas008.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1283524,
+          "runtime_ms": 31775,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "transform references": 1,
+              "transform rename": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "error": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_014pUGn82vFtr1B5MiRW3NB9",
+            "toolu_01RNFGirnxQfgzWYWAyX24Xx",
+            "toolu_018JjFzmRPVbXtif7TWWLWDB",
+            "toolu_01ET64d3JAKHNnbyEYPbx98P",
+            "toolu_0171D1VznjUUB2KLvnpxyL33"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas009.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1188982,
+          "runtime_ms": 31253,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 3,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "no_envelope": 1,
+              "ok": 3
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01WQHrBqD6UWGf87VQNuLJnC",
+            "toolu_01ULxTq5Z4PBPXcZodb6dN1f",
+            "toolu_01J7RP6bWqdJ8rvHRQTQ22FQ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas010.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.1320883,
+          "runtime_ms": 38008,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 5
+            },
+            "by_command": {
+              "explore query": 1,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01KpoUWm76NDNKufyqfwcSyu",
+            "toolu_012BwnK1hxTvYLbVgBvWhKMV",
+            "toolu_018wCntkMxAtZf7BVfZtWyEX",
+            "toolu_01J36W9EKmw1Znfn3PoFtEGc"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas011.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1736944,
+          "runtime_ms": 51924,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 10,
+            "operations_finished": 10,
+            "operations_succeeded": 8,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 10
+            },
+            "by_command": {
+              "explore query": 6,
+              "explore map": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 1,
+              "ok": 8,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_013cTutXPxd8WhZtCcmaxavV",
+            "toolu_01RPVaKojo4aYb8jsVET3QdJ",
+            "toolu_01NaGnexWkF32qgeGpsurZ3L",
+            "toolu_01TyWY27vU6CC8J27kvAiKvb",
+            "toolu_01K4RxGoNA6DgZZbSxnPXD9g",
+            "toolu_01UiB4HSsnvRgbPy3MG3f44E",
+            "toolu_01G6wTsdKY79a2yRUmvWC3pD",
+            "toolu_01NS8sgA4mQDaVmy4m9HHBxg",
+            "toolu_01J84okFH2mmURvVXgQ24XfJ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas011.hard",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.3240997,
+          "runtime_ms": 101723,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 36,
+            "operations_finished": 36,
+            "operations_succeeded": 32,
+            "operations_errored": 4,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 36
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore query": 29,
+              "explore map": 1,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore profile": 1
+            },
+            "by_envelope_status": {
+              "ok": 32,
+              "error": 3,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01UtR9e8i2ik8BrPWiVFMcTc",
+            "toolu_015GQ4znXUrKS3jQqSMnVac6",
+            "toolu_01MFHu8aBYDRZbufkqkA5nnm",
+            "toolu_01EFZpPDNjVS5rCQhvqMukXJ",
+            "toolu_01QPx3T6sCQNRWWaPmMLjatA",
+            "toolu_0183itdZYsPHXX92vsxW7KZh",
+            "toolu_01PeXjrdw6vh6rAERicbGuCs",
+            "toolu_01CgfxNH8FFaQaSyvpFdB2Md",
+            "toolu_01GVCHNmkxUCrwyGLrM6L6Df",
+            "toolu_01WU3nzPsRWzYVxnEdeuU6ro",
+            "toolu_01181myvKMdWa2CMnrgEpb6E",
+            "toolu_01JQJK5Kn4XJHGwpQisRA3Nc",
+            "toolu_01HpCdk4ibq31MESqptqH43a",
+            "toolu_019GJgtZtwzRCdMyU3P8VDoW",
+            "toolu_01J5HAgYfQcJZyWgCdZYrqtP",
+            "toolu_014CwW7GUtenLfPJzU17sNN1"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas012.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.109066,
+          "runtime_ms": 31628,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 5,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 5
+            },
+            "by_command": {
+              "transform references": 1,
+              "transform plan": 1,
+              "transform compare": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01V424qtSQRn94ivKv2BdMnH",
+            "toolu_01WMrahMe9UxKsZmfJc5wVpu",
+            "toolu_01MkdtQJwu9sjs21sbVdgsrR",
+            "toolu_0162k1FVEWckczt5NQu2kYZP"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas012.hard",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1202187,
+          "runtime_ms": 36348,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 6,
+            "operations_errored": 0,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 6
+            },
+            "by_command": {
+              "transform references": 2,
+              "transform plan": 1,
+              "transform compare": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01JDJz2RQgE2WDYHVaqTmsrJ",
+            "toolu_01VEmT8H8f2DrgEUuYT65sJn",
+            "toolu_013Ada4dirY9TrX3z4XvBikE",
+            "toolu_01R93fbuvqidMYbtDsNYZnjt",
+            "toolu_01UyTQVnunUKn2SabJiQSWKL"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas013.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1428782,
+          "runtime_ms": 37651,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 4,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "explore query": 3,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 1,
+              "ok": 4,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_012vmaDM2bnhhSKB9PhfmF9Z",
+            "toolu_012aKgKk8uRvA5uMFwdoayU8",
+            "toolu_01JC2LYE7gXx87WThu4LPAb1",
+            "toolu_01B9i3ypuhCWnAYSnwHMLUw4"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas015.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1560279,
+          "runtime_ms": 45096,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01H4NYH8vku6h2QAKaLsWHa5",
+            "toolu_013RShvc3JrwGzBVrepjtvhY",
+            "toolu_01BCP2NdpkGW5Hj9sVRKSqnh",
+            "toolu_01VDRFHCLdYZc5bi6eEQ4Kw3",
+            "toolu_012AJUZWVttojeRZitJWfHY6"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas015.low",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1614532,
+          "runtime_ms": 51227,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 6,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 2
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_019SEMjfkG9Uajk48ouf9Ybi",
+            "toolu_01Q5fPt3oycNfuh5S2gbr5AP",
+            "toolu_01XesTw8hizBkcKfprCcnNSX",
+            "toolu_01QbGvTJN2rAzUxnn8gYi55m",
+            "toolu_01QwGFEZUkgcUK7WZBLTTGYM",
+            "toolu_01QFw8s1ASZD5TH7HaqWhvvf",
+            "toolu_01QrYnBDVYV6gLYHMPmzbgBZ"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas016.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.1929729,
+          "runtime_ms": 36564,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 8,
+            "operations_finished": 8,
+            "operations_succeeded": 7,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "cli": 8
+            },
+            "by_command": {
+              "explore profile": 1,
+              "transform plan": 1,
+              "transform compare": 1,
+              "transform apply": 1,
+              "transform build": 1,
+              "explore query": 2,
+              "config get": 1
+            },
+            "by_envelope_status": {
+              "ok": 7,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01AUAxVwsmwncEw4ntXzrU2c",
+            "toolu_01HuPHWGZBAoTJZdnanM55AG",
+            "toolu_01XRAm7a6hb1BDW9RCLhEEyA",
+            "toolu_01U8XRQ63Bj7bZZ3uHcQdyvr",
+            "toolu_01Kb8PCijRwcPkGzXF7Ns3iV",
+            "toolu_01SgJe3kzVygt7SLp6bp8obH"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas017.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.09919990000000001,
+          "runtime_ms": 28679,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 4,
+            "operations_finished": 4,
+            "operations_succeeded": 2,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 1,
+            "by_entrypoint": {
+              "skill_wrapper": 4
+            },
+            "by_command": {
+              "explore profile": 2,
+              "transform build": 2
+            },
+            "by_envelope_status": {
+              "error": 1,
+              "ok": 2,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01THeR9wVJPJ19PNhwsQSmUe",
+            "toolu_018ZJ4mN1tNRaw5eq8vHNAU7",
+            "toolu_01EuSgtSBTzWzpLv8FUgewv3",
+            "toolu_012VjRKNoSUQ3WGmZKAdboJQ",
+            "toolu_017bA7oKCw48VWkK3sg8E9sk"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "helixops_saas018.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.15121620000000002,
+          "runtime_ms": 35173,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 5,
+            "operations_finished": 5,
+            "operations_succeeded": 4,
+            "operations_errored": 1,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 5
+            },
+            "by_command": {
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "no_envelope": 1
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01PTnDk6tNxTTL8sYY8DVoYS",
+            "toolu_01JjkBrDCtVhTyB9xjoKfKWd",
+            "toolu_01VFe7bU3U4z8t6hR7Z4EKXB"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "intercom001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.17018509999999998,
+          "runtime_ms": 49693,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 12,
+            "operations_finished": 12,
+            "operations_succeeded": 8,
+            "operations_errored": 4,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 12
+            },
+            "by_command": {
+              "explore profile": 3,
+              "explore inventory": 1,
+              "explore query": 5,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 4,
+              "ok": 8
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01AX9Jq3aGJBWy2Vr6E9VyY9",
+            "toolu_01PvHb2uVE8tFKf4RAELFcpU",
+            "toolu_0138Vi7wZnw6NQZYK5fMSrpt",
+            "toolu_01AjnSXxqpPvV2zENfr7ZqUu",
+            "toolu_019ZXdj8i2EyiE3yf4MASRYo",
+            "toolu_01GiVPzNsqSjh5BGJ9YxRTZ8",
+            "toolu_01LsvqzWLAgNmNkxEv2p2nGp",
+            "toolu_01JWktA535WHdVd5GxEc9ai4",
+            "toolu_01A1nzuVAnVxfxLYz5YpxYeK",
+            "toolu_017fW31PjG8bgEAWBvuvR4ZY"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "intercom002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.2032883,
+          "runtime_ms": 56455,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 9,
+            "operations_finished": 9,
+            "operations_succeeded": 6,
+            "operations_errored": 3,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 9
+            },
+            "by_command": {
+              "explore inventory": 1,
+              "explore profile": 1,
+              "explore query": 3,
+              "transform plan": 2,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 6,
+              "error": 3
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01SgNBFQjFKqs2pqJoana2Bi",
+            "toolu_01Ufb9KyCea19VX2H8BpD8DD",
+            "toolu_01ATrfKdtTBXwQbu8BjTJVJK",
+            "toolu_01MbM2m4Lsin4NyVaVj3ATJr",
+            "toolu_01BFdFSEdpvwL2DYcSXnpy3N",
+            "toolu_01Xn7v7Y8gFWKVbR3CGcbEC3",
+            "toolu_01FGGoeJ1qorn8gD59jNkkty"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "intercom003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.2156482,
+          "runtime_ms": 55323,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:explore",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 9,
+            "operations_finished": 9,
+            "operations_succeeded": 6,
+            "operations_errored": 3,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 9
+            },
+            "by_command": {
+              "explore profile": 3,
+              "explore inventory": 1,
+              "explore query": 2,
+              "transform plan": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "error": 3,
+              "ok": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01TifZDACsweL1XtswP5tgzd",
+            "toolu_01McqWQVHizzvgz24Q2Hzay8",
+            "toolu_01MLUEZ3oij8QCZYwRR8j4Pk",
+            "toolu_01SvyQHe3ArobWKxcAmgegUA",
+            "toolu_01NvjFbVUJ9RhPimhYa3FEXg",
+            "toolu_01HWRG95rQ8tPSSEZVSDuBPe",
+            "toolu_01Ttqqh5rarFmXir61BxcAyg",
+            "toolu_01XmLLFdPx3PAxHa1whs4d8W"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "quickbooks001.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.3608592,
+          "runtime_ms": 145188,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:maintain",
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 23,
+            "operations_finished": 23,
+            "operations_succeeded": 16,
+            "operations_errored": 7,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 23
+            },
+            "by_command": {
+              "maintain verify": 1,
+              "explore profile": 2,
+              "explore query": 9,
+              "explore map": 1,
+              "transform plan": 4,
+              "transform apply": 3,
+              "transform build": 3
+            },
+            "by_envelope_status": {
+              "ok": 16,
+              "error": 7
+            }
+          },
+          "command_text_candidates": [
+            "toolu_013BrKEGLXkpXnAQwAUhdMrJ",
+            "toolu_01HG9ySUpBWEP8a4djJYNqJc",
+            "toolu_0142ZhBDKc12tHGMRfVEn7Us",
+            "toolu_01LDTBHWmULCHoUVpeZZXddp",
+            "toolu_01F1rMAcVsxbjao4AL2YrkKG",
+            "toolu_01EXkeibhTY4X8FLqymJZm7v",
+            "toolu_01ED4WscaExgGxmvVbSifFrf",
+            "toolu_015K677s6qZXJaemkaLrsVDX",
+            "toolu_011nmqL6WSC2bq9Qf5BFMisS",
+            "toolu_01GGPfQ4t5WhW98jboySkBVp",
+            "toolu_01BTjcymKe5SoePpGWSfDjFv",
+            "toolu_01NvxF4djBKH8zsfzv5euUiV",
+            "toolu_01RrZfnm8GyztS5kxfhP9KVF",
+            "toolu_01LmbvjYzzMkeMoKfZnVbNbN"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "quickbooks002.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.21210179999999998,
+          "runtime_ms": 83806,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 7,
+            "operations_finished": 7,
+            "operations_succeeded": 5,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 7
+            },
+            "by_command": {
+              "transform references": 1,
+              "transform remove": 3,
+              "transform deps": 1,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 5,
+              "error": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_0186aUfwv48gD7pKE71Yx3s4",
+            "toolu_01DYVAEocoQt7aZVfRxmDHnD",
+            "toolu_01WAt1YrzxJs4znEHn7qU6Jb",
+            "toolu_01PxsLUhDJpyw6m3Dsz5Cus9",
+            "toolu_01FpTr1FxYbvGFzbwHFdMwAW"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "quickbooks003.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "fail",
+          "is_resolved": false,
+          "reported_cost_usd": 0.21464450000000002,
+          "runtime_ms": 107098,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 6,
+            "operations_finished": 6,
+            "operations_succeeded": 4,
+            "operations_errored": 2,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "skill_wrapper": 6
+            },
+            "by_command": {
+              "transform references": 1,
+              "transform remove": 3,
+              "transform apply": 1,
+              "transform build": 1
+            },
+            "by_envelope_status": {
+              "ok": 4,
+              "error": 2
+            }
+          },
+          "command_text_candidates": [
+            "toolu_01H6TrhrExAUtE94CdTYJ1w4",
+            "toolu_01KsvY3Codvv8CFG67RzeBwK",
+            "toolu_016fhrKhbM4e1yCpsWVc45o9",
+            "toolu_018vDsrfTuxfx2EqL2yDRUEq",
+            "toolu_01Y4CeoF346RLiY3CLs8xMvo"
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "quickbooks004.base",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "pass",
+          "is_resolved": true,
+          "reported_cost_usd": 0.34530770000000005,
+          "runtime_ms": 141164,
+          "telemetry_available": true,
+          "plugin_loaded": true,
+          "skill_calls": [
+            "dex:transform"
+          ],
+          "execution": {
+            "schema": 2,
+            "operations_started": 9,
+            "operations_finished": 9,
+            "operations_succeeded": 6,
+            "operations_errored": 3,
+            "operations_incomplete": 0,
+            "help_or_version_calls": 0,
+            "by_entrypoint": {
+              "cli": 9
+            },
+            "by_command": {
+              "transform plan": 4,
+              "transform deps": 1,
+              "transform apply": 2,
+              "transform build": 2
+            },
+            "by_envelope_status": {
+              "error": 3,
+              "ok": 6
+            }
+          },
+          "command_text_candidates": [
+            "toolu_016W9qNXAMZbeuVHHxbRt1kG",
+            "toolu_01SuXs2QLRvQkfZKw4Q76hFd",
+            "toolu_0199g7k4AYCWrw6X5MdTnJsi",
+            "toolu_01TQn1zFx4JcHFjaTf5jSPNi",
+            "toolu_01UzfnHCjCd3EBnVKyQgUsKF",
+            "toolu_01Bqov9LYYgJZA9miHAaMhUx",
+            "toolu_019ZuQiC4X33jqjYd2DiDrUU",
+            "toolu_01LQ9XKMZXVJdmzkF7mVJ5mT"
+          ]
+        }
+      ]
+    }
+  ]
+}

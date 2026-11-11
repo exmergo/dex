@@ -152,6 +152,25 @@ class PlanResult(Result):
         return payload
 
 
+class RepairResult(PlanResult):
+    """A drafted package override, stored as an ordinary plan (#1229).
+
+    ``repair`` leads the payload after the plan id: the node, the error read,
+    each conversion with its evidence or the reason it stayed unresolved, and
+    what the restatement changed, so a reader cut off early still learns whether
+    the draft converts what failed.
+    """
+
+    repair: dict[str, Any] = Field(default_factory=dict)
+
+    def data(self) -> dict[str, Any]:
+        """The plan's payload with ``repair`` right after its identity."""
+
+        payload = super().data()
+        head = {k: payload.pop(k) for k in ("plan_id", "intent") if k in payload}
+        return {**head, "repair": self.repair, **payload}
+
+
 class PropagationResult(PlanResult):
     """A rename or a removal, propagated across the project as one plan.
 
