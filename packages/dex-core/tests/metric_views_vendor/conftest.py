@@ -44,6 +44,7 @@ def source(
     files: list[str] | None = None,
     **views: dict[str, Any],
 ):
+    """A Metric View source built the way the engine builds one, over ``views``."""
     from exmergo_dex_core.metric_views.project import MetricViewSemanticLayer
     from exmergo_dex_core.semantic_source import SemanticSourceContext
 

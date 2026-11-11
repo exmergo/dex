@@ -16,6 +16,7 @@ PACKAGE = Path(__file__).resolve().parents[2] / "src" / "exmergo_dex_core"
 
 
 def test_the_engine_builds_the_source_through_the_seam(tmp_path):
+    """`semantic.vendor: databricks` builds this source, with a fingerprint."""
     pytest.importorskip("sqlglot")
     from exmergo_dex_core.engine import DexEngine
     from exmergo_dex_core.metric_views.project import MetricViewSemanticLayer
@@ -31,6 +32,7 @@ def test_the_engine_builds_the_source_through_the_seam(tmp_path):
 
 
 def test_a_missing_dialect_engine_is_refused_by_name(monkeypatch):
+    """Naming the extra, as a prerequisite."""
     monkeypatch.setattr(dependency, "find_spec", lambda name: None)
 
     with pytest.raises(dependency.MetricViewDependencyError) as caught:
@@ -41,6 +43,7 @@ def test_a_missing_dialect_engine_is_refused_by_name(monkeypatch):
 
 
 def test_maintain_does_not_fingerprint_metricflow_under_this_vendor(tmp_path):
+    """The vendor's fingerprint answers, never the dbt project's."""
     pytest.importorskip("sqlglot")
     from exmergo_dex_core.engine import DexEngine
     from exmergo_dex_core.maintain.commands import _semantic_layer
@@ -48,7 +51,10 @@ def test_maintain_does_not_fingerprint_metricflow_under_this_vendor(tmp_path):
     from .conftest import ORDERS, repo
 
     class Project:
+        """A dbt project whose semantic layer must not be read."""
+
         def semantic_layer(self):
+            """Fails the test if called."""
             raise AssertionError("read the MetricFlow layer under vendor: databricks")
 
     engine = DexEngine.from_repo(repo(tmp_path, orders=ORDERS))
@@ -58,6 +64,7 @@ def test_maintain_does_not_fingerprint_metricflow_under_this_vendor(tmp_path):
 
 
 def test_the_extra_is_the_dialect_engine():
+    """`[metric-views]` is `[sql]`, and `[all]` covers it."""
     import tomllib
 
     pyproject = tomllib.loads(
@@ -70,6 +77,7 @@ def test_the_extra_is_the_dialect_engine():
 
 
 def test_only_lineage_imports_sqlglot():
+    """Everything else stays importable on a base install."""
     importers = sorted(
         path.name
         for path in (PACKAGE / "metric_views").glob("*.py")
@@ -80,6 +88,7 @@ def test_only_lineage_imports_sqlglot():
 
 
 def test_loading_the_config_and_the_package_leaves_sqlglot_unimported(tmp_path):
+    """Checked in a fresh interpreter."""
     code = (
         "import sys\n"
         "import exmergo_dex_core.metric_views\n"

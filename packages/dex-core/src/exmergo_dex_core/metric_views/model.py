@@ -67,10 +67,12 @@ class Join:
 
     @property
     def dotted(self) -> str:
+        """The join's path as written in an expression, ``customer.nation``."""
         return ".".join(self.path)
 
     @property
     def parent(self) -> tuple[str, ...]:
+        """The path of the join this one hangs off, ``()`` for the source."""
         return self.path[:-1]
 
 
@@ -123,6 +125,7 @@ class MetricView:
         )
 
     def member(self, name: str) -> Member | None:
+        """The field or measure named ``name``, matched ignoring case."""
         lowered = name.lower()
         return next(
             (m for m in (*self.fields, *self.measures) if m.name.lower() == lowered),
@@ -130,5 +133,6 @@ class MetricView:
         )
 
     def measure(self, name: str) -> Member | None:
+        """The measure named ``name`` (backticks allowed), matched ignoring case."""
         lowered = name.strip("`").lower()
         return next((m for m in self.measures if m.name.lower() == lowered), None)

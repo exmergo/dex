@@ -69,6 +69,7 @@ class Diagnostic:
     message: str
 
     def render(self) -> str:
+        """The diagnostic as one line: file, element, rule and message."""
         return f"{self.file}: {self.element}: [{self.rule}] {self.message}"
 
 
@@ -81,16 +82,20 @@ class LoadResult:
 
     @property
     def errors(self) -> list[Diagnostic]:
+        """The diagnostics that refused something."""
         return [d for d in self.diagnostics if d.severity == ERROR]
 
     @property
     def empty(self) -> bool:
+        """Whether no view could be read."""
         return not self.views
 
     def notes(self) -> list[str]:
+        """Every diagnostic, as a line for a catalog's or envelope's notes."""
         return [d.render() for d in self.diagnostics]
 
     def view(self, name: str) -> MetricView | None:
+        """The view named ``name``, or ``None``."""
         return next((v for v in self.views if v.name == name), None)
 
 
@@ -113,6 +118,7 @@ _Loader.add_implicit_resolver(
 
 
 def _mapping(loader: _Loader, node: yaml.MappingNode, deep: bool = False) -> Any:
+    """Construct a mapping, refusing a duplicate key and a key that is not text."""
     seen: set[Any] = set()
     for key_node, _ in node.value:
         key = loader.construct_object(key_node, deep=True)
@@ -184,6 +190,7 @@ def validate_view_contents(contents: Mapping[str, str]) -> LoadResult:
 def _diagnostic(
     file: str, element: str, rule: str, message: str, severity: str = ERROR
 ) -> Diagnostic:
+    """One :class:`Diagnostic`, an error unless ``severity`` says otherwise."""
     return Diagnostic(
         file=file, element=element, rule=rule, severity=severity, message=message
     )
@@ -218,6 +225,7 @@ def _resolve(root: Path, name: str) -> tuple[Path | None, Diagnostic | None]:
 
 
 def _load(contents: dict[str, str], result: LoadResult) -> LoadResult:
+    """Read and validate every file given as text, into ``result``."""
     for name, text in contents.items():
         view = _read_file(name, text, result)
         if view is not None:
@@ -226,6 +234,7 @@ def _load(contents: dict[str, str], result: LoadResult) -> LoadResult:
 
 
 def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
+    """One file's view, or ``None`` with the diagnostics that say why."""
     try:
         raw = read_yaml(text)
     except yaml.YAMLError as exc:
@@ -263,6 +272,7 @@ def _expressions(view: MetricView, result: LoadResult) -> MetricView:
     from . import lineage
 
     def refuse(element: str, rule: str, message: str) -> None:
+        """Record one finding against this view, at the severity its rule carries."""
         result.diagnostics.append(
             _diagnostic(view.file, element, rule, message, validator.RULES[rule])
         )
@@ -430,6 +440,7 @@ def _expressions(view: MetricView, result: LoadResult) -> MetricView:
 
 
 def _cycles(start: str, reads: Mapping[str, list[str]]) -> bool:
+    """Whether ``start`` reaches itself through the measures it reads."""
     pending = list(reads.get(start, []))
     seen: set[str] = set()
     while pending:

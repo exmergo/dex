@@ -71,6 +71,7 @@ class LocalMetricViewLayer:
     )
 
     def __init__(self, source: Any, engine: Any = None) -> None:
+        """Wrap a Metric View source; an engine, where given, backs the PII gate."""
         self._source = source
         # Optional: reading the catalog needs no engine. With one, the values
         # gate reads the profiled cache rather than the name alone.
@@ -92,6 +93,7 @@ class LocalMetricViewLayer:
     # ---- discovery ---------------------------------------------------------
 
     def list_definitions(self) -> SemanticCatalog:
+        """The catalog `explore semantic list` renders."""
         return SemanticCatalog.from_view(self._catalog_view(), self)
 
     def declared_relationships(self) -> list[Any]:
@@ -116,6 +118,7 @@ class LocalMetricViewLayer:
         return defs.model_declarations, defs.declaration_notes
 
     def _catalog_view(self):
+        """The source's catalog, read once; an unreadable layer is a backend error."""
         if self._view is None:
             try:
                 self._view = self._source.semantic_catalog()
@@ -137,6 +140,7 @@ class LocalMetricViewLayer:
         return None
 
     def query(self, _q: Any) -> Any:
+        """Refused by name until #964."""
         raise SemanticBackendError(
             f"{_NO_RUNTIME}. Read the layer with `explore semantic list`, then "
             "query the relations it names with `explore query`, which runs under "

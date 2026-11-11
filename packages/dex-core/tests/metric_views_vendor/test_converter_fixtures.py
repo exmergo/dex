@@ -26,6 +26,7 @@ from .conftest import FIXTURES
 
 
 def _layer(tmp_path: Path, fixture: str, connector: str = "databricks"):
+    """The converter fixture ``fixture`` as the one configured file."""
     target = tmp_path / "views" / f"{fixture}.yaml"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(FIXTURES / f"converter_{fixture}.yaml", target)
@@ -40,6 +41,7 @@ def _layer(tmp_path: Path, fixture: str, connector: str = "databricks"):
 
 @pytest.mark.parametrize("fixture", ["fixtureA", "fixtureB", "tpcds"])
 def test_every_converter_fixture_reads_with_no_error(tmp_path, fixture):
+    """Each reads as one view, with no refusal."""
     layer = _layer(tmp_path, fixture)
 
     assert layer.loaded().errors == []

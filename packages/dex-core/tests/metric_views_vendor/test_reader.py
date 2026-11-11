@@ -44,6 +44,7 @@ from .conftest import ORDERS, repo, source, view, write
 
 
 def _context(root: Path, files: list[str]) -> SemanticSourceContext:
+    """A source context naming ``files`` on DuckDB."""
     return SemanticSourceContext(
         repo_root=str(root), connector="duckdb", options={"files": files}
     )
@@ -59,9 +60,11 @@ class TestMetricViewSemanticSource(
 
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path) -> None:
+        """Each test writes into its own temporary repository."""
         self.root = tmp_path
 
     def build_source(self, context: SemanticSourceContext):
+        """Build through the factory the engine uses."""
         return MetricViewSemanticLayer.from_context(context)
 
     def empty_source_context(self) -> SemanticSourceContext:
@@ -70,19 +73,24 @@ class TestMetricViewSemanticSource(
         return _context(self.root, [write(self.root, "views/empty.yaml", raw="")])
 
     def absent_document_context(self) -> SemanticSourceContext:
+        """A configured file that does not exist yet."""
         return _context(self.root, ["views/absent.yaml"])
 
     def make_semantic_source(self):
+        """A source whose one file declares no view."""
         return self.build_source(self.empty_source_context())
 
     def an_unreadable_semantic_source(self):
+        """A file that does not parse as YAML."""
         names = [write(self.root, "views/broken.yaml", raw="version: [1.1,\n")]
         return MetricViewSemanticLayer.from_context(_context(self.root, names))
 
     def a_source_declaring_a_unique_key(self):
+        """The `rely` key on the `customer` join's joined table."""
         return source(self.root, orders=ORDERS), "orders.customer", "id"
 
     def a_source_declaring_a_join(self):
+        """The nested `customer.nation` join, `using: [nation_key]`."""
         return (
             source(self.root, orders=ORDERS),
             "orders.customer",
@@ -92,6 +100,7 @@ class TestMetricViewSemanticSource(
         )
 
     def a_source_declaring_a_composite_key(self):
+        """A `rely` join on three `using` columns: one composite key."""
         declared = view(
             "demo.main.line_items",
             joins=[
@@ -111,6 +120,7 @@ class TestMetricViewSemanticSource(
         )
 
     def a_source_declaring_a_join_with_differently_named_sides(self):
+        """`source.customer_id = customer.id`."""
         return (
             source(self.root, orders=ORDERS),
             "orders",
@@ -120,6 +130,7 @@ class TestMetricViewSemanticSource(
         )
 
     def a_source_declaring_a_semantic_model(self):
+        """`ORDERS`, with every field and measure's column as expected."""
         dimensions = {
             "order_id": "order_id",
             "status": "status",
@@ -144,9 +155,11 @@ class TestMetricViewBackend(SemanticBackendContract):
 
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path) -> None:
+        """Each test writes into its own temporary repository."""
         self.root = tmp_path
 
     def make_backend(self):
+        """The explore backend over `ORDERS`."""
         return LocalMetricViewLayer(source(self.root, orders=ORDERS))
 
 
@@ -265,6 +278,7 @@ def _predicate(template: str) -> str:
 
 
 def _reference_token(metric: dict[str, Any]) -> str:
+    """The `view.measure` token a reference metric is reported as."""
     owner = {
         m["name"]: model["name"]
         for model in REFERENCE_LAYER["semantic_models"]
@@ -292,9 +306,11 @@ class TestMetricViewReferenceLayer(SemanticCatalogContract):
 
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path) -> None:
+        """Each test writes into its own temporary repository."""
         self.root = tmp_path
 
     def make_reference_backend(self):
+        """The reference layer, rendered as Metric Views, through the engine."""
         # Through the engine, as a command reaches it. The config names no
         # warehouse: nothing here may need one.
         return resolve_semantic_layer(
@@ -302,6 +318,7 @@ class TestMetricViewReferenceLayer(SemanticCatalogContract):
         )
 
     def reported_name(self, kind: str, name: str) -> str:
+        """Metrics are reported as `view.measure`; everything else keeps its name."""
         return REFERENCE_METRIC_TOKENS[name] if kind == "metrics" else name
 
     def test_the_shared_entity_carries_a_declaration_per_model_with_its_own_key(

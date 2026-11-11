@@ -28,28 +28,34 @@ from .conftest import ORDERS, view, write
 
 
 def _load(body: dict[str, Any] | str, name: str = "views/orders.yaml"):
+    """Validate one body (a mapping or raw YAML) as `views/orders.yaml`."""
     text = body if isinstance(body, str) else yaml.safe_dump(body, sort_keys=False)
     return validate_view_contents({name: text})
 
 
 def _rules(result) -> dict[str, str]:
+    """Each diagnostic's rule, with its severity."""
     return {d.rule: d.severity for d in result.diagnostics}
 
 
 def _field(**entry: Any) -> dict[str, Any]:
+    """A view with one field carrying ``entry``."""
     return view(fields=[{"name": "x", "expr": "x", **entry}])
 
 
 def _measure(**entry: Any) -> dict[str, Any]:
+    """A view with one measure carrying ``entry``."""
     return view(measures=[{"name": "m", "expr": "SUM(x)", **entry}])
 
 
 def _join(**entry: Any) -> dict[str, Any]:
+    """A view with one join carrying ``entry``."""
     body = {"name": "c", "source": "demo.main.c", "on": "source.a = c.a", **entry}
     return view(joins=[body], fields=[{"name": "x", "expr": "x"}])
 
 
 def test_the_reference_star_reads_with_no_error():
+    """`ORDERS` reads whole: three joins, six fields, seven measures."""
     result = _load(ORDERS)
 
     assert result.errors == []
@@ -104,6 +110,7 @@ def test_the_reference_star_reads_with_no_error():
     ],
 )
 def test_a_view_level_refusal_leaves_the_view_out(body, rule):
+    """What the whole view rests on refuses the view, naming the file."""
     result = _load(body)
 
     assert result.views == []
@@ -112,6 +119,7 @@ def test_a_view_level_refusal_leaves_the_view_out(body, rule):
 
 
 def test_the_version_refusal_names_the_version_and_the_way_up():
+    """The message names both versions and the re-save."""
     result = _load(_field() | {"version": 0.1})
     (message,) = [d.message for d in result.errors]
 
@@ -161,6 +169,7 @@ def test_the_version_refusal_names_the_version_and_the_way_up():
     ],
 )
 def test_a_member_refusal_keeps_the_rest_of_the_view(body, rule):
+    """One bad field or measure is refused; its neighbour stays."""
     body.setdefault("fields", []).append({"name": "kept", "expr": "kept"})
     result = _load(body)
 
@@ -183,6 +192,7 @@ def test_a_member_refusal_keeps_the_rest_of_the_view(body, rule):
     ],
 )
 def test_every_documented_window_range_reads(expr):
+    """Each `range` form the specification documents."""
     result = _load(
         _measure(window=[{"order": "d", "range": expr, "offset": "-1 month"}])
     )
@@ -191,6 +201,7 @@ def test_every_documented_window_range_reads(expr):
 
 
 def test_names_are_unique_across_fields_and_measures_ignoring_case():
+    """The later of two is refused, so the earlier keeps its readers."""
     result = _load(
         view(
             fields=[{"name": "Revenue", "expr": "x"}],
@@ -216,6 +227,7 @@ def test_names_are_unique_across_fields_and_measures_ignoring_case():
     ],
 )
 def test_a_malformed_join_is_refused_by_name(entry, rule):
+    """Each join rule refuses the join and leaves the view."""
     body = _join(**entry)
     if entry.get("on", "") is None:
         del body["joins"][0]["on"]
@@ -227,6 +239,7 @@ def test_a_malformed_join_is_refused_by_name(entry, rule):
 
 
 def test_a_nested_join_keeps_its_parents_cardinality():
+    """Databricks refuses a cardinality mix down a join tree."""
     body = _join(
         cardinality="one_to_many",
         joins=[{"name": "d", "source": "demo.main.d", "using": ["k"]}],
@@ -239,6 +252,7 @@ def test_a_nested_join_keeps_its_parents_cardinality():
 
 
 def test_sibling_joins_need_distinct_names():
+    """A join's name is a column prefix, so siblings cannot share one."""
     body = view(
         joins=[
             {"name": "c", "source": "demo.main.c", "using": ["a"]},
@@ -253,6 +267,7 @@ def test_sibling_joins_need_distinct_names():
 
 
 def test_on_beside_using_warns_and_on_wins():
+    """As in Databricks, which reads `on`."""
     result = _load(_join(using=["a"]))
 
     assert _rules(result)["on_and_using"] == WARNING
@@ -261,6 +276,7 @@ def test_on_beside_using_warns_and_on_wins():
 
 
 def test_a_field_cannot_read_a_one_to_many_join():
+    """A measure may aggregate over one; a field may not read it."""
     body = _join(cardinality="one_to_many")
     body["fields"].append({"name": "y", "expr": "c.y"})
     body["measures"] = [{"name": "total", "expr": "SUM(c.y)"}]
@@ -273,6 +289,7 @@ def test_a_field_cannot_read_a_one_to_many_join():
 
 
 def test_measure_references_resolve_and_a_refusal_retracts_its_readers():
+    """Unknown, self-referencing, and retracted measures."""
     body = view(
         measures=[
             {"name": "a", "expr": "MEASURE(missing) + 1"},
@@ -291,6 +308,7 @@ def test_measure_references_resolve_and_a_refusal_retracts_its_readers():
 
 
 def test_an_unknown_key_warns_and_reads_on():
+    """Databricks refuses it; reading, dex only warns."""
     body = _field(colour="red") | {"owner": "me"}
     result = _load(body)
 
@@ -299,6 +317,7 @@ def test_an_unknown_key_warns_and_reads_on():
 
 
 def test_a_wildcard_is_named_and_never_expanded():
+    """Its members come from the warehouse schema, which dex does not read."""
     body = view(
         fields=[
             {"expr": "source.*"},
@@ -315,6 +334,7 @@ def test_a_wildcard_is_named_and_never_expanded():
 
 
 def test_a_wildcard_takes_no_metadata():
+    """A wildcard with a `name` is refused, as Databricks refuses it."""
     result = _load(
         view(fields=[{"name": "all", "expr": "source.*"}, {"name": "x", "expr": "x"}])
     )
@@ -332,6 +352,7 @@ def test_a_wildcard_takes_no_metadata():
     ],
 )
 def test_a_missing_name_is_derived_the_way_databricks_derives_it(expr, name):
+    """Checked against the names Databricks gives the same expressions."""
     assert derived_name(expr) == name
     result = _load(view(fields=[{"expr": expr}]))
     assert result.views[0].fields[0].name == name
@@ -354,6 +375,7 @@ def test_yaml_1_2_booleans_keep_a_bare_on_key():
 
 
 def test_a_key_written_twice_is_refused():
+    """Which of two keys a reader keeps is not something dex guesses."""
     result = _load("version: 1.1\nsource: a.b.c\nsource: d.e.f\nfields: []\n")
 
     assert result.views == []
@@ -362,6 +384,7 @@ def test_a_key_written_twice_is_refused():
 
 
 def test_dimensions_is_read_as_the_older_spelling_of_fields():
+    """And noted as such."""
     result = _load(view(dimensions=[{"name": "x", "expr": "x"}]))
 
     assert result.errors == []
@@ -370,10 +393,12 @@ def test_dimensions_is_read_as_the_older_spelling_of_fields():
 
 
 def test_every_rule_is_in_the_table_with_a_severity():
+    """Each rule carries an error or a warning."""
     assert set(RULES.values()) == {ERROR, WARNING}
 
 
 def test_a_missing_file_and_one_outside_the_repository_are_named(tmp_path: Path):
+    """A symlink out of the repository is caught on the resolved path."""
     outside = tmp_path.parent / f"{tmp_path.name}-outside.yaml"
     outside.write_text(yaml.safe_dump(ORDERS), encoding="utf-8")
     (tmp_path / "views").mkdir()
@@ -389,6 +414,7 @@ def test_a_missing_file_and_one_outside_the_repository_are_named(tmp_path: Path)
 
 
 def test_reading_writes_nothing(tmp_path: Path):
+    """The repository is the same before and after a read."""
     write(tmp_path, "views/orders.yaml", ORDERS)
     before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
 
@@ -431,6 +457,7 @@ def test_with_fields_and_dimensions_both_written_dimensions_is_read():
 
 
 def test_a_measure_reads_only_the_measures_before_it():
+    """A forward `MEASURE()` is unresolved in Databricks."""
     result = _load(
         view(
             measures=[
@@ -449,6 +476,7 @@ def test_a_measure_reads_only_the_measures_before_it():
 
 
 def test_a_field_reading_a_later_fields_name_warns():
+    """Databricks reads it as a source column, which only the warehouse confirms."""
     result = _load(
         view(
             fields=[
@@ -466,6 +494,7 @@ def test_a_field_reading_a_later_fields_name_warns():
 
 
 def test_a_filter_reading_a_fields_name_warns():
+    """A view `filter` reads source columns only."""
     result = _load(
         view(filter="mode != 'AIR'", fields=[{"name": "mode", "expr": "l_shipmode"}])
     )
@@ -474,6 +503,7 @@ def test_a_filter_reading_a_fields_name_warns():
 
 
 def test_a_nested_join_is_read_through_its_whole_path():
+    """`customer.segment` under `orders` is unresolved in Databricks."""
     body = view(
         joins=[
             {

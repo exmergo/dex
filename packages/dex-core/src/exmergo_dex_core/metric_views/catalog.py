@@ -126,6 +126,7 @@ class Resolution:
     notes: list[str] = field(default_factory=list)
 
     def table(self, view: str, path: tuple[str, ...] = _SOURCE) -> Table:
+        """The resolved source of the view (``path=()``) or of one of its joins."""
         return self.tables.get((view, path), Table(None, None))
 
     def column(self, view: str, member: str) -> str | None:
@@ -146,6 +147,7 @@ class Resolution:
         return (table.gate, found.column) if table.gate else None
 
     def computed(self, view: str, member: str) -> tuple[str, str] | None:
+        """``(relation, SQL)`` the PII gate parses for a computed field."""
         found = self.members.get((view, member))
         if found is None or found.owner is None or not found.expression:
             return None
@@ -163,6 +165,7 @@ def resolution(loaded: LoadResult, connector: str | None) -> Resolution:
     from . import lineage
 
     def fold(column: str) -> str:
+        """A column name spelled the way the connector folds an unquoted identifier."""
         return fold_identifier(connector, column)
 
     resolved = Resolution()
@@ -221,6 +224,7 @@ def _table(
     )
 
     def spelled(name: str | None) -> str | None:
+        """A relation name normalized for the connector, or ``None``."""
         if name is None:
             return None
         plain = name.replace("`", "")
@@ -265,6 +269,7 @@ def _resolve_member(
     lineage: Any,
     fold: Any,
 ) -> Resolved:
+    """Where one field reads from: its owner's column, or its SQL over one table."""
     plain = lineage.plain_column(member.expr)
     if plain is not None:
         if not plain.qualifier and plain.column.lower() in earlier:
@@ -299,6 +304,7 @@ def _resolve_measure(
     lineage: Any,
     fold: Any,
 ) -> Resolved:
+    """Where one measure reads from, and its aggregate, references and ratio sides."""
     refs = tuple(lineage.measure_refs(member.expr) or ())
     ratio = lineage.ratio_sides(member.expr)
     found = None if refs else lineage.aggregate(member.expr)
@@ -408,6 +414,7 @@ def _gate(
     physical: dict[str, tuple[str, str]],
     computed: dict[str, tuple[str, str]],
 ) -> None:
+    """Record where the PII gate screens ``token``: a column, or an expression."""
     if (found := resolved.gate(view.name, member.name)) is not None:
         physical[token] = found
     elif (expression := resolved.computed(view.name, member.name)) is not None:
@@ -438,6 +445,7 @@ def _params(view: MetricView, member: Member, resolved: Resolution) -> dict[str,
 def _metric(
     view: MetricView, member: Member, groupable: list[str], resolved: Resolution
 ) -> MetricInfo:
+    """One measure as the metric the catalog lists for it."""
     here = resolved.members.get((view.name, member.name)) or Resolved(owner=None)
     token = member_token(view.name, member.name)
     filters = [f for f in (view.filter, here.aggregate and here.aggregate.filter) if f]
@@ -509,6 +517,7 @@ def _underlying(view: MetricView, member: Member, resolved: Resolution) -> list[
 
 
 def _view_notes(view: MetricView) -> list[str]:
+    """What a view declares that the catalog carries without modelling it."""
     notes: list[str] = []
     if view.filter:
         notes.append(

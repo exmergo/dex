@@ -12,10 +12,12 @@ from exmergo_dex_core.config import DexConfig
 
 
 def _config(semantic: dict) -> DexConfig:
+    """A config with this `semantic` block, validated."""
     return DexConfig.model_validate({"connector": "duckdb", "semantic": semantic})
 
 
 def test_the_vendor_reads_its_file_list():
+    """With `local` as its only deployment."""
     config = _config(
         {"vendor": "databricks", "databricks": {"files": ["views/orders.yaml"]}}
     )
@@ -38,6 +40,7 @@ def test_the_vendor_reads_its_file_list():
     ],
 )
 def test_a_listing_dex_will_not_read_is_refused_by_name(files, said):
+    """Each refusal names the setting and the reason."""
     with pytest.raises(ValueError, match=r"semantic\.databricks\.files") as caught:
         _config({"vendor": "databricks", "databricks": {"files": files}})
 
@@ -45,11 +48,13 @@ def test_a_listing_dex_will_not_read_is_refused_by_name(files, said):
 
 
 def test_the_vendor_needs_its_listing():
+    """A vendor with no files names the missing key."""
     with pytest.raises(ValueError, match=r"needs semantic\.databricks\.files"):
         _config({"vendor": "databricks"})
 
 
 def test_the_section_is_refused_under_another_vendor():
+    """Coordinates that would be ignored are refused instead."""
     with pytest.raises(
         ValueError, match=r"only valid for semantic\.vendor: databricks"
     ):
@@ -57,6 +62,7 @@ def test_the_section_is_refused_under_another_vendor():
 
 
 def test_there_is_no_hosted_deployment():
+    """Only the files in this repository are a deployment."""
     with pytest.raises(ValueError, match="deployment must be one of local"):
         _config(
             {
@@ -82,17 +88,20 @@ def test_the_connector_section_and_the_vendor_section_do_not_collide():
 
 
 def _repo(root: Path, body: str) -> Path:
+    """A repository whose `.dex/config.yml` is ``body``."""
     (root / ".dex").mkdir()
     (root / ".dex" / "config.yml").write_text(body, encoding="utf-8")
     return root
 
 
 def _run(capsys, root: Path, *argv: str):
+    """Run the CLI against ``root`` and return its exit code and envelope."""
     rc = main(["--repo-root", str(root), *argv])
     return rc, json.loads(capsys.readouterr().out)
 
 
 def test_config_validate_names_a_bad_listing_at_its_line(tmp_path, capsys):
+    """The DDL refusal reaches `config validate`."""
     root = _repo(
         tmp_path,
         "connector: duckdb\nsemantic:\n  vendor: databricks\n  databricks:\n"
@@ -106,6 +115,7 @@ def test_config_validate_names_a_bad_listing_at_its_line(tmp_path, capsys):
 
 
 def test_config_get_reports_the_listing(tmp_path, capsys):
+    """The file list, as written."""
     root = _repo(
         tmp_path,
         "connector: duckdb\nsemantic:\n  vendor: databricks\n  databricks:\n"

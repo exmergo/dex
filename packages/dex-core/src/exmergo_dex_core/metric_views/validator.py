@@ -175,6 +175,7 @@ class Finding:
 
     @property
     def severity(self) -> str:
+        """The severity :data:`RULES` gives this finding's rule."""
         return RULES[self.rule]
 
 
@@ -209,6 +210,7 @@ def check_view(
     findings: list[Finding] = []
 
     def find(element: str, rule: str, message: str) -> None:
+        """Record one finding against this view."""
         findings.append(Finding(element, rule, message))
 
     if not isinstance(raw, Mapping):
@@ -291,6 +293,7 @@ def check_view(
 
 
 def _version(value: Any, find: Any) -> str:
+    """The view's `version`, as text, or a refusal unless it is the pinned 1.1."""
     # `version: 1.1` unquoted parses as a float, which is how Databricks' own
     # examples write it; `1.10` would too, so the text is compared, not a number.
     if value is None:
@@ -318,6 +321,7 @@ def _version(value: Any, find: Any) -> str:
 def _required_text(
     raw: Mapping[str, Any], key: str, element: str, rule: str, find: Any
 ) -> str:
+    """``raw[key]`` as non-empty text, or a refusal under ``rule``."""
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
         find(element, rule, f"`{key}` is required and has to be non-empty text")
@@ -328,6 +332,7 @@ def _required_text(
 def _optional_text(
     raw: Mapping[str, Any], key: str, element: str, find: Any
 ) -> str | None:
+    """``raw[key]`` as text, ``None`` where absent, or a refusal for another type."""
     value = raw.get(key)
     if value is None:
         return None
@@ -338,6 +343,7 @@ def _optional_text(
 
 
 def _parameters(value: Any, find: Any) -> list[dict[str, Any]]:
+    """The view's `parameters`, each with a name and a type, defaults in order."""
     if value is None:
         return []
     if not isinstance(value, list):
@@ -384,6 +390,7 @@ def _parameters(value: Any, find: Any) -> list[dict[str, Any]]:
 
 
 def _materialization(value: Any, find: Any) -> dict[str, Any] | None:
+    """The view's `materialization`, checked structurally and carried as written."""
     if value is None:
         return None
     where = "materialization"
@@ -446,6 +453,7 @@ def _materialization(value: Any, find: Any) -> dict[str, Any] | None:
 def _members(
     value: Any, key: str, kind: str, wildcards: list[Wildcard], find: Any
 ) -> list[Member]:
+    """Every readable field or measure of one list; a refused entry is left out."""
     if value is None:
         return []
     if not isinstance(value, list):
@@ -470,6 +478,7 @@ def _member(
     wildcards: list[Wildcard],
     find: Any,
 ) -> Member | None:
+    """One field or measure, ``None`` for a wildcard, or a refusal."""
     where = f"{key}[{index}]"
     if not isinstance(entry, Mapping):
         find(where, "member", "each entry is a mapping with at least an `expr`")
@@ -570,6 +579,7 @@ def _member(
 
 
 def _synonyms(value: Any, where: str, find: Any) -> tuple[str, ...]:
+    """A member's `synonyms`, within Unity Catalog's count and length limits."""
     if value is None:
         return ()
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
@@ -587,6 +597,7 @@ def _synonyms(value: Any, where: str, find: Any) -> tuple[str, ...]:
 
 
 def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
+    """A member's `format`, checked against the keys its `type` allows."""
     if value is None:
         return None
     here = f"{where}.format"
@@ -662,6 +673,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
 
 
 def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
+    """A measure's `window` specs, each with an `order` and a valid `range`."""
     if value is None:
         return ()
     if not isinstance(value, list) or not value:
@@ -704,6 +716,7 @@ def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
 
 
 def _range_ok(value: Any) -> bool:
+    """Whether ``value`` is a window `range` the specification documents."""
     if not isinstance(value, str):
         return False
     tokens = value.lower().split()
@@ -720,6 +733,7 @@ def _range_ok(value: Any) -> bool:
 
 
 def _partition(value: Any, where: str, find: Any) -> dict[str, Any] | None:
+    """A measure's `partition` (level of detail), checked and carried as written."""
     if value is None:
         return None
     here = f"{where}.partition"
@@ -777,6 +791,7 @@ def _unique(
 def _joins(
     value: Any, parent: tuple[str, ...], inherited: str | None, find: Any
 ) -> list[Join]:
+    """One level of the join tree; a refused join takes its children with it."""
     if value is None:
         return []
     where = f"joins['{'.'.join(parent)}'].joins" if parent else "joins"
@@ -810,6 +825,7 @@ def _join(
     inherited: str | None,
     find: Any,
 ) -> Join:
+    """One join and the joins nested under it, or a refusal."""
     where = (
         f"joins['{'.'.join(parent)}'].joins[{index}]" if parent else f"joins[{index}]"
     )

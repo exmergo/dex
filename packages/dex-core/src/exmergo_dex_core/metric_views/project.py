@@ -60,6 +60,7 @@ class MetricViewSemanticLayer:
     def __init__(
         self, repo_root: Path | str, files: list[str], connector: str | None = None
     ) -> None:
+        """Hold the coordinates; nothing is read until a channel asks."""
         self.repo_root = Path(repo_root)
         self.files = list(files)
         self.connector = connector
@@ -184,6 +185,7 @@ class MetricViewSemanticLayer:
         return snapshot_mod.semantic_layer(loaded, resolved)
 
     def _load(self) -> LoadResult:
+        """This command's validated read of the configured files, memoized."""
         if self._loaded is None:
             ensure_available()
             from .loader import load_files
@@ -192,6 +194,7 @@ class MetricViewSemanticLayer:
         return self._loaded
 
     def _resolution(self) -> Resolution:
+        """This command's resolution of the loaded set, memoized."""
         if self._resolved is None:
             ensure_available()
             from .catalog import resolution

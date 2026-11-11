@@ -87,6 +87,7 @@ class SourceRelation:
 
 
 def _parse(sql: str) -> exp.Expression | None:
+    """``sql`` parsed in the Databricks dialect, or ``None`` where it does not parse."""
     try:
         return sqlglot.parse_one(sql, read=DIALECT)
     except (ParseError, TokenError, ValueError):
@@ -107,6 +108,7 @@ def _parts(node: exp.Expression) -> list[str] | None:
 
 
 def _is_measure_call(node: exp.Expression) -> bool:
+    """Whether ``node`` is a ``MEASURE(...)`` call."""
     return isinstance(node, exp.Anonymous) and str(node.this).upper() == "MEASURE"
 
 
@@ -119,6 +121,7 @@ def column_refs(sql: str) -> list[ColumnRef] | None:
     found: list[ColumnRef] = []
 
     def walk(node: exp.Expression) -> None:
+        """Collect the columns under ``node``, skipping ``MEASURE()`` arguments."""
         if _is_measure_call(node):
             return
         parts = _parts(node)
@@ -359,6 +362,7 @@ def join_pairs(
 
 
 def _short(sql: str, limit: int = 60) -> str:
+    """``sql`` on one line, cut to ``limit`` characters for a note."""
     text = " ".join(sql.split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
@@ -384,6 +388,7 @@ def over_own_columns(sql: str, owners: tuple[tuple[str, ...], ...]) -> str | Non
                 return None
 
     def strip(node: exp.Expression) -> exp.Expression:
+        """A column without its qualifier; any other node as it is."""
         if isinstance(node, exp.Column) and node.table:
             return exp.column(node.this.copy())
         return node
