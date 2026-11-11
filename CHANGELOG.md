@@ -14,6 +14,20 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.7] - 2026-11-11
+
+### Fixed
+
+- **`*emphasis*` in semantic YAML no longer blocks a definition edit.**
+  `semantic define|update|plan --definitions-file` refused a file whose comments or
+  descriptions held Markdown emphasis such as `*active*`, saying it used YAML anchors
+  or aliases, so the caller had to restate the whole file. `maintain reconcile` had
+  the same false positive in a `schema.yml`, and dropped the test edit it proposes
+  for a lost key. Anchors and aliases are now read from the YAML parse, so a real
+  anchor, alias or `<<: *base` merge is still refused. A file that does not parse
+  now gets its own refusal, naming the line. ([#1256](https://github.com/exmergo/dex/pull/1256))
+
+
 ## [1.17.6] - 2026-11-10
 
 ### Added
