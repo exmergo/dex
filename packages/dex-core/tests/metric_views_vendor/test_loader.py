@@ -631,3 +631,34 @@ def test_a_recursive_yaml_alias_refuses_its_file_and_not_the_layer():
         ("views/orders.yaml", "malformed")
     }
     assert [v.name for v in result.views] == ["other"]
+
+
+def test_aliases_that_expand_exponentially_refuse_their_file_quickly():
+    """Thirty levels of `[*prev, *prev]` are 2**30 values once followed; the
+    check sizes each alias once, and the file is refused rather than stalling."""
+
+    import time
+
+    lines = ["version: 1.1", "source: demo.main.orders", "a0: &a0 [0]"]
+    lines += [f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 31)]
+    lines += ["fields:", "  - name: x", "    expr: x"]
+    started = time.monotonic()
+    result = _load("\n".join(lines) + "\n")
+
+    assert time.monotonic() - started < 5
+    assert result.views == []
+    (diagnostic,) = result.diagnostics
+    assert diagnostic.rule == "malformed" and "expand" in diagnostic.message
+
+
+def test_a_shared_alias_within_bounds_still_reads():
+    """An alias reused a few times is ordinary YAML."""
+
+    text = (
+        "version: 1.1\nsource: demo.main.orders\n"
+        "fields:\n  - &f {name: x, expr: x}\n"
+        "measures:\n  - {name: n, expr: COUNT(1)}\n"
+    )
+    result = _load(text)
+
+    assert result.errors == []
