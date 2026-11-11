@@ -2451,7 +2451,14 @@ def grain_drift(
                         f"{row_count} rows (~{duplicates} duplicate rows). "
                         + _declared_consequence(origin)
                         + (" and " if joins else ", and ")
-                        + _fanout_clause(joins)
+                        + (
+                            # The probe measures the table, not which keys a
+                            # join matches, so a semantic claim's fan-out is
+                            # stated as a possibility (#1259).
+                            "joins on it can fan out where they match a duplicated key"
+                            if joins and origin and origin[1] != "combination"
+                            else _fanout_clause(joins)
+                        )
                         + floor_note
                     ),
                     data={

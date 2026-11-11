@@ -259,7 +259,9 @@ def declared_schema_drift(
             # A query source reads columns of its table before anything in the
             # view does; one it lost breaks the source itself.
             if table.relation is None or table.columns is not None:
-                missing = _query_columns_missing(written, live, lineage)
+                missing = _query_columns_missing(
+                    written, live, lineage, f"view '{view.name}': {element}", notes
+                )
                 if missing:
                     state.held.append(
                         {
@@ -402,7 +404,9 @@ def _through(table: Table, column: str) -> str | None:
     return lowered.get(column.lower())
 
 
-def _query_columns_missing(source: str, live: _Live, lineage: Any) -> str | None:
+def _query_columns_missing(
+    source: str, live: _Live, lineage: Any, element: str, notes: list[str]
+) -> str | None:
     """The first column a query ``source`` reads that its table lost, or None.
 
     A table name reads nothing of its own. A query over one table reads every
@@ -411,9 +415,17 @@ def _query_columns_missing(source: str, live: _Live, lineage: Any) -> str | None
 
     if not lineage.is_query(source):
         return None
-    for column in lineage.query_columns(source) or ():
+    reads, ambiguous = lineage.query_columns(source) or ([], [])
+    for column in reads:
         if live.find(column) is None:
             return column
+    notes.extend(
+        f"{element}: the query's `{column}` in GROUP BY or HAVING is both an "
+        f"alias and a name {live.identifier} no longer has, so whether it read "
+        "the table was not checked"
+        for column in ambiguous
+        if live.find(column) is None
+    )
     return None
 
 

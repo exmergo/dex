@@ -701,6 +701,7 @@ def test_a_contradicted_rely_key_is_worded_as_the_views_claim(tmp_path, capsys):
     assert "(orders.customer)" in finding["detail"], "the join that claims it"
     assert "the project declares" not in finding["detail"]
     assert "more than once" in finding["detail"]
+    assert "will fan out" not in finding["detail"], "a risk, not a measurement"
     assert finding["data"]["declared_on"] == ["orders.customer"]
     assert (finding["data"]["declared_by"], finding["data"]["claim"]) == (
         "databricks",
@@ -767,3 +768,33 @@ def test_a_project_grain_and_a_rely_key_on_the_same_columns_are_both_named():
         ("yaml", "combination"),
         ("databricks", "unique"),
     }
+
+
+def test_a_having_name_both_alias_and_column_is_unchecked_not_dropped(tmp_path, capsys):
+    """Databricks reads a table column before an alias in HAVING, so a name
+    that is both was a read only while the table had it: named, not judged."""
+
+    _sql(
+        tmp_path,
+        "CREATE TABLE orders (a INTEGER, b INTEGER, c INTEGER)",
+        "INSERT INTO orders VALUES (1, 2, 3)",
+    )
+    root = repo(
+        tmp_path,
+        orders=view(
+            "SELECT sum(b) AS a FROM demo.main.orders HAVING max(a) > 1",
+            measures=[{"name": "n", "expr": "COUNT(1)"}],
+        ),
+        config="duckdb:\n  path: demo.duckdb\n",
+    )
+    assert _run_ok(root, "explore", "map")
+    assert _run_ok(root, "maintain", "snapshot")
+
+    findings = _drift(capsys, root, "ALTER TABLE orders DROP COLUMN a")
+
+    assert not findings
+    rc, envelope = _run(capsys, root, "maintain", "schema")
+    assert rc == 0, envelope["errors"]
+    assert "whether it read the table was not checked" in json.dumps(
+        envelope["warnings"]
+    )

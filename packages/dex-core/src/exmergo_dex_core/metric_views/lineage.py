@@ -234,14 +234,17 @@ def is_query(source: str) -> bool:
     return bool(_QUERY.match(source))
 
 
-def query_columns(source: str) -> list[str] | None:
-    """The physical columns a query ``source`` reads, or None where it does not
-    parse.
+def query_columns(source: str) -> tuple[list[str], list[str]] | None:
+    """The physical columns a query ``source`` reads, and the names whose
+    reading is ambiguous, or None where it does not parse.
 
     A column in the select list or ``WHERE`` is a read of the table even when an
-    alias shares its name (``old AS old``). An unqualified name in ``ORDER BY``,
-    ``GROUP BY`` or ``HAVING`` that the select list names as an alias is that
-    alias, not a column (``status AS s ... ORDER BY s``).
+    alias shares its name (``old AS old``). An unqualified name in ``ORDER BY``
+    that the select list names as an alias is that alias. In ``GROUP BY`` and
+    ``HAVING`` Databricks resolves a table column before an alias, so a name
+    that is both is a read only while the table has it: such a name is returned
+    as ambiguous, for the caller to name as unchecked when it is missing rather
+    than to call it dropped.
     """
 
     tree = _parse(source)
@@ -259,18 +262,17 @@ def query_columns(source: str) -> list[str] | None:
         if isinstance(select, exp.Select)
         else set()
     )
-    later = (exp.Order, exp.Group, exp.Having)
     found: list[str] = []
+    ambiguous: list[str] = []
     for node in tree.find_all(exp.Column):
         name = node.name
-        if (
-            not node.table
-            and name.lower() in aliases
-            and node.find_ancestor(*later) is not None
-        ):
-            continue
-        found.append(name)
-    return found
+        if node.table or name.lower() not in aliases:
+            found.append(name)
+        elif node.find_ancestor(exp.Group, exp.Having) is not None:
+            ambiguous.append(name)
+        elif node.find_ancestor(exp.Order) is None:
+            found.append(name)
+    return found, ambiguous
 
 
 def source_relation(source: str) -> SourceRelation:
