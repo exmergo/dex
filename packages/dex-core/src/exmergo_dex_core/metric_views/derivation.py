@@ -190,6 +190,7 @@ def _build(
     prefix: str | None,
     documents: Mapping[str, str],
 ) -> DerivedDefinition:
+    """One declared mart as a Metric View body, or the reason there is none."""
     from ..semantic_source import DerivedDefinition
 
     model = declaration.model
@@ -201,6 +202,7 @@ def _build(
     identifier = declaration.identifier or model
 
     def finish(status: str, reason: str) -> DerivedDefinition:
+        """Close the definition with ``status`` and ``reason``, nothing carried."""
         definition.status = status  # type: ignore[assignment]
         definition.reason = reason
         definition.carried, definition.not_carried = account(
@@ -402,6 +404,7 @@ def _measure(
     limitations: list[str],
     reasons: dict[str, str],
 ) -> dict[str, Any] | None:
+    """The measure a declared aggregation states, or ``None`` with the reason."""
     declared = spec.get("aggregation")
     additivity = spec.get("additivity")
     why: str | None = None
@@ -528,6 +531,7 @@ def _joins(
     reasons: dict[str, str],
     carried: list[str],
 ) -> list[dict[str, Any]]:
+    """One ``many_to_one`` join per declared foreign key that can be written."""
     joins: list[dict[str, Any]] = []
     used: set[str] = set()
     for reference in declaration.references:
@@ -625,6 +629,7 @@ def _views(documents: Mapping[str, str]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def _stem(path: str) -> str:
+    """The view a file names: its stem."""
     return PurePosixPath(path).stem
 
 
@@ -720,6 +725,7 @@ def _validate(
 
 
 def _adopt(layer: MetricViewSemanticLayer, paths: list[str]) -> str:
+    """The commands that put ``paths`` on the write surface and author them."""
     listed = ", ".join(dict.fromkeys([*layer.files, *paths]))
     return (
         f"{', '.join(paths)} is not under semantic.databricks.files, the files dex "
@@ -730,6 +736,7 @@ def _adopt(layer: MetricViewSemanticLayer, paths: list[str]) -> str:
 
 
 def _edit(path: str, content: str) -> Any:
+    """A whole-file semantic-document edit writing ``content`` to ``path``."""
     from ..transform.plans import EditKind, PlanEdit
 
     return PlanEdit(path=path, kind=EditKind.SEMANTIC_DOCUMENT, new_content=content)
@@ -741,6 +748,7 @@ def _edit(path: str, content: str) -> Any:
 def _proposal(
     layer: MetricViewSemanticLayer, definitions: Mapping[str, DerivedDefinition]
 ) -> dict[str, Any]:
+    """The ``data.semantic_proposal`` body for the batch."""
     proposed = [d for d in definitions.values() if d.status == "proposed" and d.content]
     included = [d for d in definitions.values() if d.status == "included"]
     data: dict[str, Any] = {
@@ -775,6 +783,7 @@ def _proposal(
 
 
 def _model_data(definition: DerivedDefinition) -> dict[str, Any]:
+    """One model's entry under ``data.semantic_proposal.models``."""
     out: dict[str, Any] = {"status": definition.status}
     if definition.content is not None:
         out["view"] = definition.name
@@ -794,6 +803,7 @@ def _model_data(definition: DerivedDefinition) -> dict[str, Any]:
 
 
 def _warnings(definitions: Mapping[str, DerivedDefinition]) -> list[str]:
+    """One envelope warning per view included, failed or unvalidated."""
     out: list[str] = []
     for definition in definitions.values():
         if definition.status == "included":
@@ -1025,6 +1035,7 @@ def _annotated(
 
 
 def _is_time(member: Mapping[str, Any]) -> bool:
+    """Whether a member's ``format`` marks it a date or a timestamp."""
     fmt = member.get("format")
     return isinstance(fmt, Mapping) and fmt.get("type") in ("date", "date_time")
 
@@ -1049,6 +1060,7 @@ def _aggregation_of(member: Mapping[str, Any]) -> str | None:
 
 
 def _replace_item(text: str, section: str, name: str, entry: Mapping[str, Any]) -> str:
+    """``text`` with the member ``name`` in ``section`` re-rendered as ``entry``."""
     located = locate(text, name, section, load=read_yaml)
     if located is None:
         raise _UnwritableError(

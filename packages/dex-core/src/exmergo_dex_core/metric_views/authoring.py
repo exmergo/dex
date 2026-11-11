@@ -403,6 +403,7 @@ def _mode_for(target: Path) -> int:
 
 
 def _root(layer: MetricViewSemanticLayer) -> Path:
+    """The repository root, symlinks resolved."""
     return layer.repo_root.resolve()
 
 
@@ -423,10 +424,12 @@ def _target(root: Path, name: str) -> Path:
 def _read(path: Path) -> str:
     # Bytes decoded, not text mode, so the pinned hash is of the file's own
     # newlines and a CRLF file does not read as a change.
+    """A file's text as its bytes decode, newlines untouched."""
     return path.read_bytes().decode("utf-8")
 
 
 def _why_not_writable(layer: MetricViewSemanticLayer, path: str) -> str:
+    """Why ``path`` is not on the write surface, in one clause."""
     parts = PurePosixPath(path.replace("\\", "/")).parts
     if not parts or PurePosixPath(path).is_absolute() or ".." in parts:
         return f"'{path}' is outside the repository"
