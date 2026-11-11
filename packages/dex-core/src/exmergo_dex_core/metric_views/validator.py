@@ -721,7 +721,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
     # either, fails `CREATE VIEW` ("missing required creator property"), checked
     # against a serverless SQL warehouse (#1258).
     required = {"date": ("date_format",), "date_time": ("date_format", "time_format")}
-    if missing := [key for key in required.get(kind, ()) if key not in value]:
+    if missing := [key for key in required.get(kind, ()) if value.get(key) is None]:
         find(
             here,
             "format",

@@ -312,11 +312,11 @@ def write_edits(
             "configured Metric View files are missing at apply time, so nothing "
             "was written: " + ", ".join(missing)
         )
-    from .loader import validate_view_contents
-
-    validated = validate_view_contents(prospective)
-    if validated.errors:
-        listed = "\n  ".join(d.render() for d in validated.errors)
+    # The same checks a plan is stored under, strict rules included: a plan
+    # document applied in another checkout never ran this layer's planning.
+    _validated, refusals = refusals_for(prospective, {e.path for _, e in staged})
+    if refusals:
+        listed = "\n  ".join(d.render() for d in refusals)
         raise ProjectError(
             "the Metric Views this apply would leave are invalid, so nothing was "
             f"written:\n  {listed}"
@@ -370,6 +370,9 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
             handle, name = tempfile.mkstemp(
                 dir=target.parent, prefix=f".{target.name}.", suffix=".dex"
             )
+            # mkstemp creates the file owner-only; the written file keeps the
+            # target's mode, or a new file's usual mode under the umask.
+            os.fchmod(handle, _mode_for(target))
             with os.fdopen(handle, "wb") as out:
                 out.write((edit.new_content or "").encode("utf-8"))
             temporaries.append((Path(name), target, edit))
@@ -386,6 +389,17 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
 
 
 # --- helpers -------------------------------------------------------------------
+
+
+def _mode_for(target: Path) -> int:
+    """The permission bits a write to ``target`` should leave."""
+
+    try:
+        return target.stat().st_mode & 0o777
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
 
 
 def _root(layer: MetricViewSemanticLayer) -> Path:

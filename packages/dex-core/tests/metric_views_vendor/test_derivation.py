@@ -369,6 +369,21 @@ def test_a_percent_unit_and_a_count_keep_no_format(tmp_path: Path):
     assert "count" in definition.not_carried["columns.order_total.unit"]
 
 
+def test_a_measure_dropped_for_a_name_collision_is_not_carried(tmp_path: Path):
+    declared = copy.deepcopy(POPULATED)
+    # A field named like the measure `discount_rate` derives.
+    declared["columns"]["discount_rate_avg"] = {"role": "dimension"}
+    definition = _derive(tmp_path, declared=declared).definitions["fct_orders"]
+    measures = {m["name"] for m in read_yaml(definition.content)["measures"]}
+    assert "discount_rate_avg" not in measures
+    assert "columns.discount_rate.aggregation" not in definition.carried
+    assert "columns.discount_rate.unit" not in definition.carried
+    assert (
+        "share one namespace"
+        in definition.not_carried["columns.discount_rate.aggregation"]
+    )
+
+
 def test_an_unconfigured_path_is_proposed_with_the_command_that_adopts_it(
     tmp_path: Path,
 ):

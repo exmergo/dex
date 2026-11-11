@@ -136,6 +136,7 @@ def test_the_version_refusal_names_the_version_and_the_way_up():
         (_field(format={"type": "currency"}), "format"),
         # Databricks requires both halves of a temporal format (#1258).
         (_field(format={"type": "date"}), "format"),
+        (_field(format={"type": "date", "date_format": None}), "format"),
         (
             _field(format={"type": "date_time", "date_format": "year_month_day"}),
             "format",

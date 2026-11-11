@@ -259,6 +259,9 @@ def _build(
     grain = [g for g in declared.get("grain") or [] if isinstance(g, str)]
     fields: list[dict[str, Any]] = []
     measures: list[dict[str, Any]] = []
+    #: Each measure's source column and spec, so its facts are carried only once
+    #: it survives the name-collision check below.
+    sources: dict[str, tuple[str, Mapping[str, Any]]] = {}
     for name in dict.fromkeys([*grain, *columns]):
         spec = columns.get(name, {})
         role = spec.get("role")
@@ -266,7 +269,7 @@ def _build(
             measure = _measure(name, spec, limitations, reasons)
             if measure is not None:
                 measures.append(measure)
-                carried.extend(_carried_member(name, spec, measure))
+                sources[measure["name"]] = (name, spec)
             continue
         if name not in grain and role not in _FIELD_ROLES:
             reasons[f"columns.{name}"] = (
@@ -300,14 +303,16 @@ def _build(
 
     names = {f["name"].lower() for f in fields}
     for measure in list(measures):
+        column, spec = sources[measure["name"]]
         if measure["name"].lower() in names:
             measures.remove(measure)
-            column = measure["name"].rsplit("_", 1)[0]
             reasons[f"columns.{column}.aggregation"] = (
                 f"the measure name '{measure['name']}' is already a field's, and "
                 "fields and measures share one namespace"
             )
+            continue
         names.add(measure["name"].lower())
+        carried.extend(_carried_member(column, spec, measure))
 
     joins = _joins(declaration, current, prefix, notes, reasons, carried)
 

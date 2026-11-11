@@ -491,3 +491,42 @@ def test_authoring_opens_no_connection(tmp_path, capsys, no_warehouse):
         capsys, tmp_path, "transform", "apply", envelope["data"]["plan_id"]
     )
     assert rc == 0, applied["errors"]
+
+
+def test_apply_holds_a_written_file_to_the_strict_rules(tmp_path):
+    """A plan document applied elsewhere never ran planning's checks."""
+
+    layered(tmp_path)
+    layer = MetricViewSemanticLayer(tmp_path, [ORDERS_FILE, CUSTOMERS_FILE])
+    current = layer.semantic_edit_view().files[ORDERS_FILE]
+    edit = PlanEdit(
+        path=ORDERS_FILE,
+        kind=EditKind.SEMANTIC_DOCUMENT,
+        old_content_hash=current.sha256,
+        new_content=dump_yaml(dict(ORDERS, owner="finance")),
+    )
+    from exmergo_dex_core.errors import ProjectError
+
+    with pytest.raises(ProjectError, match=r"\[unknown_key\]"):
+        layer.write_semantic_edits([edit])
+    assert read(tmp_path, ORDERS_FILE) == current.content
+
+
+def test_apply_keeps_the_file_mode(tmp_path):
+    layered(tmp_path)
+    target = tmp_path / ORDERS_FILE
+    target.chmod(0o644)
+    layer = MetricViewSemanticLayer(tmp_path, [ORDERS_FILE, CUSTOMERS_FILE])
+    current = layer.semantic_edit_view().files[ORDERS_FILE]
+    result = layer.write_semantic_edits(
+        [
+            PlanEdit(
+                path=ORDERS_FILE,
+                kind=EditKind.SEMANTIC_DOCUMENT,
+                old_content_hash=current.sha256,
+                new_content=dump_yaml(dict(ORDERS, comment="x")),
+            )
+        ]
+    )
+    assert result.written == [ORDERS_FILE]
+    assert target.stat().st_mode & 0o777 == 0o644
