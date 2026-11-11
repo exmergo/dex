@@ -205,7 +205,10 @@ personal data, read and query the semantic layer, and map relationships as a
 Mermaid ER diagram. Exploration is read-only and needs no dbt project.
 [Skill](skills/explore/SKILL.md) · [methodology](https://docs.exmergo.com/dex/concepts/methodology) · [commands](https://docs.exmergo.com/dex/cli/explore)
 
-<img width="522" height="343" alt="Explore" src="https://github.com/user-attachments/assets/7f16b370-66ed-4596-ae01-041cf3db3525" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/explore-dark.png" />
+  <img width="522" height="343" alt="Explore" src="assets/readme/explore-light.png" />
+</picture>
 
 ### Transform
 
@@ -215,7 +218,10 @@ native semantic layer without a dbt project. Review each stored plan before
 applying it, then build and verify on a dev target.
 [Skill](skills/transform/SKILL.md) · [what Dex writes](https://docs.exmergo.com/dex/concepts/dbt-project) · [commands](https://docs.exmergo.com/dex/cli/transform)
 
-<img width="504" height="271" alt="Transform" src="https://github.com/user-attachments/assets/fda40e48-b481-424c-adc7-d79c0ede346b" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/transform-dark.png" />
+  <img width="504" height="271" alt="Transform" src="assets/readme/transform-light.png" />
+</picture>
 
 ### Maintain
 
@@ -225,7 +231,10 @@ the proposed edits. `maintain verify` also checks a project as it stands, with n
 baseline needed.
 [Skill](skills/maintain/SKILL.md) · [commands](https://docs.exmergo.com/dex/cli/maintain)
 
-<img width="484" height="344" alt="Maintain" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/maintain-dark.png" />
+  <img width="484" height="344" alt="Maintain" src="assets/readme/maintain-light.png" />
+</picture>
 
 > [!TIP]
 > **Give every agent in your repository the same procedure.**
