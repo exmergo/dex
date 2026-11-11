@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from .catalog import Resolution, Table
     from .loader import LoadResult
 
-__all__ = ["declared_schema_drift", "needed_kind"]
+__all__ = ["declared_schema_drift", "needed_kind", "view_digest"]
 
 _SOURCE: tuple[str, ...] = ()
 
@@ -65,6 +65,14 @@ _SUMMING = frozenset({"sum", "avg", "mean"})
 #: Aggregations whose result is a value of the column itself, so the measure's
 #: ``format`` describes the column's type.
 _PASSING = frozenset({"min", "max", "any_value", "first", "last", "median", "mode"})
+
+
+def view_digest(view: MetricView) -> str:
+    """The fingerprint's content hash of one view as parsed."""
+
+    from .snapshot import _hash
+
+    return _hash(view.raw)
 
 
 def needed_kind(
@@ -291,8 +299,9 @@ def declared_schema_drift(
             return None, True
 
         # The view's filter: a population, never cut by dex.
+        filter_reads = _Reads()
         if view.filter:
-            reads = _reads(view, view.filter, None, lineage)
+            reads = filter_reads = _reads(view, view.filter, None, lineage)
             for owner, column in reads.columns:
                 cause, _checked = column_cause(owner, column)
                 if cause is not None:
@@ -355,6 +364,20 @@ def declared_schema_drift(
                     state.members[member.name.lower()] = conflict
 
         _cascade(state, reads_of)
+        # A filter reading through a join that goes would be left dangling.
+        for owner in sorted(filter_reads.owners):
+            gone = state.path_gone(owner)
+            if gone is not None and not any(
+                h["reason"] == "filter_reads_dropped" for h in state.held
+            ):
+                state.held.append(
+                    {
+                        "reason": "filter_reads_removed_join",
+                        "element": "filter",
+                        "join": ".".join(gone),
+                    }
+                )
+                break
         if unread:
             notes.append(
                 f"view '{view.name}': dex could not read which columns "
@@ -389,7 +412,12 @@ def _query_columns_missing(source: str, live: _Live, lineage: Any) -> str | None
     if not lineage.is_query(source):
         return None
     refs = lineage.column_refs(source)
+    # An output alias the query itself names (`ORDER BY s` for `status AS s`)
+    # is not a column of the table.
+    aliases = {a.lower() for a in lineage.query_aliases(source)}
     for ref in refs or ():
+        if not ref.qualifier and ref.column.lower() in aliases:
+            continue
         if live.find(ref.column) is None:
             return ref.column
     return None
@@ -631,6 +659,9 @@ def _removal(state: _ViewState) -> dict[str, Any] | None:
         "whole_model": False,
         "element": "view",
         "fields_key": view.fields_key,
+        # The view as detected, so reconcile can tell a view edited since the
+        # report from the one the removal was computed for.
+        "view_sha256": view_digest(view),
         "fields": fields,
         "measures": measures,
         "joins": joins,

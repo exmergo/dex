@@ -41,6 +41,7 @@ __all__ = [
     "measure_refs",
     "over_own_columns",
     "plain_column",
+    "query_aliases",
     "ratio_sides",
     "source_relation",
 ]
@@ -231,6 +232,18 @@ def is_query(source: str) -> bool:
     """Whether a ``source`` is a query rather than a table name."""
 
     return bool(_QUERY.match(source))
+
+
+def query_aliases(source: str) -> list[str]:
+    """The output aliases a query ``source`` names in its select list, whose
+    later mentions (``ORDER BY s``) are not columns of its table."""
+
+    tree = _parse(source)
+    while isinstance(tree, exp.Subquery):
+        tree = tree.this
+    if not isinstance(tree, exp.Select):
+        return []
+    return [p.alias for p in tree.expressions if isinstance(p, exp.Alias) and p.alias]
 
 
 def source_relation(source: str) -> SourceRelation:

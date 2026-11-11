@@ -1931,9 +1931,9 @@ joined table, reach `explore` through the declaration channel at confidence 1.0.
 `semantic databricks define|update|plan` authors the files through a stored plan,
 never deploying them, and a declared dbt mart derives a view of its own (see
 `transform plan` above).
-`maintain snapshot` records `vendor: databricks` and `format_version: 1.1` (plus
-each file declaring another spec version, so a re-saved view is
-`semantic_format_changed`), and the layer-neutral axes read it: definition drift
+`maintain snapshot` records `vendor: databricks`, `format_version: 1.1` and each
+file's declared `version` (`definition_versions`, so a re-saved view is
+`semantic_format_changed` for that file alone), and the layer-neutral axes read it: definition drift
 on the semantic axis, each `rely` key and join arity on the grain axis. The
 schema axis holds the views to the warehouse metadata with the four `declared_*`
 codes, and `maintain reconcile` stores their removals as a `semantic databricks

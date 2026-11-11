@@ -482,6 +482,16 @@ def _advisory(
         ),
     }
     if finding.code == "declared_grain_not_unique" and (
+        finding.data.get("claim") == "primary"
+    ):
+        source = finding.data.get("declared_by") or "semantic"
+        actions["declared_grain_not_unique"] = (
+            f"the {source} semantic layer declares these columns its primary key "
+            "and the data says otherwise: dedup the table, or change the primary "
+            f"key with `semantic {source} update`. dex proposes no edit, because "
+            "which side is wrong is a decision"
+        )
+    if finding.code == "declared_grain_not_unique" and (
         finding.data.get("claim") == "unique"
     ):
         # A semantic layer's uniqueness claim is not the grain (#1259): a Metric
@@ -493,8 +503,8 @@ def _advisory(
             "table, or drop the claim"
             + (
                 " (`rely.at_most_one_match` on the join, with `semantic "
-                "databricks update`), since Databricks trusts the flag and "
-                "returns wrong numbers while it is false"
+                "databricks update`), since Databricks trusts the flag and can "
+                "count a row more than once while it is false"
                 if finding.data.get("declared_by") == "databricks"
                 else ""
             )

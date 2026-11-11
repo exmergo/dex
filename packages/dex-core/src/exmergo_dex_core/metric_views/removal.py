@@ -71,8 +71,14 @@ def proposals_and_edits(
     findings: list[DriftFinding],
     contents: Mapping[str, str],
     strict: Mapping[str, list[str]],
+    digests: Mapping[str, str] | None = None,
 ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
     """One proposal per finding, and one edit per view file that can take it.
+
+    ``digests`` is each view's content hash now, keyed by file: a removal
+    computed for another version of the view (the view was edited after the
+    report) is proposed as advisory, never cut, since cutting by name could
+    remove a member the edit just repaired.
 
     ``contents`` is each configured file's current text, keyed as configured.
     ``strict`` names, per file, what it already holds that authoring refuses, so
@@ -103,6 +109,23 @@ def proposals_and_edits(
         proposals.extend(_advisory(f, path) for f in whole)
         live = [f for f in group if f not in whole]
         if not live or removal is None:
+            continue
+        detected = removal.get("view_sha256")
+        if digests is not None and detected and digests.get(path) != detected:
+            warnings.append(
+                f"no edit proposed for {path}: the view changed since the drift "
+                "report; re-run `maintain check` and reconcile again"
+            )
+            proposals.extend(
+                _proposal(
+                    f,
+                    "advisory",
+                    f"view '{f.data.get('semantic_model')}' ({path}) changed "
+                    "since the drift report; re-run `maintain check`, then "
+                    "reconcile again",
+                )
+                for f in live
+            )
             continue
         if removal.get("held") or describe(removal) == "nothing":
             proposals.extend(_advisory(f, path) for f in live)
@@ -177,7 +200,14 @@ def describe(removal: Mapping[str, Any]) -> str:
 
 
 def apply_removal(text: str, removal: Mapping[str, Any]) -> str | None:
-    """``text`` with every removed entry cut out, or ``None`` if one cannot be."""
+    """``text`` with every removed entry cut out, or ``None`` if one cannot be.
+
+    Every span is located against the file as parsed, never against a copy an
+    earlier cut already pruned, so removals in one list (two sibling joins, a
+    field and another field's ``format``) compose. Every requested entry has to
+    be found exactly once, or nothing is proposed: a partial edit would read as
+    a repair and still leave the view reading what is gone.
+    """
 
     try:
         root = yaml.compose(text, Loader=_Loader)
@@ -195,26 +225,43 @@ def apply_removal(text: str, removal: Mapping[str, Any]) -> str | None:
     ):
         if not names:
             continue
-        planned = _cut(text, root, expected, key, _by_name(names))
+        selected = _by_name(names)
+        planned = _cut(text, root, data, key, selected, len(names))
         if planned is None:
             return None
         changes.extend(planned)
+        expected[key] = [item for item in expected[key] if not selected(item)]
+    # Joins grouped by the list they sit in, so removing every sibling empties
+    # that list once (`joins: []`) rather than leaving it null.
+    siblings: dict[tuple[str, ...], list[str]] = {}
     for dotted in removal.get("joins") or []:
-        planned = _cut_join(text, root, expected, tuple(dotted.split(".")))
+        path = tuple(dotted.split("."))
+        siblings.setdefault(path[:-1], []).append(path[-1])
+    for parent, names in siblings.items():
+        planned = _cut_join(text, root, data, parent, names)
         if planned is None:
             return None
         changes.extend(planned)
+        owner = _join_owner(expected, (*parent, names[0]))
+        if owner is None:
+            return None
+        selected = _by_name(names)
+        owner["joins"] = [item for item in owner["joins"] if not selected(item)]
     for name in removal.get("formats") or []:
-        planned = _cut_format(text, root, expected, fields_key, name)
+        planned = _cut_format(text, root, data, fields_key, name)
         if planned is None:
             return None
         changes.extend(planned)
+        for section in (fields_key, "measures"):
+            for item in expected.get(section) or []:
+                if _by_name([name])(item):
+                    item.pop("format", None)
     if not changes:
         return text
     edited = text
     # Back to front, so every offset not yet applied still points into the
     # original text. No two overlap: each cuts inside one list or one member.
-    for start, end, replacement in sorted(changes, reverse=True):
+    for start, end, replacement in sorted(set(changes), reverse=True):
         edited = edited[:start] + replacement + edited[end:]
     try:
         reread = read_yaml(edited)
@@ -223,11 +270,29 @@ def apply_removal(text: str, removal: Mapping[str, Any]) -> str | None:
     return edited if reread == expected else None
 
 
+def _member_name(item: Any) -> str | None:
+    """A member's name as Databricks reads it: as written, else derived from
+    its ``expr`` by the reader's own rule."""
+
+    if not isinstance(item, dict):
+        return None
+    name = item.get("name")
+    if isinstance(name, str) and name.strip():
+        return name
+    expr = item.get("expr")
+    if isinstance(expr, str) and expr.strip():
+        from .validator import derived_name
+
+        return derived_name(expr)
+    return None
+
+
 def _by_name(names: list[str]) -> Any:
     wanted = {n.lower() for n in names}
 
     def selected(item: Any) -> bool:
-        return isinstance(item, dict) and str(item.get("name", "")).lower() in wanted
+        name = _member_name(item)
+        return name is not None and name.lower() in wanted
 
     return selected
 
@@ -242,38 +307,34 @@ def _child(node: yaml.MappingNode, key: str) -> tuple[yaml.Node, yaml.Node] | No
 def _cut(
     text: str,
     owner: yaml.MappingNode,
-    entry: dict[str, Any],
+    entry: Mapping[str, Any],
     key: str,
     selected: Any,
+    wanted: int,
 ) -> list[_Change] | None:
-    """The changes that drop every selected item of ``owner[key]``, applied to
-    ``entry`` as well, so the caller's parsed copy is what the edit must read as.
-    """
+    """The changes that drop every selected item of ``owner[key]``, located
+    against ``entry`` as parsed, or None unless exactly ``wanted`` items are
+    selected and each can be cut on its own lines."""
 
     found = _child(owner, key)
-    if found is None:
-        return []
-    key_node, sequence = found
     items = entry.get(key)
-    if not isinstance(sequence, yaml.SequenceNode) or not isinstance(items, list):
+    if found is None or not isinstance(items, list):
+        return None
+    key_node, sequence = found
+    if not isinstance(sequence, yaml.SequenceNode) or sequence.flow_style:
         return None
     if len(items) != len(sequence.value):
         return None
-    keep = [item for item in items if not selected(item)]
-    if len(keep) == len(items):
-        return []
-    if sequence.flow_style:
+    chosen = [i for i, item in enumerate(items) if selected(item)]
+    if len(chosen) != wanted:
         return None
-    entry[key] = keep
     changes: list[_Change] = []
-    for item, item_node in zip(items, sequence.value, strict=True):
-        if not selected(item):
-            continue
-        span = sequence_item_span(text, item_node.start_mark.index)
+    for index in chosen:
+        span = sequence_item_span(text, sequence.value[index].start_mark.index)
         if span is None:
             return None
         changes.append((*span, ""))
-    if not keep:
+    if len(chosen) == len(items):
         colon = text.find(":", key_node.end_mark.index)
         if colon < 0:
             return None
@@ -281,13 +342,33 @@ def _cut(
     return changes
 
 
-def _cut_join(
-    text: str, root: yaml.MappingNode, data: dict[str, Any], path: tuple[str, ...]
-) -> list[_Change] | None:
-    """Cut the join at ``path`` out of the list it sits in."""
+def _join_owner(data: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any] | None:
+    """The mapping whose ``joins`` list holds the join at ``path``."""
 
-    owner, entry = root, data
+    entry: Any = data
     for name in path[:-1]:
+        items = entry.get("joins") if isinstance(entry, dict) else None
+        if not isinstance(items, list):
+            return None
+        entry = next((i for i in items if _by_name([name])(i)), None)
+    if not isinstance(entry, dict) or not isinstance(entry.get("joins"), list):
+        return None
+    return entry
+
+
+def _cut_join(
+    text: str,
+    root: yaml.MappingNode,
+    data: dict[str, Any],
+    parent: tuple[str, ...],
+    names: list[str],
+) -> list[_Change] | None:
+    """Cut the joins ``names`` out of the list under the join at ``parent``
+    (``()`` for the view's own list)."""
+
+    owner: yaml.MappingNode = root
+    entry: Any = data
+    for name in parent:
         found = _child(owner, "joins")
         items = entry.get("joins")
         if found is None or not isinstance(items, list):
@@ -296,21 +377,12 @@ def _cut_join(
         if not isinstance(sequence, yaml.SequenceNode):
             return None
         index = next(
-            (
-                i
-                for i, item in enumerate(items)
-                if isinstance(item, dict)
-                and str(item.get("name", "")).lower() == name.lower()
-            ),
-            None,
+            (i for i, item in enumerate(items) if _by_name([name])(item)), None
         )
         if index is None or not isinstance(sequence.value[index], yaml.MappingNode):
             return None
         owner, entry = sequence.value[index], items[index]
-    planned = _cut(text, owner, entry, "joins", _by_name([path[-1]]))
-    if not planned:
-        return None
-    return planned
+    return _cut(text, owner, entry, "joins", _by_name(names), len(names))
 
 
 def _cut_format(
@@ -330,12 +402,10 @@ def _cut_format(
         sequence = found[1]
         if not isinstance(sequence, yaml.SequenceNode) or sequence.flow_style:
             continue
-        for item, node in zip(items, sequence.value, strict=False):
-            if not (
-                isinstance(item, dict)
-                and str(item.get("name", "")).lower() == name.lower()
-                and isinstance(node, yaml.MappingNode)
-            ):
+        if len(items) != len(sequence.value):
+            return None
+        for item, node in zip(items, sequence.value, strict=True):
+            if not (_by_name([name])(item) and isinstance(node, yaml.MappingNode)):
                 continue
             pair = _child(node, "format")
             if pair is None or "format" not in item:
@@ -346,7 +416,6 @@ def _cut_format(
                 # `- format:` opens the member: cutting it would cut the dash.
                 return None
             end = block_end(text, line_start, indent_of(text, line_start))
-            del item["format"]
             return [(line_start, end, "")]
     return None
 
@@ -396,6 +465,12 @@ def _held_sentence(held: Mapping[str, Any]) -> str:
         return (
             f"the query in {held['element']} reads '{held.get('column')}', which "
             "is gone; edit the query"
+        )
+    if reason == "filter_reads_removed_join":
+        return (
+            f"the view's `filter` reads through the join {held.get('join')}, "
+            "which would be removed; dex does not change a view's population on "
+            "its own, so rewrite the filter"
         )
     if reason == "materialization_reads_removed":
         return (

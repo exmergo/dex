@@ -283,8 +283,9 @@ The layer-neutral axes then read the fingerprint:
   claim (`rely.at_most_one_match` on a join to the table), not as the project's
   grain: Databricks trusts the flag and returns wrong numbers when it is false.
 - `maintain semantic` reports a view re-saved in a spec version Dex does not read
-  as `semantic_format_changed`, naming the file and both versions, since the
-  fingerprint's `format_version` lists every file declaring another version.
+  as `semantic_format_changed` for that file, naming it and both versions: the
+  fingerprint records each file's declared `version` under `definition_versions`,
+  so the other views are still compared by content.
 
 `maintain schema` holds each view to the warehouse metadata Dex captured (#1259),
 with no workspace connection. Each finding names the view, the element and the

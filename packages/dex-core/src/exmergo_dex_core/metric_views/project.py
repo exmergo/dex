@@ -213,9 +213,15 @@ class MetricViewSemanticLayer:
             return [], [str(exc)]
         except (ImportError, OSError, ValueError) as exc:
             return [], [f"Metric View files were not compared to the warehouse: {exc}"]
-        return declared_schema_drift(
+        findings, notes = declared_schema_drift(
             loaded, resolved, current, baseline, connector=self.connector
         )
+        # A file the reader refused compared nothing, which reads the same as a
+        # clean one unless it is said.
+        refused = [
+            f"{d.render()} (not compared to the warehouse)" for d in loaded.errors
+        ]
+        return findings, [*refused, *notes]
 
     def handles_finding(self, finding: DriftFinding) -> bool:
         """Whether ``finding`` is one this layer's schema channel produced."""
@@ -245,7 +251,10 @@ class MetricViewSemanticLayer:
                 strict.setdefault(diagnostic.file, []).append(
                     f"{diagnostic.rule} at {diagnostic.element}"
                 )
-        return proposals_and_edits(own, contents, strict)
+        from .schema import view_digest
+
+        digests = {view.file: view_digest(view) for view in self._load().views}
+        return proposals_and_edits(own, contents, strict, digests)
 
     # --- native semantic-document authoring (#1258) ----------------------------
 

@@ -293,8 +293,28 @@ def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
             )
         )
         return None
+    written = _version_text(text)
     if isinstance(raw, Mapping) and raw.get("version") is not None:
-        result.declared_versions[name] = str(raw.get("version")).strip()
+        result.declared_versions[name] = (
+            written if written is not None else str(raw.get("version")).strip()
+        )
+    if (
+        isinstance(raw, Mapping)
+        and written is not None
+        and written != validator.METRIC_VIEW_SPEC_VERSION
+        and str(raw.get("version")).strip() == validator.METRIC_VIEW_SPEC_VERSION
+    ):
+        # `version: 1.10` parses as the number 1.1; the version is the text.
+        result.diagnostics.append(
+            _diagnostic(
+                name,
+                "(root)",
+                "version",
+                f"version {written} is not one dex reads: it reads Metric View "
+                f"YAML {validator.METRIC_VIEW_SPEC_VERSION} only",
+            )
+        )
+        return None
     stem = PurePosixPath(name).stem
     try:
         view, findings = validator.check_view(raw, name, stem)
@@ -317,6 +337,22 @@ def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
             )
         )
     return view
+
+
+def _version_text(text: str) -> str | None:
+    """The root ``version`` scalar as written, before YAML reads it as a number
+    (``1.10`` would read as ``1.1``), or None where there is none to read."""
+
+    try:
+        root = yaml.compose(text, Loader=_Loader)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(root, yaml.MappingNode):
+        return None
+    for key, value in root.value:
+        if key.value == "version" and isinstance(value, yaml.ScalarNode):
+            return str(value.value).strip()
+    return None
 
 
 def _expressions(view: MetricView, result: LoadResult) -> MetricView:

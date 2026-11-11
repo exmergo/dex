@@ -374,6 +374,94 @@ def test_a_filter_reading_a_dropped_column_is_advisory(tmp_path, capsys):
     assert "population" in proposal["action"]
 
 
+def test_a_filter_reading_through_a_removed_join_is_advisory(tmp_path, capsys):
+    _sql(
+        tmp_path,
+        "CREATE TABLE orders (customer_id INTEGER, amount DOUBLE)",
+        "INSERT INTO orders VALUES (1, 2)",
+        "CREATE TABLE customers (customer_key INTEGER, region VARCHAR)",
+        "INSERT INTO customers VALUES (1, 'EU')",
+    )
+    root = repo(
+        tmp_path,
+        orders=view(
+            filter="customer.region = 'EU'",
+            joins=[
+                {
+                    "name": "customer",
+                    "source": "demo.main.customers",
+                    "on": "source.customer_id = customer.customer_key",
+                }
+            ],
+            measures=[{"name": "revenue", "expr": "SUM(amount)"}],
+        ),
+        config="duckdb:\n  path: demo.duckdb\n",
+    )
+    assert _run_ok(root, "explore", "map")
+    assert _run_ok(root, "maintain", "snapshot")
+    _drift(capsys, root, "ALTER TABLE customers DROP COLUMN customer_key")
+
+    rc, envelope = _run(capsys, root, "maintain", "reconcile")
+
+    assert rc == 0, envelope["errors"]
+    assert envelope["data"].get("semantic_plan_id") is None
+    (proposal,) = [
+        p
+        for p in envelope["data"]["proposals"]
+        if p["finding_code"].startswith("declared")
+    ]
+    assert proposal["kind"] == "advisory"
+    assert "filter" in proposal["action"]
+
+
+def test_a_view_edited_after_the_report_is_not_cut(warehouse, capsys):
+    """The removal was computed for the view as it was; cutting by name could
+    remove a member the edit just repaired."""
+
+    _drift(capsys, warehouse, "ALTER TABLE orders DROP COLUMN amount")
+    assert _run_ok(warehouse, "maintain", "check")
+    path = warehouse / "views" / "orders.yaml"
+    path.write_text(
+        path.read_text().replace("SUM(amount)", "COUNT(1)"), encoding="utf-8"
+    )
+
+    rc, envelope = _run(capsys, warehouse, "maintain", "reconcile")
+
+    assert rc == 0, envelope["errors"]
+    assert envelope["data"].get("semantic_plan_id") is None
+    assert all(
+        p["kind"] == "advisory"
+        for p in envelope["data"]["proposals"]
+        if p["finding_code"].startswith("declared")
+    )
+    assert "changed since the drift report" in json.dumps(envelope["warnings"])
+
+
+def test_a_query_sources_own_alias_is_not_a_dropped_column(tmp_path, capsys):
+    _sql(
+        tmp_path,
+        "CREATE TABLE orders (status VARCHAR)",
+        "INSERT INTO orders VALUES ('paid')",
+    )
+    root = repo(
+        tmp_path,
+        orders=view(
+            "SELECT status AS s FROM demo.main.orders ORDER BY s",
+            fields=[{"name": "s", "expr": "s"}],
+        ),
+        config="duckdb:\n  path: demo.duckdb\n",
+    )
+    assert _run_ok(root, "explore", "map")
+    assert _run_ok(root, "maintain", "snapshot")
+
+    rc, envelope = _run(capsys, root, "maintain", "schema")
+
+    assert rc == 0, envelope["errors"]
+    assert not [
+        f for f in envelope["data"]["findings"] if f["code"].startswith("declared")
+    ]
+
+
 def test_a_removal_that_empties_the_view_is_advisory(tmp_path, capsys):
     _sql(
         tmp_path,
@@ -429,6 +517,41 @@ def test_a_removal_keeps_every_other_byte_and_on_as_text():
     assert "aov" not in edited
 
 
+def test_removals_in_one_list_compose_against_the_file_as_written():
+    """Two sibling joins, and a field beside another field's format."""
+
+    text = (
+        "version: 1.1\nsource: t\njoins:\n"
+        "  - name: a\n    source: x\n    on: source.k = a.k\n"
+        "  - name: b\n    source: y\n    on: source.k = b.k\n"
+        "fields:\n  - name: bad\n    expr: gone\n"
+        "  - name: day\n    expr: d\n    format:\n      type: date\n"
+        "      date_format: year_month_day\n"
+    )
+
+    edited = apply_removal(
+        text, {"fields": ["bad"], "formats": ["day"], "joins": ["a", "b"]}
+    )
+
+    assert edited is not None
+    body = yaml.safe_load(edited.replace("on:", "'on':"))
+    assert body["joins"] == []
+    assert body["fields"] == [{"name": "day", "expr": "d"}]
+
+
+def test_a_member_named_by_its_expr_is_found_or_nothing_is_cut():
+    text = (
+        "version: 1.1\nsource: t\nfields:\n  - expr: gone\n"
+        "  - name: bad\n    expr: other_gone\n  - name: keep\n    expr: id\n"
+    )
+
+    edited = apply_removal(text, {"fields": ["gone", "bad"]})
+    assert edited is not None
+    assert "gone" not in edited and "keep" in edited
+
+    assert apply_removal(text, {"fields": ["gone", "missing"]}) is None
+
+
 def test_a_flow_style_list_is_not_rewritten():
     text = (
         "version: 1.1\nsource: t\n"
@@ -452,22 +575,60 @@ def test_a_format_opening_its_member_is_not_cut():
 
 
 def test_a_view_resaved_in_another_spec_version_is_a_format_change(warehouse, capsys):
+    """For that file alone: the other views are still compared by content."""
+
+    _sql(warehouse, "CREATE TABLE people (tier VARCHAR)")
+    other = warehouse / "views" / "people.yaml"
+    other.write_text(
+        yaml.safe_dump(
+            view("demo.main.people", fields=[{"name": "tier", "expr": "tier"}])
+        ),
+        encoding="utf-8",
+    )
+    config = warehouse / ".dex" / "config.yml"
+    config.write_text(
+        config.read_text().replace(
+            "      - views/orders.yaml\n",
+            "      - views/orders.yaml\n      - views/people.yaml\n",
+        ),
+        encoding="utf-8",
+    )
+    assert _run_ok(warehouse, "maintain", "snapshot")
     path = warehouse / "views" / "orders.yaml"
     path.write_text(
         path.read_text().replace("version: 1.1", "version: 1.2"), encoding="utf-8"
     )
+    other.write_text(other.read_text().replace("tier", "level"), encoding="utf-8")
 
     rc, envelope = _run(capsys, warehouse, "maintain", "semantic")
 
     assert rc == 0, envelope["errors"]
-    (changed,) = [
-        f
-        for f in envelope["data"]["findings"]
-        if f["code"] == "semantic_format_changed"
-    ]
-    assert changed["data"]["format_version_before"] == "1.1"
-    assert changed["data"]["format_version_after"] == "1.1 (views/orders.yaml: 1.2)"
-    assert "views/orders.yaml: 1.2" in changed["detail"]
+    findings = envelope["data"]["findings"]
+    (changed,) = [f for f in findings if f["code"] == "semantic_format_changed"]
+    assert changed["data"]["path"] == "views/orders.yaml"
+    assert (
+        changed["data"]["format_version_before"],
+        changed["data"]["format_version_after"],
+    ) == ("1.1", "1.2")
+    assert any(
+        f["code"] == "definition_changed" and "people" in json.dumps(f)
+        for f in findings
+    ), "the other view is still compared by content"
+
+
+def test_a_version_written_1_10_is_not_read_as_1_1(tmp_path):
+    from exmergo_dex_core.metric_views.loader import validate_view_contents
+
+    loaded = validate_view_contents(
+        {
+            "views/orders.yaml": "version: 1.10\nsource: t\nmeasures:\n"
+            "  - name: n\n    expr: COUNT(1)\n"
+        }
+    )
+
+    assert loaded.empty
+    assert loaded.declared_versions == {"views/orders.yaml": "1.10"}
+    assert [d.rule for d in loaded.errors] == ["version"]
 
 
 # --- the grain wording --------------------------------------------------------------
@@ -511,8 +672,10 @@ def test_a_contradicted_rely_key_is_worded_as_the_views_claim(tmp_path, capsys):
         if f["code"] == "declared_grain_not_unique"
     ]
     assert "rely.at_most_one_match" in finding["detail"]
+    assert "(orders.customer)" in finding["detail"], "the join that claims it"
     assert "the project declares" not in finding["detail"]
-    assert "wrong numbers" in finding["detail"]
+    assert "more than once" in finding["detail"]
+    assert finding["data"]["declared_on"] == ["orders.customer"]
     assert (finding["data"]["declared_by"], finding["data"]["claim"]) == (
         "databricks",
         "unique",
