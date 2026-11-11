@@ -264,6 +264,19 @@ def test_a_cast_or_coalesce_added_inside_the_cte_is_still_found(computed, kind):
     assert not any(k == "aggregate_changed" for k, _, _ in kinds)
 
 
+def test_two_aggregates_moved_into_one_cte_are_the_same_ratio():
+    prior = "select sum(price) / count(*) as n from {{ ref('stg_orders') }}\n"
+    moved = (
+        "with a as (\n"
+        "  select sum(price) as s, count(*) as c from {{ ref('stg_orders') }}\n"
+        ")\nselect s / c as n from a\n"
+    )
+    scope = _scope(moved, prior=prior)
+    assert [(c.kind, c.detail) for c in scope.changes if c.axis == "output"] == [
+        ("expression_changed", "`n` reads the same calculation through a CTE")
+    ]
+
+
 def _parts_reshaped(body: str) -> str:
     """PARTS_PRIOR's aggregates moved into a CTE whose rows differ (#1253)."""
     return (
@@ -346,6 +359,276 @@ def test_a_row_distinct_in_the_cte_is_not_the_same_count():
     )
     kinds = _output_kinds(_scope(moved, prior=prior))
     assert ("aggregate_changed", "part_count", "undeclared") in kinds
+
+
+ACTIVE_PARTS_PRIOR = PARTS_PRIOR.replace(
+    "group by", "where c.status = 'active'\ngroup by"
+)
+
+
+def test_a_filter_moved_into_the_cte_with_the_aggregate_is_the_same():
+    moved = _parts_reshaped(
+        "from {{ ref('stg_parts') }} where status = 'active' group by project_id"
+    )
+    assert _output_kinds(_scope(moved, prior=ACTIVE_PARTS_PRIOR)) == [
+        ("expression_changed", "last_part_at", None),
+        ("expression_changed", "part_count", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("prior", "authored", "column"),
+    [
+        # The filter now reads the projects' status, not the parts'.
+        (
+            ACTIVE_PARTS_PRIOR,
+            _parts_moved() + "where p.status = 'active'\n",
+            "part_count",
+        ),
+        # Rows counted per category before, categories counted after.
+        (
+            "select count(*) as n from {{ ref('stg_orders') }} group by category\n",
+            "with g as (\n"
+            "  select category from {{ ref('stg_orders') }} group by category\n"
+            "),\nc as (select count(*) as n from g)\nselect n from c\n",
+            "n",
+        ),
+        # The DISTINCT compares fewer columns, so fewer rows are counted.
+        (
+            "with a as (select distinct id, kind from {{ ref('stg_orders') }})\n"
+            "select count(*) as n from a\n",
+            "with b as (select distinct id from {{ ref('stg_orders') }}),\n"
+            "c as (select count(*) as n from b)\nselect n from c\n",
+            "n",
+        ),
+        # The count no longer reads the table at all.
+        (
+            "select count(*) as n from {{ ref('stg_orders') }}\n",
+            "with c as (select count(*) as n)\nselect n from c\n",
+            "n",
+        ),
+        # `a` reads the table `b`, not the CTE defined after it.
+        (
+            "select count(*) as n from {{ ref('stg_orders') }}\n",
+            "with a as (select count(*) as n from b),\n"
+            "b as (select price from {{ ref('stg_orders') }})\nselect n from a\n",
+            "n",
+        ),
+        # The same name summed from the other side of the join.
+        (
+            "select sum(a.price) as n\n"
+            "from {{ ref('stg_a') }} a join {{ ref('stg_b') }} b on a.id = b.id\n",
+            "with c as (\n"
+            "  select sum(b.price) as n\n"
+            "  from {{ ref('stg_a') }} a join {{ ref('stg_b') }} b on a.id = b.id\n"
+            ")\nselect n from c\n",
+            "n",
+        ),
+        # The same output name over another filter and another aggregate.
+        (
+            "with a as (\n"
+            "  select sum(price) as n from {{ ref('stg_orders') }} where flag = 1\n"
+            ")\nselect n from a\n",
+            "with b as (\n"
+            "  select count(*) as n from {{ ref('stg_orders') }} where flag = 2\n"
+            ")\nselect n from b\n",
+            "n",
+        ),
+        # The HAVING moved from the per-key count to the sum over keys.
+        (
+            "with a as (\n"
+            "  select k, count(*) as n from {{ ref('stg_orders') }}\n"
+            "  group by k having count(*) > 1\n"
+            ")\nselect sum(n) as total from a\n",
+            "with b as (\n"
+            "  select k, count(*) as n from {{ ref('stg_orders') }} group by k\n"
+            "),\n"
+            "c as (select sum(n) as total from b having count(*) > 1)\n"
+            "select total from c\n",
+            "total",
+        ),
+        # `g` is an alias for another column on each side.
+        (
+            "select k as g, count(*) as n from {{ ref('stg_orders') }} group by g\n",
+            "with c as (\n"
+            "  select category as g, count(*) as n from {{ ref('stg_orders') }}\n"
+            "  group by g\n"
+            ")\nselect g, n from c\n",
+            "n",
+        ),
+        # The ordinal points at another column.
+        (
+            "select k, count(*) as n from {{ ref('stg_orders') }} group by 1\n",
+            "with c as (\n"
+            "  select category, count(*) as n from {{ ref('stg_orders') }} group by 1\n"
+            ")\nselect n from c\n",
+            "n",
+        ),
+        # GROUP BY ALL groups by whatever the select lists.
+        (
+            "select k, count(*) as n from {{ ref('stg_orders') }} group by all\n",
+            "with c as (\n"
+            "  select category, count(*) as n from {{ ref('stg_orders') }}\n"
+            "  group by all\n"
+            ")\nselect n from c\n",
+            "n",
+        ),
+        # A DISTINCT over a star compares the columns the star stands for.
+        (
+            "with a as (select id, kind from {{ ref('stg_orders') }}),\n"
+            "d as (select distinct * from a)\nselect count(*) as n from d\n",
+            "with b as (select id from {{ ref('stg_orders') }}),\n"
+            "e as (select distinct * from b),\n"
+            "c as (select count(*) as n from e)\nselect n from c\n",
+            "n",
+        ),
+        # DISTINCT ON keeps the row its ORDER BY puts first.
+        (
+            "with a as (\n"
+            "  select distinct on (k) k, v from {{ ref('stg_orders') }}\n"
+            "  order by k, v asc\n"
+            ")\nselect sum(v) as n from a\n",
+            "with b as (\n"
+            "  select distinct on (k) k, v from {{ ref('stg_orders') }}\n"
+            "  order by k, v desc\n"
+            "),\nc as (select sum(v) as n from b)\nselect n from c\n",
+            "n",
+        ),
+        # A self-join through a CTE: the sum moves to the other copy.
+        (
+            "with a as (select id, parent_id, price from {{ ref('stg_orders') }})\n"
+            "select sum(x.price) as n from a x join a y on x.id = y.parent_id\n",
+            "with a as (select id, parent_id, price from {{ ref('stg_orders') }}),\n"
+            "c as (\n"
+            "  select sum(y.price) as n from a x join a y on x.id = y.parent_id\n"
+            ")\nselect n from c\n",
+            "n",
+        ),
+        # A parenthesized alias is still an alias for another column.
+        (
+            "select k as g, count(*) as n from {{ ref('stg_orders') }} group by (g)\n",
+            "with c as (\n"
+            "  select category as g, count(*) as n from {{ ref('stg_orders') }}\n"
+            "  group by (g)\n"
+            ")\nselect g, n from c\n",
+            "n",
+        ),
+        # Beside a star, an ordinal names a column the select list does not.
+        (
+            "with a as (select k from {{ ref('stg_orders') }})\n"
+            "select *, count(*) as n from a group by 1\n",
+            "with b as (select category from {{ ref('stg_orders') }}),\n"
+            "c as (select *, count(*) as n from b group by 1)\n"
+            "select n from c\n",
+            "n",
+        ),
+        # A window counted before the filter, then after it.
+        (
+            "with g as (\n"
+            "  select x, count(*) over () as n from {{ ref('stg_orders') }}\n"
+            "),\nf as (select x, n from g where x > 0)\nselect n from f\n",
+            "with g as (select x from {{ ref('stg_orders') }}),\n"
+            "f as (select x, count(*) over () as n from g where x > 0)\n"
+            "select n from f\n",
+            "n",
+        ),
+        # The same window moved out of the CTE, past the filter.
+        (
+            "with w as (select x, count(*) over () as n from {{ ref('stg_orders') }})\n"
+            "select n from w where x > 0\n",
+            "select count(*) over () as n from {{ ref('stg_orders') }} where x > 0\n",
+            "n",
+        ),
+        # QUALIFY and WHERE swap stages before the sum.
+        (
+            "with a as (\n"
+            "  select k, x from {{ ref('stg_orders') }}\n"
+            "  qualify row_number() over (partition by k order by x) = 1\n"
+            "),\nb as (select x from a where x > 0)\nselect sum(x) as n from b\n",
+            "with a2 as (select k, x from {{ ref('stg_orders') }} where x > 0),\n"
+            "b2 as (\n"
+            "  select x from a2\n"
+            "  qualify row_number() over (partition by k order by x) = 1\n"
+            "),\ns as (select sum(x) as n from b2)\nselect n from s\n",
+            "n",
+        ),
+        # A sample taken from the rows, then from the one counted row.
+        (
+            "select count(*) as n from {{ ref('stg_orders') }} using sample 2 rows\n",
+            "with c as (select count(*) as n from {{ ref('stg_orders') }})\n"
+            "select n from c using sample 2 rows\n",
+            "n",
+        ),
+        # An ordered aggregate over a CTE whose order changed.
+        (
+            "with o as (select x from {{ ref('stg_orders') }} order by x desc)\n"
+            "select array_agg(x) as n from o\n",
+            "with o as (select x from {{ ref('stg_orders') }} order by x asc),\n"
+            "s as (select array_agg(x) as n from o)\nselect n from s\n",
+            "n",
+        ),
+        # ROLLUP adds a total row to the counts.
+        (
+            "select k, count(*) as n from {{ ref('stg_orders') }} group by k\n",
+            "with c as (\n"
+            "  select k, count(*) as n from {{ ref('stg_orders') }}\n"
+            "  group by rollup (k)\n"
+            ")\nselect k, n from c\n",
+            "n",
+        ),
+    ],
+)
+def test_a_moved_calculation_that_differs_is_not_the_same(prior, authored, column):
+    kinds = _output_kinds(_scope(authored, prior=prior))
+    assert ("aggregate_changed", column, "undeclared") in kinds
+
+
+def test_the_same_column_read_through_a_renamed_cte_is_traced():
+    prior = "with a as (select sum(price) as n from {{ ref('stg_orders') }})\n"
+    renamed = "with b as (select count(*) as n from {{ ref('stg_orders') }})\n"
+    scope = _scope(renamed + "select n from b\n", prior=prior + "select n from a\n")
+    assert _output_kinds(scope) == [("aggregate_changed", "n", "undeclared")]
+    # Through the same CTE, the change is reported once, in that CTE.
+    kept = renamed.replace("with b", "with a") + "select n from a\n"
+    scope = _scope(kept, prior=prior + "select n from a\n")
+    assert [(c.kind, c.scope) for c in scope.changes if c.axis == "output"] == [
+        ("aggregate_changed", "a")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("prior", "authored", "column"),
+    [
+        # `count(*)` names no column, but reads another CTE's rows.
+        (
+            "with a as (select k from {{ ref('stg_orders') }} where flag = 1)\n"
+            "select count(*) as n from a\n",
+            "with b as (select k from {{ ref('stg_orders') }} where flag = 2)\n"
+            "select count(*) as n from b\n",
+            "n",
+        ),
+        # The HAVING moved from the count to the sum, both grouped by `k`.
+        (
+            "with a as (\n"
+            "  select k, count(*) as n from {{ ref('stg_orders') }}\n"
+            "  group by k having count(*) > 1\n"
+            "),\nb as (select k, sum(n) as total from a group by k)\n"
+            "select total from b\n",
+            "with c as (\n"
+            "  select k, count(*) as n from {{ ref('stg_orders') }} group by k\n"
+            "),\nd as (\n"
+            "  select k, sum(n) as total from c group by k having count(*) > 1\n"
+            ")\nselect total from d\n",
+            "total",
+        ),
+    ],
+)
+def test_the_same_text_over_other_rows_is_left_to_population(prior, authored, column):
+    # Which rows reach an unchanged calculation is population's question: it
+    # cannot read renamed CTEs, so it says unchecked, never kept.
+    scope = _scope(authored, prior=prior)
+    assert scope.population == "unchecked"
+    assert not [c for c in scope.changes if c.axis == "output" and c.column == column]
 
 
 def test_reformatting_and_renaming_an_alias_are_silent():
