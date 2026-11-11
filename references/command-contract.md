@@ -255,7 +255,10 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      data.change_scope (#1115), static and free: per existing
                                      model the plan rewrites, population changed / kept /
                                      unchecked and each output removed, added, retyped,
-                                     re-aggregated or re-NULLed, every judged change declared
+                                     re-aggregated or re-NULLed (an aggregate is followed
+                                     through the CTEs its column reads, so one moved into a
+                                     CTE whose rows are produced alike is not
+                                     re-aggregated, #1253), every judged change declared
                                      (an assumption names its column) or undeclared (a warning),
                                      carried to a --for-plan build's
                                      completion.obligations.change_scope; a changed driving relation
