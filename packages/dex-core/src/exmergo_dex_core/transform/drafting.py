@@ -78,6 +78,7 @@ class _Origin:
     column: str
     #: The outer join that can make this column NULL where it found no match.
     outer_join: str | None = None
+    is_ref: bool = False
 
 
 @dataclass
@@ -98,6 +99,7 @@ class Usage:
     clause: str
     expression: str
     literals: list[str | Decimal] | None = None
+    is_ref: bool = False
 
 
 @dataclass
@@ -118,8 +120,8 @@ class _Reading:
     #: contradicts a declaration resting on it (#1079).
     proven_grains: list[list[str]] | None = None
     #: Columns the SQL filters or branches on, resolved to their upstream origin:
-    #: (relation, column) -> the clauses that use it.
-    used: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    #: (relation, column, is_ref) -> the clauses that use it.
+    used: dict[tuple[str, str, bool], set[str]] = field(default_factory=dict)
     #: Each filter conjunct, ``CASE`` condition and aggregation, one fragment
     #: at a time, for precedent and the literal check.
     usages: list[Usage] = field(default_factory=list)
@@ -129,6 +131,7 @@ class _Reading:
     #: Bare column names the SQL filters on, for the population hint.
     filtered: list[str] = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
+    input_origins: list[tuple[str, bool]] = field(default_factory=list)
     #: The relations that decide which rows exist: the FROM relation followed
     #: through CTEs and subqueries, plus what a RIGHT, FULL or CROSS join keeps.
     driving: list[str] = field(default_factory=list)
@@ -746,17 +749,23 @@ class _Lineage:
         # name, and a VALUES clause is not a table at all. Neither is a
         # relation ``explore profile`` can read.
         named: list[str] = []
+        input_origins: list[tuple[str, bool]] = []
         parentless = False
         for table in self.tree.find_all(exp.Table):
             kind, target = self.target(table)
             if kind == "generated":
                 parentless = True
                 continue
-            if kind in {"physical", "ref"} and target and target not in named:
-                named.append(target)
+            if kind in {"physical", "ref"} and target:
+                if target not in named:
+                    named.append(target)
+                origin_entry = (target, kind == "ref")
+                if origin_entry not in input_origins:
+                    input_origins.append(origin_entry)
         if any(True for _ in self.tree.find_all(exp.Values)):
             parentless = True
         self.reading.relations = named
+        self.reading.input_origins = input_origins
         self.reading.generated_sql = parentless and not named
 
     def _read_driving(self) -> None:
@@ -1058,7 +1067,7 @@ class _Lineage:
         outer = self.outer_join(select, join)
         kind, target = self.target(relation)
         if kind in {"physical", "ref"}:
-            return _Origin(target, node.name, outer)
+            return _Origin(target, node.name, outer, is_ref=(kind == "ref"))
         if kind != "scope":
             return None
         outputs = self.outputs(target)
@@ -1247,7 +1256,7 @@ class _Lineage:
                 origin.relation,
                 self.files,
                 self.model_paths,
-                manifest=self.manifest,
+                manifest=self.manifest if origin.is_ref else None,
             )
             profile = _column(dataset, origin.column)
             if profile is not None and profile.pii is not None:
@@ -1412,9 +1421,9 @@ class _Lineage:
         origin = self.origin(select, column)
         if origin is None:
             return
-        self.reading.used.setdefault((origin.relation, origin.column), set()).add(
-            clause
-        )
+        self.reading.used.setdefault(
+            (origin.relation, origin.column, origin.is_ref), set()
+        ).add(clause)
 
     def _fragment(self, select: Any, node: Any, clause: str) -> None:
         """Record ``node`` as one usage of each upstream column it resolves to."""
@@ -1466,6 +1475,7 @@ class _Lineage:
                     literals=(
                         literals[1] if literals and literals[0] is column else None
                     ),
+                    is_ref=origin.is_ref,
                 )
             )
 
@@ -1791,33 +1801,34 @@ def _drafted(
     if columns:
         drafted["columns"] = columns
 
-    ref_models = set(reading.tokens.values())
-
     domains = []
-    for (relation, column), clauses in sorted(reading.used.items()):
-        is_ref = relation in ref_models
+    seen_domains: set[tuple[str, str]] = set()
+    for (relation, column, is_ref), clauses in sorted(reading.used.items()):
+        effective_manifest = manifest if is_ref else None
         entry = _domain(
             relation,
             column,
             clauses,
             cache,
             domain_cap,
-            manifest=manifest if is_ref else None,
+            manifest=effective_manifest,
         )
-        if entry is not None:
+        if entry is not None and (relation, column) not in seen_domains:
+            seen_domains.add((relation, column))
             domains.append(entry)
     if domains:
         drafted["domains"] = domains
 
     inputs = []
-    for relation in reading.relations:
-        is_ref = relation in ref_models
+    input_origins = reading.input_origins or [(r, True) for r in reading.relations]
+    for relation, is_ref in input_origins:
+        effective_manifest = manifest if is_ref else None
         dataset = _dataset_for_model(
             cache,
             relation,
             files,
             model_paths,
-            manifest=manifest if is_ref else None,
+            manifest=effective_manifest,
         )
         entry: dict[str, Any] = {"relation": relation}
         if dataset is not None and dataset.columns:
@@ -1943,13 +1954,12 @@ def _column_facts(
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if origin is not None:
-        is_ref = origin.relation in reading.tokens.values()
         dataset = _dataset_for_model(
             cache,
             origin.relation,
             files,
             model_paths,
-            manifest=manifest if is_ref else None,
+            manifest=manifest if origin.is_ref else None,
         )
         profile = _column(dataset, origin.column)
         source: str | None = f"{origin.relation}.{origin.column}"
@@ -2450,13 +2460,13 @@ def _literal_warnings(
 
     out: list[str] = []
     seen: set[tuple[str, str, str]] = set()
-    ref_models = set(reading.tokens.values())
     for usage in reading.usages:
         if not usage.literals:
             continue
-        is_ref = usage.relation in ref_models
         profile = _column(
-            dataset_for(cache, usage.relation, manifest=manifest if is_ref else None),
+            dataset_for(
+                cache, usage.relation, manifest=manifest if usage.is_ref else None
+            ),
             usage.column,
         )
         if profile is None or profile.pii is not None:

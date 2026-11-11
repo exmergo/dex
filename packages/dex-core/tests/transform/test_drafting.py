@@ -1045,6 +1045,65 @@ def test_model_names_resolve_before_aliases_and_collisions_remain_ambiguous():
     assert "resolved through the compiled manifest" in input_entry["evidence"]
 
 
+def test_query_using_both_ref_and_literal_table_preserves_distinct_provenance():
+    """#989: when a query uses both ref('model') and literal 'model',
+    provenance is preserved."""
+
+    main_orders = Dataset(
+        identifier="warehouse.main.stg_orders",
+        columns=[
+            _col("order_id", "integer", null_fraction=0.5),
+            _col("status", "varchar"),
+        ],
+    )
+    dev_orders = Dataset(
+        identifier="warehouse.dbt_dev.stg_orders",
+        columns=[
+            _key("order_id"),
+            _col("amount", "double"),
+        ],
+    )
+    cache = DexCache(datasets=[main_orders, dev_orders])
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select r.order_id, l.status\n"
+        "from {{ ref('stg_orders') }} r\n"
+        "join stg_orders l on r.order_id = l.order_id\n"
+        "where r.order_id > 10\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    inputs = entry["drafted"]["inputs"]
+    assert len(inputs) == 2
+    ref_input = next(i for i in inputs if i.get("profiled") is True)
+    literal_input = next(i for i in inputs if i.get("profiled") is False)
+
+    assert ref_input["identifier"] == "warehouse.dbt_dev.stg_orders"
+    assert "resolved through the compiled manifest" in ref_input["evidence"]
+
+    assert "no profile run can settle" in literal_input["reason"]
+
+    # order_id comes from ref('stg_orders') and resolves to dev_orders
+    # where null_fraction=0.0
+    assert entry["drafted"]["columns"]["order_id"]["nullable"]["value"] is False
+
+    # status comes from literal stg_orders which is ambiguous without manifest
+    assert "nullable" not in entry["drafted"]["columns"].get("status", {})
+
+    # domain resolves for ref column
+    [domain] = entry["drafted"]["domains"]
+    assert domain["column"] == "stg_orders.order_id"
+
+
 def test_a_package_input_names_derived_dev_namespace_on_warehouse():
     """#1199: a package model with custom schema derives the namespace."""
 
