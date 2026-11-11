@@ -2075,9 +2075,7 @@ models:
         "account_id is the declared grain of stg_accounts, carried through unchanged"
         in evidence
     )
-    assert any(
-        "declares no grain; dex drafted [account_id]" in w for w in warnings
-    )
+    assert any("declares no grain; dex drafted [account_id]" in w for w in warnings)
 
 
 def test_draft_reports_drafted_grain_instead_of_unresolved_grain_warning():
@@ -2214,8 +2212,7 @@ models:
         tests: [unique]
 """,
         "models/marts/fct_projects.sql": (
-            "select project_id as pid, project_name "
-            "from {{ ref('stg_projects') }}\n"
+            "select project_id as pid, project_name from {{ ref('stg_projects') }}\n"
         ),
     }
     drafts, _ = draft(
