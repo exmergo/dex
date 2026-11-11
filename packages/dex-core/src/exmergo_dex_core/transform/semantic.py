@@ -892,10 +892,14 @@ def splice_definitions(
     return spliced
 
 
-# Constructs the line scanner cannot span without risking a wrong edit. Each
-# refusal costs the caller a whole-file edit, which still works, so failing
-# closed here is cheap; a mis-sliced definition would not be.
 def _reject_unspannable(path: str, text: str) -> None:
+    """Refuse a file the line scanner cannot span without risking a wrong edit.
+
+    Tabs, a second document, an anchor or alias, and a file that does not
+    parse. Each refusal costs the caller a whole-file edit, which still works,
+    so failing closed here is cheap; a mis-sliced definition would not be.
+    """
+
     if "\t" in text:
         raise EditValidationError(
             f"{path}: the file indents with tabs, which YAML does not allow for "

@@ -842,6 +842,12 @@ class ConfigDocument:
     # --- editing, internals -----------------------------------------------------
 
     def _require_editable(self) -> None:
+        """Refuse an in-place edit of a file one edit could not change safely.
+
+        A file that does not parse, holds no mapping, uses an anchor or alias
+        (one edit could change a value in two places), or indents with tabs.
+        """
+
         if self._syntax is not None:
             raise ConfigEditError(
                 f"{CONFIG_RELPATH} does not parse ({self._syntax.describe()}); "
