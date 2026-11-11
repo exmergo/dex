@@ -76,11 +76,11 @@ _MECHANICAL = {"column_added", "column_dropped", "nullability_changed"}
 def _semantic_update_command(vendor: str | None) -> str | None:
     """Authoring command for the configured semantic vendor (#974).
 
-    MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer and Cube each have
-    their own ``semantic <vendor> update`` route; naming the dbt command under
-    those vendors sends the operator to the wrong place. ``None`` for a vendor
-    dex reads but does not author yet (Databricks Metric Views, #1258): there is
-    no route to name.
+    MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer, Cube and Databricks
+    Metric Views (#1258) each have their own ``semantic <vendor> update`` route;
+    naming the dbt command under those vendors sends the operator to the wrong
+    place. ``None`` for a vendor dex reads but does not author: there is no route
+    to name.
     """
 
     from ..config import SEMANTIC_DOCUMENT_AUTHORING

@@ -716,6 +716,19 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
         raise _RefusedError
     date_format = value.get("date_format")
     time_format = value.get("time_format")
+    # Databricks requires both halves of a temporal format, the way it requires a
+    # currency's code: `type: date` without `date_format`, or `date_time` without
+    # either, fails `CREATE VIEW` ("missing required creator property"), checked
+    # against a serverless SQL warehouse (#1258).
+    required = {"date": ("date_format",), "date_time": ("date_format", "time_format")}
+    if missing := [key for key in required.get(kind, ()) if value.get(key) is None]:
+        find(
+            here,
+            "format",
+            f"a {kind} format needs {' and '.join(f'`{k}`' for k in missing)}; "
+            "Databricks refuses it without",
+        )
+        raise _RefusedError
     if date_format is not None:
         allowed = (*_DATE_FORMATS, "no_date") if kind == "date_time" else _DATE_FORMATS
         if date_format not in allowed:

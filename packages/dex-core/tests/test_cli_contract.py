@@ -855,6 +855,14 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "edits_file": _TRANSLATED,
         },
     },
+    ("semantic", "databricks"): {
+        "method": "semantic_databricks",
+        "args": {
+            "mode": "mode",
+            "argument": _TRANSLATED,
+            "edits_file": _TRANSLATED,
+        },
+    },
     ("maintain", "snapshot"): {
         "method": "snapshot",
         "args": {"project_only": "project_only"},

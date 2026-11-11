@@ -313,6 +313,10 @@ def test_the_cube_extra_follows_the_configured_vendor(wrapper, argv, vendor, exp
             ["metric-views"],
         ),
         (["transform", "apply"], "databricks", ["metric-views"]),
+        # Authoring validates with the reader's port of the rules (#1258), so it
+        # takes the extra whatever the configured vendor says.
+        (["semantic", "databricks", "define"], "databricks", ["metric-views"]),
+        (["semantic", "databricks", "plan"], None, ["metric-views"]),
         # Not for a command that reads no layer, and never from the connector name.
         (["explore", "inventory"], "databricks", []),
         (["explore", "map"], "databricks", []),

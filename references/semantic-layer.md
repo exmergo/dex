@@ -1473,8 +1473,14 @@ semantic:
 - **`query` and `values` are not available yet** (#964). `values` runs the PII
   gate before it refuses.
 - **`maintain` reads the fingerprint**: definition drift on `maintain semantic`, and
-  each `rely` key and join arity measured by `maintain grain`. Authoring (#1258),
-  the vendor schema axis (#1259) and the Ossie bridge (#1260) follow.
+  each `rely` key and join arity measured by `maintain grain`. The vendor schema
+  axis (#1259) and the Ossie bridge (#1260) follow.
+- **Authoring is `semantic databricks define|update|plan`** (#1258): whole files
+  on `semantic.databricks.files`, validated by the same port with an unknown key
+  and `fields` beside `dimensions` refused on write, stored as a plan and written
+  by `transform apply`. A declared dbt mart derives a Metric View (its population
+  carried as the comment's last sentence, never as a `filter`), and a
+  `declarations` payload annotates an existing view. Nothing is deployed.
 
 What Dex accepts, checks, maps and declines to claim, rule by rule, is in
 [Databricks Metric View compatibility](databricks-metric-views-compatibility.md).
@@ -1682,3 +1688,8 @@ drift fingerprints are unchanged. Use `explore profile|map --use-project` for th
 structured population, screened by the declaration withholding policy. A
 description with no `dex.population` metadata is never edited, even when it says
 `Population:`. The hosted dbt Cloud catalog is not covered.
+
+A Databricks Metric View has no metadata key to hold `dex.population`, so its
+catalog keeps a view `comment` up to the first `Population: ` it holds and
+withholds the rest, with a note, whatever wrote it. A derived or annotated view
+carries its population only there.

@@ -35,6 +35,7 @@ from typing import Any
 
 import yaml
 
+from ..yaml_items import IndentedDumper
 from . import validator
 from .model import MetricView
 
@@ -43,6 +44,7 @@ __all__ = [
     "WARNING",
     "Diagnostic",
     "LoadResult",
+    "dump_yaml",
     "load_files",
     "read_yaml",
     "validate_view_contents",
@@ -155,6 +157,28 @@ def read_yaml(text: str) -> Any:
     duplicate key refused (``yaml.YAMLError``)."""
 
     return yaml.load(text, Loader=_Loader)  # noqa: S506 - a SafeLoader subclass
+
+
+class Dumper(IndentedDumper):
+    """The writer's half of :class:`_Loader`: YAML 1.2 booleans, block lists
+    indented under their key.
+
+    PyYAML's own dumper quotes any text a YAML 1.1 reader would take for a
+    boolean (``'on'``), and a 1.1 round trip writes a parsed ``True`` key as
+    ``true:``. With 1.2's resolvers a join's ``on`` key is text and is written
+    plain, as Databricks' own examples write it, and reads back through
+    :func:`read_yaml` as the same text.
+    """
+
+
+Dumper.yaml_implicit_resolvers = dict(_Loader.yaml_implicit_resolvers)
+
+
+def dump_yaml(value: Any) -> str:
+    """``value`` as a Metric View body: block style, keys in the order given,
+    YAML 1.2 scalars, so it reads back through :func:`read_yaml` unchanged."""
+
+    return yaml.dump(value, Dumper=Dumper, sort_keys=False, allow_unicode=True)
 
 
 # --- the files ---------------------------------------------------------------------

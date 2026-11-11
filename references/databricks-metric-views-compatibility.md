@@ -95,6 +95,9 @@ since the upgrade wipes them.
 - **`format`.** Checked by `type` (`number`, `currency`, `percentage`, `byte`,
   `date`, `date_time`) with that type's keys:
   - a currency format needs an ISO-4217 `currency_code`;
+  - a `date` format needs `date_format`, and a `date_time` format needs both
+    `date_format` and `time_format` (Databricks refuses either without, checked
+    with `CREATE VIEW ... WITH METRICS` in #1258);
   - `decimal_places` of type `max` or `exact` needs `places` from 0 to 10;
   - `date_format` and `time_format` cannot both be none.
 - **Measure `window`.**
@@ -127,12 +130,14 @@ since the upgrade wipes them.
 
 **What only warns**, while reading:
 
-- **An unknown key.** Databricks refuses it on create, but the rest of the
-  definition is still readable. A later authoring release (#1258) refuses it.
+- **An unknown key**, at any level, `rely` included. Databricks refuses it on
+  create, but the rest of the definition is still readable. Authoring refuses it
+  in a file the plan writes (see [Authoring](#authoring)).
 - **`on` beside `using`.**
 - **`fields` and its older spelling `dimensions` both written.** Databricks
   creates the view from `dimensions` and drops `fields`, and so does the Ossie
-  converter. Dex reads `dimensions` too and names what it dropped.
+  converter. Dex reads `dimensions` too and names what it dropped. Authoring
+  refuses it in a file the plan writes.
 - **A field reading a later field's name, or a `filter` reading a field's name.**
   A field reads only the fields before it, and a `filter` reads source columns
   only, so Databricks reads such a name as a source column and refuses the view
@@ -158,9 +163,11 @@ paths, was checked against `CREATE VIEW ... WITH METRICS` on a serverless SQL
 warehouse. Where they differ, the difference is deliberate:
 
 - **Version `0.1`.** Databricks still creates it; Dex reads `1.1` only.
-- **An unknown key.** Databricks refuses the view; Dex warns while reading.
+- **An unknown key.** Databricks refuses the view; Dex warns while reading, and
+  refuses it in a file a plan writes.
 - **A duplicate name.** Databricks refuses the view; Dex refuses the later
-  member and keeps the rest.
+  member and keeps the rest while reading. A plan that writes a duplicate name is
+  refused, since any error in the set refuses the plan.
 
 ## References and lineage
 
@@ -275,5 +282,31 @@ The layer-neutral axes then read the fingerprint:
   each join's declared arity.
 
 Holding the views' expressions to the warehouse snapshot by type, and reconciling
-through `semantic databricks update`, is #1259. Authoring is #1258. The Ossie
-bridge is #1260.
+through `semantic databricks update`, is #1259. The Ossie bridge is #1260.
+
+## Authoring
+
+`semantic databricks define|update|plan --edits-file <f>` (#1258) authors the
+configured files through a stored plan that `transform apply` writes. Dex never
+deploys: nothing runs `CREATE VIEW ... WITH METRICS`, and no authoring path opens
+a workspace connection.
+
+- **The write surface** is exactly `semantic.databricks.files`. A path off it, a
+  `.sql` file, another suffix and a stem another file already names are refused by
+  name, the first with the `dex config set` that adopts it.
+- **Edits are whole files, written byte-for-byte**, all or none. A file changed
+  after planning is a conflict. The set apply would leave is validated again.
+- **The whole prospective set is validated** by the rules above. Every error
+  anywhere in the set refuses the plan, and so do two warnings in a file the plan
+  writes: an unknown key, and `fields` beside `dimensions`.
+- **YAML 1.2, never a 1.1 round trip.** A key that is not text is refused while
+  reading; a `true:` key names the `on:` rewrite a YAML 1.1 writer makes. Dex's
+  own writers (derivation and annotation) read and write YAML 1.2, so `on:` is
+  written plain. A file whose YAML aliases expand past 100,000 values, or refer to
+  themselves, is refused too.
+- **Derivation** from a declared dbt mart, and **annotation** with a
+  `declarations` payload, follow the mapping in the transform skill's
+  `declarations.md`. A Metric View has no metadata key, so the population is
+  carried only as the last sentence of the view's `comment`, which the catalog
+  withholds, and the NULL rule, additivity, assumptions and grain are named as not
+  carried. A population is never written as a `filter`.

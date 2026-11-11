@@ -1292,11 +1292,21 @@ def test_dangling_reference_names_the_vendor_authoring_command(vendor, command):
     assert "restore the model/column it references" in action
 
 
-def test_dangling_reference_under_an_unauthored_vendor_names_no_command():
-    """A vendor dex reads but does not author yet (#1258) gets no route to run,
-    never dbt's `semantic update`, which would edit a layer nobody reads."""
+def test_dangling_reference_under_an_unauthored_vendor_names_no_command(
+    monkeypatch,
+):
+    """A vendor dex reads but does not author gets no route to run, never dbt's
+    `semantic update`, which would edit a layer nobody reads. Databricks was the
+    one such vendor until #1258; the tuple is narrowed to keep the rule tested."""
+    from exmergo_dex_core import config
     from exmergo_dex_core.maintain.drift import DriftFinding
     from exmergo_dex_core.maintain.reconcile import _advisory
+
+    monkeypatch.setattr(
+        config,
+        "SEMANTIC_DOCUMENT_AUTHORING",
+        tuple(v for v in config.SEMANTIC_DOCUMENT_AUTHORING if v != "databricks"),
+    )
 
     finding = DriftFinding(
         axis="semantic",
@@ -1316,5 +1326,5 @@ def test_semantic_update_command_helper():
     assert _semantic_update_command("dbt") == "semantic update"
     assert _semantic_update_command("OSSIE") == "semantic ossie update"
     assert _semantic_update_command(None) == "semantic update"
-    # A vendor dex reads but does not author yet has no route to name (#1258).
-    assert _semantic_update_command("databricks") is None
+    # Databricks Metric Views are authored natively since #1258.
+    assert _semantic_update_command("databricks") == "semantic databricks update"
