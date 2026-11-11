@@ -662,3 +662,25 @@ def test_a_shared_alias_within_bounds_still_reads():
     result = _load(text)
 
     assert result.errors == []
+
+
+def test_an_oversized_alias_file_is_named_and_the_next_file_still_reads():
+    """The count saturates at the cap, so even a document whose expansion has
+    more digits than Python formats is named, and the next file still reads."""
+
+    lines = ["version: 1.1", "source: demo.main.orders", "a0: &a0 [0]"]
+    lines += [f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 200)]
+    lines += ["fields:", "  - name: x", "    expr: x"]
+    result = validate_view_contents(
+        {
+            "views/orders.yaml": "\n".join(lines) + "\n",
+            "views/other.yaml": yaml.safe_dump(
+                view(fields=[{"name": "y", "expr": "y"}])
+            ),
+        }
+    )
+
+    (diagnostic,) = result.diagnostics
+    assert (diagnostic.file, diagnostic.rule) == ("views/orders.yaml", "malformed")
+    assert "more than 100000" in diagnostic.message
+    assert [v.name for v in result.views] == ["other"]

@@ -248,8 +248,8 @@ def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
             "a YAML alias refers to the value that contains it (`&a [*a]`), so "
             "the definition has no end; write the value out"
             if expanded is None
-            else f"its YAML aliases expand to {expanded} values, past the "
-            f"{MAX_EXPANDED_VALUES} a Metric View could need; write the values out"
+            else f"its YAML aliases expand to more than {MAX_EXPANDED_VALUES} "
+            "values, far past what a Metric View needs; write the values out"
         )
         result.diagnostics.append(_diagnostic(name, "(root)", "malformed", reason))
         return None
@@ -475,6 +475,9 @@ def _expansion(value: Any) -> int | None:
 
     Each container is visited once: a shared alias is sized once and its size
     reused, so the check is linear in the parsed document, not in its expansion.
+    A size saturates at ``MAX_EXPANDED_VALUES + 1``, so a count never grows past
+    what the caller compares it with, and cycles are still looked for after it
+    saturates.
     """
 
     sizes: dict[int, int] = {}
@@ -494,7 +497,7 @@ def _expansion(value: Any) -> int | None:
             inner = size(child)
             if inner is None:
                 return None
-            total += inner
+            total = min(total + inner, MAX_EXPANDED_VALUES + 1)
         visiting.discard(key)
         sizes[key] = total
         return total
