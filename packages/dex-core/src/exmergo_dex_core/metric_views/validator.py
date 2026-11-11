@@ -139,6 +139,12 @@ _CAST_COLUMN = re.compile(
 )
 _WILDCARD = re.compile(r"\.\s*\*(\s+except\s*\(.*\))?\s*$", re.IGNORECASE | re.DOTALL)
 _OFFSET = re.compile(r"^-?\d+\s+(day|days|month|months|year|years)$", re.IGNORECASE)
+_UNIT = re.compile(r"^(day|days|month|months|year|years)$", re.IGNORECASE)
+
+#: The SQL types a parameter standing for a window's number may have.
+_INTEGER_TYPES = frozenset(
+    {"tinyint", "byte", "smallint", "short", "int", "integer", "bigint", "long"}
+)
 
 _FORMAT_KEYS: dict[str, tuple[str, ...]] = {
     "number": ("decimal_places", "hide_group_separator", "abbreviation"),
@@ -239,6 +245,19 @@ def check_view(
         materialization = _materialization(raw.get("materialization"), find)
     except _RefusedError:
         return None, findings
+    if parameters and materialization:
+        find(
+            "materialization",
+            "materialization",
+            "a view that declares `parameters` cannot be materialized: Databricks "
+            "binds a parameter per query, so there is no one result to maintain",
+        )
+        return None, findings
+    integers = frozenset(
+        str(p["name"]).lower()
+        for p in parameters
+        if str(p.get("data_type", "")).strip().lower() in _INTEGER_TYPES
+    )
 
     has_fields = bool(raw.get("fields"))
     has_dimensions = bool(raw.get("dimensions"))
@@ -263,8 +282,10 @@ def check_view(
         return None, findings
 
     wildcards: list[Wildcard] = []
-    fields = _members(raw.get(fields_key), fields_key, FIELD, wildcards, find)
-    measures = _members(raw.get("measures"), "measures", MEASURE, wildcards, find)
+    fields = _members(raw.get(fields_key), fields_key, FIELD, wildcards, find, integers)
+    measures = _members(
+        raw.get("measures"), "measures", MEASURE, wildcards, find, integers
+    )
     fields, measures = _unique(fields, measures, find)
     joins = _joins(raw.get("joins"), (), None, find)
 
@@ -451,7 +472,12 @@ def _materialization(value: Any, find: Any) -> dict[str, Any] | None:
 
 
 def _members(
-    value: Any, key: str, kind: str, wildcards: list[Wildcard], find: Any
+    value: Any,
+    key: str,
+    kind: str,
+    wildcards: list[Wildcard],
+    find: Any,
+    integers: frozenset[str] = frozenset(),
 ) -> list[Member]:
     """Every readable field or measure of one list; a refused entry is left out."""
     if value is None:
@@ -462,7 +488,7 @@ def _members(
     found: list[Member] = []
     for index, entry in enumerate(value):
         try:
-            member = _member(entry, key, index, kind, wildcards, find)
+            member = _member(entry, key, index, kind, wildcards, find, integers)
         except _RefusedError:
             continue
         if member is not None:
@@ -477,6 +503,7 @@ def _member(
     kind: str,
     wildcards: list[Wildcard],
     find: Any,
+    integers: frozenset[str] = frozenset(),
 ) -> Member | None:
     """One field or measure, ``None`` for a wildcard, or a refusal."""
     where = f"{key}[{index}]"
@@ -560,7 +587,7 @@ def _member(
                 "a measure has a `window` or a `partition`, never both",
             )
             raise _RefusedError
-        window = _window(entry.get("window"), where, find)
+        window = _window(entry.get("window"), where, find, integers)
         partition = _partition(entry.get("partition"), where, find)
 
     return Member(
@@ -605,7 +632,7 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
         find(here, "format", "`format` is a mapping with a `type`")
         raise _RefusedError
     kind = value.get("type")
-    if kind not in _FORMAT_KEYS:
+    if not isinstance(kind, str) or kind not in _FORMAT_KEYS:
         find(
             here,
             "format",
@@ -672,8 +699,14 @@ def _format(value: Any, where: str, find: Any) -> dict[str, Any] | None:
     return dict(value)
 
 
-def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
-    """A measure's `window` specs, each with an `order` and a valid `range`."""
+def _window(
+    value: Any, where: str, find: Any, integers: frozenset[str] = frozenset()
+) -> tuple[dict[str, Any], ...]:
+    """A measure's `window` specs, each with an `order` and a valid `range`.
+
+    The number in a `range` or an `offset` may be an integer parameter the view
+    declares, by its bare name; one naming no such parameter is refused.
+    """
     if value is None:
         return ()
     if not isinstance(value, list) or not value:
@@ -698,21 +731,51 @@ def _window(value: Any, where: str, find: Any) -> tuple[dict[str, Any], ...]:
                 f"[<unit>] [inclusive|exclusive]; got {spec.get('range')!r}",
             )
             raise _RefusedError
-        if spec.get("semiadditive") not in (None, "first", "last"):
-            find(here, "window", "`semiadditive` is first or last")
-            raise _RefusedError
-        offset = spec.get("offset")
-        if offset is not None and not (
-            (isinstance(offset, int) and not isinstance(offset, bool))
-            or (isinstance(offset, str) and _OFFSET.match(offset.strip()))
+        magnitude = spec["range"].split()[1:2]
+        if (
+            magnitude
+            and not magnitude[0].isdigit()
+            and (magnitude[0].lower() not in integers)
         ):
             find(
                 here,
                 "window",
-                "`offset` is a signed integer or `<n> day|month|year[s]`",
+                f"`range` reads `{magnitude[0]}`, which names no integer parameter "
+                "of this view",
+            )
+            raise _RefusedError
+        if spec.get("semiadditive") not in (None, "first", "last"):
+            find(here, "window", "`semiadditive` is first or last")
+            raise _RefusedError
+        offset = spec.get("offset")
+        if offset is not None and not _offset_ok(offset, integers):
+            find(
+                here,
+                "window",
+                "`offset` is a signed integer, `<n> day|month|year[s]`, or an "
+                "integer parameter of this view in place of `<n>`",
             )
             raise _RefusedError
     return tuple(dict(spec) for spec in value)
+
+
+def _offset_ok(value: Any, integers: frozenset[str]) -> bool:
+    """Whether ``value`` is a window `offset`: a signed integer, ``<n> <unit>``,
+    or a declared integer parameter standing for ``<n>``."""
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if _OFFSET.match(text):
+        return True
+    tokens = text.split()
+    return (
+        1 <= len(tokens) <= 2
+        and tokens[0].lower() in integers
+        and (len(tokens) == 1 or bool(_UNIT.match(tokens[1])))
+    )
 
 
 def _range_ok(value: Any) -> bool:

@@ -192,10 +192,11 @@ def test_a_member_refusal_keeps_the_rest_of_the_view(body, rule):
     ],
 )
 def test_every_documented_window_range_reads(expr):
-    """Each `range` form the specification documents."""
-    result = _load(
-        _measure(window=[{"order": "d", "range": expr, "offset": "-1 month"}])
-    )
+    """Each `range` form the specification documents; `days_back` is a declared
+    integer parameter standing for the number."""
+    body = _measure(window=[{"order": "d", "range": expr, "offset": "-1 month"}])
+    body["parameters"] = [{"name": "days_back", "data_type": "INT", "default": 7}]
+    result = _load(body)
 
     assert result.errors == []
 
@@ -534,3 +535,66 @@ def test_a_nested_join_is_read_through_its_whole_path():
     }
     assert "orders.customer.segment" in result.errors[0].message
     assert [f.name for f in result.views[0].fields] == ["seg_ok"]
+
+
+@pytest.mark.parametrize(
+    ("window", "ok"),
+    [
+        ({"range": "trailing days_back day", "offset": "days_back day"}, True),
+        ({"range": "current", "offset": "days_back"}, True),
+        ({"range": "trailing undeclared day"}, False),
+        ({"range": "current", "offset": "undeclared day"}, False),
+        ({"range": "trailing label day"}, False),  # a string parameter
+    ],
+)
+def test_a_window_number_may_be_a_declared_integer_parameter(window, ok):
+    """The specification lets an integer parameter stand for a window's number,
+    by its bare name; one naming no integer parameter of the view is refused."""
+
+    body = _measure(window=[{"order": "d", **window}])
+    body["parameters"] = [
+        {"name": "days_back", "data_type": "int", "default": 7},
+        {"name": "label", "data_type": "string", "default": "'x'"},
+    ]
+    result = _load(body)
+
+    assert (result.errors == []) is ok, result.errors
+    assert bool(result.views[0].measures) is ok
+
+
+def test_a_parameterized_view_cannot_be_materialized():
+    """Databricks binds parameters per query, so it refuses to materialize one."""
+
+    body = _field() | {
+        "parameters": [{"name": "region", "data_type": "string", "default": "'EU'"}],
+        "materialization": {
+            "mode": "relaxed",
+            "materialized_views": [
+                {"name": "m", "type": "aggregated", "dimensions": ["x"]}
+            ],
+        },
+    }
+    result = _load(body)
+
+    assert result.views == []
+    assert _rules(result) == {"materialization": ERROR}
+
+
+def test_an_unhashable_format_type_refuses_the_member_and_not_the_layer():
+    """`type: [number]` is a member's problem; the other files still read."""
+
+    body = _field(format={"type": ["number"]})
+    body["fields"].append({"name": "kept", "expr": "kept"})
+    result = validate_view_contents(
+        {
+            "views/orders.yaml": yaml.safe_dump(body),
+            "views/other.yaml": yaml.safe_dump(
+                view(fields=[{"name": "y", "expr": "y"}])
+            ),
+        }
+    )
+
+    assert {(d.file, d.rule) for d in result.errors} == {
+        ("views/orders.yaml", "format")
+    }
+    assert [[f.name for f in v.fields] for v in result.views] == [["kept"], ["y"]]

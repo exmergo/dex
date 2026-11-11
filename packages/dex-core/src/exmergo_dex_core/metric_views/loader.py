@@ -254,7 +254,20 @@ def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
         )
         return None
     stem = PurePosixPath(name).stem
-    view, findings = validator.check_view(raw, name, stem)
+    try:
+        view, findings = validator.check_view(raw, name, stem)
+    except (TypeError, ValueError, AttributeError) as exc:
+        # A shape no rule anticipated is this file's problem, never the layer's:
+        # the other files still read.
+        result.diagnostics.append(
+            _diagnostic(
+                name,
+                "(root)",
+                "malformed",
+                f"could not be read as a Metric View ({type(exc).__name__}: {exc})",
+            )
+        )
+        return None
     for finding in findings:
         result.diagnostics.append(
             _diagnostic(

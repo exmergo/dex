@@ -12,7 +12,8 @@ a physical column is decided once, whichever channel asks.
   columns and its ``rely.at_most_one_match`` key, so a column dropped from a
   joined table is reported against the table that lost it. A joined table that
   is another view's source is that view's model, which also carries the columns
-  the reading view's fields take from it, keyed ``reading_view.field``.
+  the reading view's fields and aggregates take from it, keyed
+  ``reading_view.member``.
 - Each measure is one metric named the way the catalog names it
   (``view.measure``), so a removed or rewritten one is its own finding.
 - Each join with key pairs is one relationship with every ordered pair, oriented
@@ -75,6 +76,7 @@ def semantic_layer(
     #: that view, so the table's own model carries them (qualified by the reading
     #: view, so they cannot collide with its own fields).
     borrowed: dict[str, dict[str, str | None]] = {}
+    borrowed_measures: dict[str, dict[str, str | None]] = {}
     for view in loaded.views:
         dimensions: dict[str, str | None] = {}
         categorical: dict[str, str] = {}
@@ -93,6 +95,14 @@ def semantic_layer(
             if (here := resolved.members.get((view.name, member.name))) is not None
             and here.aggregate is not None
         }
+        # An aggregate over a joined column (`SUM(lines.quantity)`) reads that
+        # table, so it is fingerprinted there too, as a field read through a
+        # join is.
+        joined_measures: dict[tuple[str, ...], dict[str, str | None]] = {}
+        for member in view.measures:
+            here = resolved.members.get((view.name, member.name))
+            if here is not None and here.aggregate is not None and here.owner:
+                joined_measures.setdefault(here.owner, {})[member.name] = here.column
         models.append(
             SemanticModelDef(
                 name=view.name,
@@ -128,6 +138,14 @@ def semantic_layer(
                         for field, column in joined.get(join.path, {}).items()
                     }
                 )
+                borrowed_measures.setdefault(other, {}).update(
+                    {
+                        catalog_mod.member_token(view.name, measure): column
+                        for measure, column in joined_measures.get(
+                            join.path, {}
+                        ).items()
+                    }
+                )
                 continue
             models.append(
                 SemanticModelDef(
@@ -136,6 +154,7 @@ def semantic_layer(
                     content_sha256=_hash(join.raw),
                     relation=table.relation,
                     dimensions=joined.get(join.path, {}),
+                    measures=joined_measures.get(join.path, {}),
                     keys=keys.get(name, []),
                 )
             )
@@ -152,6 +171,9 @@ def semantic_layer(
     for target, columns in borrowed.items():
         model = by_name[target]
         model.dimensions = {**model.dimensions, **columns}
+    for target, columns in borrowed_measures.items():
+        model = by_name[target]
+        model.measures = {**model.measures, **columns}
 
     relationships = [
         RelationshipDef(

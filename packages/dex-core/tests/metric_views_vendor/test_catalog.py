@@ -284,15 +284,10 @@ def test_a_partial_source_name_claims_no_relation_and_says_why(tmp_path: Path):
 def test_parameters_materialization_and_partition_are_named_not_modelled(
     tmp_path: Path,
 ):
-    """Each is carried, noted, and never a measure."""
-    body = view(
+    """Each is carried, noted, and never a measure. Two views, since Databricks
+    refuses to materialize a view that declares parameters."""
+    parameterized = view(
         parameters=[{"name": "region", "data_type": "string", "default": "'EU'"}],
-        materialization={
-            "mode": "relaxed",
-            "materialized_views": [
-                {"name": "daily", "type": "aggregated", "dimensions": ["x"]}
-            ],
-        },
         fields=[{"name": "x", "expr": "x"}],
         measures=[
             {
@@ -302,7 +297,19 @@ def test_parameters_materialization_and_partition_are_named_not_modelled(
             }
         ],
     )
-    catalog = source(tmp_path, orders=body).semantic_catalog()
+    materialized = view(
+        "demo.main.daily",
+        materialization={
+            "mode": "relaxed",
+            "materialized_views": [
+                {"name": "daily", "type": "aggregated", "dimensions": ["y"]}
+            ],
+        },
+        fields=[{"name": "y", "expr": "y"}],
+    )
+    catalog = source(
+        tmp_path, orders=parameterized, daily=materialized
+    ).semantic_catalog()
     notes = " ".join(catalog.notes)
 
     assert "parameters (region)" in notes
@@ -383,3 +390,39 @@ def test_a_nested_join_names_its_parent_by_name_or_path():
         (("customer",), ("customer",)),
     )
     assert found == [("c_nationkey", "n_nationkey")]
+
+
+def test_an_aggregate_over_a_joined_column_is_fingerprinted_on_that_table(
+    tmp_path: Path,
+):
+    """`SUM(lines.quantity)` reads the joined table, so dropping `quantity` there
+    has to be detectable: on the join's own model, or on the model of the view
+    that sits on the same table."""
+
+    orders = view(
+        joins=[
+            {
+                "name": "lines",
+                "source": "demo.main.order_lines",
+                "on": "source.order_id = lines.order_id",
+                "cardinality": "one_to_many",
+            },
+            {
+                "name": "customer",
+                "source": "demo.main.customers",
+                "on": "source.customer_id = customer.id",
+            },
+        ],
+        fields=[{"name": "status", "expr": "status"}],
+        measures=[
+            {"name": "units", "expr": "SUM(lines.quantity)"},
+            {"name": "balance", "expr": "SUM(customer.balance)"},
+        ],
+    )
+    customers = view("demo.main.customers", fields=[{"name": "id", "expr": "id"}])
+    layer = source(tmp_path, orders=orders, customers=customers).semantic_layer()
+    models = {m.name: m for m in layer.semantic_models}
+
+    assert models["orders.lines"].measures == {"units": "quantity"}
+    assert models["customers"].measures == {"orders.balance": "balance"}
+    assert models["orders"].measures == {"units": None, "balance": None}

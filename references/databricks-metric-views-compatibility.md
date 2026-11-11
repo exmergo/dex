@@ -81,7 +81,9 @@ since the upgrade wipes them.
 - malformed `materialization`: `mode: relaxed`, a non-empty `materialized_views`
   list with a `name` and a `type` on each, at most one `unaggregated` entry with
   no dimensions or measures, and `dimensions` or `measures` on each `aggregated`
-  one.
+  one;
+- `materialization` on a view that declares `parameters`, which Databricks
+  binds per query, so there is no one result to maintain.
 
 **What refuses one element**, leaving the rest of the view:
 
@@ -101,6 +103,9 @@ since the upgrade wipes them.
     `trailing|leading <n> [<unit>] [inclusive|exclusive]`.
   - `semiadditive` is `first` or `last`.
   - `offset` is a signed integer or `<n> day|month|year[s]`.
+  - The number in a `range` or an `offset` may be an integer parameter the view
+    declares, by its bare name (`trailing days_back day`). A name that is no
+    integer parameter of the view is refused.
 - **Measure `partition`.** `include` is a list of field names, and
   `outer_aggregate` is one of `SUM`, `AVG`, `MIN`, `MAX`, `COUNT` or `MEDIAN`. A
   measure has a `window` or a `partition`, never both.
