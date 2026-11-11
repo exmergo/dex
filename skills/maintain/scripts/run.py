@@ -324,6 +324,10 @@ _CUBE_VENDOR = "cube"
 # the extra grows. A Metric View query is SQL over the view, so MetricFlow is
 # never installed for one. (`databricks` is also a connector name; the
 # connector's extra is resolved from `connector:`, never from this.)
+# `semantic databricks` always takes it, as `semantic cube` does: authoring
+# validates a view file with the same port of the Metric View rules the reader
+# runs.
+_METRIC_VIEWS_COMMANDS = (("semantic", "databricks"),)
 _METRIC_VIEWS_VENDOR = "databricks"
 
 # The vendors that render a metric query without MetricFlow.
@@ -357,7 +361,8 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     the validation degrades to a structural check, and the warning that says so
     reads like routine news, so the authoring commands take the `semantic` extra
     and the schemas actually run. The native document commands
-    (`semantic ossie ...`, `semantic slayer ...`, `semantic cube ...`) validate
+    (`semantic ossie ...`, `semantic slayer ...`, `semantic cube ...`,
+    `semantic databricks ...`) validate
     against their own schemas and take their own extras.
 
     `explore semantic` needs the hosted client on any of its subcommands, which is
@@ -399,7 +404,9 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
         extras.append("slayer")
     if command in _CUBE_COMMANDS or (vendor == _CUBE_VENDOR and reads_layer):
         extras.append("cube")
-    if vendor == _METRIC_VIEWS_VENDOR and reads_layer:
+    if command in _METRIC_VIEWS_COMMANDS or (
+        vendor == _METRIC_VIEWS_VENDOR and reads_layer
+    ):
         extras.append("metric-views")
     if command in _SEMANTIC_AUTHORING_COMMANDS:
         extras.append("semantic")

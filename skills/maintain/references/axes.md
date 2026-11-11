@@ -452,7 +452,7 @@ and the metadata Dex captured through its own connection. The wrapper installs t
 | `volume` | unchanged: it reads the warehouse, not the layer |
 | `grain` | measures each `rely.at_most_one_match` key (`declared_grain_not_unique`) and each join's declared arity (`join_cardinality_exceeded`, a `many_to_one` join whose joined side is not unique, `rely` or not) |
 | `semantic` | definition drift free as everywhere: a view, measure or join added, removed or changed, and a field reading a column the warehouse no longer has |
-| `reconcile` | advisory only: there is no `semantic databricks update` route yet (#1258) |
+| `reconcile` | advisory, naming `semantic databricks update` as the route; no Metric View finding has a mechanical edit until the vendor schema axis (#1259) |
 | `verify` | checks the dbt project only |
 
 ## SLayer layers (`semantic.vendor: slayer`)

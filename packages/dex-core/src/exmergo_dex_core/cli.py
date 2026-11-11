@@ -485,6 +485,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "then store a plan. Needs the [cube] extra. No Cube server, no "
         "warehouse. Repo-only.",
     ),
+    ("semantic", "databricks"): (
+        "plan whole-file edits to the Metric View YAML files",
+        "Validate whole Metric View YAML files at the paths "
+        "semantic.databricks.files configures, with dex's port of the Metric View "
+        "YAML 1.1 rules, then store a plan. Needs the [metric-views] extra. Never "
+        "deploys a view and opens no workspace connection. Repo-only.",
+    ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
         "Pin the current map and fingerprint the project layers as the "

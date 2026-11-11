@@ -226,7 +226,11 @@ def reference_metric_views() -> dict[str, dict[str, Any]]:
                 "expr": dimension["name"],
                 "display_name": dimension["label"],
                 "comment": dimension["description"],
-                **({"format": {"type": "date"}} if dimension["type"] == "time" else {}),
+                **(
+                    {"format": {"type": "date", "date_format": "year_month_day"}}
+                    if dimension["type"] == "time"
+                    else {}
+                ),
             }
             for dimension in model["dimensions"]
         )

@@ -357,7 +357,7 @@ def semantic_catalog(
         models.append(
             SemanticModelInfo(
                 name=view.name,
-                description=view.comment,
+                description=_without_population(view, found),
                 relation=resolved.table(view.name).relation,
             )
         )
@@ -720,3 +720,29 @@ def definitions(
         source_relations=relations,
         notes=found,
     )
+
+
+#: How a population sentence dex wrote into a view's ``comment`` starts (see
+#: :func:`..semantic_declarations.population_sentence`).
+_POPULATION = "Population: "
+
+
+def _without_population(view: MetricView, notes: list[str]) -> str | None:
+    """The view's comment less a population sentence dex wrote (#1258).
+
+    A Metric View has no metadata key, so a derived or annotated view carries
+    its population only as the last sentence of its comment. Catalogs are
+    connectionless and cannot prove a population's values safe, so the sentence
+    is withheld here as every native catalog withholds it, and the authored
+    prefix is kept. The file is not rewritten.
+    """
+
+    comment = view.comment
+    if not isinstance(comment, str) or _POPULATION not in comment:
+        return comment
+    head = comment.split(_POPULATION, 1)[0].rstrip()
+    notes.append(
+        f"{view.file}: the view's comment ends in a population sentence, which the "
+        "catalog withholds; the file is unchanged"
+    )
+    return head or None

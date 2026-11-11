@@ -13,27 +13,37 @@ with neighbours, so nothing here can bound one entry in it, and ``None`` says so
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import yaml
 
 from .yaml_spans import before_trailing_blanks, block_end
 
-__all__ = ["append_item", "dump_items", "element_node", "locate"]
+__all__ = ["IndentedDumper", "append_item", "dump_items", "element_node", "locate"]
 
 
-class _IndentedDumper(yaml.SafeDumper):
+class IndentedDumper(yaml.SafeDumper):
     """Block lists indented under their key, the way hand-written YAML is."""
 
     def increase_indent(self, flow: bool = False, indentless: bool = False):
         return super().increase_indent(flow, False)
 
 
-def dump_items(value: Any, indent: int = 0) -> str:
-    """``value`` as block YAML, every line padded by ``indent`` spaces."""
+_IndentedDumper = IndentedDumper
+
+
+def dump_items(
+    value: Any, indent: int = 0, dumper: type[yaml.SafeDumper] | None = None
+) -> str:
+    """``value`` as block YAML, every line padded by ``indent`` spaces.
+
+    ``dumper`` replaces the default for a format with its own scalar rules: a
+    Metric View is YAML 1.2, where ``on`` is text and must be written plain.
+    """
 
     dumped = yaml.dump(
-        value, Dumper=_IndentedDumper, sort_keys=False, allow_unicode=True
+        value, Dumper=dumper or _IndentedDumper, sort_keys=False, allow_unicode=True
     )
     pad = " " * indent
     return "".join(
@@ -63,10 +73,19 @@ def element_node(
 
 
 def locate(
-    text: str, name: str, section: str = "cubes"
+    text: str,
+    name: str,
+    section: str = "cubes",
+    *,
+    load: Callable[[str], Any] = yaml.safe_load,
 ) -> tuple[int, int, int, dict[str, Any]] | None:
     """Where the element ``name``'s list item starts and ends, its dash column,
-    and its parsed body; ``None`` where it is not a block-style item."""
+    and its parsed body; ``None`` where it is not a block-style item.
+
+    ``load`` parses the item's own lines. The default is PyYAML's YAML 1.1
+    reader; a format read as YAML 1.2 passes its own, since 1.1 would turn a
+    bare ``on:`` key into ``True``.
+    """
 
     try:
         root = yaml.compose(text)
@@ -83,13 +102,19 @@ def locate(
     end = before_trailing_blanks(text, block_end(text, line_start, indent))
     # The item's own lines parse as a one-item list, which keeps its
     # indentation consistent where a slice from the first key would not.
-    parsed = yaml.safe_load(text[line_start:end])
+    parsed = load(text[line_start:end])
     if not isinstance(parsed, list) or not isinstance(parsed[0], dict):
         return None
     return line_start, end, indent, parsed[0]
 
 
-def append_item(text: str, section: str, item: Any) -> str | None:
+def append_item(
+    text: str,
+    section: str,
+    item: Any,
+    *,
+    dumper: type[yaml.SafeDumper] | None = None,
+) -> str | None:
     """``text`` with ``item`` appended to the root block list ``section``.
 
     The new item takes the indentation of the list's own items and lands after
@@ -107,7 +132,7 @@ def append_item(text: str, section: str, item: Any) -> str | None:
         return None
     sequence = next((value for key, value in root.value if key.value == section), None)
     if sequence is None:
-        body = dump_items({section: [item]})
+        body = dump_items({section: [item]}, dumper=dumper)
         prefix = text if text.endswith("\n") or not text else text + "\n"
         return prefix + body
     if not isinstance(sequence, yaml.SequenceNode) or sequence.flow_style:
@@ -121,7 +146,7 @@ def append_item(text: str, section: str, item: Any) -> str | None:
         return None
     indent = dash - line_start
     end = before_trailing_blanks(text, block_end(text, line_start, indent))
-    rendered = dump_items([item], indent)
+    rendered = dump_items([item], indent, dumper)
     head = text[:end]
     if head and not head.endswith("\n"):
         head += "\n"

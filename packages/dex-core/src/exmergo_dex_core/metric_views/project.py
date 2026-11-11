@@ -11,13 +11,17 @@ read while it is configured.
 It implements :class:`~..semantic_source.SemanticCatalogSource` for the read
 catalog and :class:`~..semantic_source.SemanticSnapshotSource` for the drift
 fingerprint, plus the declaration channel (`declared_definitions()`) that carries
-declared keys and joins to exploration. Authoring (`semantic databricks`, #1258)
-and the vendor schema axis (#1259) are later releases.
+declared keys and joins to exploration. It is also a
+:class:`~..edits.SemanticEditTarget`, which `semantic databricks
+define|update|plan` authors through (:mod:`.authoring`, #1258), and a
+:class:`~..semantic_source.SemanticDerivationSource`, which turns a declared dbt
+mart into a Metric View and annotates an existing one (:mod:`.derivation`). The
+vendor schema axis (#1259) is a later release.
 
-**Static, and never deploying.** dex reads the Metric View YAML bodies committed
-here. Nothing in this module opens a Databricks connection, reads what a
-workspace has deployed, or runs ``CREATE VIEW ... WITH METRICS``, and reading
-never writes a file.
+**Static, and never deploying.** dex reads and writes the Metric View YAML bodies
+committed here. Nothing in this module opens a Databricks connection, reads what
+a workspace has deployed, or runs ``CREATE VIEW ... WITH METRICS``; reading never
+writes a file, and authoring writes only through a stored plan.
 
 Nothing here imports sqlglot. :mod:`.lineage`, which does, is imported on first
 read, by a source that :func:`.dependency.ensure_available` let construct.
@@ -26,12 +30,13 @@ read, by a source that :func:`.dependency.ensure_available` let construct.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..errors import ConfigurationError, ProjectError, RepoRootRequiredError
 from .dependency import MetricViewDependencyError, ensure_available
 
 if TYPE_CHECKING:
+    from ..edits import ApplyResult, SemanticDocumentView, SemanticEditValidation
     from ..maintain.snapshot import SemanticLayerSnapshot
     from ..project_definitions import ProjectDefinitions
     from ..semantic_catalog import SemanticCatalogView
@@ -183,6 +188,70 @@ class MetricViewSemanticLayer:
                 notes=[f"Metric View files could not be read: {exc}"]
             )
         return snapshot_mod.semantic_layer(loaded, resolved)
+
+    # --- native semantic-document authoring (#1258) ----------------------------
+
+    def semantic_edit_view(self) -> SemanticDocumentView:
+        """The configured files' bytes and hashes, keyed as configured."""
+
+        from .authoring import load_edit_view
+
+        return load_edit_view(self)
+
+    def semantic_editing_surface(self) -> list[str]:
+        """Exactly the configured files, relative to the repository.
+
+        No directory is listed, so nothing beside a configured file is inside
+        the surface.
+        """
+
+        from .authoring import editing_surface
+
+        return editing_surface(self)
+
+    def write_semantic_edits(
+        self, edits: Any, *, confirmed: bool = False
+    ) -> ApplyResult:
+        """Write the authored bytes, all or none, refusing a stale pin."""
+
+        from .authoring import write_edits
+
+        return write_edits(self, list(edits), confirmed=confirmed)
+
+    def validate_semantic_edits(
+        self, edits: Any, mode: str, *, cache: Any = None
+    ) -> SemanticEditValidation:
+        """Validate the files these edits would leave, as the reader reads them.
+
+        ``cache`` is accepted and not read: grounding authored views against the
+        warehouse is `maintain`'s job, not authoring's.
+        """
+
+        ensure_available()
+        from .authoring import validate_plan
+
+        return validate_plan(self, list(edits), mode)
+
+    # --- the derivation channel (#927, #1258) -----------------------------------
+
+    def declaration_models(self, documents: dict[str, str]) -> dict[str, set[str]]:
+        """Views in ``documents`` and the members each exposes (#1030)."""
+
+        from .derivation import declaration_models as _models
+
+        return _models(documents)
+
+    def derive_semantic(self, request: Any) -> Any:
+        """Declared marts as Metric View files; see :mod:`.derivation`.
+
+        Reads only the request and the configured files, and validates with the
+        checks authoring runs, so no workspace or warehouse is opened.
+        """
+
+        ensure_available()
+        from .derivation import derive
+
+        return derive(self, request)
 
     def _load(self) -> LoadResult:
         """This command's validated read of the configured files, memoized."""
