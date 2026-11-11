@@ -576,6 +576,20 @@ def test_a_filter_moved_into_the_cte_with_the_aggregate_is_the_same():
             ")\nselect k, n from c\n",
             "n",
         ),
+        # An aggregate-only CTE collapses the rows `count(*)` reads to one.
+        (
+            "select count(*) as n from {{ ref('stg_orders') }}\n",
+            "with a as (select max(price) as price from {{ ref('stg_orders') }}),\n"
+            "b as (select count(*) as n from a)\nselect n from b\n",
+            "n",
+        ),
+        # `unnest` in a select list turns one row into several.
+        (
+            "select count(*) as n from {{ ref('stg_orders') }}\n",
+            "with e as (select unnest(items) as item from {{ ref('stg_orders') }}),\n"
+            "c as (select count(*) as n from e)\nselect n from c\n",
+            "n",
+        ),
     ],
 )
 def test_a_moved_calculation_that_differs_is_not_the_same(prior, authored, column):

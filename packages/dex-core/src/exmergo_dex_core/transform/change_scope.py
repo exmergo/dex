@@ -72,6 +72,15 @@ JUDGED = frozenset(
 )
 
 _NULL_FUNCTIONS = ("coalesce", "ifnull", "nvl", "nullif", "nvl2", "zeroifnull")
+# Functions that turn one row into several when they sit in a select list
+# (`select unnest(items)`; `generate_series` does in Postgres).
+_ROW_EXPANDING = (
+    exp.Explode,
+    exp.ExplodeOuter,
+    exp.Unnest,
+    exp.Inline,
+    exp.GenerateSeries,
+)
 
 
 class ScopeChange(BaseModel):
@@ -592,7 +601,8 @@ def _row_shape(
     subquery, a ``USING`` or ``NATURAL`` join, a ``GROUP BY ALL``, ``CUBE``,
     ``ROLLUP`` or ``GROUPING SETS``, a name that is also a projection alias
     for something else, an ordinal beside a star, a ``DISTINCT ON``, a
-    ``DISTINCT`` over a star, or a table or CTE read more than once.
+    ``DISTINCT`` over a star, a table or CTE read more than once, or an
+    aggregate or ``HAVING`` in a select the trace does not compute in.
 
     Columns are compared as the tables they read, and columns an inner join
     or WHERE equates are one: grouping by ``p.project_id`` and by a CTE's
@@ -701,6 +711,12 @@ def _row_shape(
             ]
         if any(select is s for s in aggregating):
             at_aggregate[id(select)] = tuple(tuple(sorted(v)) for v in stage.values())
+        elif stage["having"] or any(
+            p.find(exp.AggFunc) is not None for p in select.expressions
+        ):
+            # An aggregate the trace does not read still collapses the rows it
+            # passes on: `select max(x) from t` feeds `count(*)` one row.
+            unresolved.append(select)
         else:
             elsewhere.update((clause, k) for clause, ks in stage.items() for k in ks)
         distinct = select.args.get("distinct")
@@ -790,9 +806,10 @@ def _feeding(
     reads anything but tables and the CTEs it can see (a derived table,
     ``VALUES``, an ``UNNEST``, a nested ``WITH``'s own CTE, a CTE defined
     after it), joins with an outer join, limits or samples its rows, is a set
-    operation, or holds something whose result depends on where a filter
-    sits or on row order: a window function, a ``QUALIFY``, or an ``ORDER
-    BY`` in a CTE (an ordered aggregate downstream reads it)."""
+    operation, expands rows in its select list (``unnest``), or holds
+    something whose result depends on where a filter sits or on row order: a
+    window function, a ``QUALIFY``, or an ``ORDER BY`` in a CTE (an ordered
+    aggregate downstream reads it)."""
 
     main = ctes.get(sql_shape.MAIN_SCOPE)
     found: list[exp.Select] = []
@@ -808,7 +825,9 @@ def _feeding(
             return None
         if select is not main and select.args.get("order"):
             return None
-        if any(p.find(exp.Window) is not None for p in select.expressions):
+        if any(
+            p.find(exp.Window, *_ROW_EXPANDING) is not None for p in select.expressions
+        ):
             return None
         if any(join.side for join in select.args.get("joins") or []):
             return None
