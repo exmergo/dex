@@ -25,7 +25,9 @@ logic.
   SLayer renders its own `query` and `values`. `[cube]` follows the same
   `semantic.vendor` read for the same commands where the vendor is `cube`, is
   always taken by `semantic cube`, and a
-  Cube `query` or `values` never takes `[semantic]` either. A repo that runs
+  Cube `query` or `values` never takes `[semantic]` either. `[metric-views]`
+  follows the same read where the vendor is `databricks`, and never takes
+  `[semantic]`. A repo that runs
   neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
@@ -1882,6 +1884,29 @@ schema axis holds each member's columns and type to dex's own metadata, whose
 removals `maintain reconcile` plans through the `semantic cube update` route. `semantic cube define|update|plan` authors the files, and a
 declared dbt mart derives a cube of its own (see `transform plan` above). Selecting the vendor without the `[cube]` extra (the dialect
 engine) refuses and names it. See `references/semantic-layer.md`.
+
+**`vendor: databricks` reads Databricks Metric View files from the repository**,
+the exact paths named in `semantic.databricks.files`, statically and with no
+Databricks package and no workspace connection; dex never deploys a view. Each
+file is one Metric View YAML body (the document `CREATE VIEW ... WITH METRICS
+LANGUAGE YAML` holds), named after its stem; a `.sql` file is refused by name.
+Each body is validated by dex's own port of the Metric View YAML 1.1 rules, with
+YAML 1.2 booleans so a bare `on:` key stays text, a version other than `1.1`
+refused by name, and every refusal naming the file and the element. `list`
+answers. Each view is a semantic model on the relation its `source` names (or a
+plain single-table projection query), each field a dimension keyed `view.field`,
+each single-aggregate measure a measure and a `simple` metric, `MEASURE(a) /
+MEASURE(b)` a `ratio` and any other composition `derived`, with the view's
+`filter` on every metric. A metric is groupable by its own view's fields, so
+`--for-dimension` answers. Entities and time grains are declared `unavailable`;
+each join's key pairs and arity, and each `rely.at_most_one_match` key on the
+joined table, reach `explore` through the declaration channel at confidence 1.0.
+`query` and `values` refuse by name until #964, `values` after the PII gate.
+`maintain snapshot` records `vendor: databricks` and `format_version: 1.1`, and
+the layer-neutral axes read it: definition drift on the semantic axis, each `rely`
+key and join arity on the grain axis. Selecting the vendor without the
+`[metric-views]` extra (the dialect engine) refuses and names it. See
+[Databricks Metric View compatibility](databricks-metric-views-compatibility.md).
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than

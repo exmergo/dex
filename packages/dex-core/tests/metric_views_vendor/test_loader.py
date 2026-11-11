@@ -1,0 +1,506 @@
+"""Dex's port of the Metric View YAML 1.1 rules, and how the loader applies them.
+
+Each refusal names the file and the element, and a refused element leaves the
+rest of its view readable; a refusal of what the whole view rests on (its
+version, source, parameters, materialization) leaves the view out.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+pytest.importorskip("sqlglot")
+
+import yaml
+
+from exmergo_dex_core.metric_views.loader import (
+    ERROR,
+    WARNING,
+    load_files,
+    validate_view_contents,
+)
+from exmergo_dex_core.metric_views.validator import RULES, derived_name
+
+from .conftest import ORDERS, view, write
+
+
+def _load(body: dict[str, Any] | str, name: str = "views/orders.yaml"):
+    text = body if isinstance(body, str) else yaml.safe_dump(body, sort_keys=False)
+    return validate_view_contents({name: text})
+
+
+def _rules(result) -> dict[str, str]:
+    return {d.rule: d.severity for d in result.diagnostics}
+
+
+def _field(**entry: Any) -> dict[str, Any]:
+    return view(fields=[{"name": "x", "expr": "x", **entry}])
+
+
+def _measure(**entry: Any) -> dict[str, Any]:
+    return view(measures=[{"name": "m", "expr": "SUM(x)", **entry}])
+
+
+def _join(**entry: Any) -> dict[str, Any]:
+    body = {"name": "c", "source": "demo.main.c", "on": "source.a = c.a", **entry}
+    return view(joins=[body], fields=[{"name": "x", "expr": "x"}])
+
+
+def test_the_reference_star_reads_with_no_error():
+    result = _load(ORDERS)
+
+    assert result.errors == []
+    (orders,) = result.views
+    assert orders.name == "orders"
+    assert [j.dotted for j in orders.all_joins()] == [
+        "customer",
+        "lines",
+        "customer.nation",
+    ]
+    assert len(orders.fields) == 6 and len(orders.measures) == 7
+
+
+@pytest.mark.parametrize(
+    ("body", "rule"),
+    [
+        ({"source": "a.b.c", "fields": [{"name": "x", "expr": "x"}]}, "version"),
+        (view(fields=[{"name": "x", "expr": "x"}]) | {"version": 0.1}, "version"),
+        (view(fields=[{"name": "x", "expr": "x"}]) | {"version": "1.2"}, "version"),
+        ({"version": 1.1, "fields": [{"name": "x", "expr": "x"}]}, "source"),
+        (view(), "empty_view"),
+        (
+            _field()
+            | {
+                "parameters": [
+                    {"name": "a", "data_type": "int", "default": 1},
+                    {"name": "b", "data_type": "int"},
+                ]
+            },
+            "parameter_default_order",
+        ),
+        (_field() | {"parameters": [{"name": "a"}]}, "parameters"),
+        (
+            _field()
+            | {"materialization": {"mode": "strict", "materialized_views": []}},
+            "materialization",
+        ),
+        (
+            _field()
+            | {
+                "materialization": {
+                    "mode": "relaxed",
+                    "materialized_views": [
+                        {"name": "a", "type": "unaggregated"},
+                        {"name": "b", "type": "unaggregated"},
+                    ],
+                }
+            },
+            "materialization",
+        ),
+        ("- just\n- a list\n", "root"),
+    ],
+)
+def test_a_view_level_refusal_leaves_the_view_out(body, rule):
+    result = _load(body)
+
+    assert result.views == []
+    assert _rules(result).get(rule) == ERROR
+    assert all(d.file == "views/orders.yaml" for d in result.diagnostics)
+
+
+def test_the_version_refusal_names_the_version_and_the_way_up():
+    result = _load(_field() | {"version": 0.1})
+    (message,) = [d.message for d in result.errors]
+
+    assert "0.1" in message and "1.1" in message and "ALTER VIEW" in message
+
+
+@pytest.mark.parametrize(
+    ("body", "rule"),
+    [
+        (_field(display_name="x" * 256), "display_name"),
+        (_field(synonyms=[f"s{i}" for i in range(11)]), "synonyms"),
+        (_field(synonyms="one"), "synonyms"),
+        (_field(format={"type": "colour"}), "format"),
+        (_field(format={"type": "currency"}), "format"),
+        (
+            _field(format={"type": "number", "decimal_places": {"type": "max"}}),
+            "format",
+        ),
+        (
+            _field(
+                format={
+                    "type": "date_time",
+                    "date_format": "no_date",
+                    "time_format": "no_time",
+                }
+            ),
+            "format",
+        ),
+        (_field(name=""), "empty_name"),
+        (_measure(window=[{"order": "d", "range": "fortnightly"}]), "window"),
+        (_measure(window=[{"range": "cumulative"}]), "window"),
+        (
+            _measure(window=[{"order": "d", "range": "current", "offset": "2 weeks"}]),
+            "window",
+        ),
+        (
+            _measure(partition={"include": ["x"], "outer_aggregate": "MODE"}),
+            "partition",
+        ),
+        (
+            _measure(
+                window=[{"order": "d", "range": "cumulative"}],
+                partition={"include": ["x"], "outer_aggregate": "SUM"},
+            ),
+            "window_and_partition",
+        ),
+    ],
+)
+def test_a_member_refusal_keeps_the_rest_of_the_view(body, rule):
+    body.setdefault("fields", []).append({"name": "kept", "expr": "kept"})
+    result = _load(body)
+
+    assert _rules(result).get(rule) == ERROR
+    (only,) = result.views
+    assert [f.name for f in only.fields] == ["kept"]
+    assert only.measures == ()
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "trailing 7 day",
+        "leading 3 month inclusive",
+        "trailing 30 exclusive",
+        "trailing days_back day",
+        "current",
+        "cumulative",
+        "all",
+    ],
+)
+def test_every_documented_window_range_reads(expr):
+    result = _load(
+        _measure(window=[{"order": "d", "range": expr, "offset": "-1 month"}])
+    )
+
+    assert result.errors == []
+
+
+def test_names_are_unique_across_fields_and_measures_ignoring_case():
+    result = _load(
+        view(
+            fields=[{"name": "Revenue", "expr": "x"}],
+            measures=[{"name": "revenue", "expr": "SUM(x)"}],
+        )
+    )
+
+    assert _rules(result)["duplicate_name"] == ERROR
+    (only,) = result.views
+    assert [f.name for f in only.fields] == ["Revenue"] and only.measures == ()
+
+
+@pytest.mark.parametrize(
+    ("entry", "rule"),
+    [
+        ({"on": None}, "join_condition"),
+        ({"on": None, "using": []}, "join_condition"),
+        ({"cardinality": "many_to_many"}, "cardinality"),
+        ({"rely": {"at_most_one_match": "yes"}}, "rely"),
+        ({"name": "source"}, "join"),
+        ({"name": "has space"}, "join"),
+        ({"source": ""}, "join"),
+    ],
+)
+def test_a_malformed_join_is_refused_by_name(entry, rule):
+    body = _join(**entry)
+    if entry.get("on", "") is None:
+        del body["joins"][0]["on"]
+    result = _load(body)
+
+    assert _rules(result).get(rule) == ERROR
+    (only,) = result.views
+    assert only.joins == ()
+
+
+def test_a_nested_join_keeps_its_parents_cardinality():
+    body = _join(
+        cardinality="one_to_many",
+        joins=[{"name": "d", "source": "demo.main.d", "using": ["k"]}],
+    )
+    result = _load(body)
+
+    assert _rules(result)["cardinality_mix"] == ERROR
+    (only,) = result.views
+    assert [j.dotted for j in only.all_joins()] == ["c"]
+
+
+def test_sibling_joins_need_distinct_names():
+    body = view(
+        joins=[
+            {"name": "c", "source": "demo.main.c", "using": ["a"]},
+            {"name": "C", "source": "demo.main.d", "using": ["a"]},
+        ],
+        fields=[{"name": "x", "expr": "x"}],
+    )
+    result = _load(body)
+
+    assert _rules(result)["duplicate_join"] == ERROR
+    assert [j.name for j in result.views[0].joins] == ["c"]
+
+
+def test_on_beside_using_warns_and_on_wins():
+    result = _load(_join(using=["a"]))
+
+    assert _rules(result)["on_and_using"] == WARNING
+    (join,) = result.views[0].joins
+    assert join.on and join.using is None
+
+
+def test_a_field_cannot_read_a_one_to_many_join():
+    body = _join(cardinality="one_to_many")
+    body["fields"].append({"name": "y", "expr": "c.y"})
+    body["measures"] = [{"name": "total", "expr": "SUM(c.y)"}]
+    result = _load(body)
+
+    assert _rules(result)["one_to_many_field"] == ERROR
+    (only,) = result.views
+    assert [f.name for f in only.fields] == ["x"]
+    assert [m.name for m in only.measures] == ["total"]
+
+
+def test_measure_references_resolve_and_a_refusal_retracts_its_readers():
+    body = view(
+        measures=[
+            {"name": "a", "expr": "MEASURE(missing) + 1"},
+            {"name": "b", "expr": "MEASURE(a) * 2"},
+            {"name": "c", "expr": "MEASURE(c)"},
+            {"name": "d", "expr": "SUM(x)"},
+            {"name": "e", "expr": "MEASURE(D) / 2"},
+        ]
+    )
+    result = _load(body)
+
+    refused = {d.element for d in result.errors}
+    assert refused == {"measures['a']", "measures['b']", "measures['c']"}
+    assert {d.rule for d in result.errors} == {"unknown_measure", "measure_cycle"}
+    assert [m.name for m in result.views[0].measures] == ["d", "e"]
+
+
+def test_an_unknown_key_warns_and_reads_on():
+    body = _field(colour="red") | {"owner": "me"}
+    result = _load(body)
+
+    assert _rules(result) == {"unknown_key": WARNING}
+    assert result.views[0].fields[0].name == "x"
+
+
+def test_a_wildcard_is_named_and_never_expanded():
+    body = view(
+        fields=[
+            {"expr": "source.*"},
+            {"expr": "c.* EXCEPT (a, b)"},
+            {"name": "x", "expr": "x"},
+        ]
+    )
+    result = _load(body)
+
+    (only,) = result.views
+    assert [w.expr for w in only.wildcards] == ["source.*", "c.* EXCEPT (a, b)"]
+    assert [f.name for f in only.fields] == ["x"]
+    assert _rules(result)["wildcard"] == WARNING
+
+
+def test_a_wildcard_takes_no_metadata():
+    result = _load(
+        view(fields=[{"name": "all", "expr": "source.*"}, {"name": "x", "expr": "x"}])
+    )
+
+    assert _rules(result)["wildcard_metadata"] == ERROR
+
+
+@pytest.mark.parametrize(
+    ("expr", "name"),
+    [
+        ("o_orderkey", "o_orderkey"),
+        ("customer.nation.n_name", "n_name"),
+        ("CAST(source.amount AS DECIMAL(10, 2))", "amount"),
+        ("SUM(a + b)", "SUM(a+b)"),
+    ],
+)
+def test_a_missing_name_is_derived_the_way_databricks_derives_it(expr, name):
+    assert derived_name(expr) == name
+    result = _load(view(fields=[{"expr": expr}]))
+    assert result.views[0].fields[0].name == name
+    assert result.views[0].fields[0].derived_name
+    assert _rules(result)["derived_name"] == WARNING
+
+
+def test_yaml_1_2_booleans_keep_a_bare_on_key():
+    """YAML 1.1 reads `on:` as True; Databricks does not, and neither does dex."""
+
+    text = (
+        "version: 1.1\nsource: demo.main.orders\n"
+        "joins:\n  - name: c\n    source: demo.main.c\n    on: source.a = c.a\n"
+        "fields:\n  - name: x\n    expr: x\n"
+    )
+    result = _load(text)
+
+    assert result.errors == []
+    assert result.views[0].joins[0].on == "source.a = c.a"
+
+
+def test_a_key_written_twice_is_refused():
+    result = _load("version: 1.1\nsource: a.b.c\nsource: d.e.f\nfields: []\n")
+
+    assert result.views == []
+    assert _rules(result) == {"malformed": ERROR}
+    assert "written twice" in result.diagnostics[0].message
+
+
+def test_dimensions_is_read_as_the_older_spelling_of_fields():
+    result = _load(view(dimensions=[{"name": "x", "expr": "x"}]))
+
+    assert result.errors == []
+    assert result.views[0].fields_key == "dimensions"
+    assert result.views[0].fields[0].name == "x"
+
+
+def test_every_rule_is_in_the_table_with_a_severity():
+    assert set(RULES.values()) == {ERROR, WARNING}
+
+
+def test_a_missing_file_and_one_outside_the_repository_are_named(tmp_path: Path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.yaml"
+    outside.write_text(yaml.safe_dump(ORDERS), encoding="utf-8")
+    (tmp_path / "views").mkdir()
+    (tmp_path / "views" / "escape.yaml").symlink_to(outside)
+
+    result = load_files(tmp_path, ["views/missing.yaml", "views/escape.yaml"])
+
+    assert {(d.file, d.rule) for d in result.diagnostics} == {
+        ("views/missing.yaml", "missing"),
+        ("views/escape.yaml", "confinement"),
+    }
+    assert result.views == []
+
+
+def test_reading_writes_nothing(tmp_path: Path):
+    write(tmp_path, "views/orders.yaml", ORDERS)
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+
+    load_files(tmp_path, ["views/orders.yaml"])
+
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+
+
+def test_a_key_that_is_not_text_is_refused_naming_the_on_rewrite():
+    """What PyYAML's `safe_load` then `safe_dump` leaves of a join: `true:`."""
+
+    text = (
+        "version: 1.1\nsource: demo.main.orders\n"
+        "joins:\n  - name: c\n    source: demo.main.c\n    true: source.a = c.a\n"
+        "fields:\n  - name: x\n    expr: x\n"
+    )
+    result = _load(text)
+
+    assert result.views == []
+    (diagnostic,) = result.diagnostics
+    assert diagnostic.rule == "malformed"
+    assert "`on:`" in diagnostic.message
+
+
+def test_with_fields_and_dimensions_both_written_dimensions_is_read():
+    """What Databricks does (checked against CREATE VIEW ... WITH METRICS: the
+    view's columns are the `dimensions` ones), and what the converter does."""
+
+    result = _load(
+        view(
+            fields=[{"name": "x", "expr": "x"}],
+            dimensions=[{"name": "y", "expr": "y"}],
+        )
+    )
+
+    assert _rules(result) == {"fields_and_dimensions": WARNING}
+    (only,) = result.views
+    assert [f.name for f in only.fields] == ["y"]
+    assert only.fields_key == "dimensions"
+
+
+def test_a_measure_reads_only_the_measures_before_it():
+    result = _load(
+        view(
+            measures=[
+                {"name": "ratio", "expr": "MEASURE(revenue) / MEASURE(qty)"},
+                {"name": "revenue", "expr": "SUM(price)"},
+                {"name": "qty", "expr": "SUM(quantity)"},
+                {"name": "aov", "expr": "MEASURE(revenue) / MEASURE(qty)"},
+            ]
+        )
+    )
+
+    assert {(d.element, d.rule) for d in result.errors} == {
+        ("measures['ratio']", "forward_measure")
+    }
+    assert [m.name for m in result.views[0].measures] == ["revenue", "qty", "aov"]
+
+
+def test_a_field_reading_a_later_fields_name_warns():
+    result = _load(
+        view(
+            fields=[
+                {"name": "upper_mode", "expr": "UPPER(mode)"},
+                {"name": "mode", "expr": "l_shipmode"},
+                {"name": "lower_mode", "expr": "LOWER(mode)"},
+            ]
+        )
+    )
+
+    assert {(d.element, d.rule) for d in result.diagnostics} == {
+        ("fields['upper_mode']", "forward_field")
+    }
+    assert len(result.views[0].fields) == 3
+
+
+def test_a_filter_reading_a_fields_name_warns():
+    result = _load(
+        view(filter="mode != 'AIR'", fields=[{"name": "mode", "expr": "l_shipmode"}])
+    )
+
+    assert _rules(result) == {"filter_reads_field": WARNING}
+
+
+def test_a_nested_join_is_read_through_its_whole_path():
+    body = view(
+        joins=[
+            {
+                "name": "orders",
+                "source": "demo.main.orders",
+                "on": "source.order_id = orders.order_id",
+                "joins": [
+                    {
+                        "name": "customer",
+                        "source": "demo.main.customers",
+                        "on": "orders.customer_id = customer.id",
+                    }
+                ],
+            }
+        ],
+        fields=[
+            {"name": "seg", "expr": "customer.segment"},
+            {"name": "seg_ok", "expr": "orders.customer.segment"},
+        ],
+        measures=[{"name": "n", "expr": "COUNT(DISTINCT customer.id)"}],
+    )
+    result = _load(body)
+
+    refused = {(d.element, d.rule) for d in result.errors}
+    assert refused == {
+        ("fields['seg']", "nested_join_path"),
+        ("measures['n']", "nested_join_path"),
+    }
+    assert "orders.customer.segment" in result.errors[0].message
+    assert [f.name for f in result.views[0].fields] == ["seg_ok"]
