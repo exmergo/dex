@@ -462,6 +462,31 @@ def test_a_query_sources_own_alias_is_not_a_dropped_column(tmp_path, capsys):
     ]
 
 
+def test_a_projection_read_named_like_its_alias_is_still_a_read(tmp_path, capsys):
+    """`old AS old` reads the table's `old`; losing it breaks the source."""
+
+    _sql(
+        tmp_path,
+        "CREATE TABLE orders (old VARCHAR, n INTEGER)",
+        "INSERT INTO orders VALUES ('a', 1)",
+    )
+    root = repo(
+        tmp_path,
+        orders=view(
+            "SELECT old AS old, n FROM demo.main.orders",
+            measures=[{"name": "c", "expr": "COUNT(1)"}],
+        ),
+        config="duckdb:\n  path: demo.duckdb\n",
+    )
+    assert _run_ok(root, "explore", "map")
+    assert _run_ok(root, "maintain", "snapshot")
+
+    findings = _drift(capsys, root, "ALTER TABLE orders DROP COLUMN old")
+
+    (finding,) = findings
+    assert (finding["data"]["element"], finding["column"]) == ("source", "old")
+
+
 def test_a_removal_that_empties_the_view_is_advisory(tmp_path, capsys):
     _sql(
         tmp_path,
@@ -614,6 +639,7 @@ def test_a_view_resaved_in_another_spec_version_is_a_format_change(warehouse, ca
         f["code"] == "definition_changed" and "people" in json.dumps(f)
         for f in findings
     ), "the other view is still compared by content"
+    assert "Restore `version: 1.1`" in changed["detail"], "not re-pin an unread view"
 
 
 def test_a_version_written_1_10_is_not_read_as_1_1(tmp_path):
@@ -691,3 +717,53 @@ def test_a_contradicted_rely_key_is_worded_as_the_views_claim(tmp_path, capsys):
     ]
     assert "rely.at_most_one_match" in proposal["action"]
     assert "the project asserts" not in proposal["action"]
+
+
+def test_a_project_grain_and_a_rely_key_on_the_same_columns_are_both_named():
+    """Neither claim stands in for the other: the `rely` one leads, since a
+    query trusts it silently, and the project's grain is named beside it."""
+
+    from exmergo_dex_core.maintain import drift
+    from exmergo_dex_core.maintain.snapshot import (
+        SemanticLayerSnapshot,
+        SemanticModelDef,
+    )
+    from exmergo_dex_core.project_definitions import (
+        DeclaredCompositeKey,
+        ProjectDefinitions,
+    )
+
+    known = ["demo.main.customers"]
+    origins: dict = {}
+    definitions = ProjectDefinitions(
+        present=True,
+        declared_composite_keys=[
+            DeclaredCompositeKey(
+                model="customers",
+                relation="demo.main.customers",
+                columns=["customer_key", "region"],
+                source="yaml",
+            )
+        ],
+    )
+    by_identifier, _ = drift._declared_composites(definitions, known, None, origins)
+    semantic = SemanticLayerSnapshot(
+        vendor="databricks",
+        relationships_and_keys_captured=True,
+        semantic_models=[
+            SemanticModelDef(
+                name="orders.customer",
+                path="views/orders.yaml",
+                content_sha256="x",
+                relation="demo.main.customers",
+                keys=[["region", "customer_key"]],
+            )
+        ],
+    )
+    drift._fold_semantic_keys(by_identifier, [], semantic, known, None, origins)
+
+    (claims,) = origins.values()
+    assert {(c[0], c[1]) for c in claims} == {
+        ("yaml", "combination"),
+        ("databricks", "unique"),
+    }

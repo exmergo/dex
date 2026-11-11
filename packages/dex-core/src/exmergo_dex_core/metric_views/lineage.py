@@ -41,7 +41,7 @@ __all__ = [
     "measure_refs",
     "over_own_columns",
     "plain_column",
-    "query_aliases",
+    "query_columns",
     "ratio_sides",
     "source_relation",
 ]
@@ -234,16 +234,43 @@ def is_query(source: str) -> bool:
     return bool(_QUERY.match(source))
 
 
-def query_aliases(source: str) -> list[str]:
-    """The output aliases a query ``source`` names in its select list, whose
-    later mentions (``ORDER BY s``) are not columns of its table."""
+def query_columns(source: str) -> list[str] | None:
+    """The physical columns a query ``source`` reads, or None where it does not
+    parse.
+
+    A column in the select list or ``WHERE`` is a read of the table even when an
+    alias shares its name (``old AS old``). An unqualified name in ``ORDER BY``,
+    ``GROUP BY`` or ``HAVING`` that the select list names as an alias is that
+    alias, not a column (``status AS s ... ORDER BY s``).
+    """
 
     tree = _parse(source)
-    while isinstance(tree, exp.Subquery):
-        tree = tree.this
-    if not isinstance(tree, exp.Select):
-        return []
-    return [p.alias for p in tree.expressions if isinstance(p, exp.Alias) and p.alias]
+    if tree is None:
+        return None
+    select = tree
+    while isinstance(select, exp.Subquery):
+        select = select.this
+    aliases = (
+        {
+            p.alias.lower()
+            for p in select.expressions
+            if isinstance(p, exp.Alias) and p.alias
+        }
+        if isinstance(select, exp.Select)
+        else set()
+    )
+    later = (exp.Order, exp.Group, exp.Having)
+    found: list[str] = []
+    for node in tree.find_all(exp.Column):
+        name = node.name
+        if (
+            not node.table
+            and name.lower() in aliases
+            and node.find_ancestor(*later) is not None
+        ):
+            continue
+        found.append(name)
+    return found
 
 
 def source_relation(source: str) -> SourceRelation:

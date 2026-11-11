@@ -411,15 +411,9 @@ def _query_columns_missing(source: str, live: _Live, lineage: Any) -> str | None
 
     if not lineage.is_query(source):
         return None
-    refs = lineage.column_refs(source)
-    # An output alias the query itself names (`ORDER BY s` for `status AS s`)
-    # is not a column of the table.
-    aliases = {a.lower() for a in lineage.query_aliases(source)}
-    for ref in refs or ():
-        if not ref.qualifier and ref.column.lower() in aliases:
-            continue
-        if live.find(ref.column) is None:
-            return ref.column
+    for column in lineage.query_columns(source) or ():
+        if live.find(column) is None:
+            return column
     return None
 
 

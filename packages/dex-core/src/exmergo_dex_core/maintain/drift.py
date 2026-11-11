@@ -1066,7 +1066,7 @@ class GrainPlan(NamedTuple):
     # (a Metric View's ``rely.at_most_one_match`` is the second, #1259).
     # Defaulted for the same reason as above.
     declared_origins: (
-        dict[tuple[str, frozenset[str]], tuple[str, str, tuple[str, ...]]] | None
+        dict[tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]] | None
     ) = None
 
     def scans(self) -> bool:
@@ -1179,7 +1179,9 @@ def grain_plan(
             described[identifier] = ({c.name for c in columns}, meta.row_count)
         return described[identifier]
 
-    origins: dict[tuple[str, frozenset[str]], tuple[str, str, tuple[str, ...]]] = {}
+    origins: dict[
+        tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]
+    ] = {}
     declared_by_identifier, notes = _declared_composites(
         definitions, sorted(current), scope, origins
     )
@@ -1450,7 +1452,7 @@ def _fold_semantic_keys(
     known: list[str],
     scope: set[str] | None,
     origins: (
-        dict[tuple[str, frozenset[str]], tuple[str, str, tuple[str, ...]]] | None
+        dict[tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]] | None
     ) = None,
 ) -> None:
     """Add the keys a semantic layer declares to the declared-grain survey.
@@ -1491,13 +1493,20 @@ def _fold_semantic_keys(
             # A Metric View fingerprints only `rely` keys; every other native
             # layer's keys are its primary keys. Every model declaring the
             # combination is kept, so each claim can be found.
+            # A project grain on the same columns is a separate claim, kept
+            # beside this one rather than standing in for it.
             claim = "unique" if semantic.vendor == "databricks" else "primary"
-            key = (identifier, frozenset(c.lower() for c in combo))
-            source, kind, models = origins.get(
-                key, (semantic.vendor or "semantic", claim, ())
+            source = semantic.vendor or "semantic"
+            claims = origins.setdefault(
+                (identifier, frozenset(c.lower() for c in combo)), []
             )
-            if sm.name not in models:
-                origins[key] = (source, kind, (*models, sm.name))
+            index = next(
+                (i for i, c in enumerate(claims) if c[:2] == (source, claim)), None
+            )
+            if index is None:
+                claims.append((source, claim, (sm.name,)))
+            elif sm.name not in claims[index][2]:
+                claims[index] = (source, claim, (*claims[index][2], sm.name))
 
 
 def _join_cardinality_checks(
@@ -1773,7 +1782,7 @@ def _declared_composites(
     known: list[str],
     scope: set[str] | None,
     origins: (
-        dict[tuple[str, frozenset[str]], tuple[str, str, tuple[str, ...]]] | None
+        dict[tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]] | None
     ) = None,
 ) -> tuple[dict[str, list[list[str]]], list[str]]:
     """Declared composite grains keyed by warehouse identifier, and what could
@@ -1815,8 +1824,8 @@ def _declared_composites(
             if origins is not None:
                 origins.setdefault(
                     (identifier, frozenset(c.lower() for c in composite.columns)),
-                    (composite.source, composite.claim, (composite.model,)),
-                )
+                    [],
+                ).append((composite.source, composite.claim, (composite.model,)))
     return by_identifier, notes
 
 
@@ -2412,11 +2421,19 @@ def grain_drift(
             members = ", ".join(combo)
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             joins = _joins_on(plan, dataset.identifier, combo)
-            found = (plan.declared_origins or {}).get(
+            claims = (plan.declared_origins or {}).get(
                 (dataset.identifier, frozenset(c.lower() for c in combo))
-            )
+            ) or []
+            # A semantic claim leads where there is one: it is the one a query
+            # silently trusts; the project's grain is named beside it.
+            claims = sorted(claims, key=lambda c: c[1] == "combination")
+            found = claims[0] if claims else None
             origin = found[:2] if found else None
             declared_on = list(found[2]) if found else []
+            also = [
+                _declared_claim(c[:2], members, dataset.identifier, list(c[2]))
+                for c in claims[1:]
+            ]
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -2428,6 +2445,7 @@ def grain_drift(
                         _declared_claim(
                             origin, members, dataset.identifier, declared_on
                         )
+                        + "".join(f"; also, {a}" for a in also)
                         + f", and the combination is not "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows). "
@@ -2446,6 +2464,14 @@ def grain_drift(
                                 "declared_by": origin[0],
                                 "claim": origin[1],
                                 "declared_on": declared_on,
+                                "claims": [
+                                    {
+                                        "declared_by": c[0],
+                                        "claim": c[1],
+                                        "declared_on": list(c[2]),
+                                    }
+                                    for c in claims
+                                ],
                             }
                             if origin
                             else {}
@@ -3160,8 +3186,15 @@ def _definition_version_changes(
                     if current.format_version and after[path] != current.format_version
                     else ""
                 )
-                + ". Re-run `maintain snapshot` once the move is the state you "
-                "vouch for"
+                + (
+                    f". Restore `version: {before[path]}`, or upgrade dex to a "
+                    "reader of that version, before re-running `maintain "
+                    "snapshot`: a baseline taken now would accept a definition "
+                    "dex does not read"
+                    if current.format_version and after[path] != current.format_version
+                    else ". Re-run `maintain snapshot` once the move is the state "
+                    "you vouch for"
+                )
             ),
             data={
                 "vendor": current.vendor,

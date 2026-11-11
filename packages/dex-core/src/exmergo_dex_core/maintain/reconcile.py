@@ -481,6 +481,15 @@ def _advisory(
             "re-run `maintain snapshot --project-only` to accept it"
         ),
     }
+    if finding.code == "semantic_format_changed" and finding.data.get("path"):
+        actions["semantic_format_changed"] = (
+            f"{finding.data['path']} moved from format version "
+            f"{finding.data.get('format_version_before')} to "
+            f"{finding.data.get('format_version_after')}. If dex does not read "
+            "the new version, restore the old one or upgrade dex before "
+            "re-running `maintain snapshot`, since a baseline taken now accepts "
+            "a definition nothing checks"
+        )
     if finding.code == "declared_grain_not_unique" and (
         finding.data.get("claim") == "primary"
     ):
