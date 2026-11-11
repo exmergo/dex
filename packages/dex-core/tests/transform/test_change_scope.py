@@ -84,6 +84,270 @@ def test_a_rewritten_formula_is_listed_without_a_verdict():
     assert scope.undeclared == 0
 
 
+PARTS_PRIOR = (
+    "select p.project_id, count(*) as part_count, max(c.created_at) as last_part_at\n"
+    "from {{ ref('stg_projects') }} p\n"
+    "join {{ ref('stg_parts') }} c on c.project_id = p.project_id\n"
+    "group by p.project_id\n"
+)
+
+
+def _parts_moved(
+    count: str = "count(*)", final: str = "pa.part_count", spine: str = ""
+) -> str:
+    """The aggregates of PARTS_PRIOR extracted into a grouped CTE (#1253)."""
+    return (
+        "with parts as (\n"
+        f"  select project_id, {count} as part_count, max(created_at) as last_part_at\n"
+        "  from {{ ref('stg_parts') }} group by project_id\n"
+        f"){spine}\n"
+        f"select p.project_id, {final} as part_count, pa.last_part_at\n"
+        "from {{ ref('stg_projects') }} p\n"
+        f"join {'named' if spine else 'parts'} pa on pa.project_id = p.project_id\n"
+    )
+
+
+def _output_kinds(scope) -> list[tuple[str, str | None, str | None]]:
+    return [(c.kind, c.column, c.status) for c in scope.changes if c.axis == "output"]
+
+
+def test_an_aggregate_moved_into_a_cte_is_not_an_aggregate_change():
+    scope = _scope(_parts_moved(), prior=PARTS_PRIOR)
+    assert _output_kinds(scope) == [
+        ("expression_changed", "last_part_at", None),
+        ("expression_changed", "part_count", None),
+    ]
+    assert all(
+        "same calculation through a CTE" in c.detail
+        for c in scope.changes
+        if c.axis == "output"
+    )
+    # The move still changes the grouping and the join: those stay reported.
+    population = {c.kind for c in scope.changes if c.axis == "population"}
+    assert {"group_by_changed", "join_removed"} <= population
+
+
+def test_an_aggregate_is_traced_through_more_than_one_cte():
+    spine = ",\nnamed as (\n  select project_id, part_count, last_part_at from parts\n)"
+    scope = _scope(_parts_moved(spine=spine), prior=PARTS_PRIOR)
+    assert _output_kinds(scope) == [
+        ("expression_changed", "last_part_at", None),
+        ("expression_changed", "part_count", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    "count", ["count(part_id)", "count(distinct part_id)", "sum(1)"]
+)
+def test_an_aggregate_changed_while_it_moved_is_still_an_aggregate_change(count):
+    scope = _scope(_parts_moved(count=count), prior=PARTS_PRIOR)
+    assert ("aggregate_changed", "part_count", "undeclared") in _output_kinds(scope)
+    assert ("expression_changed", "last_part_at", None) in _output_kinds(scope)
+
+
+def test_a_coalesce_added_while_the_aggregate_moved_is_a_null_handling_change():
+    scope = _scope(_parts_moved(final="coalesce(pa.part_count, 0)"), prior=PARTS_PRIOR)
+    assert ("null_handling_changed", "part_count", "undeclared") in _output_kinds(scope)
+    assert not any(k == "aggregate_changed" for k, _, _ in _output_kinds(scope))
+
+
+def test_an_untraceable_column_is_not_taken_as_the_same_aggregate():
+    # `part_count` is unqualified over two relations, one of them a CTE, so
+    # which one it reads is a schema question: compared as written.
+    scope = _scope(_parts_moved(final="part_count"), prior=PARTS_PRIOR)
+    assert ("aggregate_changed", "part_count", "undeclared") in _output_kinds(scope)
+
+
+TOTAL_PRIOR = "select sum(price * quantity) as total from {{ ref('stg_orders') }}\n"
+
+
+def test_an_expression_traced_into_an_aggregate_needs_no_extra_parentheses():
+    moved = (
+        "with lines as (\n"
+        "  select price * quantity as subtotal from {{ ref('stg_orders') }}\n),\n"
+        "totals as (select sum(subtotal) as total from lines)\n"
+        "select total from totals\n"
+    )
+    scope = _scope(moved, prior=TOTAL_PRIOR)
+    assert _output_kinds(scope) == [("expression_changed", "total", None)]
+
+
+@pytest.mark.parametrize(
+    "authored",
+    [
+        # Columns renamed by position: `n` is the sum, not the count.
+        "with a(n, x) as (\n"
+        "  select sum(price) as x, count(*) as n from {{ ref('stg_orders') }}\n"
+        ")\nselect n from a\n",
+        # The same through a relation alias's column list.
+        "with a as (\n"
+        "  select sum(price) as x, count(*) as n from {{ ref('stg_orders') }}\n"
+        ")\nselect t.n from a as t(n, x)\n",
+        # A nested WITH shadows the top-level `a` inside `b`.
+        "with a as (select count(*) as n from {{ ref('stg_orders') }}),\n"
+        "b as (\n"
+        "  with a as (select sum(price) as n from {{ ref('stg_orders') }})\n"
+        "  select n from a\n"
+        ")\nselect n from b\n",
+    ],
+)
+def test_a_renamed_or_shadowed_cte_column_is_compared_as_written(authored):
+    prior = "select count(*) as n from {{ ref('stg_orders') }}\n"
+    scope = _scope(authored, prior=prior)
+    assert ("aggregate_changed", "n", "undeclared") in _output_kinds(scope)
+
+
+SUM_PRIOR = "select sum(price) as n from {{ ref('stg_orders') }}\n"
+
+
+@pytest.mark.parametrize(
+    "authored",
+    [
+        # A derived table renames `quantity` to `price` on the way in.
+        "with t as (\n"
+        "  select sum(s.price) as n\n"
+        "  from (select quantity as price from {{ ref('stg_orders') }}) as s\n"
+        ")\nselect n from t\n",
+        # A base relation's columns renamed by position.
+        "with t as (\n"
+        "  select sum(o.price) as n\n"
+        "  from {{ ref('stg_orders') }} as o(quantity, price)\n"
+        ")\nselect n from t\n",
+        # `a` reads the table `b`, not the CTE defined after it.
+        "with a as (select sum(price) as n from b),\n"
+        "b as (select quantity as price from {{ ref('stg_orders') }})\n"
+        "select n from a\n",
+        # Two CTE names that fold to the same text, with `a` reading the later one.
+        "with \"B\" as (select count(*) as price from {{ ref('stg_orders') }}),\n"
+        "a as (select sum(price) as n from b),\n"
+        "b as (select quantity as price from {{ ref('stg_orders') }})\n"
+        "select n from a\n",
+        # A quoted projection alias next to an unquoted one of the same letters.
+        "with a as (\n"
+        "  select count(*) as \"N\", sum(price) as n from {{ ref('stg_orders') }}\n"
+        ")\n"
+        'select "N" as n from a\n',
+        # A pivot rewrites which value a column carries.
+        "with a as (\n"
+        "  select sum(price) as n, sum(quantity) as x from {{ ref('stg_orders') }}\n"
+        ")\nselect n from a unpivot (n for k in (n, x))\n",
+        # A named window carries part of the calculation.
+        "with a as (\n"
+        "  select sum(price) over w as n from {{ ref('stg_orders') }}\n"
+        "  window w as (partition by category)\n"
+        ")\nselect n from a\n",
+        # A quoted name that differs from another only in case.
+        "with \"A\" as (select count(*) as n from {{ ref('stg_orders') }}),\n"
+        "a as (select sum(price) as n from {{ ref('stg_orders') }})\n"
+        'select n from "A"\n',
+    ],
+)
+def test_a_column_that_cannot_be_read_by_name_is_compared_as_written(authored):
+    scope = _scope(authored, prior=SUM_PRIOR)
+    assert ("aggregate_changed", "n", "undeclared") in _output_kinds(scope)
+
+
+@pytest.mark.parametrize(
+    ("computed", "kind"),
+    [
+        ("coalesce(sum(price), 0)", "null_handling_changed"),
+        ("cast(sum(price) as integer)", "type_changed"),
+    ],
+)
+def test_a_cast_or_coalesce_added_inside_the_cte_is_still_found(computed, kind):
+    moved = (
+        f"with t as (select {computed} as n from {{{{ ref('stg_orders') }}}})\n"
+        "select n from t\n"
+    )
+    kinds = _output_kinds(_scope(moved, prior=SUM_PRIOR))
+    assert (kind, "n", "undeclared") in kinds
+    assert not any(k == "aggregate_changed" for k, _, _ in kinds)
+
+
+def _parts_reshaped(body: str) -> str:
+    """PARTS_PRIOR's aggregates moved into a CTE whose rows differ (#1253)."""
+    return (
+        "with parts as (\n"
+        "  select project_id, count(*) as part_count,\n"
+        "    max(created_at) as last_part_at\n"
+        f"  {body}\n"
+        ")\n"
+        "select p.project_id, pa.part_count, pa.last_part_at\n"
+        "from {{ ref('stg_projects') }} p\n"
+        "join parts pa on pa.project_id = p.project_id\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "from {{ ref('stg_parts') }} where status = 'active' group by project_id",
+        "from {{ ref('stg_parts') }} group by project_id, kind",
+        "from {{ ref('stg_tasks') }} group by project_id",
+        "from {{ ref('stg_parts') }} group by project_id having count(*) > 1",
+        "from {{ ref('stg_parts') }} c\n"
+        "  join {{ ref('stg_tasks') }} t on t.part_id = c.part_id group by project_id",
+        # A filter inside a derived table, which count(*) never reads a column of.
+        "from (select * from {{ ref('stg_parts') }} where status = 'active') s\n"
+        "  group by project_id",
+        # A self-join that fans rows out over a table the old query already read.
+        "from {{ ref('stg_parts') }} c\n"
+        "  join {{ ref('stg_parts') }} d on d.project_id = c.project_id\n"
+        "  group by c.project_id",
+        "from {{ ref('stg_parts') }} group by project_id limit 10",
+    ],
+)
+def test_an_aggregate_moved_into_a_cte_with_other_rows_is_not_the_same(body):
+    kinds = _output_kinds(_scope(_parts_reshaped(body), prior=PARTS_PRIOR))
+    assert ("aggregate_changed", "part_count", "undeclared") in kinds
+
+
+@pytest.mark.parametrize(
+    "join",
+    [
+        "join parts pa on pa.project_id = p.parent_id",
+        "left join parts pa on pa.project_id = p.project_id",
+    ],
+)
+def test_a_moved_aggregate_joined_back_differently_is_not_the_same(join):
+    moved = _parts_moved().replace(
+        "join parts pa on pa.project_id = p.project_id", join
+    )
+    kinds = _output_kinds(_scope(moved, prior=PARTS_PRIOR))
+    assert ("aggregate_changed", "part_count", "undeclared") in kinds
+
+
+def test_count_star_over_an_outer_join_is_never_called_the_same():
+    # A project with no parts counts one row before and NULL after.
+    prior = PARTS_PRIOR.replace(
+        "join {{ ref('stg_parts') }}", "left join {{ ref('stg_parts') }}"
+    )
+    moved = _parts_moved().replace("join parts pa", "left join parts pa")
+    kinds = _output_kinds(_scope(moved, prior=prior))
+    assert ("aggregate_changed", "part_count", "undeclared") in kinds
+
+
+def test_a_row_distinct_in_the_cte_is_not_the_same_count():
+    moved = (
+        "with parts as (\n"
+        "  select distinct project_id, part_id from {{ ref('stg_parts') }}\n"
+        "),\ncounted as (\n"
+        "  select project_id, count(*) as part_count from parts group by project_id\n"
+        ")\n"
+        "select p.project_id, c.part_count\n"
+        "from {{ ref('stg_projects') }} p\n"
+        "join counted c on c.project_id = p.project_id\n"
+    )
+    prior = (
+        "select p.project_id, count(*) as part_count\n"
+        "from {{ ref('stg_projects') }} p\n"
+        "join {{ ref('stg_parts') }} c on c.project_id = p.project_id\n"
+        "group by p.project_id\n"
+    )
+    kinds = _output_kinds(_scope(moved, prior=prior))
+    assert ("aggregate_changed", "part_count", "undeclared") in kinds
+
+
 def test_reformatting_and_renaming_an_alias_are_silent():
     authored = (
         "WITH v AS (SELECT s.visit_date, COUNT(*) AS visits,\n"
@@ -734,6 +998,27 @@ def test_plan_settles_a_declared_filter_and_relays_the_detail(accounts_project, 
     assert not any("this plan changes more" in w for w in envelope["warnings"])
     (decision,) = data["decisions"]
     assert decision["detail"] == "the request names the region summary"
+
+
+def test_plan_does_not_call_an_aggregate_moved_into_a_cte_changed(
+    accounts_project, capsys
+):
+    repo, warehouse = accounts_project
+    moved = (
+        "with counted as (\n"
+        "  select region, count(*) as accounts\n"
+        "  from {{ source('raw', 'accounts') }}\n  group by region\n"
+        ")\nselect region, accounts from counted\n"
+    )
+    envelope = _plan(
+        repo, warehouse, {"edits": [_edit("region_summary", moved)]}, capsys
+    )
+    (model,) = envelope["data"]["change_scope"]["models"]
+    outputs = [c for c in model["changes"] if c["axis"] == "output"]
+    assert [(c["kind"], c["column"]) for c in outputs] == [
+        ("expression_changed", "accounts")
+    ]
+    assert "status" not in outputs[0]
 
 
 def test_a_new_model_has_no_change_scope(accounts_project, capsys):

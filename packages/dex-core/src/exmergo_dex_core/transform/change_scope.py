@@ -493,13 +493,293 @@ def _outputs(
         left, _ = _projections(before_scopes[scope])
         right, _ = _projections(after_scopes[scope])
         for name in sorted(left.keys() & right.keys()):
-            for change in _expression_changes(scope, name, left[name], right[name]):
+            before_seen: list[exp.Select] = []
+            after_seen: list[exp.Select] = []
+            before_read = _through_ctes(
+                left[name], before_scopes[scope], before_scopes, visited=before_seen
+            )
+            after_read = _through_ctes(
+                right[name], after_scopes[scope], after_scopes, visited=after_seen
+            )
+            read = (
+                (before_read, after_read)
+                if before_read is not None
+                and after_read is not None
+                and _same_rows(before_seen, after_seen, before_scopes, after_scopes)
+                else None
+            )
+            for change in _expression_changes(
+                scope, name, left[name], right[name], read
+            ):
                 changed = True
                 out.append(change)
 
     if changed:
         return "changed", reason
     return ("unchecked" if reason else "kept"), reason
+
+
+def _bare(node: exp.Expression) -> str:
+    """``node`` compared with every column's table qualifier dropped, so the
+    same filter or grouping key reads alike in a joined select and in a CTE
+    over one of its relations."""
+
+    copy = node.copy()
+    for column in copy.find_all(exp.Column):
+        column.set("table", None)
+    return sql_shape.unqualified_key(copy)
+
+
+def _row_shape(
+    selects: Iterable[exp.Select], ctes: Mapping[str, exp.Expression]
+) -> tuple[
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    bool,
+    Counter[str],
+    Counter[str],
+]:
+    """What decides which rows reach a traced calculation, over every select
+    the rows pass through: the WHERE, HAVING and QUALIFY conjuncts, the GROUP
+    BY keys, whether a row DISTINCT applies, each join's type and condition,
+    and the tables read, counted, since a second copy of a table fans rows out.
+    Table qualifiers are dropped, so a group key or join condition reads alike
+    in a joined select and in a CTE over one of its relations."""
+
+    filters: dict[str, set[str]] = {"where": set(), "having": set(), "qualify": set()}
+    groups: set[str] = set()
+    distinct = False
+    joins: Counter[str] = Counter()
+    tables: Counter[str] = Counter()
+    for select in selects:
+        for clause, found in filters.items():
+            condition = select.args.get(clause)
+            if condition is not None:
+                found.update(
+                    _bare(c) for c in sql_shape.flatten_conjuncts(condition.this)
+                )
+        group = select.args.get("group")
+        if group is not None:
+            groups.update(_bare(key) for key in group.expressions)
+        distinct = distinct or bool(select.args.get("distinct"))
+        for join in select.args.get("joins") or []:
+            on = join.args.get("on")
+            using = join.args.get("using") or []
+            joins[
+                f"{join.side} {join.kind} on {_bare(on) if on is not None else ''}"
+                f" using {','.join(sorted(_bare(u) for u in using))}"
+            ] += 1
+        for relation in _relations_of(select):
+            if isinstance(relation, exp.Table) and relation.name.lower() not in ctes:
+                tables[sql_shape.relation_key(relation)] += 1
+    return (
+        frozenset(filters["where"]),
+        frozenset(filters["having"]),
+        frozenset(filters["qualify"]),
+        frozenset(groups),
+        distinct,
+        joins,
+        tables,
+    )
+
+
+def _relations_of(select: exp.Select) -> list[exp.Expression]:
+    """The relations a select reads directly: its FROM and each join."""
+
+    from_ = select.args.get("from_") or select.args.get("from")
+    relations = [from_.this] if from_ is not None else []
+    return relations + [join.this for join in select.args.get("joins") or []]
+
+
+def _same_rows(
+    prior: list[exp.Select],
+    authored: list[exp.Select],
+    prior_ctes: Mapping[str, exp.Expression],
+    authored_ctes: Mapping[str, exp.Expression],
+) -> bool:
+    """Whether the rows each side's calculation reads are produced alike, so a
+    moved aggregate is the same calculation (#1253): the same filters,
+    grouping, row DISTINCT and joins on both paths, no table the prior side
+    did not read as often, and no outer join, LIMIT or OFFSET on either path
+    (an outer join changes what ``count(*)`` sees for a row with no match).
+    Otherwise the expressions are compared as written."""
+
+    prior_rows = _feeding(prior, prior_ctes)
+    authored_rows = _feeding(authored, authored_ctes)
+    if prior_rows is None or authored_rows is None:
+        return False
+    *before, before_joins, before_tables = _row_shape(prior_rows, prior_ctes)
+    *after, after_joins, after_tables = _row_shape(authored_rows, authored_ctes)
+    return (
+        before == after
+        and before_joins == after_joins
+        and not after_tables - before_tables
+    )
+
+
+def _feeding(
+    selects: list[exp.Select], ctes: Mapping[str, exp.Expression]
+) -> list[exp.Select] | None:
+    """``selects`` and every CTE their rows come from, followed through FROM
+    and JOIN: a filter or DISTINCT upstream shapes the rows even when no traced
+    column reads it, as with ``count(*)``. ``None`` when a select on the way
+    reads anything but tables and CTEs (a derived table, ``VALUES``, an
+    ``UNNEST``), joins with an outer join, limits its rows, or is a set
+    operation."""
+
+    found: list[exp.Select] = []
+    stack = list(selects)
+    while stack:
+        select = stack.pop()
+        if any(select is known for known in found):
+            continue
+        if any(select.args.get(key) for key in ("limit", "offset", "fetch")):
+            return None
+        if any(join.side for join in select.args.get("joins") or []):
+            return None
+        found.append(select)
+        for relation in _relations_of(select):
+            if not isinstance(relation, exp.Table):
+                return None
+            name = relation.name.lower()
+            if name in ctes and name != sql_shape.MAIN_SCOPE:
+                body = ctes[name]
+                if not isinstance(body, exp.Select):
+                    return None
+                stack.append(body)
+    return found
+
+
+def _resolves_by_name(tree: exp.Expression) -> bool:
+    """Whether every name in ``tree`` can be matched by its lowercased text,
+    which ``_through_ctes`` relies on (#1253). Not when an identifier is
+    quoted (``"N"`` and ``n`` are two names), a pivot rewrites the columns, a
+    named window carries part of a calculation, the ``WITH`` is recursive, or
+    two CTE names fold to the same text."""
+
+    if any(identifier.quoted for identifier in tree.find_all(exp.Identifier)):
+        return False
+    if tree.find(exp.Pivot) is not None:
+        return False
+    if any(select.args.get("windows") for select in tree.find_all(exp.Select)):
+        return False
+    top = tree.args.get("with_") or tree.args.get("with")
+    if top is not None:
+        if top.args.get("recursive"):
+            return False
+        names = [cte.alias_or_name.lower() for cte in top.expressions]
+        if len(names) != len(set(names)):
+            return False
+    return True
+
+
+def _through_ctes(
+    node: exp.Expression,
+    select: exp.Expression,
+    ctes: Mapping[str, exp.Expression],
+    seen: frozenset[str] = frozenset(),
+    visited: list[exp.Select] | None = None,
+) -> exp.Expression | None:
+    """``node``, read in ``select``, with every column that reads a top-level
+    CTE's output replaced by the expression that CTE computes it with, followed
+    through further CTEs (#1253), so an aggregate moved into a CTE is compared
+    as the aggregate it still is.
+
+    ``None`` when a column cannot be traced: a query whose names do not resolve
+    by lowercased text (``_resolves_by_name``), an unqualified name over several
+    relations of which one cannot be read by name, a qualifier the select does
+    not read, a derived table, columns renamed by position (``a(n, x)`` or
+    ``from t as o(n, x)``), a CTE the current one cannot see (a later or nested
+    definition), a CTE that does not project the name, a CTE reached again, or
+    a subquery in ``node``. An untraced expression is
+    compared as written, never as proven equivalent."""
+
+    if not isinstance(select, exp.Select) or node.find(exp.Select) is not None:
+        return None
+    main = ctes.get(sql_shape.MAIN_SCOPE)
+    if main is None or not _resolves_by_name(main):
+        return None
+    if visited is not None:
+        visited.append(select)
+    names = [name for name in ctes if name != sql_shape.MAIN_SCOPE]
+    # A non-recursive CTE sees only the ones defined before it; the final
+    # select sees them all. A later name read inside a CTE is a table.
+    position = next((i for i, name in enumerate(names) if ctes[name] is select), None)
+    visible = set(names if position is None else names[:position])
+    # A CTE body's own WITH binds names that shadow the top-level ones.
+    nested = select.args.get("with_") or select.args.get("with")
+    local = (
+        {item.alias_or_name.lower() for item in nested.expressions}
+        if nested is not None and select is not main
+        else set()
+    )
+    from_ = select.args.get("from_") or select.args.get("from")
+    relations = [from_.this] if from_ is not None else []
+    relations += [join.this for join in select.args.get("joins") or []]
+    # The name each relation's columns qualify it with, to the CTE it reads;
+    # ``""`` for a relation whose columns cannot be told by name.
+    reads: dict[str, str | None] = {}
+    for relation in relations:
+        alias = relation.args.get("alias")
+        key = relation.alias_or_name.lower()
+        if not isinstance(relation, exp.Table) or (alias is not None and alias.columns):
+            reads[key] = ""
+            continue
+        name = relation.name.lower()
+        if name in local:
+            reads[key] = ""
+            continue
+        if relation.db or name not in names:
+            reads[key] = None
+            continue
+        definition = ctes[name].find_ancestor(exp.CTE)
+        if name not in visible or (
+            definition is not None and definition.alias_column_names
+        ):
+            reads[key] = ""
+        else:
+            reads[key] = name
+
+    out = node.copy()
+    for column in list(out.find_all(exp.Column)):
+        if isinstance(column.this, exp.Star):
+            return None
+        qualifier = column.table.lower()
+        if qualifier:
+            if qualifier not in reads:
+                return None
+            cte = reads[qualifier]
+        elif len(reads) == 1:
+            cte = next(iter(reads.values()))
+        elif any(value is not None for value in reads.values()):
+            return None
+        else:
+            continue
+        if cte is None:
+            continue
+        if not cte or cte in seen:
+            return None
+        computed = _projections(ctes[cte])[0].get(column.name.lower())
+        if computed is None:
+            return None
+        traced = _through_ctes(computed, ctes[cte], ctes, seen | {cte}, visited)
+        if traced is None:
+            return None
+        if column is out:
+            out = traced
+        elif (
+            isinstance(column.parent, (exp.Binary, exp.Unary))
+            and not isinstance(column.parent, exp.Paren)
+            and not isinstance(traced, (exp.Column, exp.Literal))
+        ):
+            # Parentheses only where an operator needs them: `sum(subtotal)`
+            # traced to `sum(price * quantity)` must read as the same aggregate.
+            column.replace(exp.Paren(this=traced))
+        else:
+            column.replace(traced)
+    return out
 
 
 def _cast_target(node: exp.Expression) -> str | None:
@@ -539,10 +819,19 @@ def _null_handling(node: exp.Expression) -> Counter[str]:
 
 
 def _expression_changes(
-    scope: str, name: str, prior: exp.Expression, authored: exp.Expression
+    scope: str,
+    name: str,
+    prior: exp.Expression,
+    authored: exp.Expression,
+    read: tuple[exp.Expression, exp.Expression] | None = None,
 ) -> list[ScopeChange]:
     """How one column's expression changed: a cast, an aggregate, a NULL
-    treatment, or, failing all three, the expression itself."""
+    treatment, or, failing all three, the expression itself.
+
+    ``read`` is both expressions traced through the CTEs they read, when both
+    could be: casts, aggregates and NULL treatment are compared there, so an
+    aggregate that only moved into a CTE is not an aggregate change, and a cast
+    or ``coalesce`` added inside the CTE still is one (#1253)."""
 
     if sql_shape.unqualified_key(prior) == sql_shape.unqualified_key(authored):
         return []
@@ -562,7 +851,8 @@ def _expression_changes(
         )
 
     found: list[ScopeChange] = []
-    before_cast, after_cast = _cast_target(prior), _cast_target(authored)
+    traced = read or (prior, authored)
+    before_cast, after_cast = _cast_target(traced[0]), _cast_target(traced[1])
     if before_cast != after_cast:
         found.append(
             change(
@@ -571,7 +861,7 @@ def _expression_changes(
                 f"where it was cast to {before_cast or 'no type'}",
             )
         )
-    before_aggs, after_aggs = _aggregates(prior), _aggregates(authored)
+    before_aggs, after_aggs = _aggregates(traced[0]), _aggregates(traced[1])
     if before_aggs != after_aggs:
         found.append(
             change(
@@ -581,7 +871,7 @@ def _expression_changes(
                 f"{', '.join(sorted(before_aggs)) or 'nothing'}",
             )
         )
-    before_nulls, after_nulls = _null_handling(prior), _null_handling(authored)
+    before_nulls, after_nulls = _null_handling(traced[0]), _null_handling(traced[1])
     if before_nulls != after_nulls:
         found.append(
             change(
@@ -591,8 +881,16 @@ def _expression_changes(
             )
         )
     if not found:
+        moved = read is not None and sql_shape.unqualified_key(
+            read[0]
+        ) == sql_shape.unqualified_key(read[1])
         found.append(
-            change("expression_changed", f"`{name}`{where} is computed differently")
+            change(
+                "expression_changed",
+                f"`{name}`{where} reads the same calculation through a CTE"
+                if moved
+                else f"`{name}`{where} is computed differently",
+            )
         )
     return found
 
