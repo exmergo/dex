@@ -141,6 +141,37 @@ _WILDCARD = re.compile(r"\.\s*\*(\s+except\s*\(.*\))?\s*$", re.IGNORECASE | re.D
 _OFFSET = re.compile(r"^-?\d+\s+(day|days|month|months|year|years)$", re.IGNORECASE)
 _UNIT = re.compile(r"^(day|days|month|months|year|years)$", re.IGNORECASE)
 
+#: Words a window `range` or `offset` is written in. Databricks refuses a
+#: window-size parameter named after one, since `trailing day day` would read
+#: either way.
+_WINDOW_KEYWORDS = frozenset(
+    {
+        "current",
+        "cumulative",
+        "all",
+        "trailing",
+        "leading",
+        "inclusive",
+        "exclusive",
+        "day",
+        "days",
+        "week",
+        "weeks",
+        "month",
+        "months",
+        "quarter",
+        "quarters",
+        "year",
+        "years",
+        "hour",
+        "hours",
+        "minute",
+        "minutes",
+        "second",
+        "seconds",
+    }
+)
+
 #: The SQL types a parameter standing for a window's number may have.
 _INTEGER_TYPES = frozenset(
     {"tinyint", "byte", "smallint", "short", "int", "integer", "bigint", "long"}
@@ -735,13 +766,17 @@ def _window(
         if (
             magnitude
             and not magnitude[0].isdigit()
-            and (magnitude[0].lower() not in integers)
+            and (
+                magnitude[0].lower() not in integers
+                or magnitude[0].lower() in _WINDOW_KEYWORDS
+            )
         ):
             find(
                 here,
                 "window",
                 f"`range` reads `{magnitude[0]}`, which names no integer parameter "
-                "of this view",
+                "of this view, or names one after a window keyword, which "
+                "Databricks refuses",
             )
             raise _RefusedError
         if spec.get("semiadditive") not in (None, "first", "last"):
@@ -774,6 +809,7 @@ def _offset_ok(value: Any, integers: frozenset[str]) -> bool:
     return (
         1 <= len(tokens) <= 2
         and tokens[0].lower() in integers
+        and tokens[0].lower() not in _WINDOW_KEYWORDS
         and (len(tokens) == 1 or bool(_UNIT.match(tokens[1])))
     )
 

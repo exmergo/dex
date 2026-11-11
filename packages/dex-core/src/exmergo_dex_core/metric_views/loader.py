@@ -242,6 +242,17 @@ def _read_file(name: str, text: str, result: LoadResult) -> MetricView | None:
             _diagnostic(name, "(root)", "malformed", f"not valid YAML: {exc}")
         )
         return None
+    if _cyclic(raw):
+        result.diagnostics.append(
+            _diagnostic(
+                name,
+                "(root)",
+                "malformed",
+                "a YAML alias refers to the value that contains it (`&a [*a]`), so "
+                "the definition has no end; write the value out",
+            )
+        )
+        return None
     if raw is None:
         result.diagnostics.append(
             _diagnostic(
@@ -450,6 +461,18 @@ def _expressions(view: MetricView, result: LoadResult) -> MetricView:
         fields=tuple(fields),
         measures=tuple(m for m in view.measures if m.name.lower() not in refused),
     )
+
+
+def _cyclic(value: Any, ancestors: frozenset[int] = frozenset()) -> bool:
+    """Whether a parsed value contains itself, as a recursive YAML alias makes it."""
+
+    if not isinstance(value, (dict, list)):
+        return False
+    if id(value) in ancestors:
+        return True
+    inside = ancestors | {id(value)}
+    children = value.values() if isinstance(value, dict) else value
+    return any(_cyclic(child, inside) for child in children)
 
 
 def _cycles(start: str, reads: Mapping[str, list[str]]) -> bool:

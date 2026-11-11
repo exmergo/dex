@@ -598,3 +598,36 @@ def test_an_unhashable_format_type_refuses_the_member_and_not_the_layer():
         ("views/orders.yaml", "format")
     }
     assert [[f.name for f in v.fields] for v in result.views] == [["kept"], ["y"]]
+
+
+def test_a_window_size_parameter_named_after_a_window_keyword_is_refused():
+    """`trailing day day` reads either way; Databricks refuses the name."""
+
+    body = _measure(window=[{"order": "d", "range": "trailing day day"}])
+    body["parameters"] = [{"name": "day", "data_type": "int", "default": 7}]
+    result = _load(body)
+
+    assert _rules(result) == {"window": ERROR}
+    assert result.views[0].measures == ()
+
+
+def test_a_recursive_yaml_alias_refuses_its_file_and_not_the_layer():
+    """`&loop [*loop]` has no end: it would stop the fingerprint's hash."""
+
+    text = (
+        "version: 1.1\nsource: demo.main.orders\nextra: &loop [*loop]\n"
+        "fields:\n  - name: x\n    expr: x\n"
+    )
+    result = validate_view_contents(
+        {
+            "views/orders.yaml": text,
+            "views/other.yaml": yaml.safe_dump(
+                view(fields=[{"name": "y", "expr": "y"}])
+            ),
+        }
+    )
+
+    assert {(d.file, d.rule) for d in result.errors} == {
+        ("views/orders.yaml", "malformed")
+    }
+    assert [v.name for v in result.views] == ["other"]
