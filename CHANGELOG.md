@@ -63,11 +63,12 @@ pending fragments into a new section below. See
   the element. Each file is one view, named after its stem, and a `.sql`
   `CREATE VIEW ... WITH METRICS` file is refused by name. Fields are dimensions keyed
   `view.field`, single-aggregate measures are measures and metrics, and
-  `MEASURE(a) / MEASURE(b)` is a ratio. `explore relationships|map|profile
-  --use-project` carry each join and each `rely.at_most_one_match` key at
-  confidence 1.0, `maintain snapshot` fingerprints the layer, and `maintain grain`
-  measures those keys and each join's declared arity. `explore semantic list
-  --search` also matches the `synonyms` a field or measure declares. Governed
+  `MEASURE(a) / MEASURE(b)` is a ratio.
+  `explore relationships|map|profile --use-project` carry each join and each
+  `rely.at_most_one_match` key at confidence 1.0, `maintain snapshot` fingerprints
+  the layer, and `maintain grain` measures those keys and each join's declared
+  arity. `explore semantic list --search` also matches the `synonyms` a field or
+  measure declares. Governed
   `query` and `values` are not available yet and refuse by name. Install with
   `exmergo-dex-core[metric-views]`. ([#1262](https://github.com/exmergo/dex/pull/1262))
 - **The Ossie bridge proposes a Databricks Metric View from an Ossie document, and an
