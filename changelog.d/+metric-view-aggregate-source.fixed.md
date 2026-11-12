@@ -1,1 +1,0 @@
-**Metric View query sources with an aggregate or `HAVING` claim no relation.** A `source` query that aggregates its table (for example `SELECT SUM(b) AS a FROM t`), or filters with `HAVING` and no `GROUP BY`, no longer claims that table as its relation, since the view holds fewer rows than the table. A window function keeps the claim, as it keeps the row count.
