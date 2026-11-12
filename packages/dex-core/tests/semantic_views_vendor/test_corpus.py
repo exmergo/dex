@@ -74,8 +74,12 @@ def test_dex_refuses_it_by_the_rule_it_breaks(path: Path) -> None:
     kind = path.parent.name
     loaded = load_files(FIXTURES, [f"{kind}/{path.name}"])
     if (_header(path, "static") or "").startswith("unchecked"):
-        # The one rule only the warehouse can decide: a column's existence.
+        # The one rule only the warehouse can decide: a column's existence. It
+        # still warns by the rule its header names, which authoring refuses.
         assert loaded.errors == []
+        expected = _header(path, "warns")
+        if expected:
+            assert expected in {d.rule for d in loaded.diagnostics}, loaded.notes()
         return
     rule = _header(path, "expect")
     assert rule, f"{path.name} names no `# expect:` rule"

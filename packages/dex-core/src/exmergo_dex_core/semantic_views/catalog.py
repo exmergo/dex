@@ -328,7 +328,7 @@ def semantic_catalog(
             models.append(
                 SemanticModelInfo(
                     name=model,
-                    description=table.description,
+                    description=_without_population(view, table, found),
                     relation=relation,
                     primary_entity=model if single_key else None,
                 )
@@ -904,3 +904,30 @@ def definitions(
         model_declarations=declarations,
         notes=found,
     )
+
+
+#: How dex begins the population sentence it writes into a description.
+_POPULATION = "Population: "
+
+
+def _without_population(
+    view: SemanticView, table: LogicalTable, notes: list[str]
+) -> str | None:
+    """A table's description less a population sentence dex wrote (#1292).
+
+    A Semantic View has no metadata key, so a derived or annotated table carries
+    its population only as the last sentence of its description. Catalogs are
+    connectionless and cannot prove a population's values safe, so the sentence
+    is withheld here as every native catalog withholds it, and the authored
+    prefix is kept. The file is not rewritten.
+    """
+
+    description = table.description
+    if not isinstance(description, str) or _POPULATION not in description:
+        return description
+    head = description.split(_POPULATION, 1)[0].rstrip()
+    notes.append(
+        f"{view.file}: tables['{table.name}'] has a description ending in a "
+        "population sentence, which the catalog withholds; the file is unchanged"
+    )
+    return head or None

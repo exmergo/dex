@@ -108,6 +108,9 @@ RULES: dict[str, str] = {
     "file_name": WARNING,
     "duplicate_view": ERROR,
     "unparsed_expression": WARNING,
+    # A read qualified with its own table naming no member: a base column the
+    # warehouse may or may not have. Refused in a file dex writes (#1292).
+    "unresolved_member": WARNING,
     "reference": ERROR,
     "row_level": ERROR,
     "metric_aggregate": ERROR,

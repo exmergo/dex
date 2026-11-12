@@ -359,6 +359,10 @@ def test_the_metric_views_extra_follows_the_configured_vendor(
             ["semantic-views"],
         ),
         (["transform", "apply"], "snowflake", ["semantic-views"]),
+        # Authoring validates with the reader's port of the rules (#1292), so it
+        # takes the extra whatever the configured vendor says.
+        (["semantic", "snowflake", "define"], "snowflake", ["semantic-views"]),
+        (["semantic", "snowflake", "plan"], None, ["semantic-views"]),
         # Not for a command that reads no layer, and never from the connector
         # name: `connector: snowflake` with `vendor: dbt` takes nothing here.
         (["explore", "inventory"], "snowflake", []),

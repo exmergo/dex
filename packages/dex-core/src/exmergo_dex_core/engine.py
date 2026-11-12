@@ -1901,6 +1901,21 @@ class DexEngine:
             "databricks", mode, intent, edits, declarations=declarations
         )
 
+    def semantic_snowflake(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic snowflake`: :meth:`semantic_native` for Snowflake Semantic
+        View YAML files (#1292). Nothing is deployed to an account."""
+
+        return self.semantic_native(
+            "snowflake", mode, intent, edits, declarations=declarations
+        )
+
     def semantic_bridge(
         self,
         vendor: str,

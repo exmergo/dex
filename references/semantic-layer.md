@@ -1544,8 +1544,14 @@ semantic:
 - **`maintain` reads the fingerprint**: definition drift on `maintain semantic`,
   and each key and relationship arity measured by `maintain grain`. A view read
   back from Snowflake fingerprints as the file it came from. `maintain schema`
-  and `reconcile` are #1293; authoring (`semantic snowflake define|update|plan`)
-  is #1292.
+  and `reconcile` are #1293.
+- **Authoring is `semantic snowflake define|update|plan`** (#1292): whole
+  configured files through a stored plan, validated by the same port with three
+  read-time warnings refused on write (an unknown key, `access_modifier` on a
+  dimension, a qualified read naming no member), each logical table and derived
+  metric classified, never deployed. A declared dbt mart derives a logical table,
+  spliced into the file whose tables its foreign keys reference, and a
+  `declarations` payload annotates a table in place.
 
 What Dex accepts, checks, maps and declines to claim, rule by rule, is in
 [Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md).
@@ -1757,4 +1763,7 @@ description with no `dex.population` metadata is never edited, even when it says
 A Databricks Metric View has no metadata key to hold `dex.population`, so its
 catalog keeps a view `comment` up to the first `Population: ` it holds and
 withholds the rest, with a note, whatever wrote it. A derived or annotated view
-carries its population only there.
+carries its population only there. A Snowflake Semantic View has no metadata key
+either, so its catalog does the same with a logical table's `description` (#1292):
+a derived or annotated table carries its population only as that description's
+last sentence.

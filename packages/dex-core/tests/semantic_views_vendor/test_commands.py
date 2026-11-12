@@ -270,8 +270,8 @@ def test_maintain_grain_measures_a_key_and_a_relationships_arity(tmp_path, capsy
 
 def test_reconcile_with_no_project_is_advisory_not_a_refusal(tmp_path, capsys):
     """A Semantic View layer with no dbt project beside it is the repository's
-    one layer: its findings are advisory, and the key is changed in its file
-    until authoring lands (#1292)."""
+    one layer: its findings are advisory, and the key is changed through
+    `semantic snowflake update` (#1292)."""
     root = _warehouse(tmp_path, [(10, "EU"), (10, "US"), (20, "US")])
     assert _run(capsys, root, "explore", "map")[0] == 0
     assert _run(capsys, root, "maintain", "snapshot")[0] == 0
@@ -282,4 +282,4 @@ def test_reconcile_with_no_project_is_advisory_not_a_refusal(tmp_path, capsys):
     assert rc == 0, envelope["errors"]
     assert envelope["data"].get("plan_id") is None
     actions = " ".join(p["action"] for p in envelope["data"]["proposals"])
-    assert "change the primary key in its file" in actions
+    assert "change the primary key with `semantic snowflake update`" in actions

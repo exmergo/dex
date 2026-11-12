@@ -120,6 +120,7 @@ the table. A problem in what the whole view rests on refuses the view.
 | `multiple_paths` | two tables joined more than one way, or many-to-many, are not read across without `using_relationships` naming a relationship on a path between them |
 | `expression_cycle` | no expression reads itself, directly or through others. Two tables whose expressions read each other are not a cycle: Snowflake accepts them |
 | `unparsed_expression` (warning) | an expression sqlglot cannot read (a level-of-detail expression, for one) keeps its member, with its rules unchecked |
+| `unresolved_member` (warning) | a read qualified with its own table names no member of it (`SUM(orders.total_price)`), so it can only be a column of the base table, which only the warehouse can confirm; refused in a file a plan writes |
 
 Granularity follows the relationships. A relationship's left table is finer than
 its right table (many rows to one), unless its left columns are themselves a key
@@ -229,7 +230,7 @@ A semantic view on the account is not a relation Dex profiles: a plain
 | `volume` | unchanged: it reads the warehouse, not the layer |
 | `grain` | measures each primary and unique key (`declared_grain_not_unique`) and each relationship's arity (`join_cardinality_exceeded`); an ASOF or range relationship states no arity and is named unchecked |
 | `semantic` | definition drift, as everywhere |
-| `reconcile` | advisory only: there is no `semantic snowflake update` route yet (#1292) |
+| `reconcile` | advisory, naming `semantic snowflake update` as the route; no edit is stored until the schema axis (#1293) |
 
 **A read-back fingerprints as its file.** `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`
 changes nothing that is part of the definition, so the hash covers a canonical
@@ -255,10 +256,54 @@ identically to the file it came from.
 
 ## Authoring
 
-Not yet: `semantic snowflake define|update|plan` and the derivation from a
-declared mart are #1292. An edit to a view is a direct edit to its file. Read it
-back with `explore semantic list`, which validates it with the same port. Never
-deploy it from Dex: `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML` is outside Dex.
+`semantic snowflake define|update|plan --edits-file <f>` (#1292) authors the
+configured files through a stored plan that `transform apply` writes. Dex never
+deploys: nothing runs `CREATE SEMANTIC VIEW` or
+`SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`, nothing grants a privilege, and no
+authoring path opens a Snowflake connection. Check a file with
+`SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('<database>.<schema>', $$ <file> $$, TRUE)`
+(verify_only) before you deploy it yourself.
+
+- **The write surface** is exactly `semantic.snowflake.files`. A path off it, a
+  `.sql` file and another suffix are refused by name, the first with the
+  `dex config set` that adopts it. A delete is refused. A view is named by its own
+  `name`, so there is no rule on file stems; two files declaring one view stay
+  `duplicate_view`.
+- **Edits are whole files, written byte-for-byte**, all or none, and each file
+  keeps its mode. A file changed after planning is a conflict. The set apply would
+  leave is validated again, strict rules included.
+- **The whole prospective set is validated** by the rules above. Every error
+  anywhere in the set refuses the plan (a non-text key, a key written twice and a
+  duplicate member name among them), and so do three warnings in a file the plan
+  writes: an unknown key, `dimension_access` (Snowflake keeps the dimension
+  private, which hides it from every query) and `unresolved_member`.
+- **Classified by element.** Each logical table (`view.table`) and derived metric
+  (`view.metric`) in the edited files is `defined`, `updated` or `unchanged`,
+  compared as YAML 1.2 values, so reformatting is not a change. A change to a
+  view's other parts only (relationships, its description, Cortex Analyst's keys)
+  lists the view as `updated`. `define` refuses an existing view and a removal;
+  `update` refuses a new view, and reports a table it adds to an existing one as
+  `defined`.
+- **Derivation** from a declared dbt mart, and **annotation** with a
+  `declarations` payload, follow the mapping in the transform skill's
+  `declarations.md`. A derived table is spliced into the file whose tables its
+  foreign keys reference, or written as a view of its own. A Semantic View has no
+  free-form metadata key, so the population is carried only as the last sentence
+  of the table's `description`, which the catalog withholds, and units, NULL
+  rules, assumptions and any additivity but a semi-additive metric's are named as
+  not carried. Nothing is written into `custom_instructions`, which is Cortex
+  Analyst's prompt. A population is never written as a filter.
+- **A semi-additive metric reads the latest date.** Snowflake sorts by each
+  `non_additive_dimensions` entry as stated and reads the rows of the **last**
+  value in that order, checked on a live account: `sort_direction: descending`
+  reads the earliest date, and with `null_order: last` (the default) a NULL date
+  is last and wins. Dex therefore writes `sort_direction: ascending` with
+  `null_order: first`, whose last value is the latest real date.
+- **Annotation edits inside the table.** Only the lines a declaration changes are
+  rewritten: the table's `description`, one member, an appended metric, an
+  appended relationship. Comments inside the table are kept. A table or member
+  list written in flow style is refused for that declaration rather than
+  rewritten.
 
 ## The dogfood corpus
 

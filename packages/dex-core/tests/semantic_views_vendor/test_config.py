@@ -22,7 +22,7 @@ def _config(**snowflake) -> DexConfig:
 
 
 def test_the_vendor_reads_its_files() -> None:
-    """Local only, and a reader before it is authored (#1292)."""
+    """Local only, and authored through `semantic snowflake` (#1292)."""
     config = _config(files=["semantic/orders.yaml", "semantic/lines.yml"])
 
     assert config.semantic.snowflake.files == [
@@ -30,7 +30,7 @@ def test_the_vendor_reads_its_files() -> None:
         "semantic/lines.yml",
     ]
     assert SEMANTIC_DEPLOYMENTS["snowflake"] == ("local",)
-    assert "snowflake" not in SEMANTIC_DOCUMENT_AUTHORING
+    assert "snowflake" in SEMANTIC_DOCUMENT_AUTHORING
 
 
 def test_the_vendor_needs_its_files() -> None:

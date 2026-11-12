@@ -151,6 +151,7 @@ _METHOD_NAMES = {
     ("semantic", "slayer"): "semantic_slayer",
     ("semantic", "cube"): "semantic_cube",
     ("semantic", "databricks"): "semantic_databricks",
+    ("semantic", "snowflake"): "semantic_snowflake",
     ("maintain", "schema"): "schema_drift",
     ("maintain", "volume"): "volume_drift",
     ("maintain", "grain"): "grain_drift",
