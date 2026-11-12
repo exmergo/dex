@@ -227,5 +227,8 @@ errors before exploration. Metered commands retain their cost-confirmation flow.
 [Dex documentation](https://docs.exmergo.com/dex) ·
 [Project setup](https://docs.exmergo.com/dex/cli/init)
 
+Found a bug in Dex, or missing a capability? Run `dex feedback` for prefilled
+[issue](https://github.com/exmergo/dex/issues) links; nothing is sent.
+
 {ENTERPRISE}
 """

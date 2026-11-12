@@ -917,6 +917,13 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "exmergo_dex_core.procedure.text() / .block() / .check() directly"
         ),
     },
+    ("feedback", None): {
+        "reason": (
+            "reports the environment and issue links, not an engine operation: "
+            "a library caller reads exmergo_dex_core.feedback.environment() and "
+            ".bug_link() directly"
+        ),
+    },
     **{
         ("config", sub): {
             "reason": (

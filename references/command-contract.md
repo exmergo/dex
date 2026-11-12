@@ -71,7 +71,7 @@ did not write.
 
 ## The command surface
 
-Capabilities, not final spelling. Implemented incrementally: `demo`, `procedure`, `connect test`,
+Capabilities, not final spelling. Implemented incrementally: `demo`, `procedure`, `feedback`, `connect test`,
 the `config` group, the `explore` group, the authoring surface (`transform`,
 `semantic`), and the `maintain` group are live.
 
@@ -100,6 +100,14 @@ dex procedure [--block] [--check <file>...]
                                      is not current is status error (reason request).
                                      Routed before any engine: no config, no connector
                                      extra, no connection; allowed in values-free mode
+dex feedback [--command <sub>]    -> what a bug report needs: data.environment (versions,
+                                     OS, connector and semantic vendor names, result
+                                     mode; never a target, credential, path or value),
+                                     data.links (bug and feature issue forms prefilled
+                                     from it) and data.guidance. Nothing is sent. Routed
+                                     before any engine; allowed in values-free mode. A
+                                     reason: internal error envelope carries data.report,
+                                     the same prefilled bug link, never the error text
 dex connect test                  -> {capabilities, dialect, read_only: true}
 dex config get [key]              -> the effective value of every setting, or of those
                                      under key, as flat rows under data.settings: value,

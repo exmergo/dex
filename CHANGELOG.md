@@ -14,6 +14,108 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.8] - 2026-11-12
+
+### Added
+
+- Make `dex init` a complete project setup command: create a dbt-backed Dex project or local demo, adopt existing dbt, or configure exploration without dbt. Generate managed README and agent instructions, preserve existing content on reruns, verify the connection, and report readiness and recovery steps in one JSON envelope. Terminal users get guided setup and a concise Enterprise handoff. The legacy `dex transform init` scaffolder and repository-level `.dex/` layout remain available. ([#1232](https://github.com/exmergo/dex/pull/1232))
+- **`semantic databricks define|update|plan` authors Databricks Metric View files,
+  and a declared mart derives one.** Whole Metric View YAML files on
+  `semantic.databricks.files` are validated by dex's port of the YAML 1.1 rules,
+  stored as a plan and written byte-for-byte by `transform apply`, with no
+  workspace connection and nothing deployed. Writing is stricter than reading: an
+  unknown key (`rely` included) and `fields` beside `dimensions` refuse a file the
+  plan writes, since Databricks refuses the first and drops `fields` for the second.
+  Under `semantic.vendor: databricks`, `transform plan` on a declared mart derives a
+  Metric View (fields, `date`/`date_time` formats, measures `<column>_<agg>` with
+  currency or percentage formats, `many_to_one` joins with `rely.at_most_one_match`
+  where the parent declares that key), included as a second plan where its path is
+  configured and proposed otherwise; a `declarations` payload on `semantic
+  databricks plan` annotates an existing view, splicing only what changes. A Metric
+  View has no metadata key, so a population is carried only as the last sentence
+  of the view's `comment`, never as a `filter`, and the catalog withholds it. Dex's
+  own writers read and write YAML 1.2, so a join's `on:` key stays text.
+  `maintain reconcile` now names `semantic databricks update` as the route. ([#1258](https://github.com/exmergo/dex/pull/1258))
+- **`maintain` holds Databricks Metric Views to the warehouse, and reconciles them
+  through `semantic databricks update`.** Under `semantic.vendor: databricks`,
+  `maintain schema` reports `declared_column_missing` (a field, measure, `filter`,
+  join condition or query `source` reading a column its table lost),
+  `declared_relation_missing` (a view's or a join's `source` gone since the
+  baseline), `declared_type_conflict` (a `date`/`date_time` format on a column that
+  is not temporal, a numeric format on text, `SUM`/`AVG` over text) and
+  `declared_dependency_dropped` (a field, measure, window or nested join that loses
+  an input, `MEASURE()` included), each naming the view, the element and the
+  column, with no workspace connection. `maintain reconcile` cuts the removals out
+  of the view files as a `semantic databricks update` plan the reader validates,
+  keeping every other byte; a gone `source`, a `filter` or query source reading a
+  dropped column, a removal a `materialization` lists, and one that would empty the
+  view stay advisory. A view re-saved in a spec version Dex does not read is
+  `semantic_format_changed`, naming the file. A contradicted `rely` key on
+  `maintain grain` is now worded as the Metric View's uniqueness claim, not the
+  project's grain, and every `declared_grain_not_unique` carries `declared_by` and
+  `claim`. ([#1259](https://github.com/exmergo/dex/pull/1259))
+- **Ordinary plan and declare drafting carry an unchanged key from tested or declared input keys.** When an input model is not profiled in the cache, drafting now carries through an unchanged single-column or composite key declared (`meta.dex.grain`) or tested (`unique`, `unique_combination_of_columns`) on that input, without requiring a warehouse profile. The drafted grain evidence records its actual source without implying test execution. Aliases preserve key mappings, while transformations or fan-out joins that can destroy uniqueness do not inherit keys without supporting rules. When profiled warehouse data contradicts a stated key, measured evidence takes precedence and retains relevant warnings and verification obligations. ([#1261](https://github.com/exmergo/dex/pull/1261))
+- **`semantic.vendor: databricks` reads Databricks Metric View files as the
+  semantic layer.** Name the Metric View YAML files in `semantic.databricks.files`
+  and `explore semantic list` (with `--metric`, `--for-dimension` and `--search`)
+  answers from them, read statically with no workspace connection and validated by
+  dex's own port of the Metric View YAML 1.1 rules. Every refusal names the file and
+  the element. Each file is one view, named after its stem, and a `.sql`
+  `CREATE VIEW ... WITH METRICS` file is refused by name. Fields are dimensions keyed
+  `view.field`, single-aggregate measures are measures and metrics, and
+  `MEASURE(a) / MEASURE(b)` is a ratio.
+  `explore relationships|map|profile --use-project` carry each join and each
+  `rely.at_most_one_match` key at confidence 1.0, `maintain snapshot` fingerprints
+  the layer, and `maintain grain` measures those keys and each join's declared
+  arity. `explore semantic list --search` also matches the `synonyms` a field or
+  measure declares. Governed
+  `query` and `values` are not available yet and refuse by name. Install with
+  `exmergo-dex-core[metric-views]`. ([#1262](https://github.com/exmergo/dex/pull/1262))
+- **The Ossie bridge proposes a Databricks Metric View from an Ossie document, and an
+  Ossie document from a Metric View.**
+  `semantic databricks define|update|plan --from-ossie <file>` and
+  `semantic ossie define|update|plan --from-metric-view <file>` convert one file of
+  the other format into the configured layer, through
+  dex's port of the apache/ossie-converters `databricks` spoke. The port is held to
+  the converter's fixtures in both directions, with the same notices and the stash
+  JSON byte for byte, and to its example, dialect and round-trip suites. Every
+  dropped or rewritten element is named in `data.bridge`, each notice marked as the
+  converter's or dex's. Dex adds only what its own validators need: a field marked
+  `key_only` for a join column no field exposes, which its export leaves out again;
+  a key or metric naming a field reads its column, and an imported metric names
+  the fields its columns are exposed by; `expression.sql` is read; and a fact
+  dataset's metrics become measures. Each flag takes several files; those with
+  configured outputs are stored as one plan. `--dataset-metrics` writes fact-only measures
+  as dataset-scoped metrics on import (#957). `--fact` names the dataset a view is
+  on, and `--into` places the file. A configured output path is validated and
+  stored as a plan for `transform apply`. Any other path stores no plan and comes
+  back with the `dex config set` that adopts it. Nothing is deployed. ([#1275](https://github.com/exmergo/dex/pull/1275))
+- **`dex feedback`, and a report link on Dex's own failures.** `dex feedback` prints what a bug report or a feature request needs, with no project, connection or extra: the environment (versions, OS, and the connector and semantic-layer names your config writes; never a target, credential, path or value, so it can be pasted into a public issue as it stands) and links that prefill the issue forms from it. Nothing is sent. An error with `reason: internal`, an exception Dex did not anticipate, now carries `data.report`: a prefilled bug link naming the command, connector and exception class, never the error text. The issue forms add Trino, the semantic layer, how Dex is run and whether an agent filed on a person's behalf, and `SUPPORT.md` says where questions and security reports go. Reports drafted by your agent are welcome. (#1299) ([#1300](https://github.com/exmergo/dex/pull/1300))
+
+### Fixed
+
+- **A Metric View `date` format without `date_format`, or a `date_time` format
+  without both `date_format` and `time_format`, is refused.** Databricks refuses
+  both on `CREATE VIEW ... WITH METRICS`; dex read them as valid temporal fields.
+  **A derived semantic definition is placed by the siblings the same plan
+  creates.** `transform plan` now counts a model the plan itself writes when it
+  looks for the catalog and schema a native layer's views already read, so a mart
+  planned beside its staging model is no longer placed on a bare table name. ([#1258](https://github.com/exmergo/dex/pull/1258))
+- **A deployed Databricks Metric View no longer breaks `maintain check` or a
+  profile.** The Databricks connector inventoried a Metric View in the source scope
+  as a relation, and Databricks refuses a plain `SELECT` of its measure columns
+  (`METRIC_VIEW_MISSING_MEASURE_FUNCTION`), so the grain axis failed the whole
+  command. Unity Catalog objects of type `METRIC_VIEW` are now left out of the
+  inventory; their YAML is read from the repository under
+  `semantic.vendor: databricks`. `maintain reconcile` in a repository whose only
+  layer is a semantic one no longer refuses when none of its findings is a schema
+  one: they are advisory. A plan's notes are no longer repeated in reconcile's
+  warnings. ([#1259](https://github.com/exmergo/dex/pull/1259))
+- **Moving an unchanged aggregate into a CTE is no longer an aggregate change.** In `data.change_scope`, `transform plan` compared each output column's aggregates as written, so extracting `count(*) as part_count` into a grouped CTE and reading `p.part_count` in the final select reported an undeclared `aggregate_changed` ("aggregates nothing"). The comparison now follows the column through the top-level CTEs it reads. When the rows reaching the aggregate are produced alike on both sides (the same filters, the same grouping and `HAVING` where the aggregate is computed and elsewhere, the same row `DISTINCT` columns and join conditions, each column compared as the table it reads, the same tables read as often, and no outer join, `LIMIT`, sample, window function, `QUALIFY` or derived table on the way), an aggregate that only moved is listed as `expression_changed` ("reads the same calculation through a CTE"), which needs no decision. A changed aggregate, a new cast or new NULL handling is still flagged, also when it was added inside the CTE, and any other move, or a column that cannot be traced, is compared as written. An output whose text is unchanged but that now reads a differently named CTE is compared through it too, so a calculation changed there is reported. The moved query's grouping and join changes are still reported under population. (#1253) ([#1264](https://github.com/exmergo/dex/pull/1264))
+- **A semantic file that does not parse is named instead of hiding its definitions.** The semantic verbs read every project YAML file for the definitions it declares, and one that failed to parse was skipped silently: a metric living in it read as "not in the project" and a definition edit with no `path` was told to "give it a path", sending the caller looking for a missing definition or writing a duplicate when the real problem was a syntax error. The read now reports each skipped file and why, and a refusal that would claim a name is absent names the files it could not read: "`models/semantic.yml` could not be read (does not parse as YAML at line 44), so definitions in it are not visible". (#1268) ([#1277](https://github.com/exmergo/dex/pull/1277))
+- **Reconcile finds the declaration of a mart that lost its key.** After `maintain check` reported `key_lost_uniqueness` on a mart such as `dim_customers`, `maintain reconcile` looked for `models/staging/stg_dim_customers.yml`, found nothing, and only advised adding a `unique` test by hand. It now resolves the model the project builds as that relation, wherever it lives, and proposes the `unique` test in the YAML that declares it. When the key already has a `unique` test, the proposal now says so: that this test fails on the duplicates (unless they are NULL keys, which dbt's `unique` ignores) when the finding is on the model's own relation and the test is a plain `unique`, and otherwise that it is already declared. A relation the project also declares as a source table keeps the staging convention. ([#1278](https://github.com/exmergo/dex/pull/1278))
+
+
 ## [1.17.7] - 2026-11-11
 
 ### Fixed

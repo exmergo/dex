@@ -5,3 +5,8 @@ contact_links:
     about: >-
       Do not open a public issue for a security problem. Report it privately
       here, or email security@exmergo.com. See SECURITY.md.
+  - name: Questions and help
+    url: https://docs.exmergo.com/dex/guides/troubleshooting
+    about: >-
+      How-to questions: the documentation and troubleshooting guide, or the
+      Discord community linked from the README.

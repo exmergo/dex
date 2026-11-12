@@ -14,6 +14,12 @@ until `transform apply`, and any build runs against a dev target only.
 <!-- dex:procedure:begin -->
 ## Procedure
 
+For project setup, run `dex init` (or `init` through an installed skill wrapper).
+It creates or adopts a project, installs managed README and agent instructions,
+and verifies the connection. It does not explore data or build models. Read its
+structured missing inputs and readiness before continuing; installing skills
+does not necessarily install a `dex` executable.
+
 Dex works in one loop: explore, transform, maintain. `dex <command>` below is
 the `dex` CLI; where it is not installed, run the same command through the
 skill's `scripts/run.py` wrapper. Each command prints one JSON envelope: read
@@ -380,9 +386,15 @@ fetches the engine's dependencies from PyPI or your configured index.
 
 ## Transforming, step by step
 
-1. **No dbt project yet?** Offer `transform init "<name>" --connector <c>` (scaffolds into `<name>/` by default, or the current directory with `--in-place`) before
-   anything else. Ask the user for the name and **confirm the connector with
-   them**: init never defaults one. Do not hand-write the skeleton. Read
+1. **Project setup requested, or no dbt project yet?** Use the installed wrapper
+   for complete setup, including README, agent instructions and connection
+   verification. For a new project, use `init "<name>" --connector <c>`;
+   for an existing project, use `init --mode adopt --project-dir <directory>`.
+   The adoption target is its directory, which may differ from the dbt project
+   name. Existing authored files are preserved. The legacy `transform init`
+   scaffolder remains available. New projects scaffold into `<name>/` by default,
+   or the current directory with `--in-place`. Confirm the connector and the
+   new project's name with the user; do not hand-write the skeleton. Read
    `${CLAUDE_SKILL_DIR}/references/init-and-dev-target.md` for per-connector
    setup, `--in-place`, `--layered-schemas`, and the namespace warning.
 2. **Find every use first** when a change has to land in more than one place:
@@ -404,8 +416,12 @@ fetches the engine's dependencies from PyPI or your configured index.
    For the semantic layer, use the command for the vendor `semantic.vendor`
    names (`dex config get semantic` reads it): `semantic define|update|plan`
    (dbt), `semantic ossie define|update|plan` (native Ossie),
-   `semantic slayer define|update|plan` (SLayer model files), or
-   `semantic cube define|update|plan` (Cube YAML model files). Read
+   `semantic slayer define|update|plan` (SLayer model files),
+   `semantic cube define|update|plan` (Cube YAML model files), or
+   `semantic databricks define|update|plan` (Databricks Metric View YAML files,
+   never deployed). To propose a Metric View from an Ossie document, use
+   `semantic databricks --from-ossie <file>`; for the reverse,
+   `semantic ossie --from-metric-view <file>`. Read
    `${CLAUDE_SKILL_DIR}/references/semantic-layer.md` first.
 4. **Declare.** Read `data.declarations.<model>` on the plan envelope: `drafted`
    is what Dex measured, `declared` is what the YAML says, `missing` is the intent
@@ -413,7 +429,7 @@ fetches the engine's dependencies from PyPI or your configured index.
    `declarations` entry, and re-plan until `missing` holds only what you decided
    to leave open. For a declared mart, also read `data.semantic_proposal`: the
    semantic definition the declaration implies in the repository's own layer
-   (`vendor`: a MetricFlow model, or a SLayer or Cube model file stored as a
+   (`vendor`: a MetricFlow model, or a SLayer, Cube or Metric View file stored as a
    second plan whose id is `plan_id`), already planned (`mode: included`) or offered with
    the commands that adopt it (`mode: proposed`), with every gap it could not
    fill named and every declared field it could not carry in `not_carried`. When the user
@@ -575,6 +591,11 @@ a field, flag, or macro you need is not described here.
   A running Cube server does not reload an applied edit: tell the user to
   restart it before `explore semantic query` is run against the new model, which
   Dex otherwise refuses as a stale renderer.
+- For Databricks Metric Views, edit only the files listed in
+  `semantic.databricks.files`, each one view's whole YAML body (never the
+  `CREATE VIEW` SQL), and never write it through a YAML 1.1 library, which turns
+  a join's `on:` into `true:`. Dex never deploys the view: creating it in the
+  workspace is the user's step. The wrapper installs `[metric-views]`.
 - SLayer declares no entities, no aggregation on a saved measure (the formula
   carries it, as in `amount:sum`), and no per-measure time dimension (only the
   model's `default_time_dimension`). Never write those into a SLayer model.

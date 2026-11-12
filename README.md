@@ -54,24 +54,6 @@ npx skills add exmergo/dex
 npx skills add exmergo/dex --agent codex
 ```
 
-After installing the skills, ask your agent: “Initialize this repository with
-Dex.” The agent runs the installed wrapper; installing skills does not
-necessarily put a `dex` executable on your PATH.
-
-For the standalone CLI, install your connector extra and start setup:
-
-```bash
-uv tool install "exmergo-dex-core[duckdb]"
-dex init
-```
-
-Setup recommends creating a dbt-backed Dex project, with a complete local demo
-as the second option. It can also adopt existing dbt or configure exploration
-without dbt. It generates a project README and managed agent instructions,
-verifies the connection, and gives you a next command. It does not explore data
-or build models during setup. `.dex/` stays at the repository root; named dbt
-projects live beneath it.
-
 ## What you get
 
 - **Explore** your database, data warehouse, or SQL endpoint. Find the tables that matter, understand their structure, and verify how they join. Get column profiles, personal-data flags, and an ER diagram.
@@ -122,13 +104,27 @@ Writing SQL is one part of analytics engineering. Your agent also needs to:
 Dex gives the agent a repeatable explore, transform, maintain loop, with
 guardrails enforced in the engine.
 
-## Try it in three commands
+## Quickstart
 
-No existing database, no credentials, no cloud account, and no network once the
-package is installed.
+### Initialize
+If you want to use the python package `exmergo-dex-core`:
+
+1. Install it with `uv`, with the extras you need (i.e. DuckDB)
+```bash 
+uv tool install "exmergo-dex-core[duckdb]"
+```
+2. Initialize a Dex project (creatively called "analytics")
+```bash 
+dex init analytics
+```
+
+### Demo
+
+Try Dex in a demo experience with no existing database, no credentials, 
+no cloud account, and no network once the package is installed:
 
 ```bash
-pip install "exmergo-dex-core[duckdb]"
+uv tool install "exmergo-dex-core[duckdb]"
 dex init analytics --mode demo
 dex explore map
 ```
@@ -154,10 +150,10 @@ An excerpt, for one table:
 }
 ```
 
-### It is broken on purpose
+### The demo is broken (on purpose!)
 
-A first run that reports a clean bill of health teaches you nothing, so the demo
-ships with real defects. Dig into them:
+A first run that reports a clean bill of health doesn't teach us much, 
+so the demo ships with real defects. Dig into them:
 
 ```bash
 dex explore profile order_items products
@@ -430,6 +426,16 @@ Join the agent-native data/analytics community!
 - 🔗 [Follow Us on LinkedIn](https://www.linkedin.com/company/exmergo/)
 - 🐦 [Follow Us on X](https://x.com/exmergo)
 - 🔨 [Follow Us on GitHub](https://github.com/exmergo/)
+
+## Feedback and bug reports
+
+Found something wrong, or something Dex should do? Open an issue: bug reports and
+ideas are welcome, including ones your agent drafts for you. Run `dex feedback`
+for the environment to paste and links that prefill the
+[bug report](https://github.com/exmergo/dex/issues/new?template=bug_report.yml)
+and [feature request](https://github.com/exmergo/dex/issues/new?template=feature_request.yml)
+forms; nothing is sent. Security problems go to [SECURITY.md](SECURITY.md), never
+a public issue. More in [SUPPORT.md](SUPPORT.md).
 
 ## Contributing
 
