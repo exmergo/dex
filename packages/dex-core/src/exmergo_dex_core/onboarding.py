@@ -108,6 +108,7 @@ def _relative(root: Path, path: Path) -> str:
 
 
 def discover(root: Path) -> dict[str, Any]:
+    root = root.resolve()
     config = load_config(root)
     projects = [_relative(root, p) for p in discover_projects(root)]
     if config and config.dbt_project_dir:
@@ -496,9 +497,7 @@ def initialize(
         project_name = scaffold.result.project_name
     else:
         project_name = (
-            yaml.safe_load((root / selected / "dbt_project.yml").read_text()).get(
-                "name"
-            )
+            _project_name(root / selected)
             if selected
             and mode != "explore"
             and (root / selected / "dbt_project.yml").is_file()
@@ -642,6 +641,25 @@ def initialize(
     else:
         _write(root, "README.md", readme, result)
     return result
+
+
+def _project_name(project: Path) -> str:
+    try:
+        metadata = yaml.safe_load((project / "dbt_project.yml").read_text())
+    except yaml.YAMLError as exc:
+        raise RequestError(
+            "existing dbt_project.yml is not valid YAML; repair it and run dex init"
+        ) from exc
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(metadata.get("name"), str)
+        or not metadata["name"].strip()
+    ):
+        raise RequestError(
+            "existing dbt_project.yml needs a nonempty name; "
+            "repair the authored project configuration and run dex init again"
+        )
+    return metadata["name"]
 
 
 def _structure(root: Path, project_dir: str | None, warehouse: str | None) -> str:

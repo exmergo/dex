@@ -40,7 +40,7 @@ def cmd_init(args: argparse.Namespace, engine) -> env.Envelope:
     interactive = not args.no_interactive and sys.stdin.isatty() and sys.stderr.isatty()
     name, mode, project_dir = args.name, args.mode, args.project_dir
     agent_files = args.agent_file
-    root = Path(engine.repo_root)
+    root = Path(engine.repo_root).resolve()
     try:
         if interactive:
             from .config import load_config
@@ -114,6 +114,7 @@ def cmd_init(args: argparse.Namespace, engine) -> env.Envelope:
                 and mode != "demo"
                 and not engine.path
                 and not (config and config.duckdb)
+                and not existing_project
             ):
                 engine.path = _ask("Path to your existing DuckDB warehouse")
             elif connector and connector != "duckdb":
@@ -178,7 +179,7 @@ def cmd_init(args: argparse.Namespace, engine) -> env.Envelope:
         result = engine.initialize(name, **kwargs)
         if interactive and result.pending_confirmation:
             for diff in result.diffs:
-                print(diff.get("diff", diff), file=sys.stderr)
+                print(diff.get("unified") or diff, file=sys.stderr)
             if _ask("Apply this configuration change? (yes/no)", "no").lower() in {
                 "yes",
                 "y",

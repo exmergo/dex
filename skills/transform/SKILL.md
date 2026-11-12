@@ -386,9 +386,15 @@ fetches the engine's dependencies from PyPI or your configured index.
 
 ## Transforming, step by step
 
-1. **Project setup requested, or no dbt project yet?** Use `init "<name>" --connector <c>` through the installed wrapper for complete setup, including README, agent instructions and connection verification. It adopts an existing dbt project without replacing authored files. The legacy `transform init` scaffolder remains available. Both scaffold into `<name>/` by default, or the current directory with `--in-place`, before
-   anything else. Ask the user for the name and **confirm the connector with
-   them**: init never defaults one. Do not hand-write the skeleton. Read
+1. **Project setup requested, or no dbt project yet?** Use the installed wrapper
+   for complete setup, including README, agent instructions and connection
+   verification. For a new project, use `init "<name>" --connector <c>`;
+   for an existing project, use `init --mode adopt --project-dir <directory>`.
+   The adoption target is its directory, which may differ from the dbt project
+   name. Existing authored files are preserved. The legacy `transform init`
+   scaffolder remains available. New projects scaffold into `<name>/` by default,
+   or the current directory with `--in-place`. Confirm the connector and the
+   new project's name with the user; do not hand-write the skeleton. Read
    `${CLAUDE_SKILL_DIR}/references/init-and-dev-target.md` for per-connector
    setup, `--in-place`, `--layered-schemas`, and the namespace warning.
 2. **Find every use first** when a change has to land in more than one place:

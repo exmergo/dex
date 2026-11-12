@@ -425,3 +425,74 @@ def test_values_free_library_and_cli_refuse_setup_before_writes(tmp_path, capsys
     ):
         engine.initialize("analytics", mode="demo")
     assert not list(tmp_path.iterdir())
+
+
+def test_tty_adoption_from_relative_root(tmp_path, capsys, monkeypatch, duckdb_file):
+    import sys
+
+    (tmp_path / "dbt_project.yml").write_text("name: authored\n")
+    (tmp_path / "profiles.yml").write_text(
+        yaml.safe_dump(
+            {
+                "authored": {
+                    "target": "dev",
+                    "outputs": {"dev": {"type": "duckdb", "path": str(duckdb_file)}},
+                }
+            }
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(
+        "builtins.input", lambda: pytest.fail("adoption reprompted for a known path")
+    )
+    code, result = run(".", capsys)
+    assert code == 0, result
+    assert result["data"]["mode"] == "adopt"
+
+
+def test_discovery_resolves_a_symlinked_root(tmp_path, symlinks):
+    from exmergo_dex_core.onboarding import discover
+
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    (actual / "dbt_project.yml").write_text("name: authored\n")
+    linked = tmp_path / "linked"
+    linked.symlink_to(actual, target_is_directory=True)
+    assert discover(linked)["projects"] == ["."]
+
+
+def test_tty_configuration_review_prints_unified_diff(tmp_path, capsys, monkeypatch):
+    import sys
+
+    (tmp_path / ".dex").mkdir()
+    original = "connector: duckdb\nduckdb:\n  path: old.duckdb\n"
+    (tmp_path / ".dex/config.yml").write_text(original)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "no")
+    code = main(
+        ["--repo-root", str(tmp_path), "init", "analytics", "--path", "new.duckdb"]
+    )
+    output = capsys.readouterr()
+    assert code == 0
+    assert json.loads(output.out)["status"] == "needs_confirmation"
+    assert "--- a/.dex/config.yml\n+++ b/.dex/config.yml\n" in output.err
+    assert "{'path':" not in output.err
+    assert (tmp_path / ".dex/config.yml").read_text() == original
+    assert not (tmp_path / "analytics").exists()
+
+
+@pytest.mark.parametrize("metadata", ["", "[]\n", "name: null\n", "name: [broken\n"])
+def test_invalid_existing_project_metadata_is_actionable_before_writes(
+    tmp_path, capsys, metadata
+):
+    (tmp_path / "dbt_project.yml").write_text(metadata)
+    code, result = run(
+        tmp_path, capsys, "--connector", "duckdb", "--path", "missing.duckdb"
+    )
+    assert code == 1
+    assert "dbt_project.yml" in result["errors"][0]
+    assert not (tmp_path / ".dex/config.yml").exists()
+    assert not (tmp_path / "README.md").exists()
