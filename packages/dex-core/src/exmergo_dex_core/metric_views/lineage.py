@@ -275,6 +275,25 @@ def query_columns(source: str) -> tuple[list[str], list[str]] | None:
     return found, ambiguous
 
 
+def _has_aggregate(select: exp.Select) -> bool:
+    """Whether the select list aggregates its rows, outside window functions.
+
+    A window function keeps the row count, so an aggregate inside one does not
+    count; neither does one inside a subquery, which aggregates that query's
+    rows rather than this one's.
+    """
+
+    pending = list(select.expressions)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (exp.Window, exp.Subquery, exp.Select)):
+            continue
+        if isinstance(node, exp.AggFunc):
+            return True
+        pending.extend(node.iter_expressions())
+    return False
+
+
 def source_relation(source: str) -> SourceRelation:
     """A ``source`` as the relation behind it.
 
@@ -307,6 +326,8 @@ def source_relation(source: str) -> SourceRelation:
         for name, present in (
             ("a join", bool(tree.args.get("joins"))),
             ("a GROUP BY", tree.args.get("group") is not None),
+            ("an aggregate", _has_aggregate(tree)),
+            ("a HAVING", tree.args.get("having") is not None),
             ("DISTINCT", tree.args.get("distinct") is not None),
             ("a LIMIT", tree.args.get("limit") is not None),
             (
