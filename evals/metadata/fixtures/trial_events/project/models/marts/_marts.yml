@@ -1,0 +1,74 @@
+version: 2
+models:
+- name: subscription_activity
+  description: One row per customer subscription, with its billing event counts by tier.
+  config:
+    meta:
+      dex:
+        grain:
+        - subscription_id
+        population:
+          rule: Every customer subscription; internal subscriptions are excluded.
+          filters:
+          - column: is_internal
+            excludes:
+            - true
+        assumptions:
+        - decision: Whether internal subscriptions belong
+          chosen: excluded
+          evidence: request
+          column: is_internal
+          detail: the billing team asked for customer subscriptions only
+  columns:
+  - name: subscription_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+          null_rule: never
+  - name: plan_name
+    config:
+      meta:
+        dex:
+          role: dimension
+  - name: started_on
+    config:
+      meta:
+        dex:
+          role: time
+  - name: cancelled_on
+    description: The cancellation date; NULL while the subscription is active.
+    config:
+      meta:
+        dex:
+          role: time
+  - name: event_count
+    description: Every billing event of the subscription.
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: sum
+          additivity: additive
+          unit: count
+  - name: trial_event_count
+    description: Billing events in the trial tier.
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: sum
+          additivity: additive
+          unit: count
+  - name: paid_event_count
+    description: Billing events in the paid tier.
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: sum
+          additivity: additive
+          unit: count

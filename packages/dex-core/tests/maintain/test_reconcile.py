@@ -558,6 +558,12 @@ def test_staging_grain_drift_uses_existing_unique_test(maintain_repo):
     assert payload["diffs"] == []
     assert not any("stg_stg_orders" in warning for warning in payload["warnings"])
     assert not any("add a `unique` test" in warning for warning in payload["warnings"])
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "key_lost_uniqueness"
+    )
+    assert "fails on these duplicates" in proposal["action"]
 
 
 def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
@@ -571,6 +577,177 @@ def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
     assert rc == 0 and payload["status"] == "ok"
     assert payload["data"]["mechanical_count"] == 0
     assert payload["diffs"] == []
+    # The drift is on the source, so the staging model's own test may still pass:
+    # the proposal says the test exists, not that it is failing.
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "key_lost_uniqueness"
+    )
+    assert "already declares a unique test on order_id" in proposal["action"]
+    assert "fails on these duplicates" not in proposal["action"]
+
+
+def test_a_source_table_that_is_the_relation_keeps_the_staging_convention():
+    """A source whose identifier names the relation is ambiguous with a same-named
+    model, so the finding keeps resolving to the source's staging model (#1274)."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.maintain.declare import DeclarationEdits, Placed
+
+    files = {
+        "models/marts/dim_customers.sql": "select 1 as id\n",
+        "models/marts/dim_customers.yml": (
+            "version: 2\nmodels:\n  - name: dim_customers\n    columns:\n"
+            "      - name: id\n"
+        ),
+        "models/staging/stg_dim_customers.sql": "select 1 as id\n",
+        "models/staging/_sources.yml": (
+            "version: 2\nsources:\n  - name: raw\n    tables:\n"
+            "      - name: customer_input\n        identifier: dim_customers\n"
+        ),
+        "models/staging/stg_dim_customers.yml": (
+            "version: 2\nmodels:\n  - name: stg_dim_customers\n    columns:\n"
+            "      - name: id\n"
+        ),
+    }
+    view = DbtProjectView(
+        root=".",
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in files.items()
+        },
+    )
+    placed = DeclarationEdits(view, None).resolve("dim_customers")
+    assert isinstance(placed, Placed), placed
+    assert placed.model == "stg_dim_customers" and not placed.built
+
+
+def test_an_alias_keeps_the_staging_convention():
+    """Without a compiled manifest a filename does not say which model an alias
+    builds as, so an alias on either side keeps the convention (#1274)."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.maintain.declare import DeclarationEdits, Placed
+
+    def resolve(files: dict[str, str], table: str):
+        view = DbtProjectView(
+            root=".",
+            project_name="p",
+            profile_name="p",
+            files={
+                path: SourceFile(path=path, content=content, sha256="x")
+                for path, content in files.items()
+            },
+        )
+        return DeclarationEdits(view, None).resolve(table)
+
+    yml = "version: 2\nmodels:\n  - name: {0}\n    columns:\n      - name: id\n"
+    # orders.sql builds archived_orders; current_orders.sql builds orders
+    swapped = {
+        "models/marts/orders.sql": (
+            "{{ config(alias='archived_orders') }}\nselect 1 as id\n"
+        ),
+        "models/marts/orders.yml": yml.format("orders"),
+        "models/marts/current_orders.sql": (
+            "{{ config(alias='orders') }}\nselect 1 as id\n"
+        ),
+    }
+    # the alias is in the YAML instead
+    renamed = {
+        "models/marts/dim_x.sql": "select 1 as id\n",
+        "models/marts/dim_x.yml": (
+            yml.format("dim_x") + "    config:\n      alias: dim_x_live\n"
+        ),
+    }
+    for files, table in ((swapped, "orders"), (renamed, "dim_x")):
+        placed = resolve(files, table)
+        assert not (isinstance(placed, Placed) and placed.built), placed
+
+
+def _lost_key_on_a_mart(maintain_repo, id_tests: str) -> dict:
+    """A mart outside models/staging/ whose key repeats after the snapshot (#1274)."""
+
+    maintain_repo.edit(
+        "models/marts/dim_customers.sql",
+        "select * from {{ source('main', 'customers') }}\n",
+    )
+    maintain_repo.edit(
+        "models/marts/dim_customers.yml",
+        "version: 2\n"
+        "\n"
+        "models:\n"
+        "  - name: dim_customers\n"
+        "    columns:\n"
+        "      - name: id\n"
+        f"        tests: [{id_tests}]\n",
+    )
+    maintain_repo.sql("CREATE TABLE dim_customers AS SELECT * FROM customers")
+    maintain_repo.dex("explore", "map", "--verify")
+    maintain_repo.snapshot()
+    # Only the key repeats: the other columns stay unique, so `id` is the one
+    # lost key reconcile has to place.
+    maintain_repo.sql(
+        "INSERT INTO dim_customers SELECT id, name || '_again', "
+        "'again' || email, created_at + 1000 FROM dim_customers WHERE id <= 5"
+    )
+    rc, grain = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and any(
+        finding["code"] == "key_lost_uniqueness"
+        and finding["identifier"].endswith(".dim_customers")
+        for finding in grain["data"]["findings"]
+    ), grain
+    rc, payload = maintain_repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert not any("stg_dim_customers" in w for w in payload["warnings"]), payload[
+        "warnings"
+    ]
+    return payload
+
+
+def test_a_lost_key_on_a_mart_gets_the_unique_test_in_the_marts_yaml(maintain_repo):
+    payload = _lost_key_on_a_mart(maintain_repo, "not_null")
+    diff = next(
+        d for d in payload["diffs"] if d["path"] == "models/marts/dim_customers.yml"
+    )
+    assert "unique" in diff["unified"]
+
+
+def test_a_lost_key_on_a_mart_keeps_its_existing_unique_test(maintain_repo):
+    payload = _lost_key_on_a_mart(maintain_repo, "unique, not_null")
+    assert payload["diffs"] == []
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "key_lost_uniqueness"
+    )
+    action = proposal["action"]
+    assert "on id in models/marts/dim_customers.yml fails on these" in action
+    assert not any("add a `unique` test" in w for w in payload["warnings"]), payload[
+        "warnings"
+    ]
+
+
+def test_a_filtered_unique_test_on_a_mart_is_named_not_called_failing(maintain_repo):
+    """A `where` filter can leave the duplicates out of the test, so the proposal
+    says the test exists rather than that it fails (#1274)."""
+
+    payload = _lost_key_on_a_mart(
+        maintain_repo, "{unique: {config: {where: 'id > 100'}}}, not_null"
+    )
+    assert payload["diffs"] == []
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "key_lost_uniqueness"
+    )
+    action = proposal["action"]
+    assert "models/marts/dim_customers.yml already declares a unique test on id" in (
+        action
+    )
+    assert "fails on these duplicates" not in action
 
 
 # --- a declared composite grain outranks a column-level unique -----------------
@@ -1292,9 +1469,39 @@ def test_dangling_reference_names_the_vendor_authoring_command(vendor, command):
     assert "restore the model/column it references" in action
 
 
+def test_dangling_reference_under_an_unauthored_vendor_names_no_command(
+    monkeypatch,
+):
+    """A vendor dex reads but does not author gets no route to run, never dbt's
+    `semantic update`, which would edit a layer nobody reads. Databricks was the
+    one such vendor until #1258; the tuple is narrowed to keep the rule tested."""
+    from exmergo_dex_core import config
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    monkeypatch.setattr(
+        config,
+        "SEMANTIC_DOCUMENT_AUTHORING",
+        tuple(v for v in config.SEMANTIC_DOCUMENT_AUTHORING if v != "databricks"),
+    )
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dangling_reference",
+        identifier="orders.revenue",
+        detail="metric references a measure that is gone",
+    )
+    action = _advisory(finding, semantic_vendor="databricks").action
+    assert "`semantic" not in action
+    assert "edit the semantic definition in its file" in action
+    assert "restore the model/column it references" in action
+
+
 def test_semantic_update_command_helper():
     from exmergo_dex_core.maintain.reconcile import _semantic_update_command
 
     assert _semantic_update_command("dbt") == "semantic update"
     assert _semantic_update_command("OSSIE") == "semantic ossie update"
     assert _semantic_update_command(None) == "semantic update"
+    # Databricks Metric Views are authored natively since #1258.
+    assert _semantic_update_command("databricks") == "semantic databricks update"

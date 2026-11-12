@@ -1,0 +1,53 @@
+version: 2
+models:
+- name: stg_subscriptions
+  description: One row per subscription the billing feed knows, internal ones included.
+  columns:
+  - name: subscription_id
+    data_tests:
+    - unique
+    - not_null
+  - name: cancelled_on
+    description: The cancellation date; NULL while the subscription is active.
+- name: stg_events
+  description: One row per billing event, with its tier code mapped to the canonical tier.
+  config:
+    meta:
+      dex:
+        grain:
+        - event_id
+        population:
+          rule: Every event the billing feed sends.
+        assumptions:
+        - decision: How a tier code maps to a tier
+          chosen: the mapping in the event_tier_codes seed; an unlisted code is kept as sent
+          evidence: contract
+          column: event_tier
+          detail: event_tier_codes lists the canonical tier for each code the feed sends
+  columns:
+  - name: event_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+          null_rule: never
+  - name: subscription_id
+    config:
+      meta:
+        dex:
+          role: foreign_key
+  - name: event_tier
+    description: The canonical tier (trial or paid), or the code as sent where the seed lists
+      none.
+    config:
+      meta:
+        dex:
+          role: dimension
+  - name: occurred_on
+    config:
+      meta:
+        dex:
+          role: time

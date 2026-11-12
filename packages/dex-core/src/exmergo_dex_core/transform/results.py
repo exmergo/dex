@@ -152,6 +152,47 @@ class PlanResult(Result):
         return payload
 
 
+class RepairResult(PlanResult):
+    """A drafted package override, stored as an ordinary plan (#1229).
+
+    ``repair`` leads the payload after the plan id: the node, the error read,
+    each conversion with its evidence or the reason it stayed unresolved, and
+    what the restatement changed, so a reader cut off early still learns whether
+    the draft converts what failed.
+    """
+
+    repair: dict[str, Any] = Field(default_factory=dict)
+
+    def data(self) -> dict[str, Any]:
+        """The plan's payload with ``repair`` right after its identity."""
+
+        payload = super().data()
+        head = {k: payload.pop(k) for k in ("plan_id", "intent") if k in payload}
+        return {**head, "repair": self.repair, **payload}
+
+
+class BridgeResult(PlanResult):
+    """One layer proposed from the other through the Ossie bridge (#1260).
+
+    ``bridge`` leads the payload after the plan's identity: the direction, the
+    converter commit, and per conversion its source, output, status and every
+    notice, so what was dropped or rewritten is read before the diff. A
+    conversion whose output path is not on the write surface stores no plan,
+    and ``plan_id`` is then null rather than empty, as on ``transform declare``.
+    """
+
+    bridge: dict[str, Any] = Field(default_factory=dict)
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        if not self.plan_id:
+            return {"plan_id": None, "bridge": self.bridge}
+        payload = super().data()
+        head = {k: payload.pop(k) for k in ("plan_id", "intent") if k in payload}
+        return {**head, "bridge": self.bridge, **payload}
+
+
 class PropagationResult(PlanResult):
     """A rename or a removal, propagated across the project as one plan.
 
@@ -540,6 +581,12 @@ class RefactorComparisonResult(Result):
     a claim about a build, or about any input that was not compared. Every field
     here is a count, a name or a type: no row comes back.
 
+    With a stated expectation (#1157) ``status`` is ``as_expected`` or
+    ``unexpected`` instead (``matches_expected_change``, ``unexpected_change``),
+    and ``expectation`` says how. Its ``unexpected_keys`` is the one place key
+    values appear: key columns only, at most five per class, through the query
+    firewall, so a PII-flagged key is withheld (``samples_withheld``).
+
     ``keyed`` is present only when a key was given or declared, and unique on both
     sides. ``key_source`` says which, because a key the request named and one a
     declaration stated are different evidence.
@@ -574,8 +621,17 @@ class RefactorComparisonResult(Result):
     # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
     # so `cold` does not mean every input was built cold. None with no build.
     inputs_built_by: dict[str, Any] | None = None
+    # How the difference matches a stated expected change (#1157): the clauses,
+    # the counts split into matching and unexpected, the failed clauses, and up
+    # to five unexpected keys per class, firewall-cleared. Absent with no
+    # expectation.
+    expectation: dict[str, Any] | None = None
+    # A digest of the stated expectation, recorded with the verdict.
+    expectation_digest: str | None = None
 
     def data(self) -> dict[str, Any]:
+        """The comparison as ``data``: identity, verdict, counts and any expectation."""
+
         branch = {"baseline_vars": self.baseline_vars} if self.baseline_vars else {}
         if self.proposed_vars:
             branch["proposed_vars"] = self.proposed_vars
@@ -604,6 +660,7 @@ class RefactorComparisonResult(Result):
             "key_source": self.key_source,
             "keyed": self.keyed,
             "keyed_reason": self.keyed_reason,
+            **({"expectation": self.expectation} if self.expectation else {}),
             "profiled_on_demand": self.profiled_on_demand,
         }
 

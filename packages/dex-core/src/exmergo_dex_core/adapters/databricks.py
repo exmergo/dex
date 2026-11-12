@@ -388,7 +388,17 @@ class DatabricksAdapter:
 
     def _register(self, table: Any) -> None:
         identifier = str(table.full_name)
-        table_type = str(getattr(table, "table_type", "") or "")
+        raw_type = getattr(table, "table_type", "") or ""
+        # The SDK hands an enum (`TableType.METRIC_VIEW`); a fake or an older
+        # SDK, the text. Its value is the text either way.
+        table_type = str(getattr(raw_type, "value", raw_type))
+        if table_type.upper() == "METRIC_VIEW":
+            # A deployed Metric View is a semantic definition, not a relation:
+            # Databricks refuses a plain SELECT of its measure columns
+            # (METRIC_VIEW_MISSING_MEASURE_FUNCTION), so a profile or a grain
+            # probe over it would fail the whole command (#1259). Its YAML is
+            # read from the repository under `semantic.vendor: databricks`.
+            return
         columns = self._column_metas_from(getattr(table, "columns", None))
         if columns is not None:
             self._columns[identifier] = columns

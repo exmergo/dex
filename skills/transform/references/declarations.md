@@ -227,6 +227,7 @@ Each fact carries the `evidence` it rests on, and a fact the cache cannot suppor
 | `domains` | the cached value domain of each column the SQL filters (`where`, `having`, `qualify`) or branches on (`case`), capped by `profile_value_domain_cap` with the rest counted in `elided`. A PII-flagged column's values are never drafted: `values` is null and `withheld` says why |
 | `precedent` | for each upstream column the SQL filters, branches on or aggregates, what the project's other models reading the same relation do with it: `this_model` (this model's own uses), then `groups`, one per filter conjunct (`where`, `having`, `qualify`), `CASE` condition (`case`) or aggregation (`aggregation`), with `count` and `models`, and `usage: none` for readers that keep every value. See below |
 | `inputs` | every relation the SQL reads; one the cache has not profiled is `profiled: false` with the `command` that would profile it |
+| `population_parent` | for a model that declares no `population.parent`, the entity dex drafts it is about (#1228), with `evidence`, `supported_by`, `detail`, `alternatives`, `driving_relation` and `drives_from_parent`; `{"value": null, "withheld": "<why>"}` where nothing qualifies. See "A drafted parent" below |
 | `incomplete` | why part of the SQL was not read: a macro or jinja block, a set operation, an unqualified column in a multi-relation select |
 
 `declared` is what the model's YAML entry says once the plan lands: this
@@ -323,6 +324,42 @@ cost handshake on a billed connector), `row_delta` is its delta and the warning
 cites it; where it did not, the warning carries attribution's reason. Nothing
 here runs a query of its own, refuses a plan, or blocks apply.
 
+### A drafted parent
+
+Most models declare no `population.parent`, so the population checks above
+would never run on them. For each such model the plan drafts one (#1228), keyed
+by the model's grain (the declared grain, else a uniqueness test on the model,
+else the grain the SQL proves; a `GROUP BY` proves one with no cache), from four
+kinds of evidence, strongest first:
+
+| `evidence` | The candidate |
+|---|---|
+| `unique_key` | a model, seed or snapshot of the project or an installed package whose `unique` or combination test, declared grain, or profiled key is the grain, column for column |
+| `relationship` | the parent a `relationships` test, a declared `references` or a verified orphan-free join names for each grain column, on this model or on the column the grain is carried from |
+| `description` | the noun after "one row per" in the description names the candidate, which carries the grain columns |
+| `driving` | the relation that drives the SQL, when the grain is carried from it unchanged and the model does not aggregate it |
+
+A source is never a candidate (it is the raw table under a staging model), nor
+is the model itself, anything downstream of it, or a time spine or model
+generated in SQL (#988). The best tier wins, then the most tiers agreeing, then
+an ancestor of the model, then the candidate the others descend from;
+`alternatives` lists the runners-up. A declared `population.parent` always wins
+and is never drafted over.
+
+```json
+"population_parent": {
+  "value": {"model": "stg_conversations", "key": {"conversation_id": "conversation_id"}},
+  "evidence": "unique_key", "supported_by": ["unique_key", "relationship"],
+  "detail": "conversation_id is unique on stg_conversations (a unique test); ...",
+  "drafted": true, "driving_relation": "stg_parts", "drives_from_parent": false}
+```
+
+A warning names the draft. `drives_from_parent: false` means the rows come from
+a relation outside the parent's lineage (the child table), so the model holds
+whatever keys that table holds. The draft is never written into the project.
+`transform build --verify` measures the built model against it; see
+"Measured against a drafted parent" below.
+
 ### Change scope
 
 `data.change_scope` (#1115) is what an edit to an existing model changes beside
@@ -345,7 +382,16 @@ otherwise. So the scope of a repair is stated with what already exists:
   is a `null_handling_changed` that changes what NULL meant;
 - an inferred default stays `default`: retaining parents without children,
   keeping a roster whole when the request names only metrics. The assumption's
-  `detail` says why in one line and travels in `data.decisions`.
+  `detail` says why in one line and travels in `data.decisions`;
+- re-driving a model (#1228): the relations its rows come from change, or its
+  declared `population.parent` is removed or replaced. That is a `redriven`
+  population change (`reason: redriven`), judged against the applied model or,
+  for a model only an earlier unapplied plan wrote, that plan (`against:
+  earlier_plan`). It is `declared` only by an assumption on the model at
+  `request` or `contract` tier; a `precedent`, `data` or `default` one leaves it
+  `undeclared`, since which entity a model is about is never settled by
+  observed counts. NULL aggregates on a parent-driven model point at the join
+  key, not at a new driving relation.
 
 The full record is in `commands.md` under `transform plan`.
 
@@ -455,6 +501,35 @@ maintain skill's `axes.md`, "Join contract".
 
 A model derived from a dbt snapshot's status history declares its temporal
 contract in `history`; see "Temporal contracts: `history`" below.
+
+### Measured against a drafted parent
+
+`transform build --verify` also measures each built model that declares no
+parent against the one drafted for it (#1228), with the declared-parent
+statement plus one count. With `--for-plan` only the plan's models are drafted,
+and one no parent could be drafted for gets an `unchecked` record
+(`no_parent_drafted`); without a plan, up to 25 built models are, the rest
+counted in a note. `maintain verify` measures declared parents only. Each gets
+a record under `data.verification.population_delta`:
+
+| Count | Meaning |
+|---|---|
+| `orphan_keys` | the model's distinct keys the drafted parent does not have |
+| `missing_parents` | the parent's keys (after any declared `population.filters` the parent can evaluate) with no row in the model |
+| `empty_rows`, `empty_columns`, `empty_share` | rows whose child columns (the aggregates, else the columns from a join's outer side) are all NULL or zero: a signal of parents kept with no children to investigate, not proof, since children whose amounts sum to zero read the same |
+
+`status` is `satisfied` (no orphans, no missing parent, `empty_share` at most
+0.05), `needs_decision`, `settled`, `not_applicable` (both sides empty) or
+`unchecked` with a `reason_code`. `needs_decision` raises a `population_delta`
+finding (`high` with orphans, `medium` with missing parents, `low` for empty
+rows alone) and is listed under `data.completion.obligations.needs_decision`.
+It asks which rows the model is for; dex never picks. Answer it with
+`population.parent` (then the declared check governs), or with an assumption
+naming the key `column` at `request`, `contract` or `precedent` tier, which
+makes the record `settled` with `settled_by`. Every key an orphan says the join
+or the parent is suspect, not that the model should be driven from the child
+table. Counts and key column names only: no key value is reported. A drafted
+parent never appears under `parent_population` or `suppressed`.
 
 A check that could not run is named in `data.suppressed` (`unit`, `additivity`,
 `population`, `parent_population`, `temporal`, and `grain` on the build path) with the reason: nothing in scope
@@ -680,7 +755,7 @@ One model file per mart, `models/<data_source>/<mart>.yaml` under
 | Declaration | SLayer model |
 | --- | --- |
 | `grain` | `primary_key: true` on each grain column, a composite grain included |
-| any role | a column, typed from the SQL's casts or the cache's profile (`INT`, `DOUBLE`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `TEXT`); a summed measure of unknown type is `DOUBLE`, with a note |
+| any role | a column, typed from the SQL's casts or the cache's profile (`INT`, `DOUBLE`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `TEXT`); a summed measure of unknown type is `DOUBLE`, with a note. A list type (`VARCHAR[]`, `text[]`, `ARRAY<STRING>`, Snowflake `ARRAY`) is `type: ARRAY` with the `element_type` its element names, `UNKNOWN` for a list of lists or structs or a semi-structured `ARRAY` |
 | the first `time` column | `default_time_dimension` (only where its type is known to be a date or a timestamp) |
 | `foreign_key` with `references` | a `many_to_one` join to the SLayer model already sitting on the parent's table; where none does, no join and a note |
 | `measure` with `aggregation` | a saved measure named `<column>_<agg>`, formula `<column>:<agg>`: `sum`, `avg` (`average`, `mean`), `min`, `max`, `count`, `count_distinct`, `median`. SLayer keeps columns and measures in one namespace, so a name a column already holds fails the derivation rather than being renamed |
@@ -737,6 +812,33 @@ Included and proposed work as for SLayer, against `semantic.cube.files`: listed
 paths are stored as a plan of their own (`plan_id`; apply both), others are
 proposed with the `dex config set semantic.cube.files '[...]'` that adds them.
 
+### Databricks Metric Views (`semantic.vendor: databricks`)
+
+One file per mart, `<dir>/<mart>.yaml` (the one directory and suffix the
+configured files share, `metric_views/` and `.yaml` where they share none). A
+Metric View has **no metadata key**: Databricks refuses any key its
+specification does not list, so a fact with no native construct is named in
+`not_carried` rather than written.
+
+| Declaration | Metric View |
+| --- | --- |
+| the mart's relation | `source` (the siblings' `catalog.schema`, else the manifest relation, else the bare name as a limitation) |
+| any role but `measure` | a field, `expr: <column>`; a date or timestamp column (from the SQL, the cache or a `time` role) gets `format: {type: date, date_format: year_month_day}` or `{type: date_time, date_format: year_month_day, time_format: locale_hour_minute_second}` (Databricks refuses either without its formats), the only way a Metric View marks a field temporal |
+| `measure` with `aggregation` | a measure `<column>_<agg>`: `SUM`, `AVG` (`average`, `mean`), `MIN`, `MAX`, `MEDIAN`, `COUNT`, `COUNT(DISTINCT ...)`. Fields and measures share one namespace, so the suffix keeps the measure from shadowing its column |
+| `semi_additive` | no measure, named in `limitations`: a window measure (`semiadditive: last`) needs an ordering field and a range, which is the author's call |
+| `unit` | `currency:<code>` as `format: {type: currency, currency_code: <code>}`, `fraction` as `format: {type: percentage}` (Databricks displays it multiplied by 100); `percent` and any unit on a count are not carried |
+| `foreign_key` with `references` | a `many_to_one` join named after the parent, `on: source.<column> = <parent>.<parent column>`, on the parent's relation; `rely: {at_most_one_match: true}` only where the parent's own declaration states that column as its whole grain |
+| `description`, `population` | the view's `comment`, the population as its last sentence; never a `filter`. The catalog withholds that sentence, as every native catalog does |
+| a column's `description` | the member's `comment` |
+| `grain`, `null_rule`, `additivity`, `assumptions` | not carried: a view declares no key on its own source, and there is no metadata key |
+
+A view already on the mart's table is `skipped`; a file whose stem is the mart's
+name on another source is `failed`. Included and proposed work as for SLayer,
+against `semantic.databricks.files`. A join's `source` is the source of the view
+already on the parent's table where one is configured. A derived join is declared
+for exploration and `maintain grain`; a Metric View exposes only its fields, so
+add a field that reads it (`<parent>.<column>`) to query through it.
+
 ### Ossie (`semantic.vendor: ossie`)
 
 One dataset per mart, appended as a new list item to a configured document:
@@ -766,7 +868,7 @@ else the manifest relation, else the bare name as a limitation). A dataset alrea
 on the mart's table is `skipped`; one holding its name in the target document is
 `failed`.
 
-### Declarations on `semantic slayer`, `semantic cube` and `semantic ossie`
+### Declarations on `semantic slayer`, `semantic cube`, `semantic ossie` and `semantic databricks`
 
 `semantic slayer define|update|plan` take the same `declarations` key beside
 `edits`. There a declaration **annotates** a SLayer model the payload's edits or
@@ -790,6 +892,15 @@ metric `<field>_<agg>`, a `references` adds a relationship to the parent dataset
 field in the same document, and the rest lands in `ai_context` as above. Only that
 dataset's list item is rewritten, and a relationship is appended, so every other
 byte of the document is kept.
+`semantic databricks` does the same for a view (`model` is the file's stem): the
+description and population sentence become the root `comment`, a column's
+description and unit become its member's `comment` and `format`, a declared
+aggregation with no member adds a measure `<column>_<agg>`, and a `references`
+naming another configured view adds a join on that view's `source` (with no
+`rely`, since the native route reads no parent declaration). Only those parts are
+spliced, read and written as YAML 1.2, so every other byte, comment and `on:` key
+is kept; the grain, NULL rule, additivity and assumptions are named in
+`not_carried`.
 
 Per model, `status` is one of:
 

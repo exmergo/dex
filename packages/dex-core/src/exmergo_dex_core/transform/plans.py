@@ -126,6 +126,10 @@ class TransformPlan(BaseModel):
     # `undeclared`, plus `unchecked` where the edit could not be read.
     # Bookkeeping outside the digest, read by a `--for-plan` build.
     change_scope: dict[str, list[dict[str, Any]]] | None = None
+    # A package override `transform repair` drafted (#1229): the node, the
+    # conversions and what they rest on, read by a `--for-plan` build to hold the
+    # repair to its obligations. Bookkeeping outside the digest, like the two above.
+    repair: dict[str, Any] | None = None
     # The retirement contract (#858): which flag value's behavior survives and
     # what each output must hold. Intent rather than bookkeeping, so unlike the
     # two above it travels in the plan document and, where present, its digest.
@@ -618,7 +622,13 @@ def plan(
 
         warnings.extend(missing_macro_warnings(edits, view))
         warnings.extend(
-            column_contract_warnings(edits, view, cache=read_cache, dialect=dialect)
+            column_contract_warnings(
+                edits,
+                view,
+                cache=read_cache,
+                dialect=dialect,
+                compiled_models=compiled_models,
+            )
         )
         if dialect is not None:
             warnings.extend(reserved_column_warnings(edits, dialect))
@@ -1008,6 +1018,7 @@ def column_contract_warnings(
     *,
     cache: Callable[[], Any] | None = None,
     dialect: str | None = None,
+    compiled_models: Any = None,
 ) -> list[str]:
     """Warn when a model's authored SELECT list diverges from what its
     schema.yml declares, in either direction (issue #214).
@@ -1073,9 +1084,12 @@ def column_contract_warnings(
     from ..dbt_project import column_contract_divergence
     from ..model_versions import cached_version_map, label_for_file
     from .select_list import resolve_select_list
+    from .validate import lists_columns
 
     warnings: list[str] = []
-    catalog = _ProjectCatalog(edits, view, schema_sources, cache, dialect)
+    catalog = _ProjectCatalog(
+        edits, view, schema_sources, cache, dialect, compiled_models=compiled_models
+    )
     versions = cached_version_map(catalog.files, view.model_paths)
     for edit in edits:
         if (
@@ -1090,8 +1104,17 @@ def column_contract_warnings(
             continue
         declared_lower = {c.lower(): None for c in declared}
 
+        compiled = (compiled_models or {}).get(edit.path)
+        if compiled is None and lists_columns(edit.new_content):
+            warnings.append(
+                f"{edit.path}: schema.yml declares column(s) for {model}, but "
+                "the SELECT list could not be resolved statically "
+                "(compilation was not possible); the contract comparison was skipped"
+            )
+            continue
+        sql_to_resolve = compiled.sql if compiled is not None else edit.new_content
         resolved = resolve_select_list(
-            edit.new_content,
+            sql_to_resolve,
             dialect=dialect,
             relation_columns=catalog.reader(frozenset({model.lower()})),
         )
@@ -1145,6 +1168,7 @@ class _ProjectCatalog:
         schema_sources: dict[str, str],
         cache: Callable[[], Any] | None,
         dialect: str | None,
+        compiled_models: Any = None,
     ) -> None:
         from .declarations import post_change_files
 
@@ -1153,6 +1177,8 @@ class _ProjectCatalog:
         self.schema_sources = schema_sources
         self.cache = cache
         self.dialect = dialect
+        self.compiled_models = compiled_models
+        self.project_name = getattr(view, "project_name", None)
         from ..model_versions import cached_version_map, label_for_file
 
         vmap = cached_version_map(self.files, self.model_paths)
@@ -1167,29 +1193,48 @@ class _ProjectCatalog:
         }
 
     def reader(self, stack: frozenset[str]) -> Callable[[Any], Any]:
+        """Build a column reader for the given recursion stack."""
+
         return lambda relation: self._columns(relation, stack)
 
     def _columns(self, relation: Any, stack: frozenset[str]) -> Any:
+        """Resolve columns for a relation, using compiled model SQL if available."""
+
         from .declarations import model_sql_path
         from .select_list import RelationColumns, resolve_select_list
 
         inner: str | None = None
-        if relation.kind == "ref" and len(relation.parts) == 1:
+        is_own_ref = relation.kind == "ref" and (
+            len(relation.parts) == 1
+            or (
+                len(relation.parts) == 2
+                and self.project_name is not None
+                and relation.parts[0].lower() == self.project_name.lower()
+            )
+        )
+        if is_own_ref:
             model = relation.label.lower()
             if model in stack:
                 return RelationColumns(reason=f"a ref() cycle through {relation.name}")
             path = model_sql_path(self.files, self.model_paths, relation.label)
             if path is not None:
-                resolved = resolve_select_list(
-                    self.files[path],
-                    dialect=self.dialect,
-                    relation_columns=self.reader(stack | {model}),
-                )
-                if resolved.columns is not None:
-                    return RelationColumns(
-                        sorted(resolved.columns), read_from=resolved.read_from
+                compiled = (self.compiled_models or {}).get(path)
+                from .validate import lists_columns
+
+                if compiled is None and lists_columns(self.files[path]):
+                    inner = "compilation was not possible"
+                else:
+                    sql = compiled.sql if compiled is not None else self.files[path]
+                    resolved = resolve_select_list(
+                        sql,
+                        dialect=self.dialect,
+                        relation_columns=self.reader(stack | {model}),
                     )
-                inner = resolved.reason
+                    if resolved.columns is not None:
+                        return RelationColumns(
+                            sorted(resolved.columns), read_from=resolved.read_from
+                        )
+                    inner = resolved.reason
             if model in self.changed:
                 return RelationColumns(
                     reason=(

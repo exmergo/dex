@@ -57,6 +57,7 @@ from .values_free import (
 # surfaces from drifting apart the way `DexEngine.check()` once had (it dropped
 # the object-scope argument all four of its sibling detectors accept).
 COMMAND_SURFACE: dict[str, list[str]] = {
+    "init": [],
     "connect": ["test"],
     "explore": [
         "inventory",
@@ -83,6 +84,8 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # Declarations for models that already exist (#501): opt-in, one capped
         # plan per call, repo-and-cache only.
         "declare",
+        # A failing package model's project override, drafted as a plan (#1229).
+        "repair",
         "test",
         # Whether a stored plan keeps a model's results (#856).
         "compare",
@@ -129,6 +132,10 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     # before an engine is built, like `config`: an agent with only the package,
     # or a harness with no project yet, must be able to get it.
     "procedure": [],
+    # feedback: what a bug report or feature request needs and where it goes
+    # (#1299). No subcommands, routed before an engine like `procedure`: the
+    # moment to report something is often the moment the project is broken.
+    "feedback": [],
 }
 
 
@@ -270,6 +277,7 @@ def _sub_connection_options() -> argparse.ArgumentParser:
 #: I run first", which is exactly what a caller piping the output into
 #: `head -30` is looking for and not finding.
 _GROUP_HELP: dict[str, str] = {
+    "init": "set up a Dex project, adopt dbt, or explore without dbt",
     "connect": "check a connector's own credentials and capabilities",
     "explore": "make sense of a warehouse: rank objects, profile columns, infer joins",
     "transform": "author and refactor dbt models, tests, and the semantic layer",
@@ -280,6 +288,8 @@ _GROUP_HELP: dict[str, str] = {
     "(no credentials, no network)",
     "procedure": "print the agent procedure, or the block to paste into "
     "CLAUDE.md / AGENTS.md (no connection)",
+    "feedback": "report a bug or suggest an improvement: the environment to "
+    "paste and prefilled issue links (no connection, nothing sent)",
 }
 
 #: (group, subcommand) -> (summary, description). The summary is the one line
@@ -406,6 +416,14 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "intent the --edits-file declarations supply. Capped at 25 models; "
         "every skipped model is named. Repo-only and free.",
     ),
+    ("transform", "repair"): (
+        "draft an override that repairs a failing package model",
+        "Read the latest build's failure of a package model, restate its SQL as "
+        "a project override (package macros qualified, vars resolved, the "
+        "package node disabled), convert the columns the error names where the "
+        "cached profile settles what they hold, compile it, and store it as a "
+        "plan. Nothing is applied.",
+    ),
     ("transform", "test"): (
         "scaffold a unit test, or mutation-test existing tests",
         "--scaffold plans a unit_tests skeleton for a model. --mutate plants "
@@ -460,7 +478,9 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
     ("semantic", "ossie"): (
         "plan whole-document edits to a native Apache Ossie layer",
         "Validate whole Ossie documents at the paths semantic.ossie.files "
-        "configures, then store a plan. Needs the [ossie] extra. Repo-only.",
+        "configures, then store a plan. --from-metric-view proposes the document "
+        "from a Metric View file through dex's port of apache/ossie-converters. "
+        "Needs the [ossie] extra. Repo-only.",
     ),
     ("semantic", "slayer"): (
         "plan whole-file edits to the configured SLayer model files",
@@ -474,6 +494,15 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "semantic.cube.files configures, with dex's port of Cube's model rules, "
         "then store a plan. Needs the [cube] extra. No Cube server, no "
         "warehouse. Repo-only.",
+    ),
+    ("semantic", "databricks"): (
+        "plan whole-file edits to the Metric View YAML files",
+        "Validate whole Metric View YAML files at the paths "
+        "semantic.databricks.files configures, with dex's port of the Metric View "
+        "YAML 1.1 rules, then store a plan. --from-ossie proposes the view from an "
+        "Ossie document through dex's port of apache/ossie-converters. Needs the "
+        "[metric-views] extra. Never deploys a view and opens no workspace "
+        "connection. Repo-only.",
     ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
@@ -576,6 +605,8 @@ ranks what matters, profiles it, and infers how the tables join.
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """The argparse tree for every group and subcommand."""
+
     parser = argparse.ArgumentParser(
         prog="dex",
         description=(
@@ -611,6 +642,54 @@ def _build_parser() -> argparse.ArgumentParser:
             help=_GROUP_HELP.get(group),
             description=_GROUP_HELP.get(group),
         )
+        if group == "init":
+            from .onboarding import MODES
+
+            gp.add_argument(
+                "name",
+                nargs="?",
+                help="dbt project name; '.' is in-place; .dex stays at repo root",
+            )
+            gp.add_argument(
+                "--mode",
+                choices=MODES,
+                help="new project, complete demo, adopt dbt, or explore without dbt",
+            )
+            gp.add_argument(
+                "--project-dir",
+                help="existing dbt project to adopt (repository-relative)",
+            )
+            gp.add_argument("--target", help="existing dev target to adopt")
+            gp.add_argument(
+                "--dev-destination",
+                help="dev namespace: dataset, schema, or database/catalog.schema",
+            )
+            gp.add_argument(
+                "--agent-file",
+                action="append",
+                choices=["AGENTS.md", "CLAUDE.md"],
+                help="agent instruction file to update; repeat to select both",
+            )
+            gp.add_argument(
+                "--no-agent-instructions",
+                action="store_true",
+                help="skip managed agent instructions",
+            )
+            gp.add_argument(
+                "--no-interactive",
+                action="store_true",
+                help="return structured missing inputs without terminal questions",
+            )
+            gp.add_argument(
+                "--layered-schemas",
+                action="store_true",
+                help="build each dbt layer into its own schema",
+            )
+            gp.add_argument(
+                "--in-place",
+                action="store_true",
+                help="scaffold dbt in the current directory",
+            )
         if group == "demo":
             # Positional rather than --path: --path names the warehouse dex
             # reads, everywhere, and this is the one command that writes one.
@@ -634,6 +713,13 @@ def _build_parser() -> argparse.ArgumentParser:
                 metavar="FILE",
                 default=None,
                 help="report whether FILE carries the current procedure (repeatable)",
+            )
+        if group == "feedback":
+            gp.add_argument(
+                "--command",
+                metavar="SUBCOMMAND",
+                default=None,
+                help="the command that misbehaved, named in the bug report link",
             )
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
@@ -1154,9 +1240,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     )
                     sp.add_argument(
                         "--select",
+                        nargs="+",
                         default=None,
                         metavar="SELECTOR",
-                        help="dbt node selection, passed through to dbt",
+                        help=(
+                            "dbt node selection (one or more selectors, or quoted), "
+                            "passed through to dbt"
+                        ),
                     )
                     # Opt-in on every connector, free ones included. Verifying
                     # on DuckDB costs nothing, so defaulting it on there was
@@ -1310,9 +1400,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="return the reasoning without storing a plan",
                     )
+                if group == "transform" and name == "repair":
+                    sp.add_argument(
+                        "nodes",
+                        nargs="*",
+                        metavar="model",
+                        help="a failing package model (`model` or `pkg.model`)",
+                    )
                 if group == "transform" and name == "declare":
-                    # The selector `maintain verify` takes: model names, repeated
-                    # or comma-separated; none selects every model.
+                    # The selector `maintain verify` takes: model names, repeated,
+                    # comma-separated, or in one quoted argument separated by
+                    # spaces; none selects every model.
                     sp.add_argument(
                         "objects",
                         nargs="*",
@@ -1375,6 +1473,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=None,
                         metavar="COLUMN",
                         help="baseline column whose type may change in its family",
+                    )
+                    expect = sp.add_mutually_exclusive_group()
+                    expect.add_argument(
+                        "--expect",
+                        default=None,
+                        metavar="JSON",
+                        help="JSON: the rows the plan may add, remove and change",
+                    )
+                    expect.add_argument(
+                        "--expect-file",
+                        default=None,
+                        metavar="PATH",
+                        help='read --expect\'s JSON from a file ("-" reads stdin)',
                     )
                     sp.add_argument(
                         "--target",
@@ -1506,6 +1617,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="FILE",
                         help="whole-document edits payload as JSON; '-' reads stdin",
                     )
+                    # The Ossie bridge (#1260): the configured layer proposed from
+                    # one file of the other format, through the ported converter.
+                    # The flags are the bridge table's, so no vendor is named here.
+                    from .transform.semantic_bridge import bridge_arguments
+
+                    for flag, kwargs in bridge_arguments(name):
+                        sp.add_argument(flag, **kwargs)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {
@@ -1521,7 +1639,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         nargs="*",
                         metavar="object",
                         help=(
-                            "dbt selector to verify (default: the whole project)"
+                            "model names: repeated, comma-separated or "
+                            "space-separated (default: all)"
                             if name == "verify"
                             else "object to check (default: the whole project)"
                         ),
@@ -1620,6 +1739,13 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # First, and without `ensure_dialect_available`: demo authors no SQL a guard
     # has to clear, and it must stay reachable on the lightest install that can
     # run it, which is the one a first-time user has.
+    """Dispatch one parsed command to its handler and return its envelope."""
+
+    if args.group == "init":
+        from .onboarding_cli import cmd_init
+
+        return cmd_init(args, engine)
+
     if args.group == "demo":
         from .demo.commands import cmd_demo
 
@@ -1696,6 +1822,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
         ("transform", "declare"): "cmd_declare",
+        ("transform", "repair"): "cmd_repair",
         ("transform", "test"): "cmd_test",
         ("transform", "compare"): "cmd_compare",
         ("transform", "export"): "cmd_export",
@@ -1847,6 +1974,9 @@ def main(argv: list[str] | None = None) -> int:
     # and it runs before the handlers below.
     spend: dict | None = None
     connection = env.Connection()
+    # The class of an exception the catch-all below rendered, for the report
+    # pointer an internal error carries (#1299); None when a handler built it.
+    internal_exception: str | None = None
     # Resolved before anything can refuse, so even a refusal states the mode. An
     # unknown DEX_RESULT_MODE is itself a refusal, rendered below like any other.
     result_mode: ResultMode | None = None
@@ -1879,12 +2009,34 @@ def main(argv: list[str] | None = None) -> int:
 
             require_allowed(result_mode, _command_label(args))
             envelope = cmd_procedure(args)
+        elif args.group == "feedback":
+            # No engine: a broken config or connection is a common reason to
+            # report something, and must not stop the command that helps (#1299).
+            from .feedback import cmd_feedback
+
+            require_allowed(result_mode, _command_label(args))
+            envelope = cmd_feedback(
+                args,
+                repo_root=repo_root(args),
+                result_mode=result_mode.value if result_mode else None,
+            )
         else:
             # One engine per process, built from the resolved repo root. The default
             # backend is what lets the subcommands stay stateless across invocations:
             # `.dex/` on disk is how the exploration cache and the cumulative session
             # budget survive from one command to the next, and any backend selected
             # here has to be durable across processes for the same reason.
+            if args.group == "init" and (
+                getattr(args, "session_ceiling", None) is not None
+                or getattr(args, "no_session_ceiling", False)
+                or getattr(args, "budget", None) is not None
+            ):
+                from .errors import RequestError
+
+                raise RequestError(
+                    "dex init does not set spending limits; use the "
+                    "cost-confirmation flow when running exploration or builds"
+                )
             engine = DexEngine.from_repo(
                 repo_root(args),
                 cache_backend=getattr(args, "cache_backend", None),
@@ -1928,6 +2080,7 @@ def main(argv: list[str] | None = None) -> int:
         if paradigm is None and getattr(args, "connector", None):
             paradigm = paradigm_for(args.connector)
         envelope = env.error_for(exc, env.redact(str(exc)))
+        internal_exception = type(exc).__name__
 
     # A command that failed still spent what it spent. Only the two-phase
     # refusals used to say so (budget exhaustion carries its own spend), so a
@@ -1990,12 +2143,32 @@ def main(argv: list[str] | None = None) -> int:
     # semantic query --api` sets `hosted` because dbt Cloud owns that spend, and
     # a genuine "no connector resolved" stays null rather than borrowing
     # `free_local`, which is DuckDB's answer and not a way to say nothing.
-    if envelope.cost.paradigm is None and paradigm is not None:
+    if (
+        envelope.cost.paradigm is None
+        and paradigm is not None
+        and (args.group != "init" or envelope.data.get("connector") is not None)
+    ):
         envelope.cost.paradigm = paradigm
 
     # The connection identity is stamped centrally, just like cost paradigm:
     # handlers cannot drift, and filling it performs no extra warehouse read.
-    envelope.connection = connection
+    if args.group != "init" or not envelope.connection.connector:
+        envelope.connection = connection
+
+    # An exception dex did not anticipate is most likely dex's own defect, so the
+    # envelope says so and hands over a prefilled report link (#1299). The link
+    # names the command, connector and exception class, never the error text.
+    if envelope.reason is env.Reason.INTERNAL and "report" not in envelope.data:
+        from .feedback import report_pointer
+
+        envelope.data["report"] = report_pointer(
+            command=command_args.command_name(args) or None,
+            # An engine that never got built stamped no connection, so the flag
+            # is the only evidence of a connector, as for the paradigm above.
+            connector=envelope.connection.connector or getattr(args, "connector", None),
+            exception=internal_exception,
+            result_mode=result_mode.value if result_mode else None,
+        )
 
     # Every envelope a values-free process prints says so, refusals and asks
     # included, so a host can assert the mode on whatever comes back (#591).

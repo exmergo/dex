@@ -67,7 +67,9 @@ Under `semantic.vendor: slayer` the SLayer models are also held to the warehouse
 by SLayer's own `validate-models` rules, run on the metadata Dex captured and
 never through a SLayer datasource: `declared_column_missing`,
 `declared_type_conflict` (SLayer's type buckets: number, string, boolean,
-temporal), `declared_relation_missing` (a table gone since the baseline), and
+temporal, and a list; a column that became a list is `remedy_kind: reingest`
+with the warehouse's `element_type`, and reconcile states it as a `type: ARRAY`
+declaration rather than `slayer ingest`), `declared_relation_missing` (a table gone since the baseline), and
 `declared_dependency_dropped` (a join, measure or filter lost to another drop).
 Each carries the model's whole removal under `data.removal`, which is what
 `maintain reconcile` plans.
@@ -224,7 +226,12 @@ Needs no baseline. The classes of finding:
   `transform build --full-refresh --verify`, only one the build did not rebuild,
   or a microbatch model). A model that
   generates its rows in SQL, such as `range(...)` or a `VALUES` clause, has no
-  parent relation. That is named in `notes`. A real parent relation that is
+  parent relation. That is named in `notes`. A model whose driving parent is
+  the project's time spine (a `time_spine:` config, or the
+  `metricflow_time_spine` name) or a model generated in SQL
+  (`dbt_utils.date_spine` included) is not compared either, since the spine
+  supplies anchors rather than a population, and `notes` names it (#988). A
+  model that only joins a spine keeps its check. A real parent relation that is
   absent from the warehouse is still a warning.
 - **Column contract**: `column_missing`, `column_undeclared` and
   `column_type_mismatch`, the built relation's columns against `schema.yml`.
@@ -234,6 +241,20 @@ Needs no baseline. The classes of finding:
   `unique_combination_of_columns` test, a semantic model's primary entity,
   then a naming guess. `data.source` says which one. A declared grain is
   counted in the declared-fact statement below, so it is priced with it.
+  `data.grain_coverage` (#1223) holds one record per declared key, whichever
+  source declared it (`model`, `columns`, `source`, `status`, `reason`,
+  `measured`), so a key that held is stated rather than read out of an absent
+  finding. `status` is `proven` (the exact distinct count reached the row
+  count), `broken` (beside its `grain_broken` finding), `not_applicable`
+  (`empty_relation`), `unchecked` or `not_planned` (`priority`: a key from a
+  lower-ranked source the model's checked keys displaced; one on the same
+  columns as a checked key is judged by it and gets no record of its own).
+  `unchecked` names its `reason`: `no_relation`, `ambiguous`,
+  `metadata_unreadable`, `missing_columns`, `scan` (the connector could not
+  run the count), `scan_offered`, `no_count`, `refused` or `not_measured`. The
+  naming guess has no record, and the field is absent when the grain class is
+  suppressed. Only `proven` is a pass. `measured` carries the row and distinct
+  counts where both were read; the warehouse's own words stay in `notes`.
 - **Join contract** (#228, #857): every equality join's coverage, measured
   with one aggregate probe per driving relation and recorded under
   `data.join_coverage`, one record per join:
@@ -326,6 +347,20 @@ Needs no baseline. The classes of finding:
     relation the manifest names for it; with `--target dev` (and on a build's
     `--verify`) a package that sets `+schema` is read in the
     `<dev schema>_<name>` namespace dbt built it into.
+  - `population_delta` (high with orphan keys, medium with missing parents,
+    low for parents kept with no children), on `transform build --verify`
+    only, for a built model that declares no `population.parent` (#1228): the
+    same counts against the parent dex drafts for it, plus the rows whose child
+    columns are all NULL or zero (a sign of parents kept with no children, not
+    proof: children whose amounts sum to zero read the same). It asks which rows the model is for rather
+    than calling any of them wrong. Its records are under
+    `data.verification.population_delta` (`satisfied`, `needs_decision`,
+    `settled`, `not_applicable`, `unchecked`), and it is never named in
+    `suppressed`. Not every such model gets one: with `--for-plan` only the
+    plan's models are drafted (one the draft cannot reach is `unchecked`),
+    without it at most 25, and a model nothing could be drafted for is named in
+    `notes`, so an absent record does not mean the model was checked.
+    `maintain verify` measures declared parents only.
   - `temporal_transition_count_mismatch`, `temporal_latest_transition_mismatch`
     and `temporal_first_attainment_mismatch` (high), `temporal_population_missing`
     and `temporal_population_unexpected` (high), and
@@ -401,6 +436,24 @@ and `maintain check` while the layer holds one, so the layer never reads clean.
 A measure whose `filters` read a dropped column goes with the column rather than
 losing its filter, because a filter removed quietly changes what the number
 counts.
+
+## Databricks Metric View layers (`semantic.vendor: databricks`)
+
+Every layer-neutral axis runs on a Metric View layer, beside a dbt project or with
+none, without a workspace connection to read it: each reads the configured files
+and the metadata Dex captured through its own connection. The wrapper installs the
+`[metric-views]` extra for every `maintain` command where the vendor is
+`databricks`.
+
+| Axis | On Metric Views |
+|---|---|
+| `snapshot` | fingerprints each view, each joined table that is not another view's source (`view.join.path`, with the fields that read it and its `rely` key), each measure (as `view.measure`), and each join with its ordered pairs, oriented child to parent; records `vendor: databricks`, the ported converter commit and `format_version: 1.1`, and each file's declared `version` under `definition_versions` |
+| `schema` | adds the four `declared_*` codes, each naming the view, the element (`dimensions['region']`, `measures['revenue']`, `joins['customer.nation']`, `filter`, `source`) and the column. `declared_column_missing`: a field, measure, `filter`, join `on`/`using`, or query `source` reads a column its table no longer has. `declared_relation_missing`: the view's `source` (the whole view) or a join's `source` gone since the baseline. `declared_type_conflict`: a `date`/`date_time` format on a column that is not temporal, a number, currency, percentage or byte format on text, or `SUM`/`AVG` over text. `declared_dependency_dropped`: a field, measure (through `MEASURE()` too), window, or nested join that loses an input to another removal. A relation neither the connection nor the baseline lists, and an expression Dex cannot read, are named in `warnings` as unchecked |
+| `volume` | unchanged: it reads the warehouse, not the layer |
+| `grain` | measures each `rely.at_most_one_match` key (`declared_grain_not_unique`, worded as the view's claim and carrying `declared_by: databricks`, `claim: unique`, since Databricks trusts the flag and returns wrong numbers when it is false) and each join's declared arity (`join_cardinality_exceeded`, a `many_to_one` join whose joined side is not unique, `rely` or not) |
+| `semantic` | definition drift free as everywhere: a view, measure or join added, removed or changed, and a field reading a column the warehouse no longer has. A view re-saved in a spec version Dex does not read is `semantic_format_changed` for that file, naming it and both versions; the other views are still compared by content |
+| `reconcile` | the schema findings' removals are cut out of the view files and stored as a `semantic databricks update` plan under `data.semantic_plan_id`, validated by the reader before it is stored: each removed field, measure and join (a nested join goes with its parent), and a contradicted `format` (the member stays). Every other byte is kept and `on:` stays text. Advisory, never written: a view or join whose `source` is gone, a `filter` reading a dropped column (the view's population), a query `source` reading one, a removal a `materialization` names, one that would leave no field and no measure, and a file already holding a key Databricks refuses |
+| `verify` | checks the dbt project only |
 
 ## SLayer layers (`semantic.vendor: slayer`)
 

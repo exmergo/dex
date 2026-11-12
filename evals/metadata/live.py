@@ -291,7 +291,8 @@ def _flags(command: str, start: int, quoted: list[tuple[int, int]]) -> list[str]
 # A literal plan id. `$PLAN`, a flag or a redirect names none this can read.
 _PLAN_ARGUMENT = re.compile(r"\s+(\w[\w.-]*)")
 _STATUS = re.compile(r'"status"\s*:\s*"(\w+)"')
-_VERDICTS = ("equivalent", "different", "not_checked")
+# `as_expected` and `unexpected` are a comparison against a stated change (#1157).
+_VERDICTS = ("equivalent", "different", "not_checked", "as_expected", "unexpected")
 
 
 def _result_text(block: dict[str, Any]) -> str:

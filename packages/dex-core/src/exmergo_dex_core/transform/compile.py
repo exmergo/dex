@@ -17,12 +17,17 @@ import yaml
 
 from .. import command_args
 from ..adapters import get_dialect
-from ..dbt_project import profiles_dir
+from ..dbt_project import DbtProjectError, profiles_dir
 from ..envelope import EstimateQuality
 from ..guards.cost_guard import ConfirmationRequiredError
 from .build import _child_environ, _collect_messages, assert_dev_target, shadow_project
 from .plans import EditKind, PlanEdit
-from .validate import CompiledModel, EditValidationError, needs_compilation
+from .validate import (
+    CompiledModel,
+    EditValidationError,
+    has_control_flow,
+    needs_compilation,
+)
 
 TIMEOUT_SECONDS = 120
 
@@ -281,18 +286,24 @@ _FORCE_ENABLED = "{{ config(enabled=true) }}"
 
 
 def compile_models(
-    engine, edits: list[PlanEdit]
+    engine, edits: list[PlanEdit], *, force: set[str] | None = None
 ) -> tuple[dict[str, CompiledModel], CompileQueries]:
-    """Compile the complete proposed project, admitting SQL through the engine."""
+    """Compile the complete proposed project, admitting SQL through the engine.
+
+    ``force`` names model paths compiled even with no control flow: a drafted
+    package override (#1229) is checked by dbt's compile, macros and governed
+    introspection included, before it is stored.
+    """
 
     from . import dev_target
 
+    forced = force or set()
     wanted = {
         edit.path: edit
         for edit in edits
         if edit.kind is EditKind.MODEL_SQL
         and edit.new_content is not None
-        and needs_compilation(edit.new_content)
+        and (edit.path in forced or needs_compilation(edit.new_content))
     }
     broker = CompileQueries(engine)
     if not wanted:
@@ -302,16 +313,31 @@ def compile_models(
     except ModuleNotFoundError:
         available = False
     if not available:
-        raise EditValidationError(
-            "control-flow models require dbt; install the connector extra "
-            "(for example exmergo-dex-core[duckdb])"
-        )
+        if any(
+            has_control_flow(edit.new_content)
+            for edit in wanted.values()
+            if edit.new_content
+        ):
+            raise EditValidationError(
+                "control-flow models require dbt; install the connector extra "
+                "(for example exmergo-dex-core[duckdb])"
+            )
+        return {}, broker
     project = Path(engine.project_dir()).resolve()
     target = engine.config.dbt_target or "dev"
     assert_dev_target(target, engine.config.dbt_target)
     connector = engine.connector or engine.config.connector
     dialect = get_dialect(connector)
-    profiles = profiles_dir(project).resolve()
+    try:
+        profiles = profiles_dir(project).resolve()
+    except DbtProjectError as exc:
+        if any(
+            has_control_flow(edit.new_content)
+            for edit in wanted.values()
+            if edit.new_content
+        ):
+            raise EditValidationError(str(exc)) from exc
+        return {}, broker
     try:
         with shadow_project(project, edits) as shadow:
             effective = engine.config.model_copy(update={"connector": connector})
@@ -327,9 +353,16 @@ def compile_models(
                 # the disposable project. Normalize only the copied profile.
                 profile_file = shadow / "profiles.yml"
                 if not profile_file.is_file():
-                    raise EditValidationError(
-                        "control-flow compilation requires the post-edit profiles.yml"
-                    )
+                    if any(
+                        has_control_flow(edit.new_content)
+                        for edit in wanted.values()
+                        if edit.new_content
+                    ):
+                        raise EditValidationError(
+                            "control-flow compilation requires the post-edit"
+                            " profiles.yml"
+                        )
+                    return {}, broker
                 raw = yaml.safe_load(profile_file.read_text(encoding="utf-8"))
                 if not isinstance(raw, dict):
                     raise EditValidationError("profiles.yml must be a YAML mapping")

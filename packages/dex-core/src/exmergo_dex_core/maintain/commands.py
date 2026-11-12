@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
-from .. import command_args
+from .. import command_args, model_scope
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
@@ -1082,15 +1082,11 @@ def verify(
         if build_notes:
             suppressed["build_status"] = build_notes[0]
 
+    # A scope may be spelled as separate arguments, comma-separated, or as one
+    # quoted argument with the names separated by spaces: `a b`, `"a b"` and
+    # `a,b` all name the same models (#1243).
     wanted = (
-        {
-            name.strip().lower()
-            for raw in objects
-            for name in raw.split(",")
-            if name.strip()
-        }
-        if objects
-        else None
+        {name.lower() for name in model_scope.model_names(objects)} if objects else None
     )
     cost = None
     adapter = None
@@ -1098,6 +1094,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    grain_coverage: list[dict] | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
@@ -1225,6 +1222,12 @@ def verify(
                 else ([], [])
             )
             proven_grains: dict[str, dict] = {}
+            grain_coverage = []
+            spine_or_generated = (
+                verify_mod.spine_or_generated_models(project_dir, adapter.dialect)
+                if project_dir is not None
+                else set()
+            )
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1233,6 +1236,8 @@ def verify(
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
+                records=grain_coverage,
+                spine_or_generated=spine_or_generated,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1312,6 +1317,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
                 findings = verify_mod.damp_fanout(
@@ -1331,6 +1337,10 @@ def verify(
 
     if wanted and join_coverage is not None:
         join_coverage = [r for r in join_coverage if r["model"].lower() in wanted]
+    if grain_coverage is not None:
+        grain_coverage = _complete_grain_coverage(
+            definitions, grain_coverage, scope=wanted
+        )
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
@@ -1342,6 +1352,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        grain_coverage=grain_coverage,
     )
     if cost is not None:
         result.cost = cost
@@ -1369,9 +1380,8 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
     running and then being discarded by that later filter.
     """
 
-    declared_by_model, undeclared, plan_notes = verify_mod.column_contract_plan(
-        project_dir, scope=scope
-    )
+    plan = verify_mod.column_contract_plan(project_dir, scope=scope)
+    declared_by_model, undeclared, plan_notes = plan
     if not declared_by_model and not undeclared:
         reason = (
             plan_notes[0]
@@ -1386,6 +1396,7 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
         model_relations,
         [o.identifier for o in live],
         undeclared,
+        package_entries=getattr(plan, "package_entries", None),
     )
     return findings, plan_notes + finding_notes, None
 
@@ -1399,6 +1410,8 @@ def _grain_contract(
     scope=None,
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1437,8 +1450,45 @@ def _grain_contract(
         [o.identifier for o in live],
         scoped_models,
         proven=proven,
+        records=records,
+        spine_or_generated=spine_or_generated,
     )
     return findings, notes, None
+
+
+def _complete_grain_coverage(
+    definitions, records: list[dict], *, scope: set[str] | None = None
+) -> list[dict]:
+    """``grain_coverage`` as the result carries it (#1223): the records the
+    grain axis and the declared-fact statement wrote, a ``not_planned`` record
+    for each declared key the priority rule left out, and an ``unchecked``
+    record (``not_measured``) for any planned key neither path reached, so no
+    declared key is ever absent. Sorted by model, then source rank."""
+
+    declared = verify_mod.declared_grain_candidates(definitions, scope=scope)
+    planned = verify_mod.grain_plan(definitions, scope=scope)
+    seen = {
+        (r["model"], r["source"], tuple(c.lower() for c in r["columns"]))
+        for r in records
+    }
+    complete = list(records)
+    for model, candidates in planned.items():
+        for candidate in candidates:
+            marker = (
+                model,
+                candidate.source,
+                tuple(c.lower() for c in candidate.columns),
+            )
+            if marker not in seen:
+                complete.append(
+                    verify_mod.grain_record(
+                        model, candidate, "unchecked", "not_measured"
+                    )
+                )
+    complete.extend(verify_mod.not_planned_grain_records(declared, planned))
+    if scope:
+        complete = [r for r in complete if r["model"].lower() in scope]
+    return verify_mod.sort_grain_records(complete)
 
 
 def _join_contract(
@@ -1965,10 +2015,10 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # A repository whose only layer is a semantic one (#912) still has
             # that layer's own findings to reconcile, through its own route;
             # only the project's half has nowhere to land.
-            if not any(
-                semantic_source is not None and semantic_source.handles_finding(f)
-                for f in findings
-            ):
+            # A semantic vendor with no project beside it is that repository's
+            # one layer: its findings on the other axes (a contradicted key on
+            # grain, say) are advisory there too, never a refusal (#1259).
+            if semantic_source is None:
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(
                 f"no transformation project to edit ({exc}), so every proposal "
@@ -2092,7 +2142,13 @@ def _reconcile_semantic(
                     proposal.paths = []
         else:
             result.diffs = [*result.diffs, *planned.diffs]
-            result.warnings.extend([*planned.warnings, *planned.notes])
+            # The plan re-reads the layer, so its notes repeat what the report
+            # already carried; each is said once.
+            result.warnings.extend(
+                w
+                for w in dict.fromkeys([*planned.warnings, *planned.notes])
+                if w not in result.warnings
+            )
             result.semantic_plan_id = planned.plan_id
     result.proposals = _mechanical_first([*result.proposals, *proposals])
 

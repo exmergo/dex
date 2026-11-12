@@ -39,6 +39,7 @@
     }
   ],
   "procedure": {
+    "compare_expected_before_apply": true,
     "build_after_apply": true
   }
 }

@@ -461,7 +461,10 @@ class SemanticCatalogView:
 
         Matching is case-insensitive substring over each element's name, label and
         description, plus a metric's own groupable tokens, so searching a
-        dimension token finds the metrics that can be grouped by it.
+        dimension token finds the metrics that can be grouped by it, and the
+        ``synonyms`` a layer declares for a dimension or a metric (a Databricks
+        Metric View's, carried in ``vendor_params``), which exist for exactly this:
+        finding an element by a word other than its name.
         """
 
         wanted = list(
@@ -472,6 +475,10 @@ class SemanticCatalogView:
 
         def hits(term: str, *values: Any) -> bool:
             return any(term in str(value).lower() for value in values if value)
+
+        def synonyms(element: Any) -> list[str]:
+            listed = (getattr(element, "vendor_params", None) or {}).get("synonyms")
+            return [str(s) for s in listed] if isinstance(listed, list) else []
 
         matched: set[str] = set()
         unmatched: list[str] = []
@@ -484,6 +491,7 @@ class SemanticCatalogView:
                     metric.label,
                     metric.description,
                     *metric.dimensions,
+                    *synonyms(metric),
                 ):
                     found.add(metric.name)
             # An element other than a metric is matched for the metrics that
@@ -519,6 +527,7 @@ class SemanticCatalogView:
                     dimension.definition,
                     dimension.label,
                     dimension.description,
+                    *synonyms(dimension),
                 )
             }
             for metric in self.metrics:

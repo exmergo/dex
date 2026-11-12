@@ -138,7 +138,7 @@ def test_rendering_never_constructs_a_sql_client(monkeypatch):
     def refuse(*_args, **_kwargs):
         raise AssertionError("rendering reached for a SQL client")
 
-    monkeypatch.setattr(SlayerQueryEngine, "_client_for", refuse)
+    monkeypatch.setattr(SlayerQueryEngine, "client_for", refuse)
     monkeypatch.setattr(SlayerSQLClient, "__init__", refuse)
 
     assert renderer().render(QUERY).sql
@@ -209,12 +209,31 @@ def test_the_read_only_store_overrides_every_abstract_persisting_method():
     assert ValidatedModelStorage.__abstractmethods__ == frozenset()
 
 
-def test_rendering_never_imports_slayer_s_file_or_sqlite_storage(tmp_path):
-    """In a fresh interpreter, since another test may have imported either."""
+def test_rendering_never_opens_slayer_s_file_or_sqlite_storage(tmp_path):
+    """In a fresh interpreter, so no other test's storage counts.
+
+    SLayer's query engine imports its YAML storage at module load (since 1.6),
+    so the property held is that rendering never constructs either backend,
+    which is what would read or write a storage directory.
+    """
 
     script = textwrap.dedent(
         """
-        import sys, yaml
+        import yaml
+        from slayer.storage.sqlite_storage import SQLiteStorage
+        from slayer.storage.yaml_storage import YAMLStorage
+
+        opened = []
+
+        def record(name):
+            def init(self, *args, **kwargs):
+                opened.append(name)
+                raise AssertionError(f"rendering opened {name}")
+            return init
+
+        YAMLStorage.__init__ = record("YAMLStorage")
+        SQLiteStorage.__init__ = record("SQLiteStorage")
+
         from exmergo_dex_core.slayer import loader
         from exmergo_dex_core.slayer.render import SlayerRenderer
 
@@ -232,10 +251,7 @@ def test_rendering_never_imports_slayer_s_file_or_sqlite_storage(tmp_path):
         )
         query = {"source_model": "orders", "measures": ["revenue"]}
         SlayerRenderer(result.models, connector="duckdb").render(query)
-        print(sorted(
-            name for name in sys.modules
-            if name in ("slayer.storage.yaml_storage", "slayer.storage.sqlite_storage")
-        ))
+        print(sorted(opened))
         """
     )
     run = subprocess.run(  # noqa: S603 - a fixed script, run by this interpreter

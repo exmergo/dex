@@ -1,0 +1,5 @@
+{
+  "kind": "diagnose",
+  "models": ["subscription_activity"],
+  "prompt": "Subscription 1021 has no `cancelled_on` in `subscription_activity`. Is data missing? Fix the model if something is wrong."
+}

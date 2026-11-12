@@ -27,14 +27,21 @@ or uv 0.13.4+ to install.
 
 ```bash
 pip install "exmergo-dex-core[duckdb]"
-dex demo
+dex init analytics --mode demo
 dex explore map
 ```
 
 After installation, this runs locally with no credentials, cloud account, or
-network. Run it in a scratch directory: `dex demo` creates `dex_demo.duckdb`
-(7 e-commerce tables, 29,512 rows) and `.dex/config.yml`. It refuses to overwrite
-an existing warehouse and leaves an existing project config untouched.
+network. Run it in a scratch directory: initialization creates `dex_demo.duckdb`
+(7 e-commerce tables, 29,512 rows), `.dex/config.yml`, a dbt skeleton under
+`analytics/`, and managed README and agent instructions. It verifies the connection
+without exploring or building. Reruns preserve authored content.
+
+Run `dex init` for guided setup. Creating a Dex project is recommended; the demo
+is the second option. Existing dbt projects can adopt Dex without replacing their
+project or profiles, and exploration does not require dbt. All machine output
+remains one JSON envelope; terminal questions and completion go to stderr.
+`dex transform init` retains its legacy additive-scaffolder behavior.
 
 The demo has defects on purpose. The map reports 5 inferred joins, 6 PII-flagged
 columns, and 6 data-quality findings. For example, a double-loaded batch makes
@@ -110,6 +117,7 @@ Additional capabilities have their own extras:
 | `ossie` | Reading, validating, authoring, and maintaining native Apache Ossie documents |
 | `slayer` | SLayer model files, validated against one pinned SLayer release |
 | `cube` | Reading and authoring plain-YAML Cube model files, with no Node and no Cube server |
+| `metric-views` | Reading and authoring Databricks Unity Catalog Metric View YAML files, with no workspace connection |
 | `cluster` | Bounded k-means exploration with `explore cluster` |
 | `all` | Every connector and optional capability above; a substantially larger install |
 
@@ -306,6 +314,7 @@ Choose the layer in `.dex/config.yml` using `semantic.vendor` and
 | Apache Ossie | `vendor: ossie`, `deployment: local` | Reads native repository documents; catalog, authoring, and drift checks, with no query runtime |
 | SLayer | `vendor: slayer`, `deployment: local` | Reads configured model files; SLayer renders SQL and Dex executes it through its connector and cost guard |
 | Cube | `vendor: cube`, `deployment: local` | Reads and authors configured plain-YAML model files statically; catalog, authoring, and drift checks, with no query runtime yet |
+| Databricks Metric Views | `vendor: databricks`, `deployment: local` | Reads and authors configured Metric View YAML files statically (`semantic databricks`, derivation from declared marts); catalog and drift checks, never deploying, with no query runtime yet |
 
 Discover the catalog before choosing a metric or filter. On a dbt layer, for
 example, with a declared `revenue` metric:

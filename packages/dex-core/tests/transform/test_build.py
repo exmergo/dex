@@ -4306,6 +4306,8 @@ def test_cli_build_timeout_populates_envelope_spend(
         pytest.param("marts", id="outside-the-dev-naming"),
         # dbt's default naming for `+schema: marts` (#1155).
         pytest.param("dbt_dev_marts", id="derived-from-the-dev-dataset"),
+        # the layered schemas prefix form from transform init --layered-schemas (#1201).
+        pytest.param("marts_dev", id="layered-schemas-prefix-form"),
     ],
 )
 def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
@@ -4422,10 +4424,155 @@ def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(
         reason = verification["suppressed"]["row_population"]
         assert "outside dex's read scope" in reason
         assert "custom schema" in reason
+        assert "generate_schema_name" in reason
     else:
         assert "row_population" not in verification["suppressed"]
         notes = envelope["data"].get("notes") or []
-        assert any("dbt_dev_marts" in n for n in notes), notes
+        assert any(dataset in n for n in notes), notes
+
+
+def test_layered_schemas_build_verification_reads_all_layers_on_warehouse(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """a warehouse project scaffolded with layered schemas gets row-population
+    and declared-fact checks on staging, intermediate, and mart models, and notes
+    name each namespace read (#1201)."""
+
+    pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+    from google.cloud import bigquery
+
+    from exmergo_dex_core import connect
+    from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+    from exmergo_dex_core.transform import dev_target
+
+    def table(dataset: str, name: str, rows: int) -> FakeTable:
+        return FakeTable(
+            project="dex-test",
+            dataset_id=dataset,
+            table_id=name,
+            schema=[bigquery.SchemaField("id", "INTEGER")],
+            num_rows=rows,
+            num_bytes=rows * 100,
+        )
+
+    client = FakeBigQueryClient(project="dex-test", tables=[table("raw", "orders", 5)])
+
+    def opener(**kwargs):
+        config = kwargs["config"]
+        return BigQueryAdapter(
+            project="dex-test",
+            cost_gate=connect.new_cost_gate(
+                "bigquery",
+                config,
+                kwargs["store"],
+                budget=kwargs.get("budget"),
+                confirmed=kwargs.get("confirmed", False),
+                command=kwargs.get("command"),
+            ),
+            target=config.bigquery,
+            client=client,
+            principal_type="user",
+        )
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    monkeypatch.setattr(connect, "open_adapter", opener)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    monkeypatch.setattr(build_module, "compile_estimate", lambda *a, **k: (0.0, {}, []))
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: bigquery\n"
+        "dbt_project_dir: analytics\n"
+        "bigquery:\n"
+        "  project: dex-test\n"
+        "  datasets: [raw]\n"
+        "  dev_dataset: dbt_dev\n",
+        encoding="utf-8",
+    )
+    target = dex_target(bigquery_project_dir)
+    target.mkdir(parents=True, exist_ok=True)
+
+    layers = [
+        ("stg_orders", "staging_dev"),
+        ("int_orders", "intermediate_dev"),
+        ("fct_orders", "marts_dev"),
+    ]
+    sources = {
+        "stg_orders": "`dex-test`.`raw`.`orders`",
+        "int_orders": "`dex-test`.`staging_dev`.`stg_orders`",
+        "fct_orders": "`dex-test`.`intermediate_dev`.`int_orders`",
+    }
+    nodes = {
+        f"model.dex_test.{name}": {
+            "name": name,
+            "resource_type": "model",
+            "relation_name": f"`dex-test`.`{ds}`.`{name}`",
+            "config": {
+                "materialized": "table",
+                "meta": {"dex": {"grain": ["id"]}},
+            },
+            "columns": {
+                "id": {
+                    "name": "id",
+                    "data_type": "INT64",
+                }
+            },
+            "compiled_code": f"select id from {sources[name]}",  # noqa: S608
+        }
+        for name, ds in layers
+    }
+    (target / "manifest.json").write_text(
+        json.dumps({"nodes": nodes}), encoding="utf-8"
+    )
+
+    def dbt_writes(argv: list[str]) -> None:
+        if "build" in argv:
+            for name, ds in layers:
+                client.tables[f"dex-test.{ds}.{name}"] = table(ds, name, 5)
+
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            target / "run_results.json",
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "unique_id": f"model.dex_test.{name}",
+                            "status": "success",
+                            "execution_time": 1.0,
+                            "adapter_response": {"bytes_billed": 1000},
+                        }
+                        for name, _ in layers
+                    ]
+                }
+            ),
+        ),
+        on_run=dbt_writes,
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--confirm",
+            "--budget",
+            "1000000",
+            "transform",
+            "build",
+            "--verify",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    verification = envelope["data"]["verification"]
+    assert "row_population" not in verification["suppressed"]
+    notes = envelope["data"].get("notes") or []
+    assert any(
+        "intermediate_dev" in n and "marts_dev" in n and "staging_dev" in n
+        for n in notes
+    ), notes
 
 
 # --- ShadowRun.show ------------------------------------------------------------

@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: stg_listings
+    description: One row per rental listing currently on the site.
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+  - name: stg_reviews
+    description: One row per guest review, including reviews of listings since taken down.
+    columns:
+      - name: review_id
+        data_tests: [unique, not_null]

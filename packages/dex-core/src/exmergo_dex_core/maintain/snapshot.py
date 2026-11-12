@@ -381,6 +381,11 @@ class SemanticLayerSnapshot(BaseModel):
     vendor: str | None = None
     vendor_release: str | None = None
     format_version: str | None = None
+    #: The format version each definition file declares, keyed by file, for a
+    #: layer whose files each name one (a Metric View's ``version``). A file
+    #: moving version is reported for that file alone, so the rest of the layer
+    #: is still compared by content (#1259). ``None`` is not captured.
+    definition_versions: dict[str, str] | None = None
     #: Definitions recorded by their bytes alone, and whether this layer records
     #: them: a baseline pinned before they were captured carries the list empty,
     #: which must not read as every one of them being new (#912).

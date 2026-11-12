@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "workspace_memberships"
+  ],
+  "prompt": "Archived workspaces should not appear in `workspace_memberships`: leave out the memberships of archived workspaces and keep every other membership as it is. Build it on dev when you are done."
+}

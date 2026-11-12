@@ -1,5 +1,5 @@
 {
   "name": "dex",
-  "version": "1.17.4",
+  "version": "1.17.8",
   "description": "Analytics engineering for Claude Code and any agent: data warehouse exploration, dbt transformation and semantic modeling, and schema-drift maintenance on dbt."
 }

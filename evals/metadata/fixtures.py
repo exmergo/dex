@@ -12,7 +12,8 @@ On disk, one directory per fixture under ``evals/metadata/fixtures/``::
     <fixture>/packages/<name>/    optional dbt packages, each served to the
                                   project from a local git repository (see
                                   install_packages)
-    <fixture>/tasks/<id>/task.json   {"prompt", "kind": "build"|"fix", "models": [...]}
+    <fixture>/tasks/<id>/task.json   {"prompt", "kind", "models": [...]}, kind
+                                      build, fix, test or diagnose
     <fixture>/tasks/<id>/truth.json  the known right answers (see score.py)
     <fixture>/tasks/<id>/setup/      optional overlay: the task's starting state
     <fixture>/tasks/<id>/reference/  a correct answer, overlaid on the start

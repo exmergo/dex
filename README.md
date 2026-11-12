@@ -22,7 +22,7 @@ through [supported connectors](#connectors).
 [![PyPI](https://img.shields.io/pypi/v/exmergo-dex-core?logo=pypi&logoColor=white&color=165dfc)](https://pypi.org/project/exmergo-dex-core/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-165dfc)](LICENSE)
 [![data-eng-bench](https://img.shields.io/badge/data--eng--bench-57%25-33cf56)](benchmarks/data-eng-bench/README.md)
-[![ADE-bench](https://img.shields.io/badge/ADE--bench-76%25-33cf56)](benchmarks/ade_bench/README.md)
+[![ADE-bench](https://img.shields.io/badge/ADE--bench-80%25-33cf56)](benchmarks/ade_bench/README.md)
 [![CI](https://github.com/exmergo/dex/actions/workflows/ci.yml/badge.svg)](https://github.com/exmergo/dex/actions/workflows/ci.yml)
 
 [![Docs](https://img.shields.io/badge/docs-docs.exmergo.com%2Fdex-165dfc?logo=readthedocs&logoColor=white)](https://docs.exmergo.com/dex)
@@ -104,21 +104,36 @@ Writing SQL is one part of analytics engineering. Your agent also needs to:
 Dex gives the agent a repeatable explore, transform, maintain loop, with
 guardrails enforced in the engine.
 
-## Try it in three commands
+## Quickstart
 
-No existing database, no credentials, no cloud account, and no network once the
-package is installed.
+### Initialize
+If you want to use the python package `exmergo-dex-core`:
+
+1. Install it with `uv`, with the extras you need (i.e. DuckDB)
+```bash 
+uv tool install "exmergo-dex-core[duckdb]"
+```
+2. Initialize a Dex project (creatively called "analytics")
+```bash 
+dex init analytics
+```
+
+### Demo
+
+Try Dex in a demo experience with no existing database, no credentials, 
+no cloud account, and no network once the package is installed:
 
 ```bash
-pip install "exmergo-dex-core[duckdb]"
-dex demo
+uv tool install "exmergo-dex-core[duckdb]"
+dex init analytics --mode demo
 dex explore map
 ```
 
-`dex demo` writes a small e-commerce DuckDB database (`dex_demo.duckdb`, 7 tables,
-29,512 rows) and a `.dex/config.yml` into the current directory, so every command
-after it runs with no flags. It refuses rather than overwrite anything. The data
-comes from a pinned seed, so what you see is what is written here.
+`dex init analytics --mode demo` creates the e-commerce DuckDB warehouse
+(`dex_demo.duckdb`, 7 tables, 29,512 rows), a dbt project under `analytics/`,
+repository-level Dex configuration, and onboarding documentation. Reruns preserve
+authored files. The lower-level `dex demo` command remains available for creating
+just the warehouse and config. The data comes from a pinned seed.
 
 `explore map` maps all 7 tables, infers 5 joins, flags 6 columns as personal data,
 and reports 6 data-quality findings. Every command answers with one JSON envelope.
@@ -135,10 +150,10 @@ An excerpt, for one table:
 }
 ```
 
-### It is broken on purpose
+### The demo is broken (on purpose!)
 
-A first run that reports a clean bill of health teaches you nothing, so the demo
-ships with real defects. Dig into them:
+A first run that reports a clean bill of health doesn't teach us much, 
+so the demo ships with real defects. Dig into them:
 
 ```bash
 dex explore profile order_items products
@@ -162,35 +177,10 @@ type contradicts their content, and two designed PII false positives. See the
 
 ## How it works
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 56, "padding": 14}, "themeVariables": {"lineColor": "#51a2ff", "edgeLabelBackground": "#020618", "textColor": "#51a2ff", "fontSize": "14px"}, "themeCSS": ".edgeLabel p { padding: 6px 12px; margin: 0; border-radius: 6px; background: #020618; } .labelBkg { background: none !important; }"}}%%
-flowchart TB
-  agent["<b>Your coding agent</b><br/>Claude Code, Codex, any skills host"]
-  skills["<b>Dex skills</b><br/>explore · transform · maintain"]
-  engine["<b>exmergo-dex-core</b><br/>engine + guardrails"]
-  db[("<b>Your data</b><br/>database, warehouse,<br/>or SQL endpoint")]
-  repo["<b>Your repository</b><br/>dbt project +<br/>semantic layer"]
-  cache["<b>.dex/</b><br/>cache + snapshot"]
-
-  agent -->|"runs a command"| skills
-  skills --> engine
-  engine -->|"SELECT-only, cost-capped<br/>dbt builds on dev only"| db
-  engine -->|"plans as<br/>reviewable diffs"| repo
-  engine -->|"one sanitized<br/>JSON envelope"| agent
-  engine <--> cache
-
-  linkStyle default stroke:#51a2ff,stroke-width:1.5px,color:#51a2ff
-
-  classDef host fill:#020618,stroke:#51a2ff,stroke-width:1.5px,color:#ffffff
-  classDef core fill:#2563eb,stroke:#51a2ff,stroke-width:2px,color:#ffffff
-  classDef yours fill:#020618,stroke:#22d3ee,stroke-width:1.5px,color:#ffffff
-  classDef state fill:#020618,stroke:#22d3ee,stroke-width:1.5px,stroke-dasharray:5 4,color:#cad5e2
-
-  class agent,skills host
-  class engine core
-  class db,repo yours
-  class cache state
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/how-it-works-dark.png" />
+  <img width="760" height="630" alt="How it works: your coding agent runs a Dex skill, which calls the exmergo-dex-core engine; the engine queries your data (SELECT-only, cost-capped, dbt builds on dev only), writes plans as reviewable diffs to your repository, keeps its cache in .dex/, and returns one sanitized JSON envelope to the agent" src="assets/readme/how-it-works-light.png" />
+</picture>
 
 The skills connect your agent to the `exmergo-dex-core` engine, which holds the
 logic and guardrails behind a [small command contract](https://docs.exmergo.com/dex/reference/command-contract).
@@ -205,7 +195,10 @@ personal data, read and query the semantic layer, and map relationships as a
 Mermaid ER diagram. Exploration is read-only and needs no dbt project.
 [Skill](skills/explore/SKILL.md) · [methodology](https://docs.exmergo.com/dex/concepts/methodology) · [commands](https://docs.exmergo.com/dex/cli/explore)
 
-<img width="522" height="343" alt="Explore" src="https://github.com/user-attachments/assets/7f16b370-66ed-4596-ae01-041cf3db3525" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/explore-dark.png" />
+  <img width="522" height="343" alt="Explore" src="assets/readme/explore-light.png" />
+</picture>
 
 ### Transform
 
@@ -215,7 +208,10 @@ native semantic layer without a dbt project. Review each stored plan before
 applying it, then build and verify on a dev target.
 [Skill](skills/transform/SKILL.md) · [what Dex writes](https://docs.exmergo.com/dex/concepts/dbt-project) · [commands](https://docs.exmergo.com/dex/cli/transform)
 
-<img width="504" height="271" alt="Transform" src="https://github.com/user-attachments/assets/fda40e48-b481-424c-adc7-d79c0ede346b" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/transform-dark.png" />
+  <img width="504" height="271" alt="Transform" src="assets/readme/transform-light.png" />
+</picture>
 
 ### Maintain
 
@@ -225,7 +221,10 @@ the proposed edits. `maintain verify` also checks a project as it stands, with n
 baseline needed.
 [Skill](skills/maintain/SKILL.md) · [commands](https://docs.exmergo.com/dex/cli/maintain)
 
-<img width="484" height="344" alt="Maintain" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/maintain-dark.png" />
+  <img width="484" height="344" alt="Maintain" src="assets/readme/maintain-light.png" />
+</picture>
 
 > [!TIP]
 > **Give every agent in your repository the same procedure.**
@@ -268,10 +267,11 @@ in `.dex/config.yml`; Ossie, SLayer, and Cube need no dbt project.
 | --- | :---: | :---: | --- | --- | --- |
 | <img src="https://www.exmergo.com/connectors/ossie.png" width="20" height="20" alt=""> **[Apache Ossie](https://github.com/apache/ossie)** (incubating) | ❌ | ❌ | `ossie` / `local` | Native documents in the repository, no dbt or MetricFlow in the path | [Docs](https://docs.exmergo.com/dex/semantic-layers/ossie) |
 | <img src="https://www.exmergo.com/connectors/dbt.png" width="20" height="20" alt=""> **[dbt](https://github.com/dbt-labs/dbt-core)** | ✅ | ✅ | `dbt` / `local` or `dbt_cloud` | MetricFlow locally, run through the Dex connector and its cost guard, or the hosted dbt Cloud Semantic Layer API | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#choosing-a-backend-ambient-like-a-connector) |
-| <img src="assets/cube-logo.png" width="20" height="20" alt=""> **[Cube](https://github.com/cube-js/cube)** | ❌ | ✅ | `cube` / `local` | Plain YAML model files, read statically with no Node or Cube server; querying asks a running Cube server to render, Dex runs it under the cost guard | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#cube-models-vendor-cube) |
+| <img src="https://www.exmergo.com/connectors/databricks.png" width="20" height="20" alt=""> **[Databricks Metric Views](https://docs.databricks.com/aws/en/metric-views/)** | ❌ | ❌ | `databricks` / `local` | Metric View YAML files in the repository, read and authored statically with no workspace connection; nothing is deployed, and querying is not yet supported | [Docs](https://github.com/exmergo/dex/tree/main/packages/dex-core#semantic-layers) |
 | <img src="assets/motley-logo.jpeg" width="20" height="20" alt=""> **[SLayer](https://github.com/MotleyAI/slayer)** (by Motley) | ❌ | ✅ | `slayer` / `local` | SLayer model files, validated by one pinned release; SLayer renders, Dex runs it under the cost guard | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#slayer-models-vendor-slayer) |
+| <img src="assets/cube-logo.png" width="20" height="20" alt=""> **[Cube](https://github.com/cube-js/cube)** | ❌ | ✅ | `cube` / `local` | Plain YAML model files, read statically with no Node or Cube server; querying asks a running Cube server to render, Dex runs it under the cost guard | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#cube-models-vendor-cube) |
 
-**Coming next:** hosted Cube, hosted SLayer, Snowflake Semantic Views, Looker / LookML, and Databricks Metric Views.
+**Coming next:** hosted Cube, hosted SLayer, Snowflake Semantic Views and Looker / LookML.
 
 ## See it on a real project
 
@@ -320,9 +320,12 @@ raw per-task results, including the ones that flatter us least.
 | Benchmark | Setup | Result | Details |
 |---|---|---|---|
 | **data-eng-bench** (Snowflake, 103 tasks) | Dex + Claude Sonnet 5 | **57.3%** resolved, 89.7% of assertions pass | [README](benchmarks/data-eng-bench/README.md) |
-| **ADE-bench** (dbt Labs, 75 tasks) | Dex + Claude Sonnet 5 | **76%** resolved, at 2.5x lower cost than Fable 5 | [README](benchmarks/ade_bench/README.md) |
+| **ADE-bench** (dbt Labs, 75 tasks) | Dex 1.17.4 + Claude Sonnet 5.5 | **80%** resolved vs 73.3% without Dex; **25% fewer failures** | [README](benchmarks/ade_bench/README.md) |
 
-<img width="719" height="283" alt="ADE-bench accuracy and cost by model" src="https://github.com/user-attachments/assets/9f8bca64-6508-4590-9fa7-bb1ac077263d" />
+On ADE-bench, the same Claude Sonnet 5.5 model solves **60 of 75 tasks with Dex**,
+compared with **55 without it**: **+6.7 percentage points**, with net gains across
+six of seven projects. Both configurations make one scored attempt per task.
+[Compare the runs and raw results](benchmarks/ade_bench/README.md).
 
 We believe that benchmarks are important, but not as important as user/agent experience.  
 Trust in a diff, cost surfaced before spend, and sensitive data kept out of context. We optimize for that experience
@@ -423,6 +426,16 @@ Join the agent-native data/analytics community!
 - 🔗 [Follow Us on LinkedIn](https://www.linkedin.com/company/exmergo/)
 - 🐦 [Follow Us on X](https://x.com/exmergo)
 - 🔨 [Follow Us on GitHub](https://github.com/exmergo/)
+
+## Feedback and bug reports
+
+Found something wrong, or something Dex should do? Open an issue: bug reports and
+ideas are welcome, including ones your agent drafts for you. Run `dex feedback`
+for the environment to paste and links that prefill the
+[bug report](https://github.com/exmergo/dex/issues/new?template=bug_report.yml)
+and [feature request](https://github.com/exmergo/dex/issues/new?template=feature_request.yml)
+forms; nothing is sent. Security problems go to [SECURITY.md](SECURITY.md), never
+a public issue. More in [SUPPORT.md](SUPPORT.md).
 
 ## Contributing
 
