@@ -189,7 +189,7 @@ def test_adoption_preserves_authored_dbt_files_and_global_profile(
     assert code == 0, result
     assert result["data"]["mode"] == "adopt"
     assert config(tmp_path)["dbt_project_dir"] == "authored"
-    assert (project / "dbt_project.yml").read_text() == project_text
+    assert (project / "dbt_project.yml").read_text(encoding="utf-8") == project_text
     assert (profiles / "profiles.yml").read_text() == profile_text
     assert not (project / "profiles.yml").exists()
     assert (tmp_path / "README.md").read_text().startswith("# Our project\n")
