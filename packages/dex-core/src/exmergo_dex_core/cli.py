@@ -2163,7 +2163,9 @@ def main(argv: list[str] | None = None) -> int:
 
         envelope.data["report"] = report_pointer(
             command=command_args.command_name(args) or None,
-            connector=envelope.connection.connector,
+            # An engine that never got built stamped no connection, so the flag
+            # is the only evidence of a connector, as for the paradigm above.
+            connector=envelope.connection.connector or getattr(args, "connector", None),
             exception=internal_exception,
             result_mode=result_mode.value if result_mode else None,
         )

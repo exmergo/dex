@@ -168,6 +168,8 @@ def test_an_internal_error_carries_a_report_without_the_error_text(
     query = _query(report["link"])
     assert query["command"] == "dex explore inventory"
     assert "exception: RuntimeError" in query["env"]
+    # The engine never got built, so the flag is what names the connector.
+    assert "connector: duckdb" in query["env"]
     assert "customer_emails" not in report["link"]
     assert "someone" not in report["link"]
 
