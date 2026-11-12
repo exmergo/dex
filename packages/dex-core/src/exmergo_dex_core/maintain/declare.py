@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import yaml  # type: ignore[import-untyped]
 
 from ..adapters.project import PlacingProject
 from ..cache import ColumnProfile
-from ..dbt_project import DbtProjectView
+from ..dbt_project import DbtProjectView, node_name, path_family, yaml_documents
 from ..guards.pii_meta import CONTAINS_PII, entry_meta, says_pii, stamp_lines
 from ..transform.plans import EditKind, PlanEdit
 from ..transform.rewrite import (
@@ -63,6 +63,8 @@ class Placed:
 
     path: str
     model: str
+    #: The finding is about this model's own relation, not a source it stages.
+    built: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,32 @@ class _Staged:
     tests: dict[tuple[str, str], list[str]] = field(default_factory=dict)
 
 
+#: A ``config(alias=...)`` call in a model's SQL. It is a text match, so an
+#: ``alias =`` elsewhere in the SQL counts too, which only makes the lookup
+#: decline; a compiled manifest would settle it exactly.
+_SQL_ALIAS = re.compile(r"""\balias\s*=\s*["']([^"']+)["']""")
+
+
+def _declared_aliases(view: DbtProjectView) -> list[tuple[str, str]]:
+    """``(model, alias)`` for every alias a model's SQL or YAML ``config`` sets.
+
+    An alias set in ``dbt_project.yml`` or by a ``generate_alias_name`` macro is
+    not read here.
+    """
+
+    aliases = [
+        (node_name(path), match.group(1))
+        for path, source in view.files.items()
+        if path.endswith(".sql") and (match := _SQL_ALIAS.search(source.content))
+    ]
+    for parsed, _path in yaml_documents(view):
+        for entry in parsed.get("models") or []:
+            config = entry.get("config") if isinstance(entry, dict) else None
+            if isinstance(config, dict) and isinstance(config.get("alias"), str):
+                aliases.append((str(entry.get("name")), config["alias"]))
+    return aliases
+
+
 class DeclarationEdits:
     """Accumulates every change reconcile wants to make, one edit per path.
 
@@ -122,25 +150,32 @@ class DeclarationEdits:
     def resolve(self, table: str) -> Placed | Declined:
         """The declaration for ``table``, or the one reason there is not one.
 
-        The model is named after the file the format chose rather than after
-        dbt's `stg_` convention: the format already answered "where does this
-        table's declaration live", and this reads that answer instead of
-        asserting a spelling over it. A file packing several models finds no
+        A relation the project builds is that model, declared wherever its YAML
+        is. Otherwise the model is named after the file the format chose rather
+        than after dbt's `stg_` convention: the format already answered "where
+        does this table's declaration live", and this reads that answer instead
+        of asserting a spelling over it. A file packing several models finds no
         entry and is declined, which is a refusal to guess rather than a wrong
         write.
         """
 
-        path = self._placed(EditKind.SCHEMA_YML, table)
-        if path is None:
-            return Declined(
-                None,
-                "this project format has nowhere for a declaration of "
-                f"'{table}' to land",
-            )
-        # The model's own file names it. The YAML's name only does when the format
-        # keeps one file per model, and a shared `_staging.yml` would otherwise
-        # name every model in it after the file.
-        model = PurePosixPath(self._placed(EditKind.MODEL_SQL, table) or path).stem
+        # A relation the project builds is that model wherever it lives: a mart is
+        # not `stg_<mart>` (#1274). Its declaration is whichever file declares it.
+        model = self._built_model(table)
+        built = model is not None
+        path: str | None = None
+        if model is None:
+            path = self._placed(EditKind.SCHEMA_YML, table)
+            if path is None:
+                return Declined(
+                    None,
+                    "this project format has nowhere for a declaration of "
+                    f"'{table}' to land",
+                )
+            # The model's own file names it. The YAML's name only does when the
+            # format keeps one file per model, and a shared `_staging.yml` would
+            # otherwise name every model in it after the file.
+            model = PurePosixPath(self._placed(EditKind.MODEL_SQL, table) or path).stem
         # Checked before the placed file is trusted: a format that places by
         # content answers with the first file declaring the model, so a second
         # declaration would otherwise go unseen and one of the two be edited.
@@ -151,8 +186,8 @@ class DeclarationEdits:
                 f"'{model}' is declared in more than one file "
                 f"({', '.join(elsewhere)}), which dbt refuses at parse",
             )
-        content = self.content_for(path)
-        if content is None:
+        content = self.content_for(path) if path is not None else None
+        if path is None or content is None:
             # The placed file is the convention, not a fact about this project: a
             # model documented in a shared `models/schema.yml` has no
             # `stg_<table>.yml`, and writing one beside it is a second patch for
@@ -161,7 +196,9 @@ class DeclarationEdits:
                 return Declined(
                     path,
                     f"{path} is not among the files this project format's view "
-                    f"returned, and no other file declares '{model}'",
+                    f"returned, and no other file declares '{model}'"
+                    if path is not None
+                    else f"no YAML file declares the model '{model}'",
                 )
             path = elsewhere[0]
             content = self.content_for(path) or ""
@@ -187,7 +224,57 @@ class DeclarationEdits:
         ]
         if len(named) != 1:
             return Declined(path, f"{path} declares no model named '{model}'")
-        return Placed(path, model)
+        return Placed(path, model, built)
+
+    def _built_model(self, table: str) -> str | None:
+        """The model the project builds as ``table``, or ``None``.
+
+        dbt names a model's relation after its ``.sql`` file, so this reads the
+        project's own answer instead of asserting dbt's `stg_` spelling over it.
+        ``None`` when no model file has that name (or the view is not a dbt
+        project's), and when a declared source table is that relation too (its
+        ``identifier``, else its ``name``): a bare name cannot say which of the
+        two the finding is about, and the staging convention is what a source's
+        drift resolves to. ``None`` too when an ``alias`` is in play (the match
+        sets one, or another model's alias is this name): which model an alias
+        builds as is the compiled manifest's to say, and guessing would put the
+        test on the wrong model.
+        """
+
+        if not isinstance(self._view, DbtProjectView):
+            return None
+        wanted = table.casefold()
+        root = Path(self._view.root)
+        # model_file's lookup, matched the way the warehouse spells the relation
+        found = {
+            node_name(path)
+            for path in self._view.files
+            if path.endswith(".sql")
+            and node_name(path).casefold() == wanted
+            and path_family(root, path, self._view) == "model"
+        }
+        if len(found) != 1:
+            return None
+        for parsed, _path in yaml_documents(self._view):
+            for source in parsed.get("sources") or []:
+                if not isinstance(source, dict):
+                    continue
+                for entry in source.get("tables") or []:
+                    if (
+                        isinstance(entry, dict)
+                        and (
+                            str(entry.get("identifier") or entry.get("name") or "")
+                        ).casefold()
+                        == wanted
+                    ):
+                        return None
+        model = found.pop()
+        if any(
+            owner == model or alias.casefold() == wanted
+            for owner, alias in _declared_aliases(self._view)
+        ):
+            return None
+        return model
 
     def _declaring(self, model: str) -> list[str]:
         """Every YAML file in the view with a ``models:`` entry named ``model``."""
