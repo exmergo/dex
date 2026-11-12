@@ -436,12 +436,18 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
     # A copy of each existing target, staged beside it before anything moves, so
     # a failure part way through puts every moved file back with one atomic
     # rename each: all files or none, and no reader sees a half-written file.
+    backups: list[Path | None] = []
     try:
-        backups = [_backup(target) for _temporary, target, _edit in temporaries]
+        for _temporary, target, _edit in temporaries:
+            backups.append(_backup(target))
     except OSError:
         for temporary, _, _ in temporaries:
             with contextlib.suppress(OSError):
                 temporary.unlink(missing_ok=True)
+        for made in backups:
+            if made is not None:
+                with contextlib.suppress(OSError):
+                    made.unlink(missing_ok=True)
         raise
     moved: list[tuple[Path, Path | None]] = []
     written: list[str] = []
@@ -450,8 +456,9 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
             temporary.replace(target)
             moved.append((target, backup))
             written.append(edit.path)
-    except OSError:
+    except OSError as failure:
         stranded: list[str] = []
+        kept: set[Path] = set()
         for target, backup in reversed(moved):
             try:
                 if backup is None:
@@ -459,21 +466,25 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
                 else:
                     backup.replace(target)
             except OSError:
-                if backup is not None:
+                if backup is None:
+                    stranded.append(
+                        f"{target} (created by this apply; remove it by hand)"
+                    )
+                else:
+                    kept.add(backup)
                     stranded.append(f"{target} (its previous bytes are in {backup})")
         for temporary, _, _ in temporaries:
             with contextlib.suppress(OSError):
                 temporary.unlink(missing_ok=True)
         for backup in backups:
-            if backup is not None and not any(str(backup) in s for s in stranded):
+            if backup is not None and backup not in kept:
                 with contextlib.suppress(OSError):
                     backup.unlink(missing_ok=True)
         if stranded:
             raise ProjectError(
-                "a Semantic View apply failed part way and could not put back: "
-                + "; ".join(stranded)
-                + ". Move each copy back over its file by hand"
-            ) from None
+                f"a Semantic View apply failed part way ({failure}) and could not "
+                "put back: " + "; ".join(stranded)
+            ) from failure
         raise
     for backup in backups:
         if backup is not None:

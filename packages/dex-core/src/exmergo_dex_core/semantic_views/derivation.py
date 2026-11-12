@@ -1221,6 +1221,7 @@ def _annotate_relationship(
             "to a key of the table it points at"
         )
     right = str(parent.get("name"))
+    wider: str | None = None
     for existing in view.get("relationships") or []:
         if not isinstance(existing, Mapping):
             continue
@@ -1238,12 +1239,14 @@ def _annotate_relationship(
             if len(pairs) == 1:
                 return text, None
             # An authored join with more conditions is the author's; it is kept,
-            # and it is not the reference the declaration states.
-            return text, (
-                f"the authored relationship '{existing.get('name')}' joins on more "
-                "columns than the declared reference, so it is kept as written and "
-                "the reference is not carried"
-            )
+            # and it is not the reference, unless a later one states it exactly.
+            wider = wider or str(existing.get("name"))
+    if wider is not None:
+        return text, (
+            f"the authored relationship '{wider}' joins on more columns than the "
+            "declared reference, so it is kept as written and the reference is not "
+            "carried"
+        )
     names = {
         str(r.get("name", "")).lower()
         for r in view.get("relationships") or []
