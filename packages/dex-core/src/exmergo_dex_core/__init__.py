@@ -95,6 +95,7 @@ _EXPORTS = {
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
+    "MetricViewDependencyError": "metric_views.dependency",
     "MissingPackagesError": "transform.build",
     "PlanDeclaresMissingPackagesError": "transform.build",
     "RepairRefusedError": "transform.package_repair",
@@ -199,6 +200,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
+    from .metric_views.dependency import MetricViewDependencyError
     from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
@@ -292,6 +294,7 @@ __all__ = [
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
+    "MetricViewDependencyError",
     "MissingPackagesError",
     "ModelVersionError",
     "NoBaselineError",

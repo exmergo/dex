@@ -2189,3 +2189,296 @@ def test_a_replace_and_a_rename_on_one_column_stack():
     )
     assert reading.produced == ["new_id", "extra"]
     assert reading.expressions["new_id"].sql() == "0 AS new_id"
+
+
+def test_an_input_with_unique_test_drafts_grain_without_warehouse_profile():
+    """#1252: unique test on an unprofiled input drafts grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        data_tests:
+          - unique
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted["grain"]["value"] == ["project_id"]
+    evidence = drafted["grain"]["evidence"]
+    assert (
+        "project_id has a unique test on stg_projects, carried through unchanged"
+        in evidence
+    )
+    assert any("declares no grain; dex drafted [project_id]" in w for w in warnings)
+
+
+def test_an_input_with_unique_combination_of_columns_drafts_composite_grain():
+    """#1252: unique_combination_of_columns drafts composite grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_memberships
+    tests:
+      - unique_combination_of_columns:
+          combination_of_columns: [org_id, user_id]
+""",
+        "models/marts/fct_memberships.sql": (
+            "select org_id, user_id, role from {{ ref('stg_memberships') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_memberships"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_memberships"]["drafted"]
+    assert drafted["grain"]["value"] == ["org_id", "user_id"]
+    evidence = drafted["grain"]["evidence"]
+    assert (
+        "org_id, user_id has a unique_combination_of_columns test on "
+        "stg_memberships, carried through unchanged" in evidence
+    )
+    assert any(
+        "declares no grain; dex drafted [org_id, user_id]" in w for w in warnings
+    )
+
+
+def test_an_input_with_declared_grain_drafts_grain_without_warehouse_profile():
+    """#1252: declared meta.dex.grain on unprofiled input drafts grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_accounts
+    meta:
+      dex:
+        grain: [account_id]
+""",
+        "models/marts/fct_accounts.sql": (
+            "select account_id, name from {{ ref('stg_accounts') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_accounts"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_accounts"]["drafted"]
+    assert drafted["grain"]["value"] == ["account_id"]
+    evidence = drafted["grain"]["evidence"]
+    assert (
+        "account_id is the declared grain of stg_accounts, carried through unchanged"
+        in evidence
+    )
+    assert any("declares no grain; dex drafted [account_id]" in w for w in warnings)
+
+
+def test_draft_reports_drafted_grain_instead_of_unresolved_grain_warning():
+    """#1252: draft indicates drafted grain in warning when drafted from key."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    meta:
+      dex:
+        grain: [project_id]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    _drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    assert not any(w == "'fct_projects' declares no grain" for w in warnings)
+    assert any("declares no grain; dex drafted [project_id]" in w for w in warnings)
+
+
+def test_an_input_with_no_key_evidence_withholds_grain():
+    """#1252: an unprofiled input with no tests or declared grain withholds grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+      - name: project_name
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted.get("grain", {}).get("value") is None
+    assert "not profiled" in drafted.get("grain", {}).get("withheld", "")
+    assert any(
+        "'fct_projects' declares no grain" in w and "dex drafted" not in w
+        for w in warnings
+    )
+
+
+def test_transformed_key_column_does_not_inherit_grain():
+    """#1252: a transformed key expression does not carry grain forward."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        data_tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select coalesce(project_id, 0) as project_id "
+            "from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted.get("grain", {}).get("value") is None
+    assert "not selected unchanged" in drafted.get("grain", {}).get("withheld", "")
+
+
+def test_grain_evidence_identifies_exact_source_unambiguously():
+    """#1252: evidence identifies exact source and never implies test execution."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    evidence = drafted["grain"]["evidence"]
+    assert "passed" not in evidence.lower()
+    assert "ran" not in evidence.lower()
+    assert (
+        evidence
+        == "project_id has a unique test on stg_projects, carried through unchanged"
+    )
+
+
+def test_unprofiled_input_with_aliased_key_column_drafts_aliased_grain():
+    """#1252: aliased key column carries forward the new alias as grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id as pid, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted["grain"]["value"] == ["pid"]
+    assert (
+        drafted["grain"]["evidence"]
+        == "project_id has a unique test on stg_projects, carried through unchanged"
+    )
+
+
+def test_contradictory_measured_profile_takes_precedence_over_declared_key():
+    """#1252: profiled dataset with non-unique key does not fall back to stated key."""
+
+    dataset = Dataset(
+        identifier="warehouse.main.stg_projects",
+        columns=[
+            _col("project_id", "integer", is_unique=False, null_fraction=0.1),
+        ],
+    )
+    cache = DexCache(datasets=[dataset])
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=cache,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted.get("grain", {}).get("value") is None
+    assert "no proven unique key" in drafted.get("grain", {}).get("withheld", "")
+    assert any(
+        "'fct_projects' declares no grain" in w and "dex drafted" not in w
+        for w in warnings
+    )

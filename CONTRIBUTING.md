@@ -602,7 +602,9 @@ fields its format structurally cannot carry instead of returning them empty. The
 shipped native Ossie source binds every applicable contract in
 `packages/dex-core/tests/ossie/test_conformance.py`, which is the worked example
 to read. `packages/dex-core/tests/cube_vendor/test_reader.py` binds them for the
-Cube source, including a Cube rendering of the reference layer.
+Cube source, including a Cube rendering of the reference layer, and
+`packages/dex-core/tests/metric_views_vendor/test_reader.py` for the Databricks
+Metric View source.
 
 ## Linting and formatting (Ruff)
 

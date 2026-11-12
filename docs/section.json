@@ -84,7 +84,8 @@
             "pages": [
               "semantic-layers/overview",
               "semantic-layers/ossie",
-              "semantic-layers/cube"
+              "semantic-layers/cube",
+              "semantic-layers/databricks-metric-views"
             ]
           },
           {

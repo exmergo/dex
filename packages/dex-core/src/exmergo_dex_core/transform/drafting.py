@@ -222,10 +222,11 @@ def draft(
     facts_read: list[KeyFacts | None] = []
 
     def facts() -> KeyFacts | None:
-        if key_facts is None:
-            return None
         if not facts_read:
-            facts_read.append(key_facts())
+            if key_facts is not None:
+                facts_read.append(key_facts())
+            else:
+                facts_read.append(_facts_from_files(files, model_paths))
         return facts_read[0]
 
     for model in sorted(set(models)):
@@ -233,6 +234,7 @@ def draft(
         if sql_path is None:
             continue
         declared = read_declared(files, model)
+        stated = facts()
         reading = read(
             files[sql_path],
             cache,
@@ -241,6 +243,7 @@ def draft(
             files=files,
             model_paths=model_paths,
             manifest=effective_manifest,
+            known_keys=stated.known_keys() if stated is not None else None,
         )
         drafted = _drafted(
             reading,
@@ -335,6 +338,41 @@ def draft(
             out[model]["contradictions"] = found
         warnings.extend(_untoken(model_warnings, reading.tokens))
     return out, warnings
+
+
+def _facts_from_files(
+    files: Mapping[str, str],
+    model_paths: Iterable[str],
+    manifest: Mapping[str, Any] | None = None,
+) -> KeyFacts | None:
+    """Build key facts directly from project files and manifest when
+    key_facts is not supplied."""
+
+    from types import SimpleNamespace
+
+    from ..dbt_project import _declared_from_manifest, _declared_from_yaml
+    from ..project_definitions import ProjectDefinitions
+    from .population_inference import key_facts
+
+    defs_list: list[ProjectDefinitions] = []
+    try:
+        from_yaml = ProjectDefinitions(present=True)
+        view = SimpleNamespace(
+            files={p: SimpleNamespace(path=p, content=c) for p, c in files.items()},
+            model_paths=list(model_paths),
+        )
+        _declared_from_yaml(view, from_yaml)
+        defs_list.append(from_yaml)
+    except Exception:  # noqa: S110 - a key fact is evidence, never a failure
+        pass
+    if manifest and isinstance(manifest.get("nodes"), dict):
+        try:
+            compiled = ProjectDefinitions(present=True)
+            _declared_from_manifest(dict(manifest), compiled)
+            defs_list.append(compiled)
+        except Exception:  # noqa: S110 - a key fact is evidence, never a failure
+            pass
+    return key_facts(*defs_list) if defs_list else None
 
 
 def _draft_parent(
@@ -584,7 +622,7 @@ def read(
     files: Mapping[str, str] | None = None,
     model_paths: list[str] | None = None,
     manifest: Mapping[str, Any] | None = None,
-    known_keys: Mapping[str, list[list[str]]] | None = None,
+    known_keys: Mapping[str, Any] | None = None,
 ) -> _Reading:
     """Read one model's SQL statically.
 
@@ -593,7 +631,7 @@ def read(
     needs no alias. ``manifest`` is the compiled dbt manifest, used to resolve
     ambiguous ``ref()`` inputs (#989). ``known_keys`` maps a lowered relation
     name to keys the project tests or declares unique on it, which stand in
-    where the cache has proved none (the parent draft passes them, #1228).
+    where the cache has no profile (#1228, #1252).
     """
     reading = _Reading()
     try:
@@ -671,7 +709,7 @@ class _Lineage:
         files: Mapping[str, str] | None = None,
         model_paths: list[str] | None = None,
         manifest: Mapping[str, Any] | None = None,
-        known_keys: Mapping[str, list[list[str]]] | None = None,
+        known_keys: Mapping[str, Any] | None = None,
     ) -> None:
         from .. import sql_shape
 
@@ -1275,28 +1313,59 @@ class _Lineage:
             return [], "its driving relation is not one dex can follow"
         manifest = self.manifest if kind == "ref" else None
         dataset = dataset_for(self.cache, target, manifest=manifest)
-        stated = self.known_keys.get(target.rsplit(".", 1)[-1].lower())
-        if (dataset is None or not dataset.columns or not proven_keys(dataset)) and (
-            stated
-        ):
-            shown = " + ".join(", ".join(key) for key in stated)
-            return [frozenset(c.lower() for c in key) for key in stated], (
-                f"{shown} is tested unique on {target}"
-            )
-        if dataset is None or not dataset.columns:
-            return [], f"{target} is not profiled, so no key of it is proven"
-        proven = proven_keys(dataset)
-        if not proven:
+        if dataset is not None and dataset.columns:
+            proven = proven_keys(dataset)
+            if proven:
+                lowered = [frozenset(c.lower() for c in key) for key in proven]
+                shown = " + ".join(", ".join(key) for key in proven)
+                verb = (
+                    "is a proven unique key"
+                    if len(proven) == 1
+                    else "are proven unique keys"
+                )
+                return lowered, f"{shown} {verb} of {target}"
             return [], f"{target} has no proven unique key in the cache"
-        lowered = [frozenset(c.lower() for c in key) for key in proven]
-        # The evidence cites every proven key, not just the first: the grain
-        # choice may prefer a later candidate (a PII-flagged first key, #1079),
-        # and the citation must name the key it proves.
-        shown = " + ".join(", ".join(key) for key in proven)
-        verb = (
-            "is a proven unique key" if len(proven) == 1 else "are proven unique keys"
-        )
-        return lowered, f"{shown} {verb} of {target}"
+
+        stated_raw = self.known_keys.get(target.rsplit(".", 1)[-1].lower())
+        if stated_raw:
+            stated: list[tuple[list[str], str]] = []
+            for item in stated_raw:
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[1], str)
+                ):
+                    stated.append((list(item[0]), item[1]))
+                else:
+                    stated.append((list(item), "a unique test"))
+
+            lowered = [frozenset(c.lower() for c in key) for key, _ in stated]
+            evidences = []
+            for key, source in stated:
+                col_names = ", ".join(key)
+                if source == "its declared grain":
+                    evidences.append(f"{col_names} is the declared grain of {target}")
+                elif source == "its primary entity":
+                    evidences.append(f"{col_names} is the primary entity of {target}")
+                elif source in ("its primary key", "a primary key"):
+                    evidences.append(f"{col_names} is the primary key of {target}")
+                elif source == "a unique test":
+                    evidences.append(f"{col_names} has a unique test on {target}")
+                elif source in (
+                    "a unique_combination_of_columns test",
+                    "a combination test",
+                ):
+                    evidences.append(
+                        f"{col_names} has a unique_combination_of_columns test "
+                        f"on {target}"
+                    )
+                elif source.startswith("a ") and source.endswith(" test"):
+                    evidences.append(f"{col_names} has {source} on {target}")
+                else:
+                    evidences.append(f"{col_names} ({source}) on {target}")
+            return lowered, "; ".join(evidences)
+
+        return [], f"{target} is not profiled, so no key of it is proven"
 
     def _equated(self, join: Any, joined_alias: str) -> frozenset[str]:
         """Joined-side columns the ON (or USING) requires equal to something."""

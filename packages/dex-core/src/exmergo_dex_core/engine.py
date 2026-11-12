@@ -1855,6 +1855,21 @@ class DexEngine:
             "cube", mode, intent, edits, declarations=declarations
         )
 
+    def semantic_databricks(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic databricks`: :meth:`semantic_native` for Databricks Metric
+        View YAML files (#1258). Nothing is deployed to a workspace."""
+
+        return self.semantic_native(
+            "databricks", mode, intent, edits, declarations=declarations
+        )
+
     # --- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:

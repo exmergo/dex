@@ -25,7 +25,9 @@ logic.
   SLayer renders its own `query` and `values`. `[cube]` follows the same
   `semantic.vendor` read for the same commands where the vendor is `cube`, is
   always taken by `semantic cube`, and a
-  Cube `query` or `values` never takes `[semantic]` either. A repo that runs
+  Cube `query` or `values` never takes `[semantic]` either. `[metric-views]`
+  follows the same read where the vendor is `databricks`, is always taken by
+  `semantic databricks`, and never takes `[semantic]`. A repo that runs
   neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
@@ -253,7 +255,10 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      data.change_scope (#1115), static and free: per existing
                                      model the plan rewrites, population changed / kept /
                                      unchecked and each output removed, added, retyped,
-                                     re-aggregated or re-NULLed, every judged change declared
+                                     re-aggregated or re-NULLed (an aggregate is followed
+                                     through the CTEs its column reads, so one moved into a
+                                     CTE whose rows are produced alike is not
+                                     re-aggregated, #1253), every judged change declared
                                      (an assumption names its column) or undeclared (a warning),
                                      carried to a --for-plan build's
                                      completion.obligations.change_scope; a changed driving relation
@@ -575,6 +580,13 @@ dex semantic cube define|update|plan
                                      set with dex's port of Cube's model rules, each cube and view
                                      classified defined, updated or unchanged, and applied atomically
                                      with transform apply
+dex semantic databricks define|update|plan
+                                  -> Databricks Metric View YAML files as whole-file diffs; limited
+                                     to the files in semantic.databricks.files (.sql refused by name),
+                                     validated as one prospective set with dex's port of the Metric
+                                     View YAML 1.1 rules (unknown keys and fields beside dimensions
+                                     refused on write), each view classified defined, updated or
+                                     unchanged, applied atomically with transform apply, never deployed
 dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the
@@ -753,7 +765,15 @@ beside the configured files (`primary_key` on the grain dimensions, other roles 
 dimensions, declared aggregations as measures named after the column,
 `many_to_one` joins from foreign keys), validated by `semantic cube`'s own checks
 and read back through its catalog, and included or proposed on the same terms
-against `semantic.cube.files`. Under `ossie` it is a dataset (a field per declared
+against `semantic.cube.files`. Under `databricks` it is a Metric View file of its
+own, `<dir>/<mart>.yaml` (the mart as `source`, other roles as fields with a
+`date`/`date_time` format on temporal columns, declared aggregations as measures
+`<column>_<agg>` with a currency or percentage format from the unit, `many_to_one`
+joins from foreign keys with `rely.at_most_one_match` only where the parent
+declares that key as its grain), validated by `semantic databricks`'s own checks,
+read back through its catalog, and included or proposed on the same terms against
+`semantic.databricks.files`; a Metric View has no metadata key, so the population
+is only the last sentence of its `comment`. Under `ossie` it is a dataset (a field per declared
 column, `primary_key` on every grain field, declared aggregations as dataset-scoped
 metrics `<column>_<agg>`, a relationship from each foreign key to the parent's
 field) appended to the configured document holding the datasets its foreign keys
@@ -763,9 +783,10 @@ every layer a population is carried as metadata (`config.meta.dex`, `meta.dex`, 
 Ossie's `ai_context`, and one sentence in the description)
 and never as a filter, since the mart's SQL already enforces it; per model,
 `carried` and `not_carried` account for every declared field.
-`semantic slayer define|update|plan`, `semantic cube define|update|plan` and
-`semantic ossie define|update|plan` take `declarations` too, annotating a model,
-cube or dataset the payload or the layer defines. A command that takes no declarations refuses a payload
+`semantic slayer define|update|plan`, `semantic cube define|update|plan`,
+`semantic ossie define|update|plan` and `semantic databricks define|update|plan`
+take `declarations` too, annotating a model, cube, dataset or view the payload or
+the layer defines. A command that takes no declarations refuses a payload
 carrying them rather than dropping them. A version of a native dbt versioned
 model is declared as `"model": "dim_teams.v2"` and renders into that item of the
 model's `versions:` list, every other byte kept (#895); the bare name is the
@@ -1661,7 +1682,9 @@ default, or a filter or operator after it is refused. A key naming a location
   re-parses the result and compares it against what was sent. A file whose
   layout it cannot span safely (a flow-style sequence, anchors or aliases,
   multiple documents, tab indentation) is refused with `--edits-file` named as
-  the way to edit it. Classification is scoped to the definitions named, so a
+  the way to edit it. Anchors and aliases are read from the YAML parse, so
+  `*emphasis*` in a comment or a description does not count as one, and a file
+  that does not parse is refused saying so. Classification is scoped to the definitions named, so a
   spliced file's other definitions are reported in no class at all. Names
   implicitly created by `create_metric: true` measures count as existing metrics
   everywhere. Beyond MetricFlow's schemas, the engine
@@ -1730,6 +1753,16 @@ default, or a filter or operator after it is refused. A key naming a location
   carries is reported `defined`, `updated` or `unchanged`. Apply writes the
   authored bytes, all files or none, and a file changed after planning is a
   conflict.
+- `semantic databricks define|update|plan` is the same route for Databricks
+  Metric View YAML files (#1258). Each edit is one whole view body keyed as
+  `semantic.databricks.files` names it; a path off that list, a `.sql` file,
+  another suffix and a stem another file names are refused by name, and a delete
+  is refused. The prospective set is validated by dex's port of the Metric View
+  YAML 1.1 rules, every error refusing it, and in a file the plan writes an
+  unknown key (at any level, `rely` included) and `fields` beside `dimensions`
+  refuse it too. Each view is reported `defined`, `updated` or `unchanged`,
+  compared as YAML 1.2. Apply writes the authored bytes, all files or none, a
+  file changed after planning is a conflict, and nothing is deployed.
 
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
@@ -1880,6 +1913,36 @@ schema axis holds each member's columns and type to dex's own metadata, whose
 removals `maintain reconcile` plans through the `semantic cube update` route. `semantic cube define|update|plan` authors the files, and a
 declared dbt mart derives a cube of its own (see `transform plan` above). Selecting the vendor without the `[cube]` extra (the dialect
 engine) refuses and names it. See `references/semantic-layer.md`.
+
+**`vendor: databricks` reads Databricks Metric View files from the repository**,
+the exact paths named in `semantic.databricks.files`, statically and with no
+Databricks package and no workspace connection; dex never deploys a view. Each
+file is one Metric View YAML body (the document `CREATE VIEW ... WITH METRICS
+LANGUAGE YAML` holds), named after its stem; a `.sql` file is refused by name.
+Each body is validated by dex's own port of the Metric View YAML 1.1 rules, with
+YAML 1.2 booleans so a bare `on:` key stays text, a version other than `1.1`
+refused by name, and every refusal naming the file and the element. `list`
+answers. Each view is a semantic model on the relation its `source` names (or a
+plain single-table projection query), each field a dimension keyed `view.field`,
+each single-aggregate measure a measure and a `simple` metric, `MEASURE(a) /
+MEASURE(b)` a `ratio` and any other composition `derived`, with the view's
+`filter` on every metric. A metric is groupable by its own view's fields, so
+`--for-dimension` answers. Entities and time grains are declared `unavailable`;
+each join's key pairs and arity, and each `rely.at_most_one_match` key on the
+joined table, reach `explore` through the declaration channel at confidence 1.0.
+`query` and `values` refuse by name until #964, `values` after the PII gate.
+`semantic databricks define|update|plan` authors the files through a stored plan,
+never deploying them, and a declared dbt mart derives a view of its own (see
+`transform plan` above).
+`maintain snapshot` records `vendor: databricks`, `format_version: 1.1` and each
+file's declared `version` (`definition_versions`, so a re-saved view is
+`semantic_format_changed` for that file alone), and the layer-neutral axes read it: definition drift
+on the semantic axis, each `rely` key and join arity on the grain axis. The
+schema axis holds the views to the warehouse metadata with the four `declared_*`
+codes, and `maintain reconcile` stores their removals as a `semantic databricks
+update` plan (#1259). Selecting the vendor without the
+`[metric-views]` extra (the dialect engine) refuses and names it. See
+[Databricks Metric View compatibility](databricks-metric-views-compatibility.md).
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than

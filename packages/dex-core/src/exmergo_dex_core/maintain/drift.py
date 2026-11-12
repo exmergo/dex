@@ -1060,6 +1060,14 @@ class GrainPlan(NamedTuple):
     # against the data today, under its own code. Probed in the same batches
     # as the fanout pairs. Defaulted for the same reason as above.
     declared_join_checks: list[DeclaredJoinCheck] | None = None
+    # Who declared each declared combination, keyed by identifier and the
+    # combination's lower-cased columns: ``(source, claim)``, so a finding says
+    # whether it is the project's grain or a semantic layer's uniqueness claim
+    # (a Metric View's ``rely.at_most_one_match`` is the second, #1259).
+    # Defaulted for the same reason as above.
+    declared_origins: (
+        dict[tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]] | None
+    ) = None
 
     def scans(self) -> bool:
         """Whether the plan holds any statement that scans, and so is priced.
@@ -1171,10 +1179,15 @@ def grain_plan(
             described[identifier] = ({c.name for c in columns}, meta.row_count)
         return described[identifier]
 
+    origins: dict[
+        tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]
+    ] = {}
     declared_by_identifier, notes = _declared_composites(
-        definitions, sorted(current), scope
+        definitions, sorted(current), scope, origins
     )
-    _fold_semantic_keys(declared_by_identifier, notes, semantic, sorted(current), scope)
+    _fold_semantic_keys(
+        declared_by_identifier, notes, semantic, sorted(current), scope, origins
+    )
     # A count of None is unknown (no free row count on this connector), not
     # zero: the check is planned, and the scan that runs it supplies the count.
     key_checks: list[tuple[Dataset, list[str], int | None]] = []
@@ -1372,6 +1385,7 @@ def grain_plan(
         joins,
         widening_checks,
         declared_join_checks,
+        origins,
     )
 
 
@@ -1437,6 +1451,9 @@ def _fold_semantic_keys(
     semantic: SemanticLayer | None,
     known: list[str],
     scope: set[str] | None,
+    origins: (
+        dict[tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]] | None
+    ) = None,
 ) -> None:
     """Add the keys a semantic layer declares to the declared-grain survey.
 
@@ -1471,6 +1488,25 @@ def _fold_semantic_keys(
         for combo in sm.keys:
             if not any(_same_combo(combo, seen) for seen in bucket):
                 bucket.append(list(combo))
+            if origins is None:
+                continue
+            # A Metric View fingerprints only `rely` keys; every other native
+            # layer's keys are its primary keys. Every model declaring the
+            # combination is kept, so each claim can be found.
+            # A project grain on the same columns is a separate claim, kept
+            # beside this one rather than standing in for it.
+            claim = "unique" if semantic.vendor == "databricks" else "primary"
+            source = semantic.vendor or "semantic"
+            claims = origins.setdefault(
+                (identifier, frozenset(c.lower() for c in combo)), []
+            )
+            index = next(
+                (i for i, c in enumerate(claims) if c[:2] == (source, claim)), None
+            )
+            if index is None:
+                claims.append((source, claim, (sm.name,)))
+            elif sm.name not in claims[index][2]:
+                claims[index] = (source, claim, (*claims[index][2], sm.name))
 
 
 def _join_cardinality_checks(
@@ -1745,6 +1781,9 @@ def _declared_composites(
     definitions: ProjectDefinitions | None,
     known: list[str],
     scope: set[str] | None,
+    origins: (
+        dict[tuple[str, frozenset[str]], list[tuple[str, str, tuple[str, ...]]]] | None
+    ) = None,
 ) -> tuple[dict[str, list[list[str]]], list[str]]:
     """Declared composite grains keyed by warehouse identifier, and what could
     not be resolved.
@@ -1782,7 +1821,65 @@ def _declared_composites(
         bucket = by_identifier.setdefault(identifier, [])
         if not any(_same_combo(composite.columns, seen) for seen in bucket):
             bucket.append(list(composite.columns))
+            if origins is not None:
+                origins.setdefault(
+                    (identifier, frozenset(c.lower() for c in composite.columns)),
+                    [],
+                ).append((composite.source, composite.claim, (composite.model,)))
     return by_identifier, notes
+
+
+def _declared_claim(
+    origin: tuple[str, ...] | None,
+    members: str,
+    identifier: str,
+    declared_on: list[str] | None = None,
+) -> str:
+    """Who asserts the combination, and what they assert (#1259).
+
+    The project's grain, a native layer's primary key, and a uniqueness claim
+    that is not a grain at all (an Ossie ``unique_keys`` entry, a Metric View's
+    ``rely.at_most_one_match`` on a join to the table) are different statements,
+    and the finding says which one the data contradicts.
+    """
+
+    source, claim = origin or ("", "combination")
+    where = f" ({', '.join(declared_on)})" if declared_on else ""
+    if source == "databricks" and claim == "unique":
+        return (
+            f"a Metric View join to {identifier}{where} declares "
+            f"`rely.at_most_one_match` on ({members}), asserting each row "
+            "matches at most one of its rows"
+        )
+    if claim == "unique":
+        return (
+            f"the {source} semantic layer declares ({members}) unique on {identifier}"
+        )
+    if claim == "primary" and source:
+        return (
+            f"the {source} semantic layer declares ({members}) as the primary key "
+            f"of {identifier}"
+        )
+    return f"the project declares ({members}) as the grain of {identifier}"
+
+
+def _declared_consequence(origin: tuple[str, ...] | None) -> str:
+    """What a contradicted claim risks, by who made it. A risk, not a count:
+    the probe measures the table, not which of its keys a query matches."""
+
+    source, claim = origin or ("", "combination")
+    if source == "databricks" and claim == "unique":
+        return (
+            "Databricks trusts the flag without checking it, so a query through "
+            "the join can count a row more than once wherever it matches a "
+            "duplicated key"
+        )
+    if claim == "unique" or (claim == "primary" and source):
+        return (
+            "Queries relying on the claim can count a row more than once where "
+            "they match a duplicated key"
+        )
+    return "Builds asserting this grain will fail"
 
 
 class ProbeNeeds(NamedTuple):
@@ -2324,6 +2421,19 @@ def grain_drift(
             members = ", ".join(combo)
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             joins = _joins_on(plan, dataset.identifier, combo)
+            claims = (plan.declared_origins or {}).get(
+                (dataset.identifier, frozenset(c.lower() for c in combo))
+            ) or []
+            # A semantic claim leads where there is one: it is the one a query
+            # silently trusts; the project's grain is named beside it.
+            claims = sorted(claims, key=lambda c: c[1] == "combination")
+            found = claims[0] if claims else None
+            origin = found[:2] if found else None
+            declared_on = list(found[2]) if found else []
+            also = [
+                _declared_claim(c[:2], members, dataset.identifier, list(c[2]))
+                for c in claims[1:]
+            ]
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -2332,13 +2442,23 @@ def grain_drift(
                     column=members,
                     severity=severity,
                     detail=(
-                        f"the project declares ({members}) as the grain of "
-                        f"{dataset.identifier}, and the combination is not "
+                        _declared_claim(
+                            origin, members, dataset.identifier, declared_on
+                        )
+                        + "".join(f"; also, {a}" for a in also)
+                        + f", and the combination is not "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows). "
-                        "Builds asserting this grain will fail"
+                        + _declared_consequence(origin)
                         + (" and " if joins else ", and ")
-                        + _fanout_clause(joins)
+                        + (
+                            # The probe measures the table, not which keys a
+                            # join matches, so a semantic claim's fan-out is
+                            # stated as a possibility (#1259).
+                            "joins on it can fan out where they match a duplicated key"
+                            if joins and origin and origin[1] != "combination"
+                            else _fanout_clause(joins)
+                        )
                         + floor_note
                     ),
                     data={
@@ -2346,6 +2466,23 @@ def grain_drift(
                         "distinct_count": count,
                         "row_count": row_count,
                         "declared": True,
+                        **(
+                            {
+                                "declared_by": origin[0],
+                                "claim": origin[1],
+                                "declared_on": declared_on,
+                                "claims": [
+                                    {
+                                        "declared_by": c[0],
+                                        "claim": c[1],
+                                        "declared_on": list(c[2]),
+                                    }
+                                    for c in claims
+                                ],
+                            }
+                            if origin
+                            else {}
+                        ),
                         **floor_data,
                         **({"joins": joins} if joins else {}),
                     },
@@ -2660,6 +2797,7 @@ def semantic_free_drift(
     provenance = _provenance_change(baseline, current)
     if provenance is not None:
         findings.append(provenance)
+    findings.extend(_definition_version_changes(baseline, current))
     vendor_changed = provenance is not None and provenance.code == (
         "semantic_vendor_changed"
     )
@@ -3026,6 +3164,55 @@ def _provenance_change(
         ),
         data=data,
     )
+
+
+def _definition_version_changes(
+    baseline: SemanticLayer, current: SemanticLayer
+) -> list[DriftFinding]:
+    """Each definition file whose declared format version moved (#1259).
+
+    Per file, and apart from the reader's provenance: one file re-saved in
+    another version says nothing about the others, which are still compared by
+    content. Only files both sides recorded are compared.
+    """
+
+    before, after = baseline.definition_versions, current.definition_versions
+    if not before or not after:
+        return []
+    return [
+        DriftFinding(
+            axis="semantic",
+            code="semantic_format_changed",
+            severity="medium",
+            detail=(
+                f"{path} declares {current.vendor or 'semantic'} format version "
+                f"{after[path]}, and declared {before[path]} at the baseline"
+                + (
+                    f"; dex reads {current.format_version} only, so its "
+                    "definitions are not read and show as removed"
+                    if current.format_version and after[path] != current.format_version
+                    else ""
+                )
+                + (
+                    f". Restore `version: {before[path]}`, or upgrade dex to a "
+                    "reader of that version, before re-running `maintain "
+                    "snapshot`: a baseline taken now would accept a definition "
+                    "dex does not read"
+                    if current.format_version and after[path] != current.format_version
+                    else ". Re-run `maintain snapshot` once the move is the state "
+                    "you vouch for"
+                )
+            ),
+            data={
+                "vendor": current.vendor,
+                "path": path,
+                "format_version_before": before[path],
+                "format_version_after": after[path],
+            },
+        )
+        for path in sorted(before.keys() & after.keys())
+        if before[path] != after[path]
+    ]
 
 
 class CardinalityCheck(NamedTuple):
