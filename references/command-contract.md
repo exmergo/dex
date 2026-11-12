@@ -1684,7 +1684,10 @@ default, or a filter or operator after it is refused. A key naming a location
   multiple documents, tab indentation) is refused with `--edits-file` named as
   the way to edit it. Anchors and aliases are read from the YAML parse, so
   `*emphasis*` in a comment or a description does not count as one, and a file
-  that does not parse is refused saying so. Classification is scoped to the definitions named, so a
+  that does not parse is refused saying so. A project file that does not parse
+  hides the definitions it declares, so a refusal that would call a name absent
+  names each file that could not be read and why instead of reporting it "not
+  in the project". Classification is scoped to the definitions named, so a
   spliced file's other definitions are reported in no class at all. Names
   implicitly created by `create_metric: true` measures count as existing metrics
   everywhere. Beyond MetricFlow's schemas, the engine

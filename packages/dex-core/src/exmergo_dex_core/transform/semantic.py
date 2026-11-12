@@ -184,9 +184,32 @@ def existing_semantic_names(view: DbtProjectView) -> set[str]:
 DefinitionKey = tuple[str, str]
 
 
-def project_definitions(
-    view: DbtProjectView,
-) -> dict[DefinitionKey, tuple[str, dict[str, Any]]]:
+class SkippedSemanticFile(NamedTuple):
+    """A semantic YAML file the read could not parse, with the reason.
+
+    A file that does not parse declares nothing the namespace can see, but it
+    is not empty either: definitions inside it are real and merely invisible to
+    the read. Reporting the skip is what lets a refusal say the file is
+    unreadable instead of claiming a definition that lives in it is absent.
+    """
+
+    path: str
+    reason: str
+
+
+class SemanticDefinitions(NamedTuple):
+    """The definitions a project view declares, plus the files left unread.
+
+    ``definitions`` is keyed by role and name; ``skipped`` lists every YAML
+    file that did not parse, so a name that reads as absent can be told apart
+    from one the read could not see.
+    """
+
+    definitions: dict[DefinitionKey, tuple[str, dict[str, Any]]]
+    skipped: list[SkippedSemanticFile]
+
+
+def project_definitions(view: DbtProjectView) -> SemanticDefinitions:
     """Every top-level definition the project declares, keyed by role and name.
 
     The value is the file that declares it and its parsed body, which is what
@@ -197,23 +220,50 @@ def project_definitions(
     A duplicate name across two files is the project's own bug and dbt will
     refuse it; whichever file is read last wins here, because there is no right
     answer and this function is not the place to raise about it.
+
+    A file that does not parse contributes no definitions, and is reported in
+    ``skipped`` rather than passed over silently: a caller that would otherwise
+    say a name is "not in the project" can say the file holding it could not be
+    read instead, which is the difference between looking for a missing
+    definition and fixing a syntax error.
     """
 
     definitions: dict[DefinitionKey, tuple[str, dict[str, Any]]] = {}
+    skipped: list[SkippedSemanticFile] = []
     for source in view.files.values():
         if not source.path.endswith((".yml", ".yaml")):
             continue
         try:
             parsed = yaml.safe_load(source.content)
-        except yaml.YAMLError:
-            continue  # a broken hand-written file is not this command's problem
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None)
+            where = f" at line {mark.line + 1}" if mark is not None else ""
+            skipped.append(
+                SkippedSemanticFile(source.path, f"does not parse as YAML{where}")
+            )
+            continue
         if not isinstance(parsed, dict):
             continue
         for kind, key in (("semantic_model", "semantic_models"), ("metric", "metrics")):
             for entry in parsed.get(key) or []:
                 if isinstance(entry, dict) and entry.get("name"):
                     definitions[(kind, entry["name"])] = (source.path, entry)
-    return definitions
+    return SemanticDefinitions(definitions, skipped)
+
+
+def _unreadable_note(skipped: Sequence[SkippedSemanticFile]) -> str:
+    """The clause a refusal appends when the read skipped files.
+
+    It names each file and why it could not be read, and says the definitions
+    inside are invisible, so a "not in the project" verdict is not confused
+    with "the file holding it is broken".
+    """
+
+    if not skipped:
+        return ""
+    files = "; ".join(f"{s.path} could not be read ({s.reason})" for s in skipped)
+    pronoun = "it" if len(skipped) == 1 else "them"
+    return f"; {files}, so definitions in {pronoun} are not visible"
 
 
 def time_spine_warning(
@@ -325,7 +375,7 @@ def check_mode(
                 if scope is not None and (kind, name) not in scope:
                     continue
                 proposed.add(name)
-                current = on_disk.get((kind, name))
+                current = on_disk.definitions.get((kind, name))
                 if current is None:
                     # No counterpart in this role. Either the name is new (it
                     # lands in `defined`) or it exists only in the other role,
@@ -348,6 +398,7 @@ def check_mode(
                 f"not defined in the project: {', '.join(missing)}; use "
                 "`semantic define` to add a new definition, or "
                 "`semantic plan` to mix new and existing names"
+                + _unreadable_note(on_disk.skipped)
             )
 
     # Unchanged means every proposed entry for the name matched. One half of a
@@ -530,7 +581,9 @@ def check_removals(
         if definition.kind == "metric":
             metric_names.add(definition.name)
             continue
-        _path, body = on_disk.get((definition.kind, definition.name), ("", {}))
+        _path, body = on_disk.definitions.get(
+            (definition.kind, definition.name), ("", {})
+        )
         for measure in body.get("measures") or []:
             if not isinstance(measure, dict) or not measure.get("name"):
                 continue
@@ -560,7 +613,9 @@ def check_removals(
         return
 
     problems: list[str] = []
-    for (kind, name), (path, body) in sorted(project_definitions(after).items()):
+    for (kind, name), (path, body) in sorted(
+        project_definitions(after).definitions.items()
+    ):
         if kind != "metric":
             continue
         measures, metrics = metric_inputs(body)
@@ -795,18 +850,21 @@ def splice_definitions(
     existing definition of its kind or, when none of that kind exists yet, the
     project's only semantic file, and ``notes`` is told where it went. With no
     such file, or more than one, it is refused: there is nothing unambiguous to
-    pick.
+    pick. A file the read could not parse is named in the refusal, because a
+    definition hidden inside a broken file is not the same as one the project
+    lacks.
     """
 
     on_disk = project_definitions(view)
     targets: list[tuple[str, DefinitionEdit]] = []
     for definition in definitions:
-        current = on_disk.get((definition.kind, definition.name))
+        current = on_disk.definitions.get((definition.kind, definition.name))
         if definition.op is EditOp.DELETE:
             if current is None:
                 raise EditValidationError(
                     f"{definition.kind} '{definition.name}' is not declared in the "
                     "project, so there is nothing to remove"
+                    + _unreadable_note(on_disk.skipped)
                 )
             if definition.path is not None and definition.path != current[0]:
                 raise EditValidationError(
@@ -819,7 +877,9 @@ def splice_definitions(
         if definition.path is None:
             if current is None:
                 homes = {
-                    p for (k, _n), (p, _b) in on_disk.items() if k == definition.kind
+                    p
+                    for (k, _n), (p, _b) in on_disk.definitions.items()
+                    if k == definition.kind
                 }
                 where = (
                     "the project's only file that declares "
@@ -828,7 +888,7 @@ def splice_definitions(
                 if not homes:
                     # No definition of this kind yet: the first one goes to the
                     # project's only semantic file, if there is exactly one.
-                    homes = {p for p, _b in on_disk.values()}
+                    homes = {p for p, _b in on_disk.definitions.values()}
                     where = "the project's only semantic file"
                 if len(homes) == 1:
                     (home,) = homes
@@ -841,6 +901,7 @@ def splice_definitions(
                 raise EditValidationError(
                     f"{definition.kind} '{definition.name}' is not in the project, "
                     "so there is no file to rewrite: give it a path"
+                    + _unreadable_note(on_disk.skipped)
                 )
             targets.append((current[0], definition))
             continue
