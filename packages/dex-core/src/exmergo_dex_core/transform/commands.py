@@ -840,6 +840,15 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         note = "there is no exploration cache yet; run `explore map` first"
     if cache is not None:
         cache = mask_overridden(cache, pii_override_paths(engine.config.pii_overrides))
+    manifest = getattr(view, "manifest", None)
+    manifest_stale = True
+    if manifest is not None:
+        try:
+            from ..dbt_project import manifest_freshness
+
+            manifest_stale = manifest_freshness(view).get("stale") is not False
+        except Exception:
+            manifest_stale = True
     return {
         "cache": cache,
         "dialect": get_dialect(engine.connector or engine.config.connector),
@@ -852,6 +861,8 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         "cache_note": note,
         "dev_namespace": _dev_namespace(engine),
         "packaged": _package_lookup(view),
+        "manifest": manifest,
+        "manifest_stale": manifest_stale,
     }
 
 
