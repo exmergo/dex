@@ -6,10 +6,11 @@ detail.
 ## Complete setup with `init`
 
 Use `init` through this skill's `scripts/run.py` wrapper for complete onboarding.
-`init <name> --connector <c>` creates a dbt-backed Dex project; `init <name>
---mode demo` adds the local seeded DuckDB warehouse. `init --mode adopt` adopts
-existing dbt without replacing its configuration or profiles, and `init --mode
-explore` configures exploration without creating dbt. A standalone semantic
+`init <name> --connector <c>` creates a dbt-backed Dex project.
+`init <name> --mode demo` adds the local seeded DuckDB warehouse.
+`init --mode adopt` adopts existing dbt without replacing its configuration or
+profiles, and `init --mode explore` configures exploration without creating dbt.
+A standalone semantic
 setup is preserved. When several projects exist, select `--project-dir <path>`.
 
 The repository root holds `.dex/`, the README, and agent instructions. Named dbt
