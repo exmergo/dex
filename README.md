@@ -54,24 +54,6 @@ npx skills add exmergo/dex
 npx skills add exmergo/dex --agent codex
 ```
 
-After installing the skills, ask your agent: “Initialize this repository with
-Dex.” The agent runs the installed wrapper; installing skills does not
-necessarily put a `dex` executable on your PATH.
-
-For the standalone CLI, install your connector extra and start setup:
-
-```bash
-uv tool install "exmergo-dex-core[duckdb]"
-dex init
-```
-
-Setup recommends creating a dbt-backed Dex project, with a complete local demo
-as the second option. It can also adopt existing dbt or configure exploration
-without dbt. It generates a project README and managed agent instructions,
-verifies the connection, and gives you a next command. It does not explore data
-or build models during setup. `.dex/` stays at the repository root; named dbt
-projects live beneath it.
-
 ## What you get
 
 - **Explore** your database, data warehouse, or SQL endpoint. Find the tables that matter, understand their structure, and verify how they join. Get column profiles, personal-data flags, and an ER diagram.
@@ -128,7 +110,7 @@ No existing database, no credentials, no cloud account, and no network once the
 package is installed.
 
 ```bash
-pip install "exmergo-dex-core[duckdb]"
+uv tool install "exmergo-dex-core[duckdb]"
 dex init analytics --mode demo
 dex explore map
 ```
