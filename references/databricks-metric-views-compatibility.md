@@ -416,9 +416,8 @@ output, so they take one file.
   returned under the `content` of its own `data.bridge.conversions` entry. With
   no configured output in the batch, `plan_id` is `null`. `next` names the
   `dex config set` that adopts the path and the command to run again (`update`
-  where every file already exists, `define` where none does, `plan` for a
-  mix). `update` refuses
-  such a path.
+  where every output of the rerun already exists, `define` where none does,
+  `plan` for a mix). `update` refuses such a path.
 
 ### The stash
 

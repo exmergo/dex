@@ -558,3 +558,21 @@ def test_next_plans_a_batch_of_existing_and_new_outputs(tmp_path, capsys):
     rc, out = run(capsys, tmp_path, "semantic", "databricks", "plan", "--from-ossie", b)
     assert rc == 0, out
     assert "`semantic databricks define --from-ossie" in out["data"]["bridge"]["next"]
+
+
+def test_next_follows_every_output_of_the_rerun(tmp_path, capsys):
+    """A configured output not yet written and a proposed one that exists: the
+    rerun writes both, so neither `update` nor `define` would take it."""
+    a = fixture(tmp_path, "converter_fixtureA_ossie.yaml", "models/sales.yaml")
+    b = fixture(tmp_path, "converter_fixtureB_ossie.yaml", "models/lineitem.yaml")
+    fixture(tmp_path, "converter_fixtureA.yaml", "views/sales.yaml")
+    configure(tmp_path, "databricks", ["views/lineitem.yaml"])
+
+    rc, out = run(
+        capsys, tmp_path, "semantic", "databricks", "plan", "--from-ossie", a, b
+    )
+
+    assert rc == 0, out
+    statuses = {c["name"]: c["status"] for c in out["data"]["bridge"]["conversions"]}
+    assert statuses == {"sales": "proposed", "lineitem": "included"}
+    assert "`semantic databricks plan --from-ossie" in out["data"]["bridge"]["next"]

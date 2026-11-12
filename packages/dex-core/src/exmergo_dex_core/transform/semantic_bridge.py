@@ -394,7 +394,8 @@ def semantic_bridge(
     if proposed:
         paths = [str(e.output_path) for e in proposed]
         rerun = _rerun(bridge, [e.source for e in entries], options)
-        adopt = _adopt(vendor, layer, paths, rerun, repo_root)
+        outputs = [str(e.output_path) for e in entries]
+        adopt = _adopt(vendor, layer, paths, rerun, repo_root, outputs)
         for entry in proposed:
             entry.status = "proposed"
             entry.content = contents[str(entry.output_path)]
@@ -590,14 +591,23 @@ def _yaml_list(paths: list[str]) -> str:
 
 
 def _adopt(
-    vendor: str, layer: Any, paths: list[str], flags: str, repo_root: Path
+    vendor: str,
+    layer: Any,
+    paths: list[str],
+    flags: str,
+    repo_root: Path,
+    outputs: list[str],
 ) -> str:
+    """The commands that adopt ``paths`` and run the conversion again.
+
+    The rerun converts every source again, so its mode follows every output it
+    writes (``outputs``), configured ones included, not only ``paths``."""
     listed = _yaml_list(
         list(dict.fromkeys([*layer.semantic_editing_surface(), *paths]))
     )
     # `define` refuses a file that already exists and `update` one that does not,
     # and an unconfigured path can be either: a batch holding both is a `plan`.
-    existing = [(repo_root / p).exists() for p in paths]
+    existing = [(repo_root / p).exists() for p in outputs]
     mode = "update" if all(existing) else "define" if not any(existing) else "plan"
     return (
         f"{', '.join(paths)} {'is' if len(paths) == 1 else 'are'} not under "
