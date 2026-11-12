@@ -166,9 +166,10 @@ def test_adoption_preserves_authored_dbt_files_and_global_profile(
     project = tmp_path / "authored"
     project.mkdir()
     project_text = (
-        "# authored project\nname: authored\nprofile: existing\nmodel-paths: [sql]\n"
+        "# authored café project\n"
+        "name: authored\nprofile: existing\nmodel-paths: [sql]\n"
     )
-    (project / "dbt_project.yml").write_text(project_text)
+    (project / "dbt_project.yml").write_text(project_text, encoding="utf-8")
     profiles = tmp_path / "local-profiles"
     profiles.mkdir()
     profile_text = yaml.safe_dump(

@@ -645,7 +645,9 @@ def initialize(
 
 def _project_name(project: Path) -> str:
     try:
-        metadata = yaml.safe_load((project / "dbt_project.yml").read_text())
+        metadata = yaml.safe_load(
+            (project / "dbt_project.yml").read_text(encoding="utf-8")
+        )
     except yaml.YAMLError as exc:
         raise RequestError(
             "existing dbt_project.yml is not valid YAML; repair it and run dex init"
@@ -675,7 +677,9 @@ def _structure(root: Path, project_dir: str | None, warehouse: str | None) -> st
         lines.append(f"{prefix}profiles.yml       # local dev profile")
     else:
         lines.append("# Profile resolved through DBT_PROFILES_DIR or ~/.dbt")
-    authored = yaml.safe_load((project / "dbt_project.yml").read_text()) or {}
+    authored = (
+        yaml.safe_load((project / "dbt_project.yml").read_text(encoding="utf-8")) or {}
+    )
     for model_path in authored.get("model-paths", ["models"]):
         lines.append(f"{prefix}{model_path}/    # dbt models")
         lines.extend(
