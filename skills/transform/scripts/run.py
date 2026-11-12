@@ -335,6 +335,9 @@ _METRIC_VIEWS_VENDOR = "databricks"
 # heavier. A Semantic View query is a `SEMANTIC_VIEW(...)` clause Snowflake runs,
 # so MetricFlow is never installed for one. (`snowflake` is also a connector
 # name; the connector's extra is resolved from `connector:`, never from this.)
+# `semantic snowflake` always takes it, as `semantic databricks` does: authoring
+# validates a view file with the same port of Snowflake's rules the reader runs.
+_SEMANTIC_VIEWS_COMMANDS = (("semantic", "snowflake"),)
 _SEMANTIC_VIEWS_VENDOR = "snowflake"
 
 # The vendors that render a metric query without MetricFlow.
@@ -421,7 +424,9 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
         vendor == _METRIC_VIEWS_VENDOR and reads_layer
     ):
         extras.append("metric-views")
-    if vendor == _SEMANTIC_VIEWS_VENDOR and reads_layer:
+    if command in _SEMANTIC_VIEWS_COMMANDS or (
+        vendor == _SEMANTIC_VIEWS_VENDOR and reads_layer
+    ):
         extras.append("semantic-views")
     if command in _SEMANTIC_AUTHORING_COMMANDS:
         extras.append("semantic")

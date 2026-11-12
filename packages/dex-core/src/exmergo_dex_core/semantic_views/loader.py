@@ -48,7 +48,9 @@ import yaml
 
 from ..native_yaml import (
     MAX_EXPANDED_VALUES,
+    StrictDumper,
     StrictLoader,
+    dump_strict_yaml,
     expansion,
     read_strict_yaml,
 )
@@ -59,7 +61,9 @@ __all__ = [
     "ERROR",
     "WARNING",
     "Diagnostic",
+    "Dumper",
     "LoadResult",
+    "dump_yaml",
     "load_files",
     "read_yaml",
     "validate_view_contents",
@@ -128,6 +132,19 @@ def read_yaml(text: str) -> Any:
     a duplicate or non-text key refused (``yaml.YAMLError``)."""
 
     return read_strict_yaml(text, _Loader)
+
+
+class Dumper(StrictDumper):
+    """The writer's half of :class:`_Loader`: YAML 1.2 booleans, block lists
+    indented under their key, so what dex writes reads back through
+    :func:`read_yaml` as the same values (#1292)."""
+
+
+def dump_yaml(value: Any) -> str:
+    """``value`` as Semantic View YAML: block style, keys in the order given,
+    YAML 1.2 scalars."""
+
+    return dump_strict_yaml(value, Dumper)
 
 
 # --- the files ---------------------------------------------------------------------
@@ -570,6 +587,16 @@ def _expressions(view: SemanticView, result: LoadResult) -> SemanticView:
             (read, resolve_read(view, member, read.qualifier, read.name))
             for read in found
         ]
+        for read, target in targets:
+            if target.column is not None and read.qualifier is not None:
+                refuse(
+                    member,
+                    "unresolved_member",
+                    f"reads `{read.qualifier}.{read.name}`, and `{read.name}` is no "
+                    f"member of `{target.table}`, so it can only be a column of the "
+                    "base table, which dex cannot check without the warehouse. "
+                    "Declare the member, or write the column unqualified",
+                )
         reads_of[key(member)] = [
             key(t.member) for _, t in targets if t.member is not None
         ] + [

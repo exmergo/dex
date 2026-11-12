@@ -1507,15 +1507,14 @@ def test_semantic_update_command_helper():
     assert _semantic_update_command("databricks") == "semantic databricks update"
 
 
-def test_dangling_reference_under_snowflake_names_no_command():
-    """Snowflake Semantic Views are read before they are authored (#1292), so a
-    finding on that layer names the file to edit, never a route that would
-    refuse."""
+def test_dangling_reference_under_snowflake_names_its_route():
+    """Snowflake Semantic Views are authored through `semantic snowflake` (#1292),
+    so a finding on that layer names the route."""
     from exmergo_dex_core.config import SEMANTIC_DOCUMENT_AUTHORING
     from exmergo_dex_core.maintain.drift import DriftFinding
     from exmergo_dex_core.maintain.reconcile import _advisory
 
-    assert "snowflake" not in SEMANTIC_DOCUMENT_AUTHORING
+    assert "snowflake" in SEMANTIC_DOCUMENT_AUTHORING
     finding = DriftFinding(
         axis="semantic",
         code="dangling_reference",
@@ -1523,13 +1522,44 @@ def test_dangling_reference_under_snowflake_names_no_command():
         detail="metric references a measure that is gone",
     )
     action = _advisory(finding, semantic_vendor="snowflake").action
+    assert "`semantic snowflake update`" in action
+
+
+def test_a_vendor_with_no_authoring_route_names_its_file(monkeypatch):
+    """A layer dex reads but does not author names the file to edit, never a
+    route that would refuse."""
+    from exmergo_dex_core import config
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    monkeypatch.setattr(
+        config,
+        "SEMANTIC_DOCUMENT_AUTHORING",
+        tuple(v for v in config.SEMANTIC_DOCUMENT_AUTHORING if v != "snowflake"),
+    )
+    dangling = DriftFinding(
+        axis="semantic",
+        code="dangling_reference",
+        identifier="sales.orders.revenue",
+        detail="metric references a measure that is gone",
+    )
+    action = _advisory(dangling, semantic_vendor="snowflake").action
     assert "`semantic" not in action
     assert "edit the semantic definition in its file" in action
+    grain = DriftFinding(
+        axis="grain",
+        code="declared_grain_not_unique",
+        identifier="demo.main.orders",
+        detail="not unique",
+        data={"claim": "primary", "declared_by": "snowflake"},
+    )
+    assert "change the primary key in its file" in (
+        _advisory(grain, semantic_vendor="snowflake").action
+    )
 
 
-def test_a_contradicted_primary_key_names_no_route_a_vendor_lacks():
-    """Snowflake's primary key is changed in its file until #1292 authors it;
-    Cube's through its own route."""
+def test_a_contradicted_primary_key_names_the_vendor_route():
+    """Snowflake's and Cube's primary keys are changed through their own routes."""
     from exmergo_dex_core.maintain.drift import DriftFinding
     from exmergo_dex_core.maintain.reconcile import _advisory
 
@@ -1543,6 +1573,5 @@ def test_a_contradicted_primary_key_names_no_route_a_vendor_lacks():
         )
         return _advisory(finding, semantic_vendor=vendor).action
 
-    assert "change the primary key in its file" in action("snowflake")
-    assert "`semantic snowflake update`" not in action("snowflake")
+    assert "`semantic snowflake update`" in action("snowflake")
     assert "`semantic cube update`" in action("cube")

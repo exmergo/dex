@@ -681,7 +681,13 @@ SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
 #: before the layer implements it would exist only to refuse. The route takes
 #: no vendor name of its own; it reads the vendor off the subcommand, and refuses
 #: one that is not the configured `semantic.vendor`.
-SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = ("ossie", "slayer", "cube", "databricks")
+SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = (
+    "ossie",
+    "slayer",
+    "cube",
+    "databricks",
+    "snowflake",
+)
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",

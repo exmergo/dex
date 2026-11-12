@@ -29,7 +29,8 @@ logic.
   follows the same read where the vendor is `databricks`, is always taken by
   `semantic databricks`, and never takes `[semantic]`. `[semantic-views]`
   follows the same read where the vendor is `snowflake` (also a connector name,
-  whose extra still comes from `connector:` alone), and never takes `[semantic]`.
+  whose extra still comes from `connector:` alone), is always taken by
+  `semantic snowflake`, and never takes `[semantic]`.
   A repo that runs neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
@@ -615,6 +616,15 @@ dex semantic databricks define|update|plan
                                      unchanged, applied atomically with transform apply, never deployed;
                                      --from-ossie <file>... [--fact] [--into] proposes views from
                                      Ossie documents through the Ossie bridge (#1260)
+dex semantic snowflake define|update|plan
+                                  -> Snowflake Semantic View YAML files as whole-file diffs; limited
+                                     to the files in semantic.snowflake.files (.sql refused by name),
+                                     validated as one prospective set with dex's port of Snowflake's
+                                     specification and validation rules (unknown keys, access_modifier
+                                     on a dimension and a qualified read naming no member refused on
+                                     write), each logical table and derived metric classified defined,
+                                     updated or unchanged, applied atomically with transform apply,
+                                     never deployed
 dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the
@@ -801,7 +811,16 @@ joins from foreign keys with `rely.at_most_one_match` only where the parent
 declares that key as its grain), validated by `semantic databricks`'s own checks,
 read back through its catalog, and included or proposed on the same terms against
 `semantic.databricks.files`; a Metric View has no metadata key, so the population
-is only the last sentence of its `comment`. Under `ossie` it is a dataset (a field per declared
+is only the last sentence of its `comment`. Under `snowflake` it is a logical
+table (the mart as a three-part `base_table`, `primary_key` from the grain, a
+`time` role as a time dimension and other roles as dimensions, each measure a fact
+with declared aggregations as metrics `<column>_<agg>`, `non_additive_dimensions`
+for a `semi_additive` one, and a relationship from each foreign key to a parent
+table keyed on that column) spliced into the configured file holding the tables
+its foreign keys reference and stored as a second plan (`plan_id`), or a view of
+its own, `<dir>/<mart>.yaml`, included or proposed against
+`semantic.snowflake.files`; a Semantic View has no metadata key, so the
+population is only the last sentence of the table's `description`. Under `ossie` it is a dataset (a field per declared
 column, `primary_key` on every grain field, declared aggregations as dataset-scoped
 metrics `<column>_<agg>`, a relationship from each foreign key to the parent's
 field) appended to the configured document holding the datasets its foreign keys
@@ -812,9 +831,9 @@ Ossie's `ai_context`, and one sentence in the description)
 and never as a filter, since the mart's SQL already enforces it; per model,
 `carried` and `not_carried` account for every declared field.
 `semantic slayer define|update|plan`, `semantic cube define|update|plan`,
-`semantic ossie define|update|plan` and `semantic databricks define|update|plan`
-take `declarations` too, annotating a model, cube, dataset or view the payload or
-the layer defines. A command that takes no declarations refuses a payload
+`semantic ossie define|update|plan`, `semantic databricks define|update|plan` and
+`semantic snowflake define|update|plan` take `declarations` too, annotating a
+model, cube, dataset, view or logical table the payload or the layer defines. A command that takes no declarations refuses a payload
 carrying them rather than dropping them. A version of a native dbt versioned
 model is declared as `"model": "dim_teams.v2"` and renders into that item of the
 model's `versions:` list, every other byte kept (#895); the bare name is the
@@ -1794,6 +1813,19 @@ default, or a filter or operator after it is refused. A key naming a location
   refuse it too. Each view is reported `defined`, `updated` or `unchanged`,
   compared as YAML 1.2. Apply writes the authored bytes, all files or none, a
   file changed after planning is a conflict, and nothing is deployed.
+- `semantic snowflake define|update|plan` is the same route for Snowflake
+  Semantic View YAML files (#1292). Each edit is one whole file keyed as
+  `semantic.snowflake.files` names it, its view named by its own `name`; a path
+  off that list, a `.sql` file and another suffix are refused by name, and a
+  delete is refused. The prospective set is validated by dex's port of
+  Snowflake's specification and validation rules, every error refusing it, and
+  in a file the plan writes an unknown key, `access_modifier` on a dimension and
+  `unresolved_member` (a read qualified with its own table naming no member)
+  refuse it too. Each logical table (`view.table`) and derived metric
+  (`view.metric`) is reported `defined`, `updated` or `unchanged`, compared as
+  YAML 1.2, and a change to a view's other parts only reports the view. Apply
+  writes the authored bytes, all files or none, keeping each file's mode, a file
+  changed after planning is a conflict, and nothing is deployed.
 
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
@@ -2000,8 +2032,10 @@ gate. `maintain snapshot` records `vendor: snowflake` and dex's own rule-set
 revision as `format_version` (the format has no `version` key), over a canonical
 form, so a view read back from Snowflake fingerprints as its file; the
 layer-neutral axes read it: definition drift on the semantic axis, each key and
-relationship arity on the grain axis. Authoring is #1292 and the schema axis and
-reconcile #1293. Selecting the vendor without the `[semantic-views]` extra (the
+relationship arity on the grain axis. `semantic snowflake define|update|plan`
+authors the files through a stored plan, never deploying them, and a declared dbt
+mart derives a logical table (see `transform plan` above); the schema axis and
+reconcile are #1293. Selecting the vendor without the `[semantic-views]` extra (the
 dialect engine) refuses and names it. See
 [Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md).
 

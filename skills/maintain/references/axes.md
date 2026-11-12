@@ -469,7 +469,7 @@ with none, without a Snowflake connection to read it. The wrapper installs the
 | `volume` | unchanged: it reads the warehouse, not the layer |
 | `grain` | measures each primary and unique key (`declared_grain_not_unique`) and each relationship's arity (`join_cardinality_exceeded`); an ASOF or range relationship states no arity and is named unchecked |
 | `semantic` | definition drift free as everywhere: a table, member, metric or relationship added, removed or changed |
-| `reconcile` | advisory only: there is no `semantic snowflake update` route yet (#1292) |
+| `reconcile` | advisory, naming `semantic snowflake update` as the route (#1292); no edit is stored until the schema axis (#1293) |
 | `verify` | checks the dbt project only |
 
 A deployed semantic view is never inventoried: `SHOW VIEWS` does not list one,

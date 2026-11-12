@@ -504,6 +504,14 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "[metric-views] extra. Never deploys a view and opens no workspace "
         "connection. Repo-only.",
     ),
+    ("semantic", "snowflake"): (
+        "plan whole-file edits to the Semantic View YAML files",
+        "Validate whole Snowflake Semantic View YAML files at the paths "
+        "semantic.snowflake.files configures, with dex's port of Snowflake's "
+        "specification and validation rules, then store a plan. Needs the "
+        "[semantic-views] extra. Never deploys a view and opens no Snowflake "
+        "connection. Repo-only.",
+    ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
         "Pin the current map and fingerprint the project layers as the "
