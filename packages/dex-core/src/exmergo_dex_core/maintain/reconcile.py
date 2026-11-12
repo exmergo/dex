@@ -925,6 +925,17 @@ def _drop_empty_proposals(proposals: list[Proposal], written: set[str]) -> None:
 #: in that order and only this side knows the answer.
 _TEST_EDIT_CLAUSE = "; the unique test keeps the break visible in builds"
 
+#: Appended where the declaration already tests the key, so the reader learns why
+#: there is no test edit. Which test should be failing is named only where the finding
+#: is on the model's own relation and the test is a plain `unique`; even then the
+#: finding counts NULL keys and dbt's `unique` does not, so the clause says so. A
+#: source's drift, or a configured test (a `where` filter), only says the test exists.
+_FAILING_TEST_CLAUSE = (
+    "; the existing unique test on {column} in {path} fails on these duplicates "
+    "unless they are NULL keys, which dbt's unique test ignores"
+)
+_EXISTING_TEST_CLAUSE = "; {path} already declares a unique test on {column}"
+
 
 def _grain_test_edits(
     proposals: list[Proposal],
@@ -975,7 +986,11 @@ def _grain_test_edits(
             )
             continue
         if "unique" in current.values:
-            continue  # already alerting
+            failing = placed.built and "unique" in current.spans
+            proposal.action += (
+                _FAILING_TEST_CLAUSE if failing else _EXISTING_TEST_CLAUSE
+            ).format(column=proposal.column, path=placed.path)
+            continue
         composite, unresolved = _declared_grain(
             definitions, placed.model, proposal.column
         )
