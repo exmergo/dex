@@ -1870,9 +1870,18 @@ def _drafted(
     if columns:
         drafted["columns"] = columns
 
+    domain_clauses: dict[tuple[str, str], tuple[set[str], bool]] = {}
+    for (relation, column, is_ref), clauses in reading.used.items():
+        key = (relation, column)
+        if key not in domain_clauses:
+            domain_clauses[key] = (set(clauses), is_ref)
+        else:
+            existing_clauses, existing_ref = domain_clauses[key]
+            existing_clauses.update(clauses)
+            domain_clauses[key] = (existing_clauses, existing_ref or is_ref)
+
     domains = []
-    seen_domains: set[tuple[str, str]] = set()
-    for (relation, column, is_ref), clauses in sorted(reading.used.items()):
+    for (relation, column), (clauses, is_ref) in sorted(domain_clauses.items()):
         effective_manifest = manifest if is_ref else None
         entry = _domain(
             relation,
@@ -1882,8 +1891,7 @@ def _drafted(
             domain_cap,
             manifest=effective_manifest,
         )
-        if entry is not None and (relation, column) not in seen_domains:
-            seen_domains.add((relation, column))
+        if entry is not None:
             domains.append(entry)
     if domains:
         drafted["domains"] = domains
