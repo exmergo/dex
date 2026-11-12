@@ -104,10 +104,24 @@ Writing SQL is one part of analytics engineering. Your agent also needs to:
 Dex gives the agent a repeatable explore, transform, maintain loop, with
 guardrails enforced in the engine.
 
-## Try it in three commands
+## Quickstart
 
-No existing database, no credentials, no cloud account, and no network once the
-package is installed.
+### Initialize
+If you want to use the python package `exmergo-dex-core`:
+
+1. Install it with `uv`, with the extras you need (i.e. DuckDB)
+```bash 
+uv tool install "exmergo-dex-core[duckdb]"
+```
+2. Initialize a Dex project (creatively called "analytics")
+```bash 
+dex init analytics
+```
+
+### Demo
+
+Try Dex in a demo experience with no existing database, no credentials, 
+no cloud account, and no network once the package is installed:
 
 ```bash
 uv tool install "exmergo-dex-core[duckdb]"
@@ -136,10 +150,10 @@ An excerpt, for one table:
 }
 ```
 
-### It is broken on purpose
+### The demo is broken (on purpose!)
 
-A first run that reports a clean bill of health teaches you nothing, so the demo
-ships with real defects. Dig into them:
+A first run that reports a clean bill of health doesn't teach us much, 
+so the demo ships with real defects. Dig into them:
 
 ```bash
 dex explore profile order_items products
