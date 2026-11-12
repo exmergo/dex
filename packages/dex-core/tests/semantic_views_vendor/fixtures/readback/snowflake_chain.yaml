@@ -1,0 +1,121 @@
+name: SNOWFLAKE_CHAIN
+tables:
+  - name: CUSTOMER
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: CUSTOMER
+    primary_key:
+      columns:
+        - C_CUSTKEY
+    dimensions:
+      - name: CUSTOMER_NAME
+        expr: c_name
+        data_type: VARCHAR(25)
+        access_modifier: public_access
+    facts:
+      - name: LIFETIME_ORDERS
+        description: "Orders this customer placed, aggregated from the finer table."
+        expr: COUNT(orders.order_key)
+        data_type: "NUMBER(18,0)"
+        access_modifier: public_access
+    metrics:
+      - name: AVERAGE_ORDERS_PER_CUSTOMER
+        expr: AVG(customer.lifetime_orders)
+        access_modifier: public_access
+  - name: LINEITEM
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: LINEITEM
+    primary_key:
+      columns:
+        - L_ORDERKEY
+        - L_LINENUMBER
+    facts:
+      - name: EXTENDED_PRICE
+        expr: l_extendedprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: GROSS_REVENUE
+        expr: SUM(lineitem.extended_price)
+        access_modifier: public_access
+  - name: NATION
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: NATION
+    primary_key:
+      columns:
+        - N_NATIONKEY
+    dimensions:
+      - name: NATION_NAME
+        expr: n_name
+        data_type: VARCHAR(25)
+        access_modifier: public_access
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: ORDER_STATUS
+        expr: o_orderstatus
+        data_type: VARCHAR(1)
+        access_modifier: public_access
+    facts:
+      - name: ORDER_KEY
+        expr: o_orderkey
+        data_type: "NUMBER(38,0)"
+        access_modifier: public_access
+    metrics:
+      - name: ORDER_COUNT
+        expr: COUNT(o_orderkey)
+        access_modifier: public_access
+  - name: REGION
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: REGION
+    primary_key:
+      columns:
+        - R_REGIONKEY
+    dimensions:
+      - name: REGION_NAME
+        expr: r_name
+        data_type: VARCHAR(25)
+        access_modifier: public_access
+    metrics:
+      - name: AVERAGE_ORDER_VALUE
+        description: Nested aggregate over a finer table.
+        expr: AVG(SUM(lineitem.extended_price))
+        access_modifier: public_access
+relationships:
+  - name: CUSTOMER_NATION
+    left_table: CUSTOMER
+    right_table: NATION
+    relationship_columns:
+      - left_column: C_NATIONKEY
+        right_column: N_NATIONKEY
+  - name: LINEITEM_ORDERS
+    left_table: LINEITEM
+    right_table: ORDERS
+    relationship_columns:
+      - left_column: L_ORDERKEY
+        right_column: O_ORDERKEY
+  - name: NATION_REGION
+    left_table: NATION
+    right_table: REGION
+    relationship_columns:
+      - left_column: N_REGIONKEY
+        right_column: R_REGIONKEY
+  - name: ORDERS_CUSTOMER
+    left_table: ORDERS
+    right_table: CUSTOMER
+    relationship_columns:
+      - left_column: O_CUSTKEY
+        right_column: C_CUSTKEY

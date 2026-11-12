@@ -1,0 +1,12 @@
+# expect: unique_keys
+# A unique key that repeats the primary key.
+name: unique_key_repeats_primary_key
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    unique_keys:
+      - columns: [o_orderkey]
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

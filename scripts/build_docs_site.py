@@ -271,6 +271,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "snowflake-semantic-views-compatibility.md",
+        "semantic-layers/snowflake-semantic-views",
+        PageMeta(
+            "Snowflake Semantic View compatibility",
+            "How dex reads Snowflake Semantic View YAML with no Snowflake "
+            "connection: rules qualified against verify_only, the catalog "
+            "mapping and what it declines to claim.",
+            "Snowflake Semantic Views",
+        ),
+    ),
+    ReferencePage(
         "ossie-walkthrough.md",
         "guides/ossie-semantic-layer",
         PageMeta(

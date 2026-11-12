@@ -4195,6 +4195,7 @@ _DECLARING_LAYER = {
     "slayer": "the SLayer layer",
     "cube": "the Cube layer",
     "databricks": "the Databricks Metric View layer",
+    "snowflake": "the Snowflake Semantic View layer",
 }
 
 
@@ -4203,10 +4204,10 @@ def _drop_metricflow_under_native_vendor(
 ) -> dbt_project.ProjectDefinitions:
     """Drop MetricFlow grain and metric lineage when a native vendor owns the layer.
 
-    Under ``semantic.vendor: ossie|slayer|cube|databricks`` the vendor layer is the
-    repository's one semantic layer (#922). ``explore`` still reads the dbt
-    project for transformation declarations (``config.meta.dex``, unique and
-    relationships tests), but MetricFlow-derived ``primary_entities`` and
+    Under ``semantic.vendor: ossie|slayer|cube|databricks|snowflake`` the vendor
+    layer is the repository's one semantic layer (#922). ``explore`` still reads
+    the dbt project for transformation declarations (``config.meta.dex``, unique
+    and relationships tests), but MetricFlow-derived ``primary_entities`` and
     ``metric_models`` must not fold into exploration beside that vendor. Under
     ``vendor: dbt`` (or an unset vendor) the definitions are unchanged.
     """

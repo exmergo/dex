@@ -641,6 +641,10 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # here, read statically. The views deployed in a workspace are a second copy
     # dex neither reads nor writes in this release (#964 reads them, explicitly).
     "databricks": ("local",),
+    # Snowflake Semantic Views: the Semantic View YAML documents committed here,
+    # read statically. The views deployed on an account are a second copy dex
+    # neither reads nor writes in this release (#1290 reads them, explicitly).
+    "snowflake": ("local",),
 }
 
 #: The factory that builds a vendor's own semantic source, for the vendors whose
@@ -666,6 +670,7 @@ SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
     "slayer": "exmergo_dex_core.slayer.project:build_semantic_layer",
     "cube": "exmergo_dex_core.cube.project:build_semantic_layer",
     "databricks": "exmergo_dex_core.metric_views.project:build_semantic_layer",
+    "snowflake": "exmergo_dex_core.semantic_views.project:build_semantic_layer",
 }
 
 #: The vendors whose native documents `semantic <vendor> define|update|plan`
@@ -1027,6 +1032,59 @@ class DatabricksSemanticConfig(BaseModel):
         return self
 
 
+#: The suffixes a Semantic View YAML document is read from. The DDL that creates
+#: one (``CREATE SEMANTIC VIEW ...``) is a different artifact, and is refused by
+#: name rather than having a definition guessed out of it.
+SEMANTIC_VIEW_SUFFIXES = (".yaml", ".yml")
+
+
+class SnowflakeSemanticConfig(BaseModel):
+    """The repository-confined Semantic View files behind ``vendor: snowflake``.
+
+    ``files`` is an exact allowlist with the rules ``semantic.ossie.files``
+    follows: no globs, no absolute paths, no ``..``, no duplicates, each written
+    relative to the repository root. Each file is one document in Snowflake's
+    Semantic View YAML specification: the input of
+    ``SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`` and the output of
+    ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``. The view is named by the document's
+    own ``name``, so two files may not share a stem only where the documents say
+    so (the reader refuses two documents declaring one view). The DDL (a
+    ``.sql`` file, ``CREATE SEMANTIC VIEW ...``) is refused by name: dex reads the
+    YAML form, never a deployment statement.
+    """
+
+    LISTING: ClassVar[str] = "files"
+    LISTING_MEANS: ClassVar[str] = (
+        "the Semantic View YAML files to read, named relative to the repository root"
+    )
+
+    files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check(self) -> SnowflakeSemanticConfig:
+        for name in self.files:
+            path = _repository_relative("semantic.snowflake.files", name)
+            if path.suffix.lower() == ".sql":
+                raise ValueError(
+                    f"semantic.snowflake.files: '{name}' is SQL. dex reads the "
+                    "Semantic View YAML document (what "
+                    "SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW returns), not the "
+                    "`CREATE SEMANTIC VIEW` statement: keep the YAML in a .yaml "
+                    "file and list that"
+                )
+            if not name.endswith(SEMANTIC_VIEW_SUFFIXES):
+                raise ValueError(
+                    f"semantic.snowflake.files: '{name}' is not a Semantic View "
+                    "YAML file; they are named .yaml or .yml"
+                )
+        if duplicated := sorted({n for n in self.files if self.files.count(n) > 1}):
+            raise ValueError(
+                "semantic.snowflake.files names the same file twice: "
+                f"{', '.join(duplicated)}"
+            )
+        return self
+
+
 class SemanticConfig(BaseModel):
     """How ``explore semantic`` reaches the semantic layer, on two axes.
 
@@ -1100,6 +1158,7 @@ class SemanticConfig(BaseModel):
     databricks: DatabricksSemanticConfig = Field(
         default_factory=DatabricksSemanticConfig
     )
+    snowflake: SnowflakeSemanticConfig = Field(default_factory=SnowflakeSemanticConfig)
 
     @model_validator(mode="after")
     def _check_axes(self) -> SemanticConfig:

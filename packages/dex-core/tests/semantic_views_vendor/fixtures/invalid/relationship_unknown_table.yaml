@@ -1,0 +1,15 @@
+# expect: relationship
+# A relationship to a table the view does not declare.
+name: relationship_unknown_table
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+relationships:
+  - name: orders_customer
+    left_table: orders
+    right_table: customer
+    relationship_columns: [{left_column: o_custkey, right_column: c_custkey}]

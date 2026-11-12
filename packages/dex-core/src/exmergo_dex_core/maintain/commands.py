@@ -267,6 +267,17 @@ def _semantic_schema_source(engine: DexEngine):
     return (source if isinstance(source, SemanticSchemaSource) else None), None
 
 
+def _native_semantic_vendor(engine: DexEngine) -> bool:
+    """Whether a native semantic vendor (not dbt) owns the layer, so a repository
+    with no transformation project is a semantic-only repository rather than a
+    misconfigured one."""
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    return vendor in SEMANTIC_SOURCE_FACTORIES
+
+
 def _declared_schema_drift(
     engine: DexEngine,
     current: list,
@@ -2017,8 +2028,12 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # only the project's half has nowhere to land.
             # A semantic vendor with no project beside it is that repository's
             # one layer: its findings on the other axes (a contradicted key on
-            # grain, say) are advisory there too, never a refusal (#1259).
-            if semantic_source is None:
+            # grain, say) are advisory there too, never a refusal (#1259). That
+            # holds for a vendor whose source has no schema channel yet as well
+            # (Snowflake Semantic Views until #1293): the layer is still the
+            # repository's one layer, and its findings still have nowhere to
+            # land but a person's edit.
+            if semantic_source is None and not _native_semantic_vendor(engine):
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(
                 f"no transformation project to edit ({exc}), so every proposal "

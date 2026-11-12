@@ -1,0 +1,38 @@
+# View-level (derived) metrics, which read table metrics and carry no table prefix.
+name: derived_metrics
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - name: order_priority
+        expr: o_orderpriority
+    facts:
+      - name: total_price
+        expr: o_totalprice
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+      - name: revenue
+        expr: SUM(orders.total_price)
+  - name: customer
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: CUSTOMER}
+    primary_key: {columns: [c_custkey]}
+    dimensions:
+      - name: market_segment
+        expr: c_mktsegment
+    metrics:
+      - name: customer_count
+        expr: COUNT(c_custkey)
+relationships:
+  - name: orders_customer
+    left_table: orders
+    right_table: customer
+    relationship_columns: [{left_column: o_custkey, right_column: c_custkey}]
+metrics:
+  - name: average_order_value
+    description: Revenue per order.
+    synonyms: [AOV]
+    expr: orders.revenue / orders.order_count
+  - name: orders_per_customer
+    expr: orders.order_count / customer.customer_count

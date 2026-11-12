@@ -363,7 +363,7 @@ def initialize(
         )
     semantic_only = (
         mode == "explore"
-        and facts["semantic"] in {"ossie", "slayer", "cube", "databricks"}
+        and facts["semantic"] in {"ossie", "slayer", "cube", "databricks", "snowflake"}
         and "connector" not in config.model_fields_set
         and not any(
             (

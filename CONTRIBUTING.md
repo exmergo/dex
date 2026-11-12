@@ -623,7 +623,8 @@ shipped native Ossie source binds every applicable contract in
 to read. `packages/dex-core/tests/cube_vendor/test_reader.py` binds them for the
 Cube source, including a Cube rendering of the reference layer, and
 `packages/dex-core/tests/metric_views_vendor/test_reader.py` for the Databricks
-Metric View source.
+Metric View source, and `packages/dex-core/tests/semantic_views_vendor/test_reader.py`
+for the Snowflake Semantic View source.
 
 ## Linting and formatting (Ruff)
 

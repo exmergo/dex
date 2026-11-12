@@ -27,7 +27,6 @@ read best-effort:
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -35,7 +34,8 @@ from typing import Any
 
 import yaml
 
-from ..yaml_items import IndentedDumper
+from .. import native_yaml
+from ..native_yaml import StrictDumper, StrictLoader, dump_strict_yaml, read_strict_yaml
 from . import validator
 from .model import MetricView
 
@@ -109,62 +109,21 @@ class LoadResult:
 # --- YAML as Databricks reads it ----------------------------------------------------
 
 
-class _Loader(yaml.SafeLoader):
-    """SafeLoader with YAML 1.2's booleans and no duplicate keys."""
+class _Loader(StrictLoader):
+    """The shared strict loader (:mod:`..native_yaml`): YAML 1.2's booleans and
+    no duplicate or non-text keys, refusals naming a Metric View."""
 
-
-_Loader.yaml_implicit_resolvers = {
-    first: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
-    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-_Loader.add_implicit_resolver(
-    "tag:yaml.org,2002:bool",
-    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
-    list("tTfF"),
-)
-
-
-def _mapping(loader: _Loader, node: yaml.MappingNode, deep: bool = False) -> Any:
-    """Construct a mapping, refusing a duplicate key and a key that is not text."""
-    seen: set[Any] = set()
-    for key_node, _ in node.value:
-        key = loader.construct_object(key_node, deep=True)
-        if not isinstance(key, str):
-            hint = (
-                ". A YAML 1.1 reader or writer (PyYAML's default, for one) turns a "
-                "bare `on:` into `true:`; write the join condition's key as `on:` "
-                "again"
-                if key is True
-                else ""
-            )
-            raise yaml.constructor.ConstructorError(
-                None,
-                None,
-                f"the key `{key}` is not text, and every Metric View key is{hint}",
-                key_node.start_mark,
-            )
-        if key in seen:
-            raise yaml.constructor.ConstructorError(
-                None,
-                None,
-                f"the key `{key}` is written twice in one mapping",
-                key_node.start_mark,
-            )
-        seen.add(key)
-    return loader.construct_mapping(node, deep=deep)
-
-
-_Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+    document = "Metric View"
 
 
 def read_yaml(text: str) -> Any:
     """``text`` parsed the way a Metric View body is: YAML 1.2 booleans, and a
     duplicate key refused (``yaml.YAMLError``)."""
 
-    return yaml.load(text, Loader=_Loader)  # noqa: S506 - a SafeLoader subclass
+    return read_strict_yaml(text, _Loader)
 
 
-class Dumper(IndentedDumper):
+class Dumper(StrictDumper):
     """The writer's half of :class:`_Loader`: YAML 1.2 booleans, block lists
     indented under their key.
 
@@ -176,14 +135,11 @@ class Dumper(IndentedDumper):
     """
 
 
-Dumper.yaml_implicit_resolvers = dict(_Loader.yaml_implicit_resolvers)
-
-
 def dump_yaml(value: Any) -> str:
     """``value`` as a Metric View body: block style, keys in the order given,
     YAML 1.2 scalars, so it reads back through :func:`read_yaml` unchanged."""
 
-    return yaml.dump(value, Dumper=Dumper, sort_keys=False, allow_unicode=True)
+    return dump_strict_yaml(value, Dumper)
 
 
 # --- the files ---------------------------------------------------------------------
@@ -530,46 +486,10 @@ def _expressions(view: MetricView, result: LoadResult) -> MetricView:
     )
 
 
-#: How many values a file may expand to once its YAML aliases are followed. A
-#: Metric View is a few hundred; past this a file is a "billion laughs" shape
-#: that would stall every later read of it (the fingerprint serializes it whole).
-MAX_EXPANDED_VALUES = 100_000
-
-
-def _expansion(value: Any) -> int | None:
-    """How many values ``value`` expands to with aliases followed, or ``None``
-    where it contains itself (a recursive alias).
-
-    Each container is visited once: a shared alias is sized once and its size
-    reused, so the check is linear in the parsed document, not in its expansion.
-    A size saturates at ``MAX_EXPANDED_VALUES + 1``, so a count never grows past
-    what the caller compares it with, and cycles are still looked for after it
-    saturates.
-    """
-
-    sizes: dict[int, int] = {}
-    visiting: set[int] = set()
-
-    def size(node: Any) -> int | None:
-        if not isinstance(node, (dict, list)):
-            return 1
-        key = id(node)
-        if key in sizes:
-            return sizes[key]
-        if key in visiting:
-            return None
-        visiting.add(key)
-        total = 1
-        for child in node.values() if isinstance(node, dict) else node:
-            inner = size(child)
-            if inner is None:
-                return None
-            total = min(total + inner, MAX_EXPANDED_VALUES + 1)
-        visiting.discard(key)
-        sizes[key] = total
-        return total
-
-    return size(value)
+#: How many values a file may expand to once its YAML aliases are followed (see
+#: :data:`..native_yaml.MAX_EXPANDED_VALUES`).
+MAX_EXPANDED_VALUES = native_yaml.MAX_EXPANDED_VALUES
+_expansion = native_yaml.expansion
 
 
 def _cycles(start: str, reads: Mapping[str, list[str]]) -> bool:

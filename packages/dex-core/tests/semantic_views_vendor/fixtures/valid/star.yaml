@@ -1,0 +1,99 @@
+# A star: line items and customers around orders, with time dimensions,
+# synonyms and descriptions on every element.
+name: star
+description: Orders with their line items and the customers who placed them.
+tables:
+  - name: orders
+    description: One row per order.
+    synonyms: [purchases, sales orders]
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns: [o_orderkey]
+    dimensions:
+      - name: order_status
+        description: F, O or P.
+        synonyms: [status]
+        expr: o_orderstatus
+        data_type: VARCHAR
+      - name: order_priority
+        expr: o_orderpriority
+        data_type: VARCHAR
+    time_dimensions:
+      - name: order_date
+        description: When the order was placed.
+        synonyms: [placed on]
+        expr: o_orderdate
+        data_type: DATE
+    facts:
+      - name: total_price
+        description: The order's total price.
+        expr: o_totalprice
+        data_type: NUMBER
+    metrics:
+      - name: order_count
+        description: How many orders.
+        synonyms: [number of orders]
+        expr: COUNT(o_orderkey)
+      - name: revenue
+        expr: SUM(orders.total_price)
+  - name: lineitem
+    description: One row per order line.
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: LINEITEM
+    primary_key:
+      columns: [l_orderkey, l_linenumber]
+    dimensions:
+      - name: ship_mode
+        expr: l_shipmode
+        data_type: VARCHAR
+    time_dimensions:
+      - name: ship_date
+        expr: l_shipdate
+        data_type: DATE
+    facts:
+      - name: quantity
+        expr: l_quantity
+        data_type: NUMBER
+      - name: net_price
+        description: Extended price less the discount.
+        expr: l_extendedprice * (1 - l_discount)
+        data_type: NUMBER
+    metrics:
+      - name: total_quantity
+        expr: SUM(lineitem.quantity)
+      - name: net_revenue
+        expr: SUM(lineitem.net_price)
+  - name: customer
+    description: One row per customer.
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: CUSTOMER
+    primary_key:
+      columns: [c_custkey]
+    dimensions:
+      - name: market_segment
+        synonyms: [segment]
+        expr: c_mktsegment
+        data_type: VARCHAR
+    metrics:
+      - name: customer_count
+        expr: COUNT(c_custkey)
+relationships:
+  - name: lineitem_to_orders
+    left_table: lineitem
+    right_table: orders
+    relationship_columns:
+      - left_column: l_orderkey
+        right_column: o_orderkey
+  - name: orders_to_customer
+    left_table: orders
+    right_table: customer
+    relationship_columns:
+      - left_column: o_custkey
+        right_column: c_custkey

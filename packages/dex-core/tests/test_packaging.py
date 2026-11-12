@@ -1547,7 +1547,8 @@ def test_a_base_install_imports_no_reader_and_no_optional_dependency(wheel: str)
         "if m.startswith(watched)}))\n"
         "assert 'exmergo_dex_core.ossie' not in sys.modules\n"
         "assert 'exmergo_dex_core.cube' not in sys.modules\n"
-        "assert 'exmergo_dex_core.metric_views' not in sys.modules\n",
+        "assert 'exmergo_dex_core.metric_views' not in sys.modules\n"
+        "assert 'exmergo_dex_core.semantic_views' not in sys.modules\n",
     )
 
     assert done.returncode == 0, done.stderr
@@ -2019,6 +2020,97 @@ def test_the_metric_views_extra_catalogs_a_layer_with_no_workspace(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "databricks ['orders.order_count']"
+
+
+SEMANTIC_VIEW_CONFIG = """connector: duckdb
+semantic:
+  vendor: snowflake
+  snowflake:
+    files:
+      - views/sales.yaml
+"""
+
+SEMANTIC_VIEW = """name: sales
+tables:
+  - name: orders
+    base_table: {database: demo, schema: main, table: orders}
+    primary_key: {columns: [order_id]}
+    dimensions:
+      - name: status
+        expr: status
+    metrics:
+      - name: order_count
+        expr: COUNT(order_id)
+"""
+
+
+def _semantic_view_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "semantic_view_repo"
+    (root / ".dex").mkdir(parents=True)
+    (root / "views").mkdir()
+    (root / ".dex" / "config.yml").write_text(SEMANTIC_VIEW_CONFIG, encoding="utf-8")
+    (root / "views" / "sales.yaml").write_text(SEMANTIC_VIEW, encoding="utf-8")
+    return root
+
+
+def test_a_base_install_refuses_semantic_views_by_name_and_imports_no_dialect_engine(
+    wheel: str, tmp_path: Path
+):
+    root = _semantic_view_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import sys\n"
+        "from exmergo_dex_core import DexEngine, SemanticViewDependencyError\n"
+        "from exmergo_dex_core.envelope import Reason, reason_for\n"
+        f"engine = DexEngine.from_repo({str(root)!r})\n"
+        "assert engine.config.semantic.snowflake.files\n"
+        "try:\n"
+        "    engine.semantic_catalog_source()\n"
+        "except SemanticViewDependencyError as exc:\n"
+        "    assert 'exmergo-dex-core[semantic-views]' in str(exc), exc\n"
+        "    assert reason_for(exc) is Reason.PREREQUISITE\n"
+        "    print('refused')\n"
+        "assert 'sqlglot' not in sys.modules\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "refused"
+
+
+def test_config_validate_reads_a_semantic_view_block_on_a_base_install(
+    wheel: str, tmp_path: Path
+):
+    root = _semantic_view_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'config', 'validate'], "
+        "capture_output=True, text=True).stdout\n"
+        "print(json.loads(out)['status'])\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
+def test_the_semantic_views_extra_catalogs_a_layer_with_no_account(
+    wheel: str, tmp_path: Path
+):
+    root = _semantic_view_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'explore', 'semantic', 'list'], "
+        "capture_output=True, text=True).stdout\n"
+        "data = json.loads(out)['data']\n"
+        "print(data['vendor'], [m['name'] for m in data['metrics']])\n",
+        extras=["semantic-views"],
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "snowflake ['sales.orders.order_count']"
 
 
 def test_the_bundled_source_builds_at_the_pinned_release(tmp_path: Path):

@@ -175,6 +175,7 @@ _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
     "ossie": {EXECUTION_DEX: "local"},
     "slayer": {EXECUTION_DEX: "local"},
     "databricks": {EXECUTION_DEX: "local"},
+    "snowflake": {EXECUTION_DEX: "local"},
 }
 
 # The vendors whose deployment (where the layer runs) and execution (who runs
@@ -225,6 +226,12 @@ def _local_metric_views(engine: Any) -> SemanticLayer:
     return LocalMetricViewLayer.from_engine(engine)
 
 
+def _local_semantic_views(engine: Any) -> SemanticLayer:
+    from .semantic_views import LocalSemanticViewLayer
+
+    return LocalSemanticViewLayer.from_engine(engine)
+
+
 # Which backend answers for a resolved (vendor, deployment) pair. A table rather
 # than a chain of conditions, so a vendor is a row here and nowhere else, and so
 # a deployment that resolved is a deployment that gets used: the previous shape
@@ -241,6 +248,7 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("slayer", "local"): _local_slayer,
     ("cube", "local"): _local_cube,
     ("databricks", "local"): _local_metric_views,
+    ("snowflake", "local"): _local_semantic_views,
 }
 
 # Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
@@ -275,6 +283,12 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
     ("databricks", "local"): (
         "a semantic source supplies a hosted dbt Cloud token and has no "
         "meaning for Databricks Metric View files, which are files in this "
+        "repository. Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+    ("snowflake", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Snowflake Semantic View files, which are files in this "
         "repository. Drop the source, or select a hosted dbt semantic layer with "
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),

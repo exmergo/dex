@@ -118,6 +118,7 @@ Additional capabilities have their own extras:
 | `slayer` | SLayer model files, validated against one pinned SLayer release |
 | `cube` | Reading and authoring plain-YAML Cube model files, with no Node and no Cube server |
 | `metric-views` | Reading and authoring Databricks Unity Catalog Metric View YAML files, with no workspace connection |
+| `semantic-views` | Reading Snowflake Semantic View YAML files, with no Snowflake connection |
 | `cluster` | Bounded k-means exploration with `explore cluster` |
 | `all` | Every connector and optional capability above; a substantially larger install |
 
@@ -315,6 +316,7 @@ Choose the layer in `.dex/config.yml` using `semantic.vendor` and
 | SLayer | `vendor: slayer`, `deployment: local` | Reads configured model files; SLayer renders SQL and Dex executes it through its connector and cost guard |
 | Cube | `vendor: cube`, `deployment: local` | Reads and authors configured plain-YAML model files statically; catalog, authoring, and drift checks, with no query runtime yet |
 | Databricks Metric Views | `vendor: databricks`, `deployment: local` | Reads and authors configured Metric View YAML files statically (`semantic databricks`, derivation from declared marts); catalog and drift checks, never deploying, with no query runtime yet |
+| Snowflake Semantic Views | `vendor: snowflake`, `deployment: local` | Reads configured Semantic View YAML files statically; catalog, keys, relationships and drift checks, never deploying, with no authoring or query runtime yet |
 
 Discover the catalog before choosing a metric or filter. On a dbt layer, for
 example, with a declared `revenue` metric:

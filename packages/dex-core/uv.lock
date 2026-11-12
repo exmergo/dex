@@ -1172,6 +1172,9 @@ semantic-api = [
 semantic-conformance = [
     { name = "pytest" },
 ]
+semantic-views = [
+    { name = "sqlglot" },
+]
 slayer = [
     { name = "motley-slayer" },
     { name = "sqlglot" },
@@ -1273,6 +1276,7 @@ requires-dist = [
     { name = "sqlglot", marker = "extra == 'postgres'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'redshift'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'semantic'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'semantic-views'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'slayer'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=28.6,<31" },
@@ -1293,7 +1297,7 @@ requires-dist = [
     { name = "urllib3", marker = "extra == 'trino'", specifier = ">=2.8.0" },
     { name = "urllib3", marker = "extra == 'values-free-conformance'", specifier = ">=2.8.0" },
 ]
-provides-extras = ["all", "bigquery", "clickhouse", "cluster", "cube", "databricks", "dev", "duckdb", "metric-views", "ossie", "postgres", "project-conformance", "redshift", "semantic", "semantic-api", "semantic-conformance", "slayer", "snowflake", "sql", "storage-conformance", "trino", "values-free-conformance"]
+provides-extras = ["all", "bigquery", "clickhouse", "cluster", "cube", "databricks", "dev", "duckdb", "metric-views", "ossie", "postgres", "project-conformance", "redshift", "semantic", "semantic-api", "semantic-conformance", "semantic-views", "slayer", "snowflake", "sql", "storage-conformance", "trino", "values-free-conformance"]
 
 [[package]]
 name = "faker"

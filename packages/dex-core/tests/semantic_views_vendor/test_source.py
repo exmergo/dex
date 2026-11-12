@@ -1,0 +1,102 @@
+"""The Semantic View source behind the engine's seam, and what it never imports."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from exmergo_dex_core.envelope import Reason, reason_for
+from exmergo_dex_core.semantic_views import dependency
+
+PACKAGE = Path(__file__).resolve().parents[2] / "src" / "exmergo_dex_core"
+
+
+def test_the_engine_builds_the_source_through_the_seam(tmp_path):
+    """`semantic.vendor: snowflake` builds this source, with a fingerprint."""
+    pytest.importorskip("sqlglot")
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.semantic_source import SemanticSnapshotSource
+    from exmergo_dex_core.semantic_views.project import SemanticViewSemanticLayer
+
+    from .conftest import SHOP, repo
+
+    engine = DexEngine.from_repo(repo(tmp_path, SHOP))
+    built = engine.semantic_catalog_source()
+
+    assert isinstance(built, SemanticViewSemanticLayer)
+    assert isinstance(built, SemanticSnapshotSource)
+
+
+def test_a_missing_dialect_engine_is_refused_by_name(monkeypatch):
+    """Naming the extra, as a prerequisite."""
+    monkeypatch.setattr(dependency, "find_spec", lambda name: None)
+
+    with pytest.raises(dependency.SemanticViewDependencyError) as caught:
+        dependency.ensure_available()
+
+    assert "exmergo-dex-core[semantic-views]" in str(caught.value)
+    assert reason_for(caught.value) == Reason.PREREQUISITE
+
+
+def test_maintain_does_not_fingerprint_metricflow_under_this_vendor(tmp_path):
+    """The vendor's fingerprint answers, never the dbt project's."""
+    pytest.importorskip("sqlglot")
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.maintain.commands import _semantic_layer
+
+    from .conftest import SHOP, repo
+
+    class Project:
+        """A dbt project whose semantic layer must not be read."""
+
+        def semantic_layer(self):
+            """Fails the test if called."""
+            raise AssertionError("read the MetricFlow layer under vendor: snowflake")
+
+    engine = DexEngine.from_repo(repo(tmp_path, SHOP))
+    layer = _semantic_layer(engine, Project())
+
+    assert layer is not None and layer.vendor == "snowflake"
+
+
+def test_the_extra_is_the_dialect_engine():
+    """`[semantic-views]` is `[sql]`, and `[all]` covers it."""
+    import tomllib
+
+    pyproject = tomllib.loads(
+        (PACKAGE.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    extras = pyproject["project"]["optional-dependencies"]
+
+    assert extras["semantic-views"] == ["exmergo-dex-core[sql]"]
+    assert "semantic-views" in extras["all"][0]
+
+
+def test_only_lineage_imports_sqlglot():
+    """Everything else stays importable on a base install."""
+    importers = sorted(
+        path.name
+        for path in (PACKAGE / "semantic_views").glob("*.py")
+        if re.search(r"^\s*(import|from)\s+sqlglot", path.read_text(), re.MULTILINE)
+    )
+
+    assert importers == ["lineage.py"]
+
+
+def test_loading_the_config_and_the_package_leaves_sqlglot_unimported():
+    """Checked in a fresh interpreter."""
+    code = (
+        "import sys\n"
+        "import exmergo_dex_core.semantic_views\n"
+        "import exmergo_dex_core.semantic_views.project\n"
+        "import exmergo_dex_core.semantic_views.loader\n"
+        "from exmergo_dex_core.config import DexConfig\n"
+        "DexConfig.model_validate({'connector': 'snowflake', 'semantic': "
+        "{'vendor': 'snowflake', 'snowflake': {'files': ['v.yaml']}}})\n"
+        "assert 'sqlglot' not in sys.modules, 'sqlglot was imported'\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)  # noqa: S603

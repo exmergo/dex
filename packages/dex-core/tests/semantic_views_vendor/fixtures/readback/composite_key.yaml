@@ -1,0 +1,56 @@
+name: COMPOSITE_KEY
+tables:
+  - name: LINEITEM
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: LINEITEM
+    primary_key:
+      columns:
+        - L_ORDERKEY
+        - L_LINENUMBER
+    facts:
+      - name: QUANTITY
+        expr: l_quantity
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: UNITS_SOLD
+        expr: SUM(lineitem.quantity)
+        access_modifier: public_access
+  - name: PARTSUPP
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: PARTSUPP
+    primary_key:
+      columns:
+        - PS_PARTKEY
+        - PS_SUPPKEY
+    dimensions:
+      - name: PART_KEY
+        expr: ps_partkey
+        data_type: "NUMBER(38,0)"
+        access_modifier: public_access
+    facts:
+      - name: AVAILABLE_QUANTITY
+        expr: ps_availqty
+        data_type: "NUMBER(38,0)"
+        access_modifier: public_access
+      - name: SUPPLY_COST
+        expr: ps_supplycost
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: TOTAL_AVAILABLE
+        expr: SUM(partsupp.available_quantity)
+        access_modifier: public_access
+relationships:
+  - name: LINEITEM_PARTSUPP
+    left_table: LINEITEM
+    right_table: PARTSUPP
+    relationship_columns:
+      - left_column: L_PARTKEY
+        right_column: PS_PARTKEY
+      - left_column: L_SUPPKEY
+        right_column: PS_SUPPKEY

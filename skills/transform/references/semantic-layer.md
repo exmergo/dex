@@ -165,6 +165,16 @@ after their column from declared aggregations, population and units in
 `declarations`, which annotate a cube the payload or the layer defines, rewriting
 only that cube's entry. See [declarations.md](declarations.md#cube-semanticvendor-cube).
 
+## Snowflake Semantic Views: not authored yet
+
+Under `semantic.vendor: snowflake`, Dex reads the configured Semantic View YAML
+files and does not author them yet (#1292): there is no `semantic snowflake`
+subcommand, and `transform plan` derives no Semantic View from a declared mart.
+An edit to a view is a direct edit to its file; read it back with `explore
+semantic list`, which validates it with the same port of Snowflake's rules, and
+never deploy it from here (`SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML` is outside
+Dex).
+
 ## Databricks Metric Views: `semantic databricks define|update|plan`
 
 Under `semantic.vendor: databricks`, the configured Metric View YAML files are the

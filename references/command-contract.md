@@ -27,8 +27,10 @@ logic.
   always taken by `semantic cube`, and a
   Cube `query` or `values` never takes `[semantic]` either. `[metric-views]`
   follows the same read where the vendor is `databricks`, is always taken by
-  `semantic databricks`, and never takes `[semantic]`. A repo that runs
-  neither resolves neither scikit-learn nor MetricFlow.
+  `semantic databricks`, and never takes `[semantic]`. `[semantic-views]`
+  follows the same read where the vendor is `snowflake` (also a connector name,
+  whose extra still comes from `connector:` alone), and never takes `[semantic]`.
+  A repo that runs neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
   a `.venv/` and a `uv.lock` in their repo, and puts their dependencies on the
@@ -1972,6 +1974,36 @@ codes, and `maintain reconcile` stores their removals as a `semantic databricks
 update` plan (#1259). Selecting the vendor without the
 `[metric-views]` extra (the dialect engine) refuses and names it. See
 [Databricks Metric View compatibility](databricks-metric-views-compatibility.md).
+
+**`vendor: snowflake` reads Snowflake Semantic View files from the repository**,
+the exact paths named in `semantic.snowflake.files`, statically and with no
+Snowflake package and no Snowflake connection; dex never deploys a view. Each file
+is one Semantic View YAML document (what `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`
+takes and `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` returns), named by its own `name`
+(a stem that disagrees warns); a `.sql` file and a legacy Cortex Analyst semantic
+model are refused by name. Each document is validated by dex's own port of
+Snowflake's specification and validation rules, qualified against `verify_only`
+on a live account, with every refusal naming the file and the element. `list`
+answers. Every name carries its view: each logical table is a semantic model
+`view.table` on its `base_table` (or a plain single-table `definition` query),
+each dimension, time dimension and fact a dimension row `view.table.member` (a
+fact marked `kind: fact`, `groupable: false`), each single-aggregate table metric
+a measure and a `simple` metric, one metric over another a `ratio`, and any other
+composition (view-level metrics included) `derived`. A metric is groupable by its
+table's dimensions and those its relationships reach many-to-one, so
+`--for-dimension` answers. A single-column primary key is a primary entity and a
+relationship referencing it a foreign declaration; every primary and unique key
+and every key-equality relationship, with its arity, reach `explore` through the
+declaration channel at confidence 1.0. `sample_values` are counted and never
+surfaced. `query` and `values` refuse by name until #1290, `values` after the PII
+gate. `maintain snapshot` records `vendor: snowflake` and dex's own rule-set
+revision as `format_version` (the format has no `version` key), over a canonical
+form, so a view read back from Snowflake fingerprints as its file; the
+layer-neutral axes read it: definition drift on the semantic axis, each key and
+relationship arity on the grain axis. Authoring is #1292 and the schema axis and
+reconcile #1293. Selecting the vendor without the `[semantic-views]` extra (the
+dialect engine) refuses and names it. See
+[Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md).
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than

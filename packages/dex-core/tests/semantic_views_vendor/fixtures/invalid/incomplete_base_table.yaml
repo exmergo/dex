@@ -1,0 +1,9 @@
+# expect: base_table
+# A base table missing its schema.
+name: incomplete_base_table
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, table: ORDERS}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
