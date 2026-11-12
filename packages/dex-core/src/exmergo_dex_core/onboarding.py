@@ -632,7 +632,7 @@ def initialize(
         target=config.dbt_target or "dev",
     )
     readme = managed(
-        old_readme or f"# {project_name}\n", body, README_BEGIN, README_END
+        old_readme or f"# Dex {project_name}\n", body, README_BEGIN, README_END
     )
     if _read(root / "README.md") != old_readme:
         result.problems.append(

@@ -108,6 +108,7 @@ def test_complete_demo_and_repeat_preserve_authored_content(tmp_path, capsys):
     assert config(tmp_path)["dbt_project_dir"] == "analytics"
     assert result["connection"]["connector"] == "duckdb"
     readme = tmp_path / "README.md"
+    assert readme.read_text().startswith("# Dex analytics\n")
     readme.write_text("Authored before\n" + readme.read_text() + "Authored after\n")
     agents = tmp_path / "AGENTS.md"
     agents.write_text("Team instructions\n" + agents.read_text())
@@ -190,6 +191,7 @@ def test_adoption_preserves_authored_dbt_files_and_global_profile(
     assert (project / "dbt_project.yml").read_text() == project_text
     assert (profiles / "profiles.yml").read_text() == profile_text
     assert not (project / "profiles.yml").exists()
+    assert (tmp_path / "README.md").read_text().startswith("# Our project\n")
     for agent in ("AGENTS.md", "CLAUDE.md"):
         assert (tmp_path / agent).read_text().startswith("# Team guidance\n")
         assert (
