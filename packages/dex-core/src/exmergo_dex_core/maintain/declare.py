@@ -102,6 +102,32 @@ class _Staged:
     tests: dict[tuple[str, str], list[str]] = field(default_factory=dict)
 
 
+#: A ``config(alias=...)`` call in a model's SQL. It is a text match, so an
+#: ``alias =`` elsewhere in the SQL counts too, which only makes the lookup
+#: decline; a compiled manifest would settle it exactly.
+_SQL_ALIAS = re.compile(r"""\balias\s*=\s*["']([^"']+)["']""")
+
+
+def _declared_aliases(view: DbtProjectView) -> list[tuple[str, str]]:
+    """``(model, alias)`` for every alias a model's SQL or YAML ``config`` sets.
+
+    An alias set in ``dbt_project.yml`` or by a ``generate_alias_name`` macro is
+    not read here.
+    """
+
+    aliases = [
+        (node_name(path), match.group(1))
+        for path, source in view.files.items()
+        if path.endswith(".sql") and (match := _SQL_ALIAS.search(source.content))
+    ]
+    for parsed, _path in yaml_documents(view):
+        for entry in parsed.get("models") or []:
+            config = entry.get("config") if isinstance(entry, dict) else None
+            if isinstance(config, dict) and isinstance(config.get("alias"), str):
+                aliases.append((str(entry.get("name")), config["alias"]))
+    return aliases
+
+
 class DeclarationEdits:
     """Accumulates every change reconcile wants to make, one edit per path.
 
@@ -209,7 +235,10 @@ class DeclarationEdits:
         project's), and when a declared source table is that relation too (its
         ``identifier``, else its ``name``): a bare name cannot say which of the
         two the finding is about, and the staging convention is what a source's
-        drift resolves to.
+        drift resolves to. ``None`` too when an ``alias`` is in play (the match
+        sets one, or another model's alias is this name): which model an alias
+        builds as is the compiled manifest's to say, and guessing would put the
+        test on the wrong model.
         """
 
         if not isinstance(self._view, DbtProjectView):
@@ -239,7 +268,13 @@ class DeclarationEdits:
                         == wanted
                     ):
                         return None
-        return found.pop()
+        model = found.pop()
+        if any(
+            owner == model or alias.casefold() == wanted
+            for owner, alias in _declared_aliases(self._view)
+        ):
+            return None
+        return model
 
     def _declaring(self, model: str) -> list[str]:
         """Every YAML file in the view with a ``models:`` entry named ``model``."""

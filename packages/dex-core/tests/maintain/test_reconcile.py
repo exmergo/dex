@@ -625,6 +625,48 @@ def test_a_source_table_that_is_the_relation_keeps_the_staging_convention():
     assert placed.model == "stg_dim_customers" and not placed.built
 
 
+def test_an_alias_keeps_the_staging_convention():
+    """Without a compiled manifest a filename does not say which model an alias
+    builds as, so an alias on either side keeps the convention (#1274)."""
+
+    from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+    from exmergo_dex_core.maintain.declare import DeclarationEdits, Placed
+
+    def resolve(files: dict[str, str], table: str):
+        view = DbtProjectView(
+            root=".",
+            project_name="p",
+            profile_name="p",
+            files={
+                path: SourceFile(path=path, content=content, sha256="x")
+                for path, content in files.items()
+            },
+        )
+        return DeclarationEdits(view, None).resolve(table)
+
+    yml = "version: 2\nmodels:\n  - name: {0}\n    columns:\n      - name: id\n"
+    # orders.sql builds archived_orders; current_orders.sql builds orders
+    swapped = {
+        "models/marts/orders.sql": (
+            "{{ config(alias='archived_orders') }}\nselect 1 as id\n"
+        ),
+        "models/marts/orders.yml": yml.format("orders"),
+        "models/marts/current_orders.sql": (
+            "{{ config(alias='orders') }}\nselect 1 as id\n"
+        ),
+    }
+    # the alias is in the YAML instead
+    renamed = {
+        "models/marts/dim_x.sql": "select 1 as id\n",
+        "models/marts/dim_x.yml": (
+            yml.format("dim_x") + "    config:\n      alias: dim_x_live\n"
+        ),
+    }
+    for files, table in ((swapped, "orders"), (renamed, "dim_x")):
+        placed = resolve(files, table)
+        assert not (isinstance(placed, Placed) and placed.built), placed
+
+
 def _lost_key_on_a_mart(maintain_repo, id_tests: str) -> dict:
     """A mart outside models/staging/ whose key repeats after the snapshot (#1274)."""
 
