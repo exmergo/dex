@@ -20,6 +20,7 @@ from typing import Any
 
 import yaml
 
+from ...errors import RequestError
 from ._java import dumps_stash, get_simple_name, is_whitespace, java_str, trim
 
 OSSIE_VERSION = "0.2.0.dev0"
@@ -54,8 +55,12 @@ class Kind(str, enum.Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
-class ConversionError(ValueError):
-    """An input the converter refuses to convert (Java ``ConversionException``)."""
+class ConversionError(RequestError):
+    """An input the converter refuses to convert (Java ``ConversionException``).
+
+    A :class:`~exmergo_dex_core.errors.RequestError`, so it is a ``DexError``
+    and still a ``ValueError``: the input is the caller's to fix.
+    """
 
     def __init__(
         self,

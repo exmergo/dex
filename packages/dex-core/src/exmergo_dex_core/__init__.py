@@ -98,6 +98,8 @@ _EXPORTS = {
     "MetricViewDependencyError": "metric_views.dependency",
     "MissingPackagesError": "transform.build",
     "PlanDeclaresMissingPackagesError": "transform.build",
+    "BridgeError": "transform.semantic_bridge",
+    "ConversionError": "metric_views.ossie_bridge",
     "RepairRefusedError": "transform.package_repair",
     "ModelVersionError": "transform.model_versions",
     "NoBaselineError": "maintain.commands",
@@ -201,6 +203,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
     from .metric_views.dependency import MetricViewDependencyError
+    from .metric_views.ossie_bridge import ConversionError
     from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
@@ -239,6 +242,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScaffoldPrerequisiteError,
         SourcesFileError,
     )
+    from .transform.semantic_bridge import BridgeError
     from .values_free import ResultMode, ValuesFreeCode, ValuesFreeError
 
 try:
@@ -253,6 +257,7 @@ except PackageNotFoundError:
 __all__ = [
     "DEMO_FILENAME",
     "BaselineUnreadableError",
+    "BridgeError",
     "BudgetExhaustedError",
     "BuildEvidenceError",
     "CacheLock",
@@ -268,6 +273,7 @@ __all__ = [
     "ConfirmationRequiredError",
     "ConnectionSource",
     "ConnectorError",
+    "ConversionError",
     "Cost",
     "CostGuardError",
     "CredentialDiscoveryError",

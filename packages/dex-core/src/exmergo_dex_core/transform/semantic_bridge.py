@@ -28,6 +28,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from ..edits import SemanticEditTarget
+from ..errors import RequestError
 from ..metric_views.dependency import CONVERTER_COMMIT
 from .plans import EditKind, PlanEdit
 from .results import BridgeResult
@@ -38,9 +39,10 @@ if TYPE_CHECKING:
 __all__ = ["BRIDGES", "Bridge", "BridgeError", "bridge_arguments", "semantic_bridge"]
 
 
-class BridgeError(ValueError):
+class BridgeError(RequestError):
     """A conversion or validation the bridge refused, with its ``bridge`` block,
-    so the notices reach the error envelope too."""
+    so the notices reach the error envelope too. A ``RequestError``: the source
+    file, its conversion or the output path is the caller's to fix."""
 
     def __init__(self, message: str, bridge: dict[str, Any]) -> None:
         super().__init__(message)
