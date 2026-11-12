@@ -1160,6 +1160,42 @@ def test_a_new_definition_with_no_file_of_its_kind_is_still_refused(
     assert envelope["errors"] == [_NO_PATH_REFUSAL]
 
 
+def test_an_unparseable_file_is_named_when_its_definitions_read_as_absent(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#1268: the file declaring `customer_count` does not parse, so the read
+    cannot see it. The refusal has to say the file could not be read, not send
+    the caller looking for a metric that is not in the project."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    broken = dbt_project_dir / "models" / "semantic" / "customers.yml"
+    broken.write_text(broken.read_text(encoding="utf-8") + "broken: [\n")
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [
+            {
+                "kind": "metric",
+                "content": (
+                    "name: customer_count\n"
+                    "label: Renamed\n"
+                    "type: simple\n"
+                    "type_params:\n"
+                    "  measure: customer_count\n"
+                ),
+            }
+        ],
+        "broken.json",
+    )
+    assert rc == 1
+    assert envelope["errors"] == [
+        "metric 'customer_count' is not in the project, so there is no file to "
+        "rewrite: give it a path; models/semantic/customers.yml could not be "
+        "read (does not parse as YAML at line 42), so definitions in it are "
+        "not visible"
+    ]
+
+
 def test_definition_edit_drops_a_note_about_a_line_it_removed(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
