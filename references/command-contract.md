@@ -93,7 +93,7 @@ dex procedure [--block] [--check <file>...]
                                      data.digest, data.engine_version, data.markers.
                                      --block adds data.block, the text between the
                                      dex:procedure markers, to paste into CLAUDE.md or
-                                     AGENTS.md (dex never writes either). --check reads
+                                     AGENTS.md (procedure itself writes neither). --check reads
                                      each file and reports its copy current, stale,
                                      missing, malformed, absent or unreadable under
                                      data.copies, never echoing content; any copy that
@@ -232,7 +232,20 @@ dex explore semantic query <m,m>  -> one governed metric query, capped and row-m
   [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
                                      server-side where dex's cost guard is structurally unavailable and every
                                      result says so
-dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
+dex init [<name>]                -> complete project setup: new dbt-backed Dex project,
+                                     complete DuckDB demo, existing dbt adoption, or
+                                     exploration without dbt. .dex/ stays at repo root;
+                                     a name creates dbt beneath it, '.' is in-place.
+                                     TTY questions/completion go to stderr; stdout is
+                                     one JSON envelope. Noninteractive missing inputs
+                                     are structured, never prompts. Existing config
+                                     changes return a diff requiring --confirm.
+                                     README/agent managed sections preserve authored
+                                     content. Verifies connection; never scans tables,
+                                     runs builds, or chooses budgets during setup.
+                                     data.readiness separates configuration, connection,
+                                     build_prerequisites, and build (unchecked).
+dex transform init "<name>"       -> legacy bootstrap of a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their
                                      own <layer>_<target name> schemas; warns when a target

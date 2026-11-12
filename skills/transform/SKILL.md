@@ -14,6 +14,12 @@ until `transform apply`, and any build runs against a dev target only.
 <!-- dex:procedure:begin -->
 ## Procedure
 
+For project setup, run `dex init` (or `init` through an installed skill wrapper).
+It creates or adopts a project, installs managed README and agent instructions,
+and verifies the connection. It does not explore data or build models. Read its
+structured missing inputs and readiness before continuing; installing skills
+does not necessarily install a `dex` executable.
+
 Dex works in one loop: explore, transform, maintain. `dex <command>` below is
 the `dex` CLI; where it is not installed, run the same command through the
 skill's `scripts/run.py` wrapper. Each command prints one JSON envelope: read
@@ -380,7 +386,7 @@ fetches the engine's dependencies from PyPI or your configured index.
 
 ## Transforming, step by step
 
-1. **No dbt project yet?** Offer `transform init "<name>" --connector <c>` (scaffolds into `<name>/` by default, or the current directory with `--in-place`) before
+1. **Project setup requested, or no dbt project yet?** Use `init "<name>" --connector <c>` through the installed wrapper for complete setup, including README, agent instructions and connection verification. It adopts an existing dbt project without replacing authored files. The legacy `transform init` scaffolder remains available. Both scaffold into `<name>/` by default, or the current directory with `--in-place`, before
    anything else. Ask the user for the name and **confirm the connector with
    them**: init never defaults one. Do not hand-write the skeleton. Read
    `${CLAUDE_SKILL_DIR}/references/init-and-dev-target.md` for per-connector

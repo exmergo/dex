@@ -403,6 +403,13 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
 # One row per generated page. A CLI group with no row fails the build, so adding
 # a group to COMMAND_SURFACE forces it a title, a description and a nav entry.
 GENERATED_PAGES: dict[str, PageMeta] = {
+    "cli/init": PageMeta(
+        "dex init",
+        "Set up a Dex project, try a local demo, adopt existing dbt, or explore "
+        "without dbt. Managed docs, connection checks and readiness for agents "
+        "and terminals.",
+        "init",
+    ),
     "cli/overview": PageMeta(
         "dex CLI overview",
         "Every dex CLI command at a glance: global options, connection flags "

@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,6 @@ from ..config import (
     DuckDBTarget,
     SnowflakeTarget,
     load_config,
-    save_config,
 )
 from ..config_document import ABSENT, ConfigDocument
 from ..dbt_project import (
@@ -99,7 +99,14 @@ def sanitize_project_name(raw: str) -> str:
     return name
 
 
-def init_project(
+@dataclass
+class ProjectScaffold:
+    result: InitResult
+    files: dict[str, str]
+    config: DexConfig
+
+
+def prepare_project(
     name: str,
     connector: str,
     *,
@@ -108,7 +115,9 @@ def init_project(
     layered_schemas: bool = False,
     in_place: bool = False,
     project: str | None = None,
-) -> InitResult:
+    config: DexConfig | None = None,
+    resume: bool = False,
+) -> ProjectScaffold:
     """Render a fresh dbt project skeleton and record the choices in config.
 
     Creates ``<name>/dbt_project.yml``, ``models/staging/`` and ``models/marts/``
@@ -151,14 +160,14 @@ def init_project(
     project_prefix = "" if in_place else f"{project_name}/"
     project_dir = "." if in_place else project_name
     existing = discover_projects(root)
-    if existing:
+    if existing and not resume:
         raise InitError(
             "a dbt project already exists ("
             + ", ".join(str(p / PROJECT_FILE) for p in existing)
             + "); init is strictly additive and never touches an existing project"
         )
 
-    config = load_config(root) or DexConfig()
+    config = (config or load_config(root) or DexConfig()).model_copy(deep=True)
     # An explicit value must not read as "flag absent" when it is blank, and a
     # malformed id would otherwise reach the rendered profile and the config.
     if project is not None and not _BIGQUERY_PROJECT_ID.fullmatch(project):
@@ -205,12 +214,17 @@ def init_project(
             "generate_schema_name", "macros"
         ).new_content
     collisions = sorted(rel for rel in files if (root / rel).exists())
-    if collisions:
+    if collisions and not resume:
         raise InitError(
             "refusing to overwrite existing files: "
             + ", ".join(collisions)
             + "; init only creates, never replaces"
         )
+
+    if resume:
+        files = {
+            rel: content for rel, content in files.items() if not (root / rel).exists()
+        }
 
     config.connector = connector
     config.dbt_project_dir = project_dir
@@ -223,15 +237,11 @@ def init_project(
     )
 
     diffs = [file_diff(rel, None, content) for rel, content in files.items()]
-    for rel, content in files.items():
-        write_project_file(root / rel, content)
-    _persist_init_config(config, root, config_path, old_config)
-    diffs.append(
-        file_diff(config_rel, old_config, config_path.read_text(encoding="utf-8"))
-    )
+    config_text = render_init_config(config, config_path, old_config)
+    diffs.append(file_diff(config_rel, old_config, config_text))
 
     created = list(files) + ([config_rel] if old_config is None else [])
-    return InitResult(
+    result = InitResult(
         project_name=project_name,
         project_dir=project_dir,
         connector=connector,
@@ -241,6 +251,37 @@ def init_project(
         created=created,
         diffs=diffs,
     )
+    return ProjectScaffold(result, {**files, config_rel: config_text}, config)
+
+
+def init_project(
+    name: str,
+    connector: str,
+    *,
+    path: str | None = None,
+    repo_root: Path | str = ".",
+    layered_schemas: bool = False,
+    in_place: bool = False,
+    project: str | None = None,
+) -> InitResult:
+    """Create the legacy additive skeleton from the shared pure renderer."""
+    scaffold = prepare_project(
+        name,
+        connector,
+        path=path,
+        repo_root=repo_root,
+        layered_schemas=layered_schemas,
+        in_place=in_place,
+        project=project,
+    )
+    for rel, content in scaffold.files.items():
+        destination = Path(repo_root) / rel
+        if rel == f"{DEX_DIR}/{CONFIG_FILE}":
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            ConfigDocument(content, repo_root=Path(repo_root)).write(destination)
+        else:
+            write_project_file(destination, content)
+    return scaffold.result
 
 
 # Attributes init writes back onto an existing connector block. A model
@@ -258,15 +299,14 @@ _INIT_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _persist_init_config(
+def render_init_config(
     config: DexConfig,
-    root: Path,
     config_path: Path,
     old_config: str | None,
-) -> None:
-    """Write the keys ``init`` sets into ``.dex/config.yml``.
+) -> str:
+    """Render the keys ``init`` sets in ``.dex/config.yml`` without writing.
 
-    A repo with no config keeps ``save_config``: there is nothing to preserve. A
+    A new config uses the same explicit-fields serialization as ``save_config``. A
     repo that already has one is amended through ``ConfigDocument`` (the same
     in-place editor ``dex config set`` uses), so comments, key order, unread
     keys, and explicit nulls survive. Only the keys ``init`` itself changes are
@@ -275,8 +315,10 @@ def _persist_init_config(
     """
 
     if old_config is None:
-        save_config(config, root)
-        return
+        return yaml.safe_dump(
+            config.model_dump(mode="json", exclude_unset=True, exclude_none=True),
+            sort_keys=False,
+        )
 
     document = ConfigDocument.read(config_path)
     amendments: list[tuple[str, Any]] = [
@@ -297,7 +339,7 @@ def _persist_init_config(
         if current is not ABSENT and current == value:
             continue
         document = document.with_value(key, value)
-    document.write(config_path)
+    return document.text
 
 
 # --- per-connector profile renderers -------------------------------------------

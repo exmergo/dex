@@ -96,6 +96,7 @@ if TYPE_CHECKING:
         SnapshotResult,
         VerifyResult,
     )
+    from .onboarding import SetupResult
     from .references import ReferencesResult
     from .semantic_source import SemanticCatalogSource
     from .transform.plans import PlanEdit
@@ -1422,6 +1423,35 @@ class DexEngine:
     # Every method here needs `repo_root`: the dbt project is the source of
     # truth and stays a git-reviewable filesystem artifact, so an engine that
     # was never told where the project lives refuses rather than inventing one.
+
+    def initialize(
+        self,
+        name: str | None = None,
+        *,
+        mode: str | None = None,
+        project_dir: str | None = None,
+        target: str | None = None,
+        dev_destination: str | None = None,
+        agent_files: list[str] | None = None,
+        no_agent_instructions: bool = False,
+        layered_schemas: bool = False,
+        in_place: bool = False,
+    ) -> SetupResult:
+        """Set up Dex, adopt an existing project, and verify its connection."""
+        from .onboarding import initialize
+
+        return initialize(
+            self,
+            name,
+            mode=mode,
+            project_dir=project_dir,
+            target=target,
+            dev_destination=dev_destination,
+            agent_files=agent_files,
+            no_agent_instructions=no_agent_instructions,
+            layered_schemas=layered_schemas,
+            in_place=in_place,
+        )
 
     def init_project(
         self,

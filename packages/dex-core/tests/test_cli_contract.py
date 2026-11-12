@@ -590,6 +590,21 @@ _TRANSLATED = object()
 # options every subcommand takes) mapped to the `DexEngine` keyword it
 # expresses, or `_TRANSLATED`.
 _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
+    ("init", None): {
+        "method": "initialize",
+        "args": {
+            "name": "name",
+            "mode": "mode",
+            "project_dir": "project_dir",
+            "target": "target",
+            "dev_destination": "dev_destination",
+            "agent_file": "agent_files",
+            "no_agent_instructions": "no_agent_instructions",
+            "layered_schemas": "layered_schemas",
+            "in_place": "in_place",
+            "no_interactive": _TRANSLATED,
+        },
+    },
     ("connect", "test"): {"method": "connect_test", "args": {}},
     ("explore", "inventory"): {
         "method": "inventory",

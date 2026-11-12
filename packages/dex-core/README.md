@@ -27,14 +27,21 @@ or uv 0.13.4+ to install.
 
 ```bash
 pip install "exmergo-dex-core[duckdb]"
-dex demo
+dex init analytics --mode demo
 dex explore map
 ```
 
 After installation, this runs locally with no credentials, cloud account, or
-network. Run it in a scratch directory: `dex demo` creates `dex_demo.duckdb`
-(7 e-commerce tables, 29,512 rows) and `.dex/config.yml`. It refuses to overwrite
-an existing warehouse and leaves an existing project config untouched.
+network. Run it in a scratch directory: initialization creates `dex_demo.duckdb`
+(7 e-commerce tables, 29,512 rows), `.dex/config.yml`, a dbt skeleton under
+`analytics/`, and managed README and agent instructions. It verifies the connection
+without exploring or building. Reruns preserve authored content.
+
+Run `dex init` for guided setup. Creating a Dex project is recommended; the demo
+is the second option. Existing dbt projects can adopt Dex without replacing their
+project or profiles, and exploration does not require dbt. All machine output
+remains one JSON envelope; terminal questions and completion go to stderr.
+`dex transform init` retains its legacy additive-scaffolder behavior.
 
 The demo has defects on purpose. The map reports 5 inferred joins, 6 PII-flagged
 columns, and 6 data-quality findings. For example, a double-loaded batch makes

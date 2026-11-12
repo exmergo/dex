@@ -54,6 +54,24 @@ npx skills add exmergo/dex
 npx skills add exmergo/dex --agent codex
 ```
 
+After installing the skills, ask your agent: “Initialize this repository with
+Dex.” The agent runs the installed wrapper; installing skills does not
+necessarily put a `dex` executable on your PATH.
+
+For the standalone CLI, install your connector extra and start setup:
+
+```bash
+uv tool install "exmergo-dex-core[duckdb]"
+dex init
+```
+
+Setup recommends creating a dbt-backed Dex project, with a complete local demo
+as the second option. It can also adopt existing dbt or configure exploration
+without dbt. It generates a project README and managed agent instructions,
+verifies the connection, and gives you a next command. It does not explore data
+or build models during setup. `.dex/` stays at the repository root; named dbt
+projects live beneath it.
+
 ## What you get
 
 - **Explore** your database, data warehouse, or SQL endpoint. Find the tables that matter, understand their structure, and verify how they join. Get column profiles, personal-data flags, and an ER diagram.
@@ -111,14 +129,15 @@ package is installed.
 
 ```bash
 pip install "exmergo-dex-core[duckdb]"
-dex demo
+dex init analytics --mode demo
 dex explore map
 ```
 
-`dex demo` writes a small e-commerce DuckDB database (`dex_demo.duckdb`, 7 tables,
-29,512 rows) and a `.dex/config.yml` into the current directory, so every command
-after it runs with no flags. It refuses rather than overwrite anything. The data
-comes from a pinned seed, so what you see is what is written here.
+`dex init analytics --mode demo` creates the e-commerce DuckDB warehouse
+(`dex_demo.duckdb`, 7 tables, 29,512 rows), a dbt project under `analytics/`,
+repository-level Dex configuration, and onboarding documentation. Reruns preserve
+authored files. The lower-level `dex demo` command remains available for creating
+just the warehouse and config. The data comes from a pinned seed.
 
 `explore map` maps all 7 tables, infers 5 joins, flags 6 columns as personal data,
 and reports 6 data-quality findings. Every command answers with one JSON envelope.
