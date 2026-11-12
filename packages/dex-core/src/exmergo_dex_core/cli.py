@@ -57,6 +57,7 @@ from .values_free import (
 # surfaces from drifting apart the way `DexEngine.check()` once had (it dropped
 # the object-scope argument all four of its sibling detectors accept).
 COMMAND_SURFACE: dict[str, list[str]] = {
+    "init": [],
     "connect": ["test"],
     "explore": [
         "inventory",
@@ -272,6 +273,7 @@ def _sub_connection_options() -> argparse.ArgumentParser:
 #: I run first", which is exactly what a caller piping the output into
 #: `head -30` is looking for and not finding.
 _GROUP_HELP: dict[str, str] = {
+    "init": "set up a Dex project, adopt dbt, or explore without dbt",
     "connect": "check a connector's own credentials and capabilities",
     "explore": "make sense of a warehouse: rank objects, profile columns, infer joins",
     "transform": "author and refactor dbt models, tests, and the semantic layer",
@@ -634,6 +636,54 @@ def _build_parser() -> argparse.ArgumentParser:
             help=_GROUP_HELP.get(group),
             description=_GROUP_HELP.get(group),
         )
+        if group == "init":
+            from .onboarding import MODES
+
+            gp.add_argument(
+                "name",
+                nargs="?",
+                help="dbt project name; '.' is in-place; .dex stays at repo root",
+            )
+            gp.add_argument(
+                "--mode",
+                choices=MODES,
+                help="new project, complete demo, adopt dbt, or explore without dbt",
+            )
+            gp.add_argument(
+                "--project-dir",
+                help="existing dbt project to adopt (repository-relative)",
+            )
+            gp.add_argument("--target", help="existing dev target to adopt")
+            gp.add_argument(
+                "--dev-destination",
+                help="dev namespace: dataset, schema, or database/catalog.schema",
+            )
+            gp.add_argument(
+                "--agent-file",
+                action="append",
+                choices=["AGENTS.md", "CLAUDE.md"],
+                help="agent instruction file to update; repeat to select both",
+            )
+            gp.add_argument(
+                "--no-agent-instructions",
+                action="store_true",
+                help="skip managed agent instructions",
+            )
+            gp.add_argument(
+                "--no-interactive",
+                action="store_true",
+                help="return structured missing inputs without terminal questions",
+            )
+            gp.add_argument(
+                "--layered-schemas",
+                action="store_true",
+                help="build each dbt layer into its own schema",
+            )
+            gp.add_argument(
+                "--in-place",
+                action="store_true",
+                help="scaffold dbt in the current directory",
+            )
         if group == "demo":
             # Positional rather than --path: --path names the warehouse dex
             # reads, everywhere, and this is the one command that writes one.
@@ -1678,6 +1728,11 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # run it, which is the one a first-time user has.
     """Dispatch one parsed command to its handler and return its envelope."""
 
+    if args.group == "init":
+        from .onboarding_cli import cmd_init
+
+        return cmd_init(args, engine)
+
     if args.group == "demo":
         from .demo.commands import cmd_demo
 
@@ -1944,6 +1999,17 @@ def main(argv: list[str] | None = None) -> int:
             # `.dex/` on disk is how the exploration cache and the cumulative session
             # budget survive from one command to the next, and any backend selected
             # here has to be durable across processes for the same reason.
+            if args.group == "init" and (
+                getattr(args, "session_ceiling", None) is not None
+                or getattr(args, "no_session_ceiling", False)
+                or getattr(args, "budget", None) is not None
+            ):
+                from .errors import RequestError
+
+                raise RequestError(
+                    "dex init does not set spending limits; use the "
+                    "cost-confirmation flow when running exploration or builds"
+                )
             engine = DexEngine.from_repo(
                 repo_root(args),
                 cache_backend=getattr(args, "cache_backend", None),
@@ -2049,12 +2115,17 @@ def main(argv: list[str] | None = None) -> int:
     # semantic query --api` sets `hosted` because dbt Cloud owns that spend, and
     # a genuine "no connector resolved" stays null rather than borrowing
     # `free_local`, which is DuckDB's answer and not a way to say nothing.
-    if envelope.cost.paradigm is None and paradigm is not None:
+    if (
+        envelope.cost.paradigm is None
+        and paradigm is not None
+        and (args.group != "init" or envelope.data.get("connector") is not None)
+    ):
         envelope.cost.paradigm = paradigm
 
     # The connection identity is stamped centrally, just like cost paradigm:
     # handlers cannot drift, and filling it performs no extra warehouse read.
-    envelope.connection = connection
+    if args.group != "init" or not envelope.connection.connector:
+        envelope.connection = connection
 
     # Every envelope a values-free process prints says so, refusals and asks
     # included, so a host can assert the mode on whatever comes back (#591).

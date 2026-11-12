@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 # subprocess per command, so keeping package import to almost nothing is free
 # latency on every invocation.
 _EXPORTS = {
+    "SetupResult": "onboarding",
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
     "BuildEvidenceError": "transform.evidence",
@@ -204,6 +205,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .maintain.snapshot import Snapshot
     from .metric_views.dependency import MetricViewDependencyError
     from .metric_views.ossie_bridge import ConversionError
+    from .onboarding import SetupResult
     from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
@@ -330,6 +332,7 @@ __all__ = [
     "SemanticQueryRefusedError",
     "SemanticSource",
     "SessionCeilingDecisionRequiredError",
+    "SetupResult",
     "SlayerDependencyError",
     "Snapshot",
     "SourcesFileError",
