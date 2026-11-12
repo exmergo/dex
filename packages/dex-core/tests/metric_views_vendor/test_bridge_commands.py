@@ -540,3 +540,21 @@ def test_next_quotes_paths_and_updates_an_existing_file(tmp_path, capsys):
     assert "--from-ossie 'models/sales report.yaml'" in hint
     assert "semantic databricks update" in hint
     assert "'[views/other.yaml, views/sales.yaml]'" in hint
+
+
+def test_next_plans_a_batch_of_existing_and_new_outputs(tmp_path, capsys):
+    a = fixture(tmp_path, "converter_fixtureA_ossie.yaml", "models/sales.yaml")
+    b = fixture(tmp_path, "converter_fixtureB_ossie.yaml", "models/lineitem.yaml")
+    fixture(tmp_path, "converter_tpcds.yaml", "views/other.yaml")
+    fixture(tmp_path, "converter_fixtureA.yaml", "views/sales.yaml")
+    configure(tmp_path, "databricks", ["views/other.yaml"])
+
+    rc, out = run(
+        capsys, tmp_path, "semantic", "databricks", "plan", "--from-ossie", a, b
+    )
+    assert rc == 0, out
+    assert "`semantic databricks plan --from-ossie" in out["data"]["bridge"]["next"]
+
+    rc, out = run(capsys, tmp_path, "semantic", "databricks", "plan", "--from-ossie", b)
+    assert rc == 0, out
+    assert "`semantic databricks define --from-ossie" in out["data"]["bridge"]["next"]

@@ -595,10 +595,10 @@ def _adopt(
     listed = _yaml_list(
         list(dict.fromkeys([*layer.semantic_editing_surface(), *paths]))
     )
-    # `define` refuses a file that already exists, and an unconfigured path can:
-    # once configured, that file is an update.
-    exists = any((repo_root / p).exists() for p in paths)
-    mode = "update" if exists else "define"
+    # `define` refuses a file that already exists and `update` one that does not,
+    # and an unconfigured path can be either: a batch holding both is a `plan`.
+    existing = [(repo_root / p).exists() for p in paths]
+    mode = "update" if all(existing) else "define" if not any(existing) else "plan"
     return (
         f"{', '.join(paths)} {'is' if len(paths) == 1 else 'are'} not under "
         f"semantic.{vendor}.files, the files dex may write: run "
