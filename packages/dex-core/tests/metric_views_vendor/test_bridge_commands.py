@@ -521,3 +521,22 @@ def test_into_and_name_take_one_source(tmp_path, capsys):
 
     assert rc != 0
     assert "name one output" in out["errors"][0]
+
+
+def test_next_quotes_paths_and_updates_an_existing_file(tmp_path, capsys):
+    source = fixture(
+        tmp_path, "converter_fixtureA_ossie.yaml", "models/sales report.yaml"
+    )
+    fixture(tmp_path, "converter_tpcds.yaml", "views/other.yaml")
+    fixture(tmp_path, "converter_fixtureA.yaml", "views/sales.yaml")
+    configure(tmp_path, "databricks", ["views/other.yaml"])
+
+    rc, out = run(
+        capsys, tmp_path, "semantic", "databricks", "plan", "--from-ossie", source
+    )
+
+    assert rc == 0, out
+    hint = out["data"]["bridge"]["next"]
+    assert "--from-ossie 'models/sales report.yaml'" in hint
+    assert "semantic databricks update" in hint
+    assert "'[views/other.yaml, views/sales.yaml]'" in hint

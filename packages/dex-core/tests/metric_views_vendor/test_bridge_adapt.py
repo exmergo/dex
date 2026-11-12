@@ -521,3 +521,73 @@ def test_a_dex_export_of_every_ossie_fixture_passes_dexs_metric_view_rules():
     for fixture in FIXTURE_NAMES:
         converted = export_document(_ossie(fixture))
         assert _metric_view_problems(converted.value, fixture) == [], fixture
+
+
+# --- review fixes ---------------------------------------------------------------------
+
+
+def test_a_dataset_metric_reading_a_key_only_field_reads_its_column():
+    """The key-only field is resolved before it is left out of the export."""
+    view = {
+        "version": "1.1",
+        "source": "c.s.orders",
+        "joins": [{"name": "customer", "source": "c.s.customer", "using": ["k"]}],
+        "dimensions": [{"name": "k", "expr": "UPPER(other)"}],
+        "measures": [{"name": "keys", "expr": "COUNT(k)"}],
+    }
+    scoped = import_view(view, dataset_metrics=True).value
+    orders = scoped["datasets"][0]
+    assert orders["metrics"][0]["expression"]["dialects"][0]["expression"] == (
+        "COUNT(k_key)"
+    )
+    assert export_document(scoped).value["measures"] == [
+        {"name": "keys", "expr": "COUNT(k)"}
+    ]
+
+
+def _chained_fields() -> dict[str, Any]:
+    return {
+        "version": "0.2.0.dev0",
+        "name": "m",
+        "datasets": [
+            {
+                "name": "orders",
+                "source": "c.s.orders",
+                "fields": [
+                    {"name": "a", "expression": {"sql": "b"}},
+                    {"name": "b", "expression": {"sql": "c"}},
+                    {"name": "year", "expression": {"sql": "sale_year"}},
+                ],
+                "metrics": [
+                    {"name": "chained", "expression": {"sql": "SUM(a)"}},
+                    {
+                        "name": "latest",
+                        "expression": {"sql": "MAX(EXTRACT(YEAR FROM created))"},
+                    },
+                    {
+                        "name": "later",
+                        "expression": {"sql": "MAX(DATEADD(year, 1, d))"},
+                    },
+                ],
+            }
+        ],
+        "metrics": [{"name": "model_chained", "expression": {"sql": "SUM(orders.a)"}}],
+    }
+
+
+def test_a_column_written_in_is_never_read_again_as_a_field():
+    measures = {
+        m["name"]: m["expr"]
+        for m in export_document(_chained_fields()).value["measures"]
+    }
+    assert measures["chained"] == "SUM(b)"
+    assert measures["model_chained"] == "SUM(b)"
+
+
+def test_a_date_part_is_never_read_as_a_field_of_that_name():
+    measures = {
+        m["name"]: m["expr"]
+        for m in export_document(_chained_fields()).value["measures"]
+    }
+    assert measures["latest"] == "MAX(EXTRACT(YEAR FROM created))"
+    assert measures["later"] == "MAX(DATEADD(year, 1, d))"

@@ -325,21 +325,23 @@ out of its inventory. The view's YAML in the repository is what Dex reads.
 `semantic databricks define|update|plan --from-ossie <file>` proposes a Metric
 View from an Apache Ossie document, and
 `semantic ossie define|update|plan --from-metric-view <file>` proposes an Ossie
-document from a Metric View file (#1260). Each flag takes several files, which
-are stored as one plan, since the target layer validates every configured file
-together. The layer written is always the configured `semantic.vendor`. The
+document from a Metric View file (#1260). Each flag takes several files. Those
+whose output is a configured file are stored as one plan, since the target layer
+validates every configured file together; the rest are proposed, not stored. The layer written is always the configured `semantic.vendor`. The
 other format is only read, from files inside the repository, and is never
 configured. The proposal is a plan that `transform apply` writes. Nothing is
 deployed, and no command opens a workspace connection.
 
 ```bash
 dex semantic databricks plan "views from the sales model" \
-    --from-ossie semantic/sales.ossie.yaml [--fact orders] [--into views/sales.yaml]
+    --from-ossie semantic/sales.ossie.yaml --fact orders --into views/sales.yaml
 
 dex semantic ossie plan "an Ossie document from the orders view" \
-    --from-metric-view views/orders.yaml [--name sales] [--into semantic/sales.ossie.yaml] \
-    [--dataset-metrics]
+    --from-metric-view views/orders.yaml --name sales --dataset-metrics
 ```
+
+`--fact`, `--name`, `--into` and `--dataset-metrics` are optional; each is
+described below.
 
 ### Two layers: the port, and what dex adds
 
@@ -411,9 +413,11 @@ output, so they take one file.
   view, and stored as a plan. `define` refuses an existing view or model;
   `update` classifies it.
 - **Any other path** stores no plan. The document is validated the same way and
-  returned under `data.bridge.conversions[0].content`, with `plan_id: null`,
-  and `next` names the `dex config set` that adopts the path and the command to
-  run again. `update` refuses such a path.
+  returned under the `content` of its own `data.bridge.conversions` entry. With
+  no configured output in the batch, `plan_id` is `null`. `next` names the
+  `dex config set` that adopts the path and the command to run again (`update`
+  where the file already exists, `define` where it does not). `update` refuses
+  such a path.
 
 ### The stash
 

@@ -268,7 +268,7 @@ def _name_metric_fields(model: dict[str, Any], fact: str, notices: Notices) -> N
                     return m.group(0)
                 renamed.append(f"'{head}.{tail}' -> '{head}.{field}'")
                 return f"{head}.{field}"
-            if head.upper() in keywords:
+            if head.upper() in keywords or _is_sql_word(m):
                 return m.group(0)
             field = indexes.get(fact, {}).get(head.lower())
             if field is None:
@@ -375,8 +375,10 @@ def export_document(document: dict[str, Any], fact: str | None = None) -> Conver
     _read_sql(doc, notices)
     _resolve_key_fields(doc, notices)
     _resolve_metric_fields(doc, notices)
-    _drop_key_only(doc)
+    # Dataset metrics first: one may read a key-only field, which has to resolve
+    # to its column before the field goes.
     _dataset_metrics(doc, fact, notices, resolve_fact)
+    _drop_key_only(doc)
     converted = ossie_value_to_metric_view(doc, fact)
     return Conversion(
         converted.value, (*notices.items, *converted.notices), converted.fact
@@ -540,45 +542,48 @@ def _resolve_metric_fields(doc: dict[str, Any], notices: Notices) -> None:
 
     A model-scoped metric names fields by ``dataset.field``, and the converter
     keeps the name, which is a column only where the field is named after it. A
-    field whose expression is not a bare column is left as written, named.
+    field whose expression is not a bare column is left as written, named. One
+    pass over the expression, so a column written in is never read again as a
+    field of the same name.
     """
     datasets = {
         str_(as_map(d).get("name")): as_map(d) for d in as_list(doc.get("datasets"))
+    }
+    columns = {
+        name.lower(): (name, _bare_columns(d))
+        for name, d in datasets.items()
+        if name is not None
     }
     for metric in as_list(doc.get("metrics")):
         metric = as_map(metric)
         expression = as_map(metric.get("expression"))
         renamed: list[str] = []
         opaque: list[str] = []
+
+        def replace(
+            m: re.Match[str], renamed: list[str] = renamed, opaque: list[str] = opaque
+        ) -> str:
+            head, tail = m.group(1), m.group(2)
+            found = columns.get(head.lower()) if tail is not None else None
+            if found is None or tail.lower() not in found[1]:
+                return m.group(0)
+            dataset_name, fields = found
+            column = fields[tail.lower()]
+            if column is None:
+                opaque.append(f"{dataset_name}.{tail}")
+                return m.group(0)
+            if column.lower() == tail.lower():
+                return m.group(0)
+            renamed.append(f"'{dataset_name}.{tail}' -> '{column}'")
+            return f"{head}.{column}"
+
         for entry in as_list(expression.get("dialects")):
             entry = as_map(entry)
             text = entry.get("expression")
-            if not isinstance(text, str):
-                continue
-            for dataset_name, dataset in datasets.items():
-                if dataset_name is None:
-                    continue
-                for field_name, column in _bare_columns(dataset).items():
-                    reference = re.compile(
-                        r"(?<![\w.])"
-                        + re.escape(dataset_name)
-                        + r"\."
-                        + re.escape(field_name)
-                        + r"(?![\w.(])",
-                        re.IGNORECASE | re.ASCII,
-                    )
-                    if not find_outside_literals(text, reference):
-                        continue
-                    if column is None:
-                        opaque.append(f"{dataset_name}.{field_name}")
-                        continue
-                    if column.lower() == field_name:
-                        continue
-                    text = replace_outside_literals(
-                        text, reference, f"{dataset_name}.{column}"
-                    )
-                    renamed.append(f"'{dataset_name}.{field_name}' -> '{column}'")
-            entry["expression"] = text
+            if isinstance(text, str):
+                entry["expression"] = replace_outside_literals(
+                    text, _IDENTIFIER_REF, replace
+                )
         scope = f"metric '{str_(metric.get('name'))}'"
         if renamed:
             notices.warn(
@@ -651,7 +656,12 @@ def _fields_to_columns(
     metric: dict[str, Any], dataset: dict[str, Any], scope: str, notices: Notices
 ) -> dict[str, Any] | None:
     """``metric`` with each unqualified field name replaced by its column, or
-    ``None`` (and a notice) when it reads a field that is not a bare column."""
+    ``None`` (and a notice) when it reads a field that is not a bare column.
+
+    One pass over the expression, so a column written in is never read again as
+    a field; a SQL keyword or date part (``EXTRACT(YEAR FROM ...)``) is never
+    read as a field, whatever the dataset names one.
+    """
     expression = metric.get("expression")
     try:
         expr = pick_expression(expression, scope)
@@ -659,32 +669,65 @@ def _fields_to_columns(
         return metric
     if expr is None:
         return metric
-    for fld in as_list(dataset.get("fields")):
-        fld = as_map(fld)
-        name = str_(fld.get("name"))
-        if name is None:
-            continue
-        reference = re.compile(
-            r"(?<![\w.])" + re.escape(name) + r"(?![\w.])(?!\s*\()",
-            re.IGNORECASE | re.ASCII,
+    fields = _bare_columns(dataset)
+    names = {
+        str(str_(as_map(f).get("name"))).lower(): str(str_(as_map(f).get("name")))
+        for f in as_list(dataset.get("fields"))
+    }
+    opaque: list[str] = []
+
+    def replace(m: re.Match[str]) -> str:
+        head, tail = m.group(1), m.group(2)
+        if tail is not None or head.lower() not in fields:
+            return m.group(0)
+        if _is_sql_word(m):
+            return m.group(0)
+        column = fields[head.lower()]
+        if column is None:
+            opaque.append(names.get(head.lower(), head))
+            return m.group(0)
+        return column
+
+    rewritten = replace_outside_literals(expr, _IDENTIFIER_REF, replace)
+    if opaque:
+        notices.warn(
+            scope,
+            f"reads field {_listed(list(dict.fromkeys(opaque)))}, whose expression is "
+            "not a bare column, and a measure cannot name a field; dropped",
+            "dex",
         )
-        if not find_outside_literals(expr, reference):
-            continue
-        column = _expression_text(fld)
-        if column is None or not is_simple_identifier(column):
-            notices.warn(
-                scope,
-                f"reads field '{name}', whose expression is not a bare column, and a "
-                "measure cannot name a field; dropped",
-                "dex",
-            )
-            return None
-        expr = replace_outside_literals(expr, reference, column.strip())
+        return None
     out = dict(metric)
     out["expression"] = {
-        "dialects": [{"dialect": _chosen_dialect(expression), "expression": expr}]
+        "dialects": [{"dialect": _chosen_dialect(expression), "expression": rewritten}]
     }
     return out
+
+
+_DATE_PART_CALL = re.compile(
+    r"\b(?:DATEADD|DATEDIFF|DATE_ADD|DATE_DIFF|DATE_PART|TIMESTAMPADD|TIMESTAMPDIFF)"
+    r"\s*\(\s*$",
+    re.IGNORECASE | re.ASCII,
+)
+_INTERVAL_PREFIX = re.compile(r"\bINTERVAL\s+\S+\s+$", re.IGNORECASE | re.ASCII)
+_FROM_NEXT = re.compile(r"\s+FROM\b", re.IGNORECASE | re.ASCII)
+
+
+def _is_sql_word(m: re.Match[str]) -> bool:
+    """Whether a bare name sits where SQL reads a keyword or a date part, not a
+    column: ``EXTRACT(YEAR FROM d)``, ``DATEADD(day, 1, d)``, ``INTERVAL 7 DAY``."""
+    from .dialect import CONTEXT_KEYWORDS, KEYWORDS, KEYWORDS_BEFORE_PAREN
+
+    word = m.group(1).upper()
+    if word in KEYWORDS or word in KEYWORDS_BEFORE_PAREN or word in CONTEXT_KEYWORDS:
+        return True
+    before = m.string[: m.start()]
+    after = m.string[m.end() :]
+    return bool(
+        _FROM_NEXT.match(after)
+        or _DATE_PART_CALL.search(before)
+        or _INTERVAL_PREFIX.search(before)
+    )
 
 
 def _chosen_dialect(expression: Any) -> str:

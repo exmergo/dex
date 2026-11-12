@@ -22,6 +22,9 @@ site: the next pair of formats is a row, not a branch.
 
 from __future__ import annotations
 
+import json
+import re
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -391,7 +394,7 @@ def semantic_bridge(
     if proposed:
         paths = [str(e.output_path) for e in proposed]
         rerun = _rerun(bridge, [e.source for e in entries], options)
-        adopt = _adopt(vendor, layer, paths, rerun)
+        adopt = _adopt(vendor, layer, paths, rerun, repo_root)
         for entry in proposed:
             entry.status = "proposed"
             entry.content = contents[str(entry.output_path)]
@@ -562,21 +565,43 @@ def _output_path(
 
 
 def _rerun(bridge: Bridge, sources: list[str], options: dict[str, Any]) -> str:
-    """The flags to run this conversion again with, as the caller passed them."""
-    words = [bridge.flag, *sources]
+    """The flags to run this conversion again with, as the caller passed them,
+    each path shell-quoted."""
+    words = [bridge.flag, *(shlex.quote(source) for source in sources)]
     for flag, dest, kwargs in bridge.options:
         value = options.get(dest)
         if value in (None, False):
             continue
-        words += [flag] if kwargs.get("action") == "store_true" else [flag, str(value)]
+        if kwargs.get("action") == "store_true":
+            words.append(flag)
+        else:
+            words += [flag, shlex.quote(str(value))]
     return " ".join(words)
 
 
-def _adopt(vendor: str, layer: Any, paths: list[str], flags: str) -> str:
-    listed = ", ".join(dict.fromkeys([*layer.semantic_editing_surface(), *paths]))
+_PLAIN_PATH = re.compile(r"[A-Za-z0-9_./-]+")
+
+
+def _yaml_list(paths: list[str]) -> str:
+    """``paths`` as a YAML flow list: plain where a path is, JSON-quoted (which
+    YAML reads) where it holds a space, a comma or a quote."""
+    items = [p if _PLAIN_PATH.fullmatch(p) else json.dumps(p) for p in paths]
+    return "[" + ", ".join(items) + "]"
+
+
+def _adopt(
+    vendor: str, layer: Any, paths: list[str], flags: str, repo_root: Path
+) -> str:
+    listed = _yaml_list(
+        list(dict.fromkeys([*layer.semantic_editing_surface(), *paths]))
+    )
+    # `define` refuses a file that already exists, and an unconfigured path can:
+    # once configured, that file is an update.
+    exists = any((repo_root / p).exists() for p in paths)
+    mode = "update" if exists else "define"
     return (
         f"{', '.join(paths)} {'is' if len(paths) == 1 else 'are'} not under "
         f"semantic.{vendor}.files, the files dex may write: run "
-        f"`dex config set semantic.{vendor}.files '[{listed}]'`, then run "
-        f"`semantic {vendor} define {flags}` again to store the plan"
+        f"`dex config set semantic.{vendor}.files {shlex.quote(listed)}`, then run "
+        f"`semantic {vendor} {mode} {flags}` again to store the plan"
     )

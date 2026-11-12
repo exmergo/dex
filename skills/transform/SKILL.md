@@ -407,8 +407,9 @@ fetches the engine's dependencies from PyPI or your configured index.
    `semantic slayer define|update|plan` (SLayer model files),
    `semantic cube define|update|plan` (Cube YAML model files), or
    `semantic databricks define|update|plan` (Databricks Metric View YAML files,
-   never deployed). To propose one of the last two from the other's file, add
-   `--from-ossie <file>` or `--from-metric-view <file>`. Read
+   never deployed). To propose a Metric View from an Ossie document, use
+   `semantic databricks --from-ossie <file>`; for the reverse,
+   `semantic ossie --from-metric-view <file>`. Read
    `${CLAUDE_SKILL_DIR}/references/semantic-layer.md` first.
 4. **Declare.** Read `data.declarations.<model>` on the plan envelope: `drafted`
    is what Dex measured, `declared` is what the YAML says, `missing` is the intent

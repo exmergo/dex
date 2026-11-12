@@ -143,18 +143,25 @@ class _Loader(yaml.SafeLoader):
         return super().compose_node(parent, index)
 
 
-def _reject_cycles(value: Any, stack: set[int] | None = None) -> None:
+def _reject_cycles(
+    value: Any, stack: set[int] | None = None, done: set[int] | None = None
+) -> None:
     """Refuse a value that contains itself. SnakeYAML builds one from a
-    recursive alias, and the converter would recurse into it without end."""
+    recursive alias, and the converter would recurse into it without end. A
+    shared node is walked once, so aliases cannot make this exponential."""
     if not isinstance(value, (dict, list)):
         return
     stack = set() if stack is None else stack
+    done = set() if done is None else done
+    if id(value) in done:
+        return
     if id(value) in stack:
         raise yaml.YAMLError("found a recursive alias")
     stack.add(id(value))
     for item in value.values() if isinstance(value, dict) else value:
-        _reject_cycles(item, stack)
+        _reject_cycles(item, stack, done)
     stack.discard(id(value))
+    done.add(id(value))
 
 
 _Loader.yaml_implicit_resolvers = {

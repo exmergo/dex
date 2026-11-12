@@ -142,3 +142,15 @@ def test_the_port_needs_no_sqlglot_and_no_jsonschema():
         [sys.executable, "-c", script], capture_output=True, text=True
     )
     assert done.stdout.strip() == "ok", done.stderr
+
+
+def test_shared_aliases_are_walked_once():
+    """48 aliases fanning out three ways would be 3^16 paths walked per path."""
+    import time
+
+    lines = ["a0: &a0 [x]"] + [
+        f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}, *a{i - 1}]" for i in range(1, 17)
+    ]
+    started = time.monotonic()
+    parse_yaml("\n".join(lines))
+    assert time.monotonic() - started < 5
