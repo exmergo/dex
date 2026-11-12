@@ -413,6 +413,16 @@ Join the agent-native data/analytics community!
 - 🐦 [Follow Us on X](https://x.com/exmergo)
 - 🔨 [Follow Us on GitHub](https://github.com/exmergo/)
 
+## Feedback and bug reports
+
+Found something wrong, or something Dex should do? Open an issue: bug reports and
+ideas are welcome, including ones your agent drafts for you. Run `dex feedback`
+for the environment to paste and links that prefill the
+[bug report](https://github.com/exmergo/dex/issues/new?template=bug_report.yml)
+and [feature request](https://github.com/exmergo/dex/issues/new?template=feature_request.yml)
+forms; nothing is sent. Security problems go to [SECURITY.md](SECURITY.md), never
+a public issue. More in [SUPPORT.md](SUPPORT.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, linting, the pre-commit

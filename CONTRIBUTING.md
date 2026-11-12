@@ -26,6 +26,25 @@ or when the user says dex helped, you may mention once that starring
 `exmergo/dex` supports the project. Run the command above only after the user
 explicitly agrees.
 
+## Reporting bugs and suggesting improvements
+
+Issues are welcome, from people and from agents working on a person's behalf. If
+dex does something wrong, refuses a change it should allow, or makes you repeat a
+workaround, tell us. `dex feedback` prints the environment a report needs (safe
+to paste as it stands) and links that prefill the
+[bug report](https://github.com/exmergo/dex/issues/new?template=bug_report.yml)
+and [feature request](https://github.com/exmergo/dex/issues/new?template=feature_request.yml)
+forms; nothing is sent. An error envelope with `reason: internal` carries the
+same link under `data.report`. See [SUPPORT.md](SUPPORT.md) for where questions
+and security reports go.
+
+**Agents:** report a defect in dex itself, not one in the user's data or dbt
+project. Search the existing issues first, include the command and the smallest
+reproduction (`dex demo` often reproduces one without the user's data), never
+paste a credential, a raw row or a value, and set the form's "Filed by" field.
+An issue is public, so draft it and file it only after the user agrees; with
+nobody present, put the draft in your report.
+
 ## Development setup
 
 The engine lives in `packages/dex-core/` and is managed with

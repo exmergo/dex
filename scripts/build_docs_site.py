@@ -472,6 +472,13 @@ GENERATED_PAGES: dict[str, PageMeta] = {
         "carries, the block to paste into CLAUDE.md or AGENTS.md, and a stale check.",
         "procedure",
     ),
+    "cli/feedback": PageMeta(
+        "dex feedback",
+        "Reference for dex feedback: report a bug or suggest an improvement, with "
+        "the environment to paste and issue links prefilled from it. Nothing is "
+        "sent.",
+        "feedback",
+    ),
     "changelog": PageMeta(
         "Changelog",
         "Release notes for exmergo-dex-core and the dex skills: what was added, "

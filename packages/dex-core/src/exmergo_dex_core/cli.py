@@ -132,6 +132,10 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     # before an engine is built, like `config`: an agent with only the package,
     # or a harness with no project yet, must be able to get it.
     "procedure": [],
+    # feedback: what a bug report or feature request needs and where it goes
+    # (#1299). No subcommands, routed before an engine like `procedure`: the
+    # moment to report something is often the moment the project is broken.
+    "feedback": [],
 }
 
 
@@ -284,6 +288,8 @@ _GROUP_HELP: dict[str, str] = {
     "(no credentials, no network)",
     "procedure": "print the agent procedure, or the block to paste into "
     "CLAUDE.md / AGENTS.md (no connection)",
+    "feedback": "report a bug or suggest an improvement: the environment to "
+    "paste and prefilled issue links (no connection, nothing sent)",
 }
 
 #: (group, subcommand) -> (summary, description). The summary is the one line
@@ -707,6 +713,13 @@ def _build_parser() -> argparse.ArgumentParser:
                 metavar="FILE",
                 default=None,
                 help="report whether FILE carries the current procedure (repeatable)",
+            )
+        if group == "feedback":
+            gp.add_argument(
+                "--command",
+                metavar="SUBCOMMAND",
+                default=None,
+                help="the command that misbehaved, named in the bug report link",
             )
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
@@ -1961,6 +1974,9 @@ def main(argv: list[str] | None = None) -> int:
     # and it runs before the handlers below.
     spend: dict | None = None
     connection = env.Connection()
+    # The class of an exception the catch-all below rendered, for the report
+    # pointer an internal error carries (#1299); None when a handler built it.
+    internal_exception: str | None = None
     # Resolved before anything can refuse, so even a refusal states the mode. An
     # unknown DEX_RESULT_MODE is itself a refusal, rendered below like any other.
     result_mode: ResultMode | None = None
@@ -1993,6 +2009,17 @@ def main(argv: list[str] | None = None) -> int:
 
             require_allowed(result_mode, _command_label(args))
             envelope = cmd_procedure(args)
+        elif args.group == "feedback":
+            # No engine: a broken config or connection is a common reason to
+            # report something, and must not stop the command that helps (#1299).
+            from .feedback import cmd_feedback
+
+            require_allowed(result_mode, _command_label(args))
+            envelope = cmd_feedback(
+                args,
+                repo_root=repo_root(args),
+                result_mode=result_mode.value if result_mode else None,
+            )
         else:
             # One engine per process, built from the resolved repo root. The default
             # backend is what lets the subcommands stay stateless across invocations:
@@ -2053,6 +2080,7 @@ def main(argv: list[str] | None = None) -> int:
         if paradigm is None and getattr(args, "connector", None):
             paradigm = paradigm_for(args.connector)
         envelope = env.error_for(exc, env.redact(str(exc)))
+        internal_exception = type(exc).__name__
 
     # A command that failed still spent what it spent. Only the two-phase
     # refusals used to say so (budget exhaustion carries its own spend), so a
@@ -2126,6 +2154,19 @@ def main(argv: list[str] | None = None) -> int:
     # handlers cannot drift, and filling it performs no extra warehouse read.
     if args.group != "init" or not envelope.connection.connector:
         envelope.connection = connection
+
+    # An exception dex did not anticipate is most likely dex's own defect, so the
+    # envelope says so and hands over a prefilled report link (#1299). The link
+    # names the command, connector and exception class, never the error text.
+    if envelope.reason is env.Reason.INTERNAL and "report" not in envelope.data:
+        from .feedback import report_pointer
+
+        envelope.data["report"] = report_pointer(
+            command=command_args.command_name(args) or None,
+            connector=envelope.connection.connector,
+            exception=internal_exception,
+            result_mode=result_mode.value if result_mode else None,
+        )
 
     # Every envelope a values-free process prints says so, refusals and asks
     # included, so a host can assert the mode on whatever comes back (#591).

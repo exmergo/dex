@@ -48,7 +48,8 @@
               "cli/maintain",
               "cli/config",
               "cli/demo",
-              "cli/procedure"
+              "cli/procedure",
+              "cli/feedback"
             ]
           },
           {
