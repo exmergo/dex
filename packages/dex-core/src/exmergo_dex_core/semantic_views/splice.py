@@ -86,7 +86,11 @@ def set_member_scalar(
         for item in sequence.value:
             if (_name(item) or "").lower() != name.lower():
                 continue
-            if isinstance(item, yaml.MappingNode) and not item.flow_style:
+            if (
+                isinstance(item, yaml.MappingNode)
+                and not item.flow_style
+                and _inside(item, sequence)
+            ):
                 return _set_scalar(text, item, key, value, where, ())
             break
     raise UnwritableError(
@@ -144,6 +148,8 @@ def replace_member(
     for item in sequence.value:
         if (_name(item) or "").lower() != name.lower():
             continue
+        if not _inside(item, sequence):
+            break
         start, end, indent = _span(text, item)
         return text[:start] + dump_items([entry], indent, Dumper) + text[end:]
     raise UnwritableError(
@@ -166,7 +172,11 @@ def append_member(text: str, table: str, section: str, entry: dict[str, Any]) ->
     if not present:
         rendered = dump_items({section: [entry]}, _key_indent(node), Dumper)
         return _insert(text, _item_end(text, node), rendered)
-    if sequence is None or not sequence.value:
+    if (
+        sequence is None
+        or not sequence.value
+        or not _inside(sequence.value[-1], sequence)
+    ):
         raise UnwritableError(
             f"tables['{table}'].{section} is not a non-empty block-style list dex "
             "can append to"
@@ -189,7 +199,11 @@ def _table(text: str, table: str) -> yaml.MappingNode:
         raise UnwritableError("the file's `tables` is not a block-style list")
     for item in sequence.value:
         if (_name(item) or "").lower() == table.lower():
-            if not isinstance(item, yaml.MappingNode) or item.flow_style:
+            if (
+                not isinstance(item, yaml.MappingNode)
+                or item.flow_style
+                or not _inside(item, sequence)
+            ):
                 break
             return item
     raise UnwritableError(
@@ -204,10 +218,28 @@ def _section(node: Any, section: str) -> yaml.SequenceNode | None:
     for key, value in node.value:
         if str(key.value).lower() != section.lower():
             continue
-        if isinstance(value, yaml.SequenceNode) and not value.flow_style:
+        if (
+            isinstance(value, yaml.SequenceNode)
+            and not value.flow_style
+            and _inside(value, node)
+        ):
             return value
         return None
     return None
+
+
+def _inside(node: yaml.Node, container: yaml.Node) -> bool:
+    """Whether ``node`` is written inside ``container``.
+
+    A YAML alias composes to its anchor's node, whose marks point at the anchor.
+    Editing through an alias would rewrite the anchor, and with it every other
+    place that reads it, so an aliased node is never edited in place.
+    """
+
+    return (
+        container.start_mark.index <= node.start_mark.index
+        and node.end_mark.index <= container.end_mark.index
+    )
 
 
 def _name(item: Any) -> str | None:

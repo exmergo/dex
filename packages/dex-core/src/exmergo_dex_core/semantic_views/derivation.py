@@ -221,9 +221,13 @@ def _build(
         return definition
 
     views = _views(texts)
+    # The relation the table would read, so an existing table is matched on its
+    # whole base_table: two marts sharing a table name in different schemas are
+    # different marts.
+    source, placed = placed_table(identifier, declaration.relation, prefix)
     for path, raw in views:
         for table in _tables(raw):
-            if _table_part(table) == identifier.lower():
+            if _same_relation(table, source, identifier):
                 return finish(
                     "skipped",
                     f"{model} already has a logical table "
@@ -272,7 +276,6 @@ def _build(
                 "dex does not rename a table",
             )
 
-    source, placed = placed_table(identifier, declaration.relation, prefix)
     parts = _parts(source)
     if len(parts) != 3:
         return finish(
@@ -691,16 +694,46 @@ def _parts(relation: str) -> list[str]:
 def _parent_table(
     views: list[tuple[str, dict[str, Any]]], reference: DeclaredReference
 ) -> tuple[str, dict[str, Any]] | None:
-    """The file and logical table a foreign key's parent sits on, if any."""
+    """The file and logical table a foreign key's parent sits on, if any.
+
+    A table on the parent's whole relation (the one the manifest names) wins.
+    Otherwise a table on its table name, or named after the parent model, is
+    used only where every such table reads one relation: two candidates on
+    different relations are ambiguous, and no relationship is guessed.
+    """
+
     wanted = (reference.parent_identifier or reference.parent_model).lower()
-    for path, raw in views:
-        for table in _tables(raw):
-            if (
-                _table_part(table) == wanted
-                or str(table.get("name", "")).lower() == reference.parent_model.lower()
-            ):
-                return path, table
+    parent = reference.parent_model.lower()
+    candidates: list[tuple[str, dict[str, Any]]] = [
+        (path, table)
+        for path, raw in views
+        for table in _tables(raw)
+        if _table_part(table) == wanted or str(table.get("name", "")).lower() == parent
+    ]
+    if reference.parent_relation:
+        exact = [
+            c
+            for c in candidates
+            if _same_relation(c[1], reference.parent_relation, wanted)
+            and len(_parts(reference.parent_relation)) == 3
+        ]
+        if exact:
+            return exact[0]
+    relations = {(_base_table(t) or "").lower() for _p, t in candidates}
+    if len(candidates) == 1 or (candidates and len(relations) == 1):
+        return candidates[0]
     return None
+
+
+def _same_relation(table: Mapping[str, Any], relation: str, identifier: str) -> bool:
+    """Whether a logical table reads ``relation``: its whole three-part
+    base_table where ``relation`` has three parts, its table name otherwise."""
+
+    parts = [p.lower() for p in _parts(relation)]
+    base = _base_table(table)
+    if len(parts) == 3 and base is not None:
+        return [p.lower() for p in _parts(base)] == parts
+    return _table_part(table) == identifier.lower()
 
 
 def _keyed(table: Mapping[str, Any], columns: list[str]) -> bool:
@@ -1079,6 +1112,10 @@ def _annotated(
             )
             if why is None:
                 carried.append(f"columns.{name}.references")
+                # Read the view again, so the next foreign key sees the
+                # relationship this one appended and does not reuse its name.
+                reread = read_yaml(text)
+                view = reread if isinstance(reread, dict) else view
             else:
                 reasons[f"columns.{name}.references"] = why
     return text, carried, reasons
@@ -1117,7 +1154,13 @@ def _annotate_metric(
                 f"the table already has a {existing[0][:-1].replace('_', ' ')} named "
                 f"'{metric['name']}'"
             )
-        elif authored is not None and authored != expected:
+        elif authored is None:
+            reasons[f"columns.{column}.aggregation"] = (
+                f"the metric '{existing[1]['name']}' is not one aggregate over one "
+                "input dex can read, so nothing says it states this aggregation; "
+                "check it by hand"
+            )
+        elif authored != expected:
             reasons[f"columns.{column}.aggregation"] = (
                 f"the metric '{existing[1]['name']}' aggregates with "
                 f"{authored.upper()}, and the declaration says "
@@ -1188,6 +1231,7 @@ def _annotate_relationship(
             and any(
                 isinstance(p, Mapping)
                 and str(p.get("left_column", "")).lower() == column.lower()
+                and str(p.get("right_column", "")).lower() == parent_column.lower()
                 for p in pairs
             )
         ):

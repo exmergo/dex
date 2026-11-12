@@ -650,3 +650,55 @@ def test_apply_keeps_the_file_mode(tmp_path):
     )
     assert result.written == [SHOP_FILE]
     assert target.stat().st_mode & 0o777 == 0o640
+
+
+def test_a_malformed_file_can_be_repaired(tmp_path, capsys):
+    """Classification reads the old file as declaring nothing, never as a crash."""
+    layered(tmp_path)
+    put(tmp_path, STOCK_FILE, "name: stock\ntables: 7\n")
+    rc, envelope = plan(capsys, tmp_path, "plan", {STOCK_FILE: dump_yaml(STOCK)})
+    assert rc == 0, envelope["errors"]
+    assert "stock.items" in envelope["data"]["defined"]
+
+
+def test_an_alias_bomb_in_the_file_replaced_is_never_expanded(tmp_path, capsys):
+    layered(tmp_path)
+    bomb = "name: stock\na: &a [x, x, x, x, x, x, x, x, x, x]\n"
+    for level in "bcdefgh":
+        previous = chr(ord(level) - 1)
+        bomb += f"{level}: &{level} [{', '.join([f'*{previous}'] * 10)}]\n"
+    bomb += "tables: [*h]\n"
+    put(tmp_path, STOCK_FILE, bomb)
+    rc, envelope = plan(capsys, tmp_path, "plan", {STOCK_FILE: dump_yaml(STOCK)})
+    assert rc == 0, envelope["errors"]
+
+
+def test_a_failed_move_puts_back_what_was_already_written(tmp_path, monkeypatch):
+    layered(tmp_path)
+    layer = SemanticViewSemanticLayer(tmp_path, [SHOP_FILE, STOCK_FILE])
+    view = layer.semantic_edit_view().files
+    before = {name: read(tmp_path, name) for name in (SHOP_FILE, STOCK_FILE)}
+    edits = [
+        PlanEdit(
+            path=name,
+            kind=EditKind.SEMANTIC_DOCUMENT,
+            old_content_hash=view[name].sha256,
+            new_content="# changed\n" + view[name].content,
+        )
+        for name in (SHOP_FILE, STOCK_FILE)
+    ]
+    real = Path.replace
+    calls = {"n": 0}
+
+    def flaky(self, target):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky)
+    with pytest.raises(OSError, match="disk full"):
+        layer.write_semantic_edits(edits)
+    monkeypatch.setattr(Path, "replace", real)
+    assert {name: read(tmp_path, name) for name in (SHOP_FILE, STOCK_FILE)} == before
+    assert not list((tmp_path / "views").glob(".*.dex"))

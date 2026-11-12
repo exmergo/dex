@@ -363,6 +363,7 @@ def elements_of(texts: Mapping[str, str]) -> dict[tuple[str, str | None], str]:
     already said why.
     """
 
+    from ..native_yaml import MAX_EXPANDED_VALUES, expansion
     from .loader import read_yaml
 
     out: dict[tuple[str, str | None], str] = {}
@@ -373,11 +374,20 @@ def elements_of(texts: Mapping[str, str]) -> dict[tuple[str, str | None], str]:
             continue
         if not isinstance(raw, dict) or not isinstance(raw.get("name"), str):
             continue
+        # The file being replaced was never validated by this plan, so its
+        # aliases are bounded here too before anything walks them.
+        expanded = expansion(raw)
+        if expanded is None or expanded > MAX_EXPANDED_VALUES:
+            continue
         view = raw["name"].lower()
         rest = {k: v for k, v in raw.items() if k not in ("tables", "metrics")}
         out[(view, None)] = _canonical(rest)
         for key, kind in (("tables", "table"), ("metrics", "metric")):
-            for item in raw.get(key) or []:
+            items = raw.get(key)
+            if not isinstance(items, list):
+                # A malformed section declares nothing; the validator says why.
+                continue
+            for item in items:
                 if isinstance(item, dict) and isinstance(item.get("name"), str):
                     out[(view, f"{kind}:{item['name'].lower()}")] = _canonical(item)
     return out
@@ -423,10 +433,30 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
             with contextlib.suppress(OSError):
                 temporary.unlink()
         raise
+    # Each target's bytes before it is replaced, so a failure part way through
+    # puts back what was already moved: all files or none.
+    originals: list[tuple[Path, bytes | None, int | None]] = []
     written: list[str] = []
-    for temporary, target, edit in temporaries:
-        temporary.replace(target)
-        written.append(edit.path)
+    try:
+        for temporary, target, edit in temporaries:
+            before = target.read_bytes() if target.is_file() else None
+            mode = target.stat().st_mode & 0o777 if before is not None else None
+            temporary.replace(target)
+            originals.append((target, before, mode))
+            written.append(edit.path)
+    except OSError:
+        for target, before, mode in reversed(originals):
+            with contextlib.suppress(OSError):
+                if before is None:
+                    target.unlink()
+                else:
+                    target.write_bytes(before)
+                    if mode is not None:
+                        target.chmod(mode)
+        for temporary, _, _ in temporaries:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
     return written
 
 

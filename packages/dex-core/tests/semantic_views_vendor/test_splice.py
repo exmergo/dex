@@ -143,3 +143,28 @@ def test_a_flow_style_member_list_is_refused():
 def test_an_unknown_table_is_refused():
     with pytest.raises(UnwritableError, match="nowhere"):
         replace_member(TEXT, "nowhere", "dimensions", "x", {"name": "x"})
+
+
+def test_an_aliased_member_is_never_edited_through_its_alias():
+    """Editing through `*shared` would rewrite the anchor in another table."""
+    text = (
+        "name: v\n"
+        "tables:\n"
+        "  - name: a\n"
+        "    base_table: {database: d, schema: s, table: a}\n"
+        "    dimensions:\n"
+        "      - &shared\n"
+        "        name: region\n"
+        "        expr: region\n"
+        "  - name: b\n"
+        "    base_table: {database: d, schema: s, table: b}\n"
+        "    dimensions:\n"
+        "      - *shared\n"
+    )
+    with pytest.raises(UnwritableError):
+        set_member_scalar(text, "b", "dimensions", "region", "description", "x")
+    with pytest.raises(UnwritableError):
+        replace_member(text, "b", "dimensions", "region", {"name": "region"})
+    # The anchor's own table is still editable in place.
+    after = set_member_scalar(text, "a", "dimensions", "region", "description", "x")
+    assert after.count("description: x") == 1

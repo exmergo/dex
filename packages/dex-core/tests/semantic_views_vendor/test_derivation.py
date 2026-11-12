@@ -704,6 +704,135 @@ def test_annotate_with_nothing_to_change_keeps_the_file(tmp_path: Path, capsys):
     assert "already state every" in " ".join(envelope["errors"])
 
 
+TWO_KEYS = (
+    "name: shop\n"
+    "tables:\n"
+    "  - name: customers\n"
+    "    base_table: {database: demo, schema: main, table: stg_customers}\n"
+    "    primary_key: {columns: [id]}\n"
+    "    unique_keys:\n"
+    "      - {columns: [external_id]}\n"
+    "    dimensions:\n"
+    "      - name: region\n"
+    "        expr: region\n"
+    "  - name: orders\n"
+    "    base_table: {database: demo, schema: main, table: fct_orders}\n"
+    "    primary_key: {columns: [order_id]}\n"
+    "    dimensions:\n"
+    "      - name: status\n"
+    "        expr: status\n"
+    "    facts:\n"
+    "      - name: amount\n"
+    "        expr: amount\n"
+    "    metrics:\n"
+    "      - name: amount_sum\n"
+    "        expr: AVG(orders.amount) * 2\n"
+    "relationships:\n"
+    "  - name: orders_to_customers\n"
+    "    left_table: orders\n"
+    "    right_table: customers\n"
+    "    relationship_columns:\n"
+    "      - {left_column: billing_id, right_column: id}\n"
+)
+
+
+def test_annotate_two_keys_to_one_parent_get_two_relationships(tmp_path, capsys):
+    put(tmp_path, SHOP_FILE, TWO_KEYS)
+    _configure(tmp_path, [SHOP_FILE])
+    rc, envelope = _annotate(
+        tmp_path,
+        capsys,
+        [
+            {
+                "model": "orders",
+                "columns": {
+                    # Already joined on billing_id = id: kept, carried.
+                    "billing_id": {"role": "foreign_key", "references": "customers.id"},
+                    # The authored join is to `id`, not `external_id`: a new one.
+                    "shipping_id": {
+                        "role": "foreign_key",
+                        "references": "customers.external_id",
+                    },
+                    "returned_id": {
+                        "role": "foreign_key",
+                        "references": "customers.id",
+                    },
+                },
+            }
+        ],
+    )
+    assert rc == 0, envelope["errors"]
+    text = _stored_plans(tmp_path)[0]["edits"][0]["new_content"]
+    relationships = read_yaml(text)["relationships"]
+    names = [r["name"] for r in relationships]
+    assert len(names) == len(set(names)) == 3
+    pairs = {
+        (
+            r["relationship_columns"][0]["left_column"],
+            r["relationship_columns"][0]["right_column"],
+        )
+        for r in relationships
+    }
+    assert pairs == {
+        ("billing_id", "id"),
+        ("shipping_id", "external_id"),
+        ("returned_id", "id"),
+    }
+    assert validate_view_contents({SHOP_FILE: text}).errors == []
+
+
+def test_annotate_does_not_carry_an_aggregation_it_cannot_read(tmp_path, capsys):
+    put(tmp_path, SHOP_FILE, TWO_KEYS)
+    _configure(tmp_path, [SHOP_FILE])
+    rc, envelope = _annotate(
+        tmp_path,
+        capsys,
+        [
+            {
+                "model": "orders",
+                "description": "Orders.",
+                "columns": {"amount": {"role": "measure", "aggregation": "sum"}},
+            }
+        ],
+    )
+    assert rc == 0, envelope["errors"]
+    notes = " ".join(envelope["data"]["notes"])
+    assert "columns.amount.aggregation" in notes
+    assert "check it by hand" in notes
+
+
+def test_two_parents_on_one_table_name_are_ambiguous(tmp_path: Path):
+    """Two `customers` tables in different schemas: no relationship is guessed,
+    unless the manifest names the parent's whole relation."""
+    text = SHOP_TEXT + (
+        "  - name: customers_archive\n"
+        "    base_table: {database: demo, schema: archive, table: stg_customers}\n"
+        "    primary_key: {columns: [id]}\n"
+        "    dimensions:\n"
+        "      - name: region\n"
+        "        expr: region\n"
+    )
+    put(tmp_path, SHOP_FILE, text)
+    layer = _source(tmp_path, [SHOP_FILE])
+    reference = _reference(parent_model="stg_customers_x")
+    result = layer.derive_semantic(_request({SHOP_FILE: text}, references=(reference,)))
+    definition = result.definitions["fct_orders"]
+    assert "relationships" not in read_yaml(definition.content or "") or not [
+        r
+        for r in read_yaml(definition.content)["relationships"]
+        if r["left_table"] == "fct_orders"
+    ]
+
+    exact = _reference(
+        parent_model="stg_customers_x", parent_relation="demo.archive.stg_customers"
+    )
+    result = layer.derive_semantic(_request({SHOP_FILE: text}, references=(exact,)))
+    (relationship,) = read_yaml(result.definitions["fct_orders"].content)[
+        "relationships"
+    ]
+    assert relationship["right_table"] == "customers_archive"
+
+
 # --- the shipped contract -----------------------------------------------------------
 
 
