@@ -832,11 +832,15 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         },
     },
     ("semantic", "ossie"): {
-        "method": "semantic_ossie",
+        "method": ("semantic_ossie", "semantic_bridge"),
         "args": {
             "mode": "mode",
             "argument": _TRANSLATED,
             "edits_file": _TRANSLATED,
+            "from_metric_view": "source",
+            "name": "name",
+            "into": "into",
+            "dataset_metrics": "dataset_metrics",
         },
     },
     ("semantic", "slayer"): {
@@ -856,11 +860,14 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         },
     },
     ("semantic", "databricks"): {
-        "method": "semantic_databricks",
+        "method": ("semantic_databricks", "semantic_bridge"),
         "args": {
             "mode": "mode",
             "argument": _TRANSLATED,
             "edits_file": _TRANSLATED,
+            "from_ossie": "source",
+            "fact": "fact",
+            "into": "into",
         },
     },
     ("maintain", "snapshot"): {

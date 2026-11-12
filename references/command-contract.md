@@ -567,7 +567,10 @@ dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted 
 dex semantic ossie define|update|plan
                                   -> native Ossie whole-document edits as diffs; limited to the exact
                                      files in semantic.ossie.files, validated as one prospective
-                                     layer, and applied atomically with transform apply
+                                     layer, and applied atomically with transform apply;
+                                     --from-metric-view <file>... [--name] [--into] [--dataset-metrics]
+                                     proposes the document from a Metric View file through the Ossie
+                                     bridge (#1260), every notice under data.bridge
 dex semantic slayer define|update|plan
                                   -> SLayer model files as whole-file diffs; limited to the exact
                                      files in semantic.slayer.models, validated as one prospective
@@ -586,7 +589,9 @@ dex semantic databricks define|update|plan
                                      validated as one prospective set with dex's port of the Metric
                                      View YAML 1.1 rules (unknown keys and fields beside dimensions
                                      refused on write), each view classified defined, updated or
-                                     unchanged, applied atomically with transform apply, never deployed
+                                     unchanged, applied atomically with transform apply, never deployed;
+                                     --from-ossie <file>... [--fact] [--into] proposes views from
+                                     Ossie documents through the Ossie bridge (#1260)
 dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the

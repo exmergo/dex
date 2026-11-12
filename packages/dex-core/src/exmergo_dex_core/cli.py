@@ -470,7 +470,9 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
     ("semantic", "ossie"): (
         "plan whole-document edits to a native Apache Ossie layer",
         "Validate whole Ossie documents at the paths semantic.ossie.files "
-        "configures, then store a plan. Needs the [ossie] extra. Repo-only.",
+        "configures, then store a plan. --from-metric-view proposes the document "
+        "from a Metric View file through dex's port of apache/ossie-converters. "
+        "Needs the [ossie] extra. Repo-only.",
     ),
     ("semantic", "slayer"): (
         "plan whole-file edits to the configured SLayer model files",
@@ -489,8 +491,10 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "plan whole-file edits to the Metric View YAML files",
         "Validate whole Metric View YAML files at the paths "
         "semantic.databricks.files configures, with dex's port of the Metric View "
-        "YAML 1.1 rules, then store a plan. Needs the [metric-views] extra. Never "
-        "deploys a view and opens no workspace connection. Repo-only.",
+        "YAML 1.1 rules, then store a plan. --from-ossie proposes the view from an "
+        "Ossie document through dex's port of apache/ossie-converters. Needs the "
+        "[metric-views] extra. Never deploys a view and opens no workspace "
+        "connection. Repo-only.",
     ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
@@ -1550,6 +1554,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="FILE",
                         help="whole-document edits payload as JSON; '-' reads stdin",
                     )
+                    # The Ossie bridge (#1260): the configured layer proposed from
+                    # one file of the other format, through the ported converter.
+                    # The flags are the bridge table's, so no vendor is named here.
+                    from .transform.semantic_bridge import bridge_arguments
+
+                    for flag, kwargs in bridge_arguments(name):
+                        sp.add_argument(flag, **kwargs)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {

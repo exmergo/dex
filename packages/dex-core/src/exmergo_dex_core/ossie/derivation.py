@@ -127,7 +127,7 @@ def derive(
         ),
         request.project_identifiers.values(),
     )
-    directory = _directory(layer)
+    directory = document_directory(layer)
 
     built: list[DerivedDefinition] = []
     changed: list[str] = []
@@ -619,7 +619,7 @@ def _field_for_column(
     return named
 
 
-def _directory(layer: OssieSemanticLayer) -> str:
+def document_directory(layer: OssieSemanticLayer) -> str:
     parents = {str(PurePosixPath(name).parent) for name in layer.files}
     if len(parents) == 1:
         only = next(iter(parents))
