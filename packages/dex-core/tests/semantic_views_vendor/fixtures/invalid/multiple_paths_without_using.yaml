@@ -1,0 +1,26 @@
+# expect: multiple_paths
+# Two relationships between one pair, read without using_relationships.
+name: multiple_paths_without_using
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    metrics:
+      - {name: ship_count, expr: COUNT(orders.order_key)}
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    facts:
+      - {name: order_key, expr: o_orderkey}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+relationships:
+  - name: lineitem_orders
+    left_table: lineitem
+    right_table: orders
+    relationship_columns: [{left_column: l_orderkey, right_column: o_orderkey}]
+  - name: lineitem_orders_by_supplier
+    left_table: lineitem
+    right_table: orders
+    relationship_columns: [{left_column: l_suppkey, right_column: o_orderkey}]

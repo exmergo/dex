@@ -1505,3 +1505,44 @@ def test_semantic_update_command_helper():
     assert _semantic_update_command(None) == "semantic update"
     # Databricks Metric Views are authored natively since #1258.
     assert _semantic_update_command("databricks") == "semantic databricks update"
+
+
+def test_dangling_reference_under_snowflake_names_no_command():
+    """Snowflake Semantic Views are read before they are authored (#1292), so a
+    finding on that layer names the file to edit, never a route that would
+    refuse."""
+    from exmergo_dex_core.config import SEMANTIC_DOCUMENT_AUTHORING
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    assert "snowflake" not in SEMANTIC_DOCUMENT_AUTHORING
+    finding = DriftFinding(
+        axis="semantic",
+        code="dangling_reference",
+        identifier="sales.orders.revenue",
+        detail="metric references a measure that is gone",
+    )
+    action = _advisory(finding, semantic_vendor="snowflake").action
+    assert "`semantic" not in action
+    assert "edit the semantic definition in its file" in action
+
+
+def test_a_contradicted_primary_key_names_no_route_a_vendor_lacks():
+    """Snowflake's primary key is changed in its file until #1292 authors it;
+    Cube's through its own route."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    def action(vendor: str) -> str:
+        finding = DriftFinding(
+            axis="grain",
+            code="declared_grain_not_unique",
+            identifier="demo.main.orders",
+            detail="not unique",
+            data={"claim": "primary", "declared_by": vendor},
+        )
+        return _advisory(finding, semantic_vendor=vendor).action
+
+    assert "change the primary key in its file" in action("snowflake")
+    assert "`semantic snowflake update`" not in action("snowflake")
+    assert "`semantic cube update`" in action("cube")

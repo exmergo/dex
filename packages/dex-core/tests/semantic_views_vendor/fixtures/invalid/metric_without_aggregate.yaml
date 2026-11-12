@@ -1,0 +1,9 @@
+# expect: metric_aggregate
+# A table metric with no aggregate.
+name: metric_without_aggregate
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - {name: price, expr: o_totalprice}

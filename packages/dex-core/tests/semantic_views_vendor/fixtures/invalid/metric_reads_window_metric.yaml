@@ -1,0 +1,14 @@
+# expect: window_reference
+# A metric reading a window metric.
+name: metric_reads_window_metric
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    time_dimensions:
+      - {name: order_date, expr: o_orderdate}
+    metrics:
+      - {name: order_count, expr: COUNT(o_orderkey)}
+      - name: trailing
+        expr: AVG(orders.order_count) OVER (PARTITION BY EXCLUDING orders.order_date ORDER BY orders.order_date)
+      - {name: doubled, expr: 'SUM(orders.trailing) * 2'}

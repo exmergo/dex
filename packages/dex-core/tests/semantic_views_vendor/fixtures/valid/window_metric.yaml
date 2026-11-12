@@ -1,0 +1,19 @@
+# A window function metric over a table metric.
+name: window_metric
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    time_dimensions:
+      - name: order_date
+        expr: o_orderdate
+        data_type: DATE
+    facts:
+      - name: total_price
+        expr: o_totalprice
+    metrics:
+      - name: revenue
+        expr: SUM(orders.total_price)
+      - name: revenue_7d_avg
+        description: Seven-day trailing average of daily revenue.
+        expr: AVG(orders.revenue) OVER (PARTITION BY EXCLUDING orders.order_date ORDER BY orders.order_date RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW)

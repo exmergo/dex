@@ -1,0 +1,9 @@
+# expect: access_modifier
+# An access_modifier that is neither public nor private.
+name: access_modifier_value
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - {name: order_count, expr: COUNT(o_orderkey), access_modifier: hidden}

@@ -1,0 +1,19 @@
+name: ACCESS_MODIFIER_ON_DIMENSION
+tables:
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: STATUS
+        expr: o_orderstatus
+        data_type: VARCHAR(1)
+        access_modifier: private_access
+    metrics:
+      - name: ORDER_COUNT
+        expr: COUNT(o_orderkey)
+        access_modifier: public_access

@@ -1,0 +1,29 @@
+# A relationship that references a unique key rather than the primary key.
+name: unique_keys
+tables:
+  - name: supplier
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: SUPPLIER}
+    primary_key: {columns: [s_suppkey]}
+    unique_keys:
+      - columns: [s_name]
+    dimensions:
+      - name: supplier_name
+        expr: s_name
+    metrics:
+      - name: supplier_count
+        expr: COUNT(s_suppkey)
+  - name: supplier_notes
+    description: Supplier rows keyed by name instead of key.
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: SUPPLIER}
+    primary_key: {columns: [s_suppkey]}
+    facts:
+      - name: account_balance
+        expr: s_acctbal
+    metrics:
+      - name: total_balance
+        expr: SUM(supplier_notes.account_balance)
+relationships:
+  - name: notes_by_name
+    left_table: supplier_notes
+    right_table: supplier
+    relationship_columns: [{left_column: s_name, right_column: s_name}]

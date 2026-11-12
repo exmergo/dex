@@ -494,11 +494,19 @@ def _advisory(
         finding.data.get("claim") == "primary"
     ):
         source = finding.data.get("declared_by") or "semantic"
+        command = _semantic_update_command(source)
+        # A vendor dex reads but does not author yet has no route to name, so
+        # the key is changed in its file (#1291).
+        where = (
+            f"with `{command}`"
+            if command is not None and source != "semantic"
+            else "in its file"
+        )
         actions["declared_grain_not_unique"] = (
             f"the {source} semantic layer declares these columns its primary key "
             "and the data says otherwise: dedup the table, or change the primary "
-            f"key with `semantic {source} update`. dex proposes no edit, because "
-            "which side is wrong is a decision"
+            f"key {where}. dex proposes no edit, because which side is wrong is "
+            "a decision"
         )
     if finding.code == "declared_grain_not_unique" and (
         finding.data.get("claim") == "unique"

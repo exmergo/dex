@@ -338,6 +338,41 @@ def test_the_metric_views_extra_follows_the_configured_vendor(
 
 
 @pytest.mark.parametrize(
+    ("argv", "vendor", "expected"),
+    [
+        (
+            ["explore", "semantic", "list"],
+            "snowflake",
+            ["ossie", "semantic-views", "semantic-api"],
+        ),
+        # A Semantic View query is a `SEMANTIC_VIEW()` clause Snowflake runs:
+        # MetricFlow is never installed.
+        (
+            ["explore", "semantic", "query", "sales.orders.revenue"],
+            "snowflake",
+            ["ossie", "semantic-views", "semantic-api"],
+        ),
+        (["maintain", "grain"], "snowflake", ["semantic-views"]),
+        (
+            ["explore", "relationships", "--use-project"],
+            "snowflake",
+            ["semantic-views"],
+        ),
+        (["transform", "apply"], "snowflake", ["semantic-views"]),
+        # Not for a command that reads no layer, and never from the connector
+        # name: `connector: snowflake` with `vendor: dbt` takes nothing here.
+        (["explore", "inventory"], "snowflake", []),
+        (["explore", "map"], "snowflake", []),
+        (["maintain", "grain"], "dbt", []),
+    ],
+)
+def test_the_semantic_views_extra_follows_the_configured_vendor(
+    wrapper, argv, vendor, expected
+):
+    assert wrapper._feature_extras(argv, vendor) == expected
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("semantic:\n  vendor: slayer\n", "slayer"),

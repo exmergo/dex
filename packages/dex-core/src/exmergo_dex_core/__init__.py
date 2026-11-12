@@ -97,6 +97,7 @@ _EXPORTS = {
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
     "MetricViewDependencyError": "metric_views.dependency",
+    "SemanticViewDependencyError": "semantic_views.dependency",
     "MissingPackagesError": "transform.build",
     "PlanDeclaresMissingPackagesError": "transform.build",
     "BridgeError": "transform.semantic_bridge",
@@ -213,6 +214,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         Result,
         to_envelope,
     )
+    from .semantic_views.dependency import SemanticViewDependencyError
     from .slayer.dependency import SlayerDependencyError
     from .storage import (
         CacheLock,
@@ -331,6 +333,7 @@ __all__ = [
     "SemanticLayerError",
     "SemanticQueryRefusedError",
     "SemanticSource",
+    "SemanticViewDependencyError",
     "SessionCeilingDecisionRequiredError",
     "SetupResult",
     "SlayerDependencyError",

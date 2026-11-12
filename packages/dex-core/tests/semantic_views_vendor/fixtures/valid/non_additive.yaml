@@ -1,0 +1,25 @@
+# A semi-additive metric: a balance summed across suppliers but not across time.
+name: non_additive
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - name: order_status
+        expr: o_orderstatus
+    time_dimensions:
+      - name: order_date
+        expr: o_orderdate
+        data_type: DATE
+    facts:
+      - name: total_price
+        expr: o_totalprice
+    metrics:
+      - name: latest_day_value
+        description: The order value on the last order date in the range.
+        non_additive_dimensions:
+          - table: orders
+            dimension: order_date
+            sort_direction: descending
+            null_order: last
+        expr: SUM(orders.total_price)

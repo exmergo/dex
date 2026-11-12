@@ -1,0 +1,4 @@
+# expect: tables
+# A view with no logical table.
+name: no_tables
+tables: []
