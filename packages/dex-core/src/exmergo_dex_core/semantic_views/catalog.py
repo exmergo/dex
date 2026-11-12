@@ -474,8 +474,10 @@ def _groupable(
         if here != table.name.lower():
             if here not in reach:
                 continue
-            count, crosses, names = graph.paths(table.name.lower(), here)  # type: ignore[union-attr]
-            if (count > 1 or crosses) and not (chosen & names):
+            count, crosses, _ = graph.paths(table.name.lower(), here)  # type: ignore[union-attr]
+            if (count > 1 or crosses) and not graph.joined_by(  # type: ignore[union-attr]
+                table.name.lower(), here, chosen
+            ):
                 continue
         tokens.extend(
             resolved.token(view, member)

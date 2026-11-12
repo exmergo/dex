@@ -111,7 +111,14 @@ def canonical(value: Any, key: str | None = None) -> Any:
             return [str(v).lower() for v in value]
         items = [canonical(v) for v in value]
         if items and all(isinstance(i, dict) and "name" in i for i in items):
-            return {str(i["name"]): i for i in items}
+            # A structured name (a tag's `{database, schema, tag}`) is keyed by
+            # its sorted form, so reordering its fields is not a change.
+            return {
+                json.dumps(i["name"], sort_keys=True)
+                if isinstance(i["name"], dict)
+                else str(i["name"]): i
+                for i in items
+            }
         return items
     if key in _IDENTIFIERS and isinstance(value, str):
         return value.lower()

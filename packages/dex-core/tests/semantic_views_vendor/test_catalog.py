@@ -352,6 +352,11 @@ def test_a_count_over_two_columns_names_no_column(tmp_path: Path) -> None:
     [
         ("SELECT COUNT(*) AS n FROM demo.main.events", "aggregate"),
         ("SELECT id AS customer_key FROM demo.main.events", "renames or computes"),
+        (
+            "SELECT * FROM demo.main.events QUALIFY ROW_NUMBER() OVER "
+            "(PARTITION BY customer_key ORDER BY at) = 1",
+            "a QUALIFY",
+        ),
     ],
 )
 def test_a_definition_that_changes_rows_or_columns_claims_no_relation(
@@ -436,3 +441,24 @@ def test_an_enum_and_a_views_own_keys_are_fingerprinted(tmp_path: Path) -> None:
     assert prints(enum, "b")["shop.orders"] != before["shop.orders"]
     assert prints(variables, "c")["shop"] != before["shop"]
     assert prints(sample, "d")["shop.orders"] == prints(SHOP, "e")["shop.orders"]
+
+
+def test_a_tags_structured_name_is_keyed_by_its_sorted_form(tmp_path: Path) -> None:
+    """Reordering a tag's `{database, schema, tag}` is not a change."""
+    import copy
+
+    first = copy.deepcopy(SHOP)
+    first["tags"] = [
+        {"name": {"database": "d", "schema": "s", "tag": "owner"}, "value": "x"}
+    ]
+    second = copy.deepcopy(SHOP)
+    second["tags"] = [
+        {"name": {"tag": "owner", "schema": "s", "database": "d"}, "value": "x"}
+    ]
+
+    def view_hash(body, where):
+        loaded, resolved = _read(tmp_path / where, body)
+        layer = semantic_layer(loaded, resolved)
+        return next(m.content_sha256 for m in layer.semantic_models if m.name == "shop")
+
+    assert view_hash(first, "a") == view_hash(second, "b")

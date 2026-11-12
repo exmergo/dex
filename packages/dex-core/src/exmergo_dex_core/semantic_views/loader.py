@@ -392,6 +392,25 @@ class Graph:
                         pending.append(other)
         return False
 
+    def joined_by(self, a: str, b: str, chosen: set[str]) -> bool:
+        """Whether the relationships named in ``chosen`` (lowered) alone join
+        ``a`` and ``b``: what `using_relationships` selects, judged on its own
+        rather than against the paths the bounded search happened to find."""
+        if not chosen:
+            return False
+        pending, seen = [a], {a}
+        while pending:
+            node = pending.pop()
+            if node == b:
+                return True
+            for x, y, _, name in self.links:
+                if name in chosen and node in (x, y):
+                    other = y if node == x else x
+                    if other not in seen:
+                        seen.add(other)
+                        pending.append(other)
+        return False
+
     def same_grain(self, a: str, b: str) -> bool:
         """Whether ``a`` and ``b`` are one table or joined one-to-one throughout."""
         if a == b:
@@ -659,7 +678,7 @@ def _check(
     for read, target in targets:
         if target.table is None or target.table.lower() == own:
             continue
-        count, crosses, names = graph.paths(own, target.table.lower())
+        count, crosses, _ = graph.paths(own, target.table.lower())
         if count == 0:
             refuse(
                 member,
@@ -669,14 +688,20 @@ def _check(
             )
             return
         chosen = {r.lower() for r in member.using_relationships}
-        if (count > 1 or crosses) and not (chosen & names):
+        if (count > 1 or crosses) and not graph.joined_by(
+            own, target.table.lower(), chosen
+        ):
             refuse(
                 member,
                 "multiple_paths",
                 f"reads `{target.table}`, which is joined to `{member.table}` more "
                 "than one way or many-to-many; name the path with "
                 "`using_relationships`"
-                + (", which here names no relationship between them" if chosen else ""),
+                + (
+                    ", which here names no relationships that join them"
+                    if chosen
+                    else ""
+                ),
             )
             return
 

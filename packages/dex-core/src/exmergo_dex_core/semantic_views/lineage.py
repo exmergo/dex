@@ -250,6 +250,8 @@ def definition_table(sql: str) -> tuple[str | None, str | None]:
             ("a join", bool(tree.args.get("joins"))),
             ("a WHERE", tree.args.get("where") is not None),
             ("a GROUP BY", tree.args.get("group") is not None),
+            ("a HAVING", tree.args.get("having") is not None),
+            ("a QUALIFY", tree.args.get("qualify") is not None),
             ("DISTINCT", tree.args.get("distinct") is not None),
             ("a LIMIT", tree.args.get("limit") is not None),
             (

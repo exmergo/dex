@@ -287,3 +287,45 @@ def test_a_dense_graph_with_an_unreachable_table_reads_quickly() -> None:
     assert time.monotonic() - started < 10
     refused = {d.element: d.rule for d in loaded.errors}
     assert refused["tables['lonely'].metrics['m']"] == "reference"
+
+
+def test_using_relationships_is_judged_by_the_path_it_names() -> None:
+    """Three relationships from lines to orders: naming the third, which the
+    bounded path search never lists, still selects a path."""
+
+    rels = [
+        {
+            "name": name,
+            "left_table": "lines",
+            "right_table": "orders",
+            "relationship_columns": [
+                {"left_column": column, "right_column": "order_id"}
+            ],
+        }
+        for name, column in (("a", "order_id"), ("b", "return_id"), ("c", "swap_id"))
+    ]
+    view = sv(
+        "thrice",
+        table(
+            "lines",
+            "demo.main.order_lines",
+            ["line_id"],
+            metrics=[
+                {
+                    "name": "n",
+                    "expr": "COUNT(orders.key)",
+                    "using_relationships": ["c"],
+                }
+            ],
+        ),
+        table(
+            "orders",
+            "demo.main.orders",
+            ["order_id"],
+            facts=[{"name": "key", "expr": "order_id"}],
+        ),
+        relationships=rels,
+    )
+    loaded = validate_view_contents({"views/thrice.yaml": _dump(view)})
+
+    assert loaded.errors == [], loaded.notes()
