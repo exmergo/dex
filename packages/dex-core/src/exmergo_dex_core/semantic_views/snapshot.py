@@ -4,6 +4,8 @@ Builds the neutral `SemanticLayerSnapshot` from the validated set, reusing the
 catalog's resolution (:class:`.catalog.Resolution`), so whether a member links
 to a physical column is decided once, whichever channel asks.
 
+- The view's own keys (description, `variables`, `max_staleness`, tags) are one
+  definition named after the view, with no relation.
 - Each logical table is one semantic model on its base table, named as the
   catalog names it, with its dimensions, time dimensions and facts mapped to the
   column behind each (``None`` for a computed one), each aggregating table metric
@@ -15,6 +17,10 @@ to a physical column is decided once, whichever channel asks.
   ``one_to_one`` where the left columns are a key too, or ``many_to_many`` where
   the right ones are not. ASOF and range relationships are fingerprinted with
   their equality pairs and no arity, so ``maintain grain`` names them unchecked.
+
+**Identities are lower case**: every model, member, metric and relationship
+name, so a read-back (which upper-cases them) is the same definition, not a
+removal and an addition.
 
 **A canonical form, so a read-back matches its file.** Snowflake's
 ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`` returns a view with every identifier in
@@ -74,8 +80,10 @@ _IDENTIFIERS = frozenset(
 #: Keys whose value is a list of identifiers.
 _IDENTIFIER_LISTS = frozenset({"columns", "using_relationships"})
 #: Keys left out of the hash: filled in or re-typed by Snowflake on read-back,
-#: and no part of the definition.
+#: and no part of the definition (an enum's `sample_values` excepted).
 _IGNORED = frozenset({"data_type", "sample_values"})
+#: The view-level keys fingerprinted as the view's own definition.
+_VIEW_KEYS = ("description", "variables", "max_staleness", "tags")
 
 
 def canonical(value: Any, key: str | None = None) -> Any:
@@ -84,6 +92,12 @@ def canonical(value: Any, key: str | None = None) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
+            if k == "sample_values" and value.get("is_enum") is True:
+                # An enum's values are its complete allowed set: a definition,
+                # hashed (never stored), and compared as text, since read-back
+                # re-types them.
+                out[k] = sorted(str(item) for item in v or ())
+                continue
             if k in _IGNORED:
                 continue
             if k == "access_modifier" and v == "public_access":
@@ -101,8 +115,6 @@ def canonical(value: Any, key: str | None = None) -> Any:
         return items
     if key in _IDENTIFIERS and isinstance(value, str):
         return value.lower()
-    if key == "custom_instructions":
-        return value
     return value
 
 
@@ -122,23 +134,35 @@ def semantic_layer(
     models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
     for view in loaded.views:
+        # The view's own keys (its description, `variables` and their defaults,
+        # `max_staleness`, tags) change what it answers without touching a
+        # table, so they are a definition of their own, named after the view.
+        # The Cortex Analyst keys are left out: Snowflake rewrites them on
+        # read-back and no query reads them.
+        own = {k: view.raw[k] for k in _VIEW_KEYS if k in view.raw}
+        models.append(
+            SemanticModelDef(
+                name=view.name.lower(), path=view.file, content_sha256=_hash(own)
+            )
+        )
         for table in view.tables:
             dimensions: dict[str, str | None] = {}
             categorical: dict[str, str] = {}
             measures: dict[str, str | None] = {}
             for member in table.members():
                 here = resolved.member(view, member)
+                name = member.name.lower()
                 if member.kind == METRIC:
                     if here.aggregate is not None:
-                        measures[member.name] = here.column
+                        measures[name] = here.column
                     continue
-                dimensions[member.name] = here.column
+                dimensions[name] = here.column
                 if member.kind == DIMENSION and here.column:
-                    categorical[member.name] = here.column
+                    categorical[name] = here.column
             keys = [[resolved.fold(c) for c in key] for key in table.declared_keys()]
             models.append(
                 SemanticModelDef(
-                    name=resolved.model(view, table.name),
+                    name=resolved.model(view, table.name).lower(),
                     path=view.file,
                     content_sha256=_hash(table.raw),
                     relation=resolved.relation(view, table.name),
@@ -150,33 +174,35 @@ def semantic_layer(
             )
             metrics.extend(
                 MetricDef(
-                    name=resolved.token(view, member),
+                    name=resolved.token(view, member).lower(),
                     path=view.file,
                     content_sha256=_hash(member.raw),
-                    input_measures=[member.name]
-                    if resolved.member(view, member).aggregate is not None
-                    else catalog_mod.underlying(view, member, resolved),
+                    input_measures=_lower(
+                        [member.name]
+                        if resolved.member(view, member).aggregate is not None
+                        else catalog_mod.underlying(view, member, resolved)
+                    ),
                 )
                 for member in table.metrics
             )
         metrics.extend(
             MetricDef(
-                name=resolved.token(view, member),
+                name=resolved.token(view, member).lower(),
                 path=view.file,
                 content_sha256=_hash(member.raw),
-                input_measures=catalog_mod.underlying(view, member, resolved),
-                input_metrics=catalog_mod.metric_inputs(view, member, resolved),
+                input_measures=_lower(catalog_mod.underlying(view, member, resolved)),
+                input_metrics=_lower(catalog_mod.metric_inputs(view, member, resolved)),
             )
             for member in view.metrics
         )
 
     relationships = [
         RelationshipDef(
-            name=declared.declared.name or declared.relationship.name,
+            name=(declared.declared.name or declared.relationship.name).lower(),
             path=declared.view.file,
             content_sha256=_hash(declared.relationship.raw),
-            model=declared.declared.model,
-            to_model=declared.declared.to_model,
+            model=declared.declared.model.lower(),
+            to_model=declared.declared.to_model.lower(),
             column_pairs=declared.declared.column_pairs,
             cardinality=declared.cardinality,
         )
@@ -188,11 +214,11 @@ def semantic_layer(
                 continue
             relationships.append(
                 RelationshipDef(
-                    name=f"{view.name}.{rel.name}",
+                    name=f"{view.name}.{rel.name}".lower(),
                     path=view.file,
                     content_sha256=_hash(rel.raw),
-                    model=resolved.model(view, rel.left_table),
-                    to_model=resolved.model(view, rel.right_table),
+                    model=resolved.model(view, rel.left_table).lower(),
+                    to_model=resolved.model(view, rel.right_table).lower(),
                     column_pairs=[
                         (resolved.fold(p.left), resolved.fold(p.right))  # type: ignore[arg-type]
                         for p in rel.columns
@@ -211,6 +237,12 @@ def semantic_layer(
         declarations={},
         notes=notes,
     )
+
+
+def _lower(names: list[str]) -> list[str]:
+    """Names as the fingerprint identifies them: lower case, since Snowflake
+    identifiers are case-insensitive and its read-back upper-cases them."""
+    return [name.lower() for name in names]
 
 
 def _hash(definition: Any) -> str:

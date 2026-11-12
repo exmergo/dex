@@ -72,8 +72,10 @@ sql() { "${SNOW[@]}" -q "USE ROLE ACCOUNTADMIN; $1"; }
 
 # The deployer role goes to whoever runs this, named by the session itself
 # rather than by an argument, so the script carries no user name.
+# Quoted as an identifier, with any embedded double quote doubled, so a user
+# name with an @, a dot or lower case resolves to exactly this user.
 MAINTAINER=$("${SNOW[@]}" --format json -q "SELECT CURRENT_USER() AS U" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["U"])')
+  | python3 -c 'import json,sys; u=json.load(sys.stdin)[0]["U"]; print(chr(34) + u.replace(chr(34), chr(34) * 2) + chr(34))')
 
 echo "== dex Snowflake Semantic Views setup =="
 echo "   warehouse:   ${WAREHOUSE} (X-Small, auto-suspend 60s, timeout ${STATEMENT_TIMEOUT}s)"

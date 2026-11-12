@@ -114,9 +114,21 @@ def _quoted(text: str) -> str:
     return f"$${text}$$"
 
 
+#: Where the corpus names the helper table, as the fixtures write it.
+_FIXTURE_SCHEMA = "{database: DEX_SV, schema: FIXTURES"
+
+
+def _relocated(text: str, schema: str) -> str:
+    """A fixture with its helper-table reference moved to ``--schema``."""
+    database, _, name = schema.partition(".")
+    if not name:
+        raise SnowError(f"--schema is <database>.<schema>, got {schema!r}")
+    return text.replace(_FIXTURE_SCHEMA, f"{{database: {database}, schema: {name}")
+
+
 def _call(args: argparse.Namespace, path: Path, verify_only: bool) -> str:
     """SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML on one file; its status text."""
-    text = path.read_text(encoding="utf-8")
+    text = _relocated(path.read_text(encoding="utf-8"), args.schema)
     flag = "TRUE" if verify_only else "FALSE"
     rows = _run(
         args,

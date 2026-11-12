@@ -188,3 +188,102 @@ def _dump(body) -> str:
     import yaml
 
     return yaml.safe_dump(body, sort_keys=False)
+
+
+def test_a_name_no_reference_takes_is_unresolved_not_dropped() -> None:
+    """A three-part name leaves the expression unparsed, never read as no read."""
+    view = sv(
+        "three",
+        table(
+            "orders",
+            "demo.main.orders",
+            ["order_id"],
+            metrics=[{"name": "total", "expr": "SUM(db.other.amount)"}],
+        ),
+    )
+    loaded = validate_view_contents({"views/three.yaml": _dump(view)})
+
+    assert _rules(loaded) == {"unparsed_expression"}
+
+
+def test_a_refused_member_is_never_read_as_a_column_of_its_name() -> None:
+    """A fact refused for want of an `expr` refuses the metric reading it."""
+    view = sv(
+        "gone",
+        table(
+            "orders",
+            "demo.main.orders",
+            ["order_id"],
+            facts=[{"name": "net"}],
+            metrics=[{"name": "total", "expr": "SUM(net)"}],
+        ),
+    )
+    loaded = validate_view_contents({"views/gone.yaml": _dump(view)})
+
+    refused = {d.element: d.rule for d in loaded.errors}
+    assert refused["tables['orders'].metrics['total']"] == "reference"
+    assert loaded.views[0].tables[0].metrics == ()
+
+
+def test_a_metric_loses_a_refused_non_additive_dimension() -> None:
+    """The dimension it is non-additive over is part of what it reads."""
+    view = sv(
+        "semi",
+        table(
+            "orders",
+            "demo.main.orders",
+            ["order_id"],
+            dimensions=[{"name": "bad", "expr": "MAX(amount)"}],
+            metrics=[
+                {
+                    "name": "balance",
+                    "expr": "SUM(amount)",
+                    "non_additive_dimensions": [
+                        {"table": "orders", "dimension": "bad"}
+                    ],
+                }
+            ],
+        ),
+    )
+    loaded = validate_view_contents({"views/semi.yaml": _dump(view)})
+
+    refused = {d.element: d.rule for d in loaded.errors}
+    assert refused["tables['orders'].metrics['balance']"] == "reference"
+
+
+def test_a_dense_graph_with_an_unreachable_table_reads_quickly() -> None:
+    """Reachability first, then a bounded search: an unrelated reference is
+    refused without walking every path of the connected part."""
+    import time
+
+    names = [f"t{i}" for i in range(12)]
+    tables = [
+        table(n, f"demo.main.{n}", ["id"], facts=[{"name": "v", "expr": "v"}])
+        for n in names
+    ]
+    tables.append(
+        table(
+            "lonely",
+            "demo.main.lonely",
+            ["id"],
+            metrics=[{"name": "m", "expr": "SUM(t0.v)"}],
+        )
+    )
+    rels = [
+        {
+            "name": f"r_{a}_{b}",
+            "left_table": a,
+            "right_table": b,
+            "relationship_columns": [{"left_column": f"k_{b}", "right_column": "id"}],
+        }
+        for i, a in enumerate(names)
+        for b in names[i + 1 :]
+    ]
+    started = time.monotonic()
+    loaded = validate_view_contents(
+        {"views/dense.yaml": _dump(sv("dense", *tables, relationships=rels))}
+    )
+
+    assert time.monotonic() - started < 10
+    refused = {d.element: d.rule for d in loaded.errors}
+    assert refused["tables['lonely'].metrics['m']"] == "reference"

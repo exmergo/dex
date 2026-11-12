@@ -111,20 +111,22 @@ the table. A problem in what the whole view rests on refuses the view.
 
 | Rule | What it checks |
 |---|---|
-| `reference` | a name reads a member of its own table, a column of its base table, or a member of another table the relationships reach, never another table's base column |
-| `row_level` | a dimension or fact aggregates nothing of its own table and reads no metric of it |
+| `reference` | a name reads a member of its own table, a column of its base table, or a member of another table the relationships reach, never another table's base column, and never a member the reader refused (it is not read as a base column of that name instead) |
+| `row_level` | a dimension or fact aggregates nothing of its own grain (its table, or one joined one-to-one), aggregates only what it reads from a finer table (so `COUNT(*)` is refused), and reads no metric at its own grain |
 | `granularity` | a dimension or fact reads a finer table only through an aggregate; a metric reads a finer table's row-level member through a nested aggregate (two) |
-| `metric_aggregate` | a table metric aggregates, or reads another metric |
+| `metric_aggregate` | a table metric aggregates, or reads another metric, and reads no row-level value outside an aggregate (`SUM(x) + x` is refused) |
 | `derived_metric` | a view-level metric reads only metrics, is no window function, and shares no name with a table metric |
 | `window_reference` | nothing reads a window function metric |
-| `multiple_paths` | two tables joined more than one way, or many-to-many, are not read across without `using_relationships` |
-| `expression_cycle` | no expression reads itself, directly or through others |
+| `multiple_paths` | two tables joined more than one way, or many-to-many, are not read across without `using_relationships` naming a relationship on a path between them |
+| `expression_cycle` | no expression reads itself, directly or through others. Two tables whose expressions read each other are not a cycle: Snowflake accepts them |
 | `unparsed_expression` (warning) | an expression sqlglot cannot read (a level-of-detail expression, for one) keeps its member, with its rules unchecked |
 
 Granularity follows the relationships. A relationship's left table is finer than
 its right table (many rows to one), unless its left columns are themselves a key
 (one-to-one), and the order is transitive. A refused member retracts the members
-that read it, to a fixed point.
+that read it (a metric's non-additive dimension included), to a fixed point.
+The search for relationship paths checks reachability first and is bounded, so
+a dense relationship graph cannot stall the read.
 
 ## Where the port and the documentation disagree
 
@@ -138,6 +140,7 @@ The account decided, and each row below records what it said:
 | (not documented) | reads a range constraint as `constraints: [{name, distinct_range: {start_column, end_column}}]`, and refuses a range relationship without one | reads and checks it |
 | (not documented) | keeps one of two duplicate YAML keys | refuses the file |
 | (not documented) | accepts a legacy `measures` table | refuses the file by name |
+| no circular references between logical tables | accepts two tables whose expressions read each other, as long as no member reads itself | reads it |
 
 **What only the warehouse can decide.** Whether a name a table reads is one of
 its base table's columns is a fact about the warehouse, so the static reader
@@ -164,7 +167,9 @@ accepts it. `maintain`'s schema checks (#1293) hold the columns to the warehouse
 | `sample_values` | `vendor_params.sample_values.count` only: never surfaced, since Snowflake does not mask them |
 
 A metric is groupable by its own table's dimensions and those of every table its
-relationships reach many-to-one. A view-level metric is groupable by what all of
+relationships reach many-to-one, except a table joined to it more than one way
+(or many-to-many), unless its `using_relationships` names a relationship on the
+path. A view-level metric is groupable by what all of
 its inputs share.
 
 **Why every name carries its view.** Two views routinely both declare `orders`.
@@ -219,7 +224,7 @@ A semantic view on the account is not a relation Dex profiles: a plain
 
 | Axis | On Semantic Views |
 |---|---|
-| `snapshot` | fingerprints each logical table (`view.table`, with its members' columns and its primary and unique keys), each table and view-level metric, and each key-equality relationship with its ordered pairs and arity; records `vendor: snowflake` and `format_version` |
+| `snapshot` | fingerprints the view's own keys (description, `variables`, `max_staleness`, tags) as a definition named after the view, each logical table (`view.table`, with its members' columns and its primary and unique keys), each table and view-level metric, and each key-equality relationship with its ordered pairs and arity; records `vendor: snowflake` and `format_version` |
 | `schema` | unchanged: no vendor schema axis yet (#1293) |
 | `volume` | unchanged: it reads the warehouse, not the layer |
 | `grain` | measures each primary and unique key (`declared_grain_not_unique`) and each relationship's arity (`join_cardinality_exceeded`); an ASOF or range relationship states no arity and is named unchecked |
@@ -238,10 +243,11 @@ form. What Snowflake does to a view on read-back:
 - moves `custom_instructions` under `module_custom_instructions`.
 
 The canonical form therefore:
-- folds names, columns and table parts to lower case;
+- names every definition in lower case, and folds columns and table parts too;
 - keys lists of named elements by name;
 - drops the defaulted values;
-- leaves out `data_type` and `sample_values`;
+- leaves out `data_type`, and `sample_values` except an `is_enum` dimension's,
+  which are its complete allowed set and so are hashed (never stored);
 - hashes expressions as written.
 
 Every fixture in the corpus is held to this: its read-back fingerprints

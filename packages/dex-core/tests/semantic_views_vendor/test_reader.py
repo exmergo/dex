@@ -12,6 +12,7 @@ contract against a Semantic View rendering of `REFERENCE_LAYER`.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -193,9 +194,10 @@ def reference_semantic_view() -> dict[str, Any]:
     - a shared entity is a relationship from the table holding it as foreign to
       the table keying it;
     - a dimension is a dimension, a time dimension where it is time;
-    - a measure is a table metric of the same name aggregating its expression
-      (a filtered metric's filter folded into it, since a Semantic View metric
-      has no filter of its own), and a simple metric is that table metric;
+    - a measure is a table metric of the same name aggregating its expression,
+      a filtered metric's filter folded into it as `CASE WHEN` (a Semantic View
+      metric has no filter of its own), and a simple metric is that table
+      metric;
     - a ratio is a view-level metric dividing the two table metrics.
     """
 
@@ -209,6 +211,11 @@ def reference_semantic_view() -> dict[str, Any]:
     owner = {m["name"]: model["name"] for model in declared for m in model["measures"]}
     measure_of = {
         m["name"]: m["measure"] for m in REFERENCE_LAYER["metrics"] if m.get("measure")
+    }
+    filters = {
+        m["measure"]: m["filter"]
+        for m in REFERENCE_LAYER["metrics"]
+        if m.get("measure") and m.get("filter")
     }
 
     tables: list[dict[str, Any]] = []
@@ -253,7 +260,7 @@ def reference_semantic_view() -> dict[str, Any]:
                 metrics=[
                     {
                         "name": m["name"],
-                        "expr": f"{_function(m['agg'])}({m['expr']})",
+                        "expr": _aggregate(m, filters.get(m["name"])),
                         "description": m["description"],
                     }
                     for m in model["measures"]
@@ -280,6 +287,20 @@ def reference_semantic_view() -> dict[str, Any]:
 def _function(agg: str) -> str:
     """The SQL aggregate a catalog aggregation names."""
     return {"average": "AVG"}.get(agg, agg.upper())
+
+
+def _aggregate(measure: dict[str, Any], template: str | None) -> str:
+    """A reference measure as one aggregate, a filtered metric's filter folded
+    in (`SUM(CASE WHEN <filter> THEN <expr> END)`), since a Semantic View metric
+    has no filter apart from its expression."""
+
+    expr = measure["expr"]
+    if template:
+        predicate = re.sub(
+            r"\{\{\s*Dimension\('[^']*__([^']+)'\)\s*\}\}", r"\1", template
+        )
+        expr = f"CASE WHEN {predicate} THEN {expr} END"
+    return f"{_function(measure['agg'])}({expr})"
 
 
 def _reported(kind: str, name: str) -> str:

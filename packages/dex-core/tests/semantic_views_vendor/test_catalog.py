@@ -19,7 +19,7 @@ from exmergo_dex_core.semantic_views.dependency import SEMANTIC_VIEW_FORMAT_VERS
 from exmergo_dex_core.semantic_views.loader import load_files
 from exmergo_dex_core.semantic_views.snapshot import semantic_layer
 
-from .conftest import FIXTURES, SHOP, sv, table, write
+from .conftest import FIXTURES, SHOP, relationship, sv, table, write
 
 
 def _read(root: Path, *views, connector: str = "duckdb"):
@@ -327,3 +327,112 @@ def test_a_definition_change_moves_only_its_own_hash(tmp_path: Path) -> None:
 
     moved = {k for k, v in hashes(after).items() if hashes(before)[k] != v}
     assert moved == {"shop.orders", "shop.orders.revenue"}
+
+
+def test_a_count_over_two_columns_names_no_column(tmp_path: Path) -> None:
+    loaded, resolved = _read(
+        tmp_path,
+        sv(
+            "pairs",
+            table(
+                "orders",
+                "demo.main.orders",
+                ["order_id"],
+                metrics=[{"name": "pairs", "expr": "COUNT(order_id, status)"}],
+            ),
+        ),
+    )
+    (measure,) = semantic_catalog(loaded, resolved).measures
+
+    assert (measure.agg, measure.column) == ("count", None)
+
+
+@pytest.mark.parametrize(
+    ("definition", "said"),
+    [
+        ("SELECT COUNT(*) AS n FROM demo.main.events", "aggregate"),
+        ("SELECT id AS customer_key FROM demo.main.events", "renames or computes"),
+    ],
+)
+def test_a_definition_that_changes_rows_or_columns_claims_no_relation(
+    tmp_path: Path, definition: str, said: str
+) -> None:
+    query = table("q", "demo.main.unused", ["customer_key"])
+    query["base_table"] = {"definition": definition}
+    query["dimensions"] = [{"name": "k", "expr": "customer_key"}]
+    loaded, resolved = _read(tmp_path, sv("defs", query))
+    catalog = semantic_catalog(loaded, resolved)
+
+    assert catalog.semantic_models[0].relation is None
+    assert any(said in note for note in catalog.notes)
+    assert "defs.q" not in definitions(loaded, resolved).source_relations
+
+
+def test_an_ambiguously_joined_table_is_not_groupable_without_a_path(
+    tmp_path: Path,
+) -> None:
+    """Two relationships from lines to orders: a metric on lines groups by an
+    order dimension only where `using_relationships` names one of them."""
+
+    orders = table(
+        "orders",
+        "demo.main.orders",
+        ["order_id"],
+        dimensions=[{"name": "status", "expr": "status"}],
+    )
+    lines = table(
+        "lines",
+        "demo.main.order_lines",
+        ["line_id"],
+        metrics=[
+            {"name": "n", "expr": "COUNT(line_id)"},
+            {
+                "name": "n_by_order",
+                "expr": "COUNT(line_id)",
+                "using_relationships": ["by_order"],
+            },
+        ],
+    )
+    view = sv(
+        "twice",
+        orders,
+        lines,
+        relationships=[
+            relationship("by_order", "lines", "orders", ("order_id", "order_id")),
+            relationship("by_return", "lines", "orders", ("return_id", "order_id")),
+        ],
+    )
+    loaded, resolved = _read(tmp_path, view)
+    metrics = {m.name: m for m in semantic_catalog(loaded, resolved).metrics}
+
+    assert "twice.orders.status" not in metrics["twice.lines.n"].dimensions
+    assert "twice.orders.status" in metrics["twice.lines.n_by_order"].dimensions
+
+
+def test_an_enum_and_a_views_own_keys_are_fingerprinted(tmp_path: Path) -> None:
+    """An enum's values are its allowed set, and a view's `variables` change
+    what it answers; ordinary sample values move nothing."""
+    import copy
+
+    base = copy.deepcopy(SHOP)
+    base["tables"][0]["dimensions"][0]["is_enum"] = True
+    base["variables"] = [
+        {"name": "region", "data_type": "VARCHAR", "default_value": "EU"}
+    ]
+
+    def prints(body, where):
+        loaded, resolved = _read(tmp_path / where, body)
+        layer = semantic_layer(loaded, resolved)
+        return {m.name: m.content_sha256 for m in layer.semantic_models}
+
+    before = prints(base, "a")
+    enum = copy.deepcopy(base)
+    enum["tables"][0]["dimensions"][0]["sample_values"] = ["paid", "void"]
+    variables = copy.deepcopy(base)
+    variables["variables"][0]["default_value"] = "US"
+    sample = copy.deepcopy(SHOP)
+    sample["tables"][0]["dimensions"][0]["sample_values"] = ["paid", "void"]
+
+    assert prints(enum, "b")["shop.orders"] != before["shop.orders"]
+    assert prints(variables, "c")["shop"] != before["shop"]
+    assert prints(sample, "d")["shop.orders"] == prints(SHOP, "e")["shop.orders"]

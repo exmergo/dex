@@ -320,7 +320,7 @@ def check_view(raw: Any, file: str) -> tuple[SemanticView | None, list[Finding]]
 
     by_name = {t.name.lower(): t for t in tables}
     relationships = _relationships(raw.get("relationships"), by_name, find)
-    derived = _derived(raw.get("metrics"), tables, find)
+    derived, refused_derived = _derived(raw.get("metrics"), tables, find)
     tables = [_checked_members(t, by_name, relationships, find) for t in tables]
     view = SemanticView(
         name=name,
@@ -330,6 +330,7 @@ def check_view(raw: Any, file: str) -> tuple[SemanticView | None, list[Finding]]
         relationships=tuple(relationships),
         metrics=tuple(derived),
         carried={key: raw[key] for key in CARRIED if key in raw},
+        refused_metrics=tuple(refused_derived),
         raw=dict(raw),
     )
     return view, findings
@@ -425,6 +426,7 @@ def _table(entry: Any, position: int, find: Find) -> LogicalTable:
     ranges = _constraints(entry.get("constraints"), element, find)
     members: dict[str, list[Member]] = {}
     seen: set[str] = set()
+    refused: list[str] = []
     for key, kind in _LISTS.items():
         members[kind] = []
         listed = entry.get(key)
@@ -437,6 +439,8 @@ def _table(entry: Any, position: int, find: Find) -> LogicalTable:
             try:
                 member = _member(item, kind, name, f"{element}.{key}", index, find)
             except _RefusedError:
+                if isinstance(item, Mapping) and _text(item.get("name")):
+                    refused.append(_text(item.get("name")))  # type: ignore[arg-type]
                 continue
             if member.name.lower() in seen:
                 find(
@@ -467,6 +471,7 @@ def _table(entry: Any, position: int, find: Find) -> LogicalTable:
         facts=tuple(members[FACT]),
         metrics=tuple(members[METRIC]),
         filters=tuple(f for f in filters or () if isinstance(f, Mapping)),
+        refused=tuple(refused),
         raw=dict(entry),
     )
 
@@ -632,12 +637,16 @@ def _checked_members(
 
     names = {r.name.lower() for r in relationships}
     kept: list[Member] = []
+    refused = list(table.refused)
     for metric in table.metrics:
         element = f"tables['{table.name}'].metrics['{metric.name}']"
         if not _references_resolve(metric, tables, names, element, find):
+            refused.append(metric.name)
             continue
         kept.append(metric)
-    return LogicalTable(**{**table.__dict__, "metrics": tuple(kept)})
+    return LogicalTable(
+        **{**table.__dict__, "metrics": tuple(kept), "refused": tuple(refused)}
+    )
 
 
 def _references_resolve(
@@ -910,14 +919,18 @@ def _without_cycles(
 # --- derived metrics --------------------------------------------------------------
 
 
-def _derived(value: Any, tables: list[LogicalTable], find: Find) -> list[Member]:
-    """The view-level (derived) metrics, refusing one named like a table metric."""
+def _derived(
+    value: Any, tables: list[LogicalTable], find: Find
+) -> tuple[list[Member], list[str]]:
+    """The view-level (derived) metrics, refusing one named like a table metric;
+    with the names of the refused ones."""
 
     if value is None:
-        return []
+        return [], []
     if not isinstance(value, list):
         find("(root)", "derived_metric", "`metrics` is a list")
-        return []
+        return [], []
+    refused: list[str] = []
     table_metrics = {m.name.lower() for t in tables for m in t.metrics}
     found: list[Member] = []
     seen: set[str] = set()
@@ -925,6 +938,8 @@ def _derived(value: Any, tables: list[LogicalTable], find: Find) -> list[Member]
         try:
             member = _member(item, DERIVED, None, "metrics", index, find)
         except _RefusedError:
+            if isinstance(item, Mapping) and _text(item.get("name")):
+                refused.append(_text(item.get("name")))  # type: ignore[arg-type]
             continue
         element = f"metrics['{member.name}']"
         if member.name.lower() in table_metrics:
@@ -940,4 +955,4 @@ def _derived(value: Any, tables: list[LogicalTable], find: Find) -> list[Member]
             continue
         seen.add(member.name.lower())
         found.append(member)
-    return found
+    return found, refused

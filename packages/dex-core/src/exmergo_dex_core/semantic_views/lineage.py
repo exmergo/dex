@@ -110,7 +110,9 @@ def _read(node: exp.Column) -> Read | None:
 
 
 def reads(sql: str) -> list[Read] | None:
-    """Every name ``sql`` reads, or ``None`` where it does not parse."""
+    """Every name ``sql`` reads, or ``None`` where it does not parse or reads a
+    name no Semantic View reference takes (a three-part name): such a read is
+    unresolved, never dropped, so no rule passes for want of a read."""
 
     tree = _parse(sql)
     if tree is None:
@@ -120,8 +122,9 @@ def reads(sql: str) -> list[Read] | None:
         if isinstance(node.this, exp.Star):
             continue
         read = _read(node)
-        if read is not None:
-            found.append(read)
+        if read is None:
+            return None
+        found.append(read)
     return found
 
 
@@ -182,6 +185,9 @@ def aggregate(sql: str) -> Aggregate | None:
     if kind is None:
         return None
     argument = tree.this
+    if tree.args.get("expressions"):
+        # `COUNT(a, b)` reads more than one column, so it names none.
+        return Aggregate(agg=kind, read=None)
     if isinstance(tree, exp.Count) and isinstance(argument, exp.Distinct):
         kind = "count_distinct"
         argument = argument.expressions[0] if len(argument.expressions) == 1 else None
@@ -224,9 +230,11 @@ def definition_table(sql: str) -> tuple[str | None, str | None]:
     """A ``base_table.definition`` query as the one table it projects, or
     ``(None, reason)``.
 
-    Only a plain projection of one table, with no filter, join, grouping,
-    ``DISTINCT``, ``LIMIT`` or ``WITH``, stands for that table: anything else
-    holds other rows than the table does.
+    Only a plain projection of one table stands for that table: no filter,
+    join, grouping, ``DISTINCT``, ``LIMIT``, ``WITH``, aggregate or window (any
+    of which holds other rows than the table does), and every output a column of
+    the table under its own name (a renamed or computed output is not that
+    table's column).
     """
 
     tree = _unwrap(_parse(sql))
@@ -253,6 +261,24 @@ def definition_table(sql: str) -> tuple[str | None, str | None]:
     ]
     if not isinstance(single, exp.Table):
         reasons.append("no single table in FROM")
+    if any(
+        isinstance(node, (exp.AggFunc, exp.Window))
+        for projection in tree.expressions
+        for node in projection.walk()
+    ):
+        reasons.append("an aggregate or window in its select list")
+    for projection in tree.expressions:
+        inner = projection.this if isinstance(projection, exp.Alias) else projection
+        if isinstance(inner, exp.Star):
+            continue
+        if not isinstance(inner, exp.Column) or (
+            projection.alias_or_name.lower() != inner.name.lower()
+        ):
+            reasons.append(
+                "a column it renames or computes, which a member would read as "
+                "a column of the table"
+            )
+            break
     if reasons:
         return None, (
             f"its `definition` query has {', '.join(reasons)}, so no one table "

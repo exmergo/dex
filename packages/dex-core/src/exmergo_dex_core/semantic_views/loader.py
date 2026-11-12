@@ -312,7 +312,8 @@ class Graph:
 
     up: dict[str, set[str]] = field(default_factory=dict)
     same: set[frozenset[str]] = field(default_factory=set)
-    links: list[tuple[str, str, bool]] = field(default_factory=list)
+    #: ``(left, right, many_to_many, relationship name)``, all lowered.
+    links: list[tuple[str, str, bool, str]] = field(default_factory=list)
 
     def coarser(self, start: str) -> set[str]:
         """Every table ``start`` reaches through many-to-one (and one-to-one)
@@ -334,38 +335,90 @@ class Graph:
                 pending.append(table)
         return found
 
-    def paths(self, a: str, b: str) -> tuple[int, bool]:
-        """How many simple paths join ``a`` and ``b`` (capped at 2), and whether
-        one runs through a many-to-many relationship."""
+    def paths(self, a: str, b: str) -> tuple[int, bool, set[str]]:
+        """How many simple paths join ``a`` and ``b`` (capped at 2), whether one
+        runs through a many-to-many relationship, and the relationships on the
+        paths found.
 
-        count, crosses = 0, False
+        Reachability is checked first, so a table no relationship reaches costs
+        one walk of the graph, and the path search is bounded: past
+        :data:`PATH_STEPS` steps the pair is treated as joined more than one
+        way, which asks the author to name the path rather than letting a dense
+        relationship graph stall the read.
+        """
 
-        def walk(node: str, seen: set[str], m2m: bool) -> None:
-            nonlocal count, crosses
-            if count >= 2:
+        if not self._reachable(a, b):
+            return 0, False, set()
+        count, crosses, names, steps = 0, False, set(), 0
+
+        def walk(node: str, seen: set[str], m2m: bool, used: tuple[str, ...]) -> None:
+            nonlocal count, crosses, steps
+            steps += 1
+            if count >= 2 or steps > PATH_STEPS:
                 return
             if node == b:
                 count += 1
                 crosses = crosses or m2m
+                names.update(used)
                 return
-            for index, (x, y, many) in enumerate(self.links):
+            for index, (x, y, many, name) in enumerate(self.links):
                 if node not in (x, y) or index in seen_edges:
                     continue
                 other = y if node == x else x
                 if other in seen:
                     continue
                 seen_edges.add(index)
-                walk(other, seen | {other}, m2m or many)
+                walk(other, seen | {other}, m2m or many, (*used, name))
                 seen_edges.discard(index)
 
         seen_edges: set[int] = set()
-        walk(a, {a}, False)
-        return count, crosses
+        walk(a, {a}, False, ())
+        if steps > PATH_STEPS:
+            count = max(count, 2)
+        return count, crosses, names
+
+    def _reachable(self, a: str, b: str) -> bool:
+        """Whether any relationship path joins ``a`` and ``b``."""
+        pending, seen = [a], {a}
+        while pending:
+            node = pending.pop()
+            if node == b:
+                return True
+            for x, y, _, _ in self.links:
+                if node in (x, y):
+                    other = y if node == x else x
+                    if other not in seen:
+                        seen.add(other)
+                        pending.append(other)
+        return False
+
+    def same_grain(self, a: str, b: str) -> bool:
+        """Whether ``a`` and ``b`` are one table or joined one-to-one throughout."""
+        if a == b:
+            return True
+        pending, seen = [a], {a}
+        while pending:
+            node = pending.pop()
+            for pair in self.same:
+                if node in pair:
+                    for other in pair - {node}:
+                        if other == b:
+                            return True
+                        if other not in seen:
+                            seen.add(other)
+                            pending.append(other)
+        return False
 
     def finer(self, table: str, other: str) -> bool:
         """Whether ``other`` is strictly finer than ``table`` (``table`` is
         coarser than it and not one-to-one with it)."""
         return table in self.coarser(other) and other not in self.coarser(table)
+
+
+#: How many steps the path search takes before it treats a pair of tables as
+#: joined more than one way. A Semantic View has a handful of tables; this is
+#: far past any real one.
+PATH_STEPS = 20_000
 
 
 def relationship_graph(view: SemanticView) -> Graph:
@@ -377,7 +430,7 @@ def relationship_graph(view: SemanticView) -> Graph:
         many_to_many = not (
             right is not None and (right.is_key(rel.right_columns) or not rel.equi)
         )
-        graph.links.append((a, b, many_to_many))
+        graph.links.append((a, b, many_to_many, rel.name.lower()))
         if many_to_many:
             continue
         if left is not None and rel.equi and left.is_key(rel.left_columns):
@@ -397,6 +450,8 @@ def resolve_read(
             found = view.metric(name)
             if found is not None and found.name.lower() != owner.name.lower():
                 return Target(table=None, member=found)
+            if name.lower() in {m.lower() for m in view.refused_metrics}:
+                return Target(None, problem=f"reads `{name}`, a metric that is refused")
             return Target(None, problem=f"`{name}` is no metric of the view")
         table = view.table(qualifier)
         member = table.member(name) if table else None
@@ -411,6 +466,11 @@ def resolve_read(
         member = own.member(name) if own else None
         if member is not None and member.name.lower() != owner.name.lower():
             return Target(table=owner.table, member=member)
+        if own is not None and own.is_refused(name):
+            return Target(
+                None,
+                problem=f"reads `{name}`, a member of `{own.name}` that is refused",
+            )
         return Target(table=owner.table, column=name)
     table = view.table(qualifier)
     if table is None:
@@ -420,6 +480,10 @@ def resolve_read(
             "table of this view",
         )
     member = table.member(name)
+    if member is None and table.is_refused(name):
+        return Target(
+            None, problem=f"reads `{qualifier}.{name}`, a member that is refused"
+        )
     if member is None:
         return Target(
             None,
@@ -489,6 +553,9 @@ def _expressions(view: SemanticView, result: LoadResult) -> SemanticView:
         ]
         reads_of[key(member)] = [
             key(t.member) for _, t in targets if t.member is not None
+        ] + [
+            (str(entry["table"]).lower(), str(entry["dimension"]).lower())
+            for entry in member.non_additive
         ]
         _check(view, graph, member, targets, refuse, lineage)
 
@@ -592,7 +659,7 @@ def _check(
     for read, target in targets:
         if target.table is None or target.table.lower() == own:
             continue
-        count, crosses = graph.paths(own, target.table.lower())
+        count, crosses, names = graph.paths(own, target.table.lower())
         if count == 0:
             refuse(
                 member,
@@ -601,13 +668,15 @@ def _check(
                 f"`{member.table}` to `{target.table}`",
             )
             return
-        if (count > 1 or crosses) and not member.using_relationships:
+        chosen = {r.lower() for r in member.using_relationships}
+        if (count > 1 or crosses) and not (chosen & names):
             refuse(
                 member,
                 "multiple_paths",
                 f"reads `{target.table}`, which is joined to `{member.table}` more "
                 "than one way or many-to-many; name the path with "
-                "`using_relationships`",
+                "`using_relationships`"
+                + (", which here names no relationship between them" if chosen else ""),
             )
             return
 
@@ -616,13 +685,14 @@ def _check(
         # judge its aggregation.
         return
     if member.row_level:
+        justified = False
         for read, target in targets:
-            same = target.table is None or target.table.lower() == own
+            same = target.table is None or graph.same_grain(own, target.table.lower())
             if same and target.member is not None and target.member.kind == METRIC:
                 refuse(
                     member,
                     "row_level",
-                    f"reads `{_token(target.member)}`, a metric of its own table; a "
+                    f"reads `{_token(target.member)}`, a metric at its own grain; a "
                     "dimension or fact holds one value per row, and reads no "
                     "aggregate defined at its own or a finer level",
                 )
@@ -631,11 +701,13 @@ def _check(
                 refuse(
                     member,
                     "row_level",
-                    "aggregates its own table; a dimension or fact holds one value "
+                    "aggregates its own grain; a dimension or fact holds one value "
                     "per row, and aggregates only what it reads from a finer table",
                 )
                 return
             finer = not same and graph.finer(own, target.table.lower())
+            if finer and read.depth > 0:
+                justified = True
             if (
                 finer
                 and target.member is not None
@@ -650,6 +722,13 @@ def _check(
                     "one",
                 )
                 return
+        if lineage.aggregates(member.expr) and not justified:
+            refuse(
+                member,
+                "row_level",
+                "aggregates, and reads nothing of a finer table to aggregate; a "
+                "dimension or fact holds one value per row",
+            )
         return
 
     if lineage.aggregates(member.expr) is False and not any(
@@ -662,6 +741,20 @@ def _check(
             "and reads no other metric",
         )
         return
+    for read, target in targets:
+        row_level = target.column is not None or (
+            target.member is not None and target.member.row_level
+        )
+        coarse = target.table is None or not graph.finer(own, target.table.lower())
+        if row_level and coarse and read.depth == 0:
+            refuse(
+                member,
+                "metric_aggregate",
+                f"reads `{read.qualifier + '.' if read.qualifier else ''}{read.name}`, "
+                "a row-level value, outside any aggregate; a table metric "
+                "aggregates every row-level value it reads",
+            )
+            return
     for read, target in targets:
         if target.table is None or target.member is None:
             continue

@@ -99,16 +99,24 @@ def test_a_read_back_view_fingerprints_as_its_file(path: Path) -> None:
     assert back.errors == [], back.notes()
 
     def prints(loaded):
-        """Each definition's hash and structure, names compared ignoring case."""
+        """Each definition's identity, hash and structure, exactly: the
+        fingerprint names definitions in lower case, so an upper-cased
+        read-back is the same definition rather than a removal and an addition."""
         layer = semantic_layer(loaded, resolution(loaded, "snowflake"))
         return (
             {
-                m.name.lower(): (m.content_sha256, m.keys, m.relation)
+                m.name: (m.content_sha256, m.keys, m.relation, m.dimensions, m.measures)
                 for m in layer.semantic_models
             },
-            {m.name.lower(): m.content_sha256 for m in layer.metrics},
+            {m.name: (m.content_sha256, m.input_measures) for m in layer.metrics},
             {
-                r.name.lower(): (r.content_sha256, r.column_pairs, r.cardinality)
+                r.name: (
+                    r.content_sha256,
+                    r.model,
+                    r.to_model,
+                    r.column_pairs,
+                    r.cardinality,
+                )
                 for r in layer.relationships
             },
         )

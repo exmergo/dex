@@ -450,16 +450,33 @@ def _params(member: Member) -> dict[str, Any]:
 
 
 def _groupable(
-    view: SemanticView, table: LogicalTable, resolved: Resolution
+    view: SemanticView,
+    table: LogicalTable,
+    resolved: Resolution,
+    using: tuple[str, ...] = (),
 ) -> list[str]:
     """The tokens a metric on ``table`` can be grouped by: the dimensions of its
-    own table and of every table its relationships reach many-to-one."""
+    own table and of every table its relationships reach many-to-one.
+
+    A table joined to it more than one way (or many-to-many) is left out unless
+    ``using`` (the metric's ``using_relationships``) names a relationship on the
+    path, since Snowflake refuses that grouping as ambiguous.
+    """
+
+    from .loader import relationship_graph
 
     reach = resolved.coarser.get((view.name.lower(), table.name.lower()), set())
+    graph = relationship_graph(view) if reach else None
+    chosen = {name.lower() for name in using}
     tokens: list[str] = []
     for other in view.tables:
-        if other.name.lower() != table.name.lower() and other.name.lower() not in reach:
-            continue
+        here = other.name.lower()
+        if here != table.name.lower():
+            if here not in reach:
+                continue
+            count, crosses, names = graph.paths(table.name.lower(), here)  # type: ignore[union-attr]
+            if (count > 1 or crosses) and not (chosen & names):
+                continue
         tokens.extend(
             resolved.token(view, member)
             for member in (*other.dimensions, *other.time_dimensions)
@@ -480,7 +497,9 @@ def _table_metric(
     base: dict[str, Any] = {
         "name": resolved.token(view, member),
         "description": member.description,
-        "dimensions": list(groupable[table.name.lower()]),
+        "dimensions": _groupable(view, table, resolved, member.using_relationships)
+        if member.using_relationships
+        else list(groupable[table.name.lower()]),
         "semantic_models": [model],
         "vendor_params": _params(member),
     }

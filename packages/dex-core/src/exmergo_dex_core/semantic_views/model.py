@@ -151,6 +151,9 @@ class LogicalTable:
     facts: tuple[Member, ...] = ()
     metrics: tuple[Member, ...] = ()
     filters: tuple[dict[str, Any], ...] = ()
+    #: The names of members the reader refused, kept so an expression reading
+    #: one is refused too rather than read as a base column of that name.
+    refused: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, compare=False)
 
     @property
@@ -177,6 +180,10 @@ class LogicalTable:
         found = [self.primary_key] if self.primary_key else []
         return [*found, *self.unique_keys]
 
+    def is_refused(self, name: str) -> bool:
+        """Whether the reader refused a member of this name."""
+        return name.lower() in {r.lower() for r in self.refused}
+
     def is_key(self, columns: tuple[str, ...]) -> bool:
         """Whether ``columns`` cover a declared key, ignoring case and order."""
         wanted = {c.lower() for c in columns}
@@ -198,6 +205,8 @@ class SemanticView:
     #: Keys carried verbatim and not modelled, by name (``verified_queries``,
     #: ``custom_instructions``, ``variables``, ``max_staleness``, ...).
     carried: dict[str, Any] = field(default_factory=dict, compare=False)
+    #: The names of view-level metrics the reader refused.
+    refused_metrics: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, compare=False)
 
     def table(self, name: str) -> LogicalTable | None:
