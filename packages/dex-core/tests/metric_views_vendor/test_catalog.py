@@ -236,6 +236,66 @@ def test_a_projection_query_source_is_its_table_and_a_filtered_one_is_not(
     assert any("filters `demo.main.orders`" in n for n in catalog.notes)
 
 
+def test_an_aggregate_or_having_source_claims_no_relation(tmp_path: Path):
+    """An aggregate, or a HAVING with no GROUP BY, collapses the rows, so the
+    view claims no relation and the note says why, as for a GROUP BY."""
+    aggregated = lineage.source_relation("SELECT sum(b) AS a FROM t")
+    assert aggregated.relation is None and aggregated.gate is None
+    assert "an aggregate" in (aggregated.note or "")
+
+    having = lineage.source_relation("SELECT a FROM t HAVING sum(b) > 0")
+    assert having.relation is None and having.gate is None
+    assert "a HAVING" in (having.note or "")
+
+    # The issue's example: both reasons at once, both named.
+    both = lineage.source_relation("SELECT sum(b) AS a FROM t HAVING sum(b) > 0")
+    assert both.relation is None and both.gate is None
+    assert "an aggregate" in (both.note or "") and "a HAVING" in (both.note or "")
+
+
+def test_an_aggregate_or_having_source_claims_no_relation_in_the_catalog(
+    tmp_path: Path,
+):
+    """The collapsed view is no semantic model relation, and the catalog note
+    carries the reason; a windowed view keeps its table."""
+    aggregated = view(
+        "SELECT sum(amount) AS total FROM demo.main.orders",
+        fields=[{"name": "total", "expr": "total"}],
+    )
+    having = view(
+        "SELECT status FROM demo.main.orders HAVING sum(amount) > 0",
+        fields=[{"name": "status", "expr": "status"}],
+    )
+    windowed = view(
+        "SELECT order_id, row_number() OVER (ORDER BY placed_at) AS rn "
+        "FROM demo.main.orders",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
+    layer = source(
+        tmp_path, aggregated=aggregated, having=having, windowed=windowed
+    )
+    catalog = layer.semantic_catalog()
+    models = _by(catalog.semantic_models)
+
+    assert models["aggregated"].relation is None
+    assert models["having"].relation is None
+    assert models["windowed"].relation == "demo.main.orders"
+    notes = " ".join(catalog.notes)
+    assert "an aggregate" in notes and "a HAVING" in notes
+
+
+def test_a_window_function_source_keeps_its_table():
+    """A window function keeps the row count, so it may keep the claim: a bare
+    row_number, and an aggregate used only as a window."""
+    row_number = lineage.source_relation(
+        "SELECT row_number() OVER (PARTITION BY x ORDER BY y) AS rn, a FROM t"
+    )
+    assert row_number.relation == "t" and row_number.gate == "t"
+
+    windowed_sum = lineage.source_relation("SELECT sum(b) OVER () AS a FROM t")
+    assert windowed_sum.relation == "t" and windowed_sum.gate == "t"
+
+
 def test_a_field_reading_an_earlier_field_resolves_through_it(tmp_path: Path):
     """A bare name matching an earlier field is that field."""
     body = view(

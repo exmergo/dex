@@ -275,6 +275,29 @@ def query_columns(source: str) -> tuple[list[str], list[str]] | None:
     return found, ambiguous
 
 
+def _has_bare_aggregate(select: exp.Select) -> bool:
+    """Whether the select list aggregates rows instead of projecting them.
+
+    An aggregate inside a window (``SUM(x) OVER (...)``) keeps the row count,
+    so only an aggregate outside any window counts. An aggregate inside a
+    scalar subquery reads another table, not this one's rows, so nested
+    queries are not descended into.
+    """
+
+    for projection in select.expressions:
+        pending = [projection]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, exp.AggFunc):
+                if node.find_ancestor(exp.Window) is None:
+                    return True
+                continue
+            if isinstance(node, (exp.Select, exp.Subquery)):
+                continue
+            pending.extend(node.iter_expressions())
+    return False
+
+
 def source_relation(source: str) -> SourceRelation:
     """A ``source`` as the relation behind it.
 
@@ -282,7 +305,9 @@ def source_relation(source: str) -> SourceRelation:
     it is a plain projection of one table: its columns are traced through, and a
     ``WHERE`` keeps the table for the PII gate and claims no relation, since the
     view then holds fewer rows than the table. Anything else (a join, an
-    aggregate, a set operation) has no relation of its own.
+    aggregate, a set operation) has no relation of its own. A window function
+    keeps the row count, so a source that only windows its columns may still
+    claim its table.
     """
 
     if _TABLE_NAME.match(source) and not _QUERY.match(source):
@@ -307,6 +332,8 @@ def source_relation(source: str) -> SourceRelation:
         for name, present in (
             ("a join", bool(tree.args.get("joins"))),
             ("a GROUP BY", tree.args.get("group") is not None),
+            ("an aggregate", _has_bare_aggregate(tree)),
+            ("a HAVING", tree.args.get("having") is not None),
             ("DISTINCT", tree.args.get("distinct") is not None),
             ("a LIMIT", tree.args.get("limit") is not None),
             (
