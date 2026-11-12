@@ -21,7 +21,7 @@ Ossie rendering therefore agree on what each construct means.
 |---|---|
 | Specification | Metric View YAML `1.1` |
 | Mapping ported from | apache/ossie-converters, `databricks/java/README.md` at `82006ba2` |
-| Converter fixtures held to | `ossie_fixtureA`, `ossie_fixtureB`, `ossie_tpcds` (Metric View side) |
+| Converter fixtures held to | `ossie_fixtureA`, `ossie_fixtureB`, `ossie_tpcds`, both sides (the catalog reads the Metric View side; the [Ossie bridge](#the-ossie-bridge) converts either side into the other) |
 | License of the ported fixtures | Apache License 2.0 |
 
 The fingerprint records `format_version: 1.1` and the converter commit
@@ -320,7 +320,130 @@ relation Dex reads: Databricks refuses a plain `SELECT` of its measure columns,
 so the Databricks connector leaves Unity Catalog objects of type `METRIC_VIEW`
 out of its inventory. The view's YAML in the repository is what Dex reads.
 
-The Ossie bridge is #1260.
+## The Ossie bridge
+
+`semantic databricks define|update|plan --from-ossie <file>` proposes a Metric
+View from an Apache Ossie document, and
+`semantic ossie define|update|plan --from-metric-view <file>` proposes an Ossie
+document from a Metric View file (#1260). Each flag takes several files. Those
+whose output is a configured file are stored as one plan, since the target layer
+validates every configured file together; the rest are proposed, not stored. The layer written is always the configured `semantic.vendor`. The
+other format is only read, from files inside the repository, and is never
+configured. The proposal is a plan that `transform apply` writes. Nothing is
+deployed, and no command opens a workspace connection.
+
+```bash
+dex semantic databricks plan "views from the sales model" \
+    --from-ossie semantic/sales.ossie.yaml --fact orders --into views/sales.yaml
+
+dex semantic ossie plan "an Ossie document from the orders view" \
+    --from-metric-view views/orders.yaml --name sales --dataset-metrics
+```
+
+`--fact`, `--name`, `--into` and `--dataset-metrics` are optional; each is
+described below.
+
+### Two layers: the port, and what dex adds
+
+The conversion is Dex's Python port of the converter, at the commit the catalog
+mapping is pinned to. The port reproduces the converter's output for every
+input it accepts and refuses every input it refuses, with the same reason (a
+YAML syntax error aside, whose text is the YAML library's). It reproduces the byte-pinned JSON of the `custom_extensions[DATABRICKS]` stash
+too. The converter's six fixture directions, its example suite, its
+expression-dialect suite and its 300-seed round-trip property suite (with
+`java.util.Random` ported, so seed *n* is the converter's seed *n*) run against
+the port.
+
+Dex then changes only what it has to for each proposal to pass Dex's own
+validator for the target layer. Each change is named in a notice whose origin
+is `dex`:
+
+| Adaptation | Direction | Why |
+|---|---|---|
+| **Key fields.** A relationship or key column that no field exposes gets a field named after it, carrying `{"_v": 1, "key_only": true}` in its DATABRICKS stash. A field that already exposes the column is named instead. | Metric View to Ossie | Dex follows upstream's Name Resolution: a key or a relationship names fields. The converter writes columns, which Dex's reader refuses (`undeclared_relationship_field`, `undeclared_key_field`). |
+| **Key-only fields are left out** of the exported view. | Ossie to Metric View | Without this, a round trip through Dex would add a dimension per join column. |
+| **Fields resolve to columns.** A key or relationship name, or a model metric's `dataset.field`, that is a field with a bare-column expression becomes that column. A metric field that is not a bare column is named. | Ossie to Metric View | The converter reads these names as columns, which they are not when a field renames one (`customer_id` defined as `o_custkey`). Databricks accepts a measure naming a dimension, but Dex's reader traces lineage through columns, and a dropped field's name would dangle. |
+| **Metrics name fields.** A column a field exposes, in a model metric, becomes that `dataset.field`. A metric reading another measure is left as written. | Metric View to Ossie | An Ossie model metric names fields. Without this, Dex's Ossie catalog traces no imported metric to its dataset. |
+| **`expression.sql` is read** in the `OSSIE_SQL_2026` slot. | Ossie to Metric View | The converter reads only `expression.dialects`, and the schema makes `sql` authoritative. Without this the converter would drop every field of a Dex-derived document. |
+| **Dataset-scoped metrics** (#957). A metric of the fact dataset becomes a measure. One on a joined dataset, or one reading a field that is not a bare column, is dropped by name. | Ossie to Metric View | The converter ignores `datasets[].metrics` silently. |
+| **`--dataset-metrics`** moves each measure that reads only the fact source into `datasets[<fact>].metrics`. | Metric View to Ossie | Opt-in, so by default the output matches the converter's model-scoped metrics. |
+| **Duplicate relationship names** get a `_2` suffix. | Metric View to Ossie | The converter can name two joins alike (`a_to` + `b` and `a` + `to_b`), and an Ossie model's relationship names are unique. |
+
+The Java converter, reading a document Dex wrote, sees a key-only field as one
+more field and exports it as a dimension.
+
+### What is named rather than dropped
+
+`data.bridge.conversions[].notices` lists every notice, each with its `origin`.
+The converter's notices keep its exact `[scope] message` text, including:
+
+- on export, `datatype`, `dimension.is_time`, the members of an object
+  `ai_context` other than `synonyms`, a dataset's `description` and `ai_context`,
+  the model's `ai_context`, and foreign-vendor `custom_extensions`;
+- `primary_key` and `unique_keys`, which set `rely.at_most_one_match` where they
+  cover a join's columns and are otherwise not carried;
+- a metric naming a dataset reached by two join paths (a diamond), which is
+  dropped;
+- a complex field on a fanned-out join, which is dropped;
+- a field on a `one_to_many` branch, which cannot be a dimension and is dropped;
+- synonyms beyond ten, truncated;
+- a column that reads one already dropped, which is dropped too;
+- on import, a wildcard field or measure, and a view writing both `dimensions`
+  and `fields`.
+
+What the converter refuses (a cross or non-equi join, a cyclic or several-rooted
+graph, mixed cardinalities in one branch, a source that is neither a 3-part name
+nor a query, more than 200 datasets) is refused with its kind and reason, and no
+plan is stored. A model with several root datasets takes `--fact`. That is the
+converter's `--source`, renamed because `source` means a dataset's relation
+everywhere else in Dex.
+
+### Stored or proposed
+
+The output goes to `--into`, or else beside the configured files, named after
+the model: `<dir>/<model>.yaml` for a view and `<dir>/<model>.ossie.yaml` for a
+document.
+
+Several files convert together. The configured outputs are stored as one plan
+and the rest are proposed in the same answer. `--into` and `--name` name one
+output, so they take one file.
+
+- **A path in the configured files** is validated by the target layer as a
+  hand-written `--edits-file` would be, with the Metric View write rules for a
+  view, and stored as a plan. `define` refuses an existing view or model;
+  `update` classifies it.
+- **Any other path** stores no plan. The document is validated the same way and
+  returned under the `content` of its own `data.bridge.conversions` entry. With
+  no configured output in the batch, `plan_id` is `null`. `next` names the
+  `dex config set` that adopts the path and the command to run again (`update`
+  where every output of the rerun already exists, `define` where none does,
+  `plan` for a mix). `update` refuses such a path.
+
+### The stash
+
+A Metric-View-only construct with no Ossie field rides in the object's
+`custom_extensions` entry for `DATABRICKS`, as JSON in the converter's pinned
+bytes: `{"_v": 1, ...}`, `": "` and `", "` separators, non-ASCII as lowercase
+`\uXXXX`. That covers a view's `filter`, `parameters` and `materialization`,
+the fact a `one_to_many` import was on, a join's `rely`, `cardinality` and
+non-canonical `on`, a member's `format`, a measure's `window`, `partition` and
+`display_name`, and Dex's `key_only`. A stash is read strictly: the first
+DATABRICKS entry wins with a notice, and data that is not one JSON object, or
+that repeats a key, is refused.
+
+### Known differences from the converter
+
+- **The YAML reader.** Both directions read YAML 1.2, as the converter does, so
+  `on`, `off`, `yes` and `no` stay text. Dex's own Ossie reader reads YAML 1.1. A
+  hand-written Ossie document with a bare `on` value therefore reads as text in
+  the bridge and as `true` in the layer.
+- **YAML timestamps.** An unquoted timestamp stays a timestamp on the way
+  through. The converter would write it as epoch milliseconds.
+- **Recursive aliases.** A recursive YAML alias is refused. The converter would
+  recurse into it without end.
+- **What is not ported.** The converter's serialization failures (a Java bean
+  Jackson cannot write) have no Python counterpart, since a parsed document is
+  always plain data.
 
 ## Authoring
 

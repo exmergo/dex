@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     from .transform.plans import PlanEdit
     from .transform.results import (
         ApplyResult,
+        BridgeResult,
         BuildResult,
         ClassificationResult,
         DeclareResult,
@@ -1869,6 +1870,39 @@ class DexEngine:
         return self.semantic_native(
             "databricks", mode, intent, edits, declarations=declarations
         )
+
+    def semantic_bridge(
+        self,
+        vendor: str,
+        mode: str,
+        intent: str,
+        source: str | list[str],
+        *,
+        fact: str | None = None,
+        name: str | None = None,
+        into: str | None = None,
+        dataset_metrics: bool = False,
+    ) -> BridgeResult:
+        """Propose the configured layer from one file of the other format (#1260).
+
+        ``vendor`` is the configured ``semantic.vendor`` and the layer written:
+        ``databricks`` reads Apache Ossie documents at ``source`` and proposes
+        a Metric View, ``ossie`` reads a Metric View file and proposes an Ossie
+        document, both through dex's port of apache/ossie-converters. ``fact``
+        names the dataset a view is on; ``name`` the model an import writes;
+        ``into`` the output path (default: beside the configured files);
+        ``dataset_metrics`` writes measures on the fact source as dataset-scoped
+        metrics. An output path off the write surface stores no plan and is
+        returned as a proposal.
+        """
+
+        from .transform.semantic_bridge import semantic_bridge
+
+        # Each direction takes its own options and refuses the other's by name,
+        # so only the ones set are passed.
+        options = {"fact": fact, "name": name, "into": into}
+        options["dataset_metrics"] = dataset_metrics or None
+        return semantic_bridge(self, vendor, mode, intent, source, **options)
 
     # --- lifecycle ------------------------------------------------------------
 

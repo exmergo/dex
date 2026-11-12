@@ -149,7 +149,7 @@ def derive(
         return annotate(layer, request)
 
     current = _views(request.documents)
-    directory, suffix = _placement(layer)
+    directory, suffix = placement(layer)
     prefix = sibling_prefix(
         (raw.get("source") for _p, raw in current),
         request.project_identifiers.values(),
@@ -633,7 +633,7 @@ def _stem(path: str) -> str:
     return PurePosixPath(path).stem
 
 
-def _placement(layer: MetricViewSemanticLayer) -> tuple[str, str]:
+def placement(layer: MetricViewSemanticLayer) -> tuple[str, str]:
     """The directory and suffix a derived view takes: the ones the configured
     files share, else ``metric_views`` and ``.yaml``."""
 

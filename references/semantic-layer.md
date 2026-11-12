@@ -1478,8 +1478,14 @@ semantic:
   holds each view's fields, measures, `filter`, joins and query sources to the
   warehouse metadata (the four `declared_*` codes, naming the view, the element
   and the column), and `maintain reconcile` cuts the removals out of the view
-  files through `semantic databricks update` (#1259). The Ossie bridge (#1260)
-  follows.
+  files through `semantic databricks update` (#1259).
+- **The Ossie bridge** (#1260): `semantic databricks ... --from-ossie <file>`
+  proposes a view from an Ossie document, and
+  `semantic ossie ... --from-metric-view <file>` proposes an Ossie document from
+  a view. Both go
+  through Dex's port of the converter, held to its fixtures, with every lossy
+  element named in `data.bridge`. See
+  [The Ossie bridge](databricks-metric-views-compatibility.md#the-ossie-bridge).
 - **Authoring is `semantic databricks define|update|plan`** (#1258): whole files
   on `semantic.databricks.files`, validated by the same port with an unknown key
   and `fields` beside `dimensions` refused on write, stored as a plan and written

@@ -171,6 +171,28 @@ class RepairResult(PlanResult):
         return {**head, "repair": self.repair, **payload}
 
 
+class BridgeResult(PlanResult):
+    """One layer proposed from the other through the Ossie bridge (#1260).
+
+    ``bridge`` leads the payload after the plan's identity: the direction, the
+    converter commit, and per conversion its source, output, status and every
+    notice, so what was dropped or rewritten is read before the diff. A
+    conversion whose output path is not on the write surface stores no plan,
+    and ``plan_id`` is then null rather than empty, as on ``transform declare``.
+    """
+
+    bridge: dict[str, Any] = Field(default_factory=dict)
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        if not self.plan_id:
+            return {"plan_id": None, "bridge": self.bridge}
+        payload = super().data()
+        head = {k: payload.pop(k) for k in ("plan_id", "intent") if k in payload}
+        return {**head, "bridge": self.bridge, **payload}
+
+
 class PropagationResult(PlanResult):
     """A rename or a removal, propagated across the project as one plan.
 

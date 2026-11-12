@@ -101,6 +101,7 @@ def test_the_wrapper_knows_every_engine_connector(wrapper):
         (["semantic", "ossie", "define", "--edits-file", "edits.json"], ["ossie"]),
         (["semantic", "ossie", "update", "--edits-file", "edits.json"], ["ossie"]),
         (["semantic", "ossie", "plan", "--edits-file", "edits.json"], ["ossie"]),
+        (["semantic", "ossie", "plan", "--from-metric-view", "v.yaml"], ["ossie"]),
         (["maintain", "semantic"], ["ossie"]),
         (["maintain", "check"], ["ossie"]),
         (["maintain", "snapshot"], ["ossie"]),
@@ -317,6 +318,13 @@ def test_the_cube_extra_follows_the_configured_vendor(wrapper, argv, vendor, exp
         # takes the extra whatever the configured vendor says.
         (["semantic", "databricks", "define"], "databricks", ["metric-views"]),
         (["semantic", "databricks", "plan"], None, ["metric-views"]),
+        # The Ossie bridge (#1260) reads its source with a pure-Python port, so
+        # its flags add nothing to the target's own extra.
+        (
+            ["semantic", "databricks", "plan", "--from-ossie", "m.yaml", "--fact", "o"],
+            "databricks",
+            ["metric-views"],
+        ),
         # Not for a command that reads no layer, and never from the connector name.
         (["explore", "inventory"], "databricks", []),
         (["explore", "map"], "databricks", []),
