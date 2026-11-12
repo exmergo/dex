@@ -433,31 +433,73 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
             with contextlib.suppress(OSError):
                 temporary.unlink()
         raise
-    # Each target's bytes before it is replaced, so a failure part way through
-    # puts back what was already moved: all files or none.
-    originals: list[tuple[Path, bytes | None, int | None]] = []
-    written: list[str] = []
+    # A copy of each existing target, staged beside it before anything moves, so
+    # a failure part way through puts every moved file back with one atomic
+    # rename each: all files or none, and no reader sees a half-written file.
     try:
-        for temporary, target, edit in temporaries:
-            before = target.read_bytes() if target.is_file() else None
-            mode = target.stat().st_mode & 0o777 if before is not None else None
-            temporary.replace(target)
-            originals.append((target, before, mode))
-            written.append(edit.path)
+        backups = [_backup(target) for _temporary, target, _edit in temporaries]
     except OSError:
-        for target, before, mode in reversed(originals):
-            with contextlib.suppress(OSError):
-                if before is None:
-                    target.unlink()
-                else:
-                    target.write_bytes(before)
-                    if mode is not None:
-                        target.chmod(mode)
         for temporary, _, _ in temporaries:
             with contextlib.suppress(OSError):
                 temporary.unlink(missing_ok=True)
         raise
+    moved: list[tuple[Path, Path | None]] = []
+    written: list[str] = []
+    try:
+        for (temporary, target, edit), backup in zip(temporaries, backups, strict=True):
+            temporary.replace(target)
+            moved.append((target, backup))
+            written.append(edit.path)
+    except OSError:
+        stranded: list[str] = []
+        for target, backup in reversed(moved):
+            try:
+                if backup is None:
+                    target.unlink()
+                else:
+                    backup.replace(target)
+            except OSError:
+                if backup is not None:
+                    stranded.append(f"{target} (its previous bytes are in {backup})")
+        for temporary, _, _ in temporaries:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        for backup in backups:
+            if backup is not None and not any(str(backup) in s for s in stranded):
+                with contextlib.suppress(OSError):
+                    backup.unlink(missing_ok=True)
+        if stranded:
+            raise ProjectError(
+                "a Semantic View apply failed part way and could not put back: "
+                + "; ".join(stranded)
+                + ". Move each copy back over its file by hand"
+            ) from None
+        raise
+    for backup in backups:
+        if backup is not None:
+            with contextlib.suppress(OSError):
+                backup.unlink()
     return written
+
+
+def _backup(target: Path) -> Path | None:
+    """A copy of ``target`` staged beside it with its mode, or ``None`` when it
+    does not exist yet (a create, undone by removing the file)."""
+
+    if not target.is_file():
+        return None
+    handle, name = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".dex-backup"
+    )
+    try:
+        os.fchmod(handle, _mode_for(target))
+        with os.fdopen(handle, "wb") as out:
+            out.write(target.read_bytes())
+    except OSError:
+        with contextlib.suppress(OSError):
+            Path(name).unlink()
+        raise
+    return Path(name)
 
 
 # --- helpers -------------------------------------------------------------------

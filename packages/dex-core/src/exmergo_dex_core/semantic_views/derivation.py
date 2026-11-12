@@ -1235,7 +1235,15 @@ def _annotate_relationship(
                 for p in pairs
             )
         ):
-            return text, None
+            if len(pairs) == 1:
+                return text, None
+            # An authored join with more conditions is the author's; it is kept,
+            # and it is not the reference the declaration states.
+            return text, (
+                f"the authored relationship '{existing.get('name')}' joins on more "
+                "columns than the declared reference, so it is kept as written and "
+                "the reference is not carried"
+            )
     names = {
         str(r.get("name", "")).lower()
         for r in view.get("relationships") or []

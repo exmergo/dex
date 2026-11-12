@@ -781,6 +781,34 @@ def test_annotate_two_keys_to_one_parent_get_two_relationships(tmp_path, capsys)
     assert validate_view_contents({SHOP_FILE: text}).errors == []
 
 
+def test_an_authored_join_with_more_columns_is_kept_and_not_carried(tmp_path, capsys):
+    text = TWO_KEYS.replace(
+        "      - {left_column: billing_id, right_column: id}\n",
+        "      - {left_column: billing_id, right_column: id}\n"
+        "      - {left_column: tenant_id, right_column: external_id}\n",
+    )
+    put(tmp_path, SHOP_FILE, text)
+    _configure(tmp_path, [SHOP_FILE])
+    rc, envelope = _annotate(
+        tmp_path,
+        capsys,
+        [
+            {
+                "model": "orders",
+                "description": "Orders.",
+                "columns": {
+                    "billing_id": {"role": "foreign_key", "references": "customers.id"}
+                },
+            }
+        ],
+    )
+    assert rc == 0, envelope["errors"]
+    notes = " ".join(envelope["data"]["notes"])
+    assert "joins on more columns than the declared reference" in notes
+    stored = _stored_plans(tmp_path)[0]["edits"][0]["new_content"]
+    assert len(read_yaml(stored)["relationships"]) == 1
+
+
 def test_annotate_does_not_carry_an_aggregation_it_cannot_read(tmp_path, capsys):
     put(tmp_path, SHOP_FILE, TWO_KEYS)
     _configure(tmp_path, [SHOP_FILE])

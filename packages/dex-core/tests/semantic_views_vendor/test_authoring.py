@@ -701,4 +701,23 @@ def test_a_failed_move_puts_back_what_was_already_written(tmp_path, monkeypatch)
         layer.write_semantic_edits(edits)
     monkeypatch.setattr(Path, "replace", real)
     assert {name: read(tmp_path, name) for name in (SHOP_FILE, STOCK_FILE)} == before
-    assert not list((tmp_path / "views").glob(".*.dex"))
+    # No staged write and no backup copy is left behind.
+    assert not list((tmp_path / "views").glob(".*.dex*"))
+
+
+def test_a_successful_apply_leaves_no_backup_copy(tmp_path):
+    layered(tmp_path)
+    layer = SemanticViewSemanticLayer(tmp_path, [SHOP_FILE, STOCK_FILE])
+    current = layer.semantic_edit_view().files[SHOP_FILE]
+    layer.write_semantic_edits(
+        [
+            PlanEdit(
+                path=SHOP_FILE,
+                kind=EditKind.SEMANTIC_DOCUMENT,
+                old_content_hash=current.sha256,
+                new_content="# changed\n" + current.content,
+            )
+        ]
+    )
+    assert read(tmp_path, SHOP_FILE).startswith("# changed\n")
+    assert not list((tmp_path / "views").glob(".*.dex*"))
