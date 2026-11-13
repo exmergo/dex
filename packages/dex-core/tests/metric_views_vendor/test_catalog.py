@@ -254,7 +254,17 @@ def test_an_aggregating_query_source_claims_no_relation_and_a_windowed_one_keeps
         "FROM demo.main.orders",
         fields=[{"name": "order_id", "expr": "order_id"}],
     )
-    layer = source(tmp_path, aggregated=aggregated, having=having, windowed=windowed)
+    nested = view(
+        "SELECT SUM(SUM(amount)) OVER () AS total FROM demo.main.orders",
+        fields=[{"name": "total", "expr": "total"}],
+    )
+    layer = source(
+        tmp_path,
+        aggregated=aggregated,
+        having=having,
+        windowed=windowed,
+        nested=nested,
+    )
     catalog = layer.semantic_catalog()
     models = _by(catalog.semantic_models)
     notes = " ".join(catalog.notes)
@@ -262,6 +272,9 @@ def test_an_aggregating_query_source_claims_no_relation_and_a_windowed_one_keeps
     assert models["aggregated"].relation is None
     assert models["having"].relation is None
     assert models["windowed"].relation == "demo.main.orders"
+    # The inner SUM aggregates the table to one row before the outer window
+    # runs, so the nested windowed aggregate claims no relation either.
+    assert models["nested"].relation is None
     assert "has an aggregate" in notes
     assert "has a HAVING" in notes
 
