@@ -2034,8 +2034,9 @@ form, so a view read back from Snowflake fingerprints as its file; the
 layer-neutral axes read it: definition drift on the semantic axis, each key and
 relationship arity on the grain axis. `semantic snowflake define|update|plan`
 authors the files through a stored plan, never deploying them, and a declared dbt
-mart derives a logical table (see `transform plan` above); the schema axis and
-reconcile are #1293. Selecting the vendor without the `[semantic-views]` extra (the
+mart derives a logical table (see `transform plan` above). `maintain schema` holds
+each view to the columns and types Dex captured, and `maintain reconcile` cuts the
+removals out of the files as a `semantic snowflake update` plan (#1293). Selecting the vendor without the `[semantic-views]` extra (the
 dialect engine) refuses and names it. See
 [Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md).
 

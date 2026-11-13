@@ -286,7 +286,10 @@ def build(
             pii_overrides,
         )
 
-    warnings.extend(_grain_test_edits(proposals, declarations, definitions))
+    if view is not None:
+        # With no project to edit there is nowhere a `unique` test could go,
+        # which the warning above already says once (#1293).
+        warnings.extend(_grain_test_edits(proposals, declarations, definitions))
     edits.extend(declarations.edits())
     warnings.extend(declarations.warnings)
     _drop_empty_proposals(proposals, {edit.path for edit in edits})
@@ -508,21 +511,58 @@ def _advisory(
             f"key {where}. dex proposes no edit, because which side is wrong is "
             "a decision"
         )
+    if finding.code == "join_cardinality_exceeded":
+        from .drift import ARITY_INFERRED_BY
+
+        source = str(finding.data.get("declared_by") or "")
+        inferred = ARITY_INFERRED_BY.get(source)
+        if inferred is not None:
+            # No cardinality is written to change: the arity follows from the
+            # key the referenced table declares (#1293).
+            command = _semantic_update_command(source)
+            where = f" with `{command}`" if command is not None else " in its file"
+            actions["join_cardinality_exceeded"] = (
+                f"{inferred} reads this relationship as "
+                f"{finding.data.get('claim')} from the key the referenced table "
+                "declares, and the data does not hold it, so measures aggregated "
+                "across it are inflated: dedup that table, or change its key or "
+                f"the relationship{where}. dex proposes no edit, because which "
+                "of the two is right is a decision"
+            )
+    if finding.code == "key_lost_uniqueness" and finding.data.get("declared_by"):
+        # The key lapsed, and a semantic layer still claims it (#1293): the
+        # claim is what a query trusts, so the advice names where to change it.
+        source = str(finding.data["declared_by"])
+        command = _semantic_update_command(source)
+        what = "its primary key" if finding.data.get("claim") == "primary" else "unique"
+        where = f" with `{command}`" if command is not None else " in its file"
+        actions["key_lost_uniqueness"] = (
+            f"the {source} semantic layer declares these columns {what}, and they "
+            "no longer are: dedup the table, or change the key"
+            f"{where}. dex proposes no edit, because which side is wrong is a "
+            "decision"
+        )
     if finding.code == "declared_grain_not_unique" and (
         finding.data.get("claim") == "unique"
     ):
         # A semantic layer's uniqueness claim is not the grain (#1259): a Metric
         # View's `rely.at_most_one_match` asserts the join matches at most one
         # row, and Databricks trusts it.
+        declared_by = finding.data.get("declared_by") or "semantic"
+        command = (
+            _semantic_update_command(declared_by) if declared_by != "semantic" else None
+        )
         actions["declared_grain_not_unique"] = (
-            f"the {finding.data.get('declared_by') or 'semantic'} layer asserts "
+            f"the {declared_by} layer asserts "
             "these columns are unique and the data says otherwise: dedup the "
             "table, or drop the claim"
             + (
                 " (`rely.at_most_one_match` on the join, with `semantic "
                 "databricks update`), since Databricks trusts the flag and can "
                 "count a row more than once while it is false"
-                if finding.data.get("declared_by") == "databricks"
+                if declared_by == "databricks"
+                else f" with `{command}`"
+                if command is not None
                 else ""
             )
             + ". dex proposes no edit, because which side is wrong is a decision"

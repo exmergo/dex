@@ -117,6 +117,8 @@ def semantic_layer(
                 categorical_dimensions=categorical,
                 measures=measures,
                 keys=keys.get(view.name, []),
+                # A Metric View declares no key but `rely` (#1293).
+                key_claims=["unique"] * len(keys.get(view.name, [])),
             )
         )
         for join in view.all_joins():
@@ -160,6 +162,7 @@ def semantic_layer(
                     dimensions=joined.get(join.path, {}),
                     measures=joined_measures.get(join.path, {}),
                     keys=keys.get(name, []),
+                    key_claims=["unique"] * len(keys.get(name, [])),
                 )
             )
         metrics.extend(

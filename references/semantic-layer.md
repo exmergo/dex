@@ -1541,10 +1541,15 @@ semantic:
   Analyst keys are carried and named rather than modelled.
 - **`query` and `values` are not available yet** (#1290). `values` runs the PII
   gate before it refuses.
-- **`maintain` reads the fingerprint**: definition drift on `maintain semantic`,
-  and each key and relationship arity measured by `maintain grain`. A view read
-  back from Snowflake fingerprints as the file it came from. `maintain schema`
-  and `reconcile` are #1293.
+- **`maintain` reads the fingerprint**: definition drift on `maintain semantic`
+  (a changed primary key is `declaration_changed` on `grain`), and each key and
+  relationship arity measured by `maintain grain`, worded as the view's claim.
+  A view read back from Snowflake fingerprints as the file it came from.
+  `maintain schema` holds each view to the columns and types Dex captured
+  (`declared_column_missing`, `declared_relation_missing`,
+  `declared_type_conflict`, `declared_dependency_dropped`), and `maintain
+  reconcile` cuts the removals out of the files as a `semantic snowflake update`
+  plan (#1293).
 - **Authoring is `semantic snowflake define|update|plan`** (#1292): whole
   configured files through a stored plan, validated by the same port with three
   read-time warnings refused on write (an unknown key, `access_modifier` on a

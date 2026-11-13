@@ -1140,6 +1140,9 @@ class JoinCardinalityCheck(NamedTuple):
     #: None is unknown (no free row count on this connector), not zero: the
     #: scan that measures the join supplies the count, as for a key check.
     row_count: int | None
+    #: The semantic vendor whose join this is, so the finding says whose
+    #: claim the data contradicts (#1293).
+    declared_by: str | None = None
 
 
 def grain_plan(
@@ -1485,17 +1488,27 @@ def _fold_semantic_keys(
         if scope is not None and identifier not in scope:
             continue
         bucket = by_identifier.setdefault(identifier, [])
-        for combo in sm.keys:
+        claims_by_key = (
+            sm.key_claims
+            if sm.key_claims is not None and len(sm.key_claims) == len(sm.keys)
+            else None
+        )
+        for position, combo in enumerate(sm.keys):
             if not any(_same_combo(combo, seen) for seen in bucket):
                 bucket.append(list(combo))
             if origins is None:
                 continue
-            # A Metric View fingerprints only `rely` keys; every other native
-            # layer's keys are its primary keys. Every model declaring the
-            # combination is kept, so each claim can be found.
-            # A project grain on the same columns is a separate claim, kept
-            # beside this one rather than standing in for it.
-            claim = "unique" if semantic.vendor == "databricks" else "primary"
+            # Each key says what it claims where the fingerprint recorded it
+            # (#1293). A baseline from before then falls back: a Metric View
+            # fingerprints only `rely` keys, and every other native layer's
+            # keys were read as its primary keys. Every model declaring the
+            # combination is kept, so each claim can be found. A project grain
+            # on the same columns is a separate claim, kept beside this one
+            # rather than standing in for it.
+            if claims_by_key is not None:
+                claim = claims_by_key[position]
+            else:
+                claim = "unique" if semantic.vendor == "databricks" else "primary"
             source = semantic.vendor or "semantic"
             claims = origins.setdefault(
                 (identifier, frozenset(c.lower() for c in combo)), []
@@ -1577,6 +1590,7 @@ def _join_cardinality_checks(
                     identifier=identifier,
                     columns=columns,
                     row_count=row_count,
+                    declared_by=semantic.vendor,
                 )
             )
     if unchecked:
@@ -1863,23 +1877,98 @@ def _declared_claim(
     return f"the project declares ({members}) as the grain of {identifier}"
 
 
+#: What a semantic layer does with a key it declares, by vendor and claim,
+#: where it trusts the key rather than checking it: the risk a contradicted
+#: claim carries is then the layer's own wrong numbers (#1259, #1293).
+_SNOWFLAKE_TRUST = (
+    "Snowflake trusts a declared key without checking it, so a query through a "
+    "relationship to the table can count a row more than once wherever it "
+    "matches a duplicated key"
+)
+_CLAIM_TRUST: dict[str, dict[str, str]] = {
+    "databricks": {
+        "unique": (
+            "Databricks trusts the flag without checking it, so a query through "
+            "the join can count a row more than once wherever it matches a "
+            "duplicated key"
+        )
+    },
+    "snowflake": {"primary": _SNOWFLAKE_TRUST, "unique": _SNOWFLAKE_TRUST},
+}
+
+
 def _declared_consequence(origin: tuple[str, ...] | None) -> str:
     """What a contradicted claim risks, by who made it. A risk, not a count:
     the probe measures the table, not which of its keys a query matches."""
 
     source, claim = origin or ("", "combination")
-    if source == "databricks" and claim == "unique":
-        return (
-            "Databricks trusts the flag without checking it, so a query through "
-            "the join can count a row more than once wherever it matches a "
-            "duplicated key"
-        )
+    trusted = _CLAIM_TRUST.get(source, {}).get(claim)
+    if trusted is not None:
+        return trusted
     if claim == "unique" or (claim == "primary" and source):
         return (
             "Queries relying on the claim can count a row more than once where "
             "they match a duplicated key"
         )
     return "Builds asserting this grain will fail"
+
+
+def _lapsed_claim(
+    plan: GrainPlan, identifier: str, combo: list[str]
+) -> tuple[str, dict[str, Any]]:
+    """The semantic layer's claim on a key that lost its uniqueness, as a clause
+    and as data (#1293).
+
+    A key measurement proved unique at the baseline lapses as
+    ``key_lost_uniqueness`` even where a semantic layer also declares it, since
+    the measurement is the before (#1259 F4). The layer's claim is still the one
+    a query trusts, so it is named. Only a semantic claim: the project's own
+    grain is a different finding's business.
+    """
+
+    claims = [
+        c
+        for c in (plan.declared_origins or {}).get(
+            (identifier, frozenset(c.lower() for c in combo))
+        )
+        or []
+        if c[1] != "combination"
+    ]
+    if not claims:
+        return "", {}
+    found = claims[0]
+    members = ", ".join(combo)
+    sentence = _declared_claim(found[:2], members, identifier, list(found[2]))
+    trusted = _CLAIM_TRUST.get(found[0], {}).get(found[1])
+    return (
+        f"; {sentence}" + (f". {trusted}" if trusted else ""),
+        {"declared_by": found[0], "claim": found[1], "declared_on": list(found[2])},
+    )
+
+
+#: A layer whose join arity is not written but inferred from the key the
+#: referenced table declares, by vendor: a Semantic View relationship is
+#: many-to-one because its right table declares the columns a key (#1293).
+ARITY_INFERRED_BY = {"snowflake": "Snowflake"}
+
+
+def _arity_claim(check: JoinCardinalityCheck) -> str:
+    """Who says the join has this arity, for the finding's sentence."""
+
+    inferred = ARITY_INFERRED_BY.get(check.declared_by or "")
+    if inferred is not None:
+        return (
+            f"relationship '{check.relationship}' is {check.cardinality}, which "
+            f"{inferred} infers from the key '{check.side_model}' declares"
+        )
+    return f"join '{check.relationship}' is declared {check.cardinality}"
+
+
+def _arity_trust(check: JoinCardinalityCheck) -> str:
+    """What the layer does with the arity, where it trusts it unchecked."""
+
+    trusted = _CLAIM_TRUST.get(check.declared_by or "", {}).get("primary")
+    return f". {trusted}" if trusted else ""
 
 
 class ProbeNeeds(NamedTuple):
@@ -2328,9 +2417,11 @@ def grain_drift(
                         + grain_clause
                         + "; "
                         + _fanout_clause(joins)
+                        + _lapsed_claim(plan, dataset.identifier, [key])[0]
                         + floor_note
                     ),
                     data={
+                        **_lapsed_claim(plan, dataset.identifier, [key])[1],
                         "distinct_count": count,
                         "row_count": row_count,
                         "was_grain": was_grain,
@@ -2382,9 +2473,11 @@ def grain_drift(
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows); "
                         + _fanout_clause(joins)
+                        + _lapsed_claim(plan, dataset.identifier, combo)[0]
                         + floor_note
                     ),
                     data={
+                        **_lapsed_claim(plan, dataset.identifier, combo)[1],
                         "columns": list(combo),
                         "distinct_count": count,
                         "row_count": row_count,
@@ -2519,15 +2612,20 @@ def grain_drift(
                 column=members,
                 severity=severity,
                 detail=(
-                    f"join '{check.relationship}' is declared {check.cardinality}, "
+                    f"{_arity_claim(check)}, "
                     f"and ({members}) on {check.identifier} is not unique: "
                     f"{count} distinct over {row_count} rows "
                     f"(~{row_count - count} duplicate rows). Each '{other}' row can "
                     f"match several '{check.side_model}' rows, so anything "
                     f"aggregated across this join is counted more than once"
-                    f"{floor_note}"
+                    f"{_arity_trust(check)}{floor_note}"
                 ),
                 data={
+                    **(
+                        {"declared_by": check.declared_by, "claim": check.cardinality}
+                        if check.declared_by
+                        else {}
+                    ),
                     "relationship": check.relationship,
                     "declared_cardinality": check.cardinality,
                     "model": check.model,

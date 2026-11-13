@@ -47,10 +47,12 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from ..maintain.snapshot import (
+    DeclarationFingerprint,
     MetricDef,
     RelationshipDef,
     SemanticLayerSnapshot,
     SemanticModelDef,
+    native_declaration_fingerprint,
 )
 from . import catalog as catalog_mod
 from .dependency import SEMANTIC_VIEW_FORMAT_VERSION
@@ -140,6 +142,7 @@ def semantic_layer(
 
     models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
+    declarations: dict[str, DeclarationFingerprint] = {}
     for view in loaded.views:
         # The view's own keys (its description, `variables` and their defaults,
         # `max_staleness`, tags) change what it answers without touching a
@@ -167,9 +170,27 @@ def semantic_layer(
                 if member.kind == DIMENSION and here.column:
                     categorical[name] = here.column
             keys = [[resolved.fold(c) for c in key] for key in table.declared_keys()]
+            # The primary key first, then each `unique_keys` entry: only the
+            # first is the grain (#1293).
+            claims = ["primary"] * bool(table.primary_key) + ["unique"] * len(
+                table.unique_keys
+            )
+            model_name = resolved.model(view, table.name)
+            if table.primary_key:
+                # The whole declaration a Semantic View carries: no metadata
+                # key exists, so the primary key is what `explore --use-project`
+                # reads back as the grain (see `catalog.definitions`).
+                declared = native_declaration_fingerprint(
+                    [resolved.fold(c) for c in table.primary_key],
+                    None,
+                    [],
+                    path=view.file,
+                )
+                if declared is not None:
+                    declarations[model_name] = declared
             models.append(
                 SemanticModelDef(
-                    name=resolved.model(view, table.name).lower(),
+                    name=model_name.lower(),
                     path=view.file,
                     content_sha256=_hash(table.raw),
                     relation=resolved.relation(view, table.name),
@@ -177,6 +198,7 @@ def semantic_layer(
                     categorical_dimensions=categorical,
                     measures=measures,
                     keys=keys,
+                    key_claims=claims,
                 )
             )
             metrics.extend(
@@ -241,7 +263,7 @@ def semantic_layer(
         relationships_and_keys_captured=True,
         relationship_cardinality_captured=True,
         **provenance,
-        declarations={},
+        declarations=declarations,
         notes=notes,
     )
 
