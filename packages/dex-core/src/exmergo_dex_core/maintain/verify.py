@@ -108,7 +108,16 @@ def compile_check(project_dir: Path) -> tuple[DriftFinding | None, list[str]]:
     reachable.
     """
 
-    result = shadow_parse(project_dir, [])
+    return compile_failure(shadow_parse(project_dir, []))
+
+
+def compile_failure(result: dict) -> tuple[DriftFinding | None, list[str]]:
+    """:func:`compile_check`'s verdict on one ``shadow_parse`` result.
+
+    Apart so a caller that already ran the parse (``maintain coverage`` keeps
+    its manifest) reports a failure in the same words without parsing twice.
+    """
+
     if not result["available"]:
         return None, [f"compile check skipped ({result['reason']})"]
     if result["success"]:

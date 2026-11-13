@@ -46,12 +46,15 @@ reviewed what it returns:
   `explore diagram`
 - `explore query`, including several statements, `--sql-file` and `--across`
 - `explore semantic list` (it reads repository metadata, not the warehouse)
+- `maintain coverage` (it reads a parsed dbt manifest: names and counts, a
+  generic test named by the test it applies rather than by its node name, which
+  can carry its arguments, and a parse error's message withheld)
 
 Everything else refuses before it opens a connection, with `reason: guard` and
 `data.code: command_not_values_free`. That includes `explore cluster` (a small
 cluster's centroid is one row's values), `explore semantic values` and
 `explore semantic query` (their output is dimension values or group keys), every
-`transform`, `semantic` and `maintain` command, `config set` and `config unset`,
+`transform` and `semantic` command, every `maintain` command but `coverage`, `config set` and `config unset`,
 and `demo`. On the library, every `DexEngine` method outside the reviewed set
 raises `ValuesFreeError` with that code.
 

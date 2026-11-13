@@ -57,6 +57,7 @@ from . import drift as drift_mod
 from . import snapshot as snapshot_mod
 from . import verify as verify_mod
 from .results import (
+    CoverageResult,
     DriftResult,
     LayerFingerprint,
     ReconcileResult,
@@ -1626,6 +1627,157 @@ def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             engine,
             getattr(args, "objects", None),
             target=getattr(args, "target", None),
+        )
+    )
+
+
+def coverage(
+    engine: DexEngine,
+    objects: list[str] | None = None,
+    *,
+    full: bool = False,
+) -> CoverageResult:
+    """Which project resources the dbt tests reach, from the manifest alone (#1280).
+
+    Free and connectionless on every connector: the manifest comes from a
+    ``dbt parse`` of a throwaway copy of the project (the same parse ``maintain
+    verify`` runs as its compile check), which opens no warehouse connection
+    and writes nothing into the project, so the inventory describes the tree
+    as it stands rather than whatever ``target/manifest.json`` a past run left.
+    A project that does not parse is reported first and suppresses the
+    inventory, as on ``maintain verify``. Where dbt cannot parse at all (dbt or
+    ``profiles.yml`` missing, a declared package not installed), the newest
+    manifest on disk is read instead and a warning dates it.
+
+    ``objects`` is the selector ``maintain verify`` takes: names, repeated,
+    comma- or space-separated, matching models (and their versions), sources
+    (``source.table``), snapshots and seeds. ``full`` lifts every list cap.
+    Reports, never gates: low coverage is not an error in this release.
+    """
+
+    import json
+
+    from ..transform.artifact_runtime import readable_artifact_dir
+    from ..transform.build import missing_packages, shadow_parse
+    from . import coverage as coverage_mod
+
+    project, project_reason = _read_project(engine)
+    if project is not None and project.name != "dbt":
+        project_reason = (
+            f"the '{project.name}' project format declares no dbt tests to inventory"
+        )
+        project = None
+    if project is None:
+        reason = project_reason or "no readable project format found"
+        return CoverageResult(
+            suppressed={"inventory": reason},
+            warnings=[f"maintain coverage could not read the project: {reason}"],
+        )
+    try:
+        project_dir = Path(engine.project_dir())
+    except (ProjectError, RepoRootRequiredError) as exc:
+        reason = f"the dbt project could not be located: {exc}"
+        return CoverageResult(
+            suppressed={"inventory": reason},
+            warnings=[f"maintain coverage could not read the project: {reason}"],
+        )
+
+    warnings: list[str] = []
+    manifest: dict[str, Any] | None = None
+    origin: dict[str, Any] | None = None
+    parse_skipped: str | None = None
+    missing = missing_packages(project_dir)
+    if missing:
+        names = ", ".join(sorted(package.name for package in missing))
+        parse_skipped = (
+            f"declared package(s) not installed ({names}); run `dex transform "
+            "deps` to install them"
+        )
+    else:
+        parsed = shadow_parse(project_dir, [], keep_manifest=True)
+        if parsed["available"] and not parsed["success"]:
+            finding, _ = verify_mod.compile_failure(parsed)
+            if finding is not None and _values_free(engine):
+                # dbt's parse error can quote the YAML it failed on, test
+                # arguments included, so the mode keeps the code alone.
+                finding = finding.model_copy(
+                    update={
+                        "detail": "dbt could not parse the project (its message "
+                        "is withheld in values-free mode)",
+                        "data": {},
+                    }
+                )
+            reason = "the project does not compile"
+            return CoverageResult(
+                findings=[finding] if finding is not None else [],
+                suppressed={"inventory": reason},
+                warnings=[
+                    "maintain coverage reported no inventory: the project does "
+                    "not compile, so its manifest cannot be trusted"
+                ],
+            )
+        if parsed["available"]:
+            manifest = parsed.get("manifest")
+            if manifest is None:
+                parse_skipped = "dbt parsed the project but wrote no readable manifest"
+            else:
+                origin = {"source": "parsed"}
+        else:
+            parse_skipped = str(parsed["reason"])
+
+    if manifest is None:
+        path = readable_artifact_dir(project_dir) / "manifest.json"
+        loaded = None
+        if path.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            reason = (
+                f"dex could not parse the project ({parse_skipped}) and found no "
+                "manifest.json on disk to read instead"
+            )
+            return CoverageResult(
+                suppressed={"inventory": reason},
+                warnings=[f"maintain coverage reported no inventory: {reason}"],
+            )
+        manifest = loaded
+        generated = (manifest.get("metadata") or {}).get("generated_at")
+        origin = {"source": "artifact"}
+        if generated:
+            origin["generated_at"] = generated
+        warnings.append(
+            f"maintain coverage read the manifest on disk"
+            f"{f' generated at {generated}' if generated else ''}, not a fresh "
+            f"parse ({parse_skipped}): tests added or removed since then are "
+            "not reflected"
+        )
+
+    names = model_scope.model_names(objects) if objects else None
+    inventory = coverage_mod.inventory(manifest, selector=names, full=full)
+    return CoverageResult(
+        summary=inventory.summary,
+        scope=inventory.scope,
+        sections=inventory.sections,
+        excluded=inventory.excluded,
+        elided=inventory.elided,
+        manifest=origin,
+        notes=inventory.notes,
+        warnings=[*warnings, *inventory.warnings],
+    )
+
+
+def _values_free(engine: DexEngine) -> bool:
+    from ..values_free import ResultMode
+
+    return getattr(engine, "result_mode", None) is ResultMode.VALUES_FREE
+
+
+def cmd_coverage(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(
+        coverage(
+            engine,
+            getattr(args, "objects", None),
+            full=bool(getattr(args, "full", False)),
         )
     )
 

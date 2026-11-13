@@ -734,6 +734,31 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      data.suppressed names each finding class that did not run and why,
                                      declared-fact classes (unit, additivity, population,
                                      parent_population, temporal) included
+dex maintain coverage [<names>] [--full]
+                                  -> which project resources the dbt tests reach (#1280). Free and
+                                     connectionless on every connector: the manifest comes from a dbt
+                                     parse of a throwaway copy of the project, no baseline required.
+                                     Sections models, sources, snapshots and seeds hold the root
+                                     project's enabled resources (ephemeral models marked); package and
+                                     disabled resources, disabled tests and tests on them are counted and
+                                     named under excluded. Per resource: own tests by kind (generic,
+                                     singular, unit, freshness) with each data test's severity,
+                                     downstream_tests apart (never own coverage; unit tests excluded),
+                                     an incremental model's incremental_branch_tests (unit tests that
+                                     override is_incremental to true), and columns: documented,
+                                     asserted (a generic test attached), unasserted, and
+                                     undocumented_tested (listed, never counted). A generic test is
+                                     named by the test it applies and its column, never by its node
+                                     name, which can carry its arguments. data.summary leads: each
+                                     ratio is {numerator, denominator, of}, never one blended number.
+                                     Selector as on maintain verify, plus source.table, snapshots and
+                                     seeds. Capped (25 resources per section, untested first; 12 tests
+                                     and 12 column names per resource; 10 downstream names; 25
+                                     excluded), every cut in data.elided and notes; --full lifts them.
+                                     A project that does not parse is reported first and suppresses the
+                                     inventory; with no parse possible the newest manifest on disk is
+                                     read and dated (data.manifest.source: artifact). Report only:
+                                     status ok whatever the coverage. Reviewed for values-free mode
 ```
 
 ### How authored content reaches the engine

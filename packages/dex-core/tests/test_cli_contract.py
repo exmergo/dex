@@ -909,6 +909,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "method": "verify",
         "args": {"objects": "objects", "target": "target"},
     },
+    ("maintain", "coverage"): {
+        "method": "coverage",
+        "args": {"objects": "objects", "full": "full"},
+    },
     ("maintain", "reconcile"): {
         "method": "reconcile",
         "args": {"drift_class": "drift_class"},

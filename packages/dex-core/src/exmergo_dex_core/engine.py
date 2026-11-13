@@ -91,6 +91,7 @@ if TYPE_CHECKING:
         SemanticValuesResult,
     )
     from .maintain.results import (
+        CoverageResult,
         DriftResult,
         ReconcileResult,
         SnapshotResult,
@@ -1418,6 +1419,18 @@ class DexEngine:
 
         return maintain.verify(self, objects, target=target)
 
+    def coverage(
+        self,
+        objects: list[str] | None = None,
+        *,
+        full: bool = False,
+    ) -> CoverageResult:
+        """Which project resources the dbt tests reach, from the manifest (#1280)."""
+
+        from .maintain import commands as maintain
+
+        return maintain.coverage(self, objects, full=full)
+
     # --- transform --------------------------------------------------------
     #
     # Every method here needs `repo_root`: the dbt project is the source of
@@ -2000,6 +2013,7 @@ _VALUES_FREE_METHODS = frozenset(
         "query_batch",
         "query_across",
         "semantic_list",
+        "coverage",
         # The engine's own plumbing.
         "resolve_result_mode",
         "connection_provenance",

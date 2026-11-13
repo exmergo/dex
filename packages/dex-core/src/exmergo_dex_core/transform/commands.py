@@ -26,13 +26,17 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from .. import command_args
 from .. import envelope as env
 from ..config import pii_override_paths
+from ..dbt_tests import IncrementalUnitTest
+from ..dbt_tests import attached_tests as _attached_tests
+from ..dbt_tests import incremental_unit_tests as _incremental_unit_tests
+from ..dbt_tests import runs_full_build as _runs_full_build
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
 from ..errors import DexError, RequestError
@@ -2995,33 +2999,6 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
     return node, path
 
 
-def _attached_tests(manifest: dict, node: dict) -> list[str]:
-    """Every test dbt would run for this model, generic, singular and unit alike.
-
-    Read from the manifest rather than from a run, because it is the free answer
-    and it is what makes "this model has no tests" a refusal instead of N dbt
-    invocations that all report a survivor.
-    """
-
-    unique_id = node.get("unique_id")
-    attached = [
-        uid
-        for uid, other in manifest.get("nodes", {}).items()
-        if other.get("resource_type") == "test"
-        and (
-            other.get("attached_node") == unique_id
-            or unique_id in (other.get("depends_on") or {}).get("nodes", [])
-        )
-    ]
-    attached += [
-        uid
-        for uid, unit in (manifest.get("unit_tests") or {}).items()
-        if unique_id in (unit.get("depends_on") or {}).get("nodes", [])
-        or unit.get("model") == node.get("name")
-    ]
-    return attached
-
-
 def _plan_mutants(
     shadow, node, model_path, cap, dialect, mutation_mod, *, select: str | None = None
 ):
@@ -3117,81 +3094,6 @@ def _incremental_program(
     except mutation_mod.MutationError as exc:
         return None, f"dex could not read it ({exc})"
     return prepared, None
-
-
-class IncrementalUnitTest(NamedTuple):
-    """One unit test that runs the incremental branch, as dbt knows it.
-
-    ``name`` is the test as a run reports it, ``select`` the name dbt's
-    ``unit_test:`` selector matches. They differ on a versioned model: dbt
-    reports each version's instance as ``<name>_v<version>`` while the
-    selector matches the definition's ``<name>`` and so every version of it,
-    which is why a run's statuses are read for ``name`` alone.
-    """
-
-    unique_id: str
-    name: str
-    select: str
-
-
-def _covers(unit: dict, node: dict) -> bool:
-    """Whether this unit test runs ``node`` rather than another version of it.
-
-    dbt binds each unit test instance to one model through ``depends_on``,
-    one instance per version on a versioned model. The model name is a
-    fallback only for an unversioned model, where it cannot name another one.
-    """
-
-    if node.get("unique_id") in (unit.get("depends_on") or {}).get("nodes", []):
-        return True
-    return node.get("version") is None and unit.get("model") == node.get("name")
-
-
-def _incremental_unit_tests(manifest: dict, node: dict) -> list[IncrementalUnitTest]:
-    """The unit tests on this model that run its ``is_incremental()`` branch.
-
-    dbt runs the branch in a unit test only where the test overrides the
-    ``is_incremental`` macro to true; every other test runs the full build.
-    On a versioned model, only the instances that test this version.
-    """
-
-    found = []
-    for unique_id, unit in (manifest.get("unit_tests") or {}).items():
-        if not _covers(unit, node) or not unit.get("name"):
-            continue
-        value = ((unit.get("overrides") or {}).get("macros") or {}).get(
-            "is_incremental"
-        )
-        if value is not True and str(value).lower() != "true":
-            continue
-        version = unit.get("version")
-        found.append(
-            IncrementalUnitTest(
-                unique_id=unique_id,
-                name=unit["name"] if version is None else f"{unit['name']}_v{version}",
-                select=unit["name"],
-            )
-        )
-    return sorted(found, key=lambda test: test.name)
-
-
-def _runs_full_build(
-    manifest: dict, node: dict, incremental: Sequence[IncrementalUnitTest]
-) -> bool:
-    """Whether any test of the model's own runs its full build.
-
-    Compared by unique id, which is what tells one version's unit test from
-    another's: a unit test that tests another version of the model, or one that
-    runs the incremental branch, does not count.
-    """
-
-    branch = {test.unique_id for test in incremental}
-    units = manifest.get("unit_tests") or {}
-    return any(
-        unique_id not in branch
-        and (unique_id not in units or _covers(units[unique_id], node))
-        for unique_id in _attached_tests(manifest, node)
-    )
 
 
 def _parent_relations(manifest: dict, node: dict, mutation_mod) -> list:

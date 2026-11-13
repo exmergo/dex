@@ -13,6 +13,7 @@ baseline; correctness checks do not.
 | You want to know | Command | Needs a previous snapshot? |
 | --- | --- | --- |
 | Is the project correct now? | `dex maintain verify` | No |
+| Which models, columns and sources have tests? | `dex maintain coverage` | No |
 | What changed since the baseline? | `dex maintain check` | Yes |
 | What edits would reconcile the drift? | `dex maintain reconcile` | Yes |
 

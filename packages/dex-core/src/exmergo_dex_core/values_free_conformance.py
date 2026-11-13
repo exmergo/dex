@@ -363,6 +363,130 @@ _DECLARATION = (
 # Every result in the mode carries these.
 _COMMON = frozenset({"result_mode", "notes", "notes[]", "spend"})
 
+#: A ``maintain coverage`` resource record (#1280): names, counts and kinds read
+#: from the manifest. A generic test is named by the test it applies, never by
+#: its node name, which dbt builds from its arguments.
+_COVERAGE_RESOURCE = (
+    "",
+    "[]",
+    "[].name",
+    "[].resource_type",
+    "[].path",
+    "[].materialized",
+    "[].ephemeral",
+    "[].tested",
+    "[].own_tests",
+    *(f"[].own_tests.{kind}" for kind in ("generic", "singular", "unit", "freshness")),
+    "[].severity",
+    "[].severity.error",
+    "[].severity.warn",
+    "[].incremental",
+    "[].incremental.unit_tests",
+    "[].incremental.incremental_branch_tests",
+    "[].incremental.incremental_branch_tests[]",
+    "[].incremental.incremental_branch_tested",
+    "[].columns",
+    "[].columns.documented",
+    "[].columns.asserted",
+    "[].columns.unasserted",
+    "[].columns.unasserted[]",
+    "[].columns.undocumented_tested",
+    "[].columns.undocumented_tested[]",
+    "[].tests",
+    "[].tests[]",
+    "[].tests[].kind",
+    "[].tests[].severity",
+    "[].tests[].test",
+    "[].tests[].column",
+    "[].tests[].name",
+    "[].tests[].is_incremental",
+    "[].downstream_tests",
+    "[].downstream_tests.count",
+    "[].downstream_tests.on",
+    "[].downstream_tests.on[]",
+)
+_RATIO = ("", ".numerator", ".denominator", ".of")
+
+
+def _coverage_fields() -> frozenset[str]:
+    paths: set[str] = {"summary", "summary.tests", "suppressed", "suppressed.inventory"}
+    ratios = {
+        "models": (
+            "with_own_tests",
+            "with_unit_tests",
+            "downstream_only",
+            "incremental_branch_tested",
+            "columns_asserted",
+        ),
+        "sources": ("with_own_tests", "with_freshness", "columns_asserted"),
+        "snapshots": ("with_own_tests", "columns_asserted"),
+        "seeds": ("with_own_tests", "columns_asserted"),
+    }
+    for section, names in ratios.items():
+        paths |= {f"summary.{section}", f"summary.{section}.count"}
+        for name in names:
+            paths |= _under(f"summary.{section}.{name}", *_RATIO[1:])
+        paths |= _under(section, *_COVERAGE_RESOURCE[1:])
+    paths.add("summary.models.ephemeral")
+    for kind in ("generic", "singular", "unit", "freshness"):
+        paths.add(f"summary.tests.by_kind.{kind}")
+    paths |= {"summary.tests.by_kind", "summary.tests.by_severity"}
+    paths |= {"summary.tests.by_severity.error", "summary.tests.by_severity.warn"}
+    paths |= {"scope", "scope.selected", "scope.selected[]"}
+    paths |= {"manifest", "manifest.source", "manifest.generated_at"}
+    paths |= {
+        "findings",
+        "findings[]",
+        *(
+            f"findings[].{key}"
+            for key in (
+                "axis",
+                "code",
+                "severity",
+                "detail",
+                "identifier",
+                "column",
+                "exact",
+                "data",
+            )
+        ),
+    }
+    paths |= _under(
+        "excluded",
+        ".resource_count",
+        ".by_reason",
+        ".by_reason.package",
+        ".by_reason.disabled",
+        ".resources",
+        ".resources[]",
+        ".resources[].name",
+        ".resources[].resource_type",
+        ".resources[].reason",
+        ".resources[].package",
+        ".tests",
+        ".tests.disabled",
+        ".tests.package",
+        ".tests.on_excluded_resource",
+    )
+    paths |= _under(
+        "elided",
+        *(
+            f".{key}"
+            for key in (
+                "models",
+                "sources",
+                "snapshots",
+                "seeds",
+                "tests",
+                "columns",
+                "downstream_resources",
+                "excluded",
+            )
+        ),
+    )
+    return _COMMON | frozenset(paths)
+
+
 #: Every key path a result in the mode may carry, per command. A path is the
 #: envelope ``data`` key chain with list positions written ``[]``. Reviewed: none
 #: of these holds a value read from a table (``cells`` holds the aggregates an
@@ -371,6 +495,7 @@ _COMMON = frozenset({"result_mode", "notes", "notes[]", "spend"})
 #: than a silent leak. ``column_notes`` is deliberately absent: it annotates bare
 #: projected columns, and the mode admits none.
 KNOWN_FIELDS: dict[str, frozenset[str]] = {
+    "coverage": _coverage_fields(),
     "profile": _COMMON
     | frozenset(
         {
@@ -998,6 +1123,88 @@ class ValuesFreeContract:
         assert any("result_mode" in w for w in unpinned.config.load_warnings)
 
     # --- the tripwire ---------------------------------------------------------
+
+    def test_coverage_names_tests_and_never_their_arguments(self) -> None:
+        """``maintain coverage`` over a manifest carrying the sentinels (#1280).
+
+        Read from a manifest rather than the engine, since the command parses a
+        dbt project and this suite runs without dbt. The sentinels sit wherever
+        a manifest holds a value: an ``accepted_values`` test's node name and
+        arguments, descriptions, ``meta``, and the SQL of a singular test.
+        """
+
+        from .maintain.coverage import inventory
+        from .maintain.results import CoverageResult
+
+        value = SENTINELS[0]
+        model = "model.shop.orders"
+        manifest = {
+            "metadata": {"project_name": "shop"},
+            "nodes": {
+                model: {
+                    "unique_id": model,
+                    "resource_type": "model",
+                    "name": "orders",
+                    "package_name": "shop",
+                    "description": f"orders {value}",
+                    "config": {"materialized": "table", "meta": {"x": value}},
+                    "columns": {
+                        "status": {"name": "status", "description": value},
+                    },
+                    "depends_on": {"nodes": []},
+                    "raw_code": f"select '{value}' as status",
+                },
+                "test.shop.accepted": {
+                    "resource_type": "test",
+                    "name": f"accepted_values_orders_status__{value}",
+                    "package_name": "shop",
+                    "attached_node": model,
+                    "column_name": "status",
+                    "test_metadata": {
+                        "name": "accepted_values",
+                        "kwargs": {"values": [value]},
+                    },
+                    "config": {"severity": "ERROR", "enabled": True},
+                    "depends_on": {"nodes": [model]},
+                },
+                "test.shop.assert_status": {
+                    "resource_type": "test",
+                    "name": "assert_status",
+                    "package_name": "shop",
+                    # A fixture string, never executed.
+                    "raw_code": f"where status = '{value}'",
+                    "config": {"severity": "warn", "enabled": True},
+                    "depends_on": {"nodes": [model]},
+                },
+            },
+            "sources": {},
+            "unit_tests": {
+                "unit_test.shop.orders.ut": {
+                    "name": "ut_orders",
+                    "model": "orders",
+                    "package_name": "shop",
+                    "given": [{"rows": [{"status": value}]}],
+                    "expect": {"rows": [{"status": value}]},
+                    "depends_on": {"nodes": [model]},
+                }
+            },
+            "disabled": {},
+        }
+        found = inventory(manifest, full=True)
+        result = CoverageResult(
+            summary=found.summary,
+            scope=found.scope,
+            sections=found.sections,
+            excluded=found.excluded,
+            elided=found.elided,
+            manifest={"source": "parsed"},
+            notes=found.notes,
+            warnings=found.warnings,
+            result_mode=ResultMode.VALUES_FREE,
+        )
+        envelope = to_envelope(result)
+        self.assert_no_sentinel(envelope.model_dump(mode="json"))
+        assert _unknown_paths("coverage", envelope.data) == []
 
     def test_every_field_is_known(self, engine) -> None:
         outputs = {
