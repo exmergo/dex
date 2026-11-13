@@ -42,8 +42,9 @@ pending fragments into a new section below. See
     metric over another is a ratio.
 
   Primary keys are entities, and every primary and unique key and every
-  relationship (with its arity) reach `explore relationships|map|profile
-  --use-project` at confidence 1.0. `maintain snapshot` fingerprints the layer so
+  relationship (with its arity) reach
+  `explore relationships|map|profile --use-project` at confidence 1.0.
+  `maintain snapshot` fingerprints the layer so
   that a view read back from Snowflake matches its file, and `maintain grain`
   measures the keys and arities. Sample values are never surfaced. Governed `query`
   and `values` are not available yet and refuse by name. Install with
