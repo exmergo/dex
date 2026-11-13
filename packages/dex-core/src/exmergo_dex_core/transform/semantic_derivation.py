@@ -979,7 +979,6 @@ class MetricFlowDerivation:
                         "(dex does not rename either)"
                     )
                     continue
-                claimed[name] = derivation.model
             place(derivation, sql_path, docs, edits)
             try:
                 splice(derivation, files)
@@ -993,6 +992,10 @@ class MetricFlowDerivation:
                     if derivation.validation["schema"]["result"] == "not_run"
                     else "failed"
                 )
+            if name and derivation.status != "failed":
+                # Reserve the name only for a derivation that stays in the plan,
+                # so one that is rejected here cannot refuse a later mart.
+                claimed[name] = derivation.model
 
         ready = [d for d in derivations if d.status == "proposed"]
         derived_edits = _spliced_edits(ready, files, edits)

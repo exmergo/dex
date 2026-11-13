@@ -1027,3 +1027,73 @@ def test_two_marts_that_normalize_to_one_name_cannot_both_derive(
     assert second["status"] == "failed"
     assert "already derived for intercom__threads" in second["reason"]
     assert "semantic model name 'intercom_threads'" in second["reason"]
+
+
+def test_a_derivation_that_fails_validation_does_not_reserve_its_name(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A refused first mart must not hold the name: the second mart normalizes to
+    `intercom_threads` too, and if the first never reaches the plan the second is
+    the one that owns the name."""
+    real_validate = sd.validate_static
+    calls = {"count": 0}
+
+    def first_fails(derivation, view, payload_documents):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            derivation.validation["schema"] = {
+                "result": "failed",
+                "detail": "synthetic failure",
+            }
+            return False
+        return real_validate(derivation, view, payload_documents)
+
+    monkeypatch.setattr(sd, "validate_static", first_fails)
+
+    thread_mart = {
+        "description": "One row per thread.",
+        "grain": ["order_id"],
+        "columns": {
+            "order_id": {"role": "key"},
+            "status": {"role": "dimension"},
+            "order_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/intercom__threads.sql",
+                "kind": "model_sql",
+                "content": MART_SQL,
+            },
+            {
+                "path": "models/marts/intercom_threads.sql",
+                "kind": "model_sql",
+                "content": MART_SQL,
+            },
+        ],
+        "declarations": [
+            {**thread_mart, "model": "intercom__threads"},
+            {**thread_mart, "model": "intercom_threads"},
+        ],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "threads",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert models["intercom__threads"]["status"] == "failed"
+    second = models["intercom_threads"]
+    assert second["status"] in ("proposed", "unvalidated"), json.dumps(second)[:800]
+    assert "already derived" not in second.get("reason", "")
+    assert calls["count"] >= 2
