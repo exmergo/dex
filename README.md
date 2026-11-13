@@ -375,7 +375,7 @@ and treat these scores as guide posts. ([evaluation](https://docs.exmergo.com/de
 > [!IMPORTANT]
 > **Dex sends nothing to Exmergo.** No telemetry, analytics, license check, or
 > update ping. See the [Dex privacy policy](https://trydex.ai/privacy)
-> and the [Dex terms of service](https://trydex.ai/terms/terms/dex).
+> and the [Dex terms of service](https://trydex.ai/terms).
 
 ### What to commit in `.dex/`
 
